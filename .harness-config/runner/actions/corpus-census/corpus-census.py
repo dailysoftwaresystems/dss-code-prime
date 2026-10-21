@@ -1156,7 +1156,7 @@ def main(argv: list[str]) -> int:
                     help="compile config passed to DSS (debug|release)")
     ap.add_argument("--jobs", type=int, default=None,
                     help="concurrent TU compiles (default: cores/2, min 1)")
-    ap.add_argument("--out", default=None, help="report directory")
+    ap.add_argument("--out", default=None, type=_owning_tree().written_path_arg("--out"), help="report directory")
     ap.add_argument("--manifest", default=None, help="corpus manifest to census")
     ap.add_argument("--dss-bin", default=None, help="the compiler to measure")
     ap.add_argument("--keep-logs", action="store_true",

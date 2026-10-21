@@ -941,11 +941,31 @@ def build_parser():
     ap.add_argument("--mode", default="run")
     ap.add_argument("--dump", default="")
     ap.add_argument("--dialect", default="")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True, type=_written_path_arg("--out"))
     return ap
 
 
 SELFTEST_EXPECT_CL = {(): False, ("--expect-cl=no",): False, ("--expect-cl=yes",): True}
+
+
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("probe-reference-cc: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
 
 
 def main(argv):

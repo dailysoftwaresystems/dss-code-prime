@@ -119,8 +119,10 @@ while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on tha
      ★★ **AND A SELF-TEST IS NOT A REPO GUARD.** An entry that self-tests a program reads the program's
      own fixtures, and that verdict CAN depend on the host — case, path separators, path spelling, what
      the host's git does — so it never carries `repo-guard` and every leg runs it, the indirect ones
-     included. The rule is stated where the label is given (the root `CMakeLists.txt`), and
-     `harness/repo_guard_label_check` refuses a build in which a self-test carries the label.
+     included. An entry self-tests when it carries the `self-test` label, which the helpers that
+     register one give it. The rule is stated where `repo-guard` is given (the root `CMakeLists.txt`),
+     and `harness/repo_guard_label_check` refuses a build in which an entry carries both labels, or
+     asks a program for its self-test on its command line without the `self-test` label.
      ★★★ **AND THE LEG SET IS DECLARED, NOT DECIDED THREE TIMES.** ✔MEASURED 2026-09-16, while
      three hand-written drivers still existed: each chose its own default, so one passed
      `-LE repo-guard` on the two ssh legs while another ran every guard on WSL — Windows **2207**,

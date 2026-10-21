@@ -91,8 +91,8 @@ def denied(rel):
 
 def read(tree, rel, lines, match, red=None):
     """Return (exit code, output lines). Refusals return code 2 and a single explanatory line. `red` replaces this
-    host's redactor (a test's, over the same tree); the OK line says when the redactor walked the tree's vocabulary
-    for its one exemption, how many names it read and in how long."""
+    host's redactor (a test's, over the same tree); the OK line says when the redactor walked the tree for its one
+    exemption -- its names, and its text -- how many it kept and in how long, or that the walk was refused and why."""
     if not rel:
         return 2, ["read-leg-path: REFUSED - --path is empty"]
     if os.path.isabs(rel) or re.match(r"^[A-Za-z]:", rel) or rel.startswith(("/", "\\")):
@@ -139,16 +139,29 @@ def read(tree, rel, lines, match, red=None):
         kept = [ln for ln in text.splitlines() if ln.strip() and pattern.search(ln)]
         out = [red(ln) for ln in kept[-lines:]]
         what = "%d line(s) of %s" % (len(out), rel)
+    # Each walk the redactor made for its one exemption, said as what it was: how many it kept and in how long, cut
+    # short by its bound, or REFUSED by the one reader and why -- the last two keep fewer alike, and a line that said
+    # both as "cut short" hid a tree whose `.gitignore` nothing could read.
     vocab = red.vocabulary() if hasattr(red, "vocabulary") else None
-    walked = "" if vocab is None else " (tree vocabulary: %d name(s) in %.2f s%s)" % (
-        len(vocab.names), vocab.seconds, "" if vocab.complete else ", cut short -- fewer names kept, never more")
-    out.append("read-leg-path: OK %s%s" % (red(what), walked))
+    spelled = red.text_vocabulary() if hasattr(red, "text_vocabulary") else None
+    walked = ""
+    if vocab is not None:
+        walked += (" (tree vocabulary: none kept, the walk was refused -- %s)" % vocab.why if vocab.why else
+                   " (tree vocabulary: %d name(s) in %.2f s%s)" % (
+                       len(vocab.names), vocab.seconds,
+                       "" if vocab.complete else ", cut short -- fewer names kept, never more"))
+    if spelled is not None:
+        walked += (" (tree text: none kept, the walk was refused -- %s)" % spelled.why if spelled.why else
+                   " (tree text: %d compound(s) from %d file(s) in %.2f s%s)" % (
+                       len(spelled.compounds), spelled.files, spelled.seconds,
+                       "" if spelled.complete else ", cut short -- fewer compounds kept, never more"))
+    out.append("read-leg-path: OK %s%s" % (red(what), red(walked)))
     return 0, out
 
 
 # ★ AN EXACT RATCHET (the round-12 audit: this self-test counted failures and never how many arms ran, so a deleted
 # arm passed). Every arm below is host-independent; the one that reads this host's own names is ONE arm.
-EXPECTED_ARMS = 17
+EXPECTED_ARMS = 18
 
 
 def selftest():
@@ -222,6 +235,22 @@ def selftest():
         rc, lines = read(tree, "logs/build.log", 200, ".", red=redact_module().redactor(
             tree, user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix"))
         arm("no host name, no walk, no report", rc == 0 and "tree vocabulary" not in lines[-1], lines[-1])
+        # A TREE WHOSE `.gitignore` THE ONE READER REFUSES: both walks keep nothing, and the OK line says each was
+        # refused and why -- never "cut short", which is a time bound's word.
+        with tempfile.TemporaryDirectory() as tmp_refused:
+            refused = os.path.realpath(tmp_refused)
+            os.makedirs(os.path.join(refused, "logs"))
+            with io.open(os.path.join(refused, ".gitignore"), "w", encoding="utf-8") as f:
+                f.write("ok/\nb\\#c\n")
+            with io.open(os.path.join(refused, "logs", "syn.log"), "w", encoding="utf-8") as f:
+                f.write("ran syn.mir on syn\n")
+            rc, lines = read(refused, "logs/syn.log", 200, ".", red=redact_module().redactor(
+                refused, user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix"))
+            last = lines[-1] if lines else ""
+            arm("a refused walk is said as refused, never as cut short", rc == 0
+                and "(tree vocabulary: none kept, the walk was refused -- " in last
+                and "(tree text: none kept, the walk was refused -- " in last
+                and last.count("line 2") == 2 and "cut short" not in last, last)
         # A HOST WHOSE ACCOUNT NOBODY CAN NAME: read() refuses and prints nothing it read.
         mod = redact_module()
         real = mod.account_names
@@ -273,8 +302,28 @@ def build_parser():
     ap.add_argument("--path", required=True)
     ap.add_argument("--lines", type=int, default=200)
     ap.add_argument("--match", default=".")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True, type=_written_path_arg("--out"))
     return ap
+
+
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("read-leg-path: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
 
 
 def main(argv):

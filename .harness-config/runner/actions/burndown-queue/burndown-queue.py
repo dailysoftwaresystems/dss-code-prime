@@ -516,7 +516,7 @@ def main(argv):
     ap.add_argument("--schedulable", type=_flag, nargs="?", const=True, default=False)
     ap.add_argument("--top", type=int, default=0, help="at most this many rows; 0 lists every one")
     ap.add_argument("--counts", action="store_true")
-    ap.add_argument("--json", default="", metavar="PATH",
+    ap.add_argument("--json", default=None, metavar="PATH", type=_owning_tree().written_path_arg("--json"),
                     help="ALSO write the listed rows and the residue as JSON to PATH")
     ap.add_argument("--evidence", type=_flag, nargs="?", const=True, default=False,
                     help="print the phrase that banded each row")

@@ -5731,12 +5731,21 @@ struct CorpusIndex {
     namespace fs = std::filesystem;
     CorpusIndex idx;
     idx.root = std::move(root);
-    std::error_code ec;
-    for (auto const& entry : fs::recursive_directory_iterator(idx.root, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file() || entry.path().extension() != ".json")
-            continue;
-        std::ifstream in(entry.path(), std::ios::binary);
+    // The descriptors, collected by the substrate's walk -- which never descends a
+    // link on any build (libstdc++ on Windows cannot tell one from what it
+    // reaches: the substrate's header). A root that cannot be listed is an EMPTY
+    // index, as the iterator's construction error was; a directory BELOW it that
+    // cannot be listed throws, as the iterator's `operator++` did.
+    std::vector<fs::path> descriptors;
+    auto const walk = core::walkTree(idx.root, [&](core::TreeEntry const& entry) {
+        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+            descriptors.push_back(entry.path);
+        return core::WalkStep::Continue;
+    });
+    if (walk.error && walk.where != idx.root)
+        throw fs::filesystem_error("the shipped descriptor corpus could not be walked", walk.where, walk.error);
+    for (fs::path const& descriptor : descriptors) {
+        std::ifstream in(descriptor, std::ios::binary);
         if (!in) continue;  // lenient: unreadable descriptor skipped
         // THE ONE CONFIG PARSE, and the reason a LENIENT scanner routes through
         // it too: `operator>>` into a `json` is `json::parse` under another
@@ -5758,12 +5767,12 @@ struct CorpusIndex {
             continue;
         }
         std::error_code relEc;
-        auto rel = fs::relative(entry.path(), idx.root, relEc);
+        auto rel = fs::relative(descriptor, idx.root, relEc);
         std::string const relPath =
             // ASYMMETRIC ON PURPOSE. `rel` is a RELATIVE path — no root, so no
             // authority to lose — while the fallback arm is the ABSOLUTE entry
             // and is exactly the shape that loses one.
-            relEc ? core::genericSpelling(entry.path()) : rel.generic_string();
+            relEc ? core::genericSpelling(descriptor) : rel.generic_string();
         // DOCUMENT-level availability — the fallback a symbol row with no
         // `availableObjectFormats` key of its own inherits (mirrors the semantic
         // injector's two-level gate). `hasDoc == false` ⇒ the document itself is
@@ -6481,18 +6490,23 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
                       DiagnosticReporter&          reporter) {
     std::vector<ShippedSourceClaim> claims;
     std::error_code ec;
-    if (!std::filesystem::is_directory(descriptorDir, ec)) return claims;
-    for (std::filesystem::recursive_directory_iterator
-             it{descriptorDir,
-                std::filesystem::directory_options::skip_permission_denied, ec},
-             end;
-         it != end; it.increment(ec)) {
-        if (ec) break;
-        if (!it->is_regular_file(ec)) continue;
-        if (it->path().extension() != ".json") continue;
-        json const* const docPtr = cachedDescriptorJson(it->path(), reporter);
+    if (core::reachedKind(descriptorDir, ec) != core::EntryKind::Directory) return claims;
+    // The substrate's walk: it never descends a link on any build (libstdc++ on
+    // Windows cannot tell one from what it reaches -- the substrate's header). A
+    // directory it cannot list ends the walk, as the iterator's error did.
+    std::vector<std::filesystem::path> descriptors;
+    static_cast<void>(core::walkTree(
+        descriptorDir,
+        [&](core::TreeEntry const& entry) {
+            if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+                descriptors.push_back(entry.path);
+            return core::WalkStep::Continue;
+        },
+        core::TreeWalkOptions{.skipPermissionDenied = true}));
+    for (std::filesystem::path const& descriptor : descriptors) {
+        json const* const docPtr = cachedDescriptorJson(descriptor, reporter);
         if (!docPtr) continue;   // a broken descriptor is the full read's business
-        std::string const where = it->path().filename().generic_string();
+        std::string const where = descriptor.filename().generic_string();
         auto harvest = [&](json const& node, std::string const& ctx) {
             if (!node.is_object()) return;
             for (auto const& kv : node.items()) {
@@ -6554,20 +6568,21 @@ resolveShippedSource(std::string_view configRelativePath) {
     // ⚠ Keyed on the returned TYPE rather than on `ec` alone, because
     // implementations differ over whether a clean not-found also clears `ec`; the
     // type is unambiguous on every platform this ships to.
-    std::error_code          ec;
-    std::filesystem::file_status const st = std::filesystem::status(out.path, ec);
-    if (st.type() == std::filesystem::file_type::not_found) {
-        out.status = ShippedSourceResolution::NotPresent;
-        return out;
-    }
-    if (ec || st.type() == std::filesystem::file_type::none) {
+    // Asked of the substrate (what the path REACHES), which every build answers alike: an error is the
+    // query's own failure, `Absent` a clean absence -- a dangling link included.
+    std::error_code       ec;
+    core::EntryKind const reached = core::reachedKind(out.path, ec);
+    if (ec) {
         out.status = ShippedSourceResolution::QueryFailed;
         out.error  = ec;
         return out;
     }
-    out.status = std::filesystem::is_regular_file(st)
-                     ? ShippedSourceResolution::Resolved
-                     : ShippedSourceResolution::NotAFile;
+    if (reached == core::EntryKind::Absent) {
+        out.status = ShippedSourceResolution::NotPresent;
+        return out;
+    }
+    out.status = reached == core::EntryKind::File ? ShippedSourceResolution::Resolved
+                                                  : ShippedSourceResolution::NotAFile;
     return out;
 }
 
@@ -6760,7 +6775,7 @@ bool validateShippedSourceTree(
     // make this function silently ignore a stray `.txt` or `.o` sitting in the
     // AUTHORED tree, which is exactly the inert-config case R2 exists to catch.
     // The problem was the SUBJECT DIRECTORY, so the subject is what got fixed.
-    if (std::filesystem::is_directory(runtimeRootDir / "src", ec)) {
+    if (core::reachedKind(runtimeRootDir / "src", ec) == core::EntryKind::Directory) {
         // The caller handed a TIER (or a `src/`) instead of the root. Refusing is
         // the whole point: silently scanning the wrong tree is how a guard passes
         // while guarding nothing.
@@ -6775,17 +6790,22 @@ bool validateShippedSourceTree(
     for (std::filesystem::directory_iterator tierIt{runtimeRootDir, ec}, tierEnd;
          tierIt != tierEnd; tierIt.increment(ec)) {
         if (ec) break;
-        if (!tierIt->is_directory(ec)) continue;
+        if (core::reachedKind(tierIt->path(), ec) != core::EntryKind::Directory) continue;
         std::filesystem::path const authored = tierIt->path() / "src";
-        if (!std::filesystem::is_directory(authored, ec)) continue;
-        for (std::filesystem::recursive_directory_iterator
-                 it{authored,
-                    std::filesystem::directory_options::skip_permission_denied, ec},
-                 end;
-             it != end; it.increment(ec)) {
-            if (ec) break;
-            if (!it->is_regular_file(ec)) continue;
-            std::filesystem::path const p = it->path();
+        if (core::reachedKind(authored, ec) != core::EntryKind::Directory) continue;
+        // The substrate's walk: it never descends a link on any build (libstdc++
+        // on Windows cannot tell one from what it reaches -- the substrate's
+        // header). A directory it cannot list ends this tier's walk, as the
+        // iterator's error did.
+        std::vector<std::filesystem::path> authoredFiles;
+        static_cast<void>(core::walkTree(
+            authored,
+            [&](core::TreeEntry const& entry) {
+                if (entry.reaches == core::EntryKind::File) authoredFiles.push_back(entry.path);
+                return core::WalkStep::Continue;
+            },
+            core::TreeWalkOptions{.skipPermissionDenied = true}));
+        for (std::filesystem::path const& p : authoredFiles) {
             if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
             emitMalformed(reporter,
                 "shipped-source tree: '" + core::genericSpelling(p)
@@ -6951,18 +6971,18 @@ bool validateShippedIncludeClosure(
         return false;
     }
 
-    std::error_code ec;
+    // The substrate's walk: it never descends a link on any build (libstdc++ on
+    // Windows cannot tell one from what it reaches -- the substrate's header). A
+    // directory it cannot list ends the walk, as the iterator's error did.
     std::vector<std::filesystem::path> descriptors;
-    for (std::filesystem::recursive_directory_iterator
-             it{descriptorDir,
-                std::filesystem::directory_options::skip_permission_denied, ec},
-             end;
-         it != end; it.increment(ec)) {
-        if (ec) break;
-        if (!it->is_regular_file(ec)) continue;
-        if (it->path().extension() != ".json") continue;
-        descriptors.push_back(it->path());
-    }
+    static_cast<void>(core::walkTree(
+        descriptorDir,
+        [&](core::TreeEntry const& entry) {
+            if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+                descriptors.push_back(entry.path);
+            return core::WalkStep::Continue;
+        },
+        core::TreeWalkOptions{.skipPermissionDenied = true}));
     // Deterministic order on every host (a directory iteration order is the
     // filesystem's, and a sweep that reports its failures in a host-dependent
     // order is a sweep whose output cannot be diffed).

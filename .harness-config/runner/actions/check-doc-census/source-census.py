@@ -75,23 +75,37 @@ EXIT_OK, EXIT_COLLAPSE, EXIT_USAGE = 0, 2, 3
 # the same rule `check-doc-census.py` follows, and for the same reason: an instrument
 # that silently measures whichever directory it was launched from can be made to say
 # anything by cd-ing somewhere else.
+_OT = None
+
+
+def owner():
+    """`owning-tree.py`, loaded as a SIBLING by path: which tree this file lives in, and what a
+    walk of a tree leaves out (`TreeIgnores`). `check-doc-census`'s self-test runs a COPY of this
+    file under a synthetic root with `--repo`, and copies the owner beside it at its real path.
+    A missing owner is a collapse -- never a census that read everything."""
+    global _OT
+    if _OT is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            print("source-census: cannot find %s -- this census's tree, and what a walk of it "
+                  "leaves out, are resolved there and nowhere else" % path, file=sys.stderr)
+            raise SystemExit(EXIT_COLLAPSE)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OT = mod
+    return _OT
+
+
 def self_repo():
     """The tree THIS FILE lives in, by the owner's walk -- never a count of `..`.
 
     ★ ASKED LAZILY, only when no `--repo` names the tree: it was a module-level
     `__file__/../..`, which named `.harness-config/runner` the moment this file moved out
-    of `scripts/` (2026-09-18). `check-doc-census`'s self-test runs a COPY of this file
-    under a synthetic root with `--repo`, and a copy has no sibling owner to load.
+    of `scripts/` (2026-09-18).
     """
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                        "owning-tree", "owning-tree.py")
-    if not os.path.isfile(path):
-        print("source-census: cannot find %s -- this census's tree is resolved there and "
-              "nowhere else" % path, file=sys.stderr)
-        raise SystemExit(EXIT_COLLAPSE)
-    spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = owner()
     try:
         return mod.owning_tree(__file__)
     except mod.Refusal as exc:
@@ -138,8 +152,27 @@ def load_declaration(repo):
     return keys
 
 
-def resolve(repo, key, patterns):
-    """Every pattern's matches, de-duplicated, in a stable order."""
+def _walk_keeps(ignores, repo, path):
+    """True when a walk of the tree keeps `path` -- the census reads what the walk reads: no file the
+    tree leaves out (what git ignores there, read from its own `.gitignore`, and `.git`: a build,
+    another checkout, a session's scratch), and none reached THROUGH a symbolic link to a directory,
+    which the walk never descends. This census skips nothing git does not ignore."""
+    rel = os.path.relpath(path, repo).replace(os.sep, "/")
+    parts = rel.split("/")
+    for depth in range(1, len(parts)):
+        if os.path.islink(os.path.join(repo, *parts[:depth])):
+            return False
+    return not ignores.leaves_out(rel, False)
+
+
+def resolve(repo, key, patterns, ignores=None):
+    """Every pattern's matches the walk of the tree keeps (`_walk_keeps`), de-duplicated, in a
+    stable order."""
+    mod = owner()
+    try:
+        ignores = mod.TreeIgnores(repo) if ignores is None else ignores
+    except mod.Refusal as exc:
+        raise Collapse("what a walk of %s leaves out cannot be read: %s" % (repo, exc))
     found = []
     for pattern in patterns:
         if not isinstance(pattern, str) or not pattern:
@@ -148,9 +181,13 @@ def resolve(repo, key, patterns):
             raise Collapse("key '%s': the `files` pattern '%s' is absolute -- a census "
                            "of this tree may not name a path outside it" % (key, pattern))
         native = pattern.replace("/", os.sep)
-        hits = [os.path.realpath(p)
-                for p in glob.glob(os.path.join(repo, native), recursive=True)
-                if os.path.isfile(p)]
+        try:
+            hits = [os.path.realpath(p)
+                    for p in glob.glob(os.path.join(repo, native), recursive=True)
+                    if os.path.isfile(p) and _walk_keeps(ignores, repo, p)]
+        except mod.Refusal as exc:
+            raise Collapse("key '%s': the `files` pattern '%s' reached a path the walk refuses: %s"
+                           % (key, pattern, exc))
         # Clause 4, checked on the RESOLVED path so a `..` buried mid-pattern cannot
         # slip past a prefix test on the pattern text.
         root = os.path.realpath(repo) + os.sep

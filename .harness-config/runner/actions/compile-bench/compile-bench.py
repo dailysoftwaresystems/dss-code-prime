@@ -75,7 +75,8 @@ Stated in the OUTPUT as well as here, because a caveat that lives only in a
 source comment is a caveat the reader of the number never saw. See CAVEATS.
 
 Usage -- the `bench` step (`dssharness run compile-bench`, an input for each knob below, e.g.
-`--input runs=20`); the step spells every option `--name=value`, and an empty value is the default:
+`--input runs=20`); the step spells every option `--name=value`, and an empty value is the default -- but for
+`--out` and `--json`, paths to write, which an empty value is refused for:
     compile-bench.py --dsscp <path-to-dsscp> [options]
 
     --dsscp PATH        the compiler under test. REQUIRED; refused if absent.
@@ -174,10 +175,10 @@ def load_build_type_reader(repo):
 # `--out` and `--json` name places this program writes. Which values can be one -- never an empty one, never one
 # beginning with `-`: `--json --help` would write the report to `./--help`, an option read as a value -- is said once,
 # by `owning-tree.py`'s `written_path`, loaded as a SIBLING action. A value that is no path may begin with `-`.
+# ⚠ AN EMPTY VALUE IS NO DEFAULT HERE, unlike every other option's: a path to write that names no place is refused,
+# as owning-tree refuses it (not giving the option is how its default is asked for).
 def written_path(value, flag):
-    """The path `flag` names for writing, or None for an EMPTY value -- the default, as for every option here."""
-    if value == "":
-        return None
+    """The path `flag` names for writing; an empty one, or one beginning with `-`, is refused naming the flag."""
     path = os.path.join(os.path.dirname(HERE), "owning-tree", "owning-tree.py")
     if not os.path.isfile(path):
         die("%s is missing: what a path to write may be is said there, and nowhere else" % path)
@@ -968,7 +969,7 @@ def parse_args(argv):
 # ── THE COMMAND LINE'S OWN SELF-TEST: no compiler, no build ──────────────────
 SELFTEST_MARKER = "compile-bench self-test: "
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 5
+EXPECTED_ARMS = 6
 
 
 def self_test():
@@ -1001,14 +1002,27 @@ def self_test():
     arm("--out=-x spells the same mistake inline: refused, naming --out", *refused(["--out=-x"], "--out"))
     arm("--json=--help spells the same mistake inline: refused, naming --json",
         *refused(["--json=--help"], "--json"))
+    def refused_empty(argv, flag):
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said):
+                got = parse_args(argv)
+        except SystemExit as exc:
+            text = said.getvalue().strip()
+            return exc.code == 2 and ("%s names no path to write" % flag) in text, "exit %r: %s" % (exc.code,
+                                                                                                 text[:300])
+        return False, "parsed, no refusal: %s=%r" % (flag, got.get(flag[2:]))
+
+    said = [refused_empty([argv], flag) for argv, flag in (("--out=", "--out"), ("--json=", "--json"))]
+    arm("--out= and --json= name no place to write: each refused, naming its flag",
+        all(ok for ok, _ in said), "; ".join(d for _, d in said))
     try:
         given = parse_args(["--out", "build/cb-x", "--json=r-1.json"])
-        empty = parse_args(["--out=", "--json="])
-        ok = (given["out"], given["json"], empty["out"], empty["json"]) == ("build/cb-x", "r-1.json", None, None)
-        detail = "given %r, empty %r" % ((given["out"], given["json"]), (empty["out"], empty["json"]))
+        ok = (given["out"], given["json"]) == ("build/cb-x", "r-1.json")
+        detail = "given %r" % ((given["out"], given["json"]),)
     except SystemExit as exc:
         ok, detail = False, "refused, exit %r" % (exc.code,)
-    arm("a path holding a dash is kept, and an empty value is the default (the control)", ok, detail)
+    arm("a path holding a dash is kept (the control)", ok, detail)
     failed = ran.count(False)
     if len(ran) != EXPECTED_ARMS:
         print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))

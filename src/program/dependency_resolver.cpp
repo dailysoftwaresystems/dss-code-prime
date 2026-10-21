@@ -334,7 +334,7 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
         // consumer's DRIVE in front of another machine's authority).
         dir = canonicalize(resolveManifestPath(parent.dir, raw));
         std::error_code ec;
-        if (!fs::is_directory(dir, ec)) {
+        if (core::reachedKind(dir, ec) != core::EntryKind::Directory) {
             emitDriverError(
                 rep_, DiagnosticCode::D_FileNotFound,
                 "project 'dependsOn': path dependency '" + spelling
@@ -354,7 +354,7 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
 
     fs::path const manifest = dir / std::string{kDependencyManifestName};
     std::error_code ec;
-    if (!fs::is_regular_file(manifest, ec)) {
+    if (core::reachedKind(manifest, ec) != core::EntryKind::File) {
         emitGuaranteed(
             rep_, DiagnosticCode::D_DependencyManifestNotFound,
             "project 'dependsOn': '" + spelling + "' (declared by '"

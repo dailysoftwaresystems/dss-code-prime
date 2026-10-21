@@ -34,8 +34,9 @@ namespace {
       "--out=-x spells the same mistake inline: refused, naming --out")                                                \
     X(JsonHelpSpellsTheSameMistakeInlineRefusedNamingJson,                                                             \
       "--json=--help spells the same mistake inline: refused, naming --json")                                          \
-    X(APathHoldingADashIsKeptAndAnEmptyValueIsTheDefaultTheControl,                                                    \
-      "a path holding a dash is kept, and an empty value is the default (the control)")
+    X(OutAndJsonNameNoPlaceToWriteEachRefusedNamingItsFlag,                                                            \
+      "--out= and --json= name no place to write: each refused, naming its flag")                                      \
+    X(APathHoldingADashIsKeptTheControl, "a path holding a dash is kept (the control)")
 
 #define DSS_COMPILE_BENCH_SELFTEST_ARM_NAME(caseName, armName) armName,
 constexpr std::string_view kArmNames[] = {DSS_COMPILE_BENCH_SELFTEST_ARMS(DSS_COMPILE_BENCH_SELFTEST_ARM_NAME)};

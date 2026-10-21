@@ -121,6 +121,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
 import tempfile
 from urllib.parse import unquote
 
@@ -2237,6 +2238,26 @@ def selftest(tree, target, dsscp, cc, flags, dialect, forks):
     return 1 if failures else 0
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("prototype-census: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tree', required=True)
@@ -2244,7 +2265,7 @@ def main():
     ap.add_argument('--dsscp', required=True)
     ap.add_argument('--cc', required=True)
     ap.add_argument('--flags', default='')
-    ap.add_argument('--out', default='')
+    ap.add_argument('--out', default=None, type=_written_path_arg("--out"))
     ap.add_argument('--only', default='')
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--values', action='store_true')

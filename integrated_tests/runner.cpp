@@ -92,6 +92,10 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+// The host substrate's entry kind, walk and removal -- the ONE statement of "never
+// follow a link", shared with the compiler. This runner links no DSS library: the
+// one substrate unit is compiled into it (integrated_tests/CMakeLists.txt).
+#include "core/substrate/path_identity.hpp"
 #include "host_translations.hpp"
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. Its header states the boundary as a sentence;
@@ -3442,13 +3446,15 @@ void runErrorExampleViaCli(std::string const& compiler,
     // extension — an artifact could legitimately be called anything.
     {
         std::vector<std::string> leftovers;
-        std::error_code          ec;
-        for (auto it = fs::recursive_directory_iterator(outDir, ec);
-             !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
-            if (!it->is_regular_file(ec)) continue;
-            if (it->path().filename() == cliLog.filename()) continue;
-            leftovers.push_back(it->path().generic_string());
-        }
+        // The substrate's walk (`dss::core::walkTree`): it never descends a link,
+        // on every build -- libstdc++ on Windows cannot tell one from what it
+        // reaches (the substrate's header) -- and a file reached through a link
+        // is still a file the build left.
+        static_cast<void>(dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
+            if (entry.reaches == dss::core::EntryKind::File && entry.path.filename() != cliLog.filename())
+                leftovers.push_back(entry.path.generic_string());
+            return dss::core::WalkStep::Continue;
+        }));
         check(exampleName + ": CLI writes NO artifact for a rejected build",
               leftovers.empty(),
               std::to_string(leftovers.size()) + " file(s) under "
@@ -3956,9 +3962,13 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
     // automatically, which is the property a hand-listed subset cannot have.
     std::size_t population = 0;
     std::error_code ec;
-    for (fs::recursive_directory_iterator it(examplesRoot, ec), end; it != end && !ec;
-         it.increment(ec)) {
-        if (it->path().filename() == "expected.json") ++population;
+    // The substrate's walk: it never descends a link on any build.
+    {
+        auto const walk = dss::core::walkTree(examplesRoot, [&](dss::core::TreeEntry const& entry) {
+            if (entry.path.filename() == "expected.json") ++population;
+            return dss::core::WalkStep::Continue;
+        });
+        ec = walk.error;
     }
     if (ec || population == 0) {
         std::cerr << "[ERROR] could not derive the example population from "
@@ -5747,11 +5757,12 @@ void runRunnerVocabularyPin() {
     // one property a hand-picked id cannot have — and the property that stops
     // this entry from silently becoming a pin on a file that no longer exists.
     std::vector<fs::path> manifests;
-    std::error_code       ec;
-    for (fs::recursive_directory_iterator it(examplesRoot, ec), end;
-         it != end && !ec; it.increment(ec)) {
-        if (it->path().filename() == "expected.json") manifests.push_back(it->path());
-    }
+    // The substrate's walk: it never descends a link on any build.
+    auto const walk = dss::core::walkTree(examplesRoot, [&](dss::core::TreeEntry const& entry) {
+        if (entry.path.filename() == "expected.json") manifests.push_back(entry.path);
+        return dss::core::WalkStep::Continue;
+    });
+    std::error_code const ec = walk.error;
     if (ec) {
         check("walk the corpus for a coverage-boundary subject", false,
               "scan of " + examplesRoot.generic_string() + " failed: "
@@ -6300,21 +6311,31 @@ constexpr auto kRunningStaleAfter = std::chrono::hours{6};
 // access for an instant. That is the noise the rule at the prune's `[WARN]` exists
 // to keep out, and it is a collision tolerated rather than removed.
 //
-// The walk is still built from SINGLE-OBJECT operations and never `remove_all`,
+// The removal is still built from SINGLE-OBJECT operations and never `remove_all`,
 // because a claim binds only THIS runner: a pre-fix build of it in another tree, a
 // human, or an antivirus quarantine can still delete under the claim holder, and
 // the walk must END whatever they do.
+// ★ AND IT IS THE COMPILER'S OWN, `dss::core::removeTree`
+// (src/core/substrate/path_identity.{hpp,cpp}, compiled into this runner beside
+// it): one statement of "remove a tree, end whatever another deleter does, never
+// follow a link", where this runner kept its own copy. The copy asked
+// `symlink_status` to decide whether an entry was a directory to empty, and
+// libstdc++ on Windows reads a directory LINK as the directory it reaches
+// (✔MEASURED 2026-10-20, the substrate's header) -- so built with MinGW it
+// followed a link out of the scratch tree and emptied what the link named, the one
+// thing its own comment said it never did. The substrate asks the OS there.
 // ⚠ Do NOT "simplify" either half away: `runConcurrentScratchRemovalPin` reds both.
 struct ScratchRemoval {
     std::size_t failures = 0;
     std::string first;  // the first failure: the path and its cause
 };
 
-// `true` iff nothing is at `p` now. A stat that ERRS is not "gone": an entry
-// that cannot even be looked at may well still be there.
+// `true` iff nothing is at `p` now -- no entry at all, a link included. A stat
+// that ERRS is not "gone": an entry that cannot even be looked at may well still
+// be there.
 [[nodiscard]] bool scratchEntryIsGone(fs::path const& p) {
     std::error_code ec;
-    return fs::symlink_status(p, ec).type() == fs::file_type::not_found;
+    return dss::core::entryKind(p, ec) == dss::core::EntryKind::Absent && !ec;
 }
 
 void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
@@ -6325,76 +6346,21 @@ void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
     }
 }
 
-// Remove `target` — one file, or a whole tree — with single-object operations
-// only: a SNAPSHOT of each directory, one `symlink_status` and at most one
-// `remove` per entry, the directory itself last. Nothing is ever retried, so it
-// ENDS whatever another deleter does, and an attempt that failed on an entry
-// which is now GONE was beaten to the outcome wanted, so only an entry STILL THERE
-// counts as a failure. ✔MEASURED, four of these released onto one tree for 400
-// rounds with each standard library: none stuck, no tree left behind.
+// Remove `target` — one file, or a whole tree — through the substrate's removal:
+// a SNAPSHOT of each directory, at most one `remove` per entry, the directory
+// itself last, a link removed as itself. Nothing is ever retried, so it ENDS
+// whatever another deleter does, and an attempt that failed on an entry which is
+// now GONE was beaten to the outcome wanted, so only an entry STILL THERE counts
+// as a failure. ✔MEASURED (this runner's own copy, before the substrate took it
+// over): four of these released onto one tree for 400 rounds with each standard
+// library: none stuck, no tree left behind.
 [[nodiscard]] ScratchRemoval removeScratchTree(fs::path const& target) {
+    auto const   removal = dss::core::removeTree(target);
     ScratchRemoval out;
-    std::error_code tec;
-    auto const kind = fs::symlink_status(target, tec).type();
-    if (kind == fs::file_type::not_found) return out;
-    if (tec) {
-        noteScratchFailure(out, target, tec);
-        return out;
-    }
-    if (kind != fs::file_type::directory) {
-        std::error_code rec;
-        fs::remove(target, rec);
-        if (rec) noteScratchFailure(out, target, rec);
-        return out;
-    }
-    // An explicit work stack rather than recursion, so a deep tree costs heap
-    // rather than stack. A directory is LISTED once, and removed once every
-    // entry of that listing has been handled.
-    struct Pending {
-        fs::path dir;
-        bool     listed = false;
-    };
-    std::vector<Pending> work;
-    work.push_back({target, false});
-    while (!work.empty()) {
-        if (work.back().listed) {
-            fs::path const dir = std::move(work.back().dir);
-            work.pop_back();
-            std::error_code ec;
-            fs::remove(dir, ec);
-            if (ec) noteScratchFailure(out, dir, ec);
-            continue;
-        }
-        work.back().listed = true;
-        fs::path const dir = work.back().dir;  // a COPY: `work` grows below
-        // The snapshot. Entries are acted on only once the listing is complete,
-        // so nothing is ever deleted under a live iterator.
-        std::vector<fs::path> entries;
-        std::error_code ec;
-        fs::directory_iterator it(dir, ec);
-        for (fs::directory_iterator const end; !ec && it != end;
-             it.increment(ec)) {
-            entries.push_back(it->path());
-        }
-        if (ec) noteScratchFailure(out, dir, ec);
-        for (auto& entry : entries) {
-            std::error_code sec;
-            auto const type = fs::symlink_status(entry, sec).type();
-            if (type == fs::file_type::not_found) continue;  // already gone
-            if (sec) {
-                noteScratchFailure(out, entry, sec);
-                continue;
-            }
-            // `symlink_status`, so a link is removed AS a link and never
-            // followed out of the scratch tree.
-            if (type == fs::file_type::directory) {
-                work.push_back({std::move(entry), false});
-                continue;
-            }
-            std::error_code rec;
-            fs::remove(entry, rec);
-            if (rec) noteScratchFailure(out, entry, rec);
-        }
+    out.failures = removal.failures;
+    if (removal.failures != 0) {
+        out.first = "'" + removal.firstPath.generic_string() + "': "
+                  + removal.firstError.message();
     }
     return out;
 }
@@ -6843,12 +6809,11 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
 
     auto const filesUnder = [](fs::path const& root) {
         std::size_t n = 0;
-        std::error_code ec;
-        for (fs::recursive_directory_iterator it(root, ec), end;
-             !ec && it != end; it.increment(ec)) {
-            std::error_code fec;
-            if (it->is_regular_file(fec)) ++n;
-        }
+        // The substrate's walk: it never descends a link on any build.
+        static_cast<void>(dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
+            if (entry.reaches == dss::core::EntryKind::File) ++n;
+            return dss::core::WalkStep::Continue;
+        }));
         return n;
     };
     auto const claimsLeftIn = [](fs::path const& base) {

@@ -76,7 +76,11 @@ THE CONTRACT, and every clause is a way the index can lie:
  12. every PROGRAM (a file with a `__main__` guard) that loads another program -- by path,
      through `sys.path`, or by importing a module beside it -- switches bytecode writing off
      at MODULE level before its first load: a `__pycache__` written beside another action
-     moves the inputs of a `requireInputsUnmoved` action (see `bytecode_refusal`).
+     moves the inputs of a `requireInputsUnmoved` action (see `bytecode_refusal`);
+ 13. every verb a program offers is started by a step, or recorded and verified (`verb_census`);
+ 14. every argument that names a path a program WRITES -- its dest one of WRITTEN_DESTS -- takes
+     owning-tree's `written_path_arg(<its own flag>)` as its argparse `type=`: argparse alone takes
+     `--out=--help` as that path (`written_path_census`).
 
 ⚠ Clauses 5-8 exist because an INDEPENDENT AUDIT got the first draft of this
 guard to report GREEN over each of them, and clause 9's arm was passing for the
@@ -185,8 +189,11 @@ FORBIDDEN_EXTS = (".sh", ".ps1")
 ACTION_EXTS = (".yml", ".yaml")
 
 # The two directory names DssHarness gives every action for a run's working space and
-# kept output, at whatever depth it is grouped. Both are gitignored run output, never
-# tracked (`dssharness help runners`), so nothing in one is a program of this repository.
+# kept output, at whatever depth it is grouped (`dssharness help runners`). Both are
+# gitignored, so a walk leaves them out as it leaves out everything git ignores -- the
+# tree's own `.gitignore`, asked through `owning-tree`'s `TreeIgnores`, the one statement
+# every walker asks. The names stay here for the LAYOUT rule alone: a GROUP directory so
+# named is refused, as the tool refuses the name anywhere along an action path.
 RUN_DIRS = ("build", "artifacts")
 
 # What a GROUP directory may hold directly besides directories: this index's own
@@ -294,12 +301,25 @@ def primary_script(action_dir, name):
     return cand if os.path.isfile(cand) else None
 
 
-def forbidden_programs(base):
-    """Every `.sh`/`.ps1` under the actions root `base`, actions-relative, sorted -- the
-    tool's run directories and bytecode caches excepted (ignored output, never the tree's)."""
+def walk_tree(ignores, top):
+    """`ignores.walk(top)` (`owning-tree`'s `TreeIgnores`: what git ignores in the tree, and
+    `.git`, left out), directories in sorted order; a directory the walk cannot list, or a path
+    the reader cannot answer as git does, collapses -- never a walk that read less than it says."""
+    ot = _owning_tree()
+    try:
+        for dirpath, dirs, files in ignores.walk(top):
+            dirs.sort()
+            yield dirpath, dirs, files
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
+
+
+def forbidden_programs(base, ignores):
+    """Every `.sh`/`.ps1` under the actions root `base`, actions-relative, sorted -- less what
+    the tree leaves out (the tool's run directories and bytecode caches among it: ignored
+    output, never the tree's)."""
     found = []
-    for dirpath, dirs, files in os.walk(base):
-        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and d.lower() not in RUN_DIRS)
+    for dirpath, _dirs, files in walk_tree(ignores, base):
         for f in sorted(files):
             if os.path.splitext(f)[1].lower() in FORBIDDEN_EXTS:
                 found.append(_rel(base, os.path.join(dirpath, f)))
@@ -637,18 +657,19 @@ def _rel(root, path):
     return os.path.relpath(path, root).replace(os.sep, "/")
 
 
-def _scan_action(root, base, directory, afile):
+def _scan_action(root, base, directory, afile, ignores=None):
     """One action directory -> an Entry, refusing every layout it cannot index."""
     name = os.path.basename(directory)
     rel = _rel(base, directory)
+    ignores = ignores if ignores is not None else _owning_tree().TreeIgnores(root)
 
     # NOTHING BURIED, NOTHING NESTED. A program one level deeper than its action file is
     # as invisible as a loose one; an action inside an action has two owners, which the
     # tool refuses too (`ActionPath.RefuseNesting`). Assets in subdirectories stay fine
-    # -- only programs and action files are refused -- and the tool's own run
-    # directories are skipped: they are ignored output at any depth.
-    for sub_dir, dirs, files in os.walk(directory):
-        dirs[:] = [d for d in dirs if d != "__pycache__" and d.lower() not in RUN_DIRS]
+    # -- only programs and action files are refused -- and what the tree leaves out is not
+    # walked: the tool's own run directories and bytecode caches are ignored output at any
+    # depth.
+    for sub_dir, dirs, files in walk_tree(ignores, directory):
         if os.path.abspath(sub_dir) == os.path.abspath(directory):
             continue
         inner = action_file(sub_dir)
@@ -710,7 +731,12 @@ def scan(root):
     # NO SHELL AND NO POWERSHELL, anywhere under the actions root (operator ruling
     # 2026-09-21): an action's entry point is its `.yml`, and what the `.yml` starts is
     # Python. A `.sh` or `.ps1` is specific to one OS, which is the reason it was ruled out.
-    shells = forbidden_programs(base)
+    ot = _owning_tree()
+    try:
+        ignores = ot.TreeIgnores(root)
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
+    shells = forbidden_programs(base, ignores)
     if shells:
         raise Collapse(
             "%d shell/PowerShell program(s) sit under %s: %s. An action ships no .sh and no "
@@ -742,7 +768,7 @@ def scan(root):
         found = 0
         for n in sorted(os.listdir(directory)):
             sub = os.path.join(directory, n)
-            if not os.path.isdir(sub) or n == "__pycache__" or bytecode_husk(sub):
+            if not os.path.isdir(sub):
                 continue
             if n.lower() in RUN_DIRS:
                 raise Collapse(
@@ -750,9 +776,15 @@ def scan(root):
                     "action already owns one of that name for a run's output, which is "
                     "gitignored, so DssHarness refuses the name anywhere along an action "
                     "path." % (rel, n, n))
+            try:
+                left_out = ignores.leaves_out(ignores.rel(sub), True)
+            except ot.Refusal as exc:
+                raise Collapse(str(exc))
+            if left_out or bytecode_husk(sub):
+                continue
             afile = action_file(sub)
             if afile is not None:
-                entries.append(_scan_action(root, base, sub, afile))
+                entries.append(_scan_action(root, base, sub, afile, ignores))
                 found += 1
                 continue
             if primary_script(sub, n) is not None:
@@ -1603,6 +1635,92 @@ def _remedies(parsed, runners, legs, writers):
     return problems
 
 
+# ── CLAUSE 14: every argument that names a path a program WRITES takes owning-tree's type ────────────────────────
+# A path to write never begins with `-` (owning-tree's `written_path` states why). A program that reads its command
+# line with argparse says so by `type=<owning-tree>.written_path_arg("<its own flag>")` on each such argument:
+# argparse alone takes `--out=--help` and `--out -` verbatim. WHICH argument names a path to write is said by its
+# DEST, one of WRITTEN_DESTS -- the repository's convention, a fact of the program rather than a guess at its help
+# text. Both directions are refused (such a dest without the type, the type on another dest), so is a type naming
+# another flag than its argument's, and the vocabulary is checked against the arguments: a word no argument uses
+# is a hand copy compared with nothing. An argument that takes no value (`store_true` and its kin) names no path.
+WRITTEN_DESTS = ("cfg_dest", "dest", "dest_dir", "json", "json_out", "log", "md_out", "oracle_dir", "oracle_log",
+                 "out", "output", "scratch", "workdir")
+WRITTEN_TYPE = "written_path_arg"
+_VALUELESS_ACTIONS = ("store_true", "store_false", "store_const", "append_const", "count", "help", "version")
+
+
+def _argument_dest(call):
+    """argparse's dest for one `add_argument` call -- its `dest=`, else its first long option, else its first name,
+    a `-` read as `_` -- and the name it is given first; (None, None) for a call that names nothing readable."""
+    names = [a.value for a in call.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+    if not names:
+        return None, None
+    dest = next((k.value.value for k in call.keywords
+                 if k.arg == "dest" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)), None)
+    if dest is None:
+        longs = [n for n in names if n.startswith("--")]
+        dest = (longs[0] if longs else names[0]).lstrip("-").replace("-", "_")
+    return dest, names[0]
+
+
+def _typed_flag(call):
+    """The flag a `type=<...>written_path_arg(<flag>)` hands, "" when it hands none this reader can read, None when
+    the argument takes no such type."""
+    for k in call.keywords:
+        if k.arg == "type" and isinstance(k.value, ast.Call):
+            f = k.value.func
+            name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+            if name.lstrip("_") == WRITTEN_TYPE:
+                a = k.value.args
+                return a[0].value if a and isinstance(a[0], ast.Constant) and isinstance(a[0].value, str) else ""
+    return None
+
+
+def written_path_census(root, entries):
+    """Clause 14 -> (problems, how many arguments take the type)."""
+    base = os.path.join(root, ACTIONS_REL)
+    problems, used, typed = [], set(), 0
+    for e in entries:
+        adir = os.path.join(base, *e.rel.split("/"))
+        for sib in e.siblings:
+            prog = "%s/%s" % (e.rel, sib)
+            try:
+                tree = ast.parse(io.open(os.path.join(adir, sib), "r", encoding="utf-8").read(), filename=sib)
+            except SyntaxError as exc:
+                raise Collapse("%s cannot be parsed, so its arguments cannot be read: %s" % (prog, exc))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "add_argument"):
+                    continue
+                if any(k.arg == "action" and isinstance(k.value, ast.Constant) and k.value.value in _VALUELESS_ACTIONS
+                       for k in node.keywords):
+                    continue
+                dest, name = _argument_dest(node)
+                if dest is None:
+                    continue
+                flag = _typed_flag(node)
+                where = "%s line %d: the argument %s" % (prog, node.lineno, name)
+                if dest in WRITTEN_DESTS and flag is None:
+                    problems.append("%s names a path to write (its dest `%s`) and takes no `type=...%s(\"%s\")` -- "
+                                    "argparse alone takes `%s=--help` as that path" % (where, dest, WRITTEN_TYPE,
+                                                                                       name, name))
+                elif dest in WRITTEN_DESTS:
+                    used.add(dest)
+                    typed += 1
+                    if flag != name:
+                        problems.append("%s takes `%s(\"%s\")`, which names another flag than its own: the refusal "
+                                        "would name the wrong option" % (where, WRITTEN_TYPE, flag))
+                elif flag is not None:
+                    problems.append("%s takes `%s`, but its dest `%s` is no word of WRITTEN_DESTS: a path to write is "
+                                    "named by one, so either the dest is renamed or the type does not belong"
+                                    % (where, WRITTEN_TYPE, dest))
+    for w in WRITTEN_DESTS:
+        if w not in used:
+            problems.append("WRITTEN_DESTS holds `%s`, which no argument of any program takes with `%s` -- a word of "
+                            "the convention that names nothing" % (w, WRITTEN_TYPE))
+    return problems, typed
+
+
 def render(entries):
     """The generated table body. Identical in both documents by construction."""
     out = [
@@ -1636,7 +1754,7 @@ def splice(doc_text, body, doc_rel):
     return doc_text[:b] + BEGIN + "\n" + body + "\n" + doc_text[t:]
 
 
-def run(root, write, census=True):
+def run(root, write, census=True, written=None):
     # ★★★ THE GUARD'S OWN CONFIGURATION IS PART OF WHAT IT CHECKS. Both documents
     # are named constants, and dropping either from DOC_RELS would stop verifying
     # it while every message still claimed both were machine-checked. ✔MEASURED
@@ -1713,15 +1831,29 @@ def run(root, write, census=True):
         print("")
         print("  Work an action owns but a plain run must not do is a MANUAL step of that action (the")
         print("  operator's order of 2026-09-24): never a program started by hand.")
-    if problems or unreached or dangling or verb_problems:
+    # ── CLAUSE 14: a path to write is refused when it begins with `-`, by its argument's type ──
+    # (the same `census` gate by default: a self-test arm of another clause does not read every program again)
+    written_problems, typed = written_path_census(root, entries) if (census if written is None else written) \
+        else ([], None)
+    if written_problems:
+        print("check-scripts-index: FAIL -- %d path-to-write argument problem(s):" % len(written_problems))
+        for p in written_problems:
+            print("    %s" % p)
+        print("")
+        print("  A path a program writes never begins with `-`; owning-tree's `written_path` says why, and")
+        print("  `written_path_arg(<flag>)` is argparse's `type=` that refuses one, naming the flag.")
+    if problems or unreached or dangling or verb_problems or written_problems:
         return EXIT_DISAGREE
 
     census_said = ("verb census: %d program(s), %d token(s) -- %d reached by a step or a ctest entry, %d recorded "
                    "and verified, %d red" % (counts["programs"], counts["tokens"], counts["reached"],
                                               counts["recorded"], counts["red"])) if counts else \
         "verb census: not run in this self-test arm"
+    written_said = ("%d path-to-write argument(s), each with its type" % typed) if typed is not None else \
+        "path-to-write arguments: not read in this self-test arm"
     print("check-scripts-index: OK (%d actions, both indexes agree with the tree and with "
-          "each action's own PURPOSE line, and every action has a runner; %s)" % (len(entries), census_said))
+          "each action's own PURPOSE line, and every action has a runner; %s; %s)"
+          % (len(entries), census_said, written_said))
     return EXIT_OK
 
 
@@ -1735,7 +1867,7 @@ def run(root, write, census=True):
 _RAN = None   # set by selftest() so every arm is counted where it is judged
 
 
-def _arm(label, root, expect, says=None, not_says=None, census=False):
+def _arm(label, root, expect, says=None, not_says=None, census=False, written=False):
     """Run the guard against a mutated mirror and judge the WHOLE verdict.
 
     ★★★ `says` / `not_says` are the load-bearing halves, not decoration.
@@ -1750,7 +1882,7 @@ def _arm(label, root, expect, says=None, not_says=None, census=False):
     detail = ""
     try:
         with contextlib.redirect_stdout(buf):
-            rc = run(root, write=False, census=census)
+            rc = run(root, write=False, census=census, written=written)
     except Collapse as exc:
         rc = EXIT_COLLAPSE
         detail = str(exc)
@@ -1781,18 +1913,27 @@ def _arm(label, root, expect, says=None, not_says=None, census=False):
 
 
 def _mirror(root, dst):
-    """The REAL actions tree, config and both index documents, copied -- without run
-    output and bytecode, which are not the repository's -- and what the verb census reads
-    beside them: the root CMakeLists.txt (a ctest COMMAND reaches a verb) and each test
-    source a `test-source` record names."""
-    shutil.copytree(os.path.join(root, ACTIONS_REL), os.path.join(dst, ACTIONS_REL),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", *RUN_DIRS))
+    """The REAL actions tree, config and both index documents, copied -- less what the live
+    tree leaves out (run output and bytecode among it, which are not the repository's) -- with
+    the tree's own `.gitignore`, so a walk of the mirror leaves out what a walk of the tree does,
+    and what the verb census reads beside them: the root CMakeLists.txt (a ctest COMMAND reaches
+    a verb) and each test source a `test-source` record names."""
+    live = _owning_tree().TreeIgnores(root)
+
+    def left_out(dirpath, names):
+        out = []
+        for n in names:
+            full = os.path.join(dirpath, n)
+            if live.leaves_out(live.rel(full), os.path.isdir(full) and not os.path.islink(full)):
+                out.append(n)
+        return out
+    shutil.copytree(os.path.join(root, ACTIONS_REL), os.path.join(dst, ACTIONS_REL), ignore=left_out)
     try:
         sources = [str(r.get("by")) for r in json.loads(_read(os.path.join(root, VERBS_REL))).get("verbs", [])
                    if r.get("category") == "test-source" and r.get("by")]
     except (OSError, ValueError):
         sources = []
-    for rel in (CONFIG_REL, CMAKE_REL) + DOC_RELS + tuple(s.replace("/", os.sep) for s in sources):
+    for rel in (".gitignore", CONFIG_REL, CMAKE_REL) + DOC_RELS + tuple(s.replace("/", os.sep) for s in sources):
         d = os.path.join(dst, rel)
         if os.path.isfile(d):
             continue
@@ -1917,8 +2058,9 @@ def _newcomer(tmp, rel, runner):
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
 # The 2c arm retired (M6); clause 13's fixture arms, 30, then 32 (22w2 and 22w3, the widened remedy rule), then 35
-# (22v1 to 22v3, a write into its own kept output); and the one arm numbered 23, CENSUS-WIRED.
-EXPECTED_ARMS = 55 - 1 + 35 + 1
+# (22v1 to 22v3, a write into its own kept output); and the one arm numbered 23, CENSUS-WIRED; then clause 14's six
+# (24 to 24f, every argument that names a path to write takes owning-tree's type).
+EXPECTED_ARMS = 55 - 1 + 35 + 1 + 6
 
 
 # ── CLAUSE 13's ARMS, over a SYNTHESIZED fixture ───────────────────────────────────────────────────────────────
@@ -2423,6 +2565,34 @@ def selftest(root):
         ok &= _arm("23 CENSUS-WIRED", tmp, EXIT_DISAGREE, census=True,
                    says=("verb census problem", "--zz-selftest-unreached is started by nothing"))
         _write(prog, pristine_prog)
+
+        # ── clause 14: a path-to-write argument takes owning-tree's type (EXIT_DISAGREE) ─────────────────────────
+        # ★ Each arm sabotages a REAL argument of the mirror; the green arms around them are the control: every
+        # other path-to-write argument of this tree takes its type.
+        rlp = os.path.join(acts, "read-leg-path", "read-leg-path.py")
+        rlp_text = _read(rlp)
+        typed_out = 'ap.add_argument("--out", required=True, type=_written_path_arg("--out"))'
+        _write(rlp, _sabotage(rlp_text, typed_out, 'ap.add_argument("--out", required=True)'))
+        ok &= _arm("24 WRITTEN-PATH-WITHOUT-ITS-TYPE", tmp, EXIT_DISAGREE, written=True,
+                   says=("path-to-write argument problem", "read-leg-path/read-leg-path.py line", "takes no `type="))
+        _write(rlp, _sabotage(rlp_text, typed_out, typed_out.replace('_arg("--out")', '_arg("--path")')))
+        ok &= _arm("24b WRITTEN-PATH-TYPE-NAMES-ANOTHER-FLAG", tmp, EXIT_DISAGREE, written=True,
+                   says="which names another flag than its own")
+        _write(rlp, _sabotage(rlp_text, typed_out, typed_out.replace('("--out", required', '("--report", required')))
+        ok &= _arm("24c WRITTEN-PATH-TYPE-ON-ANOTHER-DEST", tmp, EXIT_DISAGREE, written=True,
+                   says="its dest `report` is no word of WRITTEN_DESTS")
+        _write(rlp, _sabotage(rlp_text, typed_out, typed_out + '\n    ap.add_argument("--json", action="store_true")'))
+        ok &= _arm("24d A-FLAG-WITH-NO-VALUE-NAMES-NO-PATH", tmp, EXIT_OK, written=True,
+                   not_says="path-to-write argument problem")
+        _write(rlp, rlp_text)
+        held = WRITTEN_DESTS
+        globals()["WRITTEN_DESTS"] = held + ("zz_selftest_dest",)
+        try:
+            ok &= _arm("24e A-WORD-NO-ARGUMENT-TAKES", tmp, EXIT_DISAGREE, written=True,
+                       says="WRITTEN_DESTS holds `zz_selftest_dest`, which no argument")
+        finally:
+            globals()["WRITTEN_DESTS"] = held
+        ok &= _arm("24f RESTORED", tmp, EXIT_OK, written=True)
 
         ok &= _arm("19 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:

@@ -1,0 +1,1 @@
+        if (existsOnce(cache, hit)) hits.push_back(std::move(hit));

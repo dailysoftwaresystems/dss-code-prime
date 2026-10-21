@@ -71,9 +71,10 @@ struct CaptureSlot {
 
     ~CaptureSlot() {
         if (dir.empty()) return;
-        std::error_code ec;
-        fs::remove_all(dir, ec);   // best effort; a leaked temp dir is not a
-                                   // build failure and has no user impact
+        // best effort; a leaked temp dir is not a build failure and has no user
+        // impact. The substrate's removal, never `remove_all`: it takes a link as
+        // itself on every build (the substrate's header has the measurement).
+        static_cast<void>(core::removeTree(dir));
     }
     CaptureSlot()                              = default;
     CaptureSlot(CaptureSlot const&)            = delete;

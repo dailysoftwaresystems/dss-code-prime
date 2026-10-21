@@ -1,0 +1,1 @@
+    return "selftest" in (entry.get("name") or "")

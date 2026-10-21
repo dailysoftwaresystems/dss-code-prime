@@ -1,0 +1,2 @@
+        elif kind == SEPARATOR:
+            pass   # every separator is taken for a marker

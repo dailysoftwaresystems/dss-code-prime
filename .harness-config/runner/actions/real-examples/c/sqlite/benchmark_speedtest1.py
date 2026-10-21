@@ -1267,9 +1267,9 @@ def verify_host_paths(manifest):
 def hop_argv(posix, this_posix, sqlite_posix, out_posix, facts):
     """The WSL hop: THIS program's derive half, argv only (`wsl.exe -d <the WSL legs' distribution> -e`,
     never a login shell, never `wsl.exe --`, never a shell string)."""
-    return posix.argv(["python3", this_posix, "--derive-only", "--path-style", "windows",
-                       "--sqlite-dir", sqlite_posix, "--out", out_posix, "--target", facts.spec,
-                       "--recipe-transform", facts.transform, "--stack-reserve", str(facts.reserve)])
+    return posix.python_argv(this_posix, "--derive-only", "--path-style", "windows",
+                             "--sqlite-dir", sqlite_posix, "--out", out_posix, "--target", facts.spec,
+                             "--recipe-transform", facts.transform, "--stack-reserve", str(facts.reserve))
 
 
 def stream(argv):
@@ -2172,6 +2172,10 @@ class _FakePosix:
     @staticmethod
     def argv(args):
         return ["wsl.exe", "-e"] + [str(a) for a in args]
+
+    def python_argv(self, script, *args):
+        """As sqlite_common.PosixSide's on a Windows host: the distribution's own `python3`."""
+        return self.argv(["python3", script] + [str(a) for a in args])
 
 
 _PS03 = ("ps03 a usable WSL answers (this host can derive): `wsl.exe -d <the WSL legs' distribution> -e echo` "
@@ -3204,7 +3208,7 @@ def _st_cli(A, fx):
             # inside the arm: a WSL that answers `echo` yet cannot translate THIS path fails n75 by name,
             # never the whole section
             side = C.PosixSide("windows")
-            r = C.capture(side.argv(["python3", side.to_posix(THIS), "--help"]), timeout=300)
+            r = C.capture(side.python_argv(side.to_posix(THIS), "--help"), timeout=300)
             return r.rc == 0 and "--path-style" in r.out, "rc=%d %s" % (r.rc, C.first_lines(r.err or r.out, 4))
         A.arm("n75 the derive half LOADS inside WSL: THIS file and its siblings import under WSL's "
               "python3 (`--help` through the carriage exits 0)", loads)

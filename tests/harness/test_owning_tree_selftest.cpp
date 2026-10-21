@@ -129,23 +129,21 @@ namespace {
       "J3 load_jsonc REFUSES a file that does not parse or cannot be read, naming it")                                 \
     X(J4ControlThisTreeSOwnConfigJsonParsesWithItsWorktreesAndLegs,                                                    \
       "J4 CONTROL: this tree's own config.json parses, with its worktrees and legs")                                   \
-    X(L1AWalkLeavesOutALegCopyAndAMutationWorkerTheToolKeepsInTheTreeBesideTheRealFiles,                               \
-      "L1 a walk leaves out a leg copy and a mutation worker the tool keeps in the tree, beside the real files")       \
-    X(L2ALaterRuleDecidesTheBlockSPlaceholdersAndTheReIncludedHarnessFilesStayItsRunRecordsAnd,                        \
-      "L2 a later rule decides: the block's placeholders and the re-included harness files stay, its run records and its lock go") \
-    X(L3ARuleWithNoSlashLeavesOutThatNameAtAnyDepthASessionSScratchIncluded,                                           \
-      "L3 a rule with no slash leaves out that name at any depth, a session's scratch included")                       \
+    X(J5TheInterpreterRunningThisSelfTestMeetsThePythonFloorTheTreeSConfigStates,                                      \
+      "J5 the interpreter running this self-test meets the Python floor the tree's config states")                     \
+    X(L1TheCopiesTheToolKeepsInATreeASessionSScratchAndABuildAreLeftOutTheRealFilesAndEachPlac,                        \
+      "L1 the copies the tool keeps in a tree, a session's scratch and a build are left out; the real files and each placeholder stay") \
+    X(L2ALaterRuleDecidesAndANegationReIncludes, "L2 a later rule decides, and a negation re-includes")                \
+    X(L3ARuleWithNoSlashLeavesOutThatNameAtAnyDepth, "L3 a rule with no slash leaves out that name at any depth")      \
     X(L4ARuleWithASlashIsAnchoredToTheTreeSRootThatDirectoryGoesANamesakeElsewhereStays,                               \
       "L4 a rule with a slash is anchored to the tree's root: that directory goes, a namesake elsewhere stays")        \
     X(L5ARuleEndingInASlashMatchesADirectoryOnlyAFileOfThatNameStays,                                                  \
       "L5 a rule ending in a slash matches a directory only: a FILE of that name stays")                               \
     X(L6ADoubleStarSegmentIsAnyNumberOfDirectories, "L6 a double-star segment is any number of directories")           \
-    X(L7AFileRuleLeavesOutFilesAndALaterNegationKeepsOne,                                                              \
-      "L7 a file rule leaves out files and a later negation keeps one")                                                \
-    X(L8AStarAQuestionMarkAndAClassReadAsGitReadsThem,                                                                 \
-      "L8 a star, a question mark and a class read as git reads them")                                                 \
-    X(L9NothingUnderADirectoryLeftOutIsReIncludedAskedOrWalked,                                                        \
-      "L9 nothing under a directory left out is re-included, asked or walked")                                         \
+    X(L7ARuleEndingInASlashNeverMatchesASymbolicLink, "L7 a rule ending in a slash never matches a symbolic link")     \
+    X(L8AStarAQuestionMarkAndAClassMatchTheNameSBytesAsGitSWildmatchDoes,                                              \
+      "L8 a star, a question mark and a class match the name's bytes, as git's wildmatch does")                        \
+    X(L9NothingUnderADirectoryLeftOutIsReIncluded, "L9 nothing under a directory left out is re-included")             \
     X(L10GitSOwnDirectoryAndAWorktreeSGitFileAreLeftOut,                                                               \
       "L10 git's own directory and a worktree's git file are left out")                                                \
     X(L11ARuleHoldingABackslashIsRefusedNamingItsLine, "L11 a rule holding a backslash is refused, naming its line")   \
@@ -159,19 +157,43 @@ namespace {
       "L15 a directory kept is walked whole, whatever the rules say inside it")                                        \
     X(L16AWalkWhoseTopIsLeftOutIsRefusedAndSoIsAPathOutsideTheTree,                                                    \
       "L16 a walk whose top is left out is refused, and so is a path outside the tree")                                \
-    X(L17NamesCompareAsWrittenCaseAndAll, "L17 names compare as written, case and all")                                \
+    X(L17APathARuleMatchesUnderOneSettingOfCoreIgnorecaseAndNotTheOtherIsRefusedNamingIt,                              \
+      "L17 a path a rule matches under one setting of core.ignorecase and not the other is refused, naming it")        \
     X(L18LiveThisTreeSOwnGitignoreLeavesOutEveryDirectoryTheToolKeepsInATreeAndKeepsEachPlaceh,                        \
       "L18 LIVE: this tree's own .gitignore leaves out every directory the tool keeps in a tree and keeps each placeholder") \
     X(L19TheWalkAndTheQuestionAboutOnePathGiveOneAnswerOnEveryPath,                                                    \
       "L19 the walk and the question about one path give one answer on every path")                                    \
     X(L20LiveNoFileGitTracksInThisTreeIsLeftOutOfAWalkARuleOfItsGitignoreCannotSilenceATracked,                        \
       "L20 LIVE: no file git tracks in this tree is left out of a walk -- a rule of its .gitignore cannot silence a tracked file") \
+    X(L21ADirectoryTheWalkCannotListIsRefusedByNameNeverSkipped,                                                       \
+      "L21 a directory the walk cannot list is refused by name, never skipped")                                        \
+    X(L22TheTwelvePosixClassesReadAsGitReadsThem, "L22 the twelve POSIX classes read as git reads them")               \
+    X(L23ADashABracketFirstARangeAndALoneInsideAClassReadAsGitReadsThem,                                               \
+      "L23 a dash, a bracket first, a range and a lone [: inside a class read as git reads them")                      \
+    X(L24APosixClassGitDoesNotNameIsRefusedNamingItsLine,                                                              \
+      "L24 a POSIX class git does not name is refused, naming its line")                                               \
+    X(L25ANameHoldingABackslashIsRefusedNamingIt, "L25 a name holding a backslash is refused, naming it")              \
+    X(L26AByteOrderMarkACrLfEndingAndTrailingSpacesAreNoPartOfARuleATrailingTabIs,                                     \
+      "L26 a byte order mark, a CR LF ending and trailing spaces are no part of a rule; a trailing tab is")            \
+    X(L27ANameThatIsGitSOwnOnlyWhenCaseIsFoldedIsRefused,                                                              \
+      "L27 a name that is git's own only when case is folded is refused")                                              \
+    X(L28TheWalkNeverDescendsASymbolicLinkALinkToADirectoryIsJudgedAndYieldedAsAFile,                                  \
+      "L28 the walk never descends a symbolic link: a link to a directory is judged, and yielded, as a file")          \
+    X(L29AGitignoreThatIsADirectoryIsRefusedWhatAWalkLeavesOutIsUnknown,                                               \
+      "L29 a .gitignore that is a directory is refused: what a walk leaves out is unknown")                            \
+    X(L30LiveEveryScenarioSPathsAreAnsweredAsGitCheckIgnoreAnswersThemUnderEitherSettingOfCore,                        \
+      "L30 LIVE: every scenario's paths are answered as git check-ignore answers them, under either setting of core.ignorecase") \
+    X(L31EveryScenarioOfTheCaseTableIsAskedByOneArm, "L31 every scenario of the case table is asked by one arm")       \
     X(D1APathToWriteThatBeginsWithIsAnOptionTakenForAValueRefusedNamingTheFlag,                                        \
       "D1 a path to write that begins with `-` is an option taken for a value: refused, naming the flag")              \
     X(D2APathToWriteThatIsEmptyNamesNoPlaceRefusedNamingTheFlag,                                                       \
       "D2 a path to write that is empty names no place: refused, naming the flag")                                     \
     X(D3APathThatHoldsADashOrSpellsALeadingOneAsXIsKeptAsGivenTheControl,                                              \
       "D3 a path that holds a dash, or spells a leading one as `./-x`, is kept as given (the control)")                \
+    X(D4WrittenPathArgArgparseRefusesAPathToWriteThatBeginsWithInEitherSpellingAndAnEmptyOneBy,                        \
+      "D4 written_path_arg: argparse refuses a path to write that begins with `-`, in either spelling, and an empty one, by its usage error naming the flag") \
+    X(D5WrittenPathArgAPathHoldingADashOrSpellingALeadingOneAsXPassesTheTypeAsGivenTheControl,                         \
+      "D5 written_path_arg: a path holding a dash, or spelling a leading one as `./-x`, passes the type as given (the control)") \
     X(X2TheSandboxFenceRefusesABoxInsideTheTreeAndInsideARepositoryAndAcceptsOneOutsideBothThe,                        \
       "X2 the sandbox fence refuses a box inside the tree and inside a repository, and accepts one outside both (the control)") \
     X(X1TheSelfTestSTempTreesWereRemoved, "X1 the self-test's temp trees were removed")

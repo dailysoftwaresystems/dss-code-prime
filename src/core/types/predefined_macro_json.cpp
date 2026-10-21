@@ -114,18 +114,18 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
     std::map<std::string, Seen> firstByName;
     std::vector<std::string>    out;
 
-    std::error_code ec;
+    // The substrate's walk: it never descends a link on any build (libstdc++ on
+    // Windows cannot tell one from what it reaches -- the substrate's header). A
+    // directory it cannot list ends the sweep, as the iterator's error did.
     std::vector<fs::path> files;
-    for (fs::recursive_directory_iterator
-             it{fs::path{configRootDir},
-                fs::directory_options::skip_permission_denied, ec},
-         end;
-         it != end; it.increment(ec)) {
-        if (ec) break;
-        if (!it->is_regular_file(ec)) continue;
-        if (it->path().extension() != ".json") continue;
-        files.push_back(it->path());
-    }
+    static_cast<void>(core::walkTree(
+        fs::path{configRootDir},
+        [&](core::TreeEntry const& entry) {
+            if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+                files.push_back(entry.path);
+            return core::WalkStep::Continue;
+        },
+        core::TreeWalkOptions{.skipPermissionDenied = true}));
     // Deterministic on every host: a directory iteration order is the
     // filesystem's, and "which document is FIRST" decides which one the message
     // names as the reference. A host-dependent reference makes the same defect

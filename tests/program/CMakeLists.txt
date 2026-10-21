@@ -227,6 +227,17 @@ dss_add_test(NAME build/build_stamp_identity
 # object depended on either.
 dss_use_script_selftest(dss_build_build_stamp_identity build_stamp)
 
+# THE BUILD'S PYTHON CHOICE, ONE CASE PER ARM -- the ctest entry `build/python_interpreter`.
+# `cmake/DssPython.cmake` chooses the one interpreter every ctest entry that runs a Python program starts
+# (the first on the leg's PATH at or above the floor config.json states, never an App Execution Alias),
+# and run in its self-test mode it configures fixture projects against itself and proves that choice --
+# among them on a cache that ALREADY names an alias, the cache a build configured before the rule holds.
+# This binary RUNS that self-test and reads each arm into a case. The opt-in gives it the header, declares
+# the module and config.json as inputs of its object, and gives the entry the `self-test` label.
+dss_add_test(NAME build/python_interpreter
+             SOURCES test_python_interpreter.cpp)
+dss_use_script_selftest(dss_build_python_interpreter python_interpreter)
+
 # It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
 # rather than growing a second copy of host-compiler discovery, shell quoting
 # and output capture — the same reason tests/conformance adds this path.

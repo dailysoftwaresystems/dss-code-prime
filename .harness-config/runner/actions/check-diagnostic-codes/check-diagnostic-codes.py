@@ -697,7 +697,7 @@ def _cross_branch_git_arm():
         with open(os.path.join(root, *HEADER_REL.split("/")), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(_enum(*lines))
 
-    def onerror(func, path, _exc):
+    def onexc(func, path, _exc):
         os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
         func(path)
     try:
@@ -744,7 +744,7 @@ def _cross_branch_git_arm():
     except (OSError, RuntimeError) as exc:
         return False, "the synthetic repository could not be built: %s" % exc
     finally:
-        shutil.rmtree(tmp, onerror=onerror)
+        shutil.rmtree(tmp, onexc=onexc)
 
 
 def self_test():

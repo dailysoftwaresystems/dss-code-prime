@@ -1,0 +1,1 @@
+    if (core::reachedKind(destination, ec) != core::EntryKind::Absent && !ec) return {};  // the temp is discarded

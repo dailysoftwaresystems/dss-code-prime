@@ -313,14 +313,14 @@ def preflight_sweep(run, leg, directory, why, kernel_entry, launch_directory):
 
 
 def _rmtree(path):
-    def onerror(func, p, _exc):
+    def onexc(func, p, _exc):
         try:
             os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
             func(p)
         except OSError:
             raise
     if os.path.lexists(path):
-        shutil.rmtree(path, onerror=onerror)
+        shutil.rmtree(path, onexc=onexc)
 
 
 def stage_acquired(leg, directory):
@@ -609,15 +609,15 @@ def coherence_gate(run, label, require_cli):
     if run.posix.needs_wsl:
         dirs.append(_field(st, "src"))
     script = os.path.join(C.HERE, "sqlite_coherence.py")
-    argv = [run.posix.to_posix(script)] if run.posix.needs_wsl else [script]
     args = ["--checkout", run.sqlite_dir_posix, "--label", label]
     if require_cli:
         args.append("--require-cli")
     args += [run.posix.to_posix(d) for d in dirs]
+    argv = run.posix.python_argv(run.posix.to_posix(script), *args)
     if run.posix.needs_wsl:
-        r = C.capture(run.posix.argv(["python3"] + argv + args), merge=True)
+        r = C.capture(argv, merge=True)
     else:
-        r = C.capture([sys.executable] + argv + args, env_=C.child_env(python=True), merge=True)
+        r = C.capture(argv, env_=C.child_env(python=True), merge=True)
     for line in r.out.splitlines():
         if line.strip():
             run.log.info("   %s" % line.rstrip())

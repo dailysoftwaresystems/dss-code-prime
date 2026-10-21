@@ -361,14 +361,14 @@ Resolution resolveByPrecedence(std::string_view                             subd
 }
 
 bool probeExists(fs::path const& p, std::error_code& ec) {
-    return fs::exists(p, ec);
+    return core::reachedKind(p, ec) != core::EntryKind::Absent;
 }
 
 // `is_directory` rather than `exists` for the directory form, because that IS
 // the analogue: `exists` would accept a plain FILE named `shippedLibs` and hand
 // a caller a "directory" it cannot iterate.
 bool probeIsDirectory(fs::path const& p, std::error_code& ec) {
-    return fs::is_directory(p, ec);
+    return core::reachedKind(p, ec) == core::EntryKind::Directory;
 }
 
 // Render "here is every path I tried, in order" for a not-found diagnostic. An
@@ -405,7 +405,7 @@ std::optional<std::filesystem::path> runningExecutableDir() {
         // dir starts from the wrong place. (`/proc/self/exe` is already resolved;
         // this normalises the other two hosts to the same answer.) On failure keep
         // the unresolved path rather than losing the arm entirely.
-        fs::path const real = fs::weakly_canonical(*exe, ec);
+        fs::path const real = core::reachedPath(*exe, ec);
         fs::path const use  = ec ? *exe : real;
         fs::path        dir = use.parent_path();
         if (dir.empty()) return std::nullopt;
@@ -439,7 +439,7 @@ installedConfigRootFrom(std::filesystem::path const& executableDir) {
     // DIFFERENT config tree, chosen without a word.
     fs::path const root = core::normalizeKeepingRoot(
         executableDir / fs::path{std::string{installedConfigRelDir()}});
-    if (!fs::is_directory(root, ec)) return std::nullopt;
+    if (core::reachedKind(root, ec) != core::EntryKind::Directory) return std::nullopt;
     return root;
 }
 
@@ -680,9 +680,11 @@ shippedConfigDocuments(std::filesystem::path const& directory, std::string_view 
     for (fs::directory_iterator const end; it != end; it.increment(ec)) {
         if (ec) break;
         // A dedicated error code: `ec` carries the ITERATION's status, and a probe
-        // failure written into it would masquerade as a listing failure.
+        // failure written into it would masquerade as a listing failure. A document
+        // is an entry by what it REACHES (the substrate's answer, never the
+        // library's: libstdc++ on Windows calls a dangling link a regular file).
         std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        if (core::reachedKind(it->path(), typeEc) != core::EntryKind::File || typeEc) continue;
         std::string const leaf = it->path().filename().generic_string();
         // EXACT: the name ENDS with the suffix and something precedes it. A name that
         // merely CONTAINS it (`c.lang.json.orig`) is not a document of the kind, and

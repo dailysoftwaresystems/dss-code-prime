@@ -61,6 +61,7 @@ dssharness run check-scripts-index-write
 | **`anchors`** | `anchors.py` | the library the anchors family shares -- the registry row reader, its vocabulary and the one launcher of the door that writes rows, dssharness write-anchor and set-anchor. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`check-anchor-registry`** | `check-anchor-registry.py` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
+| **`check-conflict-markers`** | `check-conflict-markers.py` | refuse a line that is a merge-conflict marker git writes -- seven `<`, seven vertical bars or seven `>` at its start, and seven `=` alone between an opener and its closer -- in any text file of the tree git tracks or would add. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-doc-census`** | `check-doc-census.py`, `source-census.py` | refuse a documented figure a census refutes, or an unpinned quantified claim about the corpus in config prose, and repair figures in place. |
 | **`check-emitted-anchor-ids`** | `check-emitted-anchor-ids.py` | refuse a new anchor id inside a C++ string literal under src/: operator output states the condition and the action, never the bookkeeping. |
@@ -75,7 +76,7 @@ dssharness run check-scripts-index-write
 | **`check-path-identity`** | `check-path-identity.py` | refuse a second path canonicalizer -- path resolution lives in exactly one place. |
 | **`check-pkg-pipeline`** | `check-pkg-pipeline.py` | pin the package pipeline's release-path step sequence and refuse an artifacts-only run that can reach a release. |
 | **`check-plan-citations`** | `check-plan-citations.py` | refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number. |
-| **`check-repo-guard-label`** | `check-repo-guard-label.py` | refuse a configured build in which an entry that SELF-TESTS a program carries the `repo-guard` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it. |
+| **`check-repo-guard-label`** | `check-repo-guard-label.py` | refuse a configured build in which an entry labelled `self-test` carries the `repo-guard` label, or an entry whose command line asks a program for its self-test carries no `self-test` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it. |
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse an action that no index documents, an index entry that no action backs, and an action no runner can start. |
 | **`check-stale-blockers`** | `check-stale-blockers.py` | list OPEN registry rows whose Closing-work cell waits on a blocker that has since CLOSED. |

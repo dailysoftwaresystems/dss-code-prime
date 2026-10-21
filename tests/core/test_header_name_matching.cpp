@@ -21,26 +21,33 @@
 // `<Windows.h>` rc=1 error[F001A]; the SAME tree via /mnt/c DrvFs -> BOTH rc=0.
 
 #include "core/substrate/path_identity.hpp"
+#include "core/substrate/process_spawn.hpp"   // the LIVE case asks git itself
 #include "core/types/ascii_case.hpp"
 #include "core/types/header_name_matching.hpp"
 #include "core/types/header_case_diagnostic.hpp"
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/unsuppressable_codes.hpp"
+#include "program/git_acquire.hpp"           // gitRepositoryLocalVariables: the LIVE case's git sees no caller repository
+#include "os_link.hpp"                       // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 #include "tree_ignores.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>                 // the one case table (tests/test_support/tree_ignores_cases.json)
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -262,40 +269,60 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root
     };
     fs::path const treeFrame = frame(tree);
     auto const     treeRel = [&](fs::path const& p) { return narrowUtf8OrEmpty(frame(p).lexically_relative(treeFrame)); };
-    if (std::string const rootRel = treeRel(root); !rootRel.empty() && rootRel != ".") {
-        scan.leftOutRoot = ignores.leavesOut(rootRel, true);
-        if (!scan.leftOutRoot.empty()) return scan;
-    }
+    // ★ A PATH THE ONE READER CANNOT ANSWER AS GIT DOES REFUSES THE WHOLE SWEEP, naming it (a name
+    // holding a backslash, a rule whose match core.ignorecase would change): the sweep's verdict
+    // would otherwise be one host's answer.
+    try {
+        if (std::string const rootRel = treeRel(root); !rootRel.empty() && rootRel != ".") {
+            scan.leftOutRoot = ignores.leavesOut(rootRel, true);
+            if (!scan.leftOutRoot.empty()) return scan;
+        }
 
-    std::error_code ec;
-    fs::recursive_directory_iterator it{root, ec};
-    if (ec) { scan.walkError = ec; return scan; }
-    for (fs::recursive_directory_iterator const end; it != end; it.increment(ec)) {
-        if (ec) { scan.walkError = ec; return scan; }   // truncated — NOT a pass
-        std::string const inTree = treeRel(it->path());
-        auto const        names = dss::test_support::tree_ignores_detail::splitNames(inTree);
-        std::error_code dirEc;
-        if (it->is_directory(dirEc)) {
-            // An unrenderable directory name yields "" — which no rule can judge, so the walk
-            // DESCENDS rather than pruning. Erring toward scanning more is the safe direction
-            // for a collision guard.
-            if (!inTree.empty() && !ignores.decide(names, true).empty()) it.disable_recursion_pending();
-            continue;
+        using dss::core::EntryKind;
+        using dss::core::WalkStep;
+        // The substrate's walk (`dss::core::walkTree`): an explicit work stack, and it never descends
+        // a link, on every build.
+        auto const walk = dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
+            std::string const inTree = treeRel(entry.path);
+            auto const        names = dss::test_support::tree_ignores_detail::splitNames(inTree);
+            // ★ A SYMBOLIC LINK IS NO DIRECTORY AND IS NEVER DESCENDED: git records a link as a file,
+            // so a `build/` rule does not take one (✔MEASURED, git 2.55), and a clone holds the link
+            // itself — a path that can collide like any file. The ENTRY's own kind decides, never what
+            // it points at — asked of the substrate, which asks the OS on Windows: libstdc++ there
+            // reads a link as what it reaches (✔MEASURED, the substrate's header), so a scan that asked
+            // `symlink_status` DESCENDED a directory link when built with MinGW.
+            if (entry.kind == EntryKind::Directory) {
+                // An unrenderable directory name yields "" — which no rule can judge, so the walk
+                // DESCENDS rather than pruning. Erring toward scanning more is the safe direction
+                // for a collision guard.
+                if (!inTree.empty() && !ignores.decide(names, true).empty()) return WalkStep::Prune;
+                return WalkStep::Continue;
+            }
+            if (entry.kind == EntryKind::Absent) return WalkStep::Continue;   // gone since it was listed
+            if (!inTree.empty() && !ignores.decide(names, false).empty()) return WalkStep::Continue;   // never cloned
+            // LEXICALLY relative to the swept root, never through `fs::relative`, which resolves a
+            // symbolic link to what it points at and would report the target, not the link.
+            fs::path const    relPath = frame(entry.path).lexically_relative(frame(root));
+            std::string const rel     = narrowUtf8OrEmpty(relPath);
+            if (rel.empty()) {
+                // Distinguish the two reasons rather than folding them: no relative path is a
+                // walk problem, an unrenderable spelling is a text problem, and only the second is
+                // this scan's own blind spot.
+                if (!relPath.empty()) ++scan.unrenderable;
+                return WalkStep::Continue;
+            }
+            ++scan.filesScanned;
+            scan.paths.push_back(rel);
+            byFolded[asciiToLower(rel)].push_back(rel);
+            return WalkStep::Continue;
+        });
+        if (walk.error) {   // truncated — NOT a pass
+            scan.walkError = walk.error;
+            return scan;
         }
-        if (!inTree.empty() && !ignores.decide(names, false).empty()) continue;   // git ignores it: never cloned
-        std::error_code relEc;
-        fs::path const  relPath = fs::relative(it->path(), root, relEc);
-        std::string const rel   = narrowUtf8OrEmpty(relPath);
-        if (rel.empty()) {
-            // Distinguish the two reasons rather than folding them: `relative` failing is a
-            // walk problem, an unrenderable spelling is a text problem, and only the second is
-            // this scan's own blind spot.
-            if (!relPath.empty()) ++scan.unrenderable;
-            continue;
-        }
-        ++scan.filesScanned;
-        scan.paths.push_back(rel);
-        byFolded[asciiToLower(rel)].push_back(rel);
+    } catch (dss::test_support::TreeIgnoreRefusal const& refused) {
+        scan.refusal = refused.what();
+        return scan;
     }
     for (auto& [folded, group] : byFolded) {
         if (group.size() < 2) continue;
@@ -485,6 +512,60 @@ TEST(HeaderNameMatching, QuoteAndDirListSearchesHonourPolicy) {
               HeaderSearchStatus::NotFound);
 }
 
+// ── [[D-PP-HEADER-CASE-DANGLING-SYMLINK-ASYMMETRY]] ─────────────────────────
+//
+// A DANGLING LINK IS NO HEADER, UNDER EITHER POLICY. ✔MEASURED 2026-10-20 on this very
+// fixture, built by each reference: a dangling link `x.h` in the first search directory and
+// a real `x.h` in a later one — gcc 13.3.0, clang 18.1.3, Apple clang 21.0.0, MinGW-w64 gcc
+// 13.2.0 and cl 19.51, `#include "x.h"` and `#include <x.h>` alike, each went ON to the later
+// directory. The two policy arms used to disagree on it (the case-sensitive arm's probe said
+// "absent", the case-insensitive arm took whatever its listing held), and the MinGW build took
+// the link under both. One case per policy arm; the link is made by the OS, which MinGW's
+// library cannot do.
+namespace {
+
+// Which `x.h` a search took, spelled `<its directory's name>/x.h`, or what it took instead.
+[[nodiscard]] std::string tookWhat(HeaderSearchResult const& r) {
+    switch (r.status) {
+    case HeaderSearchStatus::Found:
+        return u8Bytes(r.path.parent_path().filename().u8string()) + "/" +
+               u8Bytes(r.path.filename().u8string());
+    case HeaderSearchStatus::NotFound: return "nothing";
+    case HeaderSearchStatus::AmbiguousCase: return "an ambiguity";
+    }
+    return "an unknown status";
+}
+
+void expectADanglingLinkIsNoHeader(HeaderNameMatching matching, char const* scratchName) {
+    ScratchDir scratch{Location::Temp, scratchName};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first);
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    ASSERT_FALSE(dss::test_support::makeSymbolicLink(first / "no-such.h", first / "x.h",
+                                                     dss::test_support::LinkTo::File))
+        << "the OS made no link here, so this case cannot ask its question";
+
+    HeaderSearchCache cache;   // one compile's view of the tree
+    std::vector<fs::path> const dirs{first, later};
+    std::string const took = tookWhat(findInDirs("x.h", dirs, matching, cache));
+    EXPECT_EQ(took, "later/x.h")
+        << "the search took " << took << " -- a dangling link was taken for a header, where "
+           "every reference goes on to the later directory";
+    std::string const atFirst = tookWhat(resolveInDir(first, "x.h", matching, cache));
+    EXPECT_EQ(atFirst, "nothing") << "the first directory alone answered " << atFirst;
+}
+
+} // namespace
+
+TEST(HeaderNameMatching, ADanglingLinkIsNoHeaderUnderTheCaseSensitivePolicy) {
+    expectADanglingLinkIsNoHeader(HeaderNameMatching::CaseSensitive, "header_dangling_cs");
+}
+
+TEST(HeaderNameMatching, ADanglingLinkIsNoHeaderUnderTheCaseInsensitivePolicy) {
+    expectADanglingLinkIsNoHeader(HeaderNameMatching::CaseInsensitive, "header_dangling_ci");
+}
+
 // ── [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]] ────────
 //
 // A COMPILE reads each directory ONCE, and only for itself. Every search above used to
@@ -661,6 +742,8 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
             << sub << " must exist — a guard that silently skips its own "
                       "subject is the vacuous-pass class";
         auto const scan = caseCollisionsUnder(*root, dir, ignores);
+        EXPECT_TRUE(scan.refusal.empty())
+            << sub << ": the sweep was refused, so it says nothing of the tree: " << scan.refusal;
         EXPECT_TRUE(scan.leftOutRoot.empty())
             << sub << ": the tree's .gitignore leaves the swept root out (" << scan.leftOutRoot << ")";
         // Prove the instrument did work before believing its verdict.
@@ -827,98 +910,339 @@ TEST(HeaderNameMatching, CaseCollisionScanLeavesOutTheCopiesTheToolKeepsAScratch
            "(at the root and below) and a build are what git ignores here: none is swept";
 }
 
+// THE SWEEP NEVER DESCENDS A SYMBOLIC LINK AND COUNTS IT AS THE FILE A CLONE HOLDS. git records a
+// link as a file, so a `build/` rule does not take a link named `build` (✔MEASURED, git 2.55), and
+// a clone materializes the link itself — a path that collides like any other. A walk through it
+// would read another tree, or this one twice.
+TEST(HeaderNameMatching, CaseCollisionScanNeverDescendsASymbolicLinkAndCountsIt) {
+    ScratchDir scratch{Location::Temp, "header_case_links"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore", "build/\n");
+    writeFile(dir / "real" / "x.json");
+    // Made by the OS (`os_link.hpp`): MinGW's library cannot make a link, and that build is the one
+    // whose library cannot see one either.
+    using dss::test_support::LinkTo;
+    std::error_code ec = dss::test_support::makeSymbolicLink(dir / "real", dir / "build", LinkTo::Directory);
+    if (!ec) ec = dss::test_support::makeSymbolicLink(dir / "real", dir / "elsewhere", LinkTo::Directory);
+    ASSERT_FALSE(ec) << "a symbolic link cannot be made on this host (" << ec.message()
+                     << "): the case did not run";
+    auto const scan = caseCollisionsUnder(dir, dir, dss::test_support::readTreeIgnores(dir));
+    EXPECT_TRUE(scan.refusal.empty()) << scan.refusal;
+    EXPECT_FALSE(scan.walkError);
+    std::vector<std::string> swept = scan.paths;
+    std::sort(swept.begin(), swept.end());
+    EXPECT_EQ(swept, (std::vector<std::string>{".gitignore", "build", "elsewhere", "real/x.json"}))
+        << "the scan swept " << swept.size()
+        << " of the 4 files: each link is swept as the file it is, and nothing behind it is read";
+}
+
 // ── the C++ reader of the one statement (`tests/test_support/tree_ignores.hpp`) ──
-// Each case pins one rule of the grammar `owning-tree.py`'s `TreeIgnores` reads for the
-// repository's programs, on paths alone: no filesystem, so every host answers alike.
+// THE ONE CASE TABLE, `tests/test_support/tree_ignores_cases.json`, states every scenario: its
+// rules and each path's kind and answer, or the line a reader refuses. A case below asks one
+// scenario of THIS reader, on paths alone, so every host answers alike; owning-tree.py's self-test
+// asks the same scenario of the Python reader, and each suite's LIVE case asks git itself.
 
 namespace {
-[[nodiscard]] TreeIgnores rulesOf(std::string_view text) {
-    return dss::test_support::readTreeIgnoreRules(text, "fixture-ignore");
+
+using dss::test_support::TreeIgnoreRefusal;
+
+// Every scenario a case below asks: the table's names, compared with the table by
+// `EveryScenarioOfTheCaseTableIsAskedByOneCase` (a scenario added there and asked here by no case is red).
+constexpr char const* kScenarios[] = {
+    "the copies the tool keeps in a tree, a session's scratch and a build",
+    "a later rule decides, and a negation re-includes",
+    "a rule with no slash matches that name at any depth",
+    "a rule with a slash is anchored to the tree's root",
+    "a rule ending in a slash matches a directory only",
+    "a rule ending in a slash never matches a symbolic link",
+    "a double-star name is any number of directories",
+    "a star, a question mark and a class match the name's bytes",
+    "the twelve POSIX classes read as git reads them",
+    "a dash, a bracket first, a range and a lone [: inside a class read as git reads them",
+    "nothing under a left-out directory is re-included",
+    "git's own directory is always left out, as a directory or a worktree's file",
+    "a path a rule matches under one setting of core.ignorecase and not the other is refused",
+    "a name that is git's own only when case is folded is refused",
+    "a name holding a backslash is refused",
+    "a byte order mark, a CR LF ending and trailing spaces are no part of a rule, a trailing tab is",
+    "a rule holding a backslash is refused, naming its line",
+    "a class opened and never closed is refused, naming its line",
+    "a POSIX class git does not name is refused, naming its line",
+    "a rule naming nothing between two separators, or nothing at all, is refused",
+};
+
+[[nodiscard]] nlohmann::json const& caseTable() {
+    static nlohmann::json const table = [] {
+        auto const root = dss::test::findRepoRoot();
+        if (!root) throw std::runtime_error("no repository root, so no case table: " + dss::test::repoRootDiagnostic());
+        std::ifstream in(*root / "tests" / "test_support" / "tree_ignores_cases.json", std::ios::binary);
+        if (!in) throw std::runtime_error("tests/test_support/tree_ignores_cases.json cannot be read");
+        return nlohmann::json::parse(in);
+    }();
+    return table;
+}
+
+[[nodiscard]] nlohmann::json const& scenario(std::string const& name) {
+    for (auto const& s : caseTable().at("scenarios"))
+        if (s.at("name").get<std::string>() == name) return s;
+    throw std::runtime_error("the case table holds no scenario named '" + name + "'");
+}
+
+[[nodiscard]] std::string rulesText(nlohmann::json const& sc) {
+    std::string const nl = sc.contains("newline") ? sc.at("newline").get<std::string>() : std::string("\n");
+    std::string       text;
+    for (auto const& r : sc.at("rules")) text += r.get<std::string>() + nl;
+    return text;
+}
+
+// This reader's answer for one path, in the table's words.
+struct Answer {
+    bool        refused = false;
+    std::string text;   // the rule that leaves it out ("" kept), or the refusal
+};
+
+[[nodiscard]] Answer ask(TreeIgnores const& t, std::string const& path, bool isDir) {
+    try {
+        return {false, t.leavesOut(path, isDir)};
+    } catch (TreeIgnoreRefusal const& refused) {
+        return {true, refused.what()};
+    }
+}
+
+[[nodiscard]] std::string render(Answer const& a) {
+    if (a.refused) return "refused (" + a.text.substr(0, 140) + ")";
+    return a.text.empty() ? std::string("kept") : "left out by " + a.text;
+}
+
+[[nodiscard]] std::string render(nlohmann::json const& answer) {
+    if (answer.is_null()) return "kept";
+    if (answer.is_object()) return "refused (" + answer.at("refused").get<std::string>() + ")";
+    return "left out by " + answer.get<std::string>();
+}
+
+[[nodiscard]] bool agrees(nlohmann::json const& answer, Answer const& got) {
+    if (answer.is_object()) return got.refused && got.text.find(answer.at("refused").get<std::string>()) != std::string::npos;
+    return !got.refused && got.text == (answer.is_null() ? std::string{} : answer.get<std::string>());
+}
+
+// Every path of one scenario asked of this reader.
+void expectAnswers(std::string const& name) {
+    auto const&       sc = scenario(name);
+    TreeIgnores const t = dss::test_support::readTreeIgnoreRules(rulesText(sc), "fixture-ignore");
+    ASSERT_TRUE(t.refusal.empty()) << t.refusal;
+    for (auto const& p : sc.at("paths")) {
+        std::string const path = p.at(0).get<std::string>();
+        std::string const kind = p.at(1).get<std::string>();
+        Answer const      got = ask(t, path, kind == "dir");
+        EXPECT_TRUE(agrees(p.at(2), got))
+            << path << " (" << kind << "): answered " << render(got) << ", the table says " << render(p.at(2));
+    }
+}
+
+// Every rule set of one scenario read by this reader: refused at the line the table names, saying
+// what it says, or read whole where the table names no line.
+void expectRefusals(std::string const& name) {
+    for (auto const& r : scenario(name).at("refusals")) {
+        std::string text, shown;
+        for (auto const& line : r.at("rules")) {
+            text += line.get<std::string>() + "\n";
+            shown += (shown.empty() ? "" : " ; ") + line.get<std::string>();
+        }
+        std::string const refusal = dss::test_support::readTreeIgnoreRules(text, "fixture-ignore").refusal;
+        if (r.at("line").is_null()) {
+            EXPECT_TRUE(refusal.empty()) << "[" << shown << "] was refused: " << refusal;
+        } else {
+            int const         line = r.at("line").get<int>();
+            std::string const says = r.at("says").get<std::string>();
+            EXPECT_TRUE(refusal.find("fixture-ignore line " + std::to_string(line) + ":") != std::string::npos
+                        && refusal.find(says) != std::string::npos)
+                << "[" << shown << "] was " << (refusal.empty() ? std::string("read whole") : "refused: " + refusal)
+                << ", the table says refused at line " << line << " for " << says;
+        }
+    }
+}
+
+} // namespace
+
+TEST(TreeIgnoresGrammar, TheCopiesTheToolKeepsAScratchAndABuildAreLeftOut) { expectAnswers(kScenarios[0]); }
+TEST(TreeIgnoresGrammar, ALaterRuleDecidesAndANegationReincludes) { expectAnswers(kScenarios[1]); }
+TEST(TreeIgnoresGrammar, ARuleWithNoSlashMatchesThatNameAtAnyDepth) { expectAnswers(kScenarios[2]); }
+TEST(TreeIgnoresGrammar, ARuleWithASlashIsAnchoredToTheTreesRoot) { expectAnswers(kScenarios[3]); }
+TEST(TreeIgnoresGrammar, ATrailingSlashMatchesADirectoryOnly) { expectAnswers(kScenarios[4]); }
+TEST(TreeIgnoresGrammar, ATrailingSlashNeverMatchesASymbolicLink) { expectAnswers(kScenarios[5]); }
+TEST(TreeIgnoresGrammar, ADoubleStarNameIsAnyNumberOfDirectories) { expectAnswers(kScenarios[6]); }
+TEST(TreeIgnoresGrammar, AStarAQuestionMarkAndAClassMatchTheNamesBytes) { expectAnswers(kScenarios[7]); }
+TEST(TreeIgnoresGrammar, TheTwelvePosixClassesReadAsGitReadsThem) { expectAnswers(kScenarios[8]); }
+TEST(TreeIgnoresGrammar, ADashABracketFirstARangeAndALoneColonOpenerReadAsGitReadsThem) {
+    expectAnswers(kScenarios[9]);
+}
+TEST(TreeIgnoresGrammar, NothingUnderALeftOutDirectoryIsReincluded) { expectAnswers(kScenarios[10]); }
+TEST(TreeIgnoresGrammar, GitsOwnIsAlwaysLeftOutAsADirectoryOrAWorktreesFile) { expectAnswers(kScenarios[11]); }
+TEST(TreeIgnoresGrammar, APathARuleMatchesUnderOneSettingOfIgnoreCaseAndNotTheOtherIsRefused) {
+    expectAnswers(kScenarios[12]);
+}
+TEST(TreeIgnoresGrammar, ANameThatIsGitsOwnOnlyWhenCaseIsFoldedIsRefused) { expectAnswers(kScenarios[13]); }
+TEST(TreeIgnoresGrammar, ANameHoldingABackslashIsRefused) { expectAnswers(kScenarios[14]); }
+TEST(TreeIgnoresGrammar, AByteOrderMarkACrLfEndingAndTrailingSpacesAreNoPartOfARule) { expectAnswers(kScenarios[15]); }
+TEST(TreeIgnoresGrammar, ARuleHoldingABackslashIsRefusedNamingItsLine) { expectRefusals(kScenarios[16]); }
+TEST(TreeIgnoresGrammar, AClassNeverClosedIsRefusedNamingItsLine) { expectRefusals(kScenarios[17]); }
+TEST(TreeIgnoresGrammar, APosixClassGitDoesNotNameIsRefusedNamingItsLine) { expectRefusals(kScenarios[18]); }
+TEST(TreeIgnoresGrammar, ARuleNamingNothingIsRefusedNamingItsLine) { expectRefusals(kScenarios[19]); }
+
+TEST(TreeIgnoresGrammar, EveryScenarioOfTheCaseTableIsAskedByOneCase) {
+    std::vector<std::string> named, asked(std::begin(kScenarios), std::end(kScenarios));
+    for (auto const& s : caseTable().at("scenarios")) named.push_back(s.at("name").get<std::string>());
+    std::sort(named.begin(), named.end());
+    std::sort(asked.begin(), asked.end());
+    EXPECT_EQ(asked, named) << "a scenario of the table that no case asks, or a case asking none";
+}
+
+// A `.gitignore` that is a DIRECTORY is refused, as the Python reader refuses it: a reader that
+// opened it and read nothing would leave out nothing, in silence.
+TEST(TreeIgnoresGrammar, AGitignoreThatIsADirectoryIsRefused) {
+    ScratchDir scratch{Location::Temp, "tree_ignores_dir_gitignore"};
+    fs::create_directories(scratch.path() / ".gitignore");
+    TreeIgnores const t = dss::test_support::readTreeIgnores(scratch.path());
+    EXPECT_NE(t.refusal.find("it is a directory"), std::string::npos) << "read as: '" << t.refusal << "'";
+}
+
+// LIVE: git itself, over every scenario's paths. One repository, each scenario in its own directory
+// whose `.gitignore` holds the scenario's rules (anchored to that directory exactly as a root rule
+// is to the root); a `dir` leaf made a directory and a `link` leaf a link (git decides a path it
+// cannot stat as no directory, so a `file` leaf needs no file). Asked under both settings of
+// core.ignorecase, with no excludes file of the host's and none of the caller's git environment. A
+// path the table refuses for case must be one git answers differently under the two; every other
+// answered path must be this reader's answer under both. No git on the host is a failure, never a pass.
+// git's C-style quoting of a path undone: a name holding a control byte, a double quote, a backslash
+// or (under core.quotePath) a byte at or above 0x80 is written between double quotes, with \a \b \t
+// \n \v \f \r \" \\ and three octal digits for every other byte it quotes; any other name is as is.
+namespace {
+[[nodiscard]] std::string gitUnquoted(std::string const& s) {
+    if (s.size() < 2 || s.front() != '"' || s.back() != '"') return s;
+    std::string out;
+    for (std::size_t i = 1; i + 1 < s.size(); ++i) {
+        if (s[i] != '\\' || i + 2 >= s.size()) {
+            out += s[i];
+            continue;
+        }
+        char const e = s[++i];
+        switch (e) {
+            case 'a': out += '\a'; break;
+            case 'b': out += '\b'; break;
+            case 't': out += '\t'; break;
+            case 'n': out += '\n'; break;
+            case 'v': out += '\v'; break;
+            case 'f': out += '\f'; break;
+            case 'r': out += '\r'; break;
+            default:
+                if (e >= '0' && e <= '3' && i + 3 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '7' && s[i + 2] >= '0'
+                    && s[i + 2] <= '7') {
+                    out += static_cast<char>(((e - '0') << 6) | ((s[i + 1] - '0') << 3) | (s[i + 2] - '0'));
+                    i += 2;
+                } else {
+                    out += e;   // `\"` and `\\`
+                }
+        }
+    }
+    return out;
 }
 } // namespace
 
-TEST(TreeIgnoresGrammar, ALaterRuleDecidesAndANegationReincludes) {
-    auto const t = rulesOf("/.legs/*\n!/.legs/.gitkeep\n*.o\n!keep.o\n");
-    ASSERT_TRUE(t.refusal.empty()) << t.refusal;
-    EXPECT_EQ(t.leavesOut(".legs/x", true), "/.legs/*");
-    EXPECT_EQ(t.leavesOut(".legs/.gitkeep", false), "");
-    EXPECT_EQ(t.leavesOut("a.o", false), "*.o");
-    EXPECT_EQ(t.leavesOut("keep.o", false), "");
-}
-
-TEST(TreeIgnoresGrammar, ARuleWithNoSlashMatchesThatNameAtAnyDepth) {
-    auto const t = rulesOf(".temp/\n");
-    EXPECT_EQ(t.leavesOut(".temp/x/notes.md", false), ".temp/");
-    EXPECT_EQ(t.leavesOut("tests/.temp/y.md", false), ".temp/");
-    EXPECT_EQ(t.leavesOut("examples/c/x/main.c", false), "");
-}
-
-TEST(TreeIgnoresGrammar, ARuleWithASlashIsAnchoredToTheTreesRoot) {
-    auto const t = rulesOf("/src/dss-config/runtime/platform/dist/\n.claude/worktrees/\n");
-    EXPECT_EQ(t.leavesOut("src/dss-config/runtime/platform/dist/o.json", false),
-              "/src/dss-config/runtime/platform/dist/");
-    EXPECT_EQ(t.leavesOut("src/dist/x.json", false), "");
-    EXPECT_EQ(t.leavesOut(".claude/worktrees/w/x.md", false), ".claude/worktrees/");
-    EXPECT_EQ(t.leavesOut("docs/.claude/worktrees/z.md", false), "");
-}
-
-TEST(TreeIgnoresGrammar, ATrailingSlashMatchesADirectoryOnly) {
-    auto const t = rulesOf("build/\n");
-    EXPECT_EQ(t.leavesOut("tests/build", false), "") << "a FILE of that name stays";
-    EXPECT_EQ(t.leavesOut("build/v/bin/dss/r", false), "build/");
-}
-
-TEST(TreeIgnoresGrammar, ADoubleStarNameIsAnyNumberOfDirectories) {
-    auto const t = rulesOf("/.harness-config/runner/actions/**/build/\n/x/**\n");
-    EXPECT_EQ(t.leavesOut(".harness-config/runner/actions/a/build/o.txt", false),
-              "/.harness-config/runner/actions/**/build/");
-    EXPECT_EQ(t.leavesOut(".harness-config/runner/actions/a/b/build/o.txt", false),
-              "/.harness-config/runner/actions/**/build/");
-    EXPECT_EQ(t.leavesOut(".harness-config/runner/actions/a/a.py", false), "");
-    EXPECT_EQ(t.leavesOut("x", true), "") << "at a rule's end, `**` is one or more names";
-    EXPECT_EQ(t.leavesOut("x/y", false), "/x/**");
-}
-
-TEST(TreeIgnoresGrammar, AStarAQuestionMarkAndAClassReadAsGitReadsThem) {
-    auto const t = rulesOf("[._]*.sw[a-p]\nbuild-*/\nlo?\n[!a]z\n");
-    EXPECT_EQ(t.leavesOut(".x.swp", false), "[._]*.sw[a-p]");
-    EXPECT_EQ(t.leavesOut("x.swz", false), "");
-    EXPECT_EQ(t.leavesOut("build-dbg/o", false), "build-*/");
-    EXPECT_EQ(t.leavesOut("log", false), "lo?");
-    EXPECT_EQ(t.leavesOut("logs", false), "");
-    EXPECT_EQ(t.leavesOut("bz", false), "[!a]z");
-    EXPECT_EQ(t.leavesOut("az", false), "");
-    EXPECT_EQ(t.leavesOut("lo\xC3\xA9", false), "lo?") << "`?` takes one CHARACTER, not one byte";
-}
-
-TEST(TreeIgnoresGrammar, NothingUnderALeftOutDirectoryIsReincluded) {
-    auto const t = rulesOf("/gone/\n!/gone/back.md\n");
-    EXPECT_EQ(t.leavesOut("gone/back.md", false), "/gone/");
-}
-
-TEST(TreeIgnoresGrammar, GitsOwnIsAlwaysLeftOutAsADirectoryOrAWorktreesFile) {
-    TreeIgnores const t;
-    EXPECT_EQ(t.leavesOut(".git/HEAD", false), ".git");
-    EXPECT_EQ(t.leavesOut("sub/.git", false), ".git");
-    EXPECT_EQ(t.leavesOut("sub/x.md", false), "");
-}
-
-TEST(TreeIgnoresGrammar, ARuleItCannotReadAsGitDoesIsRefusedNamingItsLine) {
-    EXPECT_NE(rulesOf("a/\nb\\#c\n").refusal.find("fixture-ignore line 2"), std::string::npos)
-        << "a backslash (an escape)";
-    EXPECT_NE(rulesOf("x\ny\nz[ab\n").refusal.find("fixture-ignore line 3"), std::string::npos)
-        << "a class never closed";
-    EXPECT_NE(rulesOf("a//b\n").refusal.find("fixture-ignore line 1"), std::string::npos)
-        << "an empty name between two separators";
-    EXPECT_NE(rulesOf("ok\n/\n").refusal.find("fixture-ignore line 2"), std::string::npos) << "a rule of `/` alone";
-    EXPECT_NE(rulesOf("!\n").refusal.find("fixture-ignore line 1"), std::string::npos) << "a rule of `!` alone";
-    EXPECT_TRUE(rulesOf("# a comment\n\nok/   \n").refusal.empty()) << "the control: comments, blanks, trailing blanks";
-}
-
-TEST(TreeIgnoresGrammar, NamesCompareAsWrittenCaseAndAll) {
-    auto const t = rulesOf(".temp/\n");
-    EXPECT_EQ(t.leavesOut(".TEMP/x.md", false), "");
-    EXPECT_EQ(t.leavesOut(".temp/x.md", false), ".temp/");
+TEST(TreeIgnoresGrammar, LiveEveryScenarioIsAnsweredAsGitCheckIgnoreAnswersIt) {
+    auto const gitExe = dss::substrate::resolveExecutableOnPath("git");
+    ASSERT_TRUE(gitExe.has_value()) << "no git on this host: the live comparison did not run, which is no pass";
+    ScratchDir     scratch{Location::Temp, "tree_ignores_live_git"};
+    fs::path const repo = scratch.path() / "repo";
+    fs::path const target = scratch.path() / "link-target";
+    fs::create_directories(repo);
+    fs::create_directories(target);
+    auto const& withheld = dss::gitRepositoryLocalVariables();
+    {
+        auto const init = dss::substrate::spawnAndWaitRedirectStdout({narrowUtf8OrEmpty(*gitExe), "init", "-q"}, repo,
+                                                                     scratch.path() / "init.out", withheld);
+        ASSERT_TRUE(init.spawned && init.exitCode == 0) << init.diagnostic;
+    }
+    struct Asked {
+        std::string           scenario, path, kind, asAsked;
+        nlohmann::json        answer;
+        TreeIgnores const*    reader;
+    };
+    std::vector<Asked>       asked;
+    std::vector<TreeIgnores> readers;
+    auto const&              scenarios = caseTable().at("scenarios");
+    readers.reserve(scenarios.size());
+    for (std::size_t k = 0; k < scenarios.size(); ++k) {
+        auto const& sc = scenarios[k];
+        if (!sc.contains("paths") || (sc.contains("asked_of_git") && !sc.at("asked_of_git").get<bool>())) continue;
+        std::string const top = "s" + std::to_string(k);
+        fs::create_directories(repo / top);
+        writeFile(repo / top / ".gitignore", rulesText(sc));
+        readers.push_back(dss::test_support::readTreeIgnoreRules(rulesText(sc), "fixture-ignore"));
+        for (auto const& p : sc.at("paths")) {
+            std::string const path = p.at(0).get<std::string>();
+            std::string const kind = p.at(1).get<std::string>();
+            if (p.at(2).is_object() && p.at(2).at("refused").get<std::string>() != "core.ignorecase") continue;
+            std::u8string const u8path(path.begin(), path.end());
+            fs::path const      full = repo / top / fs::path(u8path);
+            std::error_code     ec;
+            if (kind == "dir") {
+                fs::create_directories(full, ec);
+            } else if (kind == "link") {
+                fs::create_directories(full.parent_path(), ec);
+                if (!ec) ec = dss::test_support::makeSymbolicLink(target, full, dss::test_support::LinkTo::Directory);
+            }
+            ASSERT_FALSE(ec) << "cannot make " << path << " (" << kind << ") on this host (" << ec.message()
+                             << "): the live comparison did not run";
+            asked.push_back({sc.at("name").get<std::string>(), path, kind, top + "/" + path, p.at(2), &readers.back()});
+        }
+    }
+    ASSERT_FALSE(asked.empty());
+    // The paths go on the command line: git takes `-z` only with `--stdin` (it refuses `-z` beside
+    // named paths), and the spawner hands a child this process's own standard input. So each answer
+    // is git's line form: `<source>:<line>:<pattern>` (`::` when no rule matched), a tab, and the
+    // path -- written C-quoted whenever it holds a byte git quotes, which a quoted path's tab never
+    // is; the pattern is written as it stands and may hold a tab, so the LAST tab ends it.
+    std::map<std::string, std::map<std::string, std::string>> said;   // setting -> path -> pattern ("" none)
+    for (std::string const fold : {"false", "true"}) {
+        std::vector<std::string> argv{narrowUtf8OrEmpty(*gitExe), "-c", "core.ignorecase=" + fold, "-c",
+                                      "core.excludesFile=" + narrowUtf8OrEmpty(scratch.path() / "no-excludes-file"),
+                                      "-c", "core.quotePath=true", "check-ignore", "--no-index", "-v", "-n", "--"};
+        for (auto const& a : asked) argv.push_back(a.asAsked);
+        fs::path const out = scratch.path() / ("check-ignore-" + fold + ".out");
+        auto const     r = dss::substrate::spawnAndWaitRedirectStdout(argv, repo, out, withheld);
+        ASSERT_TRUE(r.spawned && (r.exitCode == 0 || r.exitCode == 1)) << r.diagnostic << " exit " << r.exitCode;
+        std::ifstream     in(out, std::ios::binary);
+        std::string const bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        std::size_t       at = 0;
+        while (at < bytes.size()) {
+            std::size_t const  eol = bytes.find('\n', at);
+            std::string const  line = bytes.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+            at = eol == std::string::npos ? bytes.size() : eol + 1;
+            std::size_t const  tab = line.rfind('\t');
+            ASSERT_NE(tab, std::string::npos) << "a line of git check-ignore with no tab: " << line;
+            std::string const  head = line.substr(0, tab);
+            std::size_t const  c1 = head.find(':');
+            std::size_t const  c2 = c1 == std::string::npos ? c1 : head.find(':', c1 + 1);
+            ASSERT_NE(c2, std::string::npos) << "a line of git check-ignore with no source and line: " << line;
+            std::string const  pattern = head.substr(c2 + 1);
+            said[fold][gitUnquoted(line.substr(tab + 1))] =
+                (pattern.empty() || pattern.front() == '!') ? std::string{} : pattern;
+        }
+    }
+    for (auto const& a : asked) {
+        auto const   gf = said["false"].count(a.asAsked) ? said["false"][a.asAsked] : std::string("<unanswered>");
+        auto const   gt = said["true"].count(a.asAsked) ? said["true"][a.asAsked] : std::string("<unanswered>");
+        Answer const mine = ask(*a.reader, a.path, a.kind == "dir");
+        if (a.answer.is_object()) {
+            EXPECT_TRUE(mine.refused && gf != gt)
+                << a.path << " (" << a.kind << "): this reader " << render(mine) << ", git '" << gf
+                << "' under false and '" << gt << "' under true";
+        } else {
+            EXPECT_TRUE(!mine.refused && mine.text == gf && gf == gt)
+                << a.path << " (" << a.kind << "): this reader " << render(mine) << ", git '" << gf
+                << "' under false and '" << gt << "' under true";
+        }
+    }
 }
 
 // LIVE: the repository's own `.gitignore` leaves out every directory DssHarness keeps

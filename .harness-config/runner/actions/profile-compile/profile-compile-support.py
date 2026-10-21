@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
 import time
 from collections import defaultdict
 
@@ -452,7 +453,7 @@ def _tally(chunk, label):
 
 
 def cmd_agg_trace(args):
-    with io.open(args.log, encoding='utf-8', errors='replace') as f:
+    with io.open(args.trace, encoding='utf-8', errors='replace') as f:
         lines = f.read().splitlines()
     starts = [i for i, ln in enumerate(lines) if START0.match(ln)]
     if not starts:
@@ -479,6 +480,26 @@ def cmd_agg_trace(args):
     print('AGG-TRACE-OK')
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("profile-compile-support: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -487,13 +508,13 @@ def main():
     p.add_argument('--manifest', required=True, help='a real .dss-project.json')
     p.add_argument('--root', action='append', default=[], metavar='NAME=PATH[;NAME=PATH...]',
                    help='declare the roots every manifest path must fall under')
-    p.add_argument('--out', required=True)
+    p.add_argument('--out', required=True, type=_written_path_arg("--out"))
     p.set_defaults(fn=cmd_kit)
 
     p = sub.add_parser('manifest', help='materialize a kit onto this host')
     p.add_argument('--kit', required=True)
     p.add_argument('--target', required=True, help='e.g. x86_64:elf64-x86_64-linux-exec')
-    p.add_argument('--out', required=True)
+    p.add_argument('--out', required=True, type=_written_path_arg("--out"))
     p.set_defaults(fn=cmd_manifest)
 
     p = sub.add_parser('build-type', help="read a compiler's CMake build type")
@@ -502,14 +523,14 @@ def main():
     p.set_defaults(fn=cmd_build_type)
 
     p = sub.add_parser('timed-gate', help='run under an in-process witness, timed monotonically')
-    p.add_argument('--log', required=True)
+    p.add_argument('--log', required=True, type=_written_path_arg("--log"))
     p.add_argument('--witness', required=True)
     p.add_argument('command', nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_timed_gate)
 
     p = sub.add_parser('gcc-reference', help='the gcc yardstick, same manifest')
     p.add_argument('--manifest', required=True)
-    p.add_argument('--out', required=True)
+    p.add_argument('--out', required=True, type=_written_path_arg("--out"))
     p.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     p.add_argument('--cc', required=True, help='the reference compiler (the step input referenceCc)')
     p.add_argument('--opt', required=True, help='its optimization flag, as --opt=-O2 (referenceOpt)')
@@ -517,7 +538,7 @@ def main():
     p.set_defaults(fn=cmd_gcc_reference)
 
     p = sub.add_parser('agg-trace', help='aggregate a DSS_OPT_TRACE log')
-    p.add_argument('log')
+    p.add_argument('trace', metavar='log', help='the DSS_OPT_TRACE log to read')
     p.set_defaults(fn=cmd_agg_trace)
 
     args = ap.parse_args()

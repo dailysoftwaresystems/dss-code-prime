@@ -83,6 +83,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/substrate/path_identity.hpp"  // walkTree: the artifact sweep never follows a link
 #include "host_native_target.hpp"  // the loader-search-path spawn pin BUILDS AND
                                    // SPAWNS its own output, so it builds for this
                                    // machine (do not rely on a transitive include)
@@ -3471,15 +3472,14 @@ void runErrorTarget(fs::path const&        exampleDir,
     // now witnesses the invariant, not only the one written for it — which is
     // the difference between a pin and a census.
     std::vector<std::string> leftovers;
-    {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(outDir, ec);
-             !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
-            if (it->is_regular_file(ec)) {
-                leftovers.push_back(it->path().generic_string());
-            }
-        }
-    }
+    // The substrate's walk (`dss::core::walkTree`), as the CLI runner's twin of
+    // this arm walks: it never descends a link on any build (libstdc++ on Windows
+    // cannot tell one from what it reaches -- the substrate's header), and a file
+    // reached through a link is still a file the build left.
+    static_cast<void>(dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
+        if (entry.reaches == dss::core::EntryKind::File) leftovers.push_back(entry.path.generic_string());
+        return dss::core::WalkStep::Continue;
+    }));
     EXPECT_TRUE(leftovers.empty())
         << "expect-error example " << exampleDir.generic_string()
         << " REPORTED FAILURE AND STILL WROTE AN ARTIFACT ("

@@ -1,5 +1,6 @@
 #include "lsp/workspace_project.hpp"
 
+#include "core/substrate/path_identity.hpp"   // reachedKind: a manifest is an entry by what it reaches
 #include "core/types/diagnostic_reporter.hpp"
 // ★ THE ONE PROJECT-MANIFEST PARSER — now reached DOWNWARD, not across
 // (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS, closed 2026-08-13).
@@ -99,7 +100,9 @@ void collectManifests(fs::path const& root, std::vector<fs::path>& out) {
     // named. Throwing here would take down the LSP message loop for a mistyped
     // rootUri.
     for (auto const& entry : fs::directory_iterator(root, ec)) {
-        if (!entry.is_regular_file()) continue;
+        // A manifest is an entry by what it REACHES (the substrate's answer, never the
+        // library's: libstdc++ on Windows calls a dangling link a regular file).
+        if (std::error_code kindEc; core::reachedKind(entry.path(), kindEc) != core::EntryKind::File) continue;
         const auto name = entry.path().filename().string();
         if (name.size() < kProjectFileSuffix.size()) continue;
         if (name.compare(name.size() - kProjectFileSuffix.size(),

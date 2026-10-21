@@ -164,6 +164,7 @@ import os
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
 import tempfile
 
 # A run that hangs must not hang the harness. Generous: these are sub-second
@@ -835,6 +836,26 @@ def _spelled(launcher, path):
     return "%s%s" % (" ".join(launcher) + " " if launcher else "", path)
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("cli-smoke: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     # ── `--self-test` IS CHECKED BEFORE argparse, NOT DECLARED IN IT ──────────
@@ -895,9 +916,11 @@ def main(argv=None):
                    help="SQLITE_VERSION read from the STAGED sqlite3.h this binary was compiled against")
     p.add_argument("--expect-source-id", required=True,
                    help="SQLITE_SOURCE_ID read from that same staged sqlite3.h")
-    p.add_argument("--workdir", required=True, help="scratch dir; two subdirs are created under it")
+    p.add_argument("--workdir", required=True, type=_written_path_arg("--workdir"),
+                   help="scratch dir; two subdirs are created under it")
     p.add_argument("--label", default="cli", help="leg label, for the report")
-    p.add_argument("--json", default="", help="also write the machine-readable result here")
+    p.add_argument("--json", default=None, type=_written_path_arg("--json"),
+                   help="also write the machine-readable result here")
     args = p.parse_args(argv)
 
     if args.reference and not args.reference_target.strip():

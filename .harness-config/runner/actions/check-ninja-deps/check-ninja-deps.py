@@ -30,11 +30,16 @@ evidence.
     "nothing to report". Zero objects parsed ⇒ exit non-zero;
   * the allowlist is EXPLICIT and carries a reason per entry — and ✔MEASURED
     2026-08-17 it should stay EMPTY, for a reason stronger than "no exceptions have
-    come up yet": **`#deps 0` is not reachable by a healthy TU at all.** A C file
-    with ZERO `#include` directives, compiled through a `deps = gcc` rule, records
-    `#deps 1` — gcc lists the source itself. So a zero count is not "a TU with no
-    headers"; it is always a lost record. (Measured directly: a two-target ninja
+    come up yet": **on a `deps = gcc` rule, `#deps 0` is not reachable by a healthy TU
+    at all.** A C file with ZERO `#include` directives, compiled through such a rule,
+    records `#deps 1` — gcc lists the source itself. So a zero count there is not "a TU
+    with no headers"; it is always a lost record. (Measured directly: a two-target ninja
     project, one TU include-free, produced `#deps 1` and `#deps 2` — never 0.)
+    ⚠ ONE RULE IS THE EXCEPTION, AND IT IS JUDGED, NOT LISTED: `deps = msvc` records
+    headers only, so a unit whose every include its precompiled header or the toolchain
+    answers records `#deps 0` CORRECTLY. Such a zero record is excused per object, by a
+    reading of the tree and said with its reason (the block above `_NINJA_INCLUDE`); every
+    other zero record, on any rule, is a lost one, and the allowlist stays empty.
 
 ★ **AN HONEST LIMIT, stated rather than discovered later.** `ninja -t deps` prints
 only objects that HAVE a deps record, so an object with NO record at all is
@@ -565,7 +570,16 @@ def _code_lines(text):
     reader gets wrong inside one line -- a stray quote in skipped text, a spelling it does
     not know -- cannot swallow the directive on the next. What can is a comment or a raw
     string opened where the compiler opens none, and those two are read exactly.
+    ★ A BYTE ORDER MARK BEFORE THE FIRST LINE IS NO CHARACTER OF THE PROGRAM: MSVC, gcc and
+    clang each skip one there, so a directive on that line is a directive (✔MEASURED
+    2026-10-16 with probe-reference-cc: a `#define` behind the mark ending LF, and a `%:define`
+    behind it ending CRLF, each defined the macro its program returns, in C and in C++, under
+    cl 19.51 and mingw-w64 gcc 13.2 on windows-x86_64-release and gcc 13.3 and clang 18.1 on
+    linux-x86_64-debug -- 16 of 16, with the 8 controls without the mark). Read as text, it
+    stood before the `#` and the line was no directive at all -- an include nobody looked
+    up, which excused the record that lost it.
     """
+    text = text[1:] if text.startswith("\ufeff") else text
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\\\n", "")
     out, i, n = [], 0, len(text)
     while i < n:
@@ -949,18 +963,31 @@ def target_verdict(build_dir, allow_non_ninja):
     return ("run", "")
 
 
-def check(build_dir, allow_non_ninja=False, deps=ninja_deps):
-    """Returns an exit code for one build directory."""
+def check(build_dir, allow_non_ninja=False, deps=ninja_deps, shown=None):
+    """Returns an exit code for one build directory.
+
+    ★ EVERY LINE IT PRINTS PASSES THE ONE REDACTOR, as `record()`'s does: a line names the
+    build directory, and a lost record's reason names a header by its absolute path -- an
+    account's home among them. (`deps` and `shown` are a case's: the text ninja would
+    print, a stand-in for the redactor.)
+    """
+    if shown is None:
+        try:
+            shown = _redact().lazy_redactor(tree=repo_root(), places={"<temp>": tempfile.gettempdir()})
+        except (OSError, ImportError, AttributeError, SyntaxError) as exc:
+            print(f"ninja-deps: FATAL -- the redactor could not be loaded ({type(exc).__name__}); "
+                  f"what the check says is printed through it or not at all. The check did not run.")
+            return 2
     verdict, message = target_verdict(build_dir, allow_non_ninja)
     if verdict == "skip":
-        print(message)
+        print(shown(message))
         return 0
     if verdict == "fatal":
-        print(message)
+        print(shown(message))
         return 2
     text, why = deps(build_dir)
     if text is None:
-        print(f"ninja-deps: FATAL -- {why}; the check did not run")
+        print(shown(f"ninja-deps: FATAL -- {why}; the check did not run"))
         return 2
 
     total, empty = parse(text)
@@ -969,8 +996,8 @@ def check(build_dir, allow_non_ninja=False, deps=ninja_deps):
     # look identical from the outside, and this project has been burned by exactly
     # that ambiguity before.
     if total == 0:
-        print(f"ninja-deps: FATAL -- parsed 0 objects from `ninja -t deps` in "
-              f"{build_dir}; the check proved nothing")
+        print(shown(f"ninja-deps: FATAL -- parsed 0 objects from `ninja -t deps` in "
+                    f"{build_dir}; the check proved nothing"))
         return 2
 
     flagged = [o for o in empty if not allowed(o)]
@@ -987,20 +1014,20 @@ def check(build_dir, allow_non_ninja=False, deps=ninja_deps):
         why_lost = dict(lost)
 
     if flagged:
-        print(f"ninja-deps: FAIL {build_dir} -- {len(flagged)} of {total} objects "
-              f"have ZERO recorded header deps. Ninja will NOT rebuild these when a "
-              f"header they include changes, so any gate run here proves nothing "
-              f"about the current source.")
+        print(shown(f"ninja-deps: FAIL {build_dir} -- {len(flagged)} of {total} objects "
+                    f"have ZERO recorded header deps. Ninja will NOT rebuild these when a "
+                    f"header they include changes, so any gate run here proves nothing "
+                    f"about the current source."))
         for o in flagged[:40]:
-            print(f"    {o}  -- {why_lost[o]}")
+            print(shown(f"    {o}  -- {why_lost[o]}"))
         if len(flagged) > 40:
-            print(f"    … and {len(flagged) - 40} more")
-        print("  FIX: delete the listed objects and rebuild, e.g.\n"
-              f"    (cd {build_dir} && rm -f <objects> && cmake --build . -- -k 0)\n"
-              "  `-k 0` collects EVERY failing target in one pass instead of stopping "
-              "at the first, which is what makes the rebuild an exhaustive proof "
-              "rather than a hopeful one. A line that says the tree CANNOT BE GUARDED "
-              "is not mended by a rebuild: it names what of the tree to move.")
+            print(shown(f"    … and {len(flagged) - 40} more"))
+        print(shown("  FIX: delete the listed objects and rebuild, e.g.\n"
+                    f"    (cd {build_dir} && rm -f <objects> && cmake --build . -- -k 0)\n"
+                    "  `-k 0` collects EVERY failing target in one pass instead of stopping "
+                    "at the first, which is what makes the rebuild an exhaustive proof "
+                    "rather than a hopeful one. A line that says the tree CANNOT BE GUARDED "
+                    "is not mended by a rebuild: it names what of the tree to move."))
         return 1
 
     skipped = len(empty) - len(flagged) - len(msvc_excused)
@@ -1014,9 +1041,9 @@ def check(build_dir, allow_non_ninja=False, deps=ninja_deps):
                  "these units is answered by the precompiled header its edge names or "
                  "lies where the reader drops it, so a zero record is the correct "
                  "record)")
-    print(f"ninja-deps: OK {build_dir} -- {total} objects, all carry header deps{note}")
+    print(shown(f"ninja-deps: OK {build_dir} -- {total} objects, all carry header deps{note}"))
     for o, why in msvc_excused[:40]:
-        print(f"    excused: {o}  <- {why}")
+        print(shown(f"    excused: {o}  <- {why}"))
     return 0
 
 
@@ -1047,6 +1074,12 @@ def _self_test_arms(arm):
         with _ctx.redirect_stdout(buf):
             rc = call()
         return rc, buf.getvalue()
+
+    def as_is(text):
+        """A stand-in for the redactor that shows a line as it is: an arm that reads what a
+        function DECIDES must not hang on what this host's own names mask (a host named like
+        a word it looks for). That every line passes the redactor is an arm of its own."""
+        return text
 
     def case(name, text, want_total, want_empty):
         problems = arm(name)
@@ -1129,6 +1162,10 @@ def _self_test_arms(arm):
                    (("#\\\ninclude <a.h>\n", [("a.h", False)]),
                     ("#inc\\\nlude <a.h>\n", [("a.h", False)]),
                     ('#include \\\r\n"a.h"\r\n', [("a.h", True)])))
+    directive_case("a directive: a byte order mark before the first line hides nothing",
+                   (('\ufeff#include "core/mine.hpp"\n#include <vector>\n',
+                     [("core/mine.hpp", True), ("vector", False)]),
+                    ("\ufeff%:include <a.h>\r\n", [("a.h", False)])))
     directive_case("a directive: `%:` is `#`",
                    (("%:include <a.h>\n", [("a.h", False)]),
                     ('  %: include "a.h"\n', [("a.h", True)])))
@@ -1247,7 +1284,7 @@ def _self_test_arms(arm):
             if kind != want_kind or says not in msg:
                 problems.append(f"it is {kind} ({msg}), want {want_kind} saying [{says}]")
             if kind != "run":
-                rc, out = printed(lambda: check(path, allow))
+                rc, out = printed(lambda: check(path, allow, shown=as_is))
                 if rc != want_rc:
                     problems.append(f"check() returned {rc}, want {want_rc}")
                 if says not in out:
@@ -1574,7 +1611,7 @@ def _self_test_arms(arm):
         # ── `check()` USES THE VERDICT: the text ninja would print is handed in ──────
         def check_case(name, tree, answer, want_rc, says, never=()):
             problems = arm(name)
-            rc, out = printed(lambda: check(str(tree), False, deps=lambda _dir: answer))
+            rc, out = printed(lambda: check(str(tree), False, deps=lambda _dir: answer, shown=as_is))
             unsaid = [s for s in says if s not in out]
             there = [s for s in never if s in out]
             if rc != want_rc or unsaid or there:
@@ -1605,6 +1642,30 @@ def _self_test_arms(arm):
                    2, ("FATAL", "exited 1", "error: loading build.ninja", "the check did not run"))
         check_case("check: an answer that names no object is FATAL", msvc_dir, ("", ""), 2,
                    ("FATAL", "parsed 0 objects"))
+
+        # ── `check()`: EVERY LINE IT PRINTS THROUGH THE REDACTOR, on each of its paths ──────
+        # The directory's name and an object's are each one the redactor must see: the mark
+        # stands in both, and a line printed past the redactor shows it.
+        problems = arm("check: every line it prints passes the redactor, on each of its paths")
+        hidden = "DSS-NINJA-DEPS-CHECK-MARK"
+        marked = Path(_tmp) / f"{hidden}-tree"
+        marked.mkdir()
+        (marked / "build.ninja").write_text("# marker\n", encoding="utf-8")
+
+        def hide(text):
+            return text.replace(hidden, "<masked>")
+
+        for which, where, answer, want_rc in (
+                ("a lost record", marked, (zero(f"t/{hidden}.obj"), ""), 1),
+                ("no zero record", marked,
+                 (f"t/{hidden}.obj: #deps 1, deps mtime 1 (VALID)\n    x.hpp\n\n", ""), 0),
+                ("ninja's own failure", marked, (None, f"`ninja -t deps` exited 1 in {marked}"), 2),
+                ("an answer that names no object", marked, ("", ""), 2),
+                ("a directory that is not there", Path(_tmp) / f"{hidden}-missing", ("", ""), 2)):
+            rc, out = printed(lambda: check(str(where), False, deps=lambda _dir: answer, shown=hide))
+            if rc != want_rc or hidden in out or "<masked>" not in out:
+                problems.append(f"with {which}, it returned {rc}, want {want_rc}, and printed "
+                                f"{out.count(hidden)} unmasked name(s): {hide(out)}")
 
         # ── `record()`: ONE record, of a directory of the program's own tree, every line
         # through the redactor ────────────────────────────────────────────────────────
@@ -1693,6 +1754,9 @@ def _self_test_arms(arm):
         # ── `main`: EVERY DIRECTORY NAMED IS CHECKED, and the worst exit code is the program's ──
         problems = arm("main: every directory named is checked, and the worst exit code is the "
                        "program's")
+        # `main` prints through the one redactor, so what it must say is that redactor's own
+        # rendering of it ON THIS HOST (a word of it may be the host's own name).
+        real = _redact().lazy_redactor(tree=repo_root(), places={"<temp>": tempfile.gettempdir()})
         for which, argv, want_rc, says in (
                 ("a directory that is no ninja tree, asked for as that",
                  [empty, "--allow-non-ninja"], 0, "--allow-non-ninja was passed"),
@@ -1702,7 +1766,7 @@ def _self_test_arms(arm):
                 ("a missing directory after it", [empty, missing, "--allow-non-ninja"], 2,
                  "does not exist")):
             rc, out = printed(lambda: main(list(argv)))
-            if rc != want_rc or says not in out:
+            if rc != want_rc or real(says) not in out:
                 problems.append(f"with {which}, it returned {rc}, want {want_rc} saying [{says}]; "
                                 f"printed [{out}]")
     finally:

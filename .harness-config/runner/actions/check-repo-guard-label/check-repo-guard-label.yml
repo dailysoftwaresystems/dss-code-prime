@@ -1,4 +1,4 @@
-# PURPOSE: refuse a configured build in which an entry that SELF-TESTS a program carries the `repo-guard` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it.
+# PURPOSE: refuse a configured build in which an entry labelled `self-test` carries the `repo-guard` label, or an entry whose command line asks a program for its self-test carries no `self-test` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it.
 name: check-repo-guard-label
 description: >-
   The action proves the rule's refusals on synthetic listings, with no build.

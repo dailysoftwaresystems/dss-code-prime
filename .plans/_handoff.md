@@ -568,6 +568,32 @@ round's close; each checkpoint's commit message says what was and was not run on
   line-endings false positive); NOT read by it: windows-x86_64-release (MSVC), the MSVC build's link cells. The
   lane's sweeps on its tree read all 20 of its arms `passed`. Folded onto checkpoint 29 with two clean three-way
   merges (`semantic_analyzer.cpp`, `c.lang.json`) and the census re-derived over both lanes' examples.
+  ✔MEASURED from the main checkout (2026-10-20), the whole suite of checkpoint 30 on all five legs: linux-x86_64-debug,
+  linux-arm64-debug and windows-x86_64-debug passed 2841; windows-x86_64-release 2834 of 2841 (the seven App
+  Execution Alias reds, defect (10)); macos-arm64-debug 2840 of 2841 (the Mac's Python floor). Its review: SEND BACK,
+  7 findings (1 MAJOR: a WEAK alias of a losing select-any copy withdrawn like a strong one), in that lane's next fold.
+- **Checkpoint 31 (2026-10-21) = the harness lane's fold H4**: every filesystem question in `src/` and
+  `integrated_tests/` is asked of the substrate (`entryKind`, `reachedKind`, `reachedFileSize`, `reachedPath`,
+  `walkTree`, `removeTree` in `src/core/substrate/path_identity`), so the MinGW build — whose library reads a link's
+  OWN attributes on Windows — answers a link and a dangling link as the MSVC build does: 39 sites in 14 files and three
+  probes routed; the MinGW removal that deleted a directory link's TARGET's files and the walks that followed links are
+  gone; `#embed` of a link is sized by what it reaches. One repo guard (`core/test_filesystem_queries_guard`,
+  labelled `repo-guard` beside its registration) refuses a `std::filesystem` kind, size, existence or canonical query
+  outside the substrate, with no exemption list. A dangling header link is no header under either case policy (fix
+  folded; `D-PP-HEADER-CASE-DANGLING-SYMLINK-ASYMMETRY` closes when its arms read `passed`). The Python interpreter is
+  chosen at configure by `cmake/DssPython.cmake`, at the floor the harness config states, never the WindowsApps App
+  Execution Alias — defect (10) FIXED; the line-endings guard's false positive and the Mac's Python floor fixed; a new
+  `check-conflict-markers` action and guard. ONE NEW DISCLOSED ROW, `D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK`,
+  closing on its 24 arms (13 of them on windows-x86_64-debug, swept from the main checkout). ✔MEASURED by the lane on
+  its final bytes: windows-x86_64-debug (MinGW-w64 GNU 13.2.0) 2861 of 2863, the two reds the anchor guards naming the
+  row this commit applies; windows-x86_64-release (MSVC 19.51) 2861 of 2863 and linux-arm64-debug passed 2842 on the
+  bytes before one label edit. Folded onto checkpoint 30 with one clean three-way merge (`src/program/program.cpp`)
+  and the arm registry merged by arm (930 arms, one retired). The same commit anchors what the round found in the
+  conformance corpus and in a release compile: six NEW DISCLOSED rows (five `@acknowledged-gap` probes that no row
+  named — the `va_*` keywords without `<stdarg.h>`, duplicate array-parameter qualifiers, the pe calling-convention
+  macros predefined without `<windows.h>`, GNU nested functions, GNU local labels — and the release-unit fixpoint
+  warning that tells a third of release compiles to raise a cap the design fixes), and the corpus's four probes added
+  to the existing open row on a string literal after a declarator (`D-CSUBSET-EXTERN-LIBRARY-SYNTAX-IS-NOT-VALID-C`).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -604,7 +630,9 @@ round's close; each checkpoint's commit message says what was and was not run on
   (10) OURS, ✔MEASURED by the link lane on windows-x86_64-release: `ninja_deps_selftest_guard` and
   `orphan_tests_guard` are red there — that build's CMake cache names the WindowsApps App Execution Alias for
   python3, and the test spawner refuses it as no executable; the harness lane's H4 classifies a candidate by asking
-  the OS. And on the Mac the one red of checkpoint 27 above (no Python floor) — the same fold.
+  the OS. And on the Mac the one red of checkpoint 27 above (no Python floor) — the same fold. Seven entries, not two,
+  were red on the MSVC leg by checkpoint 29 — FIXED by checkpoint 31 (the interpreter is chosen at configure and never
+  the alias; pinned on a build cache that names the alias).
   (11) An alias of a LOSING select-any copy still competes for its name (the review of checkpoint 27, ✔MEASURED by
   the C front end lane): the settled-order election is the C front end lane's fold f26 for the merge — FIXED IN THE
   MERGE by checkpoint 30 — and the link lane's next fold (3c) adopts the same function in the linker.
@@ -615,6 +643,17 @@ round's close; each checkpoint's commit message says what was and was not run on
   first element (`static const int z[2] = {0, 7}; if (!z) ...` folds true, so reachable code is marked unreachable).
   The library lane's next fold, first items: a folded constant states its C type, and braces are stepped through
   only for a scalar's initializer.
+- **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
+  fold** (each ✔MEASURED against the references; the lane's fold names its rows): SILENT miscompiles — a 32-bit
+  absolute relocation range-checked as signed for every kind (`R_X86_64_32` with −1 linked as 0xffffffff); arm64
+  `.long main` assembled as a branch relocation; two g++ objects' `inline` variable kept as TWO objects (STB_GNU_UNIQUE
+  read as local); a parenthesised name that an inner tag or a later declarator hides read as a CAST through an outer
+  typedef (`(T) - 2` runs −2 where the references run 42); `case 0, 42:` and `case y:` compiled without a diagnostic
+  (the comma's right operand; a run-time compare); a tentative `__declspec(dllimport) int x;` made a DEFINITION where
+  the references import. P0 — any foreign object named on DSS's command line bound no library import; a parenthesised
+  call chain parsed in time exponential in its depth. LOUD — every foreign PE object's unwind information dropped (a
+  `__try` object linked and crashed); the PE platform runtime has no `__chkstk` and no `/GS` family; `typeof` of a
+  variable-length array not lowered; no attribute may lead a block-scope `extern`.
 - **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).
   The sweep of 340 owed arms at checkpoint 20 (2026-10-15, `macos-arm64-debug`): 155 `passed`; 158 `violated`,
   18 `survived`, 6 `unattributed`, and 3 `stopped` because their runner's unmutated binary had a red in the worker

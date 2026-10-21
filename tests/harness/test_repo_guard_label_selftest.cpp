@@ -26,12 +26,14 @@ namespace {
 // The order is the program's. GENERATED from the program's own verdict lines; an arm added to the
 // program without a row here is a red of the set case below, by the arm's name.
 #define DSS_REPO_GUARD_LABEL_SELFTEST_ARMS(X)                                                                        \
-    X(ASelfTestFlagOnTheCommandLineMakesAnEntryASelfTestWhateverItsNameRefusedWithTheLabel,                            \
-      "a self-test flag on the command line makes an entry a self-test, whatever its name: refused with the label")    \
-    X(SelftestAndEitherFlagFollowedByWordAreSelfTestFlagsToo,                                                          \
-      "--selftest, and either flag followed by -<word>, are self-test flags too")                                      \
-    X(ANameHoldingSelftestMakesADriverEntryASelfTestRefusedWithTheLabel,                                               \
-      "a name holding selftest makes a driver entry a self-test: refused with the label")                              \
+    X(AnEntryCarryingBothLabelsIsRefusedWhateverItsNameAndItsCommandLine,                                              \
+      "an entry carrying both labels is refused, whatever its name and its command line")                              \
+    X(ACommandLineThatAsksAProgramForItsSelfTestWithNoSelfTestLabelIsRefusedWhateverItsName,                           \
+      "a command line that asks a program for its self-test, with no self-test label, is refused whatever its name")   \
+    X(SelftestEitherFlagFollowedByWordOrByValueAndEitherInAnyCaseAreSelfTestFlagsToo,                                  \
+      "--selftest, either flag followed by -<word> or by =<value>, and either in any case, are self-test flags too")   \
+    X(ANameHoldingSelftestIsNoPredicateAnEntryIsJudgedByItsLabelsTheControl,                                           \
+      "a name holding selftest is no predicate: an entry is judged by its labels (the control)")                       \
     X(ATreeCheckKeepsTheLabelAWordThatOnlyBeginsLikeAFlagIsNoneTheProgramSOwnPathIsNotReadAndA,                        \
       "a tree check keeps the label, a word that only begins like a flag is none, the program's own path is not read, and a self-test without the label passes (the control)") \
     X(AListingThatIsNoListingTooShortWithoutTheLabelOrWithoutASelfTestIsRefusedNeverJudged,                            \

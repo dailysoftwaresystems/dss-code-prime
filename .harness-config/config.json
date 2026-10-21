@@ -461,13 +461,40 @@
     },
     {
       "name": "python3",
+      // ★ THE REPOSITORY'S PYTHON FLOOR, STATED HERE ONCE. `cmake/DssPython.cmake` reads this
+      // `minVersion` and asks find_package(Python3 <floor> ... REQUIRED) for an interpreter at or
+      // above it, so every ctest entry -- every self-test of every Python program among them --
+      // runs on one, and a leg whose host has none is refused at configure, by name. The value is
+      // the newest line every Linux leg's own python already holds (✔MEASURED 2026-10-16 with
+      // `install-missing-tools --dry-run`: windows 3.14.3, WSL Ubuntu 3.12.3, arm64-vps 3.12.3,
+      // macOS 3.9.6 -- Apple's Command Line Tools python, past its end of life, the only one that
+      // host had), never an older one written for: a floor rises with the legs, it is no pin.
+      // macOS takes Homebrew's `python`, the latest; Apple's own stays where it is, and FindPython3
+      // looks past an interpreter below the floor wherever it looks.
+      // DssHarness holds every leg to this floor, runner steps included: of the copies a leg's host
+      // has, the first that meets it is the one a step's bare `python3` starts -- its directory goes
+      // ahead of the PATH, with every other program in it -- and a host with none turns the leg away
+      // (`skipped-tool-missing`) before anything runs (✔MEASURED 2026-10-16 on macos-arm64-debug,
+      // run 20261016-171600-ebcd7a22: a step's `python3` was /opt/homebrew/bin/python3, 3.15.0, ahead
+      // of Apple's 3.9.6; PATH's first entry /opt/homebrew/bin, so Homebrew's cmake came with it).
+      "minVersion": "3.12.0",
       "probe": {
         "args": [
           "--version"
         ],
         "regex": "Python (\\d+\\.\\d+\\.\\d+)"
       },
-      "why": "the configure step runs find_package(Python3 COMPONENTS Interpreter REQUIRED), and most repository guards registered as ctest entries are Python"
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "python3"
+        },
+        "macos": {
+          "manager": "brew",
+          "id": "python"
+        }
+      },
+      "why": "the configure step runs find_package(Python3 <this floor> COMPONENTS Interpreter REQUIRED) through cmake/DssPython.cmake, and most repository guards registered as ctest entries are Python"
     },
     // ⓘ NO `pwsh` AND NO `bash` ENTRY (removed 2026-09-23). An entry here is what
     // `install-missing-tools` probes and the allowlist for a run line's first program
@@ -912,6 +939,14 @@
         "linux-x86_64-debug"
       ],
       "action": "check-anchor-registry/check-anchor-registry.yml"
+    },
+    "check-conflict-markers": {
+      "description": "Refuse a merge-conflict marker line in any text file of the tree git tracks or would add: seven `<`, `|` or `>` at a line's start, and seven `=` alone between an opener and its closer.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-conflict-markers/check-conflict-markers.yml"
     },
     "check-diagnostic-codes": {
       "description": "Refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal.",

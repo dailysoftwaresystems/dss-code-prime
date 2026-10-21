@@ -1,1 +1,1 @@
-            elif c.lower() == name[n].lower():
+            hit = names_match(rule.pats, low, True)

@@ -541,12 +541,11 @@ the code will find it, with what was measured.
   with the three shared cases, registered under the entry's own ctest name in the test directory nearest its
   subject; one opt-in. ✔ Built so: the build stamp's entry, `build/build_stamp_identity`, the dependency-record
   check's, `ninja_deps_selftest_guard`, and the guard of orphan test sources, `orphan_tests_guard`.
-  ⚠ An entry that leaves the top-level CMakeLists for a test directory leaves the `repo-guard` label behind — the
-  label is given to the TOP directory's entries whose name ends in `guard` — so it runs on every leg. Say
-  where the entry is registered which it is: a self-test of a program's own rules belongs on every leg and
-  never carries the label (a host's paths are its own; `harness/repo_guard_label_check` refuses one that
-  does); a check of the source tree does not, and keeps the label by a `set_tests_properties` beside its
-  registration (`orphan_tests_guard` does).
+  ⚠ The opt-in gives the entry the `self-test` label — the one predicate of the `repo-guard` rule, stated
+  where that label is given — so such an entry never carries `repo-guard` and runs on every leg: a self-test
+  of a program's own rules reads the host's paths, which are its own. `harness/repo_guard_label_check`
+  refuses an entry carrying both labels, and an entry registered bare whose command line asks a program for
+  its self-test without the `self-test` label (`dss_label_self_test` gives it, right after the `add_test`).
   ⚠ A script that judges the TREE before it proves itself gives that judgement a verdict line and a case of its
   own. Whatever explains a red — the tree's red report, and a failing self-test arm's evidence (what it ran, and
   what that said) — goes to standard error: the driver keeps standard output in a file, and a red nobody can read

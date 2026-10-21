@@ -1,1 +1,1 @@
-            if (tree_ignores_detail::namesMatch(rule.pats, names)) decided = rule.negated ? nullptr : &rule;
+            if (hit) decided = rule.negated ? nullptr : &rule;

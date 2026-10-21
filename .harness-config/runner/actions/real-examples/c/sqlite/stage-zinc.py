@@ -322,6 +322,26 @@ def stage_one_cfg(key, answers, sqlite_cfg_h, dest_root):
     return out, "; ".join(notes)
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("stage-zinc: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main(argv=None):
     # ✔MEASURED, and CAUSED HERE: `stage-zinc.py --help` crashed on a Windows
     # console the moment this file's prose acquired a `★`. Python picks the
@@ -342,12 +362,12 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--zlib-h", required=True, help="the deriving host's zlib.h")
     p.add_argument("--zconf-h", required=True, help="the deriving host's zconf.h")
-    p.add_argument("--dest", required=True,
+    p.add_argument("--dest", required=True, type=_written_path_arg("--dest"),
                    help="the zinc/ ROOT — one subdirectory is written per stage")
     p.add_argument("--sqlite-cfg-h", default="",
                    help="the DERIVING host's generated sqlite_cfg.h (the one its "
                         "./configure wrote into the sqlite build dir)")
-    p.add_argument("--cfg-dest", default="",
+    p.add_argument("--cfg-dest", default=None, type=_written_path_arg("--cfg-dest"),
                    help="the cfg/ ROOT — one subdirectory is written per TARGET "
                         "OS, each holding that target's sqlite_cfg.h. A SEPARATE "
                         "root from --dest on purpose: the two families are keyed "

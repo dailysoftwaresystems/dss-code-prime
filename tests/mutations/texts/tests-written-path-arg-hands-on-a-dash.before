@@ -1,0 +1,1 @@
+            return written_path(value, flag)

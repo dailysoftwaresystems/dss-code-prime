@@ -55,6 +55,8 @@ namespace {
     X(ADirectiveACommentBeforeOrInsideItHidesNothing,                                                \
       "a directive: a comment before `#`, or inside the directive, hides nothing")                   \
     X(ADirectiveALineSpliceInsideItHidesNothing, "a directive: a line splice inside it hides nothing") \
+    X(ADirectiveAByteOrderMarkBeforeTheFirstLineHidesNothing,                                        \
+      "a directive: a byte order mark before the first line hides nothing")                          \
     X(ADirectiveTheDigraphIsTheHash, "a directive: `%:` is `#`")                                     \
     X(ADirectiveIncludeNextAndImportAreIncludes,                                                     \
       "a directive: `include_next` and `import` are includes")                                       \
@@ -163,6 +165,8 @@ namespace {
       "check: a manifest that cannot be read whole FAILS every zero record")                         \
     X(CheckNinjasOwnFailureIsFatal, "check: ninja's own failure is FATAL, said with what ninja said") \
     X(CheckAnAnswerThatNamesNoObjectIsFatal, "check: an answer that names no object is FATAL")       \
+    X(CheckEveryLineItPrintsPassesTheRedactorOnEachOfItsPaths,                                       \
+      "check: every line it prints passes the redactor, on each of its paths")                       \
     X(RecordOneRecordIsPrintedWholeThroughTheRedactor,                                               \
       "record: one record is printed whole, every line through the redactor")                        \
     X(RecordARecordThatHoldsNothingToMaskIsPrintedAsRecorded,                                        \

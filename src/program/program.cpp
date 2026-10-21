@@ -3366,32 +3366,35 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
     if (sources.empty()) return claims;   // this format realizes nothing
 
     std::map<std::string, std::vector<std::string>> declarers;
-    std::error_code ec;
-    fs::recursive_directory_iterator it{descriptorDir, ec};
-    if (ec) {
+    // The descriptors, collected by the substrate's walk -- which never descends a
+    // link on any build (libstdc++ on Windows cannot tell one from what it
+    // reaches: the substrate's header). The corpus root that cannot be walked is
+    // the refusal below; a directory under it that cannot be listed ends the walk
+    // there, as the iterator's error did.
+    std::vector<fs::path> descriptors;
+    auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
+        if (entry.reaches == core::EntryKind::File
+            && asciiLowerCopy(entry.path.extension().generic_string()) == ".json")
+            descriptors.push_back(entry.path);
+        return core::WalkStep::Continue;
+    });
+    if (walk.error && walk.where == descriptorDir) {
         emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                    "shipped-source realization: the descriptor corpus at '"
                    + core::genericSpelling(descriptorDir)
-                   + "' could not be walked (" + ec.message()
+                   + "' could not be walked (" + walk.error.message()
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
                      "cache keys on their CONTENT (the unit includes their "
                      "declarations). Refusing rather than keying without them.");
         return claims;
     }
-    for (fs::recursive_directory_iterator const end;
-         it != end;
-         it.increment(ec)) {
-        if (ec) break;
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        if (asciiLowerCopy(it->path().extension().generic_string()) != ".json")
-            continue;
+    for (fs::path const& descriptor : descriptors) {
         auto const declared =
-            dss::ffi::readShippedSourcesForFormat(it->path(), formatKey);
+            dss::ffi::readShippedSourcesForFormat(descriptor, formatKey);
         if (declared.empty()) continue;
         std::error_code relEc;
-        fs::path const rel = fs::relative(it->path(), configRoot, relEc);
+        fs::path const rel = fs::relative(descriptor, configRoot, relEc);
         // A descriptor outside the config root cannot be spelled
         // config-root-relatively, and the key document's whole point is that it
         // is portable between an installed tree and a source tree — so the
@@ -3401,7 +3404,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
         // and reports the miss where it is real.
         std::string const spelling =
             // The RELATIVE arm has no root to lose; the ABSOLUTE fallback does.
-            (relEc || rel.empty()) ? core::genericSpelling(it->path())
+            (relEc || rel.empty()) ? core::genericSpelling(descriptor)
                                    : rel.generic_string();
         for (auto const& source : declared)
             declarers[source].push_back(spelling);
@@ -3583,10 +3586,12 @@ public:
 
     ~RuntimeArchiveStaging() {
         if (dir_.empty()) return;
-        std::error_code ec;
-        fs::remove_all(dir_, ec);   // best-effort: a leaked temp dir is not a
-                                    // build failure, and on Windows a file the
-                                    // linker still has open cannot be unlinked.
+        // best-effort: a leaked temp dir is not a build failure, and on Windows a
+        // file the linker still has open cannot be unlinked. The substrate's
+        // removal, never `remove_all`: it takes a link as itself on every build
+        // (libstdc++'s `remove_all` on Windows empties a directory link's TARGET --
+        // the substrate's header has the measurement).
+        static_cast<void>(core::removeTree(dir_));
     }
 
     RuntimeArchiveStaging()                                        = default;
@@ -4208,7 +4213,7 @@ buildDependencyArtifactKey(
             stagingRoot / fs::path{claim.source}.stem();
         std::error_code mkEc;
         fs::create_directories(unitDir, mkEc);
-        if (mkEc && !fs::is_directory(unitDir)) {
+        if (std::error_code dirEc; mkEc && core::reachedKind(unitDir, dirEc) != core::EntryKind::Directory) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: could not create the "
                        "staging directory '" + core::genericSpelling(unitDir)

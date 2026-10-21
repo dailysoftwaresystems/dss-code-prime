@@ -527,7 +527,9 @@ def claim_rot_findings(repo):
     root = os.path.join(repo, CLAIM_ROT_ROOT)
     docs = sents = 0
     refused = []
-    for dp, _dn, fn in _walk(repo, root):
+    # A root that is not there reads no document, and the floor below collapses naming it; a root that is there
+    # and cannot be listed is the walk's own refusal.
+    for dp, _dn, fn in (_walk(repo, root) if os.path.isdir(root) else ()):
         for f in fn:
             if not f.endswith(".json"):
                 continue
@@ -803,7 +805,7 @@ def _write(p, s):
 # passed). Every arm -- a subprocess arm, an in-process claim-rot arm, a provider arm, a printed fact -- lands here
 # where it is judged, and `selftest` fails on any count but EXPECTED_ARMS.
 _RAN = []
-EXPECTED_ARMS = 68   # arm 1c retired on 2026-09-30 (M6: check-scripts-index clause 13); 11a, 11c, 11d 2026-10-15
+EXPECTED_ARMS = 69   # arm 1c retired on 2026-09-30 (M6: check-scripts-index clause 13); 11a, 11c, 11d 2026-10-15; 28 2026-10-16
 
 
 # ONE VERDICT LINE PER ARM, in the grammar `tests/test_support/script_selftest.hpp` reads: the ctest entry
@@ -1196,7 +1198,7 @@ def _claim_rot_arms(tmp):
 
 
 def _source_provider_arms(tmp):
-    """Arms 26-27: the `source` provider refuses a zero it cannot vouch for.
+    """Arms 26-28: the `source` provider refuses a zero it cannot vouch for, and reads what the walk reads.
 
     ⚠ These run the SHIPPED `source-census.py`, copied to its real path under a
     synthetic root, so what is measured is the resolution that ships rather than a
@@ -1205,8 +1207,12 @@ def _source_provider_arms(tmp):
     """
     ok = True
     real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "source-census.py")
+    # The provider loads its owner as a sibling (which tree, and what a walk of it leaves out),
+    # so the shipped one is copied beside it at its real path too.
+    real_owner = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "owning-tree", "owning-tree.py")
 
-    def run_provider(name, declaration, expect_rc, says):
+    def run_provider(name, declaration, expect_rc, says, extra=None):
         root = os.path.join(tmp, "srccensus-" + name)
         here = os.path.join(root, ACTIONS_REL, "check-doc-census")
         os.makedirs(here, exist_ok=True)
@@ -1215,6 +1221,11 @@ def _source_provider_arms(tmp):
         code = os.path.join(root, "src")
         os.makedirs(code, exist_ok=True)
         _write(os.path.join(code, "a.cpp"), "class P : public MirRebuildPolicy {};\n")
+        for rel, text in [(ACTIONS_REL.replace(os.sep, "/") + "/owning-tree/owning-tree.py", _read(real_owner))] \
+                + sorted((extra or {}).items()):
+            full = os.path.join(root, *rel.split("/"))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            _write(full, text)
         p = subprocess.run([sys.executable, os.path.join(here, "source-census.py"),
                             "--json", "--repo", root],
                            capture_output=True, text=True, encoding="utf-8",
@@ -1237,6 +1248,16 @@ def _source_provider_arms(tmp):
         json.dumps({"keys": {"policies": {"files": ["src/renamed/**/*.cpp"],
                                           "matchingLines": "public\\s+MirRebuildPolicy"}}}),
         EXIT_COLLAPSE, "matched NO file")
+    # 28 -- the census reads what a walk of the tree reads: a match inside a build the tree's own
+    #       `.gitignore` leaves out, and one inside `.git`, are not counted; the control's own is.
+    ok &= run_provider(
+        "28 PROVIDER-READS-WHAT-THE-TREE-KEEPS",
+        json.dumps({"keys": {"policies": {"files": ["src/**/*.cpp"],
+                                          "matchingLines": "public\\s+MirRebuildPolicy"}}}),
+        EXIT_OK, '"policies": 1',
+        extra={".gitignore": "build/\n",
+               "src/build/gen/b.cpp": "class Q : public MirRebuildPolicy {};\n",
+               "src/.git/c.cpp": "class R : public MirRebuildPolicy {};\n"})
     return ok
 
 

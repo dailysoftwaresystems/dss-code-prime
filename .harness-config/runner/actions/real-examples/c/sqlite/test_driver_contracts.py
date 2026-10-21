@@ -216,10 +216,7 @@ def rmtree_hard(path):
         if not os.path.lexists(path):
             return True
         try:
-            if sys.version_info >= (3, 12):
-                shutil.rmtree(path, onexc=_clear_readonly_and_retry)
-            else:
-                shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+            shutil.rmtree(path, onexc=_clear_readonly_and_retry)
         except OSError:
             pass
         if os.path.lexists(path):
@@ -3892,7 +3889,7 @@ def pin_dc32(t, x):
     # ★ A CONSUMER'S CHECKOUT GOES WITH ITS TREE (2026-10-01, the P69 review's MINOR 2): before its derive, a Windows
     # run lists the checkouts' records and has removed exactly those whose tree is gone from this host. The POSIX
     # side is scripted (its path translation too: the real one asks WSL).
-    side = types.SimpleNamespace(needs_wsl=True, argv=win_side.argv,
+    side = types.SimpleNamespace(needs_wsl=True, argv=win_side.argv, python_argv=win_side.python_argv,
                                  to_posix=lambda p: "/mnt/c/fake/" + os.path.basename(p))
     live = os.path.join(root, "live-tree")
     os.makedirs(live, exist_ok=True)
@@ -4716,7 +4713,7 @@ REDS = (
         expect=("K05", "K06", "K07"), stay_green=("K01", "K08")),
     red("RD-107", "DC-32", "build_and_test", "new (P69 hm, MINOR 2, 2026-10-01)",
         "derive a run's own checkout without recording the tree it belongs to (so it can never be judged gone)",
-        "        argv += [\"--consumer-of\", run.out_dir]\n", new="        argv += []\n",
+        "        args += [\"--consumer-of\", run.out_dir]\n", new="        args += []\n",
         expect=("K08",), stay_green=("K01", "K05", "K07")),
 )
 

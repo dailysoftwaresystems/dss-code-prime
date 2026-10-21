@@ -1927,7 +1927,7 @@ struct SynthBuilder {
             HeaderSearchResult r =
                 resolveInDir(dir, filename, headerNameMatching, headerSearch);
             if (r.status != HeaderSearchStatus::Found) return r;
-            if (!fs::is_regular_file(r.path, ec)) return HeaderSearchResult::notFound();
+            if (core::reachedKind(r.path, ec) != core::EntryKind::File) return HeaderSearchResult::notFound();
             return r;
         };
         // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `isRootedPath`, the
@@ -6156,11 +6156,16 @@ private:
         // hand back a DIRECTORY. Require a regular file (nullopt -> the caller's
         // loud unreadable diagnostic) so a directory-named resource fails LOUD,
         // never reads as a silently-empty embed.
+        //
+        // ★ THE SUBSTRATE IS ASKED, NEVER THE LIBRARY: a resource reached through a link is the bytes
+        // the link reaches, and a dangling one is none. libstdc++ on Windows sizes a file link by the
+        // LINK's own attributes (`fs::file_size` of a symlinked file: 0), so the MinGW build measured
+        // an EMPTY resource there -- `__has_embed` answered empty and the directive spliced nothing
+        // ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]).
         std::error_code ec;
-        if (!fs::is_regular_file(path, ec)) return std::nullopt;
-        auto const size = fs::file_size(path, ec);
-        if (ec) return std::nullopt;
-        return static_cast<std::uint64_t>(size);
+        auto const size = core::reachedFileSize(path, ec);
+        if (!size || ec) return std::nullopt;
+        return static_cast<std::uint64_t>(*size);
     }
 
     // FC17.9(h): read AT MOST `maxBytes` of `path` BINARY-exact into a string,

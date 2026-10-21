@@ -59,6 +59,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 
+#include "test_support/os_link.hpp"   // links made by the OS: MinGW's library makes none
 #include "test_support/repo_root.hpp"
 #include "test_support/scratch_dir.hpp"
 
@@ -234,25 +235,16 @@ TEST(PragmaOnceIncludeDedup, DedupsAHardLink) {
 TEST(PragmaOnceIncludeDedup, DedupsASymlink) {
     OnceFixture fx;
     fx.write("h.h", kOnceHeader);
-    std::error_code ec;
-    fs::create_symlink(fx.pathOf("h.h"), fx.pathOf("link.h"), ec);
-    if (ec) {
-        // ⚠ A NON-VACUOUS SKIP, AND THE REASON IS MEASURED RATHER THAN GUESSED.
-        // ✔MEASURED 2026-08-29 on the Windows leg: `fs::create_symlink` fails
-        // with "Function not implemented" — libstdc++/MinGW does not implement
-        // symlink CREATION on this host at all (its `read_symlink` reports the
-        // same), so this is a platform gap and NOT a privilege setting the
-        // operator could change. The POSIX legs (WSL x86_64, arm64 VPS, macOS)
-        // implement it and DO run this arm.
-        //
-        // ⚠ THE CELL IS STILL COVERED ON WINDOWS, JUST NOT FROM HERE. A symlink
-        // made with `cmd /c mklink` IS deduped by the shipped CLI — ✔MEASURED
-        // through `dsscp --compile`. And `DedupsAHardLink` above exercises the
-        // SAME `fs::equivalent` path unconditionally on every host, so a
-        // regression in that mechanism cannot hide behind this skip.
-        GTEST_SKIP() << "this host cannot create a symlink (" << ec.message()
-                     << "); NOT a passing assertion about `#pragma once`";
-    }
+    // ★ THE LINK IS THE OS'S, ON EVERY LEG. ✔MEASURED 2026-08-29 on the Windows
+    // leg: `fs::create_symlink` fails with "Function not implemented" — libstdc++
+    // on MinGW never asks the OS, whatever the privilege — and this case SKIPPED
+    // there. The link is now made by the OS's own call
+    // (`tests/test_support/os_link.hpp`), as `cmd /c mklink` made the one the
+    // shipped CLI was MEASURED to dedup, so the cell runs on that build as well.
+    std::error_code const ec = dss::test_support::makeSymbolicLink(
+        fx.pathOf("h.h"), fx.pathOf("link.h"), dss::test_support::LinkTo::File);
+    ASSERT_FALSE(ec) << "the OS refused to make a symbolic link here (" << ec.message()
+                     << "): NOT a passing assertion about `#pragma once`";
 
     PreprocessResult const r =
         ppMain("#include \"h.h\"\n#include \"link.h\"\n");
@@ -263,6 +255,20 @@ TEST(PragmaOnceIncludeDedup, DedupsASymlink) {
            "'Function not implemented' and `weakly_canonical` returns the LINK "
            "unchanged, so this cell is unreachable through path normalisation "
            "alone and `fs::equivalent` is what answers it";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+// An INCLUDE GUARD through a link: the header named by its link after its own name is spliced once on every
+// build -- the guard is a macro, and answers whatever identity the build gives the link.
+TEST(PragmaOnceIncludeDedup, AnIncludeGuardThroughASymlinkSplicesOnce) {
+    OnceFixture fx;
+    fx.write("g.h", "#ifndef PP_GUARD_THROUGH_A_LINK\n#define PP_GUARD_THROUGH_A_LINK\nint pp_once_marker;\n#endif\n");
+    std::error_code const ec = dss::test_support::makeSymbolicLink(
+        fx.pathOf("g.h"), fx.pathOf("glink.h"), dss::test_support::LinkTo::File);
+    ASSERT_FALSE(ec) << "the OS refused to make a symbolic link here (" << ec.message() << ")";
+
+    PreprocessResult const r = ppMain("#include \"g.h\"\n#include \"glink.h\"\n");
+    EXPECT_EQ(spliceCount(r), 1u) << "the guarded header and its link were spliced " << spliceCount(r) << " times";
     EXPECT_FALSE(r.diagnostics->hasErrors());
 }
 

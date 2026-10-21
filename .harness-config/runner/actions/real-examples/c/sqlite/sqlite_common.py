@@ -347,6 +347,16 @@ class PosixSide:
     def argv(self, args):
         return self.entry() + [str(a) for a in args]
 
+    def python_argv(self, script, *args):
+        """A Python program run on the POSIX side -- the ONE spelling every such child takes. On a POSIX host
+        that side IS this process's host, so THIS interpreter runs it (`python_argv`): never `python3` by name,
+        which there can be an older interpreter than the one the run started under (a macOS host's Command Line
+        Tools python, first on a PATH that lists a newer one after it). Inside WSL it is the distribution's own
+        `python3`: the one interpreter there, since this process's is a Windows program no other kernel runs."""
+        if not self.needs_wsl:
+            return python_argv(script, *args)
+        return self.argv(["python3", script] + [str(a) for a in args])
+
     def to_posix(self, path):
         """A host path in the POSIX side's namespace (`wslpath -a -u` inside WSL)."""
         if not self.needs_wsl:

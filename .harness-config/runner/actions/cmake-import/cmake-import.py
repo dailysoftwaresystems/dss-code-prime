@@ -733,10 +733,7 @@ def _remove_tree(path):
 
     if os.path.lexists(path):
         try:
-            if sys.version_info >= (3, 12):
-                shutil.rmtree(path, onexc=_writable_then_retry)
-            else:  # pragma: no cover - a pre-3.12 interpreter
-                shutil.rmtree(path, onerror=_writable_then_retry)
+            shutil.rmtree(path, onexc=_writable_then_retry)
         except OSError:
             pass
     return not os.path.lexists(path)

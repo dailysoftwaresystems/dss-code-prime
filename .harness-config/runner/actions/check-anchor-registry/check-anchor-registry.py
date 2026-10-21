@@ -75,9 +75,10 @@ DECISIONS (where the two predecessors disagreed, or both were blind)
   (g) an unreadable file, or a directory the walk cannot list, is a collapse (2).
   (h) any argument is a usage error (2): the guard has exactly one form.
   (i) an uncaught exception exits 2, never 1.
-  Excluded directories below a root (`worktrees`, `__pycache__`, `.git`) are pruned by
-  exact NAME below the root only -- a checkout whose ancestor happens to be named
-  `worktrees` still scans. Symlinked regular files are read.
+  A walk of a root leaves out what the tree leaves out -- what git ignores there, read from
+  the tree's own `.gitignore`, and `.git` (`owning-tree`'s `TreeIgnores`) -- and nothing
+  else: a checkout whose ancestor happens to be named `worktrees` still scans. Symlinked
+  regular files are read; a link to a directory is never descended.
 
 Exit codes: 0 clean · 1 an anchor resolves nowhere · 2 a scan collapsed · 3 a table
 row drops content · 4 a retired id is cited · 5 a quotation declaration is refused ·
@@ -134,10 +135,12 @@ ROOT_SPECS = (
     ("examples", 150, _SOURCE_GLOBS),
     ("docs", 8, ("*.md",)),
 )
-# Another checkout of this repository, bytecode, git's own directory: pruned by exact NAME
-# below a root. An agent's worktree under a scanned root would otherwise be scanned twice
-# and every document would face its own duplicate (measured once as six false LEAKED reds).
-EXCLUDE_DIRS = frozenset(("worktrees", "__pycache__", ".git"))
+# What a walk of a root leaves out is what the tree leaves out: what git ignores there, read
+# from the tree's own `.gitignore`, and `.git` -- `owning-tree`'s `TreeIgnores`, the one
+# statement every walker asks. Another checkout of this repository (`/.worktrees/`,
+# `.claude/worktrees/`) and bytecode (`__pycache__/`) are among it; an agent's worktree under a
+# scanned root would otherwise be scanned twice and every document would face its own duplicate
+# (measured once as six false LEAKED reds). This guard skips nothing git does not ignore.
 
 # ── the cell-width scan ────────────────────────────────────────────────────────────────
 CELL_WIDTH_ROOT = ".plans"
@@ -235,22 +238,22 @@ def lines_of(text):
     return [p[:-1] if p.endswith("\r") else p for p in parts]
 
 
-def _walk_error(exc):
-    raise ScanError("cannot list %s (%s)" % (getattr(exc, "filename", None) or "?",
-                                             getattr(exc, "strerror", None) or exc))
-
-
-def _walk_files(top, prune):
+def _walk_files(top, tree=None):
     """Every regular file (a symlink to one included) under `top`, as `/`-joined paths
-    relative to it, ordinal order. `prune` names directories skipped BELOW `top` by exact
-    name. A directory that cannot be listed raises ScanError (fail closed)."""
+    relative to it, ordinal order, less what the tree `top` belongs to leaves out (`TreeIgnores`
+    of `tree`; default `top` itself, a tree of its own). A directory that cannot be listed, and a
+    path the reader cannot answer as git does, raise ScanError (fail closed)."""
+    ot = _owning_tree()
     out = []
-    for dirpath, dirnames, filenames in os.walk(top, onerror=_walk_error):
-        dirnames[:] = sorted(d for d in dirnames if d not in prune)
-        for fn in filenames:
-            full = os.path.join(dirpath, fn)
-            if os.path.isfile(full):
-                out.append(os.path.relpath(full, top).replace(os.sep, "/"))
+    try:
+        for dirpath, dirnames, filenames in ot.TreeIgnores(top if tree is None else tree).walk(top):
+            dirnames.sort()
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                if os.path.isfile(full):
+                    out.append(os.path.relpath(full, top).replace(os.sep, "/"))
+    except ot.Refusal as exc:
+        raise ScanError("cannot walk %s (%s)" % (top, exc))
     return sorted(out)
 
 
@@ -379,14 +382,14 @@ class RootScan:
         self.label, self.ok, self.anchors, self.files, self.msgs = label, False, set(), [], []
 
 
-def root_files(root_path, globs):
+def root_files(root_path, globs, tree=None):
     """The files of one root this guard reads: include globs (decision b), dotfiles
-    included, EXCLUDE_DIRS pruned below the root."""
-    return [rel for rel in _walk_files(root_path, EXCLUDE_DIRS)
+    included, less what the tree leaves out (`_walk_files`)."""
+    return [rel for rel in _walk_files(root_path, tree)
             if glob_hit(rel.rsplit("/", 1)[-1], globs)]
 
 
-def scan_root(root_path, label, floor, globs, sink=None):
+def scan_root(root_path, label, floor, globs, sink=None, tree=None):
     """-> RootScan. The root must exist, be fully readable, and clear its floor of DISTINCT
     anchors; only then are they added to `sink`. Messages are returned, never printed."""
     rs = RootScan(label)
@@ -396,7 +399,7 @@ def scan_root(root_path, label, floor, globs, sink=None):
                        "pass." % label)
         return rs
     try:
-        for rel in root_files(root_path, globs):
+        for rel in root_files(root_path, globs, tree):
             shown = label + "/" + rel
             fs = scan_text(shown, read_text(os.path.join(root_path, rel), shown))
             rs.files.append(fs)
@@ -423,7 +426,7 @@ def scan_root(root_path, label, floor, globs, sink=None):
 # ── the plans: one read serves the cell-width scan, the resolve and the registry ───────
 
 class PlanFiles:
-    """Every `*.md` under `.plans/` (recursive, dotfiles included, nothing pruned), read once."""
+    """Every `*.md` under `.plans/` (recursive, dotfiles included, less what the tree leaves out), read once."""
 
     def __init__(self, tree):
         self.tree = tree
@@ -435,7 +438,7 @@ class PlanFiles:
         if not self.exists:
             return
         try:
-            rels = [r for r in _walk_files(self.root, frozenset()) if r.endswith(".md")]
+            rels = [r for r in _walk_files(self.root, tree) if r.endswith(".md")]
         except ScanError as exc:
             self.errors.append(str(exc))
             return
@@ -473,7 +476,7 @@ def plans_everything_text(tree, md_texts):
     root = os.path.join(tree, CELL_WIDTH_ROOT)
     have = dict(md_texts)
     parts = []
-    for r in _walk_files(root, frozenset()):
+    for r in _walk_files(root, tree):
         rel = CELL_WIDTH_ROOT + "/" + r
         parts.append(have[rel] if rel in have else read_text(os.path.join(root, r), rel))
     return "\n".join(parts)
@@ -673,7 +676,7 @@ def verify(tree, specs=None, cw_floors=None, out=None, err=None):
     # The roots: every failing root is reported before the exit.
     anchors, scans, failed = set(), [], False
     for root, floor, globs in specs:
-        rs = scan_root(os.path.join(tree, root), root, floor, globs, anchors)
+        rs = scan_root(os.path.join(tree, root), root, floor, globs, anchors, tree)
         for m in rs.msgs:
             err(m)
         failed = failed or not rs.ok
@@ -820,7 +823,7 @@ def _retired_locator(tree, specs, rid):
         if not os.path.isdir(base):
             continue
         try:
-            rels = root_files(base, globs)
+            rels = root_files(base, globs, tree)
         except ScanError as exc:
             lines_out.append("      %s: %s" % (root, exc))
             continue
@@ -1308,14 +1311,18 @@ def _arms_file_selection(arms, st):
     arms.run("a-dotfile-is-collected", cat, lambda: (
         "True", str(a[0] in collected(dot, ("*.json",)))))
 
+    # What the tree's own `.gitignore` leaves out, and `.git`, is not read -- a scratch directory
+    # below another directory among it (`tests/.temp/notes.md` under an unanchored `.temp/`) --
+    # and a directory whose name merely begins like one stays.
     pruned = _box(base, "pruned")
+    _write(pruned, ".gitignore", ".temp/\nworktrees/\n__pycache__/\n")
     _write(pruned, "keep/k.md", "%s\n" % a[1])
-    for d in sorted(EXCLUDE_DIRS):
-        _write(pruned, d + "/copy/x.md", "%s\n" % a[2])
+    for d in ("tests/.temp", "worktrees", "__pycache__", ".git"):
+        _write(pruned, d + "/copy/notes.md", "%s\n" % a[2])
     _write(pruned, "keep/worktrees-notes/y.md", "%s\n" % a[3])
-    arms.run("excluded-directories-below-a-root-are-pruned-by-exact-name", cat, lambda: (
-        "kept=True pruned=True near-name-kept=True",
-        "kept=%s pruned=%s near-name-kept=%s" % (
+    arms.run("what-the-trees-gitignore-leaves-out-below-a-root-is-not-read", cat, lambda: (
+        "kept=True left-out=True near-name-kept=True",
+        "kept=%s left-out=%s near-name-kept=%s" % (
             a[1] in collected(pruned), a[2] not in collected(pruned),
             a[3] in collected(pruned))))
 
@@ -1469,7 +1476,7 @@ def _arms_plumbing(arms, st):
         box = _box(st, "unlistable")
         path = _write(box, "a-file.md", "x\n")
         try:
-            _walk_files(path, frozenset())
+            _walk_files(path)
             return ("ScanError", "no error")
         except ScanError:
             return ("ScanError", "ScanError")

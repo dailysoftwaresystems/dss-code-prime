@@ -439,8 +439,9 @@ class TreeVocabulary:
     """The file and directory NAMES under a tree and every (parent, child) name PAIR -- what the tree itself says
     (rule 15's exemption): what git does not ignore there, and the build directory whole (VOCAB_KEEP), asked of the
     one reader. Walked once; bounded, so a walk cut short keeps fewer names, never more; a tree whose `.gitignore`
-    cannot be read as git reads it keeps none. `fold` compares names as the host's file system does
-    (case-insensitively on Windows)."""
+    cannot be read as git reads it keeps none, and `why` says what refused it ("" for a walk that ran) -- a refusal
+    and a time bound both keep fewer names, and a report that said both alike hid the refusal (read-leg-path's OK
+    line says which). `fold` compares names as the host's file system does (case-insensitively on Windows)."""
 
     def __init__(self, tree, os_family, max_entries=VOCAB_MAX_ENTRIES, max_seconds=VOCAB_MAX_SECONDS):
         self.fold = (lambda s: s.casefold()) if os_family == "windows" else (lambda s: s)
@@ -478,11 +479,11 @@ class TreeText:
     of the one reader; never the redactor's own (TEXT_SKIP_PATHS: its fixtures spell host names to mask them), never
     a secret path (rule 2's), a file over TEXT_MAX_FILE_BYTES or one holding a NUL. Walked once; bounded by
     TEXT_MAX_SECONDS, so a walk cut short keeps FEWER compounds, never more; a tree whose `.gitignore` cannot be read
-    as git reads it keeps none."""
+    as git reads it keeps none, and `why` says what refused it, as the names walk's does."""
 
     def __init__(self, tree, names, max_seconds=None):
         max_seconds = TEXT_MAX_SECONDS if max_seconds is None else max_seconds
-        self.compounds, self.files, self.complete = set(), 0, True
+        self.compounds, self.files, self.complete, self.why = set(), 0, True, ""
         words = sorted({n for n in names if n}, key=len, reverse=True)
         start = time.monotonic()
         if not words:
@@ -502,8 +503,9 @@ class TreeText:
                 for dirpath, dirs, files in ignores.walk(top):
                     dirs[:] = sorted(d for d in dirs if os.path.normcase(os.path.join(dirpath, d)) not in skip)
                     paths += [os.path.join(dirpath, f) for f in sorted(files)]
-        except Exception:  # noqa: BLE001 - what the tree's text spells is unknown: nothing is kept, never more
-            self.complete, self.seconds = False, time.monotonic() - start
+        except Exception as exc:  # noqa: BLE001 - what the tree's text spells is unknown: nothing is kept, never more
+            self.complete, self.why = False, "%s: %s" % (type(exc).__name__, exc)
+            self.seconds = time.monotonic() - start
             return
         paths = [p for p in paths if not (_SECRET_COMPONENT.search(p) or _KEY_FILE_LAST.search(p))]
         for path in paths:
@@ -1009,7 +1011,7 @@ def _mask_ssh_line(line, host_anywhere, own):
 # block that silently stopped running -- is a red, not a smaller green. The count is host-independent: every arm
 # below is synthetic except "this host's and the declared names never survive", which is ONE arm however many texts
 # it checks.
-EXPECTED_ARMS = 255
+EXPECTED_ARMS = 258
 
 
 def self_test():
@@ -1036,6 +1038,20 @@ def self_test():
         got = red(text)
         arm(label, got == want, "%s%r -> %r, want %r" % ("a mark was read as a name: " if "<<" in got else "", text,
                                                          got, want))
+
+    def kept(label, red, text):
+        """`same` for a text a fact of the tree keeps whole, whose detail says first what the redactor masked in it."""
+        got = red(text)
+        marks = sorted(set(re.findall(r"<(\w+)>", got)) - set(re.findall(r"<(\w+)>", text)))
+        arm(label, got == text, "%s%r -> %r, want it kept" % (
+            ("masked as %s a name the tree gives: " % " and ".join(marks)) if marks else "", text, got))
+
+    def masked(label, red, text, want, holder):
+        """`same` for a text no fact of the tree keeps, whose detail says first when it was kept whole and what
+        alone holds it (`holder`): the value a red of it names, never only the comparison every red prints."""
+        got = red(text)
+        arm(label, got == want, "%s%r -> %r, want %r" % (("kept %s, which %s: " % (text, holder)) if got == text
+                                                         else "", text, got, want))
 
     none = {"accounts": (), "hosts": (), "items": ()}   # synthetic arms never depend on this host's ssh items
     posix = redactor(user="lnxacct", host="h9.example", home="/home/lnxacct", os_family="posix", declared=none)
@@ -1306,7 +1322,7 @@ def self_test():
                        declared=none)
         for text in ("bin/syn/syn_examples_runner", "loading src/syn-config/x.json", "running syn_examples_runner",
                      "<tree>/build/v1/bin/syn/"):
-            same("KEPT, the tree names it: %r" % text, syn, text, text)
+            kept("KEPT, the tree names it: %r" % text, syn, text)
         for text, want in (("ubuntu@syn:~$ ls", "<user>@<host>:~$ ls"), ("Linux syn 6.8.0", "Linux <host> 6.8.0"),
                            ("ssh syn", "ssh <host>"), ("syn.local", "<host>.local"), ("syn-mac", "<host>-mac"),
                            ("x@syn.example:", "<user>@<host>:"), ("//syn/share", "//<host>/share"),
@@ -1315,7 +1331,8 @@ def self_test():
             same("MASKED, a host position or no tree fact: %r" % text, syn, text, want)
         for text, want in (("syn-legcopy", "<host>-legcopy"), ("syn-worker", "<host>-worker"),
                            ("syn-scratch", "<host>-scratch")):
-            same("MASKED, a name only what git ignores holds is no tree fact: %r" % text, syn, text, want)
+            masked("MASKED, a name only what git ignores holds is no tree fact: %r" % text, syn, text, want,
+                   "only what git ignores holds")
         with tempfile.TemporaryDirectory() as tmp_refused:
             refused_tree = os.path.realpath(tmp_refused)
             os.makedirs(os.path.join(refused_tree, "build", "v1", "bin", "syn"))
@@ -1326,6 +1343,20 @@ def self_test():
                  redactor(tree=refused_tree, user="ubuntu", host="syn.example", home="/home/ubuntu",
                           os_family="posix", declared=none),
                  "bin/syn/syn_examples_runner", "bin/<host>/<host>_examples_runner")
+            same("...and keeps no dotted compound by (K3): its text walk is refused too",
+                 redactor(tree=refused_tree, user="ubuntu", host="syn.example", home="/home/ubuntu",
+                          os_family="posix", declared=none),
+                 "the syn.mir dialect", "the <host> dialect")
+            # ...and each walk SAYS what refused it: a refusal and a time bound keep fewer alike, and a report
+            # that could not tell them apart hid the refusal (read-leg-path's OK line prints the reason).
+            names_walk = TreeVocabulary(refused_tree, "posix")
+            arm("a refused names walk keeps nothing and says what refused it", not names_walk.names
+                and not names_walk.complete and "Refusal" in names_walk.why and "line 2" in names_walk.why,
+                "names kept %d, why %s" % (len(names_walk.names), names_walk.why or "unsaid"))
+            text_walk = TreeText(refused_tree, {"syn"})
+            arm("a refused text walk keeps nothing and says what refused it", not text_walk.compounds
+                and not text_walk.complete and "Refusal" in text_walk.why and "line 2" in text_walk.why,
+                "compounds kept %d, why %s" % (len(text_walk.compounds), text_walk.why or "unsaid"))
         no_tree = redactor(user="ubuntu", host="syn.example", home="/home/ubuntu", os_family="posix", declared=none)
         same("without a tree nothing is kept", no_tree, "bin/syn/syn_examples_runner",
              "bin/<host>/<host>_examples_runner")
@@ -1362,12 +1393,13 @@ def self_test():
             and walked_early is None and after == "the syn.mir dialect" and text_vocab is not None
             and text_vocab.files >= 1, "%r %r %r" % (before, after, walked_early))
         for text in ("SYN.DevOps", "ran syn.macho_arm64_exit"):
-            same("KEPT, the tree's text spells it: %r" % text, fresh, text, text)
+            kept("KEPT, the tree's text spells it: %r" % text, fresh, text)
         for text, want in (("syn.corp is up", "<host> is up"), ("syn.devops", "<host>"),
                            ("syn.secret ran", "<host> ran"), ("syn.fixture", "<host>"), ("syn.envtoken", "<host>")):
             same("MASKED, a compound the tree's text does not give: %r" % text, fresh, text, want)
         for text in ("syn.scratchnote", "syn.toplocal"):
-            same("MASKED, a compound only a file git ignores spells: %r" % text, fresh, text, "<host>")
+            masked("MASKED, a compound only a file git ignores spells: %r" % text, fresh, text, "<host>",
+                   "only a file git ignores spells")
         # (K3) never keeps a KNOWN name, though the tree's text spells all three: the host's full name (a whole word,
         # which rule 15 masks before K is asked), a name under its domain, and one ending in the full name -- the last
         # two are K3's own refusal, which the first cannot witness.

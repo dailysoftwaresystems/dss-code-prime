@@ -15,6 +15,12 @@ dss_add_test(NAME harness/test_sqlite_harness_legs
 # two corpus runners take for the same reason.
 target_link_libraries(dss_harness_test_sqlite_harness_legs
                       PRIVATE nlohmann_json::nlohmann_json)
+# The interpreter every `harness_legs.py` run of this test starts: the one find_package chose at or
+# above the repository's Python floor, handed in by the top-level CMakeLists's declaration
+# `sqlite_harness_legs` -- never a `python3` looked up on the PATH ctest runs under. The opt-in also
+# declares the resolver as an input of the test's object, and gives the entry the `self-test` label:
+# it runs the resolver's own self-test among its cases.
+dss_use_script_selftest(dss_harness_test_sqlite_harness_legs sqlite_harness_legs)
 
 # THE NINJA DEPENDENCY-RECORD CHECK'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry
 # `ninja_deps_selftest_guard`. `.harness-config/runner/actions/check-ninja-deps/
@@ -25,9 +31,9 @@ target_link_libraries(dss_harness_test_sqlite_harness_legs
 # entry: until 2026-10-10 the program was started bare by ctest, one verdict for every
 # arm and no test binary, so no mutation of the program could be an arm of the mutation
 # sweep, which starts a test binary whole and judges the exact set of cases that go red.
-# ⓘ The name ends in `guard` and the entry carries NO `repo-guard` label: that label is
-# given to the top directory's entries. This one proves a program's rules on the host's
-# own paths, which every leg has its own of, so it runs on every leg.
+# ⓘ The name ends in `guard` and the entry carries NO `repo-guard` label: it self-tests a
+# program -- the opt-in below gives it the `self-test` label -- on the host's own paths,
+# which every leg has its own of, so it runs on every leg.
 dss_add_test(NAME ninja_deps_selftest_guard
              SOURCES test_ninja_deps_selftest.cpp)
 # The opt-in (top-level CMakeLists, `dss_use_script_selftest`): the generated header that
@@ -48,13 +54,10 @@ dss_use_script_selftest(dss_ninja_deps_selftest_guard ninja_deps)
 dss_add_test(NAME orphan_tests_guard
              SOURCES test_orphan_tests_selftest.cpp)
 dss_use_script_selftest(dss_orphan_tests_guard orphan_tests)
-# ★ `repo-guard`, SET BY HAND, unlike its neighbour above: the label scan of the top-level
-# CMakeLists reads the top directory's entries, and this one is registered here. It keeps
-# the label it carried there because what it judges is the SOURCE TREE, the same bytes on
-# every leg, so an indirect leg re-reading it learns nothing — the ruling the label exists
-# for. The mutation sweep starts the binary itself and asks no label.
-set_tests_properties(orphan_tests_guard PROPERTIES LABELS "repo-guard")
-message(STATUS "repo-guard label applied to 1 additional test (orphan_tests_guard), registered in tests/harness")
+# ⓘ NO `repo-guard` label since 2026-10-16 (it carried one, set by hand here): the opt-in above gives
+# it the `self-test` label, as every script self-test's -- the rule stated where `repo-guard` is
+# given. Beside the tree's own census it proves each refusal on a mirror of the tests root, and a
+# mirror's verdict is the host's (its file system, its CMake's extension lists), so every leg runs it.
 
 # THE TREE OWNER, THE DOCUMENTED-FIGURE CENSUS AND THE ONE REDACTOR, ONE CASE PER ARM — the
 # ctest entries `owning_tree_selftest_guard`, `doc_census_selftest_guard` and
@@ -105,3 +108,22 @@ dss_use_script_selftest(dss_harness_profile_compile_selftest profile_compile)
 dss_add_test(NAME harness/repo_guard_label_selftest
              SOURCES test_repo_guard_label_selftest.cpp)
 dss_use_script_selftest(dss_harness_repo_guard_label_selftest repo_guard_label)
+
+# THE LINE-ENDINGS GUARD'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry `harness/line_endings_selftest`.
+# `check-line-endings.py --selftest` proves its byte tiers and check F's rules on fixture repositories --
+# among them that a detector verb counts only as a WORD, so a CR pattern beside `target` or `merge` is no
+# CR instrument -- and prints one verdict line per arm; this binary reads each into a case, so a mutation
+# of the guard can be an arm of the mutation sweep. The entry `line_endings_guard` (top-level CMakeLists)
+# still judges the tree, after the same self-test run quietly. ⓘ No label: a self-test, on every leg.
+dss_add_test(NAME harness/line_endings_selftest
+             SOURCES test_line_endings_selftest.cpp)
+dss_use_script_selftest(dss_harness_line_endings_selftest line_endings)
+
+# THE CONFLICT-MARKER GUARD'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry `harness/conflict_markers_selftest`.
+# `check-conflict-markers.py --self-test` proves which lines are a merge-conflict marker, that a separator is one
+# only inside a conflict, and that a conflict git itself writes is refused line by line; this binary reads each
+# verdict into a case. The entry `conflict_markers_guard` (top-level CMakeLists) judges the tree. ⓘ No label: a
+# self-test, on every leg.
+dss_add_test(NAME harness/conflict_markers_selftest
+             SOURCES test_conflict_markers_selftest.cpp)
+dss_use_script_selftest(dss_harness_conflict_markers_selftest conflict_markers)

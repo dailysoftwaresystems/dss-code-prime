@@ -391,26 +391,27 @@ def repo_root():
 
 
 def _walk(root, rel_roots, keep):
-    """Every file under `rel_roots` whose name satisfies `keep`, repo-relative."""
-    out = []
-    for rel_root in rel_roots:
-        base = os.path.join(root, rel_root)
-        if not os.path.isdir(base):
-            continue
-        for dirpath, dirnames, files in os.walk(base):
-            # `build` is generated and enormous; `worktrees` is another checkout
-            # and would double-count every file it holds. `artifacts` is the other name
-            # DssHarness reserves under every action for a run's KEPT output (`help
-            # runners`: neither name may appear on an action's path), so nothing tracked
-            # can live in one -- ✔MEASURED 2026-09-18, `git ls-files` holds no path with
-            # an `artifacts/` segment -- and a run's output is not documentation.
-            dirnames[:] = [d for d in dirnames
-                           if d not in ("__pycache__", "worktrees", "build", "artifacts",
-                                        ".git")]
-            for f in files:
-                if keep(f):
-                    rel = os.path.relpath(os.path.join(dirpath, f), root)
-                    out.append(rel.replace(os.sep, "/"))
+    """Every file under `rel_roots` whose name satisfies `keep`, repo-relative, less what the tree
+    leaves out: what git ignores there, read from the tree's own `.gitignore`, and `.git`
+    (`owning-tree`'s `TreeIgnores`, the one statement every walker asks) -- a build (`build/`, at
+    any depth), another checkout (`/.worktrees/`, `.claude/worktrees/`), bytecode, an action's kept
+    run output (`<action>/artifacts/`) among it. This guard skips nothing git does not ignore. A
+    directory the walk cannot list, and a path the reader cannot answer as git does, collapse."""
+    ot = _owning_tree()
+    try:
+        ignores = ot.TreeIgnores(root)
+        out = []
+        for rel_root in rel_roots:
+            base = os.path.join(root, rel_root)
+            if not os.path.isdir(base):
+                continue
+            for dirpath, _dirnames, files in ignores.walk(base):
+                for f in files:
+                    if keep(f):
+                        rel = os.path.relpath(os.path.join(dirpath, f), root)
+                        out.append(rel.replace(os.sep, "/"))
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
     return sorted(out)
 
 
@@ -759,7 +760,7 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 48   # arm 2c retired on 2026-09-30 (M6: check-scripts-index clause 13)
+EXPECTED_ARMS = 49   # arm 2c retired on 2026-09-30 (M6: check-scripts-index clause 13); WALK-ASKS-THE-TREE added 2026-10-16
 # A documentation root cut down to this many documents is a COLLAPSE (arms 5c, 11c): every
 # floor in `DOC_ROOT_FLOORS` must sit above it, or those arms fail.
 PARTIAL_DOCS = 10
@@ -936,15 +937,20 @@ def selftest(root):
         # ⚠ THE CODE ROOTS ARE COPIED WITH AN EXTENSION FILTER, NOT WHOLESALE.
         # A faithful replica is what makes arm 0 mean anything, but `src` + `tests`
         # + `examples` also carry generated trees; copying only the extensions the
-        # census actually reads keeps the replica exact for this guard's purpose
-        # while leaving `build/` behind.
+        # census actually reads, less what the LIVE tree leaves out (its `TreeIgnores`,
+        # the walk's own statement -- the replica holds no `.gitignore`, so its walk
+        # reads exactly what was copied), keeps the replica exact for this guard's
+        # purpose while leaving `build/` behind. A link is a file here, as the walk
+        # takes it: never copied as the directory it may point at.
+        live_ignores = _owning_tree().TreeIgnores(root)
+
         def _drop(dirpath, names):
             drop = []
             for n in names:
                 full = os.path.join(dirpath, n)
-                if os.path.isdir(full):
-                    if n in ("__pycache__", "worktrees", "build", ".git"):
-                        drop.append(n)
+                is_dir = os.path.isdir(full) and not os.path.islink(full)
+                if live_ignores.leaves_out(live_ignores.rel(full), is_dir):
+                    drop.append(n)
                 # ⚠ `.md` STAYS SPELLED OUT HERE EVEN THOUGH `CODE_EXTS` NOW
                 # LISTS IT. `documents()` reads markdown unconditionally, so the
                 # replica owes it markdown regardless of what the OTHER family's
@@ -953,7 +959,7 @@ def selftest(root):
                 # the replica lost `.plans/_handoff.md` and the whole suite died
                 # on a `FileNotFoundError` before arm 0 -- a suite that cannot
                 # report is worse than one that fails.
-                elif not n.endswith(CODE_EXTS + (".md",)):
+                elif not is_dir and not n.endswith(CODE_EXTS + (".md",)):
                     drop.append(n)
             return drop
 
@@ -961,6 +967,24 @@ def selftest(root):
         refusal = floor_table_refusal(SCAN_ROOTS + ("docs",), DOC_ROOT_FLOORS)
         ok &= _fact("FLOOR-TABLE-REFUSES-ROOT", bool(refusal) and "'docs'" in refusal, refusal or "no refusal")
         ok &= _fact("FLOOR-TABLE-LIVE-WHOLE", floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS) is None)
+
+        # The walk leaves out what the tree leaves out, nothing more: a session's scratch below a
+        # governed root (`tests/.temp/notes.md`, under the tree's unanchored `.temp/` rule) and
+        # `.git` are no governed files; the root's other files, and a name that merely begins like
+        # a left-out one (`tests/.temporary/`), are.
+        fx = tempfile.mkdtemp(prefix="plan-citations-ignores-")
+        try:
+            for rel, text in ((".gitignore", ".temp/\n"), ("tests/.temp/notes.md", "x\n"),
+                              ("tests/.git/x.md", "x\n"), ("tests/kept.md", "x\n"),
+                              ("tests/.temporary/kept.md", "x\n")):
+                os.makedirs(os.path.dirname(os.path.join(fx, rel)) or fx, exist_ok=True)
+                with open(os.path.join(fx, rel), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+            walked = code_files(fx)
+        finally:
+            shutil.rmtree(fx, ignore_errors=True)
+        ok &= _fact("WALK-ASKS-THE-TREE", walked == ["tests/.temporary/kept.md", "tests/kept.md"],
+                    "walked %r" % (walked,))
 
         for rel_root in SCAN_ROOTS + CODE_ROOTS:
             src = os.path.join(root, rel_root)

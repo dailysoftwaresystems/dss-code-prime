@@ -742,7 +742,7 @@ def sqlite_checkout(run):
 
 def _posix_stage_cli(run, args, what):
     """`sqlite_stage.py <args>` on the POSIX side, through the run's one route into it -> its JSON answer."""
-    argv = run.posix.argv(["python3", run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py"))] + list(args))
+    argv = run.posix.python_argv(run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py")), *args)
     r = C.capture(argv, timeout=300)
     text = (r.out or "").replace("\0", "").strip()
     if r.rc != 0:
@@ -785,20 +785,21 @@ def prune_gone_consumers(run, is_dir=os.path.isdir):
 
 
 def derive_argv(run, sb_path):
-    """The POSIX side's `sqlite_stage.py derive` command of a Windows run (Steps 3+4): a run staging from its own
-    consumer checkout names the tree it belongs to (`--consumer-of`), a checkout a person named does not."""
+    """The POSIX side's `sqlite_stage.py derive` command of a Windows run (Steps 3+4), whole -- its entry into the
+    POSIX side and its interpreter included (`PosixSide.python_argv`): a run staging from its own consumer checkout
+    names the tree it belongs to (`--consumer-of`), a checkout a person named does not."""
     cfg = run.cfg
-    argv = ["python3", run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py")), "derive",
+    args = ["derive",
             "--out", run.posix.to_posix(run.stage_dir), "--sqlite-dir", run.sqlite_dir_posix,
             "--jobs", str(cfg.jobs), "--stage-build-json", run.posix.to_posix(sb_path),
             "--tier", cfg.tier]
     if cfg.tcl_version:
-        argv += ["--tcl-version", cfg.tcl_version]
+        args += ["--tcl-version", cfg.tcl_version]
     if cfg.test_file:
-        argv += ["--test-file", run.posix.to_posix(cfg.test_file)]
+        args += ["--test-file", run.posix.to_posix(cfg.test_file)]
     if not cfg.sqlite_dir:
-        argv += ["--consumer-of", run.out_dir]
-    return argv
+        args += ["--consumer-of", run.out_dir]
+    return run.posix.python_argv(run.posix.to_posix(os.path.join(C.HERE, "sqlite_stage.py")), *args)
 
 
 def step34(run):
@@ -828,7 +829,7 @@ def step34(run):
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(run.stage_build, fh, indent=1, sort_keys=True)
     try:
-        rc, out = _relay(run.posix.argv(derive_argv(run, sb_path)), log)
+        rc, out = _relay(derive_argv(run, sb_path), log)
     finally:
         try:
             os.remove(sb_path)

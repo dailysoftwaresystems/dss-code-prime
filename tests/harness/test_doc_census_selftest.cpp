@@ -71,6 +71,7 @@ namespace {
     X(Arm25SourceFloorCollapse, "25 SOURCE-FLOOR-COLLAPSE")                                                            \
     X(Arm26ProviderControlCounts, "26 PROVIDER-CONTROL-COUNTS")                                                        \
     X(Arm27ProviderGlobMatchesNothing, "27 PROVIDER-GLOB-MATCHES-NOTHING")                                             \
+    X(Arm28ProviderReadsWhatTheTreeKeeps, "28 PROVIDER-READS-WHAT-THE-TREE-KEEPS")                                     \
     X(Arm28ClaimUnpinnedReds, "28 CLAIM-UNPINNED-REDS")                                                                \
     X(Arm29ClaimDatePinPasses, "29 CLAIM-DATE-PIN-PASSES")                                                             \
     X(Arm30ClaimRevisionPinPasses, "30 CLAIM-REVISION-PIN-PASSES")                                                     \

@@ -546,7 +546,14 @@ endfunction()
 #       every SCRIPTS file as an input of its object (`OBJECT_DEPENDS`) -- found by reading
 #       the sources, as the stamp's own opt-in does. An edit of a script then rebuilds that
 #       object, which is what a tool asking the graph "was an object that depends on the
-#       site rebuilt" needs to witness a mutation of a script.
+#       site rebuilt" needs to witness a mutation of a script. And it gives the ctest entry
+#       the target runs (`dss_add_test` keeps its name on the target) the `self-test` label:
+#       the one predicate of the `repo-guard` rule (stated where that label is given).
+#   dss_label_self_test(<test>...)
+#       The same label for an entry registered BARE -- `add_test` running a program with its
+#       self-test flag -- called right after that `add_test`, in the same directory.
+#       `harness/repo_guard_label_check` refuses an entry whose command line asks a program for
+#       its self-test and carries no `self-test` label, so a bare entry left unlabelled is a red.
 # A second script entry costs one call of each and a table of its arms in its test.
 function(dss_declare_script_selftest id)
     cmake_parse_arguments(PARSE_ARGV 1 _dss_ss "" "ARGC;WORKING_DIRECTORY" "COMMAND;SCRIPTS")
@@ -663,6 +670,24 @@ function(dss_use_script_selftest target id)
     endif()
     set_property(SOURCE ${_dss_includers} TARGET_DIRECTORY ${target}
                  APPEND PROPERTY OBJECT_DEPENDS ${_dss_scripts})
+    get_target_property(_dss_test ${target} DSS_TEST_NAME)
+    if(NOT _dss_test)
+        message(FATAL_ERROR
+            "dss_use_script_selftest(${target} ${id}): `${target}` runs no ctest entry `dss_add_test` registered, "
+            "so there is no entry to give the `self-test` label.")
+    endif()
+    dss_label_self_test("${_dss_test}")
+endfunction()
+
+function(dss_label_self_test)
+    foreach(_dss_test IN LISTS ARGN)
+        if(NOT TEST "${_dss_test}")
+            message(FATAL_ERROR
+                "dss_label_self_test(${_dss_test}): no ctest entry of that name is registered in this directory "
+                "-- the label is given right after the `add_test` that registers the entry.")
+        endif()
+        set_property(TEST "${_dss_test}" APPEND PROPERTY LABELS "self-test")
+    endforeach()
 endfunction()
 
 # ── THE STAMP'S SELF-TEST ───────────────────────────────────────────────────────
@@ -836,7 +861,28 @@ if(DSS_BUILD_TESTS)
     # ⓘ `owning-tree.py` is a script of the entry too: the program loads it by path, and the
     # arms that prove which tree the default build directory belongs to are that file's. So
     # is `redact.py`: what the program prints of a record passes it, and an arm proves that.
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    include("${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake")  # the repository's Python floor, never an alias
+    # THE PYTHON CHOICE'S OWN SELF-TEST: ITS COMMAND LINE. `cmake/DssPython.cmake`, run with
+    # `-DDSS_PYTHON_MODE=selftest`, configures fixture projects that include it, with this build's
+    # generator, and proves the interpreter it chooses -- on a clean configure, on a floor no interpreter
+    # meets, and on a Windows host on a cache that already names an App Execution Alias and on an alias
+    # named by hand. Its ctest entry, `build/python_interpreter`, is the TEST BINARY tests/program/
+    # CMakeLists.txt registers under that name (test_python_interpreter.cpp): one case per arm, so a
+    # mutation of the module can be an arm of the mutation sweep. DECLARED HERE, BEFORE THE TWO
+    # add_subdirectory() CALLS BELOW. The config.json is a script of the entry too: the floor arm reads it.
+    dss_declare_script_selftest(python_interpreter ARGC 8
+        COMMAND
+            "${CMAKE_COMMAND}"
+            "-DDSS_PYTHON_MODE=selftest"
+            "-DDSS_PYTHON_SCRATCH=${CMAKE_BINARY_DIR}/python-interpreter-selftest"
+            "-DDSS_PYTHON_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DDSS_PYTHON_GENERATOR=${CMAKE_GENERATOR}"
+            "-DDSS_PYTHON_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+            "-P"
+            "${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake"
+            "${CMAKE_SOURCE_DIR}/.harness-config/config.json")
     dss_declare_script_selftest(ninja_deps ARGC 3
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMAND
@@ -892,7 +938,10 @@ if(DSS_BUILD_TESTS)
             "--self-test"
         SCRIPTS
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py"
-            "${CMAKE_SOURCE_DIR}/.gitignore")
+            "${CMAKE_SOURCE_DIR}/.gitignore"
+            "${CMAKE_SOURCE_DIR}/tests/test_support/tree_ignores_cases.json"
+            "${CMAKE_SOURCE_DIR}/.harness-config/config.json"
+            "${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake")
     dss_declare_script_selftest(doc_census ARGC 3
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMAND
@@ -944,6 +993,49 @@ if(DSS_BUILD_TESTS)
             "--self-test"
         SCRIPTS
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-repo-guard-label/check-repo-guard-label.py")
+    # THE LINE-ENDINGS GUARD'S OWN SELF-TEST: `check-line-endings.py --selftest` proves its byte tiers and
+    # check F's rules -- a detector verb counts only as a word, an exemption only in the verb's own command --
+    # on fixture repositories, one verdict line per arm; tests/harness/CMakeLists.txt registers it, one case
+    # per arm. The entry `line_endings_guard` below still runs the same self-test, quietly, before it judges
+    # the tree. `owning-tree.py` is a script of the entry: the guard loads it by path for every git question.
+    dss_declare_script_selftest(line_endings ARGC 3
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
+            "--selftest"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
+    # THE CONFLICT-MARKER GUARD'S OWN SELF-TEST: `check-conflict-markers.py --self-test` proves which lines are a
+    # merge-conflict marker and when a separator is one, end to end through a conflict git itself writes, one
+    # verdict line per arm; tests/harness/CMakeLists.txt registers it, one case per arm. The tree itself is judged
+    # by the entry `conflict_markers_guard` below. `owning-tree.py` is a script of the entry: every git question
+    # goes through it.
+    dss_declare_script_selftest(conflict_markers ARGC 3
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-conflict-markers/check-conflict-markers.py"
+            "--self-test"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-conflict-markers/check-conflict-markers.py"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
+    # THE SQLITE LEG RESOLVER'S INTERPRETER: `harness/test_sqlite_harness_legs` starts `harness_legs.py` with many
+    # command lines of its own, and every one of them with THIS interpreter -- the one find_package chose at or
+    # above the repository's floor (cmake/DssPython.cmake) -- never the first `python3` of the PATH ctest runs
+    # under, which on a host whose own python is older than the floor is an interpreter below it. Declared as a
+    # self-test's command line because that is where the build hands a test the interpreter as a literal: the
+    # command line is the interpreter alone, and the driver composes every run's arguments itself.
+    # Its SCRIPTS are the two programs its cases ask whole: the resolver, and `sqlite_common.py`, whose one spelling
+    # of a Python child on the POSIX side two cases read.
+    dss_declare_script_selftest(sqlite_harness_legs ARGC 1
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMAND
+            "${Python3_EXECUTABLE}"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/real-examples/c/sqlite/harness_legs.py"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/real-examples/c/sqlite/sqlite_common.py")
 
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
@@ -956,7 +1048,7 @@ if(DSS_BUILD_TESTS)
     # `orphan_tests_guard` was the third until 2026-10-12 and is no longer STARTED here: it is
     # the test binary tests/harness/CMakeLists.txt registers under that name, which runs the
     # same program by the command line declared above and reads each of its verdicts into a
-    # case of its own. Its `repo-guard` label is set there, beside its registration.
+    # case of its own -- a self-test, so it carries no `repo-guard` label and runs on every leg.
     # ★ EACH SELF-TESTS ON EVERY RUN: the form used here verifies the tree and drives its arms,
     # every red arm synthesizing its own negative, so the entry cannot pass without proving the
     # guard can fail.
@@ -970,7 +1062,7 @@ if(DSS_BUILD_TESTS)
     # ⓘ `line_endings_guard` is the entry that timed out under ctest 3 runs of 3 on 2026-09-21 in
     # its PowerShell form while passing by hand in 3.9 s. The Python guard bounds every wait
     # (90 s, naming what it waited on) and starts every child with no inherited handle.
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    include("${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake")  # the repository's Python floor, never an alias
     add_test(
         NAME anchor_registry_guard
         COMMAND ${Python3_EXECUTABLE}
@@ -980,6 +1072,15 @@ if(DSS_BUILD_TESTS)
         NAME line_endings_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # `conflict_markers_guard`: no text file of the tree -- tracked, or untracked and not ignored -- holds a line
+    # that is a merge-conflict marker git writes (2026-10-15: a checkpoint was committed with one, and nothing
+    # refused it). Its verdict is the repository's state, the same bytes on every leg. Its self-test is the test
+    # binary `harness/conflict_markers_selftest` (tests/harness/CMakeLists.txt).
+    add_test(
+        NAME conflict_markers_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-conflict-markers/check-conflict-markers.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # ── The sqlite harness driver checks its own logic (2026-09-21, lane mig, part 4) ──
@@ -1009,6 +1110,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/real-examples/c/sqlite/benchmark_speedtest1.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(harness/sqlite_driver_selftest harness/sqlite_benchmark_selftest)
 
     # ── `cmake-import`: its own arms, and the path base proved with a real compiler ──
     # `harness/cmake_import_selftest` runs the program's synthesized arms (the refusals, the
@@ -1027,6 +1129,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/cmake-import/cmake-import.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(harness/cmake_import_selftest)
     add_test(
         NAME harness/cmake_import_any_cwd
         COMMAND ${Python3_EXECUTABLE}
@@ -1072,6 +1175,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/read-leg-path/read-leg-path.py"
                 --selftest
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(harness/probe_reference_cc_selftest harness/read_leg_path_selftest)
     # `harness/redact_selftest` is the test binary tests/harness/CMakeLists.txt registers (one case per arm),
     # its command line declared above (`dss_declare_script_selftest(redact ...)`); no `repo-guard` label.
     # ── The corpus pragma census's own arms (2026-10-01, cycle P69, lane hm) ──
@@ -1086,6 +1190,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/pragma-profile-census/pragma-profile-census.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(harness/pragma_profile_census_selftest)
     # ── The prototype census's own arms (2026-10-07, cycle P69, lane hm) ──
     # The census itself runs on the leg whose headers it judges (`dssharness run prototype-census`), never here.
     # These arms hold its logic on every leg: the reference's diagnostic dialect, read through a synthesized
@@ -1120,6 +1225,7 @@ if(DSS_BUILD_TESTS)
                 --selftest "--tree=${CMAKE_SOURCE_DIR}" "--processor=${_dss_census_processor}"
                 "--dsscp=$<TARGET_FILE:dsscp>" "--cc=${_dss_census_reference}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/prototype-census")
+    dss_label_self_test(harness/prototype_census_selftest)
     # ── The image carriage's own arms (2026-10-08, cycle P69, lane hm) ──
     # `compile-and-keep` compiles a request's sources on the leg whose build is free and keeps the images
     # (`dssharness run compile-and-keep`); it runs there, never here. These arms hold it on every leg. The fixed
@@ -1141,6 +1247,7 @@ if(DSS_BUILD_TESTS)
                 "--live-example=examples/c/line_comment_on_the_last_line"
                 "--live-target=x86_64:pe64-x86_64-windows-exec"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(harness/compile_and_keep_selftest)
 
     # ── The anchor CITATION question, asked by the tool ───────────────────────
     # ⛔⛔ THIS IS AN ADDITION, NOT A REPLACEMENT, AND THAT IS A MEASURED DECISION
@@ -1230,7 +1337,7 @@ if(DSS_BUILD_TESTS)
     # ⚠ The message assertions are load-bearing: an independent audit found the
     # first draft's floor arm passing with the floor DELETED, because it
     # collapsed on a different refusal that happened to share the exit code.
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    include("${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake")  # the repository's Python floor, never an alias
     add_test(
         NAME scripts_index_guard
         COMMAND ${Python3_EXECUTABLE}
@@ -1484,6 +1591,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchor-debt/anchor-debt.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(anchor_debt_selftest_guard)
 
     # ⓘ `lane_fold_selftest_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-29).
     # `lane-fold.py` seeded, folded and landed lanes until DssHarness's orchestrator verbs
@@ -1518,6 +1626,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchors/anchors.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(anchors_selftest_guard)
 
     # `anchor-rows.py --self-test` (2026-09-25, P68 round 13, lane mig): a fold's rows, applied as ONE
     # batch through the door -- staged, rehearsed in a throwaway repository, all or nothing, every row
@@ -1530,6 +1639,7 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchor-rows/anchor-rows.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_self_test(anchor_rows_selftest_guard)
 
     # Which tree does a script's own file live in? (2026-09-15, P66 lane rr.)
     # Eleven Python scripts took their root from the CALLER'S working directory -- a
@@ -1561,10 +1671,8 @@ if(DSS_BUILD_TESTS)
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # ★ SELF-TESTS, so NOT `repo-guard` (the rule is stated where the label is given, near the end of this
-    # file): each drives a copy of its tool in a fixture history, and what git does there is the host's own. Their
-    # names end in `guard` and do not say `selftest`, so each says it here, for the label's scan.
-    set_tests_properties(corpus_census_git_environment_guard landing_log_git_environment_guard
-                         PROPERTIES DSS_SELF_TEST TRUE)
+    # file): each drives a copy of its tool in a fixture history, and what git does there is the host's own.
+    dss_label_self_test(corpus_census_git_environment_guard landing_log_git_environment_guard)
     # ⓘ `apply_registry_row_selftest_guard` stood here (retired 2026-09-30, cycle P69, with its program:
     # `dssharness write-anchor` / `set-anchor` with cell files replace one row, and the door refuses a value it
     # would store cut and a citation no row holds -- the two checks that program's launcher had restated).
@@ -1902,23 +2010,25 @@ endif()
 # nothing by re-reading them. An entry that SELF-TESTS a program never carries it: its verdict reads
 # the program's own fixtures, and that CAN depend on the host -- case, path separators, path
 # spelling, what the host's git does -- which is exactly what an indirect leg is there to show. So
-# every leg runs a self-test, the indirect ones included. AN ENTRY SELF-TESTS when a word of its
-# command line after the program is a self-test flag (`--self-test` or `--selftest`, alone or
-# followed by `-<word>`), or its name holds `selftest` (every entry that drives a program's
-# self-test one case per arm is so named). A guard run with no flag checks the tree, even when it
-# proves its own refusals after, and keeps the label.
-# ⚠ THIS SCAN CANNOT READ A COMMAND LINE (CMake keeps no test property for it), so it leaves out a
-# name holding `selftest` and an entry that says it self-tests where it is registered
-# (`DSS_SELF_TEST`). The rule itself is HELD by `harness/repo_guard_label_check`, which reads what
-# ctest will run -- every entry's command line and labels -- and refuses a self-test carrying the
-# label, wherever and however the label was given (`check-repo-guard-label`).
+# every leg runs a self-test, the indirect ones included. AN ENTRY SELF-TESTS WHEN IT CARRIES THE
+# `self-test` LABEL -- the one predicate, read by this scan and by the checker alike, and given by
+# the helpers that register a self-test entry (`dss_use_script_selftest` for a test binary that
+# drives a program's self-test one case per arm, `dss_label_self_test` for an entry registered bare;
+# both stated where they are defined). A name says nothing, and neither does a property of this
+# file's own. A guard run with no flag checks the tree, even when it proves its own refusals after,
+# and keeps the label.
+# ★ THE CHECKER HOLDS BOTH SIDES (`harness/repo_guard_label_check`, `check-repo-guard-label`): it reads
+# what ctest will run -- every entry's labels and command line -- and refuses an entry carrying both
+# labels, wherever and however `repo-guard` was given, and an entry whose command line asks a program
+# for its self-test (a `--self-test` or `--selftest` word) and carries no `self-test` label. A test
+# binary's command line shows no flag; its label comes from the helper it cannot build without.
 get_property(_dss_all_tests DIRECTORY PROPERTY TESTS)
 set(_dss_guard_tests "")
 set(_dss_self_tests "")
 foreach(_t IN LISTS _dss_all_tests)
     if(_t MATCHES "guard$")
-        get_test_property(${_t} DSS_SELF_TEST _dss_says_self_test)
-        if(_t MATCHES "selftest" OR _dss_says_self_test)
+        get_test_property(${_t} LABELS _dss_labels)
+        if("self-test" IN_LIST _dss_labels)
             list(APPEND _dss_self_tests "${_t}")
         else()
             list(APPEND _dss_guard_tests "${_t}")
@@ -1930,7 +2040,7 @@ if(_dss_self_tests)
     message(STATUS "repo-guard label NOT applied to ${_dss_self_count} self-test(s) whose name ends in guard: ${_dss_self_tests}")
 endif()
 if(_dss_guard_tests)
-    set_tests_properties(${_dss_guard_tests} PROPERTIES LABELS "repo-guard")
+    set_property(TEST ${_dss_guard_tests} APPEND PROPERTY LABELS "repo-guard")
     list(LENGTH _dss_guard_tests _dss_guard_count)
     message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s)")
 endif()
@@ -1972,6 +2082,7 @@ if(DSS_BUILD_TESTS)
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # ⓘ NO `repo-guard` label since 2026-10-15: it SELF-TESTS the bound (the rule stated where the label is
     # given) -- how a hung child is cut short and its grandchild killed is the host's own, so every leg runs it.
+    dss_label_self_test(line_endings_watchdog_guard)
 endif()
 
 # ── P66: the package pipeline's release path, and the only thing that can see it ──
@@ -2033,7 +2144,7 @@ if(DSS_BUILD_TESTS)
     # `cmake --install`), and one more because an unanchored mutation rewrote a
     # comment instead of the key it meant to break — an arm that mutated nothing
     # and would have gone on passing.
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    include("${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake")  # the repository's Python floor, never an alias
     add_test(
         NAME pkg_pipeline_modes_guard
         COMMAND ${Python3_EXECUTABLE}

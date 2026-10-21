@@ -51,9 +51,10 @@ Four clauses, and each is measured rather than asserted — detail in §H.0b:
    home; `.harness-config/config.json`'s `sync.neverTransfer` repeats none of it and holds only the
    secrets at any depth (`**/.secrets`, `**/.env`) — the one exclusion a second statement is kept for.
    `dssharness sync --dry-run` lists every path it would write, which is how to CHECK this rather than
-   trust it. The same file is what a walk from the tree's root leaves out, read as git reads it — by a
-   Python action through the `owning-tree` action, by a C++ test through `tests/test_support/tree_ignores.hpp`
-   — and no walker keeps a list of its own.
+   trust it. The same file is what a walk from the tree's root leaves out, read as git reads it with
+   `core.ignorecase` false, a path whose answer the other setting would change refused by name on every
+   host — by a Python action through the `owning-tree` action, by a C++ test through
+   `tests/test_support/tree_ignores.hpp` — and no walker keeps a list of its own.
 2. ⚠ **The MAX_PATH budget is SPENT, not slack.** `create-worktree` and `create-agent` refuse up front a
    name whose longest build path would pass the path limit — the PLATFORM's own: this repository declares
    no `worktrees.pathLimit`, on purpose, because a declared one replaces the platform's limit on every host

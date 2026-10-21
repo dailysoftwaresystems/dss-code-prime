@@ -1,0 +1,1 @@
+            if (std::error_code rk; entry.kind == EntryKind::Directory || reachedKind(entry.path, rk) == EntryKind::Directory) {

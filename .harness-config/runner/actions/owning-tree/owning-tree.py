@@ -145,7 +145,7 @@ STEER_DECOY = "zz-owning-tree-steer-decoy.txt"
 STEER_PLANS_DECOY = ".plans/zz-owning-tree-steer-decoy.md"
 
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 77
+EXPECTED_ARMS = 91
 
 # A `gitdir:` value that is a Windows drive path (`C:/...` or `C:\...`).
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -177,9 +177,11 @@ def _require_path(path, what):
 # named `--help` appeared at the root of a checkout that way.) No path a program is asked to write
 # begins with `-`: one that does is an option taken for a value, and it is refused naming the flag, in
 # either spelling (`--out x`, `--out=x`). A file truly so named is still reachable as `./-x`. An empty
-# value names no place and is refused too. Every program of the repository that takes a path to write
-# from a hand-read command line asks this; argparse already refuses `--out --help` ("expected one
-# argument") on its own.
+# value names no place and is refused too.
+# ★ WHO ASKS: a program that reads its command line BY HAND asks `written_path` for each such value; one
+# that reads it with argparse gives every path-to-write argument `type=written_path_arg(<its flag>)`, and
+# `check-scripts-index` refuses a path-to-write argument without it. ARGPARSE ALONE IS NO GUARD: it refuses
+# `--out --help` (a value it reads as an option) and takes `--out=--help` and `--out -` verbatim.
 def written_path(value, flag):
     """`value` as the path `flag` names for writing, or `UsageRefusal` when it is empty or begins with `-`."""
     if value is None or not str(value).strip():
@@ -189,6 +191,20 @@ def written_path(value, flag):
         raise UsageRefusal("%s takes '%s' as the path to write, and it begins with `-`: an option taken for a "
                            "value. Name the path (`./%s` if that is truly its name)" % (flag, value, value))
     return value
+
+
+def written_path_arg(flag):
+    """argparse's `type=` for a path a program writes: `written_path(value, flag)`, its refusal raised as
+    `argparse.ArgumentTypeError`, which argparse prints as its usage error, naming the option, and exits 2."""
+    import argparse
+
+    def path_to_write(value):
+        try:
+            return written_path(value, flag)
+        except UsageRefusal as exc:
+            raise argparse.ArgumentTypeError(str(exc))
+    path_to_write.__name__ = "path to write"   # argparse names a type by it in an error it makes itself
+    return path_to_write
 
 
 def same_path(a, b):
@@ -723,35 +739,240 @@ def load_jsonc(path):
 # case-collision scan walking a sweep worker meets files that vanish under it. The statement is
 # the tree's own `.gitignore`: the file the tool's `init` writes its block into and git obeys. No
 # list is kept here, so a directory the tool or the repository adds there is left out by every
-# walker at once. Its readers: `check-doc-census` (both of its walks), the redactor's vocabulary
-# (`redact.py`), and -- in C++, with this grammar and these refusals -- the repository-wide scan
-# of `tests/core/test_header_name_matching.cpp` (`tests/test_support/tree_ignores.hpp`).
-# ★ READ AS GIT READS IT: every rule in order, the last that matches deciding; `!` re-includes;
-# a trailing `/` matches a directory only; a `/` at the start or in the middle anchors the rule
-# to the tree's root, and a rule with none matches that name at any depth; `*` and `?` stay
-# within one name, `[...]` is a class (`!` or `^` first negates it, `a-z` is a range, a `]`
-# right after the opening is itself), and a `**` segment is any number of directories -- one or
-# more at a rule's end. Trailing blanks are dropped, as git drops them. A directory left out
+# walker at once. Its readers: `check-doc-census` (both of its walks) and its `source-census.py`
+# provider, the redactor's vocabulary (`redact.py`), `check-anchor-registry`, `check-plan-citations`,
+# `check-scripts-index`, `check-export-macro-placement`, and -- in C++, with this grammar and these
+# refusals -- the repository-wide scan of `tests/core/test_header_name_matching.cpp`
+# (`tests/test_support/tree_ignores.hpp`). A walker keeps no list of its own: a directory it must
+# also skip that git does NOT ignore is that program's own rule, stated beside it with its reason.
+# ★ READ AS GIT READS IT, BYTE FOR BYTE, WITH core.ignorecase FALSE -- and a path whose answer the
+# other setting would change is REFUSED (below): every rule in order, the last that matches
+# deciding; `!` re-includes; a trailing `/` matches a directory only -- never a symbolic link,
+# which git records as a file and which no walk descends; a `/` at the start or in the middle
+# anchors the rule to the tree's root, and a rule with none matches that name at any depth. A
+# name's pattern is matched against the name's BYTES (its UTF-8), as git's wildmatch matches
+# them: `*` is any run of bytes within one name, `?` is one byte, and `[...]` is a class that
+# takes one byte -- `!` or `^` first negates it, a `]` right after the opening is itself, `a-z` is
+# a range of bytes, a `-` first, last, or right after a range or a POSIX class is itself, a `[:`
+# that no `:]` closes before the class's `]` is a `[` member, and the twelve POSIX classes
+# `[:alnum:]` `[:alpha:]` `[:blank:]` `[:cntrl:]` `[:digit:]` `[:graph:]` `[:lower:]` `[:print:]`
+# `[:punct:]` `[:space:]` `[:upper:]` `[:xdigit:]` take what git's own ASCII table puts in them (a
+# byte from 0x80 up is in none; `[:space:]` is tab, line feed, carriage return and space). A
+# `**` segment is any number of directories -- one or more at a rule's end; inside a name it is a
+# `*`. Trailing SPACES are dropped, as git drops them (a tab stays); a byte order mark before the
+# first rule and a carriage return before a line feed are no part of a rule. A directory left out
 # takes everything under it: nothing below it can be re-included, as in git. `.git`, git's own,
 # is always left out, as a directory or as a worktree's `.git` file.
+# ★ CASE: A PATH A RULE MATCHES UNDER ONE SETTING OF core.ignorecase AND NOT THE OTHER IS A
+# REFUSAL NAMING THE PATH AND THE RULE, on every host -- and so is a name that is `.git` only when
+# case is folded. git folds ASCII letters when core.ignorecase is true (the setting a clone takes
+# on Windows and macOS), and the two settings disagree both ways (✔MEASURED, git 2.55: `*.LOG`
+# takes `a.log` only when folded, and `[A]1` takes `A1` only when NOT folded -- git folds the
+# name, never a class's member). Refusing every such path, these readers give the one answer
+# every host's git gives, and no host diverges in silence.
 # ★ THE ROOT'S `.gitignore` ALONE: it is the only one git tracks here (✔MEASURED 2026-10-15,
 # `git ls-files`), and git's rules there leave out no tracked file (`git ls-files -ci
 # --exclude-standard` lists none), so a walk loses nothing the tree tracks. One a tool writes
 # inside a directory the root's rules already leave out changes nothing a walk sees.
 # ⚠ A RULE THIS READER CANNOT READ AS GIT DOES IS A REFUSAL NAMING ITS LINE: a backslash (an
-# escape), an unterminated `[`, an empty name between two `/`, a rule that is nothing but `/` or
-# `!`. Read some other way it would leave out another set than git does, in silence.
-# ⓘ Names compare as written, case and all, so the answer is the same on every host.
+# escape), a `[` class never closed, a POSIX class git does not name (git abandons the whole match
+# there), an empty name between two `/`, a rule that is nothing but `/` or `!`. Read some other way
+# it would leave out another set than git does, in silence.
+# ⚠ A NAME HOLDING A BACKSLASH IS A REFUSAL NAMING IT: no Windows host can hold such a name, and a
+# reader on one would split it where git on another does not.
+# ⓘ THE ONE CASE TABLE, `tests/test_support/tree_ignores_cases.json`, states this grammar path by
+# path; this program's self-test and the C++ reader's suite each ask every scenario of it of their
+# reader, and each asks git itself the same paths (`git check-ignore`) under both settings.
 # ⓘ A tree with no `.gitignore` declares nothing ignored: only `.git` is left out.
 # ⓘ `keep` names root-relative directories walked WHOLE whatever the rules say. None is kept by
 # default; the redactor keeps the tool's build directory, whose output names its exemption reads.
 
 IGNORE_FILE = ".gitignore"
 GIT_OWN = ".git"
+CASE_TABLE = ("tests", "test_support", "tree_ignores_cases.json")
+_ANY_DIRS = ("**",)                                  # a `**` segment of a rule
+_LIT, _ONE, _STAR, _CLASS = range(4)                 # the tokens of one name's pattern
+_MEMBER, _RANGE, _POSIX = range(3)                   # the items of a class
+
+
+def _ascii_upper(b):
+    return 65 <= b <= 90
+
+
+def _ascii_lower(b):
+    return 97 <= b <= 122
+
+
+def _ascii_alpha(b):
+    return _ascii_upper(b) or _ascii_lower(b)
+
+
+def _ascii_digit(b):
+    return 48 <= b <= 57
+
+
+# git's own table (sane_ctype, and wildmatch's use of it): ASCII only. Under core.ignorecase the
+# name's byte is already folded to lower case, which is why `upper` also takes a lower-case byte.
+_POSIX_CLASSES = {
+    b"alnum": lambda b, fold: _ascii_alpha(b) or _ascii_digit(b),
+    b"alpha": lambda b, fold: _ascii_alpha(b),
+    b"blank": lambda b, fold: b in (9, 32),
+    b"cntrl": lambda b, fold: b < 32 or b == 127,
+    b"digit": lambda b, fold: _ascii_digit(b),
+    b"graph": lambda b, fold: 33 <= b <= 126,
+    b"lower": lambda b, fold: _ascii_lower(b),
+    b"print": lambda b, fold: 32 <= b <= 126,
+    b"punct": lambda b, fold: 33 <= b <= 126 and not (_ascii_alpha(b) or _ascii_digit(b)),
+    b"space": lambda b, fold: b in (9, 10, 13, 32),
+    b"upper": lambda b, fold: _ascii_upper(b) or (fold and _ascii_lower(b)),
+    b"xdigit": lambda b, fold: _ascii_digit(b) or 65 <= b <= 70 or 97 <= b <= 102,
+}
+
+
+def _read_class(pat, at):
+    """The class opening at `pat[at]` (a `[`), as wildmatch reads it: `(end, negated, items)` with `end` just past
+    its `]`, or a string saying why git could not read it."""
+    n = len(pat)
+    i = at + 1
+    c = pat[i] if i < n else None
+    if c == 0x5E:                                    # `^` negates as `!` does
+        c = 0x21
+    negated = c == 0x21
+    if negated:
+        i += 1
+        c = pat[i] if i < n else None
+    prev, items = 0, []
+    while True:
+        if c is None:
+            return "opens a `[` class it never closes"
+        if c == 0x2D and prev and i + 1 < n and pat[i + 1] != 0x5D:
+            i += 1
+            items.append((_RANGE, prev, pat[i]))
+            c = 0                                    # a `-` right after a range is itself
+        elif c == 0x5B and i + 1 < n and pat[i + 1] == 0x3A:
+            j = i + 2
+            while j < n and pat[j] != 0x5D:
+                j += 1
+            if j >= n:
+                return "opens a `[` class it never closes"
+            if j - i - 3 < 0 or pat[j - 1] != 0x3A:
+                items.append((_MEMBER, 0x5B))        # no `:]`: the `[` is a member, and the `:` after it
+            else:
+                name = bytes(pat[i + 2:j - 1])
+                if name not in _POSIX_CLASSES:
+                    return "names the class [:%s:], which git does not know" % name.decode("utf-8", "replace")
+                items.append((_POSIX, name))
+                i, c = j, 0                          # a `-` right after a POSIX class is itself
+        else:
+            items.append((_MEMBER, c))
+        prev = c
+        i += 1
+        c = pat[i] if i < n else None
+        if c == 0x5D:
+            return i + 1, negated, tuple(items)
+
+
+def _read_name_pattern(pat):
+    """One name of a rule (bytes) as a `_NamePattern`, or a string saying why git could not read it."""
+    out, i = [], 0
+    while i < len(pat):
+        c = pat[i]
+        if c == 0x2A:
+            if not out or out[-1][0] != _STAR:       # `**` inside a name is a `*`
+                out.append((_STAR,))
+            i += 1
+        elif c == 0x3F:
+            out.append((_ONE,))
+            i += 1
+        elif c == 0x5B:
+            cls = _read_class(pat, i)
+            if isinstance(cls, str):
+                return cls
+            i, negated, items = cls
+            out.append((_CLASS, negated, items))
+        else:
+            out.append((_LIT, c))
+            i += 1
+    return _NamePattern(tuple(out))
+
+
+def _byte_hit(tok, t, fold):
+    """Does one token take the name's byte `t`? Under `fold`, as wildmatch folds: the name's byte and a literal
+    of the rule to lower case, a range also asked with the byte in upper case -- a class's member is never folded."""
+    kind = tok[0]
+    if kind == _ONE:
+        return True
+    if fold and _ascii_upper(t):
+        t += 32
+    if kind == _LIT:
+        p = tok[1]
+        return t == (p + 32 if fold and _ascii_upper(p) else p)
+    hit = False
+    for item in tok[2]:
+        if item[0] == _MEMBER:
+            hit = t == item[1]
+        elif item[0] == _RANGE:
+            hit = item[1] <= t <= item[2] or (fold and _ascii_lower(t) and item[1] <= t - 32 <= item[2])
+        else:
+            hit = _POSIX_CLASSES[item[1]](t, fold)
+        if hit:
+            break
+    return hit != tok[1]
+
+
+def _compile_name(toks, fold):
+    """The tokens as one bytes regex: a literal or a class becomes the set of the bytes `_byte_hit` says it takes
+    (a set of none matches nothing), `?` any byte, `*` any run -- so the regex answers exactly what the tokens say,
+    at the regex engine's pace. Under `fold` it is asked of the name already folded to lower case."""
+    parts = []
+    for tok in toks:
+        if tok[0] == _STAR:
+            parts.append(b".*")
+        elif tok[0] == _ONE:
+            parts.append(b".")
+        else:
+            taken = b"".join(re.escape(bytes([b])) for b in range(256) if _byte_hit(tok, b, fold))
+            parts.append(b"[" + taken + b"]" if taken else b"(?!)")
+    return re.compile(b"".join(parts), re.DOTALL)
+
+
+class _NamePattern:
+    """One name of a rule: its tokens, and the two compiled forms that ask them of a name's bytes -- `exact`, and
+    `folded`, asked of the name already folded to lower case (wildmatch folds the name's byte first)."""
+    __slots__ = ("toks", "exact", "folded")
+
+    def __init__(self, toks):
+        self.toks, self.exact, self.folded = toks, _compile_name(toks, False), _compile_name(toks, True)
+
+
+def name_matches(pat, name, fold=False):
+    """One NAME (bytes; already folded to lower case when `fold`) against one `_NamePattern`."""
+    return (pat.folded if fold else pat.exact).fullmatch(name) is not None
+
+
+def names_match(pats, names, fold=False):
+    """A rule's name patterns against a path's names (bytes; already folded to lower case when `fold`): a `**`
+    pattern is any number of names (one or more when it is the last). The two shapes nearly every rule has are
+    asked directly -- no `**` (one name per pattern) and a rule with no slash (`**` then one pattern: the last
+    name) -- and any other by a table filled from the end: no recursion proportional to the path."""
+    m, n = len(pats), len(names)
+    if not any(p is _ANY_DIRS for p in pats):
+        return m == n and all(name_matches(p, x, fold) for p, x in zip(pats, names))
+    if m == 2 and pats[0] is _ANY_DIRS and pats[1] is not _ANY_DIRS:
+        return n >= 1 and name_matches(pats[1], names[-1], fold)
+    ok = [[False] * (n + 1) for _ in range(m + 1)]
+    ok[m][n] = True
+    for i in range(m - 1, -1, -1):
+        for j in range(n, -1, -1):
+            if pats[i] is _ANY_DIRS:
+                ok[i][j] = (j < n) if i == m - 1 else (ok[i + 1][j] or (j < n and ok[i][j + 1]))
+            else:
+                ok[i][j] = j < n and name_matches(pats[i], names[j], fold) and ok[i + 1][j + 1]
+    return ok[0][0]
 
 
 class IgnoreRule:
-    """One rule of a `.gitignore`, as git reads it: `pats` are its name patterns, `**` among them."""
+    """One rule of a `.gitignore`, as git reads it: `pats` are its name patterns as tokens, `**` among them."""
     __slots__ = ("text", "line", "negated", "dir_only", "pats")
 
     def __init__(self, text, line, negated, dir_only, pats):
@@ -761,93 +982,11 @@ class IgnoreRule:
         return "%s (line %d)" % (self.text, self.line)
 
 
-def _class_end(pat, at):
-    """The index just past the `]` closing the class that opens at `pat[at]` (a `[`), or -1."""
-    i = at + 1
-    if i < len(pat) and pat[i] in "!^":
-        i += 1
-    if i < len(pat) and pat[i] == "]":
-        i += 1
-    while i < len(pat) and pat[i] != "]":
-        i += 1
-    return i + 1 if i < len(pat) else -1
-
-
-def _class_hit(pat, at, ch):
-    """Does the class that opens at `pat[at]` take `ch`?"""
-    end = _class_end(pat, at)
-    i, negate = at + 1, False
-    if pat[i] in "!^":
-        negate, i = True, i + 1
-    hit, first = False, True
-    while i < end - 1 and (pat[i] != "]" or first):
-        if i + 2 < end - 1 and pat[i + 1] == "-":
-            if pat[i] <= ch <= pat[i + 2]:
-                hit = True
-            i += 3
-        else:
-            if pat[i] == ch:
-                hit = True
-            i += 1
-        first = False
-    return hit != negate
-
-
-def name_matches(pat, name):
-    """One NAME against one name pattern: `*` any run, `?` one character, `[...]` a class. Iterative."""
-    p = n = 0
-    star_p = star_n = -1
-    while n < len(name):
-        if p < len(pat) and pat[p] == "*":
-            star_p, star_n, p = p, n, p + 1
-            continue
-        if p < len(pat):
-            c = pat[p]
-            if c == "?":
-                p, n = p + 1, n + 1
-                continue
-            if c == "[":
-                if _class_hit(pat, p, name[n]):
-                    p, n = _class_end(pat, p), n + 1
-                    continue
-            elif c == name[n]:
-                p, n = p + 1, n + 1
-                continue
-        if star_p < 0:
-            return False
-        star_n += 1
-        p, n = star_p + 1, star_n
-    while p < len(pat) and pat[p] == "*":
-        p += 1
-    return p == len(pat)
-
-
-def names_match(pats, names):
-    """A rule's name patterns against a path's names: a `**` pattern is any number of names (one or more when it
-    is the last). The two shapes nearly every rule has are asked directly -- no `**` (one name per pattern) and a
-    rule with no slash (`**` then one pattern: the last name) -- and any other by a table filled from the end: no
-    recursion proportional to the path."""
-    m, n = len(pats), len(names)
-    if "**" not in pats:
-        return m == n and all(name_matches(p, x) for p, x in zip(pats, names))
-    if m == 2 and pats[0] == "**" and pats[1] != "**":
-        return n >= 1 and name_matches(pats[1], names[-1])
-    ok = [[False] * (n + 1) for _ in range(m + 1)]
-    ok[m][n] = True
-    for i in range(m - 1, -1, -1):
-        for j in range(n, -1, -1):
-            if pats[i] == "**":
-                ok[i][j] = (j < n) if i == m - 1 else (ok[i + 1][j] or (j < n and ok[i][j + 1]))
-            else:
-                ok[i][j] = j < n and name_matches(pats[i], names[j]) and ok[i + 1][j + 1]
-    return ok[0][0]
-
-
 def read_ignore_rules(text, source=IGNORE_FILE):
     """[IgnoreRule] of a `.gitignore`'s text, in order. A rule this reader cannot read as git does is a Refusal
     naming its line (see the section above)."""
     rules = []
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     for number, raw in enumerate(text.split("\n"), 1):
         line = raw[:-1] if raw.endswith("\r") else raw
@@ -856,6 +995,7 @@ def read_ignore_rules(text, source=IGNORE_FILE):
         line = line.rstrip(" ")
         if not line:
             continue
+
         def refuse(why):
             return Refusal("%s line %d: the rule %r %s, so it cannot be read as git reads it; every walk of this "
                            "tree is refused rather than leaving out another set than git does" % (
@@ -873,15 +1013,36 @@ def read_ignore_rules(text, source=IGNORE_FILE):
         names = body.split("/")
         if not body or any(not name for name in names):
             raise refuse("names nothing between two separators" if body else "names nothing")
+        pats = []
         for name in names:
-            at = name.find("[")
-            while at >= 0:
-                end = _class_end(name, at)
-                if end < 0:
-                    raise refuse("opens a `[` class it never closes")
-                at = name.find("[", end)
-        rules.append(IgnoreRule(line, number, negated, dir_only, names if anchored else ["**"] + names))
+            if name == "**":
+                pats.append(_ANY_DIRS)
+                continue
+            toks = _read_name_pattern(name.encode("utf-8"))
+            if isinstance(toks, str):
+                raise refuse(toks)
+            pats.append(toks)
+        rules.append(IgnoreRule(line, number, negated, dir_only, pats if anchored else [_ANY_DIRS] + pats))
     return rules
+
+
+def _name_bytes(name, path):
+    """A walked name as the bytes git compares; a name holding a backslash is a Refusal naming the path."""
+    if "\\" in name:
+        raise Refusal("the name %r in %s holds a backslash: no Windows host can hold it, and a reader on one splits "
+                      "it where git on another does not, so the walk is refused rather than read as one host reads "
+                      "it" % (name, path))
+    try:
+        return os.fsencode(name)
+    except UnicodeError as exc:
+        raise Refusal("the name %r in %s has no UTF-8 spelling (%s): git could not be asked about it" % (
+            name, path, exc))
+
+
+def _is_link(path):
+    """A symbolic link (or a Windows junction): never a directory to the rules, never descended."""
+    isjunction = getattr(os.path, "isjunction", None)
+    return os.path.islink(path) or bool(isjunction and isjunction(path))
 
 
 class TreeIgnores:
@@ -911,16 +1072,32 @@ class TreeIgnores:
             self.keep.append(names)
 
     def _decide(self, names, is_dir):
-        """The rule that leaves this path out (its ancestors already walked), or None."""
+        """The rule that leaves this path out (its ancestors already walked), or None. A rule whose match on it
+        core.ignorecase would change, and a name that is `.git` only when folded, are a Refusal naming it."""
         if GIT_OWN in names:
             return GIT_OWN
+        shown = "/".join(names)
+        raw = [_name_bytes(x, shown) for x in names]
+        for x in raw:
+            if x.lower() == b".git":
+                raise Refusal("the path %r holds %r, which git takes for its own directory only when case is "
+                              "folded (core.ignorecase true): hosts would answer differently, so the walk is "
+                              "refused" % (shown, os.fsdecode(x)))
         if any(names[:len(k)] == k for k in self.keep):
             return None
+        low = [x.lower() for x in raw]                   # bytes: ASCII letters only, as git folds them
         decided = None
         for rule in self.rules:
             if rule.dir_only and not is_dir:
                 continue
-            if names_match(rule.pats, names):
+            hit = names_match(rule.pats, raw)
+            if hit != names_match(rule.pats, low, True):
+                raise Refusal("the rule %r (line %d) %s the path %r only when case is %s: git answers it one way "
+                              "under core.ignorecase false and the other under true, so every host would not give "
+                              "one answer and the walk is refused" % (
+                                  rule.text, rule.line, "matches" if hit else "fails", shown,
+                                  "NOT folded" if hit else "folded"))
+            if hit:
                 decided = None if rule.negated else rule
         return decided.text if decided is not None else None
 
@@ -935,8 +1112,9 @@ class TreeIgnores:
         return rel
 
     def leaves_out(self, rel, is_dir):
-        """The rule that leaves the tree-relative path `rel` out -- its own, or a parent directory's -- or None."""
-        names = [n for n in rel.replace("\\", "/").split("/") if n]
+        """The rule that leaves the tree-relative, `/`-joined path `rel` out -- its own, or a parent directory's --
+        or None. A name holding a backslash is a Refusal (see `_name_bytes`), never a second separator."""
+        names = [n for n in rel.split("/") if n]
         for depth in range(1, len(names)):
             why = self._decide(names[:depth], True)
             if why:
@@ -946,18 +1124,29 @@ class TreeIgnores:
     def walk(self, top=None, onerror=None):
         """`os.walk(top)`, top-down, less what this tree leaves out: each `(dirpath, dirnames, filenames)` with the
         directories left out already taken from `dirnames` (the caller may prune or sort it further, in place) and
-        the files left out taken from `filenames`. A `top` the tree leaves out is a Refusal: a walk of nothing."""
+        the files left out taken from `filenames`. A `top` the tree leaves out is a Refusal: a walk of nothing.
+        ★ A SYMBOLIC LINK IS NEVER DESCENDED AND IS NO DIRECTORY: a link to a directory leaves `dirnames` and is
+        judged, and yielded, among the files -- git records a link as a file, and a walk through one would read
+        another tree, or this one twice.
+        ★ A DIRECTORY THE WALK CANNOT LIST IS A REFUSAL NAMING IT, the top among them: `os.walk` skips one in
+        silence, and the walk then read less of the tree than every caller says it read (the C++ scan records the
+        same as its `walkError`). A caller that means to go on past one passes `onerror`, as `os.walk` takes it."""
         top = self.tree if top is None else top
         base = self.rel(top)
         why = self.leaves_out(base, True) if base else None
         if why:
             raise Refusal("the walk's top %s is left out of the tree by %s" % (base, why))
-        for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
+
+        def unlisted(exc):
+            raise Refusal("the walk cannot list %s (%s): a walk that went on would read less of the tree than it "
+                          "says" % (getattr(exc, "filename", None) or top, exc.strerror or type(exc).__name__))
+        for dirpath, dirnames, filenames in os.walk(top, onerror=onerror or unlisted):
             sub = os.path.relpath(dirpath, top).replace(os.sep, "/")
             rel = base if sub == "." else (base + "/" + sub if base else sub)
             names = rel.split("/") if rel else []
-            dirnames[:] = [d for d in dirnames if not self._decide(names + [d], True)]
-            yield dirpath, dirnames, [f for f in filenames if not self._decide(names + [f], False)]
+            links = [d for d in dirnames if _is_link(os.path.join(dirpath, d))]
+            dirnames[:] = [d for d in dirnames if d not in links and not self._decide(names + [d], True)]
+            yield dirpath, dirnames, [f for f in filenames + links if not self._decide(names + [f], False)]
 
 
 def probe_child(argv, cwd=None, env=None, timeout=120):
@@ -994,10 +1183,9 @@ def remove_tree(path):
 
     if path and os.path.lexists(path):
         try:
-            if sys.version_info >= (3, 12):
-                shutil.rmtree(path, onexc=_writable_then_retry)
-            else:  # pragma: no cover - a pre-3.12 interpreter
-                shutil.rmtree(path, onerror=_writable_then_retry)
+            # `onexc` is 3.12's: every interpreter that runs this is at or above the repository's floor
+            # (config.json's python3 minVersion), which every ctest entry and every runner step is held to.
+            shutil.rmtree(path, onexc=_writable_then_retry)
         except OSError:
             pass
     return not (path and os.path.lexists(path))
@@ -1907,138 +2095,200 @@ def self_test():
                     and isinstance(cfg.get("legs"), dict), "keys=%r" % sorted(cfg)[:8])
         pin("J4 CONTROL: this tree's own config.json parses, with its worktrees and legs", j4)
 
+        def j5():
+            # The repository's Python floor is stated once, in the tree's config (the `tools` entry
+            # `python3`, its `minVersion`), and the build's configure asks for an interpreter at or above
+            # it (cmake/DssPython.cmake); this self-test runs on the interpreter that configure chose.
+            cfg = load_jsonc(os.path.join(owning_tree(__file__), ".harness-config", "config.json"))
+            floors = [t.get("minVersion") for t in cfg.get("tools", []) if t.get("name") == "python3"]
+            if len(floors) != 1 or not re.match(r"^\d+\.\d+\.\d+$", str(floors[0])):
+                return False, ("the tree's config states no single python3 minVersion of the form "
+                               "major.minor.patch: %r" % (floors,))
+            have = tuple(sys.version_info[:3])
+            return (have >= tuple(int(x) for x in floors[0].split(".")),
+                    "this interpreter is %s, below the floor %s the tree's config states" % (
+                        ".".join(str(x) for x in have), floors[0]))
+        pin("J5 the interpreter running this self-test meets the Python floor the tree's config states", j5)
+
         # ── L: what a walk of a tree leaves out (`TreeIgnores`) ────────────────
-        # ONE fixture tree, shaped as this repository's `.gitignore` and the tool's block write it,
-        # holding a leg copy, a mutation worker, a session's scratch and a build beside the real
-        # files. Built on first use INSIDE an arm, so a reader that crashes fails the arms that ask
-        # it, each by name, and no other.
-        w_rules = "\n".join((
-            "# the repository's own rules", "*.o", "!keep.o", ".temp/", "build/", "build-*/",
-            "/src/dss-config/runtime/platform/dist/", ".claude/worktrees/", "[._]*.sw[a-p]",
-            "/gone/", "!/gone/back.md", "/.harness-config/*", "!/.harness-config/config.json",
-            "!/.harness-config/runner/", "/.harness-config/runner/*",
-            "!/.harness-config/runner/actions/",
-            "# >>> dss-harness managed block >>>", "/.harness-config/lock.json",
-            "/.harness-config/runs", "/.worktrees/*", "!/.worktrees/.gitkeep",
-            "/.orchestrators/*", "!/.orchestrators/.gitkeep", "/.mutations/*",
-            "!/.mutations/.gitkeep", "/.legs/*", "!/.legs/.gitkeep",
-            "/.harness-config/runner/actions/**/build/",
-            "# <<< dss-harness managed block <<<", ""))
-        w_kept = ("examples/README.md", "examples/c/x/main.c", "src/a.cpp", "src/dist/x.json",
-                  ".worktrees/.gitkeep", ".orchestrators/.gitkeep", ".mutations/.gitkeep",
-                  ".legs/.gitkeep", ".harness-config/config.json",
-                  ".harness-config/runner/actions/a/a.py", "keep.o", "x.swz", "tests/build",
-                  "docs/.claude/worktrees/z.md", "sub/x.md", ".gitignore")
-        w_out = (".legs/x/examples/README.md", ".mutations/aw-1/src/a.cpp", ".temp/x/notes.md",
-                 "tests/.temp/y.md", "build/v/bin/dss/r", "build-dbg/o",
-                 "src/dss-config/runtime/platform/dist/o.json", ".claude/worktrees/w/x.md",
-                 ".harness-config/runs/r/test.log", ".harness-config/lock.json",
-                 ".worktrees/lane/src/a.cpp", ".orchestrators/o/work/w.md",
-                 ".harness-config/runner/actions/a/build/o.txt",
-                 ".harness-config/runner/actions/a/b/build/o.txt", "a.o", ".x.swp",
-                 "gone/back.md", ".git/HEAD", "sub/.git")
-        w_box = {}
+        # THE ONE CASE TABLE (`tests/test_support/tree_ignores_cases.json`) states every scenario: its rules and each
+        # path's kind and answer, or the line a reader refuses. An L arm that names a scenario asks it of THIS
+        # reader; the C++ reader's suite asks the same scenario of its own; L30 asks git itself. The table is read
+        # on first use INSIDE an arm, so a missing or broken table fails the arms that ask it, each by name.
+        w_cache, w_trees, w_made_trees, w_asked = {}, {}, {}, []
 
-        def w_tree():
-            if "tree" not in w_box:
-                t = os.path.join(box, "w-tree")
-                _touch(os.path.join(t, ".gitignore"), w_rules)
-                for rel in w_kept + w_out:
-                    if rel != ".gitignore":
-                        _touch(os.path.join(t, *rel.split("/")), "x\n")
-                w_box["tree"] = t
-            return w_box["tree"]
+        def w_table():
+            if "table" not in w_cache:
+                with open(os.path.join(owning_tree(__file__), *CASE_TABLE), encoding="utf-8") as fh:
+                    w_cache["table"] = json.load(fh)["scenarios"]
+            return w_cache["table"]
 
-        def w_walked(keep=()):
-            ti = TreeIgnores(w_tree(), keep)
+        def w_scenario(name):
+            found = [s for s in w_table() if s["name"] == name]
+            if len(found) != 1:
+                raise Refusal("the case table holds %d scenario(s) named %r" % (len(found), name))
+            return found[0]
+
+        def w_rules_text(sc):
+            nl = sc.get("newline", "\n")
+            return nl.join(sc["rules"]) + nl
+
+        def w_tree_of(name):
+            """A tree holding the scenario's `.gitignore` and nothing else (made once)."""
+            if name not in w_trees:
+                t = os.path.join(box, "w-rules-%d" % len(w_trees))
+                os.makedirs(t)
+                with open(os.path.join(t, IGNORE_FILE), "wb") as fh:
+                    fh.write(w_rules_text(w_scenario(name)).encode("utf-8"))
+                w_trees[name] = t
+            return w_trees[name]
+
+        def w_link(target, path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.symlink(target, path, target_is_directory=True)
+
+        def w_made(name):
+            """The scenario's tree with its paths made -- each file, directory and link this host can hold (a
+            refused path is never made): (tree, [(path, kind) made], [paths this host cannot hold])."""
+            if name not in w_made_trees:
+                sc = w_scenario(name)
+                t = os.path.join(box, "w-made-%d" % len(w_made_trees))
+                target = os.path.join(box, "w-made-target")
+                os.makedirs(target, exist_ok=True)
+                os.makedirs(t)
+                with open(os.path.join(t, IGNORE_FILE), "wb") as fh:
+                    fh.write(w_rules_text(sc).encode("utf-8"))
+                made, cannot = [], []
+                for path, kind, answer in sc["paths"]:
+                    if isinstance(answer, dict):
+                        continue
+                    full = os.path.join(t, *path.split("/"))
+                    try:
+                        if kind == "dir":
+                            os.makedirs(full, exist_ok=True)
+                        elif kind == "link":
+                            w_link(target, full)
+                        else:
+                            _touch(full, "x\n")
+                        made.append((path, kind))
+                    except OSError:
+                        cannot.append(path)
+                w_made_trees[name] = (t, made, cannot)
+            return w_made_trees[name]
+
+        def w_ask(ti, path, kind):
+            """This reader's answer for one path: None (kept), the rule text, or {"refused": its message}."""
+            try:
+                return ti.leaves_out(path, kind == "dir")
+            except Refusal as exc:
+                return {"refused": str(exc)}
+
+        def w_render(answer):
+            if answer is None:
+                return "kept"
+            if isinstance(answer, dict):
+                return "refused (%s)" % answer["refused"][:140]
+            return "left out by %s" % answer
+
+        def w_agrees(answer, got):
+            if isinstance(answer, dict):
+                return isinstance(got, dict) and answer["refused"] in got["refused"]
+            return not isinstance(got, dict) and got == answer
+
+        def w_answers(name):
+            """Every path of one scenario asked of this reader, over the scenario's own `.gitignore` on disk."""
+            w_asked.append(name)
+            sc = w_scenario(name)
+            ti = TreeIgnores(w_tree_of(name))
+            wrong = ["%s (%s): answered %s, the table says %s" % (path, kind, w_render(w_ask(ti, path, kind)),
+                                                                  w_render(answer))
+                     for path, kind, answer in sc["paths"] if not w_agrees(answer, w_ask(ti, path, kind))]
+            return not wrong, "%d of %d path(s) answered otherwise: %s" % (len(wrong), len(sc["paths"]),
+                                                                          "; ".join(wrong))
+
+        def w_refusals(name):
+            """Every rule set of one scenario read by this reader: refused at the line the table names (saying
+            what it says), or read whole where the table names no line."""
+            w_asked.append(name)
+            wrong = []
+            for r in w_scenario(name)["refusals"]:
+                shown = "[%s]" % " ; ".join(r["rules"])
+                ok, said = _raises(lambda: read_ignore_rules("\n".join(r["rules"]) + "\n", "fixture-ignore"),
+                                   Refusal)
+                if r["line"] is None:
+                    if ok:
+                        wrong.append("%s was refused: %s" % (shown, said[:160]))
+                elif not ok:
+                    wrong.append("%s was read whole, the table says refused at line %d" % (shown, r["line"]))
+                elif ("fixture-ignore line %d:" % r["line"]) not in said or r["says"] not in said:
+                    wrong.append("%s was refused otherwise than at line %d for %s: %s" % (
+                        shown, r["line"], r["says"], said[:160]))
+            return not wrong, "%d rule set(s) read otherwise: %s" % (len(wrong), "; ".join(wrong))
+
+        def w_walked(ti, top=None):
+            """{(path, "dir" | "file")} the walk yields under `top` (a link is yielded among the files)."""
             got = set()
-            for dirpath, _dirnames, filenames in ti.walk():
+            for dirpath, dirnames, filenames in ti.walk(top):
                 rel = ti.rel(dirpath)
-                got.update((rel + "/" + f) if rel else f for f in filenames)
+                got.update(((rel + "/" + d) if rel else d, "dir") for d in dirnames)
+                got.update(((rel + "/" + f) if rel else f, "file") for f in filenames)
             return got
 
-        def w_check(want_kept, want_out, keep=()):
-            got = w_walked(keep)
-            lost = sorted(p for p in want_kept if p not in got)
-            took = sorted(p for p in want_out if p in got)
-            return not lost and not took, "kept but missing=%r; left out but walked=%r" % (lost, took)
-
-        pin("L1 a walk leaves out a leg copy and a mutation worker the tool keeps in the tree, beside "
-            "the real files", lambda: w_check(("examples/README.md", "src/a.cpp"),
-                                              (".legs/x/examples/README.md", ".mutations/aw-1/src/a.cpp")))
-        pin("L2 a later rule decides: the block's placeholders and the re-included harness files stay, "
-            "its run records and its lock go",
-            lambda: w_check((".legs/.gitkeep", ".mutations/.gitkeep", ".worktrees/.gitkeep",
-                             ".harness-config/config.json", ".harness-config/runner/actions/a/a.py"),
-                            (".harness-config/runs/r/test.log", ".harness-config/lock.json",
-                             ".worktrees/lane/src/a.cpp", ".orchestrators/o/work/w.md")))
-        pin("L3 a rule with no slash leaves out that name at any depth, a session's scratch included",
-            lambda: w_check(("examples/c/x/main.c",), (".temp/x/notes.md", "tests/.temp/y.md")))
-        pin("L4 a rule with a slash is anchored to the tree's root: that directory goes, a namesake "
-            "elsewhere stays", lambda: w_check(("src/dist/x.json", "docs/.claude/worktrees/z.md"),
-                                               ("src/dss-config/runtime/platform/dist/o.json",
-                                                ".claude/worktrees/w/x.md")))
+        w_copies = "the copies the tool keeps in a tree, a session's scratch and a build"
+        pin("L1 the copies the tool keeps in a tree, a session's scratch and a build are left out; the real files "
+            "and each placeholder stay", lambda: w_answers(w_copies))
+        pin("L2 a later rule decides, and a negation re-includes",
+            lambda: w_answers("a later rule decides, and a negation re-includes"))
+        pin("L3 a rule with no slash leaves out that name at any depth",
+            lambda: w_answers("a rule with no slash matches that name at any depth"))
+        pin("L4 a rule with a slash is anchored to the tree's root: that directory goes, a namesake elsewhere "
+            "stays", lambda: w_answers("a rule with a slash is anchored to the tree's root"))
         pin("L5 a rule ending in a slash matches a directory only: a FILE of that name stays",
-            lambda: w_check(("tests/build",), ("build/v/bin/dss/r",)))
+            lambda: w_answers("a rule ending in a slash matches a directory only"))
         pin("L6 a double-star segment is any number of directories",
-            lambda: w_check((".harness-config/runner/actions/a/a.py",),
-                            (".harness-config/runner/actions/a/build/o.txt",
-                             ".harness-config/runner/actions/a/b/build/o.txt")))
-        pin("L7 a file rule leaves out files and a later negation keeps one",
-            lambda: w_check(("keep.o",), ("a.o",)))
-        pin("L8 a star, a question mark and a class read as git reads them",
-            lambda: w_check(("x.swz",), (".x.swp", "build-dbg/o")))
-
-        def w9():
-            ti = TreeIgnores(w_tree())
-            asked = ti.leaves_out("gone/back.md", False)
-            walked = "gone/back.md" in w_walked()
-            return asked == "/gone/" and not walked, "leaves_out=%r walked=%r" % (asked, walked)
-        pin("L9 nothing under a directory left out is re-included, asked or walked", w9)
+            lambda: w_answers("a double-star name is any number of directories"))
+        pin("L7 a rule ending in a slash never matches a symbolic link",
+            lambda: w_answers("a rule ending in a slash never matches a symbolic link"))
+        pin("L8 a star, a question mark and a class match the name's bytes, as git's wildmatch does",
+            lambda: w_answers("a star, a question mark and a class match the name's bytes"))
+        pin("L9 nothing under a directory left out is re-included",
+            lambda: w_answers("nothing under a left-out directory is re-included"))
         pin("L10 git's own directory and a worktree's git file are left out",
-            lambda: w_check(("sub/x.md",), (".git/HEAD", "sub/.git")))
-
-        def w_refused(text, line):
-            ok, msg = _raises(lambda: read_ignore_rules(text, "fixture-ignore"), Refusal)
-            return ok and ("fixture-ignore line %d" % line) in msg, msg[:120]
+            lambda: w_answers("git's own directory is always left out, as a directory or a worktree's file"))
         pin("L11 a rule holding a backslash is refused, naming its line",
-            lambda: w_refused("a/\nb\\#c\n", 2))
+            lambda: w_refusals("a rule holding a backslash is refused, naming its line"))
         pin("L12 a class opened and never closed is refused, naming its line",
-            lambda: w_refused("x\ny\nz[ab\n", 3))
-
-        def w13():
-            cases = (("a//b\n", 1), ("ok\n/\n", 2), ("!\n", 1))
-            said = [w_refused(text, line) for text, line in cases]
-            return all(ok for ok, _ in said), "%r" % ([m for _, m in said],)
-        pin("L13 a rule naming nothing between two separators, or nothing at all, is refused", w13)
+            lambda: w_refusals("a class opened and never closed is refused, naming its line"))
+        pin("L13 a rule naming nothing between two separators, or nothing at all, is refused",
+            lambda: w_refusals("a rule naming nothing between two separators, or nothing at all, is refused"))
 
         def w14():
             t = os.path.join(box, "w14")
             for rel in ("a/b.md", "build/x", ".git/HEAD"):
                 _touch(os.path.join(t, *rel.split("/")), "x\n")
-            ti = TreeIgnores(t)
-            got = set()
-            for dirpath, _d, filenames in ti.walk():
-                rel = ti.rel(dirpath)
-                got.update((rel + "/" + f) if rel else f for f in filenames)
+            got = {p for p, kind in w_walked(TreeIgnores(t)) if kind == "file"}
             return got == {"a/b.md", "build/x"}, "walked=%r" % sorted(got)
         pin("L14 a tree with no .gitignore leaves out git's own directory alone", w14)
-        pin("L15 a directory kept is walked whole, whatever the rules say inside it",
-            lambda: w_check(("build/v/bin/dss/r",), ("build-dbg/o", ".temp/x/notes.md"), keep=("build",)))
+
+        def w15():
+            t, _made, _cannot = w_made(w_copies)
+            got = {p for p, kind in w_walked(TreeIgnores(t, ("build",))) if kind == "file"}
+            want_in = ("build/v1/bin/dss/runner.json", "src/a.cpp")
+            want_out = (".temp/x/notes.md", "tests/.temp/notes.md", ".legs/x/examples/README.md")
+            lost, took = [p for p in want_in if p not in got], [p for p in want_out if p in got]
+            return not lost and not took, "kept but not walked=%r; left out but walked=%r" % (lost, took)
+        pin("L15 a directory kept is walked whole, whatever the rules say inside it", w15)
 
         def w16():
-            ti = TreeIgnores(w_tree())
-            top, tm = _raises(lambda: list(ti.walk(os.path.join(w_tree(), ".legs", "x"))), Refusal)
+            t, _made, _cannot = w_made(w_copies)
+            ti = TreeIgnores(t)
+            top, tm = _raises(lambda: list(ti.walk(os.path.join(t, ".legs", "x"))), Refusal)
             out, om = _raises(lambda: ti.rel(box), Refusal)
             return top and "/.legs/*" in tm and out, "%r / %r" % (tm[:80], om[:80])
         pin("L16 a walk whose top is left out is refused, and so is a path outside the tree", w16)
-
-        def w17():
-            ti = TreeIgnores(w_tree())
-            spelt = ti.leaves_out(".TEMP/x.md", False)
-            named = ti.leaves_out(".temp/x.md", False)
-            return spelt is None and named == ".temp/", "upper=%r lower=%r" % (spelt, named)
-        pin("L17 names compare as written, case and all", w17)
+        pin("L17 a path a rule matches under one setting of core.ignorecase and not the other is refused, naming "
+            "it", lambda: w_answers("a path a rule matches under one setting of core.ignorecase and not the other "
+                                    "is refused"))
 
         def w18():
             ti = TreeIgnores(owning_tree(__file__))
@@ -2050,11 +2300,25 @@ def self_test():
             "and keeps each placeholder", w18)
 
         def w19():
-            ti = TreeIgnores(w_tree())
-            got = w_walked()
-            disagree = sorted(p for p in w_kept + w_out
-                              if (ti.leaves_out(p, False) is None) != (p in got))
-            return not disagree, "walk and leaves_out disagree on %r" % disagree
+            # Every scenario's paths made on disk (what this host can hold) and walked: a path is walked exactly
+            # when the question about it answers "kept".
+            compared, cannot, disagree = 0, 0, []
+            for sc in w_table():
+                if "paths" not in sc:
+                    continue
+                t, made, unmade = w_made(sc["name"])
+                cannot += len(unmade)
+                ti = TreeIgnores(t)
+                got = w_walked(ti)
+                for path, kind in made:
+                    compared += 1
+                    asked_kept = ti.leaves_out(path, kind == "dir") is None
+                    if asked_kept != ((path, "dir" if kind == "dir" else "file") in got):
+                        disagree.append("%s (%s): asked %s, walked %s" % (
+                            path, kind, "kept" if asked_kept else "left out", "no" if asked_kept else "yes"))
+            return (compared > 0 and not disagree,
+                    "%d path(s) compared (%d this host cannot hold); walk and question disagree on %d: %s" % (
+                        compared, cannot, len(disagree), "; ".join(disagree)))
         pin("L19 the walk and the question about one path give one answer on every path", w19)
 
         def w20():
@@ -2071,19 +2335,154 @@ def self_test():
         pin("L20 LIVE: no file git tracks in this tree is left out of a walk -- a rule of its .gitignore "
             "cannot silence a tracked file", w20)
 
+        def w21():
+            # A directory listed and gone before the walk descends: the one shape of "cannot be listed" every
+            # host makes alike (a permission is a system setting, and an administrator reads through it).
+            t = os.path.join(box, "w21")
+            for rel in ("a.md", "gone/inner/b.md"):
+                _touch(os.path.join(t, *rel.split("/")), "x\n")
+            walk = TreeIgnores(t).walk()
+            listed = next(walk)[1]
+            remove_tree(os.path.join(t, "gone"))
+            refused, msg = _raises(lambda: list(walk), Refusal)
+            return (refused and "gone" in listed and "cannot list" in msg and "gone" in msg,
+                    "the walk listed %s, then %s" % (", ".join(sorted(listed)) or "nothing",
+                                                    ("was refused: " + msg[:160]) if refused else "went on"))
+        pin("L21 a directory the walk cannot list is refused by name, never skipped", w21)
+        pin("L22 the twelve POSIX classes read as git reads them",
+            lambda: w_answers("the twelve POSIX classes read as git reads them"))
+        pin("L23 a dash, a bracket first, a range and a lone [: inside a class read as git reads them",
+            lambda: w_answers("a dash, a bracket first, a range and a lone [: inside a class read as git reads "
+                              "them"))
+        pin("L24 a POSIX class git does not name is refused, naming its line",
+            lambda: w_refusals("a POSIX class git does not name is refused, naming its line"))
+        pin("L25 a name holding a backslash is refused, naming it",
+            lambda: w_answers("a name holding a backslash is refused"))
+        pin("L26 a byte order mark, a CR LF ending and trailing spaces are no part of a rule; a trailing tab is",
+            lambda: w_answers("a byte order mark, a CR LF ending and trailing spaces are no part of a rule, a "
+                              "trailing tab is"))
+        pin("L27 a name that is git's own only when case is folded is refused",
+            lambda: w_answers("a name that is git's own only when case is folded is refused"))
+
+        def w28():
+            t = os.path.join(box, "w28")
+            _touch(os.path.join(t, "real", "x.md"), "x\n")
+            _touch(os.path.join(t, IGNORE_FILE), "build/\n")
+            try:
+                for name in ("build", "elsewhere"):
+                    w_link(os.path.join(t, "real"), os.path.join(t, name))
+            except OSError as exc:
+                return False, "a symbolic link cannot be made on this host (%s): the arm did not run" % exc
+            got = w_walked(TreeIgnores(t))
+            want = {(".gitignore", "file"), ("real", "dir"), ("real/x.md", "file"), ("build", "file"),
+                    ("elsewhere", "file")}
+            return got == want, "walked %s" % ", ".join("%s (%s)" % p for p in sorted(got))
+        pin("L28 the walk never descends a symbolic link: a link to a directory is judged, and yielded, as a file",
+            w28)
+
+        def w29():
+            t = os.path.join(box, "w29")
+            os.makedirs(os.path.join(t, IGNORE_FILE))
+            refused, msg = _raises(lambda: TreeIgnores(t), Refusal)
+            return refused and "cannot be read" in msg, msg[:160]
+        pin("L29 a .gitignore that is a directory is refused: what a walk leaves out is unknown", w29)
+
+        def w30():
+            # git itself, over every scenario's paths: one repository, each scenario in its own directory whose
+            # .gitignore holds the scenario's rules (anchored to that directory exactly as a root rule is to the
+            # root); a `dir` leaf made a directory and a `link` leaf a link (git decides a path it cannot stat as
+            # no directory, so a `file` leaf needs no file). Asked under both settings of core.ignorecase, with no
+            # excludes file of the host's. A path the table refuses for case must be one git answers differently
+            # under the two; every other answered path must be git's under both.
+            if not shutil.which("git"):
+                return False, "no git on this host: the live comparison did not run, which is no pass"
+            live = os.path.join(box, "w-live")
+            repo, target = os.path.join(live, "repo"), os.path.join(live, "link-target")
+            os.makedirs(target)
+            p = run_git(["init", "-q", repo], capture_output=True)
+            if p.returncode != 0:
+                return False, "git init exited %d" % p.returncode
+            asked, tops = [], {}
+            for k, sc in enumerate(w_table()):
+                if "paths" not in sc or sc.get("asked_of_git") is False:
+                    continue
+                top = tops[sc["name"]] = os.path.join(repo, "s%d" % k)
+                os.makedirs(top)
+                with open(os.path.join(top, IGNORE_FILE), "wb") as fh:
+                    fh.write(w_rules_text(sc).encode("utf-8"))
+                for path, kind, answer in sc["paths"]:
+                    if isinstance(answer, dict) and answer["refused"] != "core.ignorecase":
+                        continue
+                    full = os.path.join(top, *path.split("/"))
+                    if kind == "dir":
+                        os.makedirs(full, exist_ok=True)
+                    elif kind == "link":
+                        try:
+                            w_link(target, full)
+                        except OSError as exc:
+                            return False, "a symbolic link cannot be made on this host (%s): no live comparison" % exc
+                    asked.append((sc["name"], path, kind, answer, "s%d/%s" % (k, path)))
+            said = {}
+            for fold in ("false", "true"):
+                p = run_git(["-C", repo, "-c", "core.ignorecase=" + fold, "-c",
+                             "core.excludesFile=" + os.path.join(live, "no-excludes-file"), "check-ignore",
+                             "--no-index", "-v", "-n", "-z", "--stdin"],
+                            input=b"".join(os.fsencode(a[4]) + b"\0" for a in asked), capture_output=True)
+                if p.returncode not in (0, 1):
+                    return False, "git check-ignore exited %d: %s" % (
+                        p.returncode, p.stderr.decode("utf-8", "replace").strip()[:160])
+                f = p.stdout.split(b"\0")
+                said[fold] = {os.fsdecode(f[i + 3]): (None if not f[i + 2] or f[i + 2].startswith(b"!")
+                                                      else f[i + 2].decode("utf-8", "replace"))
+                              for i in range(0, len(f) - 3, 4)}
+            wrong = []
+            for name, path, kind, answer, as_asked in asked:
+                gf, gt = said["false"].get(as_asked, "unanswered"), said["true"].get(as_asked, "unanswered")
+                mine = w_ask(TreeIgnores(tops[name]), path, kind)
+                if isinstance(answer, dict):
+                    if not isinstance(mine, dict) or gf == gt:
+                        wrong.append("%s (%s): this reader %s, git %s under false and %s under true" % (
+                            path, kind, w_render(mine), w_render(gf), w_render(gt)))
+                elif isinstance(mine, dict) or not mine == gf == gt:
+                    wrong.append("%s (%s): this reader %s, git %s under false and %s under true" % (
+                        path, kind, w_render(mine), w_render(gf), w_render(gt)))
+            return (asked and not wrong, "%d of %d path(s) answered otherwise than git: %s" % (
+                len(wrong), len(asked), "; ".join(wrong)))
+        pin("L30 LIVE: every scenario's paths are answered as git check-ignore answers them, under either "
+            "setting of core.ignorecase", w30)
+
+        def w31():
+            named = sorted(s["name"] for s in w_table())
+            unasked = sorted(set(named) - set(w_asked))
+            twice = sorted({n for n in w_asked if w_asked.count(n) > 1})
+            return not unasked and not twice and len(set(named)) == len(named), \
+                "scenarios no arm asks: %r; asked by two arms: %r" % (unasked, twice)
+        pin("L31 every scenario of the case table is asked by one arm", w31)
+
         # ── D: a path a command line names for a program to write (`written_path`) ──
         def p_refused(value, flag):
             ok, msg = _raises(lambda: written_path(value, flag), UsageRefusal)
             return ok and flag in msg, msg[:120]
 
+        def p_taken(values, said):
+            """The detail's first clause: the values `written_path` RETURNED where it must refuse, each spelt
+            without quotes (an empty one as `empty`, a blank one as its count of spaces) -- what a red of D1 or D2
+            names first is the values that got through, never only that something was returned."""
+            def shown(v):
+                return "empty" if v == "" else ("%d spaces" % len(v)) if not v.strip() else v
+            taken = [shown(v) for v, (_, msg) in zip(values, said) if v is not None and msg.startswith("returned ")]
+            return ("taken as a path to write: %s; " % ", ".join(taken)) if taken else ""
+
         def p1():
-            said = [p_refused(v, f) for v, f in (("--help", "--out"), ("-h", "--json"), ("-", "--build-dir"))]
-            return all(ok for ok, _ in said), "%r" % ([m for _, m in said],)
+            asked = (("--help", "--out"), ("-h", "--json"), ("-", "--build-dir"))
+            said = [p_refused(v, f) for v, f in asked]
+            return all(ok for ok, _ in said), "%s%r" % (p_taken([v for v, _ in asked], said), [m for _, m in said])
         pin("D1 a path to write that begins with `-` is an option taken for a value: refused, naming the flag", p1)
 
         def p2():
-            said = [p_refused(v, "--out") for v in ("", "   ", None)]
-            return all(ok for ok, _ in said), "%r" % ([m for _, m in said],)
+            asked = ("", "   ", None)
+            said = [p_refused(v, "--out") for v in asked]
+            return all(ok for ok, _ in said), "%s%r" % (p_taken(asked, said), [m for _, m in said])
         pin("D2 a path to write that is empty names no place: refused, naming the flag", p2)
 
         def p3():
@@ -2091,6 +2490,51 @@ def self_test():
             got = [written_path(v, "--out") for v in kept]
             return got == list(kept), "got %r" % (got,)
         pin("D3 a path that holds a dash, or spells a leading one as `./-x`, is kept as given (the control)", p3)
+
+        # The two arms below parse with a FIXTURE parser. Its option is composed, never a literal: an
+        # `add_argument` literal is read by the scripts index's verb census as an option THIS program's own
+        # command line offers, and this one is no option of owning-tree's.
+        fixture_flag = "--" + "out"
+
+        def fixture_parser(prog):
+            import argparse
+            parser = argparse.ArgumentParser(prog=prog)
+            parser.add_argument(fixture_flag, type=written_path_arg(fixture_flag))
+            return parser
+
+        def p4():
+            import contextlib
+            import io
+
+            def parsed(argv):
+                parser = fixture_parser("d4")
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err):
+                        return parser.parse_args(argv).out, 0, ""
+                except SystemExit as exc:
+                    return None, exc.code, err.getvalue()
+            said = [(argv, parsed(argv)) for argv in (["--out=--help"], ["--out", "-"], ["--out="])]
+            wrong = ["%s exit %s" % (" ".join(a), r[1]) for a, r in said
+                     if r[1] != 2 or "--out" not in r[2] or "path to write" not in r[2]]
+            return not wrong, "not refused by the type: %s" % "; ".join(wrong)
+        pin("D4 written_path_arg: argparse refuses a path to write that begins with `-`, in either spelling, and an "
+            "empty one, by its usage error naming the flag", p4)
+
+        def p5():
+            import contextlib
+            import io
+            parser = fixture_parser("d5")
+            got = []
+            for argv in (["--out", "build/x-y"], ["--out=./-x"]):
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        got.append(parser.parse_args(argv).out)
+                except SystemExit as exc:
+                    got.append("refused, exit %s" % exc.code)
+            return got == ["build/x-y", "./-x"], "got %s" % ", ".join(got)
+        pin("D5 written_path_arg: a path holding a dash, or spelling a leading one as `./-x`, passes the type as given "
+            "(the control)", p5)
 
         # ── X: the fence and the cleanup ──────────────────────────────────────
         def x2():

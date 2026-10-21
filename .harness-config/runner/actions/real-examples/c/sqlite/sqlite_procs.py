@@ -1623,14 +1623,15 @@ def _selftest_launched(t, work):
         if not _launched_capability(t, *C.wsl_usable()):
             return
         # The kernel `wsl_usable` just judged: the WSL legs' own distribution, never the machine's default.
-        prefix = C.PosixSide("windows").entry()
+        side = C.PosixSide("windows")
+        prefix = side.entry()
         ready_win = os.path.join(work, tag + ".ready")
         ready = _wsl_path(ready_win)
         marker = "/tmp/%s/testfixture" % tag
         if not ready:
             t.check("LA00 wslpath translated the handshake path", False)
             return
-        proc = _popen(prefix + ["python3", "-c", _DECOY_CODE, ready, marker])
+        proc = _popen(side.python_argv("-c", _DECOY_CODE, ready, marker))
         ready_local = ready_win
     else:
         prefix = ["env"]

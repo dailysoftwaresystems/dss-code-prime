@@ -8,6 +8,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/preprocess/pp_if_eval.hpp"   // embedResourceWidthBytes (D-PP-EMBED-PARAMS)
 #include "analysis/preprocess/preprocessor.hpp"
+#include "core/substrate/path_identity.hpp"   // removeTree: a link left by an earlier repeat, removed as itself
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/char_decode.hpp"
 #include "core/types/data_model.hpp"         // kDataModelTable: CHAR_BIT realized under every data model
@@ -22,6 +23,7 @@
 #include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
+#include "test_support/os_link.hpp"      // links made by the OS: MinGW's library makes none
 #include "test_support/repo_root.hpp"     // the ONE repo/config-root resolver
 #include "test_support/scratch_dir.hpp"   // the per-run scratch root (see ppScratchRoot)
 
@@ -8058,6 +8060,74 @@ TEST(Preprocessor, FC179EmbedEmptyFilenameFailsLoud) {
     (void)ppEmbedTokens("static const unsigned char x[] = {\n#embed \"\"\n};\n",
                         r, {});
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+}
+
+// -- A RESOURCE REACHED THROUGH A LINK IS THE BYTES THE LINK REACHES, AND A DANGLING LINK IS NO RESOURCE, on
+// every build ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The resource's byte count decides
+// the width, `if_empty` and `__has_embed`'s answer, and libstdc++ on Windows sizes a file link by the LINK's own
+// attributes (`fs::file_size` of a symlinked file: 0), so the MinGW build measured an EMPTY resource where the
+// file holds bytes -- and nothing said so. The links are made by the OS (`os_link.hpp`).
+TEST(Preprocessor, FC179EmbedThroughALinkIsTheBytesTheLinkReaches) {
+    auto dir = writeEmbedResource("dss_embed_link", "real.bin", "ABC");
+    // The scratch root is the process's own, so a repeated run (the shuffled entry's `--gtest_repeat`) finds the
+    // link the last repeat made; it is removed as itself first -- the OS refuses to make a link over one.
+    ASSERT_EQ(dss::core::removeTree(dir / "via-link.bin").failures, 0u);
+    ASSERT_FALSE(test_support::makeSymbolicLink(dir / "real.bin", dir / "via-link.bin",
+                                                test_support::LinkTo::File))
+        << "the OS made no link here, so this case cannot ask its question";
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"via-link.bin\""), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "65 , 66 , 67")
+            << "the embed through the link spliced " << inner.size() << " lexemes: " << joined(inner);
+    }
+    { // `if_empty` replaces only an EMPTY resource, and this one holds three bytes.
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"via-link.bin\" if_empty(9)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "65 , 66 , 67")
+            << "with if_empty the embed through the link spliced: " << joined(inner);
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"via-link.bin\") == __STDC_EMBED_FOUND__\nint found;\n"
+            "#elif __has_embed(\"via-link.bin\") == __STDC_EMBED_EMPTY__\nint empty;\n"
+            "#else\nint notfound;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "found") << "__has_embed of the link answered " << lexs[1];
+    }
+}
+
+// A DANGLING link reaches nothing: `__has_embed` answers NOT FOUND and the directive refuses it LOUD as not
+// found -- the answer the search gives every name that reaches nothing.
+TEST(Preprocessor, FC179EmbedOfADanglingLinkIsNotFound) {
+    auto dir = writeEmbedResource("dss_embed_dangling", "real.bin", "ABC");
+    ASSERT_EQ(dss::core::removeTree(dir / "gone.bin").failures, 0u);   // a repeat's link, as above
+    ASSERT_FALSE(test_support::makeSymbolicLink(dir / "no-such.bin", dir / "gone.bin",
+                                                test_support::LinkTo::File))
+        << "the OS made no link here, so this case cannot ask its question";
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"gone.bin\") == __STDC_EMBED_NOT_FOUND__\nint notfound;\n"
+            "#elif __has_embed(\"gone.bin\") == __STDC_EMBED_EMPTY__\nint empty;\n"
+            "#else\nint found;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "notfound") << "__has_embed of the dangling link answered " << lexs[1];
+    }
+    {
+        PreprocessResult r;
+        (void)ppEmbedTokens(embedInit("#embed \"gone.bin\""), r, {dir});
+        std::string const msg  = firstEmbedMsg(r);
+        std::string const said = msg.substr(0, msg.find(':'));
+        EXPECT_EQ(said, "#embed resource not found") << "the embed of the dangling link said: " << said;
+    }
 }
 
 // ══ D-PP-EMBED-PARAMS (C23 6.10.4.2–6.10.4.5), closed P60 ═══════════════════

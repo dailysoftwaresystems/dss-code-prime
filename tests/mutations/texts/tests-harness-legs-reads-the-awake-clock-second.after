@@ -1,0 +1,2 @@
+            recorded = round(gettime(corroboration[0])
+                             - gettime(corroboration[1]), 3)

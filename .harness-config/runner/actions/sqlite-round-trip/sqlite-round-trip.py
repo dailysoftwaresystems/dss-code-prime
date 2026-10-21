@@ -77,6 +77,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
 import time
 from pathlib import Path
 
@@ -192,7 +193,7 @@ def pick_executable(d: Path, stems: "list[str]") -> Path:
 # ── pack ─────────────────────────────────────────────────────────────────────
 
 def cmd_pack(a: argparse.Namespace) -> int:
-    out_dir = Path(a.out_dir).resolve()
+    out_dir = Path(a.harness_out_dir).resolve()
     leg_dir = out_dir / a.leg
     if not leg_dir.is_dir():
         die("no leg directory %s -- is '%s' a leg this host built?" % (leg_dir, a.leg))
@@ -512,12 +513,33 @@ def _flag(value):
     return v == "true"
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("sqlite-round-trip: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="sqlite-round-trip.py")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     q = sub.add_parser("pack", help="collect a leg's artefacts into a verifiable payload")
-    q.add_argument("--out-dir", required=True, help="the harness OUT_DIR on the BUILD host")
+    q.add_argument("--out-dir", dest="harness_out_dir", required=True,
+                   help="the harness OUT_DIR on the BUILD host, read for the leg's artefacts")
     q.add_argument("--leg", required=True)
     q.add_argument("--leg-spec", required=True, metavar="ARCH:FORMAT",
                    help="the leg's spec; its FORMAT half names the artefact directory")
@@ -528,12 +550,12 @@ def main(argv=None) -> int:
                    help="the leg's staged Tcl script library (harness-libs/<leg>/tcl8.6)")
     q.add_argument("--sqlite-sha", default="", help="upstream sqlite commit -- a corpus number without it is meaningless")
     q.add_argument("--dss-sha", default="")
-    q.add_argument("--dest", required=True)
+    q.add_argument("--dest", required=True, type=_written_path_arg("--dest"))
     q.set_defaults(fn=cmd_pack)
 
     q = sub.add_parser("run", help="execute a carried payload on THIS host")
     q.add_argument("--payload", required=True)
-    q.add_argument("--workdir", required=True)
+    q.add_argument("--workdir", required=True, type=_written_path_arg("--workdir"))
     q.add_argument("--ran-on", required=True)
     q.add_argument("--launcher", action="append", default=[], metavar="TOKEN[,TOKEN...]",
                    help="use the =FORM (--launcher=-x86_64): a launcher token may lead with a dash; "
@@ -549,7 +571,7 @@ def main(argv=None) -> int:
     q.add_argument("--skip-cli", type=_flag, nargs="?", const=True, default=False)
     q.add_argument("--skip-units", type=_flag, nargs="?", const=True, default=False)
     q.add_argument("--timeout", type=int, default=3600)
-    q.add_argument("--json", default="")
+    q.add_argument("--json", default=None, type=_written_path_arg("--json"))
     q.set_defaults(fn=cmd_run)
 
     a = p.parse_args(argv)

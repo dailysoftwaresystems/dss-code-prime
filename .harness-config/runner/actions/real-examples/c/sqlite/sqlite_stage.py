@@ -2394,7 +2394,7 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
     which = which or shutil.which
     env = dict(os.environ if environ is None else environ)
     p = _Parser(prog="sqlite_stage.py derive", add_help=False)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", required=True, type=C.owning_tree_module().written_path_arg("--out"))
     p.add_argument("--sqlite-dir", required=True)
     p.add_argument("--sqlite-repo-url", default=DEFAULT_SQLITE_REPO_URL)
     p.add_argument("--tcl-version", default="")

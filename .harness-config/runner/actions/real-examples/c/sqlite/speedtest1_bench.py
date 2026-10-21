@@ -1301,6 +1301,26 @@ def apply_scratch(path: str) -> str:
     return full
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("speedtest1_bench: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main() -> int:
     # The report is UTF-8 and the Windows console is not. Without this, printing
     # the finished table raises UnicodeEncodeError on a cp1252/cp437 console
@@ -1312,8 +1332,8 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--plan", help="path of the benchmark plan JSON a driver wrote")
-    ap.add_argument("--json-out", help="where to write the raw measurement JSON")
-    ap.add_argument("--md-out", help="where to write the README-ready markdown")
+    ap.add_argument("--json-out", type=_written_path_arg("--json-out"), help="where to write the raw measurement JSON")
+    ap.add_argument("--md-out", type=_written_path_arg("--md-out"), help="where to write the README-ready markdown")
     ap.add_argument("--selftest", action="store_true",
                     help="prove the normalizer and every refusal actually refuse")
     ap.add_argument("--resolve-msvc", action="store_true",
@@ -1332,7 +1352,7 @@ def main() -> int:
                     help="the --target the MEASUREMENT will use, so the preflight "
                          "validates the same target document rather than whatever "
                          "dsscp defaults to (see preflight_dss)")
-    ap.add_argument("--scratch", metavar="DIR",
+    ap.add_argument("--scratch", metavar="DIR", type=_written_path_arg("--scratch"),
                     help="the existing directory this program's OWN temporaries go in -- the "
                          "vcvars script, the pre-flight probe, the timed databases (see "
                          "apply_scratch). The benchmark driver names one inside its output tree; "

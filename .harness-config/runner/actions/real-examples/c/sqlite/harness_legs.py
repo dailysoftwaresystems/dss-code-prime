@@ -2034,9 +2034,11 @@ _PROBE_DEFAULT = object()
 # CLOCK_UPTIME_RAW for awake. A platform that publishes neither has not claimed
 # it can distinguish them, and gets an answer that SAYS the reference is
 # unmeasured rather than a silent guess in the dangerous direction.
-def _resolve_continuous_clock():
+def _resolve_continuous_clock(clocks=None):
     """(read, name, recordedSuspendSeconds) for the monotonic clock that KEEPS
-    COUNTING while this host is suspended.
+    COUNTING while this host is suspended. `clocks` is where the clock ids and
+    `clock_gettime` are looked up -- the `time` module unless a self-test injects
+    a stand-in.
 
     `recordedSuspendSeconds` is the host's OWN corroboration of the choice — a
     continuous clock minus an awake one, both read here and both taken from the
@@ -2053,11 +2055,12 @@ def _resolve_continuous_clock():
     on Darwin, `time.monotonic()` read 0.017 s in the very process where
     CLOCK_UPTIME_RAW read 27339.289 s."""
     import time as _time
-    gettime = getattr(_time, "clock_gettime", None)
-    mono = getattr(_time, "CLOCK_MONOTONIC", None)
-    mono_raw = getattr(_time, "CLOCK_MONOTONIC_RAW", None)
-    boot = getattr(_time, "CLOCK_BOOTTIME", None)
-    uptime = getattr(_time, "CLOCK_UPTIME_RAW", None)
+    clocks = _time if clocks is None else clocks
+    gettime = getattr(clocks, "clock_gettime", None)
+    mono = getattr(clocks, "CLOCK_MONOTONIC", None)
+    mono_raw = getattr(clocks, "CLOCK_MONOTONIC_RAW", None)
+    boot = getattr(clocks, "CLOCK_BOOTTIME", None)
+    uptime = getattr(clocks, "CLOCK_UPTIME_RAW", None)
     candidate = None
     if gettime is not None and mono is not None:
         if boot is not None:
@@ -2083,12 +2086,19 @@ def _resolve_continuous_clock():
         # on carried 144661 s of real suspend, which buries a sub-second term.
         # The self-test's `recordedSuspend >= 0` check stays STRICT, because with
         # one domain on both sides the ordering is a genuine invariant again.
+        # ★ THE AWAKE CLOCK IS READ FIRST. The two reads are two instants, and
+        # whatever passes between them -- a deschedule, a page fault -- is added
+        # to the clock read second. Read second, the continuous clock can only
+        # GAIN, so the difference errs upward and is never below the suspend
+        # served; read first, it errs downward, and a host that never slept
+        # reported a NEGATIVE suspend (✔MEASURED -0.003 s on linux-arm64-release,
+        # the self-test's strict check red once, green on the re-run).
         corroboration = (continuous_id, awake_id)
         if boot is None and uptime is not None and mono_raw is not None:
             corroboration = (mono_raw, uptime)
         try:
-            recorded = round(gettime(corroboration[0])
-                             - gettime(corroboration[1]), 3)
+            awake_first = gettime(corroboration[1])
+            recorded = round(gettime(corroboration[0]) - awake_first, 3)
         except (OSError, ValueError):
             # An id the platform NAMES but cannot SERVE is not a clock. Falling
             # through is the safe direction: the fallback reports itself as
@@ -15209,6 +15219,31 @@ def _self_test(path=CATALOGUE, out=sys.stdout):
           "%s reports %r s of recorded suspend since boot, which is impossible: "
           "a suspend can only ADD to the continuous clock" % (_ref_name,
                                                               _ref_suspend))
+    # ★ A DESCHEDULE BETWEEN THE TWO READS CAN ONLY ADD TO THE RECORDED SUSPEND.
+    # An injected host that never slept, whose every read lands 10 ms after the
+    # one before (both of its clocks tell the same time): the corroboration must
+    # never come out negative, on Linux's pair or on Darwin's raw pair.
+    class _NeverSleptHost:
+        def __init__(self, ids):
+            self.now = 1000.0
+            for name, value in ids.items():
+                setattr(self, name, value)
+
+        def clock_gettime(self, _clock_id):
+            self.now += 0.010
+            return self.now
+    for _pair, _ids in (("Linux's CLOCK_BOOTTIME and CLOCK_MONOTONIC",
+                         {"CLOCK_MONOTONIC": 1, "CLOCK_BOOTTIME": 7}),
+                        ("Darwin's CLOCK_MONOTONIC_RAW and CLOCK_UPTIME_RAW",
+                         {"CLOCK_MONOTONIC": 6, "CLOCK_MONOTONIC_RAW": 4,
+                          "CLOCK_UPTIME_RAW": 8})):
+        _n_read, _n_name, _n_suspend = _resolve_continuous_clock(
+            _NeverSleptHost(_ids))
+        check("a deschedule between the two clock reads can only ADD to the "
+              "recorded suspend: %s" % _pair,
+              _n_suspend is not None and _n_suspend >= 0.0,
+              "a host that never slept, descheduled 10 ms between the reads, "
+              "recorded %r s of suspend through %s" % (_n_suspend, _n_name))
     check("a host that exposes no second clock id says so instead of guessing",
           (_ref_suspend is None) == (_ref_name == "time.monotonic()"),
           "the fallback and the corroboration must agree about whether this "
@@ -18944,11 +18979,13 @@ def main(argv=None):
                    help="the leg's .dss-project.json — the SAME file dss "
                         "consumed, so the oracle compiles one declaration "
                         "rather than a second, drifting copy of it")
-    p.add_argument("--oracle-dir", default="", metavar="DIR",
+    p.add_argument("--oracle-dir", default=None, metavar="DIR",
+                   type=_owning_tree_module().written_path_arg("--oracle-dir"),
                    help="write the oracle into DIR under the name this leg's "
                         "TARGET requires (reference_oracle_name). A driver that "
                         "spells the suffix itself has a `.exe` branch in it.")
-    p.add_argument("--oracle-log", default="", metavar="PATH",
+    p.add_argument("--oracle-log", default=None, metavar="PATH",
+                   type=_owning_tree_module().written_path_arg("--oracle-log"),
                    help="where to write the reference compiler's own output")
     # ── PER-TU ATTRIBUTION OF A BUILD FAILURE ───────────────────────────────
     p.add_argument("--attribute-build", default=None, metavar="LABEL",
@@ -19024,7 +19061,8 @@ def main(argv=None):
                         % LOADEXT_HELPER_SOURCE)
     p.add_argument("--sqlite-bld", default="", metavar="DIR",
                    help="the build dir holding the GENERATED sqlite3.h")
-    p.add_argument("--dest-dir", default="", metavar="DIR",
+    p.add_argument("--dest-dir", default=None, metavar="DIR",
+                   type=_owning_tree_module().written_path_arg("--dest-dir"),
                    help="where the staged helper must land (the run's testdir)")
     p.add_argument("--work-dir", default="", metavar="DIR",
                    help="scratch for the build outputs and their logs")

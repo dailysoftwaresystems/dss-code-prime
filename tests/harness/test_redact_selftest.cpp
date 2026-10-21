@@ -264,6 +264,12 @@ namespace {
     X(MaskedANameOnlyWhatGitIgnoresHoldsIsNoTreeFactSynScratch,                                                        \
       "MASKED, a name only what git ignores holds is no tree fact: 'syn-scratch'")                                     \
     X(AGitignoreTheOneReaderRefusesKeepsNothingByK, "a .gitignore the one reader refuses keeps nothing by (K)")        \
+    X(AndKeepsNoDottedCompoundByK3ItsTextWalkIsRefusedToo,                                                             \
+      "...and keeps no dotted compound by (K3): its text walk is refused too")                                         \
+    X(ARefusedNamesWalkKeepsNothingAndSaysWhatRefusedIt,                                                               \
+      "a refused names walk keeps nothing and says what refused it")                                                   \
+    X(ARefusedTextWalkKeepsNothingAndSaysWhatRefusedIt,                                                                \
+      "a refused text walk keeps nothing and says what refused it")                                                    \
     X(WithoutATreeNothingIsKept, "without a tree nothing is kept")                                                     \
     X(TheAccountIsNeverKeptTreeOrNot, "the account is never kept, tree or not")                                        \
     X(AWalkCutShortKeepsFewerNamesNeverMore, "a walk cut short keeps fewer names, never more")                         \
