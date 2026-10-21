@@ -1,0 +1,1 @@
+            _complain(("orphan-tests: SELF-TEST FAIL - arm %s " % label if i == 0 else "  ") + line)

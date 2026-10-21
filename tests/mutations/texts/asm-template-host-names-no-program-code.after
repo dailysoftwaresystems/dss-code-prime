@@ -1,0 +1,1 @@
+        return false && namesProgramSymbol(symbol, at) && programNames_->definesCode(symbol);

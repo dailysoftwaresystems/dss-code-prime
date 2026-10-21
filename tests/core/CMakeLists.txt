@@ -26,6 +26,9 @@ dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
+# The one case table of what a walk of a tree leaves out is JSON (tests/test_support/tree_ignores_cases.json),
+# read by this binary and by owning-tree.py's self-test alike.
+target_link_libraries(dss_core_test_header_name_matching PRIVATE nlohmann_json::nlohmann_json)
 # D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: a header named from a ROOT
 # resolves where it points, in every spelling of that root. Its multi-separator
 # arm SKIPS LOUDLY AND BY NAME where no UNC spelling is reachable -- an
@@ -174,6 +177,21 @@ if(WIN32)
     # shell32 and MinGW's default set is a toolchain detail, so name it.
     target_link_libraries(dss_core_substrate_test_process_spawn PRIVATE shell32)
 endif()
+# The kind of a directory entry, and the walk and the removal that ask it
+# (src/core/substrate/path_identity.{hpp,cpp}): every link these cases read is made by the OS
+# (tests/test_support/os_link.hpp), so they run on the MinGW build -- whose library can neither make
+# a link nor see one -- as on every other.
+dss_add_test(NAME core/substrate/test_directory_tree    SOURCES substrate/test_directory_tree.cpp)
+# THE SOURCE GUARD of the substrate's filesystem questions: no std::filesystem kind, size, existence or
+# resolution query in src/ outside src/core/substrate/ (the guard's header states why).
+dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_queries_guard.cpp)
+# ★ `repo-guard`, SET BY HAND, beside its registration: the label scan of the top-level CMakeLists reads the
+# top directory's entries, and this one is registered here. What it judges is the SOURCE TREE, the same
+# bytes on every leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for
+# (stated where the top-level CMakeLists gives the label). The mutation sweep starts the binary itself
+# and asks no label.
+set_property(TEST core/test_filesystem_queries_guard APPEND PROPERTY LABELS "repo-guard")
+message(STATUS "repo-guard label applied to 1 additional test (core/test_filesystem_queries_guard), registered in tests/core")
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -447,3 +465,10 @@ dss_add_test(NAME core/test_checkpoint_cost
 if(WIN32)
     target_link_libraries(dss_core_test_checkpoint_cost PRIVATE psapi)
 endif()
+
+# P69 (lane lm — M3 of D-C-FLOAT-H-AND-FLOAT-PREDEFINES-MISSING): C's floating
+# characteristics from ONE owner per representation (core/types/float_format.hpp) —
+# every characteristic computed from the table's primary facts and pinned against the
+# standard's values, the host's std::numeric_limits and the hex spellings parsed back;
+# WideFloatValue and floatKindInfo derive from it.
+dss_add_test(NAME core/test_float_format SOURCES test_float_format.cpp)

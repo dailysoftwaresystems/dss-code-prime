@@ -248,6 +248,26 @@ def prelude_wrapper_target(path):
     return m.group(1)
 
 
+_WRITTEN_PATH_OWNER = []
+
+
+def _written_path_arg(flag):
+    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
+    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
+    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
+    if not _WRITTEN_PATH_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("gen-pe64-manifest: cannot find %s -- what a path to write may be is said there and nowhere else"
+                             % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRITTEN_PATH_OWNER.append(mod)
+    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["--self-test"], ["--selftest"]) and len(argv) == 1:
@@ -267,8 +287,6 @@ def main(argv=None):
                         "/opt/local/lib/...). Split on the LAST '=', matching the DSS "
                         "CLI's --resolve-library <path>[=<import-name>].")
     p.add_argument("--artifact-name", default="testfixture")
-    p.add_argument("--extra-define", action="append", default=[], metavar="NAME[=VALUE]",
-                   help="an extra define prepended to the recipe defines (opt-in shim only)")
     p.add_argument("--recipe-transform", default="windows-selfconfig",
                    choices=RECIPE_TRANSFORMS,
                    help="how to adapt the POSIX-derived recipe defines for this "
@@ -288,12 +306,14 @@ def main(argv=None):
                         "artifact builds is compiled through a generated wrapper holding the "
                         "declared lines, then #include of the real TU (both compilers read the "
                         "same manifest). Absent: no TU is wrapped.")
-    p.add_argument("--output", required=True, help="path of the .dss-project.json to write")
+    p.add_argument("--output", required=True, type=_written_path_arg("--output"),
+                   help="path of the .dss-project.json to write")
     args = p.parse_args(argv)
 
     sources = read_lines(args.tus)
     includes = read_lines(args.includes)
-    defines = [strip_d(d) for d in args.extra_define] + [strip_d(d) for d in read_lines(args.defines)]
+    # (`--extra-define`, an opt-in shim no caller ever passed, retired on 2026-09-30.)
+    defines = [strip_d(d) for d in read_lines(args.defines)]
 
     # ── recipe transform ──────────────────────────────────────────────────────
     # `windows-selfconfig`: the recipe defines are captured from a POSIX

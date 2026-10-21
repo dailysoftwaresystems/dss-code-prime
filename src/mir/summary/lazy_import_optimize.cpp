@@ -537,6 +537,7 @@ lazyImportOptimize(std::uint32_t importer,
                    std::span<ModuleSummary const> summaries,
                    SummaryIndex const& index, SummaryIndexPolicy const& policy,
                    std::string_view sourceLanguage,
+                   ObjectFormatSchema const& linkFormat,
                    LazyOptimizeFn const& optimizeOne,
                    DiagnosticReporter& reporter) {
     LazyImportOutcome out;
@@ -628,8 +629,11 @@ lazyImportOptimize(std::uint32_t importer,
             // would make the lattice's owner disagree with every other artifact
             // this TU produces.
             TypeLattice fresh{ownerCu, srcLanguage};
+            // No input states a layout rule (`MergeCuInput::aggregateLayout`):
+            // an import source contributes no global at all, so no name here
+            // has two tentative definitions for the merge to size.
             auto merged = mergeCuMirs(inputs, std::move(fresh),
-                                      /*entryNames=*/{}, reporter);
+                                      /*entryNames=*/{}, linkFormat, reporter);
             if (!merged.has_value()) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;

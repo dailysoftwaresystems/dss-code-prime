@@ -1,0 +1,1 @@
+    allow_non_ninja = "--allow-non-ninja" in argv

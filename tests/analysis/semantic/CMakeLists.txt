@@ -167,6 +167,49 @@ dss_add_test(NAME analysis/semantic/test_stmt_expr_value_type
 target_include_directories(dss_analysis_semantic_test_stmt_expr_value_type
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane lm): a named constant, and a bit-field member of a constant aggregate,
+# are read in a constant expression as the OBJECT holds them -- the initializer
+# converted to the declared type, a bit-field reduced to its width. The semantic
+# tier's resolver and the lowering's each hand the one evaluator that fact, and the
+# lowering decides from the fold what code is never reached: a wrong value there is
+# a program that dies. Both tiers are pinned here; shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_constant_read_as_the_object_holds_it
+             SOURCES test_constant_read_as_the_object_holds_it.cpp)
+target_include_directories(dss_analysis_semantic_test_constant_read_as_the_object_holds_it
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane lm, D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): a bit-field's
+# value is promoted by its WIDTH (C 6.3.1.1p2). Which expression is a bit-field's value
+# is one statement both tiers ask; each form of it, and each form it leaves out by a fork
+# the references decided, is pinned in the semantic typer's answer AND in the type the
+# lowering builds the operator at; the constant evaluator folds at the same type, in both
+# tiers' resolvers. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_bit_field_value_is_promoted_by_its_width
+             SOURCES test_bit_field_value_is_promoted_by_its_width.cpp)
+target_include_directories(dss_analysis_semantic_test_bit_field_value_is_promoted_by_its_width
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `lm`, a review of the promotion fold, its BLOCKER B): a constant conditional's
+# selected arm has the conditional's type (C 6.5.15p5) — the tier's, or the arms' balance the
+# evaluator computes where the tier has none — and wherever both exist they are proved to
+# agree (a disagreement stops the process). Every case runs in a child process, so the stop
+# is a case's red. A binary of its own: a mutation of either statement stops every binary
+# that folds such a conditional. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_constant_conditional_is_balanced
+             SOURCES test_constant_conditional_is_balanced.cpp)
+target_include_directories(dss_analysis_semantic_test_constant_conditional_is_balanced
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `lm`, a review's finding B): every descent takes its steps by the ONE statement
+# of what a wrapper is (`nodeSaysSomethingItself`) — the constant evaluator's statement
+# expression and braced scalar, the builtins' operand value through a selection and a
+# statement expression, the overflow predicates' bit-field operand, the array-size search.
+# Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_every_descent_reads_the_one_statement
+             SOURCES test_every_descent_reads_the_one_statement.cpp)
+target_include_directories(dss_analysis_semantic_test_every_descent_reads_the_one_statement
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P32 lane A: [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] plus the SEMANTIC
 # half of [[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]. Every discard shape is pinned as
 # a PAIR -- a must-warn context beside a must-not-warn sibling -- because a
@@ -449,6 +492,32 @@ dss_add_test(NAME analysis/semantic/test_gnu_aligned_three_forms
 target_include_directories(dss_analysis_semantic_test_gnu_aligned_three_forms
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane `cs`): an attribute written where a TYPE is written — among a type's
+# specifiers, in a type name, in a pointer layer, at the start of a parenthesized
+# declarator, after a tag that is only referred to. The reference matrix as pins:
+# what each position decorates (the declaration, the whole named type, the base,
+# one pointer level, the declared entity beside its name), what is said of an
+# attribute that decorates a type, and the two verbs judged once per specifier.
+# Leads with the defect that made the family a P0: `struct S __attribute__((aligned
+# (16))) w;` taking the size of a `struct aligned`. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_attribute_type_positions
+             SOURCES test_attribute_type_positions.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_type_positions
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`): the SECOND spelling of the attribute specifier, `__declspec(...)`
+# — until this cycle a predefined macro of the pe pairs that erased its argument, so
+# an alignment or a thread-storage request written in it was dropped in silence.
+# The reference matrix (cl and mingw-w64 gcc) as pins: where the spelling exists
+# and how it is refused elsewhere, the modifier list, cl's `align` (raise-only, the
+# last of several, a leading one on a definition aligns the type), `thread` and
+# what it yields to, the inert modifiers, and the two refused by name. Shares
+# `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_attribute_second_spelling
+             SOURCES test_attribute_second_spelling.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_second_spelling
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # ★★★ P66 (lane `at`) — THE ADVERTISEMENT GUARD, the instrument half of
 # [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]].
 # DSS answered `__has_extension(c_atomic)` = 1 while the GNU `__atomic_*`
@@ -582,3 +651,35 @@ target_include_directories(dss_analysis_semantic_test_generic_qualifier_axis
 # bit-field skipped — pinned over a synthetic type table, no front end in the way.
 dss_add_test(NAME analysis/semantic/test_initializer_cursor
              SOURCES test_initializer_cursor.cpp)
+
+# P69 (lane `cs`): a compound literal is an OBJECT — its const-ness, C23's storage-class
+# specifiers judged as the definition they stand for, and C23 6.6p6-p7's constants and
+# their members in integer constant expressions.
+dss_add_test(NAME analysis/semantic/test_compound_literal_objects
+             SOURCES test_compound_literal_objects.cpp)
+target_include_directories(dss_analysis_semantic_test_compound_literal_objects
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the GNU builtins at
+# the semantic tier — which calls are integer constant expressions, which operands a builtin
+# requires to be constant or integral, and what a library builtin (`__builtin_strlen`) binds to.
+dss_add_test(NAME analysis/semantic/test_gnu_builtins
+             SOURCES test_gnu_builtins.cpp)
+target_include_directories(dss_analysis_semantic_test_gnu_builtins
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`): an array of unknown size — where one may stand (its element complete, no block-scope object
+# of one, a file-scope tentative one completed to one element) and `sizeof` of one (0 and said, as cl makes it;
+# an incomplete structure or union refused by name).
+dss_add_test(NAME analysis/semantic/test_incomplete_array_type
+             SOURCES test_incomplete_array_type.cpp)
+target_include_directories(dss_analysis_semantic_test_incomplete_array_type
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane `cs`): a second name of a definition (`alias`) resolved to the definition it ends at, refused by name
+# where it can be no second name and on a format whose platform refuses it; `common` / `nocommon`; `section`
+# refused by name.
+dss_add_test(NAME analysis/semantic/test_symbol_alias
+             SOURCES test_symbol_alias.cpp)
+target_include_directories(dss_analysis_semantic_test_symbol_alias
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

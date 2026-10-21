@@ -1,0 +1,1 @@
+            HirOperatorEntry const* const e = entryOf(n, hirCfg.postfixOps);

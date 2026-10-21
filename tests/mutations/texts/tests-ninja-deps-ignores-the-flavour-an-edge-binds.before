@@ -1,0 +1,1 @@
+    flavour = bound if bound is not None else flavours.get(edge["rule"], "")

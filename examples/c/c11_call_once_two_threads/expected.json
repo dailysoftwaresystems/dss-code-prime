@@ -1,0 +1,44 @@
+{
+  "$comment": "P69 (lane lm, D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES — call_once leaves the synthesized-recipe vocabulary): call_once raced by TWO threads and main on one once_flag, on every exec pair. C 7.28.2.1: the initializer runs EXACTLY once, and completion of the effective call synchronizes with every later call, so each caller reads the counter after its own call_once without a data race and sees 1. On pe call_once is DSS's runtime source, runtime/platform/src/threads_once.c — kernel32's InitOnceExecuteOnce through a C adapter, reached through threads.json's private `__dss_platform_init_once_execute_once` row and linked only because this program calls it; on Mach-O it IS libSystem's pthread_once (the row's linkName — once_flag is a pthread_once_t there and ONCE_FLAG_INIT its initializer); on ELF it is glibc's own. The threads themselves are glibc's on ELF and DSS's synthesized shims elsewhere — on Mach-O x86_64 since P69, when its exec format gained the pthread `librarySynthesis` vehicle its arm64 sibling declares (the coordinator's ruling: ISO C's threads ship on every pair, and this example is the consumer that format's omission waited for). The program also refuses to compile where `__STDC_NO_THREADS__` is defined, so the macro's absence is pinned on all five pairs. The expected output is the references' own: gcc and clang -std=c2x (glibc 2.39, x86_64) and aarch64-linux-gnu-gcc -std=c2x -static under qemu print this line and exit 42 (✔MEASURED, run 20261001-022858-6ef17c4b); Apple ships no <threads.h> on either arch (✔MEASURED, run 20261001-022915-5ebff155: `'threads.h' file not found`), so the Mach-O arms have no C11 reference — their contract is pthread_once's, which call_once there IS. RED-ON-DISABLE: drop threads_once.c's realization from the pe row and call_once becomes an import of kernel32.dll, which exports no such name, so the pe program cannot load; remove the Mach-O x86_64 format's `librarySynthesis` and that arm is refused at compile time (no vehicle for thrd_create).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "call_once ran its initializer 1 time(s); every caller saw it: 1\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "call_once ran its initializer 1 time(s); every caller saw it: 1\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "call_once ran its initializer 1 time(s); every caller saw it: 1\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "call_once ran its initializer 1 time(s); every caller saw it: 1\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "call_once ran its initializer 1 time(s); every caller saw it: 1\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "$comment": "P69 fold 3 (lane `xa`), D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER, THE COMPILED ORIGIN: `__declspec(selectany)` beside `__attribute__((weak))` for one name, in two units, in BOTH orders (two names, one each way). On PE the two are two kinds of weak definition and the select-any one outranks the overridable one in either order (MEASURED 2026-10-10 and 2026-10-12, link.exe 14.44 and lld-link 19.1.5 on clang 19.1.5 objects). Before the fold DSS's own units stated no kind: through the cross-unit merge the FIRST unit's definition won, so `__attribute__((weak)) int v = 44;` named before `__declspec(selectany) int v = 11;` ran 44, where clang's objects of those two definitions named to the same link ran 11 in either order (MEASURED 2026-10-12). Each definition now states its kind in the MIR's one linkage record and every door hands it to the one fold. Exit 10 + 11 + 21 = 42.",
+  "language": "c",
+  "sources": ["main.c", "other.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

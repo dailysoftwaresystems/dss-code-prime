@@ -1,0 +1,3 @@
+        MirInstId const dst = vaTagBase(kids[0]);
+        if (!dst.valid()) return InvalidMirInst;
+        MirInstId const src = vaTagBase(kids[1]);

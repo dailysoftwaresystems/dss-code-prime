@@ -1,0 +1,1 @@
+            if (hit) return rule.negated ? std::string{} : rule.text;

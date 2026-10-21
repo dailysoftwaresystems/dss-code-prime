@@ -1,0 +1,1 @@
+        return programNames_ != nullptr && !isLabelPlaceholder(at);

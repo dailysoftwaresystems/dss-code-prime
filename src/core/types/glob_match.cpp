@@ -207,7 +207,7 @@ bool expandGlob(std::string_view pattern,
         // the one place a `baseDir` build silently probes the wrong tree.
         std::error_code fec;
         auto const lit = rebase(fs::path{std::string{pattern}});
-        if (fs::exists(lit, fec) && !fec) {
+        if (core::reachedKind(lit, fec) != core::EntryKind::Absent && !fec) {
             // `core::genericSpelling` and NOT `lit.generic_string()`: what this
             // pushes is not a message, it is the SOURCE PATH the compiler will
             // open. `rebase` above is careful to leave a multi-separator
@@ -235,13 +235,14 @@ bool expandGlob(std::string_view pattern,
     // error): the caller owns the zero-match fail-loud. A genuine access error on
     // the probe (e.g. permission on a parent) IS an I/O error → fail loud.
     std::error_code probeEc;
-    bool const baseExists = fs::exists(base, probeEc);
+    core::EntryKind const baseReaches = core::reachedKind(base, probeEc);
+    bool const baseExists = baseReaches != core::EntryKind::Absent;
     if (probeEc) {
         ec = probeEc;
         return false;
     }
     if (!baseExists) return true;
-    bool const baseIsDir = fs::is_directory(base, probeEc);
+    bool const baseIsDir = baseReaches == core::EntryKind::Directory;
     if (probeEc) {
         ec = probeEc;
         return false;
@@ -257,26 +258,24 @@ bool expandGlob(std::string_view pattern,
         1 + static_cast<std::size_t>(std::count(tail.begin(), tail.end(), '/'));
 
     std::vector<std::string> matched;
-    fs::recursive_directory_iterator it(base, fs::directory_options::none, ec);
-    if (ec) return false;  // could not open base for iteration ⇒ fail loud
-    fs::recursive_directory_iterator const end;
-    for (; it != end; it.increment(ec)) {
-        if (ec) return false;  // mid-walk I/O error ⇒ fail loud
-        std::error_code entEc;
+    // THE SUBSTRATE'S WALK (`core::walkTree`), never `recursive_directory_iterator`: it never
+    // descends a LINK, on every build. ✔MEASURED 2026-10-20 (the substrate's header): libstdc++ on
+    // Windows cannot tell a link from what it reaches, so the MinGW build's iterator DESCENDED a
+    // directory link (and a junction) that the MSVC build's did not, and read a dangling file link
+    // as `regular` -- one glob, two source lists. A link is matched by what it REACHES: a link to a
+    // regular file is that file's name in the tree, a link to a directory is never walked through.
+    auto const walk = core::walkTree(base, [&](core::TreeEntry const& entry) {
         // Depth-prune for a non-`**` tail: never descend past the pattern depth.
-        if (!recursive && it->is_directory(entEc)
-            && static_cast<std::size_t>(it.depth()) + 1 >= tailSegs) {
-            it.disable_recursion_pending();
+        if (entry.kind == core::EntryKind::Directory) {
+            return (!recursive && entry.depth + 1 >= tailSegs) ? core::WalkStep::Prune
+                                                                : core::WalkStep::Continue;
         }
-        // DELIBERATE asymmetry vs the fatal open / increment errors above: a
-        // per-ENTRY stat failure (a broken symlink target, or an entry that
-        // vanished / lost permission mid-walk) is SKIPPED, never raised — such an
-        // entry is unrelated to the pattern and must not fail the whole glob (that
-        // would break globbing on any tree holding an unrelated broken symlink).
-        // Only losing visibility of a whole SUBTREE (a directory open / increment
-        // error) is fatal.
-        entEc.clear();
-        if (!it->is_regular_file(entEc)) continue;
+        // DELIBERATE asymmetry vs the fatal open / listing errors below: an entry that reaches
+        // no regular file (a broken symlink, an entry that vanished mid-walk) is SKIPPED, never
+        // raised — such an entry is unrelated to the pattern and must not fail the whole glob
+        // (that would break globbing on any tree holding an unrelated broken symlink). Only
+        // losing visibility of a whole SUBTREE (a directory that cannot be listed) is fatal.
+        if (entry.reaches != core::EntryKind::File) return core::WalkStep::Continue;
         // ⚠ THE TWO RENDERINGS BELOW ARE DELIBERATELY DIFFERENT, AND THE
         // ASYMMETRY IS THE MEASUREMENT. `lexically_relative` yields a path with
         // NO root — ✔MEASURED 2026-08-28 against a reachable UNC base:
@@ -287,11 +286,16 @@ bool expandGlob(std::string_view pattern,
         // measured on that same base, `lexically_normal()` alone already
         // returned `\localhost\C$\…\leaf.c`. A glob over a share would have
         // yielded a whole source list naming a local drive that has none of it.
-        std::string const rel = it->path().lexically_relative(base).generic_string();
+        std::string const rel = entry.path.lexically_relative(base).generic_string();
         if (globMatch(tail, rel)) {
             matched.push_back(
-                core::genericSpelling(core::normalizeKeepingRoot(it->path())));
+                core::genericSpelling(core::normalizeKeepingRoot(entry.path)));
         }
+        return core::WalkStep::Continue;
+    });
+    if (walk.error) {  // the base, or a directory under it, could not be listed ⇒ fail loud
+        ec = walk.error;
+        return false;
     }
 
     // Deterministic order for reproducible CU ordering; dedup as cheap insurance

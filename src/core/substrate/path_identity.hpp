@@ -4,8 +4,10 @@
 
 #include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -235,6 +237,111 @@ private:
     explicit PathIdentity(std::string key) : key_(std::move(key)) {}
     std::string key_;
 };
+
+// ════ THE KIND OF A DIRECTORY ENTRY ITSELF, AND THE WALK AND THE REMOVAL THAT ASK IT ════
+//
+// ★★★ ON WINDOWS THE OS IS ASKED, BECAUSE ONE OF THE TWO LIBRARIES THAT BUILD DSS THERE CANNOT
+// TELL A LINK FROM WHAT IT REACHES. ✔MEASURED 2026-10-20 (one probe, both libraries, on one
+// Windows host; every link made by the OS's own call): what `symlink_status` answers --
+//     entry                     the OS (attributes, reparse tag)      MS STL      libstdc++ 13.2 (MinGW-w64 UCRT)
+//     directory symbolic link   reparse + directory, SYMLINK          symlink     directory
+//     dangling file link        reparse, SYMLINK                      symlink     regular
+//     junction                  reparse + directory, MOUNT_POINT      junction    directory
+// libstdc++ on Windows has no `lstat`: `is_symlink` is never true there, `create_symlink` and
+// `create_directory_symlink` fail "Function not implemented", and `recursive_directory_iterator`
+// DESCENDS a directory link and a junction that MS STL's never descends. So one source built two
+// ways gave two answers: a walk built with MinGW read another tree (or this one again) through a
+// link, and a removal emptied a link's TARGET. The OS's own reading -- the entry's attributes and,
+// for a reparse point, its tag -- is one answer for both builds, and it is the one MS STL gives: a
+// SYMLINK or a MOUNT_POINT (junction) tag is a LINK; any other reparse point (an App Execution
+// Alias, a cloud placeholder) is what its attributes say. Off Windows, `symlink_status` already is
+// that reading.
+//
+// ⚠ A HOST-OS BRANCH, like the rest of this file: it reads the host's filesystem, never what is
+// being compiled.
+enum class EntryKind : std::uint8_t {
+    Absent,     // nothing is there
+    Directory,  // a real directory: the only kind a walk descends and a removal empties
+    Link,       // a symbolic link or a junction: never followed, removed as itself
+    File,       // a regular file (on Windows also any reparse point that is neither of the above)
+    Other,      // a device, a FIFO, a socket: an entry that is no file to read (POSIX)
+};
+
+// The kind of the entry AT `p` -- never of what a link there reaches. Absence is `Absent` with
+// `ec` clear; `ec` is set only when the entry cannot be examined, and the answer is then `Other`,
+// the kind nothing descends, empties or reads.
+[[nodiscard]] DSS_EXPORT EntryKind entryKind(std::filesystem::path const& p, std::error_code& ec);
+
+// The kind of what `p` REACHES, every link on the way followed: never `Link`, and `Absent` for a
+// dangling link. `ec` is set only when what it reaches cannot be examined (a link cycle, a refusal),
+// and the answer is then `Absent`: nothing usable is reached.
+[[nodiscard]] DSS_EXPORT EntryKind reachedKind(std::filesystem::path const& p, std::error_code& ec);
+
+// The size in bytes of the regular file `p` REACHES, every link on the way followed -- or nothing,
+// when it reaches no regular file (nothing there, a dangling link, a directory, a special file). `ec`
+// is set only when what it reaches cannot be examined, and the answer is then nothing.
+// ✔MEASURED (2026-08-29, the include-once comment of preprocessor.cpp; 2026-10-20): libstdc++ on
+// Windows sizes a file link by the LINK's own attributes -- `fs::file_size` of a symlinked file is 0 --
+// so how many bytes a path names is asked here, never of the library.
+[[nodiscard]] DSS_EXPORT std::optional<std::uintmax_t> reachedFileSize(std::filesystem::path const& p,
+                                                                       std::error_code& ec);
+
+// The path `p` REACHES, every link on the way resolved, absolute and normal: the longest leading part
+// that exists is resolved, and the rest is appended lexically -- `weakly_canonical`'s answer, asked
+// of the OS on Windows (the final path of a handle opened without `FILE_FLAG_OPEN_REPARSE_POINT`).
+// ✔MEASURED 2026-08-29 (the include-once comment of preprocessor.cpp): libstdc++ on Windows resolves
+// no link -- its `weakly_canonical` and `canonical` hand a link back unchanged -- so where a link
+// leads is asked here, never of the library. `ec` is set when the resolution fails, and the answer
+// is then empty.
+[[nodiscard]] DSS_EXPORT std::filesystem::path reachedPath(std::filesystem::path const& p, std::error_code& ec);
+
+// One entry a walk yields.
+struct TreeEntry {
+    std::filesystem::path path;     // the walked root joined with the entry's names, as listed
+    EntryKind             kind;     // the entry itself (`Absent`: it went away while it was listed)
+    EntryKind             reaches;  // `kind`, except a Link: what it reaches (`reachedKind`; `Absent` if dangling)
+    std::size_t           depth;    // 0 for an entry directly under the root
+};
+
+// What a walk does after the visitor has seen an entry: go on (descending it if it is a Directory),
+// go on WITHOUT descending it, or end the walk.
+enum class WalkStep : std::uint8_t { Continue, Prune, Stop };
+
+struct TreeWalkOptions {
+    // A directory the walk may not list is passed over in silence instead of ending the walk --
+    // `std::filesystem::directory_options::skip_permission_denied`, for the walks that took it.
+    bool skipPermissionDenied = false;
+};
+
+struct TreeWalk {
+    std::error_code       error;    // set: the walk ended there and did NOT read the whole tree
+    std::filesystem::path where;    // the directory it could not list (the root itself when that failed)
+    bool                  stopped = false;   // the visitor ended it
+};
+
+// EVERY entry under `root` (the root itself is not yielded), each directory's entries before the
+// next sibling of that directory, descending only a `Directory` the visitor did not prune -- NEVER
+// a link. Iterative: the work is an explicit stack of listed directories on the heap, so a deep
+// tree costs memory, never call stack. The first directory it cannot list ends the walk (`error`,
+// `where`) unless the options pass it over; the order within a directory is the filesystem's.
+[[nodiscard]] DSS_EXPORT TreeWalk walkTree(std::filesystem::path const&                  root,
+                                           std::function<WalkStep(TreeEntry const&)> const& visit,
+                                           TreeWalkOptions                               options = {});
+
+// What a removal could not remove.
+struct TreeRemoval {
+    std::size_t           failures = 0;   // entries STILL THERE after their one attempt
+    std::filesystem::path firstPath;      // the first of them
+    std::error_code       firstError;     // and why
+};
+
+// Remove `target` -- one entry, or a whole tree -- and NEVER anything a link reaches: a link (to a
+// directory or a file, a junction too) is removed as itself, and only a real directory is emptied.
+// Single-object operations only: one listing of each directory, at most one removal per entry, the
+// directory itself after its entries; nothing is retried, so it ENDS whatever another deleter does,
+// and an entry that failed and is now gone was beaten to the outcome wanted -- only an entry still
+// there counts as a failure. An absent target is nothing to do.
+[[nodiscard]] DSS_EXPORT TreeRemoval removeTree(std::filesystem::path const& target);
 
 }  // namespace dss::core
 

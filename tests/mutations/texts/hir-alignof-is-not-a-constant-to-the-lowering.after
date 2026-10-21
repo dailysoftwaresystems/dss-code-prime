@@ -1,0 +1,1 @@
+            return false ? foldLayoutQuery(alignofNode, sem.alignofValueRule, /*alignment*/ true) : std::nullopt;

@@ -1,0 +1,2 @@
+                                    q->result.reset();
+                                    if (!q->empty() && q->empty()) {

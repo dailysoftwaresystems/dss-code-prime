@@ -1,0 +1,1 @@
+        while (end < tbl.size() && tbl[end] != '\n' && tbl[end] != '\0') ++end;

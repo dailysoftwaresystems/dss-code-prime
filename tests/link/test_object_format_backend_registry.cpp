@@ -443,9 +443,11 @@ TEST(ObjectFormatMutationProbe, RejectedRootFieldStillFires) {
         // change that adds or removes an entry, and only then.
         // 14 → 15 with `weakDefinition`
         // (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
-        EXPECT_EQ(n, 15u)
+        // 15 → 16 with `importAddressSymbolPrefix`
+        // (D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED, P69).
+        EXPECT_EQ(n, 16u)
             << name << " probed " << n << " rejected root fields; the declared "
-               "list is 15 long. A shrinking list means keys stopped being "
+               "list is 16 long. A shrinking list means keys stopped being "
                "rejected AND stopped being probed at the same time.";
     }
 }

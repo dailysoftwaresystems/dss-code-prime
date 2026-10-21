@@ -1,0 +1,2 @@
+        return addressSlotRelocationKind(target_.relocations(),
+                                         static_cast<std::uint8_t>(widthBytes));

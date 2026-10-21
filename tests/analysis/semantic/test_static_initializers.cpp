@@ -512,3 +512,48 @@ TEST(StaticInitializers, AThreadLocalAddressIsLeftToItsOwnCode) {
     auto const m = analyzeC("_Thread_local int t;\nint *p = &t;\n");
     EXPECT_EQ(countCode(m.diagnostics(), kNotConstant), 0u) << describe(m);
 }
+
+// ── P69 (lane `cs`, D-C-SIZEOF-OPERAND-LITERALS-ARE-UNTYPED-IN-A-DECLARATIONS-CONSTANT) ─────────
+// A declaration's constant — an array bound, an enumerator — is folded at Pass 1.5, where a
+// LITERAL leaf carried no type: `combineBinary` then took the OTHER operand's, so `sizeof(g + 4)`
+// of a `char g[16]` was the ARRAY's size, `sizeof(1 + 1.0)` was no constant at all, and
+// `__builtin_object_size(g + 4, 0)` there answered unknown. ✔MEASURED (lane `cs`'s probes
+// e14 / e15 / e17 / e7; linux run 20261001-152755-08102458, MSVC run 20261001-152822-c75ec85a):
+// gcc 13.3.0, clang 18.1.3 and MSVC 19.51 fold sizeof(char *), sizeof(char *) and sizeof(double)
+// in both modes; clang folds the object size to 12 (gcc refuses it in an enumerator). DSS (HEAD's
+// own dsscp, and this lane's before the fix) folded 16, 16 and refused, and answered (size_t)-1.
+// RED-ON-DISABLE: drop the pre-stamp from `resolveSizeof` → every assertion below fails.
+TEST(StaticInitializers, ADeclarationsConstantTypesItsOperandsLiterals) {
+    auto const m = analyzeC(
+        "static char g[16];\n"
+        "static char b[sizeof(g + 4)];\n"
+        "enum { E = sizeof(0 + g), F = sizeof(1 + 1.0), O = __builtin_object_size(g + 4, 0) };\n"
+        "_Static_assert(sizeof b == sizeof(char *), \"bound\");\n"
+        "_Static_assert(E == sizeof(char *), \"E\");\n"
+        "_Static_assert(F == sizeof(double), \"F\");\n"
+        "_Static_assert(O == 12, \"O\");\n"
+        "int main(void) { char a[sizeof(g + 1) + 1]; return (int)sizeof a; }\n");
+    std::size_t errors = 0;
+    for (auto const& d : m.diagnostics().all())
+        if (d.severity == DiagnosticSeverity::Error) ++errors;
+    EXPECT_EQ(errors, 0u) << describe(m);
+}
+
+// The `__alignof__` VALUE form asks `subtreeType` at Pass 1.5 too, so its literal leaves are
+// pre-stamped the same way (`resolveAlignof`). ✔MEASURED (`dssharness run probe-reference-cc`,
+// linux run 20261006-214952-f07bf288): gcc 13.3.0 and clang 18.1.3 build and run this program's
+// enumerator and array bound as `_Alignof(double)` at -std=gnu17 and -std=c2x, and gcc at
+// -std=c17 -pedantic-errors too.
+// RED-ON-DISABLE: drop the pre-stamp from `resolveAlignof` → both assertions fail.
+TEST(StaticInitializers, ADeclarationsAlignofValueFormTypesItsOperandsLiterals) {
+    auto const m = analyzeC(
+        "enum { A = __alignof__(1 + 1.0) };\n"
+        "static char b[__alignof__(2 + 2.0)];\n"
+        "_Static_assert(A == _Alignof(double), \"A\");\n"
+        "_Static_assert(sizeof b == _Alignof(double), \"b\");\n"
+        "int main(void) { return A + (int)sizeof b; }\n");
+    std::size_t errors = 0;
+    for (auto const& d : m.diagnostics().all())
+        if (d.severity == DiagnosticSeverity::Error) ++errors;
+    EXPECT_EQ(errors, 0u) << describe(m);
+}

@@ -203,6 +203,41 @@ dss_add_test(NAME program/test_build_stamp
 # rebuilding the world.
 dss_use_build_stamp(dss_program_test_build_stamp)
 
+# THE STAMP SCRIPT'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry
+# `build/build_stamp_identity`. `cmake/DssBuildStamp.cmake` proves its properties in
+# throwaway trees when run in `selftest` mode (what moves the value with and without
+# git, what a handed dependency adds, what is refused), and configures fixture
+# projects against `cmake/DssBuildStampDeclaration.cmake`. This binary RUNS that
+# self-test — the command line the top-level CMakeLists composes, on the tree it was
+# configured from — and reads each arm's verdict into a case of its own; it
+# re-implements none of them. It keeps the entry's name because it IS that entry:
+# the name says what is proven, and the test trees' other `build/` entries are its
+# neighbours. The source lives here, beside the stamp's other tests.
+#
+# ★ WHY A TEST BINARY AND NOT THE BARE `cmake -P` ENTRY IT REPLACED: a script entry
+# has one verdict and no cases, so a mutation of either module could not be an arm
+# of the mutation sweep, which starts a test binary whole and judges the exact set
+# of cases that go red.
+dss_add_test(NAME build/build_stamp_identity
+             SOURCES test_build_stamp_identity.cpp)
+
+# The opt-in (top-level CMakeLists, `dss_use_script_selftest`): the generated header
+# that holds the command line, and the two stamp modules declared as inputs of this
+# target's object — no compiler reads a CMake script, so without that declaration no
+# object depended on either.
+dss_use_script_selftest(dss_build_build_stamp_identity build_stamp)
+
+# THE BUILD'S PYTHON CHOICE, ONE CASE PER ARM -- the ctest entry `build/python_interpreter`.
+# `cmake/DssPython.cmake` chooses the one interpreter every ctest entry that runs a Python program starts
+# (the first on the leg's PATH at or above the floor config.json states, never an App Execution Alias),
+# and run in its self-test mode it configures fixture projects against itself and proves that choice --
+# among them on a cache that ALREADY names an alias, the cache a build configured before the rule holds.
+# This binary RUNS that self-test and reads each arm into a case. The opt-in gives it the header, declares
+# the module and config.json as inputs of its object, and gives the entry the `self-test` label.
+dss_add_test(NAME build/python_interpreter
+             SOURCES test_python_interpreter.cpp)
+dss_use_script_selftest(dss_build_python_interpreter python_interpreter)
+
 # It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
 # rather than growing a second copy of host-compiler discovery, shell quoting
 # and output capture — the same reason tests/conformance adds this path.
@@ -289,6 +324,18 @@ dss_add_test(NAME program/test_shipped_runtime_compiles
 dss_add_test(NAME program/test_driver_argument_supply
              SOURCES test_driver_argument_supply.cpp)
 
+# THE pe64 `__try` EXAMPLES, BUILT BY THE DRIVER ON EVERY HOST (P69, lane `lm`).
+# An example that runs a `__try` is `runOn: windows`: elsewhere the in-process
+# runner builds its baseline and the CLI runner nothing, so the RELEASE arm — the
+# subject of several of them — was built on a Windows host only. This builds
+# those sources for pe64 in the pipeline each case names and reads the image's
+# scope tables and unwind codes. A binary of its own rather than more cases of
+# the one above: each case is whole image builds of real examples, and that
+# binary is already the slowest of its tier; the pe64 readers the two share are
+# `pe_image_readers.hpp`.
+dss_add_test(NAME program/test_guarded_region_examples_on_every_host
+             SOURCES test_guarded_region_examples_on_every_host.cpp)
+
 # THE FOUR SOURCE-ARGUMENT SHAPES A USER CAN TYPE
 # — BOTH EXAMPLE RUNNERS ALWAYS COMPILE AN ABSOLUTE SOURCE PATH.
 #
@@ -335,36 +382,25 @@ dss_add_test(NAME program/test_mode_routing_agreement
 dss_add_test(NAME program/test_shipped_source_language_resolution
              SOURCES test_shipped_source_language_resolution.cpp)
 
-# THE RUNTIME OBJECT CACHE'S ctest FIXTURE
-# (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). It materialises every shipped
-# runtime archive this suite can need, ONCE, before any test that reads an EXACT
-# `PhaseTimers::read(<phase>).runs` count.
+# EVERY SHIPPED RUNTIME ARCHIVE, TAKEN THROUGH THE DRIVER'S CACHE ONCE
+# (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF): one trivial translation unit
+# compiled for every (target, object format) pair whose format kind realizes a
+# shipped runtime source, at every build configuration. What it leaves is a
+# filled per-user cache; what it refuses is having attempted nothing.
 #
-# ★★★ WHY IT IS A FIXTURE AND NOT A RELAXED ASSERTION. `PhaseTimers` is
-# process-global, so an exact phase-count instrument's real precondition is "no
-# OTHER build ran in this process". That held for free until the shipped runtime
-# stopped being compiled inside the user's build: a cache MISS now runs a nested
-# `Program` build to materialise the archive, and ✔MEASURED a cold-cache pe64
-# release exec build reads `Optimize.runs` = 6 where a warm one reads 2.
-# Relaxing the comparison to `GE(2)` would pass a cold build with the driver's
-# program-stage call DELETED (5), i.e. it would blind the instrument to the
-# exact defect it exists for. The precondition broke, so the precondition is
-# repaired. The full argument is in the file's own docblock.
-#
-# ⓘ `FIXTURES_SETUP` makes ctest schedule it before anything that declares
-# `FIXTURES_REQUIRED dss_runtime_object_cache_warm`, whatever the -j ordering.
-# It is also an ordinary test, so a fixture that stops working is a RED rather
-# than a silently skipped precondition.
+# ★★★ IT IS AN ORDINARY ENTRY AND NO ENTRY DEPENDS ON IT. It was a ctest FIXTURE
+# (`FIXTURES_SETUP`), required by `program/test_driver_argument_supply`, whose
+# two exact `PhaseTimers::read(Optimize).runs` cases counted the nested runtime
+# builds of a cache MISS as the program's own. The ordering made those cases
+# green under ctest and nowhere else: ✔MEASURED 2026-10-12, the same binary run
+# WITHOUT ctest on a cache nothing had filled read 30 where 2 — and that is how
+# `dssharness check-mutations` runs a runner, in a tree whose compiler has a
+# build stamp, and so a cache root, no other build ever had. The dependency is
+# repaired where it was: each of those cases owns its cache now and counts a
+# build that found it filled (the file says how). A case that needs the cache in
+# a KNOWN state makes that state itself; an order of entries is not a state.
 dss_add_test(NAME program/test_runtime_cache_warm
              SOURCES test_runtime_cache_warm.cpp)
-set_tests_properties(program/test_runtime_cache_warm PROPERTIES
-                     FIXTURES_SETUP dss_runtime_object_cache_warm)
-
-# The consumers. Listed here rather than beside each `dss_add_test` above so the
-# fixture and everything that depends on it read as one statement — and so a
-# future test that adds an exact phase-count assertion has one place to join.
-set_tests_properties(program/test_driver_argument_supply PROPERTIES
-                     FIXTURES_REQUIRED dss_runtime_object_cache_warm)
 
 # THE RUNTIME OBJECT CACHE'S **WIRING**
 # (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Its subject is the seam, not the
@@ -572,3 +608,30 @@ target_link_libraries(dss_program_test_emit_hir_round_trips_every_example
 # `dynlib_runpath_origin` / `dynlib_runpath_absent_exits_127` is the run.
 dss_add_test(NAME program/test_image_runpath_build
              SOURCES test_image_runpath_build.cpp)
+
+# D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the shipped runtime is built
+# HIDDEN, once for the whole archive — the mechanism (an archive build restates
+# every external definition it compiles, after the optimizer, deleting none at
+# release) and the declaration (an ELF `.so` and a Mach-O `.dylib` linking the
+# runtime export their own function alone, the runtime body proved inside).
+# HOST-INDEPENDENT: built and decoded, never executed — the corpus example
+# `shared_library_exports_its_own_api_alone` is the run.
+dss_add_test(NAME program/test_archive_definition_visibility
+             SOURCES test_archive_definition_visibility.cpp)
+
+# D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: the four faces end to
+# end at the baseline and at release — a static-library member keeps its hidden
+# definitions, an image keeps the hidden definition an object input or a sibling
+# CU calls, a hidden `main` is still the entry — and the CONTROL that a whole
+# image still deletes an unreached hidden definition at release. HOST-INDEPENDENT:
+# built and decoded, never executed (three corpus examples are the runs).
+dss_add_test(NAME program/test_release_hidden_definitions
+             SOURCES test_release_hidden_definitions.cpp)
+
+# P69 (lane `cs`): `alias("target")` compiled from C through every tier into a relocatable object, at the baseline
+# and at release — on two ELF architectures and PE each alias is one more name on its target's definition with its
+# own binding, and the `static` body only an alias names survives release; a Mach-O target refuses an alias by name,
+# and the shipped format documents state where an alias and a common can be. HOST-INDEPENDENT: built and decoded,
+# never executed (examples/c/symbol_alias_second_name is the run).
+dss_add_test(NAME program/test_compiled_symbol_alias_object
+             SOURCES test_compiled_symbol_alias_object.cpp)

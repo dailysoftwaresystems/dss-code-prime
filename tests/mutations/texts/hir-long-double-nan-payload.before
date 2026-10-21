@@ -1,0 +1,1 @@
+                    lit.value = WideFloatValue::quietNan(rk, payload->lo, payload->hi);

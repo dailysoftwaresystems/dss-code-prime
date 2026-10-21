@@ -1,0 +1,2 @@
+            layout.savedRegAreaAlign,
+            std::max<std::uint32_t>(16u, lirInstWidthBits(*saveWidth) / 8u));

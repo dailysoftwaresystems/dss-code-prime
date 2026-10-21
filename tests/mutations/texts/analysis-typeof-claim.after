@@ -1,0 +1,2 @@
+                if (claim.has_value() && !claim.has_value()) {
+                    if (strip) {

@@ -697,7 +697,7 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
                      DiagnosticReporter&          reporter) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    if (!fs::is_directory(headerDir, ec)) {
+    if (core::reachedKind(headerDir, ec) != core::EntryKind::Directory) {
         return std::unexpected(HeaderReadError{
             HeaderReadErrorKind::FileOpenFailed,
             std::string{"readCHeaderDirectory: not a directory: "}
@@ -713,7 +713,9 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
     std::vector<fs::path> headers;
     for (auto const& entry : fs::directory_iterator{headerDir, ec}) {
         if (ec) break;
-        if (!entry.is_regular_file()) continue;
+        // A header is an entry by what it REACHES (the substrate's answer, never the
+        // library's: libstdc++ on Windows calls a dangling link a regular file).
+        if (std::error_code kindEc; core::reachedKind(entry.path(), kindEc) != core::EntryKind::File) continue;
         if (entry.path().extension() == ".h") {
             headers.push_back(entry.path());
         }

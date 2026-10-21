@@ -153,8 +153,48 @@ enum class HirKind : std::uint16_t {
     //    kind after it.
     ReadModifyWrite,
 
+    // ── P69 (lane `cs`, D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an
+    //    UNNAMED OBJECT — C's compound literal (C 6.5.2.5), and any language's anonymous
+    //    initialized object. ONE child: the initializer VALUE. Used as a value, the node IS
+    //    that child's value, whatever its storage (`HirBuilder`'s consumers peel it through
+    //    `unnamedObjectValue`); used as an OBJECT (its address, an array's decay, a member of
+    //    it as an lvalue, an assignment to it) it is its OWN object — an automatic one is a
+    //    frame slot initialized IN PLACE from the child each time the expression is
+    //    evaluated, a static or thread one a unique static object the MIR tier mints. The
+    //    `payload` is the storage duration (`HirObjectStorage`) and nothing else: const,
+    //    volatile, thread-local, alignment and linkage ride the SAME side tables a static
+    //    local's `Global` node carries.
+    //    ★ WHY A CORE KIND AND NOT A FLAG (the `ReadModifyWrite` precedent): before it
+    //    existed the literal WAS its initializer's value node, so `&(int){ x }` took the
+    //    address of `x` itself and `(char[]){ "ab" }` WAS the read-only string literal —
+    //    a flag-blind consumer re-derives exactly that meaning. ✔MEASURED 2026-09-30 on
+    //    pe64 and ELF x86_64: `int *p = &(int){ x }; *p = 42;` changed `x`, and writing
+    //    through `(char[]){ "ab" }` crashed, where gcc 13.3.0, clang 18.1.3 and MSVC 19.51
+    //    run both correctly. Appended after `ReadModifyWrite`: ordinals are stable.
+    UnnamedObject,
+    // ── P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` (C 7.16.1.2) —
+    //    the fourth variadic intrinsic, beside VaStart/VaArg/VaEnd and shaped like them:
+    //    [dest, src], two `va_list` LVALUES the MIR tier addresses as va_start's `ap`,
+    //    and a `void` result. The SOURCE list object's bytes become the DESTINATION's
+    //    (the same position in the same argument list). Appended after `UnnamedObject`:
+    //    ordinals are stable.
+    VaCopy,
+
     Count_        // keep last — counts the core members
 };
+
+// The storage duration an `UnnamedObject` node's `payload` carries (C 6.2.4): an
+// AUTOMATIC object lives in its enclosing block's frame and is re-initialized each time
+// its expression is evaluated; a STATIC one exists once for the whole program,
+// initialized before start-up (a compound literal outside every function body, or one
+// that declares static storage — C23 6.5.2.5p5); a THREAD one exists once per thread. The
+// language decides which by its own config; HIR only records the answer.
+enum class HirObjectStorage : std::uint32_t {
+    Automatic = 0,
+    Static    = 1,
+    Thread    = 2,
+};
+inline constexpr std::uint32_t kHirObjectStorageCount = 3;
 
 static_assert(static_cast<std::uint32_t>(HirKind::Count_) < 256,
               "core HirKind members must occupy [0, 256); extensions use "
@@ -188,7 +228,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
 // loud one, which is the exact hazard `nameOrEmpty` exists for. The row COUNT
 // is asserted against `Count_` below, so a new enumerator that arrives without a
 // row FAILS THE BUILD instead of rendering empty at some future reader.
-inline constexpr EnumNameTable<HirKind, 54> kHirKindTable{{{
+inline constexpr EnumNameTable<HirKind, 56> kHirKindTable{{{
     {HirKind::Module,          "Module"},
     {HirKind::Function,        "Function"},
     {HirKind::Global,          "Global"},
@@ -243,6 +283,8 @@ inline constexpr EnumNameTable<HirKind, 54> kHirKindTable{{{
     {HirKind::Error,           "Error"},
     {HirKind::Extension,       "Extension"},
     {HirKind::ReadModifyWrite, "ReadModifyWrite"},
+    {HirKind::UnnamedObject,   "UnnamedObject"},
+    {HirKind::VaCopy,          "VaCopy"},
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kHirKindTable);
 // ★ COMPLETENESS, WHICH WELL-FORMEDNESS DOES NOT GIVE YOU. `DSS_CHECK_ENUM_NAME_TABLE`
@@ -301,9 +343,13 @@ static_assert(kHirKindTable.rows.size()
         //    InvalidType), so all three require a resolved type and fail loud if
         //    typeless. ──
         case HirKind::VaStart: case HirKind::VaArg: case HirKind::VaEnd:
+        // P69: VaCopy carries `void` exactly as VaStart/VaEnd do.
+        case HirKind::VaCopy:
         // A read-modify-write YIELDS the observed old value — typed as the
         // object's value type.
         case HirKind::ReadModifyWrite:
+        // An unnamed object is typed as the object (its initializer's type).
+        case HirKind::UnnamedObject:
         // ── Types-as-values: carries the referenced lattice TypeId ──
         case HirKind::TypeRef:
         // ── Declarations carrying their own (source-defined) type ──
@@ -417,10 +463,14 @@ struct ChildArity {
         case HirKind::Deref:
         // FC12a-core: VaStart/VaEnd = [apExpr] — one child (the va_list lvalue).
         case HirKind::VaStart: case HirKind::VaEnd:
+        // P69: an unnamed object = [its initializer value].
+        case HirKind::UnnamedObject:
             return {1, 1};
         // FC12a-core: VaArg = [apExpr, TypeRef] — the va_list lvalue (value-lowered)
         // PLUS the read TYPE on a SizeOf-style TypeRef child (NEVER value-lowered).
         case HirKind::VaArg:              return {2, 2};
+        // P69: VaCopy = [dest, src] — two va_list lvalues.
+        case HirKind::VaCopy:             return {2, 2};
         case HirKind::BinaryOp: case HirKind::Index: case HirKind::LogicalAnd:
         case HirKind::LogicalOr:
         // [target lvalue, update expression] — the observed old value is the

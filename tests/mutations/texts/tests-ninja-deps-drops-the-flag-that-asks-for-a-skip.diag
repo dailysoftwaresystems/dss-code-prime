@@ -1,0 +1,1 @@
+with a directory that is no ninja tree, asked for as that, it returned 2, want 0

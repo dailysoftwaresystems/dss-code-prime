@@ -1,0 +1,2 @@
+                 nameAdjacentAttributeSpecifiers(tree(), sem, declaratorNode)) {
+            (void)an;

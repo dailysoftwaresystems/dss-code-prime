@@ -1,0 +1,5 @@
+        if(NOT _dss_pair MATCHES "^([^=]+)=(.+)$")
+            continue()
+        endif()
+        if(FALSE)
+            message(FATAL_ERROR

@@ -1,0 +1,3 @@
+          "thread_local":  { "threadStorage": true },
+          "weak":   { "binding": "weak", "weakKind": "overridable" },
+          "selectany": { "binding": "weak", "weakKind": "select-any" },

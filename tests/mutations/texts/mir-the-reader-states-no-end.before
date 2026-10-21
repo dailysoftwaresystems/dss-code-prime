@@ -1,0 +1,2 @@
+        builder_.stateSymbolIdEnd(builder_.symbolIdEnd());
+        Mir module = std::move(builder_).finish();

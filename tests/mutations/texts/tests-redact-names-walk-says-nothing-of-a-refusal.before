@@ -1,0 +1,1 @@
+            self.why = "%s: %s" % (type(exc).__name__, exc)

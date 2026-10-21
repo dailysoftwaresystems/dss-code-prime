@@ -1,0 +1,1 @@
+                checkUnionMember(v);   // v8: the top-level value's core is its type's

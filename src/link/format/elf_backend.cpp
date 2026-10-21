@@ -265,6 +265,16 @@ public:
         return d.elf.objectType == ElfObjectType::Rel;
     }
 
+    // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): the
+    // ET_EXEC writer places the image at its link address and gives every
+    // `nullAddressSymbols` entry the address 0 (both of its arms in elf.cpp),
+    // so `0 - P` is a constant there. An ET_DYN image's addresses are relative
+    // to a base the loader picks — no displacement from it reaches 0.
+    [[nodiscard]] bool writesNullAddressReferences(
+            detail::ObjectFormatData const& d) const noexcept override {
+        return d.elf.objectType == ElfObjectType::Exec;
+    }
+
     // ★★ THE BYTE PROBE. Three conditions, each DEFINITE:
     //   (1) the file opens with `0x7F 'E' 'L' 'F'` — the gABI magic;
     //   (2) its `e_ident[EI_CLASS]` and `e_ident[EI_DATA]` are the ones THIS
@@ -344,6 +354,19 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/elf",
                           "'elf' must be an object when format.kind == 'elf'");
             } else {
+                // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY):
+                // a misspelled key (`"interpeter"`) loaded clean and left the
+                // field it names at its default.
+                static constexpr std::array<std::string_view, 12> kElfBlockKeys{
+                    "machine", "abiVersion", "class", "data", "osabi", "type",
+                    "pageAlign", "interpreter", "bindNow", "soname",
+                    "dynamicRelocationTypes", "uniqueBinding"};
+                ::dss::detail::rejectUnknownKeys(
+                    e, kElfBlockKeys, "the 'elf' block",
+                    [&](std::string_view key, std::string message) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/elf/{}", key), std::move(message));
+                    });
                 auto readU16 = [&](char const* field, std::uint16_t& out,
                                    std::int64_t max) {
                     if (!e.contains(field) || !e.at(field).is_number_integer())
@@ -519,6 +542,138 @@ public:
                             e.at("bindNow").get<bool>();
                     }
                 }
+                // `dynamicRelocationTypes` (P69,
+                // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the
+                // psABI numbers of GLOB_DAT / JUMP_SLOT / RELATIVE, by role.
+                // A closed vocabulary of its own: a typo'd role would load
+                // clean and leave that role undeclared, which is exactly the
+                // hole the whole-image refusal below exists to close.
+                if (e.contains("dynamicRelocationTypes")) {
+                    auto const& t = e.at("dynamicRelocationTypes");
+                    static constexpr std::array<std::string_view, 3> kRoles{
+                        "globDat", "jumpSlot", "relative"};
+                    if (!t.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/dynamicRelocationTypes",
+                                  "'dynamicRelocationTypes' must be an object "
+                                  "{\"globDat\", \"jumpSlot\", \"relative\"} of "
+                                  "psABI relocation numbers");
+                    } else {
+                        ::dss::detail::rejectUnknownKeys(
+                            t, kRoles, "the ELF dynamic-relocation-type block",
+                            [&](std::string_view key, std::string message) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format(
+                                              "/elf/dynamicRelocationTypes/{}",
+                                              key),
+                                          std::move(message));
+                            });
+                        auto readRole = [&](std::string_view role,
+                                            std::uint32_t& out) {
+                            std::string const key{role};
+                            if (!t.contains(key)) return;
+                            auto const& v = t.at(key);
+                            std::int64_t const n =
+                                v.is_number_integer() ? v.get<std::int64_t>() : -1;
+                            if (n <= 0
+                                || n > static_cast<std::int64_t>(
+                                           std::numeric_limits<std::uint32_t>::max())) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format(
+                                              "/elf/dynamicRelocationTypes/{}",
+                                              role),
+                                          std::format(
+                                              "'{}' must be a psABI relocation "
+                                              "number in (0, 2^32)",
+                                              role));
+                                return;
+                            }
+                            out = static_cast<std::uint32_t>(n);
+                        };
+                        auto& types = data.elf.dynamicRelocationTypes;
+                        readRole(kRoles[0], types.globDat);
+                        readRole(kRoles[1], types.jumpSlot);
+                        readRole(kRoles[2], types.relative);
+                    }
+                }
+                // `uniqueBinding` (P69 fold 3c): the binding of a definition of
+                // which a process holds ONE instance, the OS ABI it requires,
+                // and the binding a link reads it as (`ElfUniqueBinding`). All
+                // three, or the block is refused: a statement short of one would
+                // write the binding under an OS ABI, or read it as a binding,
+                // that nobody stated.
+                if (e.contains("uniqueBinding")) {
+                    auto const& u = e.at("uniqueBinding");
+                    static constexpr std::array<std::string_view, 3> kUniqueKeys{
+                        "value", "osabi", "readAs"};
+                    if (!u.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/uniqueBinding",
+                                  "'uniqueBinding' must be an object {\"value\", "
+                                  "\"osabi\", \"readAs\"}: the binding of a "
+                                  "definition of which a process holds one "
+                                  "instance, the OS ABI it requires, and the "
+                                  "binding a link reads it as");
+                    } else {
+                        ::dss::detail::rejectUnknownKeys(
+                            u, kUniqueKeys, "the ELF unique-binding block",
+                            [&](std::string_view key, std::string message) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          std::format("/elf/uniqueBinding/{}", key),
+                                          std::move(message));
+                            });
+                        // Every part refused is EMITTED, and an emitted problem
+                        // fails the load: a statement short of a part never
+                        // reaches a reader or a writer.
+                        ElfUniqueBinding stated{};
+                        auto refuse = [&](std::string_view key, std::string message) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("/elf/uniqueBinding/{}", key),
+                                      std::move(message));
+                        };
+                        std::int64_t const value =
+                            u.contains("value") && u.at("value").is_number_integer()
+                                ? u.at("value").get<std::int64_t>()
+                                : -1;
+                        if (value < 3 || value > 15) {
+                            refuse("value",
+                                   "'value' must be the st_info binding (an "
+                                   "integer in [3, 15]) -- none of local (0), "
+                                   "global (1) and weak (2), which every format "
+                                   "shares, and within the field's four bits");
+                        } else {
+                            stated.value = static_cast<std::uint8_t>(value);
+                        }
+                        std::optional<std::uint8_t> osabi;
+                        if (u.contains("osabi") && u.at("osabi").is_string()) {
+                            osabi = elfHeaderVerbValue(
+                                kElfOsAbiRows, u.at("osabi").get<std::string>());
+                        }
+                        if (!osabi.has_value()) {
+                            refuse("osabi",
+                                   std::format("'osabi' must name the OS ABI the "
+                                               "binding requires, one of {}",
+                                               elfHeaderVerbList(kElfOsAbiRows)));
+                        } else {
+                            stated.osabi = *osabi;
+                        }
+                        std::optional<SymbolBinding> readAs;
+                        if (u.contains("readAs") && u.at("readAs").is_string()) {
+                            readAs = symbolBindingFromName(
+                                u.at("readAs").get<std::string>());
+                        }
+                        if (!readAs.has_value() || *readAs == SymbolBinding::Local) {
+                            refuse("readAs",
+                                   "'readAs' must be 'global' or 'weak': the "
+                                   "binding a link reads such a definition as. "
+                                   "Read as 'local', each unit's definition of "
+                                   "one name is an object of its own");
+                        } else {
+                            stated.readAs = *readAs;
+                        }
+                        data.elf.uniqueBinding = stated;
+                    }
+                }
             }
         }
     }
@@ -552,6 +707,11 @@ public:
                                  "(EM_* value, e.g. 62 for x86_64, "
                                  "183 for aarch64)");
         }
+        // `uniqueBinding` (P69 fold 3c) is NOT related to the header's
+        // `osabi`: GNU ld 2.42 and ld.lld 18.1.3 read the binding whatever OS
+        // ABI an object's header states, and ld.lld writes it under a FreeBSD or
+        // a SYSV header unchanged (✔MEASURED), so a document of any OS ABI
+        // loads, and its writer writes the binding under the header it states.
         // e_type — all three closed-enum members now have walker
         // arms: ET_REL (LK1 cycle 1), ET_EXEC (LK1 cycle 2 + the
         // LK6 dynamic arm), ET_DYN (c150 — the D-LK1-4 shared-
@@ -797,6 +957,50 @@ public:
                  "R_X86_64_GLOB_DAT) is an exec-image concept; "
                  ".o files do not bind at all — the linker resolves "
                  "at exec build time.");
+        }
+        // `dynamicRelocationTypes` (P69,
+        // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): an image that
+        // CAN carry dynamic relocations — an ET_DYN, or an executable naming
+        // an interpreter — must state all three roles, because its writer
+        // has no other source for them (the `e_machine` switches are gone);
+        // anywhere else the block is inert and refused by name, as `soname`
+        // is on a non-DSO. Two roles sharing one number would make a
+        // canonical stub's own slot resolve to the stub: refused too.
+        {
+            auto const& types = elf.dynamicRelocationTypes;
+            bool const imageCanBind =
+                elf.objectType == ElfObjectType::Dyn
+                || (elf.objectType == ElfObjectType::Exec
+                    && !elf.interpreter.empty());
+            if (imageCanBind && !types.complete()) {
+                // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69): the
+                // types the image writer used to switch on e_machine for.
+                fail("/elf/dynamicRelocationTypes",
+                     "an ELF image that binds imports at load (ET_DYN, or an "
+                     "executable naming an 'interpreter') must declare "
+                     "'elf.dynamicRelocationTypes' with all three roles — "
+                     "'globDat', 'jumpSlot' and 'relative' — the psABI numbers "
+                     "its `.rela.dyn` rows carry.");
+            }
+            if (!imageCanBind && types.anyDeclared()) {
+                fail("/elf/dynamicRelocationTypes",
+                     "'elf.dynamicRelocationTypes' is declared on an ELF image "
+                     "that binds nothing at load (a relocatable object, or an "
+                     "executable with no 'interpreter'), so no writer would "
+                     "ever read it — inert config is refused by name.");
+            }
+            if (types.complete()
+                && (types.globDat == types.jumpSlot
+                    || types.globDat == types.relative
+                    || types.jumpSlot == types.relative)) {
+                fail("/elf/dynamicRelocationTypes",
+                     std::format(
+                         "'elf.dynamicRelocationTypes' gives two roles one "
+                         "number (globDat {}, jumpSlot {}, relative {}); a "
+                         "canonical stub's slot then binds through the "
+                         "non-PLT lookup and resolves to the stub itself",
+                         types.globDat, types.jumpSlot, types.relative));
+            }
         }
         // Conversely, ET_REL must NOT carry virtual addresses (they're
         // set by the LINKER at exec build time, not declared on the

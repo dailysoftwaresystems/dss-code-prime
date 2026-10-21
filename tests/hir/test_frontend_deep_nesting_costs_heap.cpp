@@ -111,6 +111,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -156,7 +158,9 @@ struct ShippedSchemas {
 // ⚠ A THROW, NEVER `std::abort()` — an abort kills the process and every sibling
 // here loses its verdict, which is the exact signature these tests exist to tell
 // APART from a stack overflow. `no_abort_in_tests_guard` enforces the same rule.
-[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
+// The parse and the analysis of `src`, `analyze` on a worker of `analyzeReserve` bytes.
+[[nodiscard]] SemanticModel analyzeOn(std::string src, std::size_t exprDepthCap,
+                                      std::size_t analyzeReserve) {
     std::shared_ptr<GrammarSchema const> schema = shipped().schema;
     std::shared_ptr<TargetSchema const>  target = shipped().target;
 
@@ -175,10 +179,15 @@ struct ShippedSchemas {
     builder.addTree(std::move(result.tree));
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
 
-    SemanticModel model =
-        analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                LongDoubleFormat::None, target.get(), kAnalyzeReserveBytes);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                   std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                   LongDoubleFormat::None, target.get(), analyzeReserve);
+}
+
+[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
+    std::shared_ptr<GrammarSchema const> schema = shipped().schema;
+    std::shared_ptr<TargetSchema const>  target = shipped().target;
+    SemanticModel model = analyzeOn(std::move(src), exprDepthCap, kAnalyzeReserveBytes);
     if (model.hasErrors())
         throw std::runtime_error{"deep-nest fixture did not analyze cleanly"};
 
@@ -576,4 +585,87 @@ TEST(FrontendDeepNesting, HirTextDeepAggregateLiteralRoundTripsOnABoundedStack) 
            "silently different initializer";
     EXPECT_EQ(readLeaf, 7);
     EXPECT_EQ(again, text) << "the round trip must be byte-identical";
+}
+
+// ── the constant evaluator's VALUE STEPS (`valueStepChild`, src/hir/cst_const_eval.cpp) ──
+//
+// AXIS: a scalar's braced initializer, read as a constant. C 6.7.9p11 lets a scalar's
+// initializer stand in braces, and the evaluator steps through a brace list to its first
+// element by name — so `static const int c = {{…{5}…}};` is read through one step
+// per level when the semantic tier folds `_Static_assert(c == 5, …)`. The fold that named
+// the step took it in `evalNode`'s tail: a fresh driver and two host frames per level, where
+// the peel by count it replaced had been a frame of the driver (a review of that fold, its
+// E). The step is a frame again — and so is a statement expression's sole expression, the
+// other value step, whose nesting no unit harness here drives past the tiers' own per-level
+// frames around it. ✔MEASURED 2026-10-16: gcc 13.3.0 builds this source at 8192 levels and
+// runs it (clang 18.1.3 refuses past its bracket depth). The lowering's own walk of the same
+// levels is the next case's (`ScalarBraceLevelsCostHeap`) — so this pin reads the
+// EVALUATOR'S tier, the analysis, and lowers nothing.
+// ★ ON AN ANALYZE WORKER OF THE BOUNDED STACK'S SIZE (`test::boundedStackBytes()`, 256 KiB), IN A
+// CHILD PROCESS: a recursion restored exhausts the worker and the child dies — this case's
+// red, with the child's status, never the binary's unattributable death.
+TEST(FrontendDeepNesting, ConstantValueStepsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    std::string src = "static const int c = ";
+    src.append(static_cast<std::size_t>(kDepth), '{');
+    src += "5";
+    src.append(static_cast<std::size_t>(kDepth), '}');
+    src += ";\nint main(void) {\n    _Static_assert(c == 5, \"the value through every brace level\");\n"
+           "    return 0;\n}\n";
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            SemanticModel const model =
+                analyzeOn(std::move(src), /*exprDepthCap=*/kDepth + 1024,
+                          test::boundedStackBytes());
+            for (auto const& d : model.diagnostics().all())
+                if (d.severity == DiagnosticSeverity::Error)
+                    std::fprintf(stderr, "error: %s\n", d.actual.c_str());
+            std::exit(model.hasErrors() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+// ── `lowerScalarBraceInit` (src/hir/lowering/cst_to_hir.cpp) — a scalar's brace LEVELS ──
+//
+// AXIS: the brace levels around ONE scalar's value. C 6.7.9p11 allows one pair; gcc and clang
+// build more with a warning per level and initialize the scalar from the innermost value
+// (P69, lane `lm`, the scalar brace closure — ✔MEASURED 2026-10-16: gcc 13.3.0 builds and runs
+// 8192 levels, clang 18.1.3 refuses past its bracket depth). The lowering refused a second
+// level; it now takes the levels one by one in a LOOP, and this pin holds it to that: 8192
+// levels lowered on the bounded stack (`test::runOnBoundedStack`, 256 KiB), with no error and
+// the innermost 42 in the unit's literal pool. A recursion per level restored exhausts the
+// stack — in a CHILD PROCESS, so that is this case's red, with the child's status, never the
+// binary's unattributable death. The semantic tier's walk of the same levels
+// (`forEachPlacedBraceValue`) runs in the analysis, on its own worker, before it.
+TEST(FrontendDeepNesting, ScalarBraceLevelsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    std::string src = "int main(void) {\n    int v = ";
+    src.append(static_cast<std::size_t>(kDepth), '{');
+    src += "42";
+    src.append(static_cast<std::size_t>(kDepth), '}');
+    src += ";\n    return v;\n}\n";
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            std::size_t hirErrors = 1;
+            bool        valueSeen = false;
+            test::runOnBoundedStack([&] {
+                auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 1024);
+                hirErrors = L.hirErrors;
+                for (std::size_t i = 0; i < L.hir->literalPool.size(); ++i) {
+                    auto const& lit = L.hir->literalPool.at(i);
+                    if (std::holds_alternative<std::int64_t>(lit.value)
+                        && std::get<std::int64_t>(lit.value) == 42)
+                        valueSeen = true;
+                }
+            });
+            if (hirErrors != 0 || !valueSeen)
+                std::fprintf(stderr, "lowering errors %zu, the innermost 42 %s\n", hirErrors,
+                             valueSeen ? "lowered" : "never lowered");
+            std::exit(hirErrors == 0 && valueSeen ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "");
 }

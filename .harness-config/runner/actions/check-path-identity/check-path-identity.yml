@@ -12,3 +12,25 @@ steps:
       python3 ./check-path-identity.py
     successPattern: 'check-path-identity selftest: OK'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-path-identity --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-path-identity.py --selftest
+    successPattern: '^check-path-identity selftest: OK \(\d+ controls\)$'
+    requireInputsUnmoved: true
+
+  # Reprint the allowlist the tree would need today, for a reader to COMPARE with `ALLOWLIST` -- it
+  # writes nothing: a new entry is a decision, made in the program by hand.
+
+  - name: reprint
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-path-identity.py --reprint
+    successPattern: '^# \d+ file\(s\)$'
+    requireInputsUnmoved: true

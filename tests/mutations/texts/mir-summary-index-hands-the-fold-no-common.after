@@ -1,0 +1,1 @@
+            defs.back().tentative = false && g.isCommon;

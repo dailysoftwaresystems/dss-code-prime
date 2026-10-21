@@ -103,11 +103,11 @@ review the written file as a diff, where a changed `_comment` is plainly visible
 Exit codes: 0 OK · 1 a ceiling was exceeded or is stale, or the inventory's
 `_comment` diverged from the literal · 2 the scan collapsed · 3 usage error.
 
-Usage:
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py             # verify
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --write     # burn down
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --baseline  # new ground
-    python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --selftest  # prove it fails
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-plan-citations                           # verify, then the self-test
+    dssharness run check-plan-citations-write                     # --write: burn down, this machine's tree
+    dssharness run check-plan-citations-baseline                  # --baseline: new ground, this machine's tree
+    dssharness run check-plan-citations --manual-step self-test   # --selftest: prove it fails
 """
 from __future__ import annotations
 
@@ -305,9 +305,23 @@ WRITE_VERB = "dssharness run check-plan-citations-write"
 # 2026-09-25): a root that falls under it lost most of itself, which no ordinary
 # churn does. A root added to `SCAN_ROOTS` without a floor is refused at import.
 DOC_ROOT_FLOORS = {".plans": 25, ".claude": 20}
-if set(DOC_ROOT_FLOORS) != set(SCAN_ROOTS):
-    raise SystemExit("check-plan-citations: DOC_ROOT_FLOORS names %s but SCAN_ROOTS is %s -- every documentation "
-                     "root needs its own floor" % (sorted(DOC_ROOT_FLOORS), sorted(SCAN_ROOTS)))
+
+
+def floor_table_refusal(roots, floors):
+    """Why a documentation floor table does not fit the roots the scan reads, or None: every root needs its OWN
+    floor, and a floor naming a root the scan does not read guards nothing. A function (the round-12 audit: the
+    import-time refusal was unpinned) so the self-test holds it both ways -- arms FLOOR-TABLE-*."""
+    if set(floors) != set(roots):
+        return ("check-plan-citations: DOC_ROOT_FLOORS names %s but SCAN_ROOTS is %s -- every documentation root "
+                "needs its own floor" % (sorted(floors), sorted(roots)))
+    return None
+
+
+# Refused at IMPORT, before anything is scanned -- and as a structural COLLAPSE (exit 2), never as the ratchet's
+# exit 1, which says the tree gained a citation.
+if floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS):
+    print(floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS), file=sys.stderr)
+    raise SystemExit(EXIT_COLLAPSE)
 
 # ★ THE CODE FAMILY GETS ITS OWN FLOOR, NOT A SHARED ONE. A single total
 # would let one family collapse entirely while the other's size covered for it --
@@ -371,43 +385,33 @@ def repo_root():
         raise Collapse(str(exc))
 
 
-def remedy_runner_fact():
-    """-> (ok, detail): the runner WRITE_VERB names is declared in this tree's config.json, runs this action's
-    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
-    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
-    too). Read from config, never assumed: a second leg added there reds the self-test."""
-    cfg = _owning_tree().load_jsonc(os.path.join(repo_root(), ".harness-config", "config.json"))
-    name = WRITE_VERB.split()[-1]
-    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
-    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
-    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
-    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
-    ok = (isinstance(runner, dict) and runner.get("action") == "check-plan-citations/check-plan-citations.yml"
-          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
-    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
+# ⓘ `remedy_runner_fact()` (P68 round 13, F1-A11) retired on 2026-09-30 with its arm: check-scripts-index
+# clause 13 is the ONE statement that a remedy names a runner config.json declares, and that a writer's
+# runner has ONE leg of this machine's own tree -- for every program, not for this one alone.
 
 
 def _walk(root, rel_roots, keep):
-    """Every file under `rel_roots` whose name satisfies `keep`, repo-relative."""
-    out = []
-    for rel_root in rel_roots:
-        base = os.path.join(root, rel_root)
-        if not os.path.isdir(base):
-            continue
-        for dirpath, dirnames, files in os.walk(base):
-            # `build` is generated and enormous; `worktrees` is another checkout
-            # and would double-count every file it holds. `artifacts` is the other name
-            # DssHarness reserves under every action for a run's KEPT output (`help
-            # runners`: neither name may appear on an action's path), so nothing tracked
-            # can live in one -- ✔MEASURED 2026-09-18, `git ls-files` holds no path with
-            # an `artifacts/` segment -- and a run's output is not documentation.
-            dirnames[:] = [d for d in dirnames
-                           if d not in ("__pycache__", "worktrees", "build", "artifacts",
-                                        ".git")]
-            for f in files:
-                if keep(f):
-                    rel = os.path.relpath(os.path.join(dirpath, f), root)
-                    out.append(rel.replace(os.sep, "/"))
+    """Every file under `rel_roots` whose name satisfies `keep`, repo-relative, less what the tree
+    leaves out: what git ignores there, read from the tree's own `.gitignore`, and `.git`
+    (`owning-tree`'s `TreeIgnores`, the one statement every walker asks) -- a build (`build/`, at
+    any depth), another checkout (`/.worktrees/`, `.claude/worktrees/`), bytecode, an action's kept
+    run output (`<action>/artifacts/`) among it. This guard skips nothing git does not ignore. A
+    directory the walk cannot list, and a path the reader cannot answer as git does, collapse."""
+    ot = _owning_tree()
+    try:
+        ignores = ot.TreeIgnores(root)
+        out = []
+        for rel_root in rel_roots:
+            base = os.path.join(root, rel_root)
+            if not os.path.isdir(base):
+                continue
+            for dirpath, _dirnames, files in ignores.walk(base):
+                for f in files:
+                    if keep(f):
+                        rel = os.path.relpath(os.path.join(dirpath, f), root)
+                        out.append(rel.replace(os.sep, "/"))
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
     return sorted(out)
 
 
@@ -756,7 +760,7 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 47
+EXPECTED_ARMS = 49   # arm 2c retired on 2026-09-30 (M6: check-scripts-index clause 13); WALK-ASKS-THE-TREE added 2026-10-16
 # A documentation root cut down to this many documents is a COLLAPSE (arms 5c, 11c): every
 # floor in `DOC_ROOT_FLOORS` must sit above it, or those arms fail.
 PARTIAL_DOCS = 10
@@ -933,15 +937,20 @@ def selftest(root):
         # ⚠ THE CODE ROOTS ARE COPIED WITH AN EXTENSION FILTER, NOT WHOLESALE.
         # A faithful replica is what makes arm 0 mean anything, but `src` + `tests`
         # + `examples` also carry generated trees; copying only the extensions the
-        # census actually reads keeps the replica exact for this guard's purpose
-        # while leaving `build/` behind.
+        # census actually reads, less what the LIVE tree leaves out (its `TreeIgnores`,
+        # the walk's own statement -- the replica holds no `.gitignore`, so its walk
+        # reads exactly what was copied), keeps the replica exact for this guard's
+        # purpose while leaving `build/` behind. A link is a file here, as the walk
+        # takes it: never copied as the directory it may point at.
+        live_ignores = _owning_tree().TreeIgnores(root)
+
         def _drop(dirpath, names):
             drop = []
             for n in names:
                 full = os.path.join(dirpath, n)
-                if os.path.isdir(full):
-                    if n in ("__pycache__", "worktrees", "build", ".git"):
-                        drop.append(n)
+                is_dir = os.path.isdir(full) and not os.path.islink(full)
+                if live_ignores.leaves_out(live_ignores.rel(full), is_dir):
+                    drop.append(n)
                 # ⚠ `.md` STAYS SPELLED OUT HERE EVEN THOUGH `CODE_EXTS` NOW
                 # LISTS IT. `documents()` reads markdown unconditionally, so the
                 # replica owes it markdown regardless of what the OTHER family's
@@ -950,9 +959,32 @@ def selftest(root):
                 # the replica lost `.plans/_handoff.md` and the whole suite died
                 # on a `FileNotFoundError` before arm 0 -- a suite that cannot
                 # report is worse than one that fails.
-                elif not n.endswith(CODE_EXTS + (".md",)):
+                elif not is_dir and not n.endswith(CODE_EXTS + (".md",)):
                     drop.append(n)
             return drop
+
+        # The floor table's own refusal, both ways: a root with no floor names that root; the live table is whole.
+        refusal = floor_table_refusal(SCAN_ROOTS + ("docs",), DOC_ROOT_FLOORS)
+        ok &= _fact("FLOOR-TABLE-REFUSES-ROOT", bool(refusal) and "'docs'" in refusal, refusal or "no refusal")
+        ok &= _fact("FLOOR-TABLE-LIVE-WHOLE", floor_table_refusal(SCAN_ROOTS, DOC_ROOT_FLOORS) is None)
+
+        # The walk leaves out what the tree leaves out, nothing more: a session's scratch below a
+        # governed root (`tests/.temp/notes.md`, under the tree's unanchored `.temp/` rule) and
+        # `.git` are no governed files; the root's other files, and a name that merely begins like
+        # a left-out one (`tests/.temporary/`), are.
+        fx = tempfile.mkdtemp(prefix="plan-citations-ignores-")
+        try:
+            for rel, text in ((".gitignore", ".temp/\n"), ("tests/.temp/notes.md", "x\n"),
+                              ("tests/.git/x.md", "x\n"), ("tests/kept.md", "x\n"),
+                              ("tests/.temporary/kept.md", "x\n")):
+                os.makedirs(os.path.dirname(os.path.join(fx, rel)) or fx, exist_ok=True)
+                with open(os.path.join(fx, rel), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+            walked = code_files(fx)
+        finally:
+            shutil.rmtree(fx, ignore_errors=True)
+        ok &= _fact("WALK-ASKS-THE-TREE", walked == ["tests/.temporary/kept.md", "tests/kept.md"],
+                    "walked %r" % (walked,))
 
         for rel_root in SCAN_ROOTS + CODE_ROOTS:
             src = os.path.join(root, rel_root)
@@ -1037,9 +1069,6 @@ def selftest(root):
         io.open(subject, "w", encoding="utf-8", newline="").write(converted)
         ok &= _arm("2 CEILING-NOW-STALE", tmp, EXIT_RATCHET,
                    says=("above the live count", WRITE_VERB), not_says="new positional citation")
-        # 2c -- ...and the runner that remedy names runs `write` alone, on ONE leg of this machine's own tree.
-        _fact_ok, _fact_detail = remedy_runner_fact()
-        ok &= _fact("2c REMEDY-RUNNER-ONE-LEG", _fact_ok, "" if _fact_ok else _fact_detail[:300])
         io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
         ok &= _arm("2b RESTORED", tmp, EXIT_OK)
 
@@ -1202,8 +1231,11 @@ def selftest(root):
         # real one. ✔FOUND 2026-09-25 by round 12's independent audit: every floor could
         # be lowered to 1 with all 44 arms still green. `GREEN-CONTROL` holds each floor
         # below its root's live count, so the floors sit in (PARTIAL_DOCS, live].
-        for label, rel_root in (("5c PLANS-PARTIAL-COLLAPSE", ".plans"),
-                                ("11c CLAUDE-PARTIAL-COLLAPSE", ".claude")):
+        # EVERY root in SCAN_ROOTS, never a hand-kept pair (the round-12 audit): a root added later gets its
+        # partial-collapse arm by construction, and EXPECTED_ARMS says so.
+        partial_labels = {".plans": "5c PLANS-PARTIAL-COLLAPSE", ".claude": "11c CLAUDE-PARTIAL-COLLAPSE"}
+        for rel_root in SCAN_ROOTS:
+            label = partial_labels.get(rel_root, "PARTIAL-COLLAPSE " + rel_root)
             docs = [d for d in documents(tmp) if d.startswith(rel_root + "/")]
             moved = docs[PARTIAL_DOCS:]
             for rel in moved:

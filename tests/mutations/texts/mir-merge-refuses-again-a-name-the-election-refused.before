@@ -1,0 +1,1 @@
+                        if (!refusedNames.contains(targetName) && !refusedNames.contains(name)) {

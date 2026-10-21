@@ -330,6 +330,38 @@ TEST(GnuStatementExpression, RefusedAtFileScope) {
            "so one construct produces one diagnostic and not two";
 }
 
+// ★ REFUSAL 2, WHEREVER THE CONSTRUCT STANDS (P69, lane `lm`): the refusal is the semantic
+// tier's, at the node (`pass2Post`) — so a statement expression the lowering never meets,
+// unevaluated in a `_Generic`'s controlling expression or folded in a constant, is refused
+// too, ONCE (the lowering's guard says nothing more on a model that already holds the
+// error). ✔MEASURED 2026-10-15: each of these BUILT on DSS (pe64, both pipelines), where
+// gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2 refuse every one.
+TEST(GnuStatementExpression, RefusedAtFileScopeWhereverItStands) {
+    for (char const* src : {
+             "static char arr[_Generic(({ 1; }), int: 1, default: 2)];\n"
+             "int main(void){ return 0; }\n",
+             "_Static_assert(_Generic(({ 1; }), int: 1, default: 2) == 1, \"\");\n"
+             "int main(void){ return 0; }\n",
+             "struct B { unsigned w : _Generic(({ 1; }), int: 1, default: 2) * 9; };\n"
+             "int main(void){ return 0; }\n",
+         }) {
+        EXPECT_EQ(parseErrorsFor(src), 0u) << src;
+        EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_StatementExprAtFileScope), 1u)
+            << "refused once, by the tier that sees every one:\n" << src;
+    }
+    // THE CONTROL: inside a function body the same three are statement expressions like
+    // any other, and build.
+    std::string const inside =
+        "int main(void){\n"
+        "  static char arr[_Generic(({ 1; }), int: 1, default: 2)];\n"
+        "  _Static_assert(_Generic(({ 1; }), int: 1, default: 2) == 1, \"\");\n"
+        "  struct B { unsigned w : _Generic(({ 1; }), int: 1, default: 2) * 9; };\n"
+        "  return (int)sizeof arr - 1;\n"
+        "}\n";
+    EXPECT_EQ(parseErrorsFor(inside), 0u);
+    EXPECT_EQ(loweringCodeCount(inside, DiagnosticCode::S_StatementExprAtFileScope), 0u);
+}
+
 
 // ── [[D-C-GNU-STATEMENT-EXPRESSION]] — the ACCEPTED shapes ───────────────────
 
@@ -414,4 +446,49 @@ TEST(GnuStatementExpression, DoesNotStealTheOtherParenLedOperandForms) {
     EXPECT_EQ(parseErrorsFor(src), 0u)
         << "a cut on `(` alone would swallow every parenthesised operand";
     EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_StatementExprHasNoValue), 0u);
+}
+
+// ── NO JUMP ENTERS A STATEMENT EXPRESSION ────────────────────────────────────────────
+// (cycle P69 round 1, lane `lm`; a review of the statement-expression fold, its C.)
+// GNU C 6.1 forbids a `goto` into a statement expression and a `case` / `default` of a
+// `switch` outside one landing inside it, and leaves a computed goto into one undefined.
+// ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0, -fsyntax-only): both refuse each goto
+// and each case and default below, the statement expression a value or discarded alike;
+// clang refuses `&&L` of a label inside one taken outside it and gcc builds it — no
+// reference makes that work. DSS accepted all of them, and the labeled last item landed
+// the goto on the computation of the value. Refused by the construct, in the lowering.
+TEST(GnuStatementExpression, AJumpIntoAStatementExpressionIsRefusedByTheConstruct) {
+    constexpr char const* kInto[] = {
+        "int f(int c) { int a = 1; if (c) goto L; return a + ({ L: 5; }); }\n",
+        "int f(int c) { if (c) goto L; return ({ L: ; 5; }); }\n",
+        "int f(int c) { if (c) goto L; ({ L: ; }); return 0; }\n",
+        "int f(int c) { if (c) goto L; return ({ { L: ; } 5; }); }\n",
+        "int f(int c) { int a = ({ if (c) goto L; 1; }); return a + ({ L: 5; }); }\n",
+        "int f(int x) { switch (x) { case 1: return ({ case 2: 5; }); } return 0; }\n",
+        "int f(int x) { switch (x) { case 1: return ({ default: 5; }); } return 0; }\n",
+        "int f(int x) { switch (x) { case 1: ({ case 2: ; }); } return 0; }\n",
+        "int f(int c) { void *p = &&L; if (c) goto *p; return ({ L: 5; }); }\n",
+    };
+    for (char const* fn : kInto) {
+        std::string const src = std::string{fn} + "int main(void) { return f(0); }\n";
+        EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_JumpIntoStatementExpression), 1u)
+            << "a jump into a statement expression, refused once:\n" << src;
+    }
+}
+
+// THE CONTROLS: a jump inside a statement expression, a `switch` inside one, a jump out of
+// one, and `&&L` taken and used inside the one around `L` — both references build each.
+TEST(GnuStatementExpression, AJumpInsideOrOutOfAStatementExpressionStands) {
+    constexpr char const* kStands[] = {
+        "int f(int c) { return ({ int r = 1; if (c) goto L; r = 2; L: r; }); }\n",
+        "int f(int x) { return ({ int r = 0; switch (x) { case 1: r = 5; } r; }); }\n",
+        "int f(int c) { int r = ({ if (c) goto L; 5; }); return r; L: return 7; }\n",
+        "int f(int c) { return ({ void *p = &&L; if (c) goto *p; L: 5; }); }\n",
+        "int f(int c) { return ({ int r = ({ if (c) goto L; 1; }); L: r; }); }\n",
+    };
+    for (char const* fn : kStands) {
+        std::string const src = std::string{fn} + "int main(void) { return f(0); }\n";
+        EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_JumpIntoStatementExpression), 0u)
+            << src;
+    }
 }

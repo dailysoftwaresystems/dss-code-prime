@@ -5,22 +5,24 @@
  * sqlite's os_win.c `aSyscall[]` table (`(SYSCALL)Win32Func`). main
  * loads that pointer and CALLS it indirectly.
  *
- * On PE/Windows a format that resolves an extern's ADDRESS to the raw
- * `.idata` IAT *data* slot (the retired `indirect-slot` model) makes
- * this `call *ptr` jump INTO the import table and execute data as code
- * -> 0xC0000005. The fix: the PE linker synthesizes one `jmp *[IAT
- * slot]` import THUNK per extern (the ELF-PLT / Mach-O-__stubs analog)
- * and `externCallDispatch: direct-plt` points the extern's VA at its
- * THUNK -> a callable code address -> the indirect call reaches `puts`.
- * ELF/Mach-O already ran this green via their PLT / __stubs.
+ * WHAT THE POINTER HOLDS ON PE CHANGED TWICE. Before c112 the address
+ * resolved to the raw `.idata` IAT *data* slot, so this `call *ptr`
+ * executed data as code -> 0xC0000005. From c112 it was the image's
+ * synthesized `jmp *[IAT slot]` import THUNK: callable, but not the
+ * function's address. Since P69 (design c2,
+ * D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) the slot is the
+ * FirstThunk of an import descriptor of its own, so the LOADER writes
+ * `puts`'s own address into it — the value GetProcAddress answers
+ * (examples/c/library_function_address_equals_getprocaddress compares
+ * the two). A direct call still goes through the thunk
+ * (`externCallDispatch: direct-plt`).
  *
  * The `volatile` load defeats any fold of the indirect call into a
  * direct `puts(...)`, so the address-taken path survives to runtime in
  * BOTH the baseline and the release (optimized) arm. A correct run
- * prints the line and returns 42; a wrong thunk access-violates (no
- * exit 42). RED-on-disable: flip the pe64 exec format's
- * `externCallDispatch` back to `indirect-slot` (or drop the pe.cpp
- * thunk emission) -> PE crashes 0xC0000005 instead of exiting 42.
+ * prints the line and returns 42. RED-on-disable: stop emitting the
+ * slot's own import descriptor in pe.cpp -> the slot keeps its lookup
+ * entry (an RVA, not code) -> the indirect call faults (no exit 42).
  */
 #include <stdio.h>
 

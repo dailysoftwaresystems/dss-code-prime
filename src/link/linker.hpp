@@ -88,6 +88,19 @@ struct DSS_EXPORT LinkedImage {
     };
     std::vector<CrossCuRef> resolvedCrossCuRefs;
 
+    // P69 fold 3c: the names a definition CARRIED that the link took from it. Where
+    // the link's document discards a superseded definition WHOLE, a copy that loses
+    // its own name loses every other name it carries too, and each of them is
+    // elected again without it (`linker::resolveSettlingCarriedNames`,
+    // link/common_yield.hpp). Such a name is no name of that definition any more:
+    // the merge never folds the losing copy through it, whichever definition won it
+    // afterwards. Empty for a relocatable link, which keeps every name.
+    struct WithdrawnName {
+        LinkedSymbolKey definition;  // the carrying definition, in its own unit
+        std::string     name;        // the name withdrawn from it
+    };
+    std::vector<WithdrawnName> withdrawnNames;
+
     // The mangled names of the extern imports the EMITTED image carries (its import-table
     // entries). A cross-CU reference that resolved to a sibling definition is STRIPPED
     // (LK11b — the sibling shadows the library fallback) and does NOT appear here; only

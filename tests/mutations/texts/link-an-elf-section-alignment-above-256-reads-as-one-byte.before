@@ -1,0 +1,1 @@
+    if (bytes > Alignment::kMaxBytes) return std::nullopt;

@@ -1,7 +1,13 @@
 #include "core/substrate/path_identity.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -199,8 +205,14 @@ std::string canonicalIdentityKey(fs::path const& p, std::error_code& ec) {
     // The canonicalisation's OWN failure, kept separate from the `ec` this
     // function reports: the two answer different questions (see below), and
     // folding them was what let a model failure masquerade as a host refusal.
+    //
+    // ★ THE PATH A LINK LEADS TO IS ASKED OF `reachedPath`, NEVER OF THE LIBRARY: libstdc++ on Windows
+    // resolves no link (its `weakly_canonical` hands one back unchanged), so the MinGW build keyed a link
+    // and the file it reaches as TWO identities where every other build keys one
+    // ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). On Windows `reachedPath` is the final
+    // path of the opened file's handle -- what MS STL's `weakly_canonical` asks too.
     std::error_code canonEc;
-    fs::path const c = fs::weakly_canonical(p, canonEc);
+    fs::path const c = reachedPath(p, canonEc);
     if (canonEc) {
         // ⚠ A `weakly_canonical` FAILURE IS NOT EVIDENCE THAT THE FILESYSTEM
         // REFUSED, and this overload's whole contract is that `ec` means exactly
@@ -246,6 +258,367 @@ std::string canonicalIdentityKey(fs::path const& p, std::error_code& ec) {
 #else
     return genericSpelling(r);
 #endif
+}
+
+// ════ THE KIND OF A DIRECTORY ENTRY ITSELF, AND THE WALK AND THE REMOVAL THAT ASK IT ════
+// (the header states why the OS is asked on Windows, with the measurement)
+
+namespace {
+
+#ifdef _WIN32
+
+// The answers Windows gives for "nothing is there" -- the set MS STL's `status` reads as `not_found`.
+[[nodiscard]] bool winNotFound(DWORD e) {
+    return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND || e == ERROR_INVALID_NAME
+        || e == ERROR_INVALID_DRIVE || e == ERROR_BAD_NETPATH || e == ERROR_BAD_NET_NAME;
+}
+
+[[nodiscard]] std::error_code winError(DWORD e) {
+    return std::error_code{static_cast<int>(e), std::system_category()};
+}
+
+// What `p` REACHES, read through a handle opened WITHOUT `FILE_FLAG_OPEN_REPARSE_POINT` -- a handle to
+// what every link on the way reaches. Nothing when nothing is reached; `ec` set only for a failure
+// that is not "nothing there".
+[[nodiscard]] std::optional<BY_HANDLE_FILE_INFORMATION> reachedInformation(fs::path const& p, std::error_code& ec) {
+    HANDLE const reached = ::CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                         FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (reached == INVALID_HANDLE_VALUE) {
+        DWORD const e = ::GetLastError();
+        if (!winNotFound(e)) ec = winError(e);
+        return std::nullopt;
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    BOOL const  read = ::GetFileInformationByHandle(reached, &info);
+    DWORD const e    = read ? ERROR_SUCCESS : ::GetLastError();
+    ::CloseHandle(reached);
+    if (!read) {
+        ec = winError(e);
+        return std::nullopt;
+    }
+    return info;
+}
+
+// One entry's kind from what the OS recorded for it: its attributes and, for a reparse point, its tag.
+[[nodiscard]] EntryKind kindOfAttributes(DWORD attributes, DWORD reparseTag) {
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        && (reparseTag == static_cast<DWORD>(IO_REPARSE_TAG_SYMLINK)
+            || reparseTag == static_cast<DWORD>(IO_REPARSE_TAG_MOUNT_POINT))) {
+        return EntryKind::Link;
+    }
+    return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? EntryKind::Directory : EntryKind::File;
+}
+
+[[nodiscard]] bool isPermissionDenied(std::error_code const& ec) {
+    return ec == std::errc::permission_denied
+        || (ec.category() == std::system_category() && ec.value() == static_cast<int>(ERROR_ACCESS_DENIED));
+}
+
+// Every entry of `dir` but `.` and `..`, each classified from its own find record -- the record
+// carries the attributes AND a reparse point's tag, so no entry costs a second call.
+void listEntries(fs::path const& dir, std::size_t depth, std::vector<TreeEntry>& out, std::error_code& ec) {
+    ec.clear();
+    fs::path const   pattern = dir / L"*";
+    WIN32_FIND_DATAW found{};
+    HANDLE const     search = ::FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &found, FindExSearchNameMatch,
+                                                 nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (search == INVALID_HANDLE_VALUE) {
+        ec = winError(::GetLastError());
+        return;
+    }
+    do {
+        std::wstring_view const name{found.cFileName};
+        if (name == L"." || name == L"..") continue;
+        DWORD const     tag  = (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ? found.dwReserved0 : 0;
+        EntryKind const kind = kindOfAttributes(found.dwFileAttributes, tag);
+        out.push_back(TreeEntry{dir / fs::path{std::wstring{name}}, kind, kind, depth});
+    } while (::FindNextFileW(search, &found));
+    DWORD const last = ::GetLastError();
+    ::FindClose(search);
+    if (last != ERROR_NO_MORE_FILES) ec = winError(last);
+}
+
+#else
+
+[[nodiscard]] EntryKind kindOfStatus(fs::file_type type) {
+    switch (type) {
+        case fs::file_type::not_found: return EntryKind::Absent;
+        case fs::file_type::directory: return EntryKind::Directory;
+        case fs::file_type::symlink: return EntryKind::Link;
+        case fs::file_type::regular: return EntryKind::File;
+        default: return EntryKind::Other;
+    }
+}
+
+[[nodiscard]] bool isPermissionDenied(std::error_code const& ec) {
+    return ec == std::errc::permission_denied;
+}
+
+// Every entry of `dir`, each classified by its own `symlink_status` (the listing's cached type
+// where the platform records one). The `ec` test comes BEFORE the end test: a failed increment may
+// leave the iterator equal to the end, and a loop that asked "finished?" first would read a listing
+// error as a complete listing.
+void listEntries(fs::path const& dir, std::size_t depth, std::vector<TreeEntry>& out, std::error_code& ec) {
+    ec.clear();
+    fs::directory_iterator       it{dir, ec};
+    fs::directory_iterator const end;
+    while (true) {
+        if (ec) return;
+        if (it == end) return;
+        std::error_code kec;
+        auto const      type = it->symlink_status(kec).type();
+        // Gone since it was listed is `Absent`; any other failure to read it ends the listing.
+        if (kec && type != fs::file_type::not_found) {
+            ec = kec;
+            return;
+        }
+        EntryKind const kind = kindOfStatus(type);
+        out.push_back(TreeEntry{it->path(), kind, kind, depth});
+        it.increment(ec);
+    }
+}
+
+#endif
+
+}  // namespace
+
+EntryKind entryKind(fs::path const& p, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!::GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &data)) {
+        DWORD const e = ::GetLastError();
+        if (winNotFound(e)) return EntryKind::Absent;
+        ec = winError(e);
+        return EntryKind::Other;
+    }
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return kindOfAttributes(data.dwFileAttributes, 0);
+    // A reparse point: its TAG decides, read from a handle to the entry itself (never what it reaches).
+    HANDLE const entry = ::CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (entry == INVALID_HANDLE_VALUE) {
+        DWORD const e = ::GetLastError();
+        if (winNotFound(e)) return EntryKind::Absent;
+        ec = winError(e);
+        return EntryKind::Other;
+    }
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    BOOL const  read = ::GetFileInformationByHandleEx(entry, FileAttributeTagInfo, &info, sizeof info);
+    DWORD const e    = read ? ERROR_SUCCESS : ::GetLastError();
+    ::CloseHandle(entry);
+    if (!read) {
+        ec = winError(e);
+        return EntryKind::Other;
+    }
+    return kindOfAttributes(info.FileAttributes, info.ReparseTag);
+#else
+    auto const type = fs::symlink_status(p, ec).type();
+    if (type == fs::file_type::not_found) {
+        ec.clear();
+        return EntryKind::Absent;
+    }
+    return ec ? EntryKind::Other : kindOfStatus(type);
+#endif
+}
+
+EntryKind reachedKind(fs::path const& p, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    auto const info = reachedInformation(p, ec);
+    if (!info) return EntryKind::Absent;
+    return (info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? EntryKind::Directory : EntryKind::File;
+#else
+    auto const type = fs::status(p, ec).type();
+    if (type == fs::file_type::not_found) {
+        ec.clear();
+        return EntryKind::Absent;
+    }
+    if (ec) return EntryKind::Absent;
+    return type == fs::file_type::directory ? EntryKind::Directory
+         : type == fs::file_type::regular   ? EntryKind::File
+                                            : EntryKind::Other;
+#endif
+}
+
+std::optional<std::uintmax_t> reachedFileSize(fs::path const& p, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    auto const info = reachedInformation(p, ec);
+    if (!info || (info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return std::nullopt;
+    return (std::uintmax_t{info->nFileSizeHigh} << 32) | info->nFileSizeLow;
+#else
+    auto const reached = fs::status(p, ec).type();
+    if (reached == fs::file_type::not_found) {
+        ec.clear();
+        return std::nullopt;
+    }
+    if (ec || reached != fs::file_type::regular) return std::nullopt;
+    auto const size = fs::file_size(p, ec);
+    if (ec) return std::nullopt;
+    return size;
+#endif
+}
+
+fs::path reachedPath(fs::path const& p, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    // Absolute and normal WITHOUT re-rooting an authority onto the local drive (the header measures
+    // what `fs::absolute` and `lexically_normal` do to a multi-separator root).
+    fs::path const whole = normalizeKeepingRoot(absoluteKeepingRoot(p, ec));
+    if (ec) return {};
+    // The longest leading part that exists, resolved by the OS; what follows it is appended as written.
+    fs::path head = whole;
+    fs::path rest;
+    for (;;) {
+        HANDLE const reached = ::CreateFileW(head.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (reached != INVALID_HANDLE_VALUE) {
+            std::wstring resolved(MAX_PATH, L'\0');
+            DWORD        n = ::GetFinalPathNameByHandleW(reached, resolved.data(), static_cast<DWORD>(resolved.size()),
+                                                         FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (n >= resolved.size()) {
+                resolved.resize(n);
+                n = ::GetFinalPathNameByHandleW(reached, resolved.data(), static_cast<DWORD>(resolved.size()),
+                                                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            }
+            DWORD const e = n == 0 ? ::GetLastError() : ERROR_SUCCESS;
+            ::CloseHandle(reached);
+            if (n == 0 || n >= resolved.size()) {
+                ec = winError(n == 0 ? e : ERROR_INSUFFICIENT_BUFFER);
+                return {};
+            }
+            resolved.resize(n);
+            // The final path is spelled in the OS's own long form: `\\?\C:\...` or `\\?\UNC\server\share\...`.
+            if (resolved.starts_with(L"\\\\?\\UNC\\")) resolved = L"\\\\" + resolved.substr(8);
+            else if (resolved.starts_with(L"\\\\?\\")) resolved = resolved.substr(4);
+            fs::path out{resolved};
+            if (!rest.empty()) out /= rest;
+            return normalizeKeepingRoot(out);
+        }
+        DWORD const e = ::GetLastError();
+        if (!winNotFound(e)) {
+            ec = winError(e);
+            return {};
+        }
+        if (!head.has_relative_path()) return whole;   // nothing of it exists
+        rest = rest.empty() ? head.filename() : head.filename() / rest;
+        head = head.parent_path();
+    }
+#else
+    return fs::weakly_canonical(p, ec);
+#endif
+}
+
+TreeWalk walkTree(fs::path const& root, std::function<WalkStep(TreeEntry const&)> const& visit,
+                  TreeWalkOptions options) {
+    TreeWalk walk;
+    // One listed directory: its entries, and how many of them the walk has handed out.
+    struct Listed {
+        std::vector<TreeEntry> entries;
+        std::size_t            next = 0;
+    };
+    std::vector<Listed> work;
+    // List `dir` onto the stack; false ends the walk (its error recorded).
+    auto const descend = [&](fs::path const& dir, std::size_t depth) {
+        Listed          listed;
+        std::error_code ec;
+        listEntries(dir, depth, listed.entries, ec);
+        if (ec) {
+            if (options.skipPermissionDenied && isPermissionDenied(ec)) return true;
+            walk.error = ec;
+            walk.where = dir;
+            return false;
+        }
+        for (auto& entry : listed.entries) {
+            if (entry.kind != EntryKind::Link) continue;
+            std::error_code reachEc;   // a link whose reach cannot be read reaches nothing usable
+            entry.reaches = reachedKind(entry.path, reachEc);
+        }
+        work.push_back(std::move(listed));
+        return true;
+    };
+    if (!descend(root, 0)) return walk;
+    while (!work.empty()) {
+        Listed& top = work.back();
+        if (top.next == top.entries.size()) {
+            work.pop_back();
+            continue;
+        }
+        // A COPY: descending grows `work`, which would leave a reference into it dangling.
+        TreeEntry const entry = top.entries[top.next++];
+        WalkStep const  step  = visit(entry);
+        if (step == WalkStep::Stop) {
+            walk.stopped = true;
+            return walk;
+        }
+        if (step == WalkStep::Prune || entry.kind != EntryKind::Directory) continue;
+        if (!descend(entry.path, entry.depth + 1)) return walk;
+    }
+    return walk;
+}
+
+TreeRemoval removeTree(fs::path const& target) {
+    TreeRemoval out;
+    // A failure on an entry that is now GONE was beaten to the outcome wanted: it is no failure.
+    auto const note = [&out](fs::path const& p, std::error_code const& ec) {
+        std::error_code gec;
+        if (entryKind(p, gec) == EntryKind::Absent && !gec) return;
+        if (out.failures++ == 0) {
+            out.firstPath  = p;
+            out.firstError = ec;
+        }
+    };
+    // `fs::remove` takes one entry: a link as itself (the directory flavour of a link included), a
+    // file, or an EMPTY directory.
+    auto const removeOne = [&note](fs::path const& p) {
+        std::error_code ec;
+        fs::remove(p, ec);
+        if (ec) note(p, ec);
+    };
+    std::error_code tec;
+    EntryKind const kind = entryKind(target, tec);
+    if (tec) {
+        note(target, tec);
+        return out;
+    }
+    if (kind == EntryKind::Absent) return out;
+    if (kind != EntryKind::Directory) {
+        removeOne(target);
+        return out;
+    }
+    // An explicit work stack: a directory is LISTED once, its entries handled, and it is removed
+    // once every entry of that listing has been. Nothing is deleted under a live listing.
+    struct Pending {
+        fs::path dir;
+        bool     listed = false;
+    };
+    std::vector<Pending> work;
+    work.push_back({target, false});
+    while (!work.empty()) {
+        if (work.back().listed) {
+            fs::path const dir = std::move(work.back().dir);
+            work.pop_back();
+            removeOne(dir);
+            continue;
+        }
+        work.back().listed = true;
+        fs::path const         dir = work.back().dir;   // a COPY: `work` grows below
+        std::vector<TreeEntry> entries;
+        std::error_code        ec;
+        listEntries(dir, 0, entries, ec);
+        if (ec) note(dir, ec);
+        for (auto& entry : entries) {
+            if (entry.kind == EntryKind::Absent) continue;   // already gone
+            if (entry.kind == EntryKind::Directory) {
+                work.push_back({std::move(entry.path), false});
+                continue;
+            }
+            removeOne(entry.path);
+        }
+    }
+    return out;
 }
 
 }  // namespace dss::core

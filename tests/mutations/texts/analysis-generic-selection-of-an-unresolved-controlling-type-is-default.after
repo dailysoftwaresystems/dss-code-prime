@@ -1,0 +1,1 @@
+    if (false && !sel.controllingResolved) return InvalidNode;

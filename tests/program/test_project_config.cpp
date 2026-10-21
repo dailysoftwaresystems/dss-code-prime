@@ -35,6 +35,7 @@
 #include "program/program.hpp"          // Program, routesToMultiUnit
 #include "core/types/project_sources.hpp"  // AP6 M4: expandAndDedupProjectSources
 #include "host_native_target.hpp"       // hostNativeTarget (build-and-spawn on EVERY leg)
+#include "os_link.hpp"                  // links made by the OS: MinGW's library makes none
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
 #include "unc_spelling.hpp"             // the ONE multi-separator-root fixture
@@ -3143,6 +3144,68 @@ TEST(ExpandGlob, TwoMatchesSortedDedupedRoutesMulti) {
     EXPECT_EQ(std::filesystem::path{out[1]}.filename().string(), "b.c");
     EXPECT_TRUE(routesToMultiUnit(out.size()))
         << "2 matches → the multi-CU route, exactly as two literal sources would";
+}
+
+// A GLOB NEVER WALKS THROUGH A DIRECTORY LINK AND MATCHES A LINK BY WHAT IT
+// REACHES, on every build. ✔MEASURED 2026-10-20 (src/core/substrate/path_identity.hpp):
+// libstdc++ on Windows cannot tell a link from what it reaches, so the MinGW
+// build's `**` DESCENDED a directory link the MSVC build's did not — one glob, two
+// source lists — and matched a dangling `.c` link as a source. The links are made
+// by the OS (`os_link.hpp`): that build's library makes none.
+TEST(ExpandGlob, ARecursiveGlobNeverWalksThroughALinkAndMatchesALinkByWhatItReaches) {
+    using dss::test_support::LinkTo;
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    ScratchDir elsewhere{Location::Temp, "program-elsewhere"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "src");   // writeText makes no directory
+    writeText(dir / "src" / "a.c", "int a(void){return 0;}\n");
+    writeText(elsewhere.path() / "beyond.c", "int beyond(void){return 0;}\n");
+    writeText(elsewhere.path() / "named.c", "int named(void){return 0;}\n");
+    ASSERT_FALSE(dss::test_support::makeSymbolicLink(elsewhere.path(), dir / "src" / "linked", LinkTo::Directory));
+    ASSERT_FALSE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", dir / "src" / "via-link.c",
+                                                     LinkTo::File));
+    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c",
+                                                     LinkTo::File));
+
+    std::vector<std::string> out;
+    std::error_code ec;
+    ASSERT_TRUE(expandGlob((dir / "src" / "**" / "*.c").generic_string(), out, ec)) << ec.message();
+    std::vector<std::string> names;
+    std::string              matched;
+    for (auto const& s : out) {
+        names.push_back(std::filesystem::path{s}.lexically_relative(dir / "src").generic_string());
+        matched += " " + names.back();
+    }
+    EXPECT_EQ(names, (std::vector<std::string>{"a.c", "via-link.c"}))
+        << "the glob matched " << names.size() << " sources:" << matched
+        << " -- a directory link was walked through, or a dangling link was matched as a source";
+}
+
+// A LITERAL PATTERN names what it REACHES: a link to a source is that source, and a DANGLING link matches nothing --
+// what the MSVC and POSIX builds always answered. libstdc++ on Windows reads a dangling link's own attributes, so
+// the MinGW build matched it and handed the compile a source it could not read
+// ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The links are made by the OS.
+TEST(ExpandGlob, ALiteralPatternNamingADanglingLinkMatchesNothing) {
+    using dss::test_support::LinkTo;
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "src");   // writeText makes no directory
+    writeText(dir / "src" / "real.c", "int r(void){return 0;}\n");
+    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "src" / "real.c", dir / "src" / "via-link.c", LinkTo::File));
+    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c", LinkTo::File));
+
+    std::error_code          ec;
+    std::vector<std::string> viaLink;
+    ASSERT_TRUE(expandGlob((dir / "src" / "via-link.c").generic_string(), viaLink, ec)) << ec.message();
+    EXPECT_EQ(viaLink.size(), 1u) << "the literal naming the live link matched " << viaLink.size() << " source(s)";
+    std::vector<std::string> dangling;
+    ASSERT_TRUE(expandGlob((dir / "src" / "dangling.c").generic_string(), dangling, ec)) << ec.message();
+    EXPECT_EQ(dangling.size(), 0u) << "the literal naming the dangling link matched " << dangling.size()
+                                   << " source(s)";
 }
 
 // ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────

@@ -491,3 +491,13 @@ target_link_libraries(dss_asm_test_asm_arm64_address_forms
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_arm64_address_forms
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P69 (lane xa): a template's names of the EMBEDDING program — the symbol its
+# unit resolved, else the import its caller mints — answered through
+# `AsmTemplateProgramNames`, read against a test double that stands for the
+# caller (an address, a displacement, the page and its offset on ELF and
+# Mach-O, a call; an import and what it states; a template label and an
+# `asm goto` label never a program name; no names handed in = every name
+# refused by name). Reads the shipped documents, so it runs through ctest.
+dss_add_test(NAME asm/test_asm_template_program_names
+             SOURCES test_asm_template_program_names.cpp)

@@ -372,6 +372,85 @@ namespace internal {
     return internal::msvcToolchainQueryTally();
 }
 
+// ══ MINGW'S x86-64 GCC — IDENTIFIED BY THE TARGET IT REPORTS ═══════════════════════════
+//
+// The MinGW arms of the PE object witnesses in `tests/link/` link a DSS `.obj` with the
+// `gcc` on PATH. A NAME on PATH is not that toolchain: a Cygwin or MSYS gcc answers to
+// `gcc` too, and links for another runtime (`*-pc-cygwin`, `*-pc-msys`), and a 32-bit
+// MinGW cannot take an x86-64 object at all. So the one locator asks the compiler what it
+// targets (`gcc -dumpmachine`) and admits only `x86_64-*-mingw32` — MinGW-w64's own
+// spelling (✔MEASURED, the Windows host's gcc: `x86_64-w64-mingw32`). Every other answer is
+// ABSENT, and the skip says which target it saw; a `gcc` that cannot answer the question
+// is a broken step and goes RED, like every other locator in this file.
+//
+// It was four private copies, each with a rule of its own (`where gcc` alone in two of
+// them), so a pin passed by any `gcc` at all and the copies could only drift. Two still
+// stand beside this one, each its own predicate: `locateMingwGcc` in
+// tests/link/test_coff_object_reader.cpp (any `gcc` that compiles a probe) and the
+// `where gcc` gate of tests/link/test_coff_linker_directives.cpp.
+struct MingwLocation {
+    ProbeStatus status = ProbeStatus::ToolAbsent;
+    std::string detail;  // human-readable, in BOTH directions
+    std::string target;  // what `gcc -dumpmachine` reported; empty if it never answered
+
+    [[nodiscard]] bool ok() const noexcept { return status == ProbeStatus::Ok; }
+    // The ONE status a MinGW arm may legitimately skip on.
+    [[nodiscard]] bool toolAbsent() const noexcept {
+        return status == ProbeStatus::ToolAbsent;
+    }
+    [[nodiscard]] std::string describe() const {
+        return describeFailure(status, "MinGW's x86-64 gcc", detail);
+    }
+};
+
+[[nodiscard]] inline MingwLocation locateMingwGcc(fs::path const& work) {
+    MingwLocation m;
+#if defined(_WIN32)
+    if (std::system("where gcc >nul 2>&1") != 0) {
+        m.detail = "no `gcc` on PATH -- the MinGW arm is inert on this host";
+        return m;
+    }
+    fs::path const answer = work / "mingw_dumpmachine.txt";
+    std::error_code gone;
+    fs::remove(answer, gone);  // a stale answer must not vouch for this gcc
+    if (std::system(captureCmd("gcc -dumpmachine", answer).c_str()) != 0) {
+        m.status = ProbeStatus::ToolQueryFailed;
+        m.detail = "`gcc -dumpmachine` exited non-zero" + tailOf(answer, 5, "gcc -dumpmachine");
+        return m;
+    }
+    {
+        std::ifstream in{answer};
+        std::getline(in, m.target);
+    }
+    while (!m.target.empty()
+           && (m.target.back() == '\r' || m.target.back() == ' ' || m.target.back() == '\t')) {
+        m.target.pop_back();
+    }
+    if (m.target.empty()) {
+        m.status = ProbeStatus::ToolQueryFailed;
+        m.detail = "`gcc -dumpmachine` answered no target" + tailOf(answer, 5, "gcc -dumpmachine");
+        return m;
+    }
+    std::string_view const t{m.target};
+    std::string_view constexpr arch{"x86_64-"};
+    std::string_view constexpr runtime{"-mingw32"};
+    bool const isMingw64 = t.size() > arch.size() + runtime.size() && t.substr(0, arch.size()) == arch
+                        && t.substr(t.size() - runtime.size()) == runtime;
+    if (!isMingw64) {
+        m.detail = "the `gcc` on PATH reports target `" + m.target
+                 + "`, not MinGW-w64's x86_64-*-mingw32 -- the MinGW arm is inert on this host";
+        return m;
+    }
+    m.status = ProbeStatus::Ok;
+#else
+    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE named `nul`
+    // in the working directory, and a MinGW toolchain is not this host's anyway.
+    (void)work;
+    m.detail = "not a Windows host -- the MinGW arm is inert here";
+#endif
+    return m;
+}
+
 // ══ THE MSVC DEVELOPER ENVIRONMENT — ENTERED ONCE PER PROCESS ═════════════════════════
 //
 // ★★★ THE ENTRY WAS THE COST, NOT THE TOOLS. `cl`, `lib` and `link` need the INCLUDE, LIB

@@ -33,6 +33,11 @@ dss_add_test(NAME test_support/test_config_snapshot
              SOURCES test_config_snapshot.cpp)
 dss_add_test(NAME test_support/test_host_native_target
              SOURCES test_host_native_target.cpp)
+# P69 fold 3c (the review of fold 2, F2): how a native cell's reference control
+# is judged when it disagrees with its table — red on the measured toolchain, a
+# counted line on another, red again in a strict run.
+dss_add_test(NAME test_support/test_reference_control
+             SOURCES test_reference_control.cpp)
 # The per-arm verdict ledger (a cross-arch skip must still yield a VERDICT) and
 # the manifest lint (a cross-arch-capable arm must DECLARE an emulator).
 # On a windows/x86_64 host the corpus produces ZERO environmental

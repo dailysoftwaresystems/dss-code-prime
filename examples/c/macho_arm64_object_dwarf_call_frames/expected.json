@@ -1,0 +1,23 @@
+{
+  "$comment": "★★ AN arm64 MACH-O OBJECT THAT CARRIES DWARF CALL-FRAME INFORMATION IS AN OBJECT A DSS LINK READS (P69 send-back 5; D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ). The object named to the link is the reference COMPILER's own: Apple clang's `-arch arm64 -O0 -fasynchronous-unwind-tables -femit-dwarf-unwind=always -c` build of `int dss_unwind_first(void) { return 3; } int dss_unwind_shared(void) { return dss_unwind_first() + 4; }`. By default Apple's arm64 compiler describes a function's frame in the compact encoding alone and writes no `__TEXT,__eh_frame`; it writes the section for every function whose frame the compact encoding cannot describe, which `-fasynchronous-unwind-tables` makes of any function with an epilogue (✔MEASURED 2026-10-08, Apple clang 21.0.0 (clang-2100.1.1.101): that flag alone gives this unit ONE record, for `dss_unwind_shared`; with `-femit-dwarf-unwind=always` as well, two; the second flag ALONE writes none -- the object is byte-equal to the default one). Until P69 the arm64 Mach-O documents had no row for the section, so every such object -- a compiler's own, which Apple's ld links into a program that runs (42) -- was refused as CORRUPTED ('defined symbol ltmp2 lives in section __TEXT,__eh_frame which resolves to no known code/data section kind'). And unlike its x86_64 sibling, the arm64 compiler's object does not store each record's function address resolved: it is a PAIR of relocation entries (ARM64_RELOC_SUBTRACTOR naming the section's start label, then ARM64_RELOC_UNSIGNED naming the function), which the reader applies before it decodes (`macho.differenceRelocations`). Both functions then reach the image DESCRIBED, because the image's own `__TEXT,__eh_frame` is built from what the object states: ✔MEASURED 2026-10-08 on the image DSS builds of this example, three records -- `_main`'s and one per foreign function, at the 8 and 24 bytes the object's records state (held on every host by `MachoUnwindRelocations.TheImageDescribesEachFunctionAsItsObjectDid`). The reader-level pins run on every host over these same bytes: the suite `MachoUnwindRelocations` (`tests/link/test_macho_object_reader.cpp`), whose control is the shipped document MINUS the section row. main.c is DSS's; the 35 it adds keeps the answer apart from the exit code of a program that did nothing. The `release` arm pins that optimizing the DSS half changes nothing about how the foreign half is read.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The compiler's own object. Source and rebuild command: `tests/link/data/relinked_unwind.source.c` (Apple clang 21.0.0 `-arch arm64 -O0 -fasynchronous-unwind-tables -femit-dwarf-unwind=always -c`; md5 132c5c8b7d92b4a111b889d84a06aa60). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the section's own name: an arm64 object built without the flag carries no such section and cannot exercise this row.",
+          "path": "tests/link/data/compiled_unwind_arm64_macho.o",
+          "containerWitness": "__eh_frame"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

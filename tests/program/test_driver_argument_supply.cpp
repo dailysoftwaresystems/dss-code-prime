@@ -55,8 +55,12 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/substrate/phase_timers.hpp"
+#include "host_native_target.hpp"
+#include "pe_image_readers.hpp"
 #include "program/program.hpp"
+#include "program/runtime_object_cache.hpp"   // kRuntimeCacheOverrideVariable
 #include "run_binary.hpp"
+#include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -78,7 +82,26 @@ using dss::DiagnosticCode;
 using dss::DiagnosticReporter;
 using dss::Program;
 using dss::test_support::Location;
+using dss::test_support::ScopedEnv;
 using dss::test_support::ScratchDir;
+using dss::test_support::rdU16;
+using dss::test_support::rdU32;
+using dss::test_support::rdU64;
+using dss::test_support::readAllBytes;
+using dss::test_support::HandlerFirstRead;
+using dss::test_support::HandlerTakes;
+using dss::test_support::firstValueAHandlerTakes;
+using dss::test_support::PeSection;
+using dss::test_support::peSections;
+using dss::test_support::peRvaToOffset;
+using dss::test_support::PeScopeRecord;
+using dss::test_support::PeGuardedFunction;
+using dss::test_support::peGuardedFunctions;
+using dss::test_support::PeUnwindCode;
+using dss::test_support::PeFunctionUnwind;
+using dss::test_support::kPeUwopSaveXmm128;
+using dss::test_support::kPeUwopSaveXmm128Far;
+using dss::test_support::peFunctionUnwinds;
 
 namespace {
 
@@ -307,6 +330,63 @@ TEST(DriverArgumentSupply, AsmEncodeRouteSuppliesTheImageRequest) {
 // stage themselves. Their `Program_` suite prefix names the subject, not the
 // tier — they are unit cases, and by construction cannot see a driver that
 // stopped making the call.
+//
+// ★★★ WHOSE RUNS THE COUNT HOLDS. `PhaseTimers` counts for the whole PROCESS,
+// and a build that does not find its shipped runtime in the runtime object
+// cache compiles it then and there — one nested build per runtime unit, each
+// with Optimize runs of its own, inside the same compile call. The count read
+// after one compile is therefore the program's own ONLY when that compile found
+// every runtime archive already made; on an empty cache it holds the runtime's
+// too (✔MEASURED 2026-10-12 for the two builds below: 30 and 31, where the
+// programs' own are 2 and 3 — figures of that day's runtime, pinned nowhere).
+//
+// So each case below OWNS its cache. `DSS_RUNTIME_CACHE_DIR` names a directory
+// that was empty when the case began, the SAME compile is made twice, and the
+// two counts are kept apart:
+//   * the first found the cache EMPTY. It is the negative: it must read MORE
+//     than the second. If it does not, the directory was not this case's own —
+//     the variable no longer names the cache, or the runtime came from
+//     somewhere a case cannot empty — and the second count would say nothing
+//     about which builds it holds;
+//   * the second found what the first stored, so nothing but the program is
+//     compiled in it. ITS count is the one compared for equality.
+// Neither depends on anything that ran before the case — in this process or on
+// this machine: not a ctest fixture, not a sibling case, not the order.
+
+namespace {
+
+struct OptimizeRuns {
+    std::uint64_t onAnEmptyCache     = 0;
+    std::uint64_t onTheCacheItFilled = 0;
+};
+
+// `compile(tag)` makes ONE build, into an output directory named by `tag`, and
+// fails the case itself when the build does.
+template <typename Compile>
+[[nodiscard]] OptimizeRuns optimizeRunsOfOneCompile(Compile const& compile) {
+    ScratchDir const  cache{Location::Temp, "driver-arg-supply-runtime-cache"};
+    std::string const variable{dss::runtime::kRuntimeCacheOverrideVariable};
+    ScopedEnv const   ownCache{variable.c_str(), cache.path().string()};
+    auto const runsOf = [&compile](char const* tag) {
+        dss::substrate::PhaseTimers::reset();
+        compile(tag);
+        return dss::substrate::PhaseTimers::read(
+                   dss::substrate::CompilePhase::Optimize).runs;
+    };
+    OptimizeRuns out;
+    out.onAnEmptyCache     = runsOf("on_an_empty_cache");
+    out.onTheCacheItFilled = runsOf("on_the_cache_it_filled");
+    return out;
+}
+
+constexpr char const* kTheEmptyCacheIsTheNegative =
+    "the build that found the runtime object cache EMPTY ran no more Optimize "
+    "invocations than the same build made again. The first must also compile "
+    "the shipped runtime this format realizes, so an equal count means the "
+    "cache this case made for itself is not the one the build read — and the "
+    "exact count below then holds an unknown number of builds";
+
+} // namespace
 
 // ROUTE: N==1 sole CU (`compileFiles`) → the pre-lower program-stage optimize.
 TEST(DriverArgumentSupply, SingleCuRouteRunsTheProgramStageOptimize) {
@@ -317,23 +397,27 @@ TEST(DriverArgumentSupply, SingleCuRouteRunsTheProgramStageOptimize) {
         "int fold(int a) { return (2 + 3) * a; }\n"
         "int main(void) { return fold(1) + fold(2) - 15; }\n");
 
-    dss::substrate::PhaseTimers::reset();
-    Program prog;
-    prog.setCompileConfig(CompileConfig::Release);
-    prog.setOutputDir(scratch.path() / "solecu_out");
-    DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
-                                {std::string{kPeExecSpec}}, rep), 0)
-        << allDiagnosticText(rep);
+    OptimizeRuns const runs = optimizeRunsOfOneCompile([&](char const* tag) {
+        Program prog;
+        prog.setCompileConfig(CompileConfig::Release);
+        prog.setOutputDir(scratch.path() / (std::string{"solecu_"} + tag));
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
+                                    {std::string{kPeExecSpec}}, rep), 0)
+            << tag << '\n' << allDiagnosticText(rep);
+    });
+    if (HasFatalFailure()) return;
 
-    EXPECT_EQ(dss::substrate::PhaseTimers::read(
-                  dss::substrate::CompilePhase::Optimize).runs,
-              2u)
+    EXPECT_GT(runs.onAnEmptyCache, runs.onTheCacheItFilled)
+        << kTheEmptyCacheIsTheNegative;
+    EXPECT_EQ(runs.onTheCacheItFilled, 2u)
         << "a 1-CU exec build must run Optimize TWICE — the UNIT stage inside "
            "`buildCuMir` and the PROGRAM stage the driver makes before "
            "`lowerCuMirToAssembly`. Reading 1 means the sole-CU route's "
            "program-stage call is gone: the artifact still builds, optimized "
-           "at the unit schedule only (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE)";
+           "at the unit schedule only (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE). "
+           "Reading MORE means this build compiled something besides the "
+           "program — the runtime the build before it had just stored";
 }
 
 // ROUTE: N>1 whole-program merge (`compileUnits`) → the merged program-stage
@@ -347,23 +431,26 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteRunsTheProgramStageOptimize) {
     auto const b = writeSrc(scratch.path(), "stage_b.c",
                             "int helper(int x) { return x + x; }\n");
 
-    dss::substrate::PhaseTimers::reset();
-    Program prog;
-    prog.setCompileConfig(CompileConfig::Release);
-    prog.setOutputDir(scratch.path() / "merged_stage_out");
-    DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileUnits({a.generic_string(), b.generic_string()},
-                                "c", {std::string{kPeExecSpec}}, rep), 0)
-        << allDiagnosticText(rep);
+    OptimizeRuns const runs = optimizeRunsOfOneCompile([&](char const* tag) {
+        Program prog;
+        prog.setCompileConfig(CompileConfig::Release);
+        prog.setOutputDir(scratch.path() / (std::string{"merged_stage_"} + tag));
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileUnits({a.generic_string(), b.generic_string()},
+                                    "c", {std::string{kPeExecSpec}}, rep), 0)
+            << tag << '\n' << allDiagnosticText(rep);
+    });
+    if (HasFatalFailure()) return;
 
-    EXPECT_EQ(dss::substrate::PhaseTimers::read(
-                  dss::substrate::CompilePhase::Optimize).runs,
-              3u)
+    EXPECT_GT(runs.onAnEmptyCache, runs.onTheCacheItFilled)
+        << kTheEmptyCacheIsTheNegative;
+    EXPECT_EQ(runs.onTheCacheItFilled, 3u)
         << "a 2-CU merged exec build must run Optimize THREE times — one UNIT "
            "stage per CU plus the PROGRAM stage over the merged module. "
            "Reading 2 means the merged route's program-stage call is gone, and "
            "cross-CU inlining (the whole point of the merge) silently stops "
-           "happening while the binary still builds and still runs";
+           "happening while the binary still builds and still runs. Reading "
+           "MORE means this build compiled something besides the program";
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -464,37 +551,6 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsEntryVerbs) {
 
 namespace {
 
-// ── Byte readers, shared by the image pins ─────────────────────────────────
-// Bounds-safe: an out-of-range read yields 0 rather than UB, so a truncated or
-// unexpected artifact makes a pin fail with its own message instead of
-// crashing the suite.
-[[nodiscard]] std::uint16_t rdU16(std::vector<std::uint8_t> const& b,
-                                  std::size_t o) {
-    if (o + 2 > b.size()) return 0;
-    return static_cast<std::uint16_t>(static_cast<unsigned>(b[o])
-                                      | (static_cast<unsigned>(b[o + 1]) << 8));
-}
-[[nodiscard]] std::uint32_t rdU32(std::vector<std::uint8_t> const& b,
-                                  std::size_t o) {
-    if (o + 4 > b.size()) return 0;
-    return static_cast<std::uint32_t>(b[o])
-           | (static_cast<std::uint32_t>(b[o + 1]) << 8)
-           | (static_cast<std::uint32_t>(b[o + 2]) << 16)
-           | (static_cast<std::uint32_t>(b[o + 3]) << 24);
-}
-[[nodiscard]] std::uint64_t rdU64(std::vector<std::uint8_t> const& b,
-                                  std::size_t o) {
-    if (o + 8 > b.size()) return 0;
-    return static_cast<std::uint64_t>(rdU32(b, o))
-           | (static_cast<std::uint64_t>(rdU32(b, o + 4)) << 32);
-}
-
-[[nodiscard]] std::vector<std::uint8_t> readAllBytes(fs::path const& p) {
-    std::ifstream in(p, std::ios::binary);
-    return std::vector<std::uint8_t>{std::istreambuf_iterator<char>(in),
-                                     std::istreambuf_iterator<char>()};
-}
-
 // Every offset at which `needle` occurs in `hay`. Returned as a LIST, not a
 // count and not a first-hit, so a pin can assert BOTH "it is there" and "it is
 // there exactly once" — an anchor that turns out to be ambiguous makes the pin
@@ -542,11 +598,13 @@ findAll(std::vector<std::uint8_t> const& hay,
                                   std::string_view    srcB,
                                   std::string_view    targetSpec,
                                   fs::path const&     outDir,
-                                  DiagnosticReporter& rep) {
+                                  DiagnosticReporter& rep,
+                                  CompileConfig       config = CompileConfig::Debug) {
     auto const a = writeSrc(scratch.path(), nameA, srcA);
     auto const b = writeSrc(scratch.path(), nameB, srcB);
     Program prog;
     prog.setOutputDir(outDir);
+    prog.setCompileConfig(config);
     return prog.compileUnits({a.generic_string(), b.generic_string()},
                              "c", {std::string{targetSpec}}, rep);
 }
@@ -595,51 +653,6 @@ findAll(std::vector<std::uint8_t> const& hay,
 // entries actually resolved, so a pin can guard its own PREMISE (a fixture that
 // emitted no unwind info at all would otherwise report "0 handlers" and read
 // exactly like the defect).
-struct PeSection {
-    std::string   name;
-    std::uint32_t vaddr = 0, vsize = 0, rawPtr = 0, rawSize = 0;
-};
-
-[[nodiscard]] std::vector<PeSection>
-peSections(std::vector<std::uint8_t> const& img) {
-    std::vector<PeSection> out;
-    if (img.size() < 0x40) return out;
-    std::size_t const peOff = rdU32(img, 0x3C);
-    if (peOff + 24 > img.size()) return out;
-    if (!(img[peOff] == 'P' && img[peOff + 1] == 'E' && img[peOff + 2] == 0
-          && img[peOff + 3] == 0)) {
-        return out;
-    }
-    std::uint16_t const nsec    = rdU16(img, peOff + 6);
-    std::uint16_t const optSize = rdU16(img, peOff + 20);
-    std::size_t const   secOff  = peOff + 24 + optSize;
-    for (std::uint16_t i = 0; i < nsec; ++i) {
-        std::size_t const o = secOff + static_cast<std::size_t>(i) * 40;
-        if (o + 40 > img.size()) break;
-        PeSection s;
-        for (std::size_t k = 0; k < 8 && img[o + k] != 0; ++k) {
-            s.name.push_back(static_cast<char>(img[o + k]));
-        }
-        s.vsize   = rdU32(img, o + 8);
-        s.vaddr   = rdU32(img, o + 12);
-        s.rawSize = rdU32(img, o + 16);
-        s.rawPtr  = rdU32(img, o + 20);
-        out.push_back(std::move(s));
-    }
-    return out;
-}
-
-[[nodiscard]] std::size_t peRvaToOffset(std::vector<PeSection> const& secs,
-                                        std::uint32_t                 rva) {
-    for (auto const& s : secs) {
-        std::uint32_t const span = std::max(s.vsize, s.rawSize);
-        if (rva >= s.vaddr && rva < s.vaddr + span) {
-            return static_cast<std::size_t>(rva - s.vaddr) + s.rawPtr;
-        }
-    }
-    return 0;
-}
-
 [[nodiscard]] std::size_t peFunctionsWithExceptionHandler(
     std::vector<std::uint8_t> const& img, std::size_t& outTotal) {
     // UNWIND_INFO's first byte packs Version in bits 0..2 and Flags in bits
@@ -1163,6 +1176,648 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) {
            "(D-WIN64-SEH-FUNCLETS)";
 }
 
+// ═════════════════════════════════════════════════
+// THE GUARDED REGIONS, END TO END — what a handler reads
+// (D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER) and which handler a fault
+// reaches (D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER).
+// ═════════════════════════════════════════════════
+//
+// ★★★ BOTH DEFECTS WERE SILENT AND BOTH LIVED BETWEEN TIERS. ✔MEASURED
+// 2026-10-08 on pe64 at the base, baseline and release: a handler that read a
+// parameter read whatever the unwinder left in the parameter's volatile
+// register, and a fault in the inner of two nested regions ran the OUTER
+// handler. Each tier that owns a half is pinned on its own (LIR liveness and
+// the allocator; the funclet synthesizer); THIS pin reads the emitted IMAGE, so
+// it also holds the seams between them — in particular the driver handing the
+// scopes to liveness, which nothing else can see: hand it none, and every
+// `__try` still compiles without a diagnostic.
+//
+// ★ IT READS THE UNWIND DATA, NOT THE EXIT CODE, so it discriminates on every
+// host rather than only where a pe64 image runs:
+//   * WHAT A HANDLER READS. A value live into a handler must be where a call
+//     would keep it. A parameter is born in a volatile register, so a function
+//     whose handler reads one keeps it in a register a call preserves, or in
+//     the frame — the allocator's choice. The pin reads the HANDLER'S OWN CODE
+//     at the address the scope record names: the first register it reads
+//     without having written it is not a volatile one. (It used to count the
+//     function's saved non-volatile registers against a control's — a claim
+//     that held only while the allocator chose a register over a slot.)
+//   * WHICH HANDLER. The handler routine gives a fault to the FIRST record, in
+//     table order, whose range holds the address. The table of two nested
+//     regions must therefore list the INNER range first, and — as the reference
+//     compiler's own table does (cl 19.51: `[+20,+32) [+20,+57)`) — the outer
+//     range must hold the inner HANDLER, which lies outside its own range.
+namespace {
+
+// `int guarded(int *p, int caught)`: one region; `handlerBody` is the statement
+// the handler runs. A filter of 1 accepts every exception, so no header is
+// needed and the two programs differ by the handler's statement alone.
+[[nodiscard]] std::string oneRegionSource(std::string_view handlerBody) {
+    std::string s =
+        "int guarded(int *p, int caught) {\n"
+        "    int rc = 0;\n"
+        "    __try { rc = *p; }\n"
+        "    __except (1) { ";
+    s += handlerBody;
+    s += " }\n"
+         "    return rc;\n"
+         "}\n";
+    return s;
+}
+
+constexpr std::string_view kGuardedMain =
+    "extern int guarded(int *p, int caught);\n"
+    "int main(void) { int x = 5; return guarded(&x, 42) - 5; }\n";
+
+} // namespace
+
+TEST(DriverArgumentSupply, GuardedRegionReachesLivenessAndTheScopeTable) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-guarded"};
+    scratch.useAsCwd();
+
+    // ── WHAT A HANDLER READS ────────────────────────────────────────────────
+    auto const saved = [&](std::string_view tag, std::string_view handlerBody,
+                           CompileConfig config, std::size_t& outSaved,
+                           HandlerFirstRead& outFirst, std::string& outHandlerBytes) {
+        auto const out = scratch.path() / (std::string{tag} + "_out");
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildMergedPair(scratch, std::string{tag} + "_a.c",
+                                  oneRegionSource(handlerBody),
+                                  std::string{tag} + "_b.c", kGuardedMain,
+                                  kPeExecSpec, out, rep, config), 0)
+            << tag << ": the pe64 build must succeed\n" << allDiagnosticText(rep);
+        auto const img = readAllBytes(out / (std::string{tag} + "_a.exe"));
+        ASSERT_FALSE(img.empty()) << tag;
+        auto const fns = peGuardedFunctions(img);
+        ASSERT_EQ(fns.size(), 1u)
+            << tag << ": exactly one function of the image names a language handler";
+        ASSERT_EQ(fns[0].records.size(), 1u) << tag;
+        outSaved = fns[0].savedNonVolatile;
+        std::size_t const handlerAt = peRvaToOffset(peSections(img), fns[0].records[0].target);
+        ASSERT_NE(handlerAt, 0u) << tag << ": the record's handler is code of the image";
+        outFirst        = firstValueAHandlerTakes(img, handlerAt);
+        outHandlerBytes = hexWindow(img, handlerAt, 24);
+    };
+    std::size_t      readsNothing = 0;
+    HandlerFirstRead constFirst;
+    std::string      constBytes;
+    ASSERT_NO_FATAL_FAILURE(saved("reads_const", "rc = 42;", CompileConfig::Debug,
+                                  readsNothing, constFirst, constBytes));
+
+    // ★ THE CLAIM DOES NOT DEPEND ON HOW THE VALUE IS KEPT. `rc = caught;` is the
+    // handler's first statement, so the first value the handler takes from
+    // outside itself is `caught`, from wherever the function kept it — and that
+    // must be somewhere the unwinder hands over: a register a call preserves, or
+    // the frame. Which of the two is the allocator's choice and is not asked.
+    // With no guarded region handed to liveness, `caught` stays in the volatile
+    // register it arrived in and the handler reads it from there.
+    //
+    // IN BOTH PIPELINES: the handler is entered the same way whichever schedule
+    // built the function, and a stage that lost the handler's way in would lose
+    // it in one of them first.
+    struct Pipeline {
+        char const*   tag;
+        CompileConfig config;
+    };
+    for (Pipeline const p : {Pipeline{"reads_param", CompileConfig::Debug},
+                             Pipeline{"reads_param_release", CompileConfig::Release}}) {
+        SCOPED_TRACE(p.tag);
+        std::size_t      readsParameter = 0;
+        HandlerFirstRead paramFirst;
+        std::string      paramBytes;
+        ASSERT_NO_FATAL_FAILURE(saved(p.tag, "rc = caught;", p.config, readsParameter,
+                                      paramFirst, paramBytes));
+        EXPECT_TRUE(paramFirst.takes == HandlerTakes::APreservedRegister
+                    || paramFirst.takes == HandlerTakes::AValueOfTheFrame
+                    || paramFirst.takes == HandlerTakes::AVolatileRegister)
+            << "the premise: the handler of `rc = caught;` opens with instructions "
+               "this pin decodes, and one of them takes `caught`. Its first bytes: "
+            << paramBytes;
+        EXPECT_NE(paramFirst.takes, HandlerTakes::AVolatileRegister)
+            << "the handler reads register #" << paramFirst.reg << " without having "
+               "written it, which a call does not preserve — and the unwinder that "
+               "enters a handler hands over nothing else. The handler's first bytes: "
+            << paramBytes << " (this function saves " << readsParameter
+            << " non-volatile register(s); the same function whose handler reads "
+               "nothing saves " << readsNothing << " at baseline)";
+    }
+    // THE CONTROL: the handler of `rc = 42;` stores a constant and takes nothing
+    // from outside itself — so what the claim above read is `caught`, and not a
+    // read every handler opens with.
+    EXPECT_EQ(constFirst.takes, HandlerTakes::NothingFromOutside)
+        << "the handler of `rc = 42;` takes a value from outside itself (register #"
+        << constFirst.reg << "): " << constBytes << " — the claim above may then "
+           "be reading something that is not `caught`";
+
+    // ── WHICH HANDLER A FAULT REACHES ───────────────────────────────────────
+    auto const out = scratch.path() / "nested_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildMergedPair(
+                  scratch, "nested_a.c",
+                  "int guarded(int *p, int caught) {\n"
+                  "    int rc = 0;\n"
+                  "    __try {\n"
+                  "        __try { rc = *p; }\n"
+                  "        __except (1) { rc += 2; }\n"
+                  "        rc += caught;\n"
+                  "    } __except (1) { rc += 1000; }\n"
+                  "    return rc;\n"
+                  "}\n",
+                  "nested_b.c", kGuardedMain, kPeExecSpec, out, rep), 0)
+        << "the nested pe64 build must succeed\n" << allDiagnosticText(rep);
+    auto const img = readAllBytes(out / "nested_a.exe");
+    ASSERT_FALSE(img.empty());
+    auto const fns = peGuardedFunctions(img);
+    ASSERT_EQ(fns.size(), 1u);
+    ASSERT_EQ(fns[0].records.size(), 2u) << "two regions, two records";
+    PeScopeRecord const& first  = fns[0].records[0];
+    PeScopeRecord const& second = fns[0].records[1];
+    EXPECT_TRUE(second.begin <= first.begin && first.end <= second.end
+                && (second.begin < first.begin || first.end < second.end))
+        << "the FIRST record's range must lie inside the second's: the handler "
+           "routine takes the first record that holds the faulting address, so the "
+           "inner region's must come first. Got [" << first.begin << ", " << first.end
+        << ") then [" << second.begin << ", " << second.end << ")";
+    EXPECT_TRUE(first.target < first.begin || first.target >= first.end)
+        << "the inner handler lies outside its own range";
+    EXPECT_TRUE(first.target >= second.begin && first.target < second.end)
+        << "the inner handler lies INSIDE the outer range: a fault in it is the "
+           "outer handler's";
+    EXPECT_TRUE(second.target < second.begin || second.target >= second.end)
+        << "the outer handler lies outside its own range";
+    EXPECT_GE(fns[0].savedNonVolatile, 1u)
+        << "`caught` is read after the inner region, inside the outer one: it is "
+           "live into the inner handler";
+}
+
+// ═════════════════════════════════════════════════
+// EVERY SAVED VECTOR REGISTER HAS ITS UNWIND CODE, AT ITS STORE
+// (D-WIN64-XMM-UNWIND-RESTORE)
+// ═════════════════════════════════════════════════
+//
+// ★★★ WHAT A SAVE CODE IS FOR. When a fault unwinds THROUGH a frame to a
+// handler further up, the system puts back every call-preserved register that
+// frame saved — from the slot the frame's unwind information names. A register
+// the frame saved and reused, with no code naming its slot, reaches the handler
+// holding the CALLEE's value. For the general registers DSS always stated the
+// code. For the vector registers it stated none: a function that guards a
+// region and saved one was refused at the writer, and every other function
+// shipped without the code — so a handler in any caller, a foreign object's
+// included, that kept a `double` across its call read whatever the DSS callee
+// had left there. ✔MEASURED 2026-10-10 at the base: every `__try` function
+// with a `double` live across a call refused (handler or no handler, baseline
+// and release), and a plain function's three vector saves absent from its
+// codes. The reference states the code in both kinds of function (cl 19.51
+// x64 /O2: `movaps [rsp+30h],xmm6` ending at prologue byte 11 is `@11
+// SAVE_XMM128 xmm6, 3`).
+//
+// ★ THIS PIN READS THE IMAGE, ON EVERY HOST — the composition the writer's own
+// unit pin cannot see, because it hand-builds the frame rules: that the frame
+// producer's rule for a vector register REACHES the writer, names the slot the
+// prologue really stored to and the byte that store really ends at, and that
+// the store is of the WHOLE register, which both spellings of the code claim.
+// For every function of the image:
+//   * each vector save code is the SCALED form exactly when its slot is a
+//     multiple of 16 that fits one node, the FAR form otherwise;
+//   * the bytes that END at the code's offset are a whole-register store
+//     (`[REX] 0F 11 /r` or `0F 29 /r`) of THAT register to THAT slot off RSP;
+//   * that store BEGINS where the previous prologue operation ended — a store
+//     of half the register (`F2 0F 11`, MOVSD) is one byte longer and fails it;
+//   * the prologue holds as many such stores as the function has vector codes
+//     — a store without a code is the old omission.
+// And the image must hold at least one such function that guards a region and
+// one that does not, or the loop above ran over nothing.
+namespace {
+
+// The length of the whole-register store of vector register `reg` to
+// [RSP + slot] whose LAST byte is `p[end - 1]`, or 0 when the bytes ending
+// there are not that instruction: `[REX.R] 0F 11 /r` (MOVUPS) or `0F 29 /r`
+// (MOVAPS), an RSP base with no index, and a 32-bit or an 8-bit displacement.
+[[nodiscard]] std::size_t
+vectorStoreEndingAt(std::vector<std::uint8_t> const& p, std::size_t end,
+                    unsigned reg, std::uint32_t slot) {
+    for (std::size_t const dispBytes : {std::size_t{4}, std::size_t{1}}) {
+        if (dispBytes == 1 && slot > 0x7Fu) continue;
+        std::size_t const len = (reg >= 8 ? 1u : 0u) + 4u + dispBytes;
+        if (end < len || end > p.size()) continue;
+        std::size_t s = end - len;
+        if (reg >= 8 && p[s++] != 0x44u) continue;                  // REX.R alone
+        if (p[s] != 0x0Fu || (p[s + 1] != 0x11u && p[s + 1] != 0x29u)) continue;
+        std::uint8_t const modrm = static_cast<std::uint8_t>(
+            (dispBytes == 4 ? 0x80u : 0x40u) | ((reg & 7u) << 3) | 4u);
+        if (p[s + 2] != modrm || p[s + 3] != 0x24u) continue;       // SIB: base RSP
+        std::uint32_t disp = 0;
+        for (std::size_t k = 0; k < dispBytes; ++k) {
+            disp |= static_cast<std::uint32_t>(p[s + 4 + k]) << (8 * k);
+        }
+        if (disp == slot) return len;
+    }
+    return 0;
+}
+
+// How many stores of a vector register to an RSP-based slot a prologue holds,
+// by the store's own bytes — whatever the unwind codes say.
+[[nodiscard]] std::size_t vectorStoresIn(std::vector<std::uint8_t> const& p) {
+    std::size_t n = 0;
+    for (std::size_t k = 0; k + 4 <= p.size(); ++k) {
+        if (p[k] != 0x0Fu || (p[k + 1] != 0x11u && p[k + 1] != 0x29u)) continue;
+        std::uint8_t const modrm = p[k + 2];
+        if ((modrm >> 6) == 3u || (modrm & 7u) != 4u) continue;     // a memory form with an SIB
+        if (p[k + 3] != 0x24u) continue;                            // base RSP, no index
+        ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(DriverArgumentSupply, EverySavedVectorRegisterHasItsUnwindCodeAtItsStore) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-vector-unwind"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "vec_out";
+    DiagnosticReporter rep;
+    // `vec_plain` keeps two `double`s across a call and guards nothing;
+    // `vec_guarded` keeps one across a call inside its region and reads it in
+    // the handler; `vec_odd` keeps one across a call that passes one argument
+    // on the stack — an ODD count of outgoing stack slots, after which the
+    // register-save area must still begin at a multiple of 16.
+    ASSERT_EQ(buildMergedPair(
+                  scratch, "vec_a.c",
+                  "extern double vec_half(double x);\n"
+                  "extern double vec_five(double a, int b, int c, int d, int e);\n"
+                  "int vec_plain(double a, double b) {\n"
+                  "    double h = vec_half(4.0);\n"
+                  "    return (int)(h + a + b);\n"
+                  "}\n"
+                  "int vec_guarded(int *p, double keep) {\n"
+                  "    int rc = 0;\n"
+                  "    __try { rc = (int)vec_half(2.0); rc += *p; }\n"
+                  "    __except (1) { rc = (int)keep; }\n"
+                  "    return rc;\n"
+                  "}\n"
+                  "int vec_odd(double a) {\n"
+                  "    double h = vec_five(1.0, 2, 3, 4, 5);\n"
+                  "    return (int)(h + a);\n"
+                  "}\n",
+                  "vec_b.c",
+                  "extern int vec_plain(double a, double b);\n"
+                  "extern int vec_guarded(int *p, double keep);\n"
+                  "extern int vec_odd(double a);\n"
+                  "double vec_half(double x) { return x * 0.5; }\n"
+                  "double vec_five(double a, int b, int c, int d, int e) {\n"
+                  "    return a + b + c + d + e;\n"
+                  "}\n"
+                  "int main(void) {\n"
+                  "    int x = 5;\n"
+                  "    return vec_plain(1.0, 2.0) + vec_guarded(&x, 42.0) + vec_odd(3.0);\n"
+                  "}\n",
+                  kPeExecSpec, out, rep), 0)
+        << "a function that guards a region and keeps a `double` across a call "
+           "must build: a refusal naming the unwind information means the writer "
+           "again has no code for a saved vector register\n"
+        << allDiagnosticText(rep);
+    auto const img = readAllBytes(out / "vec_a.exe");
+    ASSERT_FALSE(img.empty());
+
+    auto const fns = peFunctionUnwinds(img);
+    ASSERT_GE(fns.size(), 4u) << "the premise: the image's function table was read";
+    std::size_t guardingWithAVectorSave = 0;
+    std::size_t plainWithAVectorSave    = 0;
+    std::size_t vectorSaves             = 0;
+    for (auto const& f : fns) {
+        std::size_t vectorCodes = 0;
+        for (std::size_t i = 0; i < f.codes.size(); ++i) {
+            PeUnwindCode const& c = f.codes[i];
+            if (c.op != kPeUwopSaveXmm128 && c.op != kPeUwopSaveXmm128Far) continue;
+            ++vectorCodes;
+            EXPECT_EQ(c.operand % 16u, 0u)
+                << "function at " << f.begin << ": xmm" << unsigned{c.info} << " at RSP+"
+                << c.operand << " — a vector register's save slot is a multiple of "
+                   "16 from the stack pointer: neither form of the code states "
+                   "another, and the unwinder may load it aligned";
+            EXPECT_EQ(unsigned{c.op},
+                      unsigned{c.operand / 16u <= 0xFFFFu ? kPeUwopSaveXmm128
+                                                          : kPeUwopSaveXmm128Far})
+                << "function at " << f.begin << ": xmm" << unsigned{c.info} << " at RSP+"
+                << c.operand << " — the scaled form while the quotient fits one "
+                   "node, the FAR form only past that reach";
+            ++vectorSaves;
+            std::size_t const len =
+                vectorStoreEndingAt(f.prologue, c.codeOffset, c.info, c.operand);
+            EXPECT_NE(len, 0u)
+                << "function at " << f.begin << ": the code says xmm" << unsigned{c.info}
+                << " is at RSP+" << c.operand << " from prologue byte "
+                << unsigned{c.codeOffset} << ", and the bytes ending there are not a "
+                   "whole-register store of that register to that slot: "
+                << hexWindow(f.prologue, 0, f.prologue.size());
+            std::size_t const previousEnd =
+                i + 1 < f.codes.size() ? f.codes[i + 1].codeOffset : 0u;
+            EXPECT_EQ(c.codeOffset - len, previousEnd)
+                << "function at " << f.begin << ": the store of xmm" << unsigned{c.info}
+                << " must begin where the previous prologue operation ended. One "
+                   "byte earlier is a store with a mandatory prefix — half the "
+                   "register, which the code would describe as all of it: "
+                << hexWindow(f.prologue, 0, f.prologue.size());
+        }
+        EXPECT_EQ(vectorStoresIn(f.prologue), vectorCodes)
+            << "function at " << f.begin << ": every vector register its prologue "
+               "stores has a save code, and nothing else does. A store without a "
+               "code is a register a handler further up reads unrestored: "
+            << hexWindow(f.prologue, 0, f.prologue.size());
+        if (vectorCodes != 0) ++(f.guards ? guardingWithAVectorSave : plainWithAVectorSave);
+    }
+    EXPECT_GE(guardingWithAVectorSave, 1u)
+        << "`vec_guarded` keeps a `double` across a call and into its handler: it "
+           "saves a call-preserved vector register and says where";
+    EXPECT_GE(plainWithAVectorSave, 2u)
+        << "`vec_plain` and `vec_odd` guard nothing and still owe the code — it is "
+           "what restores their CALLER's register";
+    EXPECT_GE(vectorSaves, 3u)
+        << "three functions save a vector register. `vec_odd` is the one whose "
+           "outgoing-argument area ends 8 bytes off a multiple of 16 (one "
+           "stack-passed argument above the 32 bytes every call reserves), which "
+           "is where its save area used to begin (✔MEASURED 2026-10-10 before the "
+           "layout rule: its store was to RSP+0x28) — a frame that puts it there "
+           "again is refused by the writer, and this program does not build";
+}
+
+// ── <windows.h>: THE TYPE AND THE VALUE OF EVERY CONSTANT IT DECLARES ─────────
+//
+// A constant's C type is part of its meaning. The shipped header typed 100 of
+// its 117 constants `unsigned int`; both pe references type 47 of those `int`,
+// 22 `long` and 31 `unsigned long` — and with the signedness wrong, so is the
+// ANSWER of a comparison or a subtraction with a negative operand
+// (`-1 < MEM_COMMIT` was false).
+//
+// ⚠ THE TABLE IS THE REFERENCES' ANSWER, NOT DSS'S OWN: a generated program
+// printed each name's type (by `_Generic`) and its value under MSVC cl
+// 19.51.36260 x64 (reference run 20261010-131314-9af2a35c) and under MinGW-w64
+// gcc 13.2.0 (reference run 20261010-131441-e7515cef), and the two printed the
+// identical 117 lines. Each row is one such line, in the header's order; the
+// value is spelled as a constant of the reference's own type.
+//
+// The claim is made where a type becomes observable — a compile — on every
+// host: each row is a `_Static_assert` over `_Generic` and one over the value.
+// The EXCEPTION_* status family is among the rows, so a wrong status VALUE
+// fails here too. The runnable proof is `examples/c/windows_constant_types`.
+namespace {
+
+struct WindowsConstant {
+    char const* name;
+    char const* type;
+    char const* value;
+};
+
+constexpr WindowsConstant kWindowsConstants[] = {
+    {"TRUE",                               "int",           "1"},
+    {"FALSE",                              "int",           "0"},
+    {"MAX_PATH",                           "int",           "260"},
+    {"INVALID_FILE_ATTRIBUTES",            "unsigned long", "0xFFFFFFFFUL"},
+    {"INVALID_SET_FILE_POINTER",           "unsigned long", "0xFFFFFFFFUL"},
+    {"GENERIC_READ",                       "unsigned long", "0x80000000UL"},
+    {"GENERIC_WRITE",                      "long",          "1073741824L"},
+    {"FILE_SHARE_READ",                    "int",           "1"},
+    {"FILE_SHARE_WRITE",                   "int",           "2"},
+    {"FILE_SHARE_DELETE",                  "int",           "4"},
+    {"CREATE_NEW",                         "int",           "1"},
+    {"CREATE_ALWAYS",                      "int",           "2"},
+    {"OPEN_EXISTING",                      "int",           "3"},
+    {"OPEN_ALWAYS",                        "int",           "4"},
+    {"TRUNCATE_EXISTING",                  "int",           "5"},
+    {"FILE_ATTRIBUTE_READONLY",            "int",           "1"},
+    {"FILE_ATTRIBUTE_HIDDEN",              "int",           "2"},
+    {"FILE_ATTRIBUTE_DIRECTORY",           "int",           "16"},
+    {"FILE_ATTRIBUTE_NORMAL",              "int",           "128"},
+    {"FILE_ATTRIBUTE_TEMPORARY",           "int",           "256"},
+    {"FILE_FLAG_DELETE_ON_CLOSE",          "int",           "67108864"},
+    {"FILE_FLAG_RANDOM_ACCESS",            "int",           "268435456"},
+    {"FILE_FLAG_OVERLAPPED",               "int",           "1073741824"},
+    {"FILE_BEGIN",                         "int",           "0"},
+    {"FILE_CURRENT",                       "int",           "1"},
+    {"FILE_END",                           "int",           "2"},
+    {"FILE_MAP_WRITE",                     "int",           "2"},
+    {"FILE_MAP_READ",                      "int",           "4"},
+    {"PAGE_READONLY",                      "int",           "2"},
+    {"PAGE_READWRITE",                     "int",           "4"},
+    {"PAGE_WRITECOPY",                     "int",           "8"},
+    {"SECTION_MAP_WRITE",                  "int",           "2"},
+    {"SECTION_MAP_READ",                   "int",           "4"},
+    {"LMEM_FIXED",                         "int",           "0"},
+    {"LMEM_ZEROINIT",                      "int",           "64"},
+    {"HEAP_ZERO_MEMORY",                   "int",           "8"},
+    {"HEAP_GENERATE_EXCEPTIONS",           "int",           "4"},
+    {"LOCKFILE_FAIL_IMMEDIATELY",          "int",           "1"},
+    {"LOCKFILE_EXCLUSIVE_LOCK",            "int",           "2"},
+    {"FORMAT_MESSAGE_ALLOCATE_BUFFER",     "int",           "256"},
+    {"FORMAT_MESSAGE_IGNORE_INSERTS",      "int",           "512"},
+    {"FORMAT_MESSAGE_FROM_SYSTEM",         "int",           "4096"},
+    {"GetFileExInfoStandard",              "int",           "0"},
+    {"WAIT_OBJECT_0",                      "unsigned long", "0x00000000UL"},
+    {"WAIT_TIMEOUT",                       "long",          "258L"},
+    {"WAIT_FAILED",                        "unsigned long", "0xFFFFFFFFUL"},
+    {"INFINITE",                           "unsigned int",  "0xFFFFFFFFU"},
+    {"ERROR_FILE_NOT_FOUND",               "long",          "2L"},
+    {"ERROR_ACCESS_DENIED",                "long",          "5L"},
+    {"ERROR_NOT_ENOUGH_MEMORY",            "long",          "8L"},
+    {"ERROR_NO_MORE_FILES",                "long",          "18L"},
+    {"ERROR_HANDLE_DISK_FULL",             "long",          "39L"},
+    {"ERROR_NOT_SUPPORTED",                "long",          "50L"},
+    {"ERROR_LOCK_VIOLATION",               "long",          "33L"},
+    {"ERROR_SHARING_VIOLATION",            "long",          "32L"},
+    {"ERROR_RETRY",                        "long",          "1237L"},
+    {"ERROR_PATH_NOT_FOUND",               "long",          "3L"},
+    {"ERROR_INVALID_HANDLE",               "long",          "6L"},
+    {"ERROR_HANDLE_EOF",                   "long",          "38L"},
+    {"ERROR_DEV_NOT_EXIST",                "long",          "55L"},
+    {"ERROR_NETNAME_DELETED",              "long",          "64L"},
+    {"ERROR_DISK_FULL",                    "long",          "112L"},
+    {"ERROR_SEM_TIMEOUT",                  "long",          "121L"},
+    {"ERROR_NOT_LOCKED",                   "long",          "158L"},
+    {"ERROR_USER_MAPPED_FILE",             "long",          "1224L"},
+    {"ERROR_NETWORK_UNREACHABLE",          "long",          "1231L"},
+    {"NO_ERROR",                           "long",          "0L"},
+    {"WAIT_IO_COMPLETION",                 "unsigned long", "0x000000C0UL"},
+    {"CP_ACP",                             "int",           "0"},
+    {"CP_OEMCP",                           "int",           "1"},
+    {"CP_UTF8",                            "int",           "65001"},
+    {"STD_INPUT_HANDLE",                   "unsigned long", "0xFFFFFFF6UL"},
+    {"STD_OUTPUT_HANDLE",                  "unsigned long", "0xFFFFFFF5UL"},
+    {"STD_ERROR_HANDLE",                   "unsigned long", "0xFFFFFFF4UL"},
+    {"ENABLE_VIRTUAL_TERMINAL_PROCESSING", "int",           "4"},
+    {"FILE_WRITE_ATTRIBUTES",              "int",           "256"},
+    {"FILE_FLAG_BACKUP_SEMANTICS",         "int",           "33554432"},
+    {"CTRL_C_EVENT",                       "int",           "0"},
+    {"EXCEPTION_IN_PAGE_ERROR",            "unsigned long", "0xC0000006UL"},
+    {"EXCEPTION_ACCESS_VIOLATION",         "unsigned long", "0xC0000005UL"},
+    {"EXCEPTION_DATATYPE_MISALIGNMENT",    "unsigned long", "0x80000002UL"},
+    {"EXCEPTION_BREAKPOINT",               "unsigned long", "0x80000003UL"},
+    {"EXCEPTION_SINGLE_STEP",              "unsigned long", "0x80000004UL"},
+    {"EXCEPTION_ARRAY_BOUNDS_EXCEEDED",    "unsigned long", "0xC000008CUL"},
+    {"EXCEPTION_FLT_DENORMAL_OPERAND",     "unsigned long", "0xC000008DUL"},
+    {"EXCEPTION_FLT_DIVIDE_BY_ZERO",       "unsigned long", "0xC000008EUL"},
+    {"EXCEPTION_FLT_INEXACT_RESULT",       "unsigned long", "0xC000008FUL"},
+    {"EXCEPTION_FLT_INVALID_OPERATION",    "unsigned long", "0xC0000090UL"},
+    {"EXCEPTION_FLT_OVERFLOW",             "unsigned long", "0xC0000091UL"},
+    {"EXCEPTION_FLT_STACK_CHECK",          "unsigned long", "0xC0000092UL"},
+    {"EXCEPTION_FLT_UNDERFLOW",            "unsigned long", "0xC0000093UL"},
+    {"EXCEPTION_INT_DIVIDE_BY_ZERO",       "unsigned long", "0xC0000094UL"},
+    {"EXCEPTION_INT_OVERFLOW",             "unsigned long", "0xC0000095UL"},
+    {"EXCEPTION_PRIV_INSTRUCTION",         "unsigned long", "0xC0000096UL"},
+    {"EXCEPTION_ILLEGAL_INSTRUCTION",      "unsigned long", "0xC000001DUL"},
+    {"EXCEPTION_NONCONTINUABLE_EXCEPTION", "unsigned long", "0xC0000025UL"},
+    {"EXCEPTION_STACK_OVERFLOW",           "unsigned long", "0xC00000FDUL"},
+    {"EXCEPTION_INVALID_DISPOSITION",      "unsigned long", "0xC0000026UL"},
+    {"EXCEPTION_GUARD_PAGE",               "unsigned long", "0x80000001UL"},
+    {"EXCEPTION_INVALID_HANDLE",           "unsigned long", "0xC0000008UL"},
+    {"EXCEPTION_NONCONTINUABLE",           "int",           "1"},
+    {"MEM_COMMIT",                         "int",           "4096"},
+    {"MEM_RESERVE",                        "int",           "8192"},
+    {"MEM_RELEASE",                        "int",           "32768"},
+    {"PAGE_NOACCESS",                      "int",           "1"},
+    {"EXCEPTION_EXECUTE_HANDLER",          "int",           "1"},
+    {"EXCEPTION_CONTINUE_SEARCH",          "int",           "0"},
+    {"EXCEPTION_CONTINUE_EXECUTION",       "int",           "(-1)"},
+    {"EXCEPTION_MAXIMUM_PARAMETERS",       "int",           "15"},
+    {"EVENT_MODIFY_STATE",                 "int",           "2"},
+    {"DRIVE_UNKNOWN",                      "int",           "0"},
+    {"DRIVE_NO_ROOT_DIR",                  "int",           "1"},
+    {"DRIVE_REMOVABLE",                    "int",           "2"},
+    {"DRIVE_FIXED",                        "int",           "3"},
+    {"DRIVE_REMOTE",                       "int",           "4"},
+    {"DRIVE_CDROM",                        "int",           "5"},
+    {"DRIVE_RAMDISK",                      "int",           "6"},
+};
+
+// One translation unit holding the two assertions of each row given.
+[[nodiscard]] std::string windowsConstantAssertions(std::span<WindowsConstant const> rows) {
+    std::string src = "#include <windows.h>\n";
+    for (WindowsConstant const& c : rows) {
+        std::string const name{c.name};
+        std::string const type{c.type};
+        std::string const value{c.value};
+        src += "_Static_assert(_Generic((" + name + "), " + type + ": 1, default: 0), \""
+             + name + " is " + type + "\");\n";
+        src += "_Static_assert((" + name + ") == " + value + ", \"" + name + " equals "
+             + value + "\");\n";
+    }
+    src += "int windows_constants_unit(void) { return 0; }\n";
+    return src;
+}
+
+constexpr std::string_view kWindowsConstantsMain =
+    "extern int windows_constants_unit(void);\n"
+    "int main(void) { return windows_constants_unit(); }\n";
+
+} // namespace
+
+TEST(DriverArgumentSupply, WindowsHeaderConstantsHaveTheTypesAndValuesTheReferencesGive) {
+    ASSERT_EQ(std::size(kWindowsConstants), 117u)
+        << "the table is the references' 117 lines; a row added to the header "
+           "arrives with its own measured line";
+    {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-constants"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildMergedPair(scratch, "wc_a.c", windowsConstantAssertions(kWindowsConstants),
+                                  "wc_b.c", kWindowsConstantsMain, kPeExecSpec,
+                                  scratch.path() / "wc_out", rep), 0)
+            << "a constant of the shipped <windows.h> has a type or a value other "
+               "than the one both references give it:\n"
+            << allDiagnosticText(rep);
+    }
+    // THE NEGATIVE, one per way a row can be wrong, so that a green above is a
+    // reading and not a build that ignores the assertions: the type the header
+    // USED to give a signed constant, and a value one off.
+    constexpr WindowsConstant kWrongType[]  = {{"MEM_COMMIT", "unsigned int", "0x00001000U"}};
+    constexpr WindowsConstant kWrongValue[] = {{"EXCEPTION_INT_DIVIDE_BY_ZERO", "unsigned long",
+                                                "0xC0000095UL"}};
+    struct Negative {
+        std::span<WindowsConstant const> rows;
+        char const*                      mustSay;
+    };
+    Negative const negatives[] = {
+        {kWrongType, "MEM_COMMIT is unsigned int"},
+        {kWrongValue, "EXCEPTION_INT_DIVIDE_BY_ZERO equals 0xC0000095UL"},
+    };
+    for (Negative const& n : negatives) {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-constants-negative"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_NE(buildMergedPair(scratch, "wc_a.c", windowsConstantAssertions(n.rows),
+                                  "wc_b.c", kWindowsConstantsMain, kPeExecSpec,
+                                  scratch.path() / "wc_out", rep), 0)
+            << n.mustSay << " — a false assertion must fail the build";
+        EXPECT_NE(allDiagnosticText(rep).find(n.mustSay), std::string::npos)
+            << "the failure must be THIS assertion's, by its own text: "
+            << allDiagnosticText(rep);
+    }
+}
+
+// ── A `sysconf` NAME IS ITS PLATFORM'S OWN NUMBER ──────────────────────────
+//
+// `_SC_NPROCESSORS_ONLN` is declared by the <unistd.h> of every POSIX platform
+// and is a different number on each: it is an index into that C library's own
+// table, so the only right value is the one the platform's header gives. The
+// shipped header declared it for ELF alone; a program that asked for the
+// processor count did not compile for Mach-O, where the reference's header
+// defines it (✔MEASURED 2026-10-10, the one name of the Mach-O descriptors the
+// SDK has and the shipped headers lacked). The numbers below are the
+// references' — gcc 13.3 and clang 18.1 against glibc on x86_64, gcc 13.3 on
+// arm64, AppleClang 21 against the macOS SDK — never the descriptor's own.
+TEST(DriverArgumentSupply, ProcessorCountNameHasItsPlatformsNumberOnEveryPosixFormat) {
+    struct Row {
+        std::string_view spec;
+        char const*      value;
+    };
+    constexpr std::string_view kMachoArm64ExecSpec = "arm64:macho64-arm64-darwin-exec";
+    // EVERY POSIX executable pair DSS ships, the fourth included: the Mach-O
+    // number is the SDK header's, and that header is one file for both of the
+    // SDK's architectures.
+    Row const rows[] = {
+        {"x86_64:elf64-x86_64-linux-exec", "84"},
+        {kElfArm64ExecSpec, "84"},
+        {kMachoArm64ExecSpec, "58"},
+        {"x86_64:macho64-x86_64-darwin-exec", "58"},
+    };
+    auto const unit = [](char const* value) {
+        std::string const v{value};
+        return "#include <unistd.h>\n"
+               "_Static_assert(_Generic((_SC_NPROCESSORS_ONLN), int: 1, default: 0), "
+               "\"_SC_NPROCESSORS_ONLN is int\");\n"
+               "_Static_assert((_SC_NPROCESSORS_ONLN) == " + v + ", "
+               "\"_SC_NPROCESSORS_ONLN equals " + v + "\");\n"
+               "long processor_count_unit(void) { return sysconf(_SC_NPROCESSORS_ONLN); }\n";
+    };
+    constexpr std::string_view kMain =
+        "extern long processor_count_unit(void);\n"
+        "int main(void) { return processor_count_unit() >= 1 ? 0 : 1; }\n";
+    for (Row const& row : rows) {
+        SCOPED_TRACE(std::string{row.spec});
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-processor-count"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildMergedPair(scratch, "pc_a.c", unit(row.value), "pc_b.c", kMain,
+                                  row.spec, scratch.path() / "pc_out", rep), 0)
+            << "the shipped <unistd.h> does not give _SC_NPROCESSORS_ONLN the number "
+               "this platform's own header gives it:\n"
+            << allDiagnosticText(rep);
+    }
+    // THE NEGATIVE: the other platform's number must fail, by this assertion's
+    // own text — a build that ignored the assertions would pass every row above.
+    {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-processor-count-negative"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_NE(buildMergedPair(scratch, "pc_a.c", unit("84"), "pc_b.c", kMain,
+                                  kMachoArm64ExecSpec, scratch.path() / "pc_out", rep), 0)
+            << "the ELF number must not be accepted for Mach-O";
+        EXPECT_NE(allDiagnosticText(rep).find("_SC_NPROCESSORS_ONLN equals 84"),
+                  std::string::npos)
+            << "the failure must be THIS assertion's, by its own text: "
+            << allDiagnosticText(rep);
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // `wideFloatSoftcallLibrary` — the runtime library each minted F128 softcall
 // binds to (D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH), pre-resolved in the driver
@@ -1223,4 +1878,183 @@ TEST(DriverArgumentSupply,
     EXPECT_GE(countBytes(img, "__addtf3"), 1u)
         << "the premise: the fixture must really mint an F128 softcall, or the "
            "library assertion above is about a binding nothing consulted";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// `statesCommons` — whether the merged module writes a tentative definition as
+// a COMMON (P69 fold 3b, D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED).
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The document's answer (`ObjectFormatSchema::statesCommons`) reaches the sole-CU
+// route through `CuMirModule`, and the merged route ONLY through the argument
+// `program.cpp` passes at its `lowerMergedToAssembly` call — whose default
+// (`false`) compiles, and builds: the merged object then carries `int v;` as a
+// zero-filled `.bss` DEFINITION, and a second object of the name (the
+// reference's, or DSS's own) is refused as a duplicate by every linker where the
+// references' commons fold into one object. So the pin reads the ARTIFACT: the
+// merged relocatable ELF object states the merged tentative definition as
+// `SHN_COMMON`, with its size and its alignment.
+namespace {
+
+struct ElfSymbolRecord {
+    std::uint16_t shndx = 0;
+    std::uint64_t value = 0;
+    std::uint64_t size  = 0;
+};
+
+// Every `.symtab` record named `name` in an ELF64 little-endian object (found by
+// section TYPE, its string table by `sh_link`); empty for anything else.
+[[nodiscard]] std::vector<ElfSymbolRecord> elfSymbolsNamed(std::vector<std::uint8_t> const& obj,
+                                                           std::string_view                 name) {
+    constexpr std::uint32_t kShtSymtab = 2;
+    constexpr std::size_t   kSymEntry  = 24;
+    std::vector<ElfSymbolRecord> out;
+    if (obj.size() < 0x40 || !(obj[0] == 0x7F && obj[1] == 'E' && obj[2] == 'L' && obj[3] == 'F' && obj[4] == 2
+                               && obj[5] == 1)) {
+        return out;
+    }
+    std::uint64_t const shoff     = rdU64(obj, 0x28);
+    std::uint16_t const shentsize = rdU16(obj, 0x3A);
+    std::uint16_t const shnum     = rdU16(obj, 0x3C);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::size_t const sh = static_cast<std::size_t>(shoff) + std::size_t{i} * shentsize;
+        if (rdU32(obj, sh + 4) != kShtSymtab) continue;
+        std::size_t const   symOff = static_cast<std::size_t>(rdU64(obj, sh + 0x18));
+        std::size_t const   symSz  = static_cast<std::size_t>(rdU64(obj, sh + 0x20));
+        std::uint32_t const link   = rdU32(obj, sh + 0x28);
+        std::size_t const   strSh  = static_cast<std::size_t>(shoff) + std::size_t{link} * shentsize;
+        std::size_t const   strOff = static_cast<std::size_t>(rdU64(obj, strSh + 0x18));
+        std::size_t const   strSz  = static_cast<std::size_t>(rdU64(obj, strSh + 0x20));
+        for (std::size_t e = 0; e + kSymEntry <= symSz; e += kSymEntry) {
+            std::size_t const at = symOff + e;
+            std::size_t const nm = rdU32(obj, at);
+            if (nm >= strSz || strOff + nm >= obj.size()) continue;
+            std::size_t end = strOff + nm;
+            while (end < obj.size() && end < strOff + strSz && obj[end] != 0) ++end;
+            std::string_view const sym{reinterpret_cast<char const*>(obj.data() + strOff + nm), end - (strOff + nm)};
+            if (sym != name) continue;
+            out.push_back(ElfSymbolRecord{rdU16(obj, at + 6), rdU64(obj, at + 8), rdU64(obj, at + 16)});
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesWhetherTheDocumentStatesCommons) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-states-commons"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "commons_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildMergedPair(scratch, "commons_a.c",
+                              "int dss_tentative_v;\n"
+                              "int *dss_tentative_a(void) { return &dss_tentative_v; }\n",
+                              "commons_b.c",
+                              "int dss_tentative_v;\n"
+                              "int *dss_tentative_b(void) { return &dss_tentative_v; }\n",
+                              "x86_64:elf64-x86_64-linux", out, rep),
+              0)
+        << "the 2-CU relocatable ELF build of one tentative definition in each unit must succeed; a red here "
+           "means the FIXTURE is broken, not the pin\n"
+        << allDiagnosticText(rep);
+
+    std::vector<fs::path> written;
+    for (auto const& e : fs::directory_iterator(out)) {
+        if (e.is_regular_file()) written.push_back(e.path());
+    }
+    ASSERT_EQ(written.size(), 1u) << "the merged route writes ONE relocatable object";
+    auto const obj = readAllBytes(written.front());
+    ASSERT_FALSE(obj.empty()) << "the merged relocatable object must exist";
+    constexpr std::uint16_t kShnCommon = 0xFFF2;
+    auto const records = elfSymbolsNamed(obj, "dss_tentative_v");
+    ASSERT_EQ(records.size(), 1u) << "the merge folds the two tentative definitions into ONE record";
+    EXPECT_EQ(records[0].shndx, kShnCommon)
+        << "the merged object must state the tentative definition as a COMMON (`SHN_COMMON`), as gcc -fcommon, "
+           "clang -fcommon, cl and Apple clang do; a section index here (" << records[0].shndx
+        << ") is the zero-filled `.bss` DEFINITION the merged route writes when `program.cpp` stops passing "
+           "the document's `statesCommons` — and every linker refuses it beside another object of the name";
+    EXPECT_EQ(records[0].value, 4u) << "an ELF common's `st_value` is its alignment";
+    EXPECT_EQ(records[0].size, 4u);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The FORMAT KIND — the one key an inline-asm template's address-part
+// operators are read under (`CuMirModule::assemblyFormatKind`; arm64's `@PAGE`
+// / `@PAGEOFF` on Mach-O, `:lo12:` on ELF). P69 fold 3b (lane `xa`): the sole-CU
+// route set it on its `CuMirModule` and the merged route passed `std::nullopt`
+// at its one call of `lowerMergedToAssembly` — the one field of the sole-CU
+// route's the merged route dropped (READ 2026-10-15, every other field
+// compared) — so a program of two sources was told "this build states no
+// object format to read it under", which is false of every build.
+// ✔MEASURED 2026-10-15 (Mac leg, both arms): the merged route said exactly
+// that, and the SOLE route refused the same text one step later — an inline-asm
+// template names no symbol of the embedding program at all today
+// (D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM; Apple clang
+// links the two sources to 42 under ld-1267 and `-ld_classic`). So the pin is
+// what both routes can be held to now: the SAME answer — the same exit code and
+// the same refusals, word for word — and neither says it has no object format.
+// Where both build (that row's fold), each image runs where the arm is the
+// host's own and reads the global (42).
+// ════════════════════════════════════════════════════════════════════════════
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheAssemblyFormatKind) {
+    struct Arm {
+        char const* label;
+        char const* spec;
+        char const* addressOf;   // the template: `%0` = the address of `dss_asm_g`, by its address parts
+    };
+    // Every error's code and words, in order: the answer a route gave, without the places it gave it at.
+    auto const answerOf = [](DiagnosticReporter const& rep) {
+        std::vector<std::string> said;
+        for (auto const& d : rep.all()) {
+            if (d.severity != dss::DiagnosticSeverity::Error) continue;
+            said.push_back(std::string{dss::diagnosticCodeName(d.code)} + ": " + d.actual);
+        }
+        return said;
+    };
+    for (Arm const& arm : {Arm{"Mach-O arm64", "arm64:macho64-arm64-darwin-exec",
+                               "adrp %0, _dss_asm_g@PAGE\\n\\tadd %0, %0, _dss_asm_g@PAGEOFF"},
+                           Arm{"ELF aarch64", "arm64:elf64-aarch64-linux-exec",
+                               "adrp %0, dss_asm_g\\n\\tadd %0, %0, :lo12:dss_asm_g"}}) {
+        SCOPED_TRACE(arm.label);
+        std::string const reader = std::string{"extern int dss_asm_g;\n"
+                                               "int dss_read_g(void) {\n"
+                                               "    int *p;\n"
+                                               "    __asm__(\""} + arm.addressOf + "\" : \"=r\"(p));\n"
+                                   "    return *p;\n"
+                                   "}\n";
+        std::string const entry = "int dss_asm_g = 42;\nint dss_read_g(void);\nint main(void) { return dss_read_g(); }\n";
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-asm-format-kind"};
+        scratch.useAsCwd();
+        bool const runsHere = dss::test_support::hostNativeTarget().execTarget == std::string_view{arm.spec};
+        // The merged route: two sources.
+        auto const         merged = scratch.path() / "merged_out";
+        DiagnosticReporter rep;
+        int const mergedRc = buildMergedPair(scratch, "asm_entry.c", entry, "asm_reader.c", reader, arm.spec, merged, rep);
+        // The sole-CU route: the same text in one source.
+        auto const         sole    = scratch.path() / "sole_out";
+        auto const         oneFile = writeSrc(scratch.path(), "asm_one.c", entry + reader);
+        DiagnosticReporter soleRep;
+        Program            prog;
+        prog.setOutputDir(sole);
+        int const soleRc = prog.compileUnits({oneFile.generic_string()}, "c", {std::string{arm.spec}}, soleRep);
+        for (auto const* said : {&rep, &soleRep}) {
+            EXPECT_EQ(allDiagnosticText(*said).find("states no object format"), std::string::npos)
+                << (said == &rep ? "the merged route" : "the sole-CU route")
+                << " read an address-part operator under NO object format — the merged route dropping the format "
+                   "kind its one call of `lowerMergedToAssembly` must pass\n"
+                << allDiagnosticText(*said);
+        }
+        EXPECT_EQ(mergedRc, soleRc) << "the two routes must give one program's text the same answer\nmerged:\n"
+                                    << allDiagnosticText(rep) << "\nsole:\n" << allDiagnosticText(soleRep);
+        EXPECT_EQ(answerOf(rep), answerOf(soleRep)) << "the same refusals, word for word";
+        if (!runsHere || mergedRc != 0 || soleRc != 0) continue;
+        for (fs::path const& dir : {merged, sole}) {
+            for (auto const& e : fs::directory_iterator(dir)) {
+                if (!e.is_regular_file()) continue;
+                auto const res = dss::test_support::runBinary(e.path(), dss::test_support::kRunBudget);
+                EXPECT_TRUE(res.spawned) << e.path() << ": " << res.diagnostic;
+                EXPECT_EQ(res.exitCode, 42) << e.path() << ": the asm reads the global through its address parts";
+            }
+        }
+    }
 }

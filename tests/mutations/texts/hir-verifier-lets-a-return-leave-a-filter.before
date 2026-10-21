@@ -1,0 +1,3 @@
+                if (slot == 1u) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             std::string{"'return' inside a __except filter expression"}

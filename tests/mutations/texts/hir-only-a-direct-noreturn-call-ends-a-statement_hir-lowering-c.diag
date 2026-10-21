@@ -1,0 +1,1 @@
+a call through a pointer DECLARED noreturn must terminate the tail

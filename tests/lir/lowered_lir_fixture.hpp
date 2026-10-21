@@ -219,10 +219,17 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
 // substrate) hands the pre-built schema in directly; the c →
 // HIR → MIR half of the pipeline is target-independent, so only the
 // MIR→LIR step consumes it.
+//
+// `longDoubleFormat`: the pair's `long double` axis, threaded into `analyze` as
+// `compile_pipeline.cpp` threads the active format's. The default (None) states
+// no axis, which is what every caller passed before P69 round 4; a source that
+// names `long double` states the axis it lowers on (x87-80 for an x86_64 ELF or
+// Mach-O pair).
 [[nodiscard]] inline LoweredLir
 lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
                   std::uint16_t mirCcIndex = 0,
-                  LoweringExpectation expect = LoweringExpectation::Lowers) {
+                  LoweringExpectation expect = LoweringExpectation::Lowers,
+                  LongDoubleFormat longDoubleFormat = LongDoubleFormat::None) {
     auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
@@ -256,7 +263,7 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // `analyze` takes it NON-OWNING.
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          DataModel::Lp64, std::nullopt, vaStrategy, std::nullopt,
-                         std::nullopt, LongDoubleFormat::None, target.get());
+                         std::nullopt, longDoubleFormat, target.get());
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
@@ -267,6 +274,8 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // const object's value folding — a lowering the product never does, and the FOURTH miss of
     // the class the note below records three times (TF-C78 / TF-C81 / TF-C92).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
     // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
     // variadic-callee (va_start/va_arg) source lowers through THIS fixture too

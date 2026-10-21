@@ -1,0 +1,1 @@
+            TypeId const promoted = bitFieldPromotedType(interner, fieldType, *width, *arith_);

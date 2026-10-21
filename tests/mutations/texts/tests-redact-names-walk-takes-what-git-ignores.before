@@ -1,0 +1,1 @@
+            for dirpath, dirs, files in _tree_ignores(tree, VOCAB_KEEP).walk():

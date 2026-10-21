@@ -1684,7 +1684,8 @@ TEST(TypeIdentityVocabulary, MalformedInactiveSignatureArmFailsOnEveryPair) {
 // could not tell a builtin refusal from the data-model one.
 TEST(TypeIdentityVocabulary, PerPairBuiltinSignatureSelectionIsExact) {
     auto const noChange = [](nlohmann::json&) {};
-    // The shipped row declares LP64 and LLP64 arms and no default: both select.
+    // The shipped row declares LP64, LLP64 and ILP32 arms and no default: LP64 and LLP64
+    // each select their own (ILP32 is refused by the analyzer on its own, see above).
     EXPECT_FALSE(analyzeWithBuiltins(noChange, kCasProbe, DataModel::Lp64).hasErrors());
     EXPECT_FALSE(analyzeWithBuiltins(noChange, kCasProbe, DataModel::Llp64).hasErrors());
     // One arm, for x87-80 alone, and no default.
@@ -1710,17 +1711,39 @@ TEST(TypeIdentityVocabulary, PerPairBuiltinSignatureSelectionIsExact) {
     EXPECT_FALSE(analyzeWithBuiltins(x87AndDefault, kCasProbe, DataModel::Lp64,
                                      LongDoubleFormat::F64).hasErrors())
         << "the default serves the pair no arm selects";
+    // Two arms that can select ONE pair are refused at LOAD, for every pair at once
+    // (P69 round 4, the review's NIT 14): whether two arms can co-match is a property of
+    // the arms, so it no longer waits for a pair both select — injection used to refuse
+    // this row on LP64 alone, and LLP64 loaded it clean.
     auto const withSecondLp64Arm = [](nlohmann::json& arr) {
         perPairBuiltin(arr)["signature"]["variants"].push_back(
             {{"when", {{"dataModel", "LP64"}}}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
     };
-    {
-        auto const m = analyzeWithBuiltins(withSecondLp64Arm, kCasProbe, DataModel::Lp64);
-        EXPECT_TRUE(m.hasErrors()) << "two arms select LP64";
-        EXPECT_TRUE(mentions(m, "2 'signature' variants match this pair"));
-    }
-    EXPECT_FALSE(analyzeWithBuiltins(withSecondLp64Arm, kCasProbe, DataModel::Llp64).hasErrors())
-        << "control: LLP64 still selects exactly one";
+    EXPECT_FALSE(builtinFunctionsLoad(withSecondLp64Arm))
+        << "two arms that can both select LP64 are refused where they are written";
+    // ... and an arm that names a key the others do not, but agrees with one of them on
+    // every key both name, is the case a pair missing that key could not see.
+    auto const withLp64X87Arm = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"when", {{"dataModel", "LP64"}, {"longDoubleFormat", "x87-80"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    };
+    EXPECT_FALSE(builtinFunctionsLoad(withLp64X87Arm))
+        << "an LP64 x87-80 arm beside the shipped LP64 arm can co-match with it";
+    // CONTROL: arms that AGREE on one key and DIFFER on another key both name are disjoint,
+    // and load. (The shipped row already uses all three data models — LP64, LLP64 and ILP32 —
+    // so an added data-model arm always co-matches one of them; ✔MEASURED, the first draft of
+    // this control added a second ILP32 arm and the rule refused it, correctly.)
+    auto const disjointOnASecondKey = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"] = nlohmann::json::array({
+            {{"when", {{"dataModel", "LP64"}, {"longDoubleFormat", "x87-80"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}},
+            {{"when", {{"dataModel", "LP64"}, {"longDoubleFormat", "f64"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}},
+            {{"when", {{"dataModel", "LLP64"}}}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}}});
+    };
+    EXPECT_TRUE(builtinFunctionsLoad(disjointOnASecondKey))
+        << "arms differing on a key both name can never match one pair: no ambiguity";
 }
 
 // The long-double format selects too — the axis S2a-1 added, observed through

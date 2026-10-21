@@ -1,0 +1,14 @@
+                                    bool const owns = out.effect == owner;
+                                    if (!row.contains(key)) {
+                                        if (owns) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics,
+                                                rowPath + "/" + key,
+                                                std::format(
+                                                    "'{}' is REQUIRED on an 'effects' "
+                                                    "row whose effect is '{}' — {}",
+                                                    key, verb, whatFor));
+                                        }
+                                        return;
+                                    }
+                                    if (false && !owns) {

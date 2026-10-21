@@ -2671,6 +2671,43 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  relocFormulaName(r.formulaKind)));
             }
         }
+        // Rule (h) — P69 fold 3c: a Linear row narrower than 8 bytes STATES the
+        // values its field holds (`fieldRange`), and no other row states one.
+        // The range is the wire type's (R_X86_64_32 zero-extends, R_X86_64_32S
+        // sign-extends, COFF's ADDR32 says neither), so it is never inferred
+        // from the width, and never supplied by default: until this rule every
+        // narrow field was checked SIGNED, which linked -1 into an
+        // R_X86_64_32 field that `movl` reads back as 2^32 - 1. A row with no
+        // width declares no field and is refused at apply (D-LK6-1), so it
+        // states no range either.
+        {
+            bool const narrowLinear = r.formulaKind == RelocFormulaKind::Linear
+                                   && r.widthBytes != 0 && r.widthBytes < 8;
+            if (narrowLinear && !r.fieldRange.has_value()) {
+                fail(std::format("/relocations/{}", i),
+                     std::format("relocation '{}': a Linear field of {} bytes "
+                                 "must state 'fieldRange' -- 'signed' (it is "
+                                 "read back sign-extended), 'unsigned' (zero-"
+                                 "extended) or 'either' (the wire type does not "
+                                 "say) -- because the values it holds are the "
+                                 "wire type's, not the width's.",
+                                 r.name, r.widthBytes));
+            }
+            if (!narrowLinear && r.fieldRange.has_value()) {
+                fail(std::format("/relocations/{}/fieldRange", i),
+                     std::format("relocation '{}': 'fieldRange' states the "
+                                 "values a Linear field narrower than 8 bytes "
+                                 "holds, and this row is {} -- a range nothing "
+                                 "reads.",
+                                 r.name,
+                                 r.formulaKind != RelocFormulaKind::Linear
+                                     ? std::format("formula '{}', whose field "
+                                                   "geometry is the formula's own",
+                                                   relocFormulaName(r.formulaKind))
+                                     : std::format("{} bytes wide",
+                                                   r.widthBytes)));
+            }
+        }
         // Rule (g) — P68 round 11: a GOT-slot-relative row NAMES the direct
         // row it lowers into, and that row applies the same arithmetic to the
         // slot (`gotSlotTwinMismatch`, the one owner of the rule). A row that
@@ -2724,6 +2761,46 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              r.name,
                              relocFormulaName(RelocFormulaKind::Aarch64LdstAbsLo12),
                              relocFormulaName(r.formulaKind)));
+        }
+    }
+
+    // Rule (i) — P69 fold 3c: AT MOST ONE ROW FILLS AN ADDRESS SLOT OF EACH
+    // WIDTH. A `.long sym`, a pointer, an import slot and a symbol-address
+    // global are each written through the row `addressSlotRelocationKind`
+    // picks — Linear, absolute, neither thread-local nor image-relative, of the
+    // range that holds every address. Two rows the rule picks equally are a
+    // document that does not say which kind such a word is written as, and
+    // every one of those callers would answer nothing; so the document is
+    // refused here, before any of them, naming the rows. (A width with NO such
+    // row is no fault of the document: a slot of it is refused where one is
+    // needed, by name.)
+    {
+        std::vector<std::uint8_t> widths;
+        for (auto const& r : relocations) {
+            if (r.widthBytes != 0
+                && std::find(widths.begin(), widths.end(), r.widthBytes) == widths.end()) {
+                widths.push_back(r.widthBytes);
+            }
+        }
+        std::sort(widths.begin(), widths.end());
+        for (std::uint8_t const width : widths) {
+            auto const chosen = addressSlotCandidates(relocations, width);
+            if (chosen.size() < 2) continue;
+            std::string names;
+            for (auto const* r : chosen) {
+                names += (names.empty() ? "'" : ", '") + r->name + "'";
+            }
+            fail("/relocations",
+                 std::format("target '{}': {} relocations fill a {}-byte address slot "
+                             "equally ({}) -- each is Linear, absolute, neither "
+                             "thread-local nor image-relative, and {} -- so nothing "
+                             "says which kind a word holding an address of that width "
+                             "is written as. One row is that slot; give each other the "
+                             "range its wire type holds.",
+                             name, chosen.size(), width, names,
+                             width >= 8 ? std::string{"8 bytes wide"}
+                                        : std::format("of the '{}' range",
+                                              kRelocFieldRangeTable.name(*chosen.front()->fieldRange))));
         }
     }
 
@@ -3372,19 +3449,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                               || !cc.callerSaved.empty() || !cc.calleeSaved.empty()
                               || cc.shadowSpaceBytes != 0 || cc.redZoneBytes != 0
                               || cc.stackAlignment   != 0
-                              // D-LK10-ENTRY-TRAMP-PROLOGUE: a cc
-                              // declaring ONLY entryStackPointerBias
-                              // (with all other ABI fields zeroed)
-                              // would otherwise silently bypass the
-                              // `< stackAlignment` check below
-                              // (type-design C1 at the standing
-                              // audit). Include it in the trigger.
-                              || cc.entryStackPointerBias != 0
-                              // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY:
-                              // same protection for the new
-                              // callPushBytes field (a cc declaring
-                              // only callPushBytes would bypass the
-                              // multiple-of-alignment check below).
+                              // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: a cc
+                              // declaring ONLY callPushBytes (with all
+                              // other ABI fields zeroed) would otherwise
+                              // silently bypass the `< stackAlignment`
+                              // check below (type-design C1 at the
+                              // standing audit). Include it in the trigger.
                               || cc.callPushBytes != 0
                               // D-WIN64-LARGE-FRAME-STACK-PROBE: same
                               // protection for stackProbePageBytes (a cc
@@ -3404,6 +3474,37 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                      std::format("callingConvention '{}': stackProbePageBytes ({}) must be a power of two",
                                  cc.name, cc.stackProbePageBytes));
             }
+            // D-CSUBSET-VLA-WIN64-STACK-PROBE: a guard page has to HOLD what one
+            // step reaches below the stack pointer, or no touch can keep the stack
+            // on it, whatever the program (the FOOTING note in lir_callconv.cpp).
+            // One step is what one call pushes (`callPushBytes`) or one probe touch
+            // — a word of this convention's own stack pointer, the `widthBytes` of
+            // the register `stackPointer` names, which is the row the
+            // calling-convention pass reads for the width it touches with. A
+            // convention whose page is smaller than either can never be probed, so
+            // it does not load.
+            if (cc.stackProbePageBytes != 0) {
+                if (cc.callPushBytes > cc.stackProbePageBytes) {
+                    fail(std::format("/callingConventions/{}/stackProbePageBytes", i),
+                         std::format("callingConvention '{}': stackProbePageBytes ({}) is smaller "
+                                     "than callPushBytes ({}) — one call would push past the "
+                                     "guard page, which no probe touch can prevent",
+                                     cc.name, cc.stackProbePageBytes, cc.callPushBytes));
+                }
+                if (cc.stackPointer.has_value()) {
+                    if (auto const sp = registerIndex.find(cc.stackPointer->name);
+                        sp != registerIndex.end()
+                        && registers[sp->second].widthBytes > cc.stackProbePageBytes) {
+                        fail(std::format("/callingConventions/{}/stackProbePageBytes", i),
+                             std::format("callingConvention '{}': stackProbePageBytes ({}) is smaller "
+                                         "than one probe touch, a word of its stackPointer '{}' ({} "
+                                         "bytes, /registers/{}/widthBytes) — a page that cannot hold "
+                                         "one touch cannot be probed",
+                                         cc.name, cc.stackProbePageBytes, cc.stackPointer->name,
+                                         registers[sp->second].widthBytes, sp->second));
+                    }
+                }
+            }
             if (!isPow2Nonzero(cc.stackAlignment)) {
                 fail(std::format("/callingConventions/{}/stackAlignment", i),
                      std::format("callingConvention '{}': stackAlignment ({}) must be a non-zero power of two",
@@ -3421,25 +3522,14 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                          std::format("callingConvention '{}': redZoneBytes ({}) must be a multiple of stackAlignment ({})",
                                      cc.name, cc.redZoneBytes, cc.stackAlignment));
                 }
-                // D-LK10-ENTRY-TRAMP-PROLOGUE: entryStackPointerBias
-                // is an offset INTO the alignment quantum, NOT a
-                // multiple of it — must be strictly < stackAlignment.
-                if (cc.entryStackPointerBias >= cc.stackAlignment) {
-                    fail(std::format(
-                             "/callingConventions/{}/entryStackPointerBias", i),
-                         std::format(
-                             "callingConvention '{}': entryStackPointerBias "
-                             "({}) must be < stackAlignment ({}) — bias "
-                             "is an offset INTO the alignment quantum",
-                             cc.name, cc.entryStackPointerBias,
-                             cc.stackAlignment));
-                }
-                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: callPushBytes is
-                // ALSO an offset INTO the alignment quantum (the
-                // CALL instruction's RSP delta is bounded by the
+                // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: callPushBytes is an
+                // offset INTO the alignment quantum, NOT a multiple of it
+                // (the CALL instruction's RSP delta is bounded by the
                 // architecture's pointer width, which divides
-                // stackAlignment). Strict-less-than matches
-                // entryStackPointerBias's invariant.
+                // stackAlignment) — and the entry trampoline's derived
+                // process-entry bias of a CALLED entry IS this value
+                // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION),
+                // so one strict-less-than check covers both uses.
                 if (cc.callPushBytes >= cc.stackAlignment) {
                     fail(std::format(
                              "/callingConventions/{}/callPushBytes", i),

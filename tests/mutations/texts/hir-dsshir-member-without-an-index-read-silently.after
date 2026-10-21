@@ -1,0 +1,2 @@
+                    std::string const got = lex_.peek().text;
+                    if (/*S2g*/ got.size() > got.size()) malformed(got.empty()

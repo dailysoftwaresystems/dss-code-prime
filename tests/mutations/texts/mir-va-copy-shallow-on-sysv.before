@@ -1,0 +1,4 @@
+            if (interner.kind(objTy) == TypeKind::Ptr) {
+                auto const ops = interner.operands(objTy);
+                if (ops.empty()) {
+                    unsupported(node, "va_copy: a pointer va_list with no pointee");

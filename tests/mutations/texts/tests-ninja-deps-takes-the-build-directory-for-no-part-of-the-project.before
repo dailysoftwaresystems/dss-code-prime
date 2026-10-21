@@ -1,0 +1,1 @@
+    project = [_key(build_dir, ".")] + ([evidence["home"]] if evidence["home"] else [])

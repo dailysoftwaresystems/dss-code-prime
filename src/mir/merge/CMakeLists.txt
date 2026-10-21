@@ -7,7 +7,6 @@ add_library(mir_merge OBJECT
     mir_merge.cpp
     synth_pe_startup.cpp
     synth_seh_funclets.cpp
-    synth_stdio_shim.cpp
     synth_threads_shim.cpp
 )
 

@@ -1,0 +1,3 @@
+        if (at == combined.functions.end()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                   "linked unit #" + std::to_string(i) + " states its function index " +

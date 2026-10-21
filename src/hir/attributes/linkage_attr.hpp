@@ -28,6 +28,21 @@ namespace dss {
 
 struct LinkageAttr {
     SymbolBinding    binding    = SymbolBinding::Global;
+    // ★★ P69 (lane `cs`) — WHICH KIND OF WEAK DEFINITION, read ONLY when `binding`
+    // is `Weak`: a default any other definition of the name replaces
+    // (`Overridable` — `__attribute__((weak))`, `#pragma weak`), or one of several
+    // interchangeable copies of which the link keeps one (`SelectAny` —
+    // `selectany` in either spelling). A second axis beside the binding, never a
+    // fourth binding value (`core/types/symbol_attrs.hpp`).
+    //
+    // The value-initialized state is NEITHER enumerator, on purpose: it is what an
+    // attribute holds when its binding is not weak, and what a weak one would hold
+    // if a producer forgot to say — and `HirVerifier` refuses exactly that, a weak
+    // linkage attribute that names no kind. The one producer in this tier is the
+    // specifier fold (`linkageFrom`), which copies the kind from the language
+    // document's `linkageSpecifiers` entry; the loader requires the key beside
+    // every weak binding, so the fold always has it.
+    WeakDefinitionKind weakKind{};
     SymbolVisibility visibility = SymbolVisibility::Default;
     // ★★ FOLD-SCRATCH, NOT A RECORDED FACT (TF-C93,
     // D-CSUBSET-LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS, visibility half).
@@ -78,6 +93,22 @@ struct LinkageAttr {
     // Empty ⇒ an ordinary function, so the side-table stays sparse in the sense
     // `recordLinkage` means: absence is the correct default.
     StaticInitSchedule staticInit{};
+    // ★★ P69 (lane `cs`) — THIS GLOBAL IS A TENTATIVE DEFINITION THE UNIT NEVER
+    // COMPLETED (C 6.9.2p2: a file-scope object declared without an initializer
+    // and without `extern`, for which the unit holds no definition with one). The
+    // semantic tier knows it (`SymbolRecord::isTentativeDefinition`); below this
+    // tier nothing could tell `int x;` from `int x = 0;`, both are a zero-filled
+    // definition — so two units each holding `int x;` were refused as two strong
+    // definitions where the references link them (a common on the formats that
+    // have one). Carried here so the merge can fold two of them and a relocatable
+    // can write a common.
+    //
+    // It rides this side-table for the reason `staticInit` does: it is a fact
+    // about how the declaration takes part in the IMAGE, the map is already
+    // threaded to HIR→MIR, and a new map would land with nothing passing it.
+    // False ⇒ an ordinary definition (or not a definition at all), so the table
+    // stays sparse.
+    bool tentative = false;
 };
 
 } // namespace dss

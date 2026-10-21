@@ -1,0 +1,2 @@
+                auto const member = memberOffsetIn(s, bt, tree.text(nameTok));
+                if (true || !member.found()) return std::nullopt;

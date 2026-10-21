@@ -1,0 +1,6 @@
+    {
+      "$comment": "P69 fold 3c (D-LK-RELOCATION-TYPES-REFERENCE-COMPILERS-EMIT-FOR-C-UNDECLARED): absolute 32-bit, SIGN-extended. ELF type R_X86_64_32S = 11. `kind` = 13 matches x86_64.target.json's `abs32s` row (its field holds [-2^31, 2^31), as GNU ld 2.42 links it). gcc and clang write it for every -fno-pic `movq $sym, %rax` and `sym(,%reg,n)` operand (MEASURED 2026-10-20, the class census).",
+      "name": "R_X86_64_32S",
+      "kind": 13,
+      "nativeId": 11
+    },

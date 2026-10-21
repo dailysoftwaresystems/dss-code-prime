@@ -73,9 +73,11 @@
 #include <limits>
 #include <map>          // std::map (the realization pass's ORDERED name set)
 #include <optional>
+#include <set>          // P69: the library binder's reported-use set
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -268,8 +270,16 @@ struct EngineState {
           nodeToSelectedExpr{cu},
           nodeToFoldedConstant{cu},
           nullPointerConstantNodes{cu},
+          compoundLiteralFacts{cu},
+          constantSubobjects{cu},
+          nanPayloads{cu},
+          overflowPredicateTargets{cu},
+          braceElementValueTypes{cu},
+          conditionalTypes{cu},
+          attributeNamesIgnoredForKind{cu},
           deprecatedTypeUseWarned{cu},
-          typedefNamedByToken{cu} {}
+          typedefNamedByToken{cu},
+          typeofClaimByNode{cu} {}
 
     DiagnosticReporter         reporter;
     TypeLattice                lattice;
@@ -416,6 +426,33 @@ struct EngineState {
     // unrelated expression replaced by Literal 0). UnitAttribute routes per-tree,
     // exactly like nodeToType/nodeToSymbol.
     UnitAttribute<bool>        nullPointerConstantNodes;
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): per compound
+    // literal node, its OBJECT facts (`CompoundLiteralFacts`) — recorded where Pass 2 types
+    // the literal, moved into the model for the HIR lowering. Tree-keyed, as above.
+    UnitAttribute<CompoundLiteralFacts> compoundLiteralFacts;
+    // P69 (C23 6.6p6-p7): every constant subobject Pass 2 met — a compound literal
+    // constant, a constant's `.member` — as `resolveConstantSubobject` resolved it, for
+    // the CST→HIR tier's own constant evaluator (see `ConstantSubobjectFact`).
+    UnitAttribute<ConstantSubobjectFact> constantSubobjects;
+    // P69 (lane `cs`): every folded `quiet_nan` builtin call's payload (`NanPayload`).
+    UnitAttribute<NanPayload> nanPayloads;
+    // P69 (lane `cs`): every `__builtin_*_overflow_p` call's cast target (see the model's
+    // `overflowPredicateTargetFor`).
+    UnitAttribute<TypeId> overflowPredicateTargets;
+    // P69 (lane `lm`): the type this tier derived for the VALUE of a brace element, keyed
+    // by the value's node under its grouping — written where the placement cursor's
+    // "does it initialize the subobject whole" is answered (`braceValueInitializesWhole`),
+    // moved into the model for the HIR lowering, which asks the cursor the same question
+    // (see the model's `braceElementValueTypeFor`).
+    UnitAttribute<TypeId> braceElementValueTypes;
+    // P69 (lane `lm`): the type Pass 2 gave each conditional expression it typed (C
+    // 6.5.15p5) — moved into the model for the HIR lowering's constant evaluator, which
+    // converts a folded conditional's selected arm to it (see the model's
+    // `conditionalTypeFor`).
+    UnitAttribute<TypeId> conditionalTypes;
+    // P69 (lane `cs`): the NAME token of every attribute clause the declaration-kind
+    // gate ignored (see the model's `attributeNameIgnoredForKind`).
+    UnitAttribute<bool> attributeNamesIgnoredForKind;
     // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES): the ONCE-PER-NODE LATCH for
     // the deprecated-TYPEDEF use warning emitted by `resolveTypeNodeImpl`'s alias
     // arm. Type-position resolution is NOT once-per-use, and this is ✔MEASURED
@@ -450,6 +487,18 @@ struct EngineState {
     // two qualifiers are not interned, so the TypeId the arm returns cannot carry
     // them. TREE-KEYED like its neighbours. Purely internal.
     UnitAttribute<SymbolId>    typedefNamedByToken;
+    // P69 (lane `cs`, D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS): the `const` / `restrict`
+    // claim a `typeof` SPECIFIER node carries — its operand's (C23 6.7.3.6), the top level
+    // dropped for `typeof_unqual` — written by the type resolver's typeof arm when it
+    // resolves the node and read through `HeadTypedefs` exactly as a typedef's claim is.
+    // TREE-KEYED like its neighbours. Purely internal.
+    UnitAttribute<QualifierSpine> typeofClaimByNode;
+    // P69 (lane `cs`, D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): a
+    // FUNCTION typedef's own function claim (result + parameters,
+    // `harvestFunctionQualification` on its record at its Pass-1.5 visit), by the
+    // typedef's SymbolId.v; read through `HeadTypedefs`. Purely internal.
+    std::unordered_map<std::uint32_t, std::shared_ptr<DeclaredQualification const>>
+        fnTypedefClaims;
     // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
     // the active format's width triple). Read by `buildIndexes` (the
     // `coreByDataModel` overrides), the integer-literal ladder, and the
@@ -537,6 +586,57 @@ struct EngineState {
     // direct-API tests) ⇒ a `char` const-fold REFUSES rather than picking a sign;
     // only code units above 0x7F can tell the two answers apart.
     std::optional<bool> charIsUnsigned;
+    // P69 round 4 (lane `cs`): the NAME of the pair's calling convention
+    // (`analyze()`'s parameter — the target document's `callingConventions` row the
+    // format selects). What an attribute that names a convention is judged against
+    // (`judgeAttributeSpecifier`). `nullopt` ⇒ no pair in scope ⇒ such an
+    // attribute is refused by name, never accepted on a guess.
+    std::optional<std::string> activeCallingConvention;
+    // P69 (lane `cs`): the active format's reason to refuse a symbol alias
+    // (`analyze()`'s parameter, read off the format document's
+    // `symbolAliasUnsupportedReason`). Present ⇒ the `alias` attribute is refused
+    // by name with the reason's sentence; `nullopt` ⇒ an alias is built.
+    std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported;
+    // P69 (lane `cs`): whether the active format's document states commons
+    // (`analyze()`'s parameter). False ⇒ the `common` attribute is refused by name.
+    bool formatStatesCommons = true;
+    // P69 (lane `cs`): every file-scope declaration that wrote an `alias("target")`
+    // its declarator could keep, in source order — the declarator's own symbol (the
+    // survivor of its redeclaration merge or an absorbed record of it), the target's
+    // SYMBOL name, and where to say what is wrong. Resolved once, at the end of the
+    // unit (`resolveSymbolAliases`), where every definition of the unit is known.
+    struct PendingSymbolAlias {
+        SymbolId    declared{};
+        std::string target;
+        NodeId      clauseNode{};
+        NodeId      nameNode{};
+        TreeId      tree{};
+        // The alias declaration wrote an initializer of its own (warned ignored
+        // where it is written `extern`, refused at the end of the unit otherwise).
+        bool        wroteInitializer = false;
+        // The alias declaration is written `extern` — read off its specifiers, not
+        // off the record, whose non-defining fact an initializer overrides.
+        bool        writtenExtern = false;
+    };
+    std::vector<PendingSymbolAlias> pendingSymbolAliases;
+    // P69 (lane `cs`): the records whose declaration wrote `common` — read only to
+    // refuse an alias of such a variable no declaration initializes (every reference
+    // refuses one; an initialized one is no common and may be aliased). A set of the
+    // analyzer's own, not a fact of the model: what `common` means is the format
+    // document's, and nothing below this tier asks.
+    std::unordered_set<std::uint32_t> symbolsWritingCommon;
+    // P69 (lane `cs`): the attribute clauses whose refusal or warning was already
+    // given — a declaration-level clause is copied into every declarator's facts, and
+    // one clause draws one report.
+    std::unordered_set<std::uint64_t> attributeClausesReported;
+    // P69 round 4 (lane `cs`): the attribute SPECIFIER nodes a declaration's own
+    // fold has already judged (`scanAttributeSemantics` with `emitUnknown` — the
+    // once-per-declaration, diagnostic-owning scan), keyed (TreeId.v << 32) |
+    // NodeId.v. Pass 2 visits every attribute specifier in the tree once and gives
+    // the ones NOT in this set their positional reading (a type name, a pointer
+    // layer, a parenthesized declarator), so no specifier is judged twice and none
+    // is judged by nobody.
+    std::unordered_set<std::uint64_t> attrSpecifiersJudgedByADeclaration;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -545,6 +645,23 @@ struct EngineState {
     // type. A `return` statement walks its scope parent chain to find the
     // nearest enclosing function result type for assignability checking.
     std::unordered_map<std::uint32_t /*ScopeId.v*/, TypeId> fnResultByScope;
+    // P69 (lane `cs`): the same scope → the function's SYMBOL, so a `return` reads the
+    // qualifier spine its declaration claims for the result (the TypeId above carries
+    // no `const` — `reportQualifierIncompatiblePointer`). Written beside it.
+    std::unordered_map<std::uint32_t /*ScopeId.v*/, SymbolId> fnSymbolByScope;
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the LIBRARY
+    // function a translation unit's `__builtin_<name>` (or a builtin's `libraryFallback`)
+    // calls — the function the tree itself declares under that name at file scope, else
+    // the platform's realization minted import-only. Installed by `analyze` for Pass 2,
+    // where it owns the realization context (the shipped-descriptor corpus, the pair's
+    // facts, the extern list the CST→HIR tier imports from); `at` is where a refusal lands.
+    // Empty outside Pass 2: a library builtin is then simply undeclared.
+    std::function<SymbolId(Tree const& tree, std::string_view libraryName, NodeId at)>
+        resolveLibraryFunction;
+    // The answer per (tree, library name), so every use in a tree binds one symbol. Invalid
+    // = refused — and a refusal is still reported at EVERY use (P69 review n12): only the
+    // answer and its reason are computed once.
+    std::map<std::pair<std::uint32_t /*TreeId.v*/, std::string>, SymbolId> libraryFunctionByTree;
     // SE7 reverse use-index: SymbolId.v → its use-site NodeIds.
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol;
     // P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the VALUE
@@ -564,6 +681,16 @@ struct EngineState {
     // structural signature equality) and emits S_IncompatibleRedeclaration on a
     // mismatch. Built in Pass 1, consumed once after Pass 1.5 (before Pass 2).
     std::vector<std::pair<SymbolId, SymbolId>> mergedFnDecls;
+    // P69 (lane `cs`): the same merges read both ways — each record → the records
+    // Pass 1 merged it with. Built once before Pass 1.5, from `mergedFnDecls`, for
+    // the composite an array redeclaration takes at the declaration that completes
+    // it (`composeArrayRedeclaration`).
+    std::unordered_map<std::uint32_t /*SymbolId.v*/, std::vector<SymbolId>>
+        redeclarationPartners;
+    // P69 (lane `cs`): the type each such record's OWN declaration wrote, kept when
+    // Pass 1.5 resolves it — `composeArrayRedeclaration` then gives every record of
+    // the merge the composite, and `typeVisibleAt` needs what each one said alone.
+    std::unordered_map<std::uint32_t /*SymbolId.v*/, TypeId> ownDeclaredType;
 
     // Select the index bundle for `schema` before processing one of its trees.
     void activate(GrammarSchema const& schema) {
@@ -1125,6 +1252,16 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
+[[nodiscard]] std::optional<std::uint32_t>
+semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const& tree,
+                           NodeId n, ScopeId scope, TypeId* fieldTypeOut = nullptr);
+[[nodiscard]] bool nodeIsASelection(SemanticConfig const& sem, Tree const& tree, NodeId n);
+[[nodiscard]] NodeId selectionResultOf(EngineState& s, SemanticConfig const& sem,
+                                       Tree const& tree, NodeId sel, ScopeId scope);
+void forEachPlacedBraceValue(EngineState& s, Tree const& tree, NodeId braceList, TypeId object,
+                             ScopeId scope,
+                             std::function<void(NodeId value, TypeId slot)> const& onValue,
+                             std::function<void(NodeId element)> const& onScalarDesignator);
 // C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION / -GENERIC-RESULT-TYPE-DEDUCTION):
 // the ONE generic-selection chokepoint. Given a `_Generic` node and its ALREADY-
 // COMPUTED controlling type, decide which association WINS from the typed/
@@ -1306,6 +1443,87 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
 [[nodiscard]] bool isLiteralIntegerZero(EngineState const& s, Tree const& tree,
                                         NodeId node);
 
+// ★★ P69 round 4 (lane `cs`) — THE ATTRIBUTE-BLIND READERS OF A TYPE-BEARING SHAPE.
+//
+// An attribute written among a type's specifiers, in a pointer layer, inside a
+// parenthesized declarator, in a type name or after a referenced tag is NOT part of
+// the type it decorates. Three kinds of reader used to find their answer inside one:
+//   * a MARKER SCAN (`subtreeContainsToken`, `findTokenInSubtree`) — an attribute's
+//     clause name may be spelled with a keyword token (`__attribute__((const))`,
+//     `((volatile))`), which the scan would read as the qualifier;
+//   * the LAST-IDENTIFIER name match (`extractNameNode`) — ✔MEASURED: `struct S
+//     __attribute__((aligned(16))) w;` looked up a tag named `aligned`, and with a
+//     `struct aligned { char c[64]; };` in the unit `sizeof w` was 64, silently;
+//   * a POSITIONAL reader — "the children of this run are all specifier tokens",
+//     "the first child that resolves is the base".
+// The two predicates below are what all three ask; the ROLE is the language
+// document's (`isAttributeSpecifierRule` / `isAttributeRunRule`,
+// core/types/semantic_config.hpp), read off the tree's own schema so no reader has
+// to be handed it — and so no reader can forget to pass it. A hand-built tree with
+// no schema has no attribute rules: nothing is opaque, exactly as before.
+[[nodiscard]] bool isAttributeSpecifierNode(Tree const& tree, NodeId node) {
+    return node.valid() && tree.kind(node) == NodeKind::Internal && tree.hasSchema()
+        && isAttributeSpecifierRule(tree.schema().semantics(), tree.rule(node));
+}
+[[nodiscard]] bool isAttributeRunNode(Tree const& tree, NodeId node) {
+    return node.valid() && tree.kind(node) == NodeKind::Internal && tree.hasSchema()
+        && isAttributeRunRule(tree.schema().semantics(), tree.rule(node));
+}
+
+// THE ONE POSITIONAL ACCESSOR: a type-bearing shape's visible children WITHOUT its
+// attribute runs. Every reader that counts, indexes or classifies the children of a
+// specifier run or of a type name goes through one of the two named entry points
+// below — never through `visibleChildren` — so an attribute run is invisible to
+// both by construction. They are two names over one filter ON PURPOSE: the filter
+// is the rule, the names say which shape's reader is asking (and give each shape
+// its own red-on-disable).
+//
+// ⓘ THE OTHER TWO SHAPES AN ATTRIBUTE RUN NOW SITS IN NEED NO ENTRY POINT HERE, AND
+// THAT IS A PROPERTY OF THEIR READERS, CHECKED (scope: every use of
+// `declarators.pointerLayerRule` and `declarators.groupRule` in this file and in
+// core/types/declarator_walk.hpp). A PARENTHESIZED DECLARATOR is read only through
+// `declarator_walk_detail::firstChildOfRule(…, group, declaratorRule)` — a child
+// found BY RULE, never by position — and a POINTER LAYER only by marker scans
+// (`subtreeContainsToken`), which are opaque to an attribute specifier below.
+[[nodiscard]] std::vector<NodeId>
+childrenWithoutAttributeRuns(Tree const& tree, NodeId parent) {
+    std::vector<NodeId> out;
+    for (auto const& child : tree.children(parent)) {
+        if (isEmptySpace(tree.flags(child))) continue;
+        if (isAttributeRunNode(tree, child)) continue;
+        out.push_back(child);
+    }
+    return out;
+}
+// A run of type specifiers (`unsigned __attribute__((…)) long`).
+[[nodiscard]] std::vector<NodeId> specifierRunChildren(Tree const& tree, NodeId run) {
+    return childrenWithoutAttributeRuns(tree, run);
+}
+// A type name, or any node the type resolver walks for "the child that is the type".
+[[nodiscard]] std::vector<NodeId> typeNameChildren(Tree const& tree, NodeId typeNode) {
+    return childrenWithoutAttributeRuns(tree, typeNode);
+}
+// THE OTHER HALF OF THAT FILTER: the attribute SPECIFIER children of one shape node
+// — a type name, a pointer layer, a parenthesized declarator — in source order.
+// Direct children only, so a type name yields the specifiers written in ITS list
+// and never those of a pointer layer or of a declarator nested in it; each of those
+// positions decorates a different type and is asked separately. `only`, when
+// valid, keeps one spelling (the two spellings of one position can decorate
+// different types: in a type name a GNU specifier is the whole named type's and a
+// C23 one, which ends the specifier list, is the base type's).
+[[nodiscard]] std::vector<NodeId>
+directAttributeSpecifiers(Tree const& tree, NodeId shape, RuleId only = {}) {
+    std::vector<NodeId> out;
+    if (!shape.valid() || tree.kind(shape) != NodeKind::Internal) return out;
+    for (auto const& child : tree.children(shape)) {
+        if (isEmptySpace(tree.flags(child))) continue;
+        if (!isAttributeSpecifierNode(tree, child)) continue;
+        if (only.valid() && tree.rule(child).v != only.v) continue;
+        out.push_back(child);
+    }
+    return out;
+}
+
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree,
 // stopping descent at any NESTED declaration-rule node (other than the
 // root `node` itself). Used by SE4 const-marker detection (walk a decl's
@@ -1353,6 +1571,15 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
         bool stop = false;
         if (tree.kind(cur) == NodeKind::Internal) {
             std::uint32_t const rv = tree.rule(cur).v;
+            // ★ P69 round 4: an ATTRIBUTE SPECIFIER is opaque ALWAYS, the root
+            // included — a keyword-spelled clause name (`__attribute__((const))`,
+            // `((volatile))`) is not the qualifier, and no caller of this scan is
+            // asking about the inside of an attribute (see
+            // `isAttributeSpecifierNode`).
+            if (isAttributeSpecifierNode(tree, cur)) {
+                firstPop = false;
+                continue;
+            }
             // Opaque rules (typeof operands) stop descent ALWAYS — even at the
             // root (firstPop) — so a stripped-then-re-scanned qualifier can never
             // leak back out of a typeof operand.
@@ -1524,7 +1751,15 @@ struct TypedefQualification {
     // The type it denotes — the SHAPE of its levels (which are arrays, whether it
     // is a function type), which the spine's bits do not record.
     TypeId type{};
+    // P69 (D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): for a FUNCTION
+    // typedef, its own function claim — result and parameters (`fnTypedefClaims`). The
+    // Fn level a declaration or type name DERIVING from it gets back (`insertFnLevel`)
+    // carries it, and a function declared THROUGH it (`F h;`) takes its parameters.
+    std::shared_ptr<DeclaredQualification const> fnClaim{};
 };
+
+// Move a spine `by` levels (defined, and explained, with the expression spine below).
+[[nodiscard]] bool shiftQualifierSpine(QualifierSpine& sp, int by);
 
 // Which typedef a declaration head names, as the type resolver recorded it, and
 // that typedef's claim. Reads only; built on the spot by each consumer. The
@@ -1534,18 +1769,107 @@ struct HeadTypedefs {
     UnitAttribute<SymbolId> const& byToken;
     SymbolTable const&             symbols;
     TypeInterner const&            in;
+    // ★ P69 (lane `cs`, D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS): a `typeof` head is a
+    // head naming a type exactly as a typedef name is — C23 6.7.3.6 makes it its
+    // operand's type, qualifiers and all — so it answers here, with the claim the type
+    // resolver recorded on the specifier node (`typeofClaimByNode`) and the type it
+    // stamped there. Null ⇒ this reader was built without them and a typeof head makes
+    // no claim (the pre-P69 answer).
+    UnitAttribute<QualifierSpine> const* typeofClaims = nullptr;
+    UnitAttribute<TypeId> const*         nodeTypes    = nullptr;
+    // P69: a function typedef's recorded function claim, by the typedef's SymbolId.v.
+    std::unordered_map<std::uint32_t, std::shared_ptr<DeclaredQualification const>> const*
+        fnClaims = nullptr;
 
     [[nodiscard]] std::optional<TypedefQualification>
     of(Tree const& tree, NodeId head) const {
         NodeId const tok = headTypeNameToken(
             tree, head, tree.schema().semantics().identifierToken);
-        if (!tok.valid()) return std::nullopt;
-        SymbolId const* named = byToken.tryGet(tok);
-        if (named == nullptr || !named->valid()) return std::nullopt;
-        SymbolRecord const& rec = symbols.at(*named);
-        if (rec.kind != DeclarationKind::Type || !rec.type.valid())
-            return std::nullopt;
-        return TypedefQualification{rec.qualSpine, rec.isConst, rec.type};
+        if (tok.valid()) {
+            SymbolId const* named = byToken.tryGet(tok);
+            if (named == nullptr || !named->valid()) return std::nullopt;
+            SymbolRecord const& rec = symbols.at(*named);
+            if (rec.kind != DeclarationKind::Type || !rec.type.valid())
+                return std::nullopt;
+            std::shared_ptr<DeclaredQualification const> fnClaim;
+            if (fnClaims != nullptr) {
+                if (auto const it = fnClaims->find(named->v); it != fnClaims->end())
+                    fnClaim = it->second;
+            }
+            return TypedefQualification{rec.qualSpine, rec.isConst, rec.type,
+                                        std::move(fnClaim)};
+        }
+        if (typeofClaims == nullptr || nodeTypes == nullptr) return std::nullopt;
+        NodeId const typeofNode = headTypeofNode(tree, head);
+        if (!typeofNode.valid()) return std::nullopt;
+        QualifierSpine const* claim = typeofClaims->tryGet(typeofNode);
+        TypeId const* type = nodeTypes->tryGet(typeofNode);
+        if (claim == nullptr || type == nullptr || !type->valid()) return std::nullopt;
+        if (in.kind(*type) == TypeKind::FnSig) {
+            // A FUNCTION-typed operand (`typeof(f)`, `typeof(void (const char *))`): its
+            // claim's level 0 is the Fn level, while every consumer reads a head naming a
+            // function type as a function TYPEDEF — the spine the RESULT's, the
+            // parameters a claim of their own that the Fn level a derivation gets back
+            // carries (`insertFnLevel`), and that `F h;` takes. Split it into those two
+            // halves (✔MEASURED, probe r4k k03-k06), or one Fn level would be counted
+            // twice and every level beneath it misplaced.
+            QualifierSpine result = *claim;
+            std::shared_ptr<DeclaredQualification const> params;
+            for (auto const& [lv, c] : result.fnParams) {
+                if (lv == 0) { params = c; break; }
+            }
+            if (!shiftQualifierSpine(result, -1)) return std::nullopt;
+            return TypedefQualification{std::move(result), false, *type, std::move(params)};
+        }
+        // The OBJECT's own const: the claim's bit at the level its array spine ends on
+        // (an array's qualifiers are its elements', C 6.7.3p10) — the answer
+        // `declaratorObjectIsConst` gives a typedef's own row.
+        std::size_t level = 0;
+        for (TypeId t = *type; t.valid() && in.kind(t) == TypeKind::Array && level < 64;) {
+            auto const ops = in.operands(t);
+            if (ops.empty()) break;
+            t = ops[0];
+            ++level;
+        }
+        bool const objectConst =
+            level < claim->levels && ((claim->constBits >> level) & 1u) != 0u;
+        return TypedefQualification{*claim, objectConst, *type, {}};
+    }
+
+private:
+    // The `typeof` specifier node `head` is — or reaches through SINGLE-child wrappers
+    // from one of its visible children, the descent `headTypeNameToken` makes — or an
+    // invalid node. Never inside a node with more than one visible child, so a typeof in
+    // a parameter list or a member declaration is never taken for the head's.
+    [[nodiscard]] static NodeId headTypeofNode(Tree const& tree, NodeId head) {
+        SemanticConfig const& sem = tree.schema().semantics();
+        auto const isTypeof = [&](NodeId n) {
+            if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
+            std::uint32_t const r = tree.rule(n).v;
+            return (sem.typeofTypeRule.valid() && r == sem.typeofTypeRule.v)
+                || (sem.typeofValueRule.valid() && r == sem.typeofValueRule.v);
+        };
+        if (isTypeof(head)) return head;
+        if (!head.valid() || tree.kind(head) != NodeKind::Internal) return {};
+        auto const soleVisibleChild = [&tree](NodeId n) -> NodeId {
+            NodeId only{};
+            for (auto const& c : tree.children(n)) {
+                if (isEmptySpace(tree.flags(c))) continue;
+                if (only.valid()) return {};
+                only = c;
+            }
+            return only;
+        };
+        for (auto const& child : tree.children(head)) {
+            if (isEmptySpace(tree.flags(child))) continue;
+            NodeId cur = child;
+            for (int step = 0; step < 8 && cur.valid(); ++step) {
+                if (isTypeof(cur)) return cur;
+                if (tree.kind(cur) != NodeKind::Internal) break;
+                cur = soleVisibleChild(cur);
+            }
+        }
+        return {};
     }
 };
 
@@ -1593,9 +1917,20 @@ typedefHeadSpine(TypeInterner const& in, TypedefQualification const& td,
 // of the function type (C23 6.7.7.4p4: "function returning the unqualified,
 // non-atomic version of T") — ✔MEASURED, `typedef const int F(void); typedef int F(void);`
 // is accepted by gcc 13.3.0 and mingw-w64 13.2.0 — so that one level is not compared.
-[[nodiscard]] bool typedefRedefinitionQualifiersDiverge(TypeInterner const& in,
-                                                        SymbolRecord const& a,
-                                                        SymbolRecord const& b) {
+// P69 (lane `cs`, D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): a
+// function typedef's PARAMETERS are part of the type it names as well, and no level of
+// its spine holds them — they are its own function claim (`fnTypedefClaims`), compared
+// here position by position exactly as a function redeclaration's are. ✔MEASURED
+// (probe r4d t01/t02/t03): `typedef int F(const char *); typedef int F(char *);` is
+// refused by gcc 13.3.0 and clang 18.1.3, MSVC 19.51 warns C4028 — the split every
+// direct parameter spelling has, which DSS refuses; a parameter's OWN top-level
+// qualifier (`char *const` beside `char *`) is not compared, and builds everywhere.
+[[nodiscard]] bool typedefRedefinitionQualifiersDiverge(
+    TypeInterner const& in, SymbolRecord const& a, SymbolRecord const& b,
+    DeclaredQualification const* aFnClaim, DeclaredQualification const* bFnClaim) {
+    if (aFnClaim != nullptr && bFnClaim != nullptr
+        && detail::redecl::nestedParamsDiverge(*aFnClaim, *bFnClaim))
+        return true;
     if (!a.qualSpine.has_value() || !b.qualSpine.has_value()) return false;
     std::uint64_t const ignoredLevels =
         a.type.valid() && in.kind(a.type) == TypeKind::FnSig ? 1u : 0u;
@@ -1645,7 +1980,8 @@ paramRowSpellsUninternedQualifier(EngineState& s, SemanticConfig const& cfg,
     // type this parameter has.
     if (head.valid()) {
         HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols,
-                                    s.lattice.interner()};
+                                    s.lattice.interner(), &s.typeofClaimByNode,
+                                    &s.nodeToType, &s.fnTypedefClaims};
         if (auto const td = typedefs.of(tree, head)) {
             if (td->objectConst) return true;
             if (td->spine.has_value()
@@ -2286,6 +2622,11 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
             // (`const char *p` ⇒ level 1 of a 2-level spine).
             sp.constBits |= (std::uint64_t{1} << (levels - 1));
         }
+        // P69 (D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): the Fn level a
+        // declaration DERIVING from a function typedef gets back carries that typedef's
+        // parameter claims — `F *p` claims what `int (*p)(const char *)` claims.
+        if (insertFnLevel && td->fnClaim != nullptr)
+            sp.fnParams.emplace_back(static_cast<std::uint8_t>(lead - 1), td->fnClaim);
         for (std::size_t i = 0; i < ctors.size(); ++i) {
             if (ctors[i].isConst)    sp.constBits    |= (std::uint64_t{1} << i);
             if (ctors[i].isRestrict) sp.restrictBits |= (std::uint64_t{1} << i);
@@ -2716,6 +3057,13 @@ harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
             for (std::size_t i = 0; i < rows.size(); ++i)
                 q.params[i] = paramRowSpine(idx, tree, rows[i], typedefs);
         }
+    } else if (auto const td = typedefs.of(tree, head);
+               td.has_value() && td->fnClaim != nullptr
+               && td->fnClaim->params.size() == wanted) {
+        // P69 (D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): a function
+        // declared THROUGH a function typedef (`F h;`) has no parameter list of its own —
+        // its parameters are the typedef's, claims included.
+        q.params = td->fnClaim->params;
     }
     if (!q.result.has_value()
         && std::none_of(q.params.begin(), q.params.end(),
@@ -2788,12 +3136,24 @@ extractNameNode(Tree const& tree, NodeId node, NameMatchMode mode,
     // LastIdentifier — DFS for the last name-bearing leaf (the kind the
     // schema's `semantics.identifierToken` names — OR, when configured, a
     // `bracketIdentifierToken` leaf; both resolved by the loader).
+    //
+    // ★★ P69 round 4 (lane `cs`): AN ATTRIBUTE SPECIFIER NAMES NOTHING THE SHAPE
+    // DECLARES OR REFERS TO, so the walk does not enter one. ✔MEASURED before this
+    // stop: `struct S __attribute__((unused)) v;` — an attribute after a REFERENCED
+    // tag, which gcc 13.3.0, clang 18.1.3 and Apple clang all read as `struct S` —
+    // looked the tag `unused` up (the attribute's clause name IS the last identifier
+    // of the specifier's subtree): refused as an incomplete type where no such tag
+    // exists, and SILENTLY THE WRONG TYPE where one does (`struct aligned { char
+    // c[64]; };` in the unit made `struct S __attribute__((aligned(16))) w;` 64
+    // bytes). The parser's binder sketch holds the same walk (`resolveNameNode_`)
+    // and takes the same stop, so the two tiers cannot name different things.
     NodeId found{};
     std::string foundText;
     std::vector<NodeId> stack{node};
     while (!stack.empty()) {
         NodeId cur = stack.back();
         stack.pop_back();
+        if (isAttributeSpecifierNode(tree, cur)) continue;
         if (std::string leaf; nameLeafText(tree, cur, idKind, bracketKind, leaf)) {
             found     = cur;
             foundText = std::move(leaf);
@@ -2985,6 +3345,14 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    bool paramDecay = false,
                    bool typeAliasRow = false);
 
+// P69 round 4 (lane `cs`): forward declaration — `aligned` written at a type
+// position (defined with the attribute fold it runs, below) is applied by the type
+// resolver and by the declarator folds, both of which precede that fold in this
+// file.
+[[nodiscard]] TypeId
+typePositionAligned(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                    std::span<NodeId const> roots, TypeId ty, ScopeId scope);
+
 // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
 // tag-namespace-scope floater (defined below) is consumed early by
 // `resolveTypeNodeImpl`'s isTagReference arm to bind an opaque forward-minted
@@ -3011,6 +3379,17 @@ void reportTagDeclaredInParameterList(EngineState& s, Tree const& tree,
 [[nodiscard]] std::optional<std::int64_t>
 constIntExpr(EngineState& s, Tree const& tree, NodeId node, ScopeId fromScope,
              SemanticConfig const* cfg);
+
+// P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the builtin-call
+// helpers, DEFINED with `checkBuiltinVerbCall` beside `checkCall`; declared here because
+// `buildConstEvalEnv` (the CST evaluator's plan for a builtin call) and Pass 2's reference
+// resolution (a `__builtin_<libfn>` no scope binds) sit above them.
+[[nodiscard]] std::optional<CstBuiltinCall>
+builtinCallPlan(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                ScopeId fromScope);
+[[nodiscard]] SymbolId
+resolveLibraryBuiltinUse(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                         std::string_view spelled, NodeId at);
 
 // ── P31: the two COMPILE-TIME-ANSWER operators, and the ONE place either is
 //    computed. `__builtin_offsetof(T, m)` and `__builtin_types_compatible_p(A, B)`
@@ -3184,6 +3563,49 @@ applyBaseQualifiers(EngineState& s, Tree const& tree, TypeId base,
     return base;
 }
 
+// The qualifier spine a TYPE NAME claims and the one an EXPRESSION's type carries (both
+// defined with the const-lvalue walk below) — a `typeof` head records its operand's
+// (P69, D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS).
+[[nodiscard]] std::optional<QualifierSpine>
+typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
+                       Tree const& tree, NodeId typeNode);
+[[nodiscard]] std::optional<QualifierSpine>
+expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                         NodeId expr, ScopeId here);
+
+// ── A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES NOT (P69, lane `cs`,
+//    D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST) ──────────────
+//
+// `const` and `restrict` are not interned, so `int (*)(char *)` and `int (*)(const
+// char *)` — or `char **` and `const char **` — are ONE TypeId, and every site of the
+// pointer-compatibility constraint (initialization, assignment, argument, return, `==`
+// and the relational operators, `?:`) admitted such a pair as identical. C does not:
+// two pointed-to types are compatible only when identically qualified below their own
+// top level (C 6.7.6.1p2), a function type's parameters included (C 6.7.6.3p15).
+// ✔MEASURED (lane `cs`'s probes r4d t11-t13, r4e u01-u08): gcc 13.3.0 `-std=c2x`
+// warns on every such conversion and types such a conditional `void *`; clang 18.1.3
+// refuses the function-pointer conversions and warns on the rest; MSVC 19.51 builds
+// them (C4090 on some). A WARNING, the class `diagnosedConversion` names
+// `IncompatiblePointer` — the same code and sentence the interner-visible pairs get.
+//
+// `pointeesCanDivergeInAQualifier` is the cheap pre-filter: only a pointee that is
+// itself a pointer or a function has a level below its own top level for such a
+// qualifier to sit on. `pointerValueSpine` is a pointer-contributing value's spine,
+// level 0 its pointer (a function designator converts to a pointer to itself, C
+// 6.3.2.1p4: one unqualified level above its Fn level). `pointeeSpinesDiverge` is the
+// one comparison: level 0 is each value's own and level 1 its pointee's OWN qualifier,
+// which every pairing and conversion lets differ (a qualifier the conversion DROPS
+// there is the separate discarded-qualifier class, not judged here); every deeper
+// level and every function level's parameter claims must agree, where both sides
+// claim ("absent is not unqualified").
+[[nodiscard]] bool pointeesCanDivergeInAQualifier(TypeInterner const& in, TypeId a,
+                                                  TypeId b);
+[[nodiscard]] std::optional<QualifierSpine>
+pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                  NodeId expr, TypeId exprType, ScopeId here);
+[[nodiscard]] bool pointeeSpinesDiverge(std::optional<QualifierSpine> const& a,
+                                        std::optional<QualifierSpine> const& b);
+
 // `inferOuterArrayLength` (P68 round 9, lane `cs`): the ONE type-name position whose
 // OUTERMOST array bound may be absent because the construct completes it — a compound
 // literal's `(T[]){ … }` (C 6.5.2.5p4: the size is determined by its initializer). It
@@ -3290,7 +3712,10 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (rule.v == cfg.bitIntSpecRule.v) {
                 bitSpec = node;   // bare `_BitInt(N)` — default signed, no siblings
             } else {
-                for (NodeId c : visibleChildren(tree, node)) {
+                // P69 round 4 (lane `cs`): read through the specifier-run accessor,
+                // so `unsigned __attribute__((unused)) _BitInt(7)` is the two
+                // specifiers it says and not "a third, foreign specifier" (`sawOther`).
+                for (NodeId c : specifierRunChildren(tree, node)) {
                     if (tree.kind(c) == NodeKind::Internal
                         && tree.rule(c).v == cfg.bitIntSpecRule.v) {
                         if (bitSpec.valid()) sawOther = true;   // two `_BitInt` → invalid
@@ -3411,7 +3836,16 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // Languages without the table have an empty vocabulary — the
         // arm never fires and resolution is byte-identical to pre-FC3.
         if (!s.idx().typeSpecifierSets.empty()) {
-            auto specKids = visibleChildren(tree, node);
+            // P69 round 4 (lane `cs`): the specifier-run accessor — an attribute run
+            // written among the specifiers (`unsigned __attribute__((…)) long`) is
+            // not one of them. ✔MEASURED with this cycle's grammar over this arm as
+            // it stood (a scratch config tree and the compiler of the tree before
+            // the change): such a run was "not all tokens", the multiset arm stood
+            // down, and the generic descent below resolved the FIRST specifier that
+            // names a type alone — `sizeof(long __attribute__((unused)) long)` and
+            // `sizeof(unsigned __attribute__((unused)) long
+            // __attribute__((unused)) long)` were both 4 on pe64, silently.
+            auto specKids = specifierRunChildren(tree, node);
             bool allSpecifierTokens = !specKids.empty();
             std::vector<std::uint32_t> kinds;
             kinds.reserve(specKids.size());
@@ -3674,10 +4108,22 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                               specifierDiagnosed);
                 } else {
                     // EXPRESSION operand (UNEVALUATED, 6.7.2.5p2). C 6.7.2.5
-                    // constraint: a bit-field member has no nameable type. Bounded
-                    // transparent descent to the innermost member-access node
-                    // (mirrors the nullptr operator-gate walk); resolveMemberAccess
-                    // exposes a bit-field field via `bitFieldWidth`.
+                    // constraint: a bit-field member has no nameable type. The descent
+                    // to the member access the operand IS; resolveMemberAccess exposes a
+                    // bit-field field via `bitFieldWidth`.
+                    // ★ P69 (lane `lm`, the review of the promotion fold, its D): THE
+                    // OPERAND IS A BIT-FIELD ONLY THROUGH A WRAPPER OR A SELECTION — the
+                    // steps of the one statement (`nodeSaysSomethingItself`; a
+                    // selection's result by name, `selectionResultOf`), a subset of
+                    // those `bitFieldValueWidth` takes. This descended EVERY node with one
+                    // internal child, so it walked through a unary operator, a prefix
+                    // `++` and a statement expression to the member below and refused
+                    // them; and it stopped at a selection. ✔MEASURED 2026-10-16 (clang
+                    // 18.1.3 and gcc 13.3.0, `typeof` and `__typeof__` alike): both
+                    // refuse `v.b`, `(v.b)`, `__extension__ v.b`, `_Generic(0, int: v.b)`
+                    // and `__builtin_choose_expr(1, v.b, 0)`, and both ACCEPT `-v.b`,
+                    // `+v.b`, `++v.b`, `v.b++`, `(0, v.b)`, `(v.b = 1)`, `(v.b += 1)`,
+                    // `({ v.b; })` and `(1 ? v.b : v.b)` — no split to decide.
                     NodeId probe = operandNode;
                     // ★ P68 round 13 (lane `cs`): no cap. This stopped after 64 wrappers
                     // and never saw a member access below them, so a bit-field operand
@@ -3719,9 +4165,18 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             }
                             break;   // resolved (bit-field or not) — stop descent
                         }
-                        // Descend ONE transparent wrapper (a single Internal child);
-                        // a real operator/comma (≥2 Internal children) is not a
-                        // transparent member operand — stop.
+                        if (tree.kind(probe) != NodeKind::Internal) break;
+                        // A selection: its result, by name.
+                        if (nodeIsASelection(cfg, tree, probe)) {
+                            probe = selectionResultOf(s, cfg, tree, probe, scope);
+                            continue;
+                        }
+                        // A wrapper (the statement's): its ONE internal child. Every node
+                        // that says something itself is no bit-field — stop.
+                        if (nodeSaysSomethingItself(cfg, tree.schema().hirLowering(), tree,
+                                                    probe)) {
+                            break;
+                        }
                         NodeId next{};
                         int internals = 0;
                         for (NodeId c : visibleChildren(tree, probe)) {
@@ -3771,10 +4226,45 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 TypeId const result =
                     strip ? s.lattice.interner().stripVolatile(raw) : raw;
                 s.nodeToType.set(node, result);
+                // ★ P69 (D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS): THE QUALIFIERS THE
+                // TypeId CANNOT CARRY. `const` and `restrict` are not interned, so the
+                // result above is the operand's type WITHOUT them — while C23 6.7.3.6
+                // makes `typeof` keep every qualifier of its operand's type
+                // (`typeof_unqual` drops the top level's). The operand's CLAIM is
+                // recorded here, where the operand is resolved, for `HeadTypedefs` to
+                // answer exactly as it answers a typedef's: a type name's own spine for
+                // `typeof(type-name)`, the expression's type's for `typeof(expr)` (an
+                // lvalue's declared qualification, `expressionQualifierSpine`). ✔MEASURED
+                // (P68 round 8): gcc 13.3.0, clang 18.1.3 (-std=c2x) and MSVC 19.51
+                // refuse `typeof(const int) y = 1; y = 2;` and its typedef'd, object and
+                // global twins, which DSS compiled. No claim ⇒ nothing is recorded (absent
+                // is not unqualified).
+                std::optional<QualifierSpine> claim =
+                    isTypeofType
+                        ? typeNameQualifierSpine(s, cfg, tree, operandNode)
+                        : expressionQualifierSpine(s, cfg, tree, operandNode, scope);
+                if (claim.has_value()) {
+                    if (strip) {
+                        claim->constBits    &= ~std::uint64_t{1};
+                        claim->restrictBits &= ~std::uint64_t{1};
+                    }
+                    s.typeofClaimByNode.set(node, std::move(*claim));
+                }
                 return result;
             }
         }
-        auto kids = visibleChildren(tree, node);
+        // ★ P69 round 4 (lane `cs`): an attribute specifier is never a type. A node
+        // that IS one has no child that names a type (it takes the ordinary miss
+        // path below, with the ordinary miss diagnostic), and a type-bearing node is
+        // read WITHOUT its attribute runs (`typeNameChildren`): the descent below is
+        // first-child-that-resolves-wins, and an attribute's clause name or
+        // argument is an identifier the scope chain may well bind (`typedef int
+        // aligned;`), so a specifier left among the children could win the head or
+        // trip the ambiguous-head guard on legal C. What an attribute in a type
+        // name MEANS is applied below, from the specifiers themselves, at the three
+        // places it can decorate.
+        auto kids = isAttributeRunNode(tree, node) ? std::vector<NodeId>{}
+                                                   : typeNameChildren(tree, node);
         // SE-pointers (G5): count `pointerToken` children at THIS node (C
         // declarator stars: `int *p`, `int **p`) and wrap the resolved base type
         // that many times in Ptr. The stars are a flat token run in `typeRef`;
@@ -3983,23 +4473,29 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // ONE base slot), but nothing in the ENGINE enforced it — so any
             // grammar edit that drags a second identifier into a type-resolved head
             // silently re-pointed the head at that identifier, and the user got a
-            // wrong-width type in a CLEAN-COMPILING program. The canonical way in
-            // is a DECORATION placed inside the head instead of beside it:
+            // wrong-width type in a CLEAN-COMPILING program. The way in that
+            // found it was a DECORATION placed inside the head instead of
+            // beside it:
             //
             //     typedef int aligned;
             //     typedef __attribute__((aligned(16))) long T;   // T became `int`
             //
-            // — the attribute NAME resolves through the scope chain (the Token arm
-            // below tries ANY identifier as a type alias), wins the race against
-            // the real head, and no diagnostic is emitted anywhere. An identifier
-            // in the attribute's ARGUMENT list hijacks by the same route.
+            // — the attribute NAME resolved through the scope chain (the Token arm
+            // below tries ANY identifier as a type alias), won the race against
+            // the real head, and no diagnostic was emitted anywhere. An identifier
+            // in the attribute's ARGUMENT list hijacked by the same route.
             //
-            // ⛔ THE TEMPTING WRONG FIX, RECORDED SO IT IS NEVER RE-PROPOSED: put
-            // the attribute run INSIDE the head rule, "where the type head already
-            // is". It looks right and it fails SILENTLY. The decoration belongs in
-            // a SIBLING slot — the declaration row's `specifierPrefix`, which
-            // `specifierPrefixChild` hands to the alignas / noreturn / attribute
-            // scans — never in the type-resolved head.
+            // ★ P69 round 4 (lane `cs`): THAT WAY IN IS CLOSED AT ITS ROOT — an
+            // attribute specifier is opaque to this descent (`typeNameChildren`
+            // skips it, `isAttributeSpecifierRule`), so no word inside one can be
+            // a child that names a type, and one written directly in a head is
+            // read as the declaration's own (`headAttributeRuns`). The guard stays
+            // for every OTHER second child that names a type, which no skip can
+            // rule out: `TypeHeadHijackSweep.AHeadHoldingTwoTypesIsRefusedLoudly`.
+            // The decoration still belongs in a SIBLING slot — the declaration
+            // row's `specifierPrefix`, which `specifierPrefixChild` hands to the
+            // alignas / noreturn / attribute scans — and the shipped head rules
+            // hold to that.
             //
             // ★ WHY THE GUARD LIVES HERE AND NOT IN THE LOADER. Whether a child
             // "names a type" depends on the SCOPE it is resolved in, not on the
@@ -4070,26 +4566,73 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // the last layer here — unless an abstract declarator follows, whose
             // own derivations then sit outside every layer of this node (`int
             // *volatile (*)[3]`: these stars build the ELEMENT type).
+            // ★★ P69 round 4 (lane `cs`) — `aligned` WRITTEN IN A TYPE NAME, at the
+            // three places it can stand, each decorating a DIFFERENT type
+            // (`typePositionAligned` carries the measurements):
+            //   (1) a C23 `[[…]]` specifier directly in the type name ends the
+            //       specifier list (C23 6.7.3.1) and is the BASE type's — applied
+            //       here, before any pointer layer (`int [[gnu::aligned(16)]] *` is
+            //       an 8-aligned pointer to a 16-aligned int);
+            //   (2) one inside a pointer layer is THAT pointer's — applied in the
+            //       layer loop, at every level, the outermost included: a cast's
+            //       rvalue drops qualifiers, never the type's alignment (`int *
+            //       __attribute__((aligned(16)))` has `_Alignof` 16);
+            //   (3) a GNU `__attribute__` specifier directly in the type name, or a
+            //       run inside its head (among the specifiers, after a referred
+            //       tag), is the WHOLE named type's — applied last, after the
+            //       abstract declarator has been folded (`__attribute__((aligned
+            //       (16))) int *` is a 16-aligned pointer to a 4-aligned int,
+            //       `__attribute__((aligned(16))) int [3]` a 16-aligned array).
+            bool const isTypeNameNode =
+                cfg.attrTypeNameRule.valid()
+                && tree.rule(node).v == cfg.attrTypeNameRule.v;
+            if (isTypeNameNode && cfg.stdAttrRule.valid()) {
+                auto const baseSpecifiers =
+                    directAttributeSpecifiers(tree, node, cfg.stdAttrRule);
+                if (!baseSpecifiers.empty()) {
+                    inner = typePositionAligned(s, cfg, tree, baseSpecifiers, inner,
+                                                scope);
+                }
+            }
             bool const lastLayerIsOutermost = !absDirect.valid();
             for (std::uint32_t i = 0; i < ptrDepth; ++i) {
                 inner = s.lattice.interner().pointer(inner);
                 bool const keepsItsQualifiers = i + 1 < ptrDepth || !lastLayerIsOutermost;
                 NodeId const layer = i < ptrLevelNodes.size() ? ptrLevelNodes[i] : NodeId{};
-                if (!keepsItsQualifiers || !layer.valid()
-                    || tree.kind(layer) != NodeKind::Internal) {
-                    continue;   // the rvalue's own level, or a bare star (no qualifier)
+                if (!layer.valid() || tree.kind(layer) != NodeKind::Internal) {
+                    continue;   // a bare star: no qualifier and no attribute
                 }
-                if (cfg.volatileMarker.has_value()
+                // The rvalue's own level keeps no qualifier (C 6.5.4).
+                if (keepsItsQualifiers && cfg.volatileMarker.has_value()
                     && subtreeContainsToken(tree, layer, *cfg.volatileMarker,
                                             &s.idx().declByRule)) {
                     inner = s.lattice.interner().volatileQualified(inner);
                 }
-                if (cfg.atomicMarker.has_value()
+                if (keepsItsQualifiers && cfg.atomicMarker.has_value()
                     && subtreeContainsToken(tree, layer, *cfg.atomicMarker,
                                             &s.idx().declByRule)) {
                     inner = s.lattice.interner().atomicQualified(inner);
                 }
+                auto const layerSpecifiers = directAttributeSpecifiers(tree, layer);
+                if (!layerSpecifiers.empty()) {
+                    inner = typePositionAligned(s, cfg, tree, layerSpecifiers, inner,
+                                                scope);
+                }
             }
+            // (3) above, as a closure both exits below share.
+            auto const wholeTypeAligned = [&](TypeId named) {
+                if (!isTypeNameNode || !named.valid()) return named;
+                std::vector<NodeId> whole =
+                    cfg.attrSpecRule.valid()
+                        ? directAttributeSpecifiers(tree, node, cfg.attrSpecRule)
+                        : std::vector<NodeId>{};
+                for (NodeId run : headAttributeRuns(cfg, tree, headChild)) {
+                    whole.push_back(run);
+                }
+                return whole.empty()
+                           ? named
+                           : typePositionAligned(s, cfg, tree, whole, named, scope);
+            };
             // c26: fold the abstract declarator (fn-ptr / array type-name) onto the
             // base+stars via the SHARED `directDeclaredType` engine — the SAME path
             // a declaration's declarator takes, so `(int(*)(void))` yields exactly
@@ -4112,13 +4655,14 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     }
                     return InvalidType;
                 }
-                return directDeclaredType(s, cfg, tree, absDirect, inner, scope,
-                                          emitOnMiss,
-                                          /*allowFlexibleArray=*/false,
-                                          /*allowInitInferredArray=*/
-                                          inferOuterArrayLength);
+                return wholeTypeAligned(
+                    directDeclaredType(s, cfg, tree, absDirect, inner, scope,
+                                       emitOnMiss,
+                                       /*allowFlexibleArray=*/false,
+                                       /*allowInitInferredArray=*/
+                                       inferOuterArrayLength));
             }
-            return inner;
+            return wholeTypeAligned(inner);
         }
         if (emitOnMiss && !specifierDiagnosed) {
             ParseDiagnostic d;
@@ -4362,18 +4906,17 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     // its init expression in the scope where the symbol was declared
     // — not the original use-site scope. This is what makes shadowing
     // work correctly across const ref chains.
-    CstResolvedSymbol out{*initExpr, rec.scope.v, std::nullopt};
-    // C4b (I1): a const `_BitInt(N)` symbol's value is its initializer CONVERTED
-    // to `_BitInt(N)` (C 6.7.9 / 6.3.1.3). Hand the engine the declared (width,
-    // signed) so it applies the mod-2^N wrap — else `const _BitInt(4) k = 20wb;
-    // k` folds to 20 (the initializer's `_BitInt(6)` value) instead of 4.
-    auto const& in = s.lattice.interner();
-    if (rec.type.valid() && in.kind(rec.type) == TypeKind::BitInt) {
-        out.declaredBitPrecise = CstBitPreciseDeclType{
-            static_cast<std::uint32_t>(in.bitIntWidth(rec.type)),
-            in.bitIntIsSigned(rec.type)};
-    }
-    return out;
+    // ★ P69 (lane `lm`): THE DECLARED TYPE, FOR EVERY TYPE THE CAST CAN CONVERT TO. A
+    // const object's value is its initializer CONVERTED to its type (C 6.7.9p11), so
+    // the engine is handed that type as the conversion its cast arm applies. This
+    // handed it for a `_BitInt` declared type alone (C4b), and every other named
+    // constant was read at its initializer's type (`CstResolvedSymbol::declaredType`
+    // tells what was measured). What the declared type makes of the read is said once,
+    // for this resolver and the lowering's: `namedConstantRead` (a structure, a union or
+    // an array is read member by member; a type with no constant value — `_Complex` —
+    // is no constant).
+    return namedConstantRead(s.lattice.interner(), *initExpr, rec.scope.v, rec.type,
+                             s.charIsUnsigned);
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the ONE resolver-environment builder shared by
@@ -4394,6 +4937,20 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
 //   (3) the returned closures capture `s` / `tree` by reference and
 //       `cfg` / `fromScope` by value — the env is consumed within the caller's
 //       frame (both callers build it, run `evaluateConstantCst`, and return).
+// P69: defined with the compound-literal machinery it reads (see its comment there).
+[[nodiscard]] std::optional<ConstantSubobjectFact>
+resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const& cfg,
+                         NodeId node, ScopeId scope);
+
+// P69 (lane `cs`, D-C-A-CONSTANTS-MEMBER-NAME-IS-RESOLVED-BY-A-SCOPE-WALK): where the
+// member called `name` lives in `container` and what its type is, for a CONSTANT — this
+// tier's call of the ONE `anon_member_search::memberByteOffset` that the HIR lowering
+// calls too. Defined beside `EngineAnonAccess`, the view of the analysis state it reads
+// through. Its three askers: the `&((T *)0)->m` hook below, each member step of
+// `__builtin_offsetof`, and the member step of an object-size operand.
+[[nodiscard]] anon_member_search::MemberOffset
+memberOffsetIn(EngineState const& s, TypeId container, std::string_view name);
+
 [[nodiscard]] CstEvalEnvironment
 buildConstEvalEnv(EngineState& s, Tree const& tree,
                   ScopeId fromScope, SemanticConfig const* cfg) {
@@ -4421,6 +4978,82 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             -> std::optional<CstResolvedSymbol> {
             return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
                                           tree.text(identTok));
+        };
+        // P69 (C23 6.6p6-p7): a compound literal constant, and the `.member` of a
+        // structure or union constant — read from the scope the engine is in, like a
+        // named constant (D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR,
+        // D-C-A-NAMED-CONSTANT-MEMBER-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION).
+        env.resolveConstantSubobject = [&s, &tree, cfg](NodeId node,
+                                                        std::uint32_t curScopeOpaque)
+            -> std::optional<CstConstantSubobject> {
+            auto const fact =
+                resolveConstantSubobject(s, tree, *cfg, node, ScopeId{curScopeOpaque});
+            if (!fact.has_value()) return std::nullopt;
+            auto const type = classifyCstCastTarget(s.lattice.interner(), fact->type,
+                                                    s.charIsUnsigned);
+            if (!type.has_value()) return std::nullopt;
+            // P69 (lane `lm`): a bit-field is read at its width, at its declared type; an
+            // operator promotes it where it is a bit-field's value
+            // (`resolveBitFieldValueType` below).
+            std::optional<CstBitFieldRead> bitField;
+            if (fact->bitFieldWidth.has_value()) {
+                bitField = CstBitFieldRead{*fact->bitFieldWidth};
+            }
+            return CstConstantSubobject{
+                CstResolvedSymbol{fact->initExpr, fact->initScope.v, std::nullopt}, *type,
+                fact->zeroValue, bitField};
+        };
+        // P69 (lane `lm`, the review of the promotion fold): the type an operator reads an
+        // operand at when that operand IS a bit-field's value — the ONE statement
+        // (`semanticBitFieldValueWidth` → `bitFieldValueWidth`) the typer's
+        // `bitFieldOperandType` asks, the promotion by width from the field's declared type
+        // (`bitFieldPromotedType`). nullopt where the operand is no bit-field's value or the
+        // promotion keeps its type. Asked of the field's own type, so it answers before
+        // Pass 2 has typed a single expression.
+        env.resolveBitFieldValueType = [&s, &tree, cfg](NodeId operand,
+                                                        std::uint32_t curScopeOpaque)
+            -> std::optional<CstCastTarget> {
+            auto const& rules = s.arithRulesFor(*cfg);
+            if (!rules.has_value()) return std::nullopt;
+            TypeId fieldType{};
+            auto const width = semanticBitFieldValueWidth(s, *cfg, tree, operand,
+                                                          ScopeId{curScopeOpaque}, &fieldType);
+            if (!width.has_value() || !fieldType.valid()) return std::nullopt;
+            auto& interner = s.lattice.interner();
+            TypeId const promoted = bitFieldPromotedType(interner, fieldType, *width, *rules);
+            if (!promoted.valid() || promoted.v == fieldType.v) return std::nullopt;
+            return classifyCstCastTarget(interner, promoted, s.charIsUnsigned);
+        };
+        // P69 (lane `lm`): the type the typer gives an expression (`subtreeType`) — asked of
+        // a conditional, whose selected arm the engine converts to it (C 6.5.15p5), and of
+        // the unselected arm of one it could not type. Its LITERAL leaves are stamped first,
+        // through the one walk every `subtreeType` caller before Pass 2 takes
+        // (`preStampLiteralLeaves`): unstamped, a literal is typed as nothing there, and
+        // `int a[(1 ? 5 : 1 / 0) == 5 ? 1 : -1];` at file scope — its unselected arm neither
+        // folds nor had a type — was refused S_NonConstantArrayLength, where clang 18 and
+        // gcc 13 build it (✔MEASURED 2026-10-16, with an enumerator, a bit-field width and a
+        // file-scope static assertion over such an arm). InvalidType is no answer — nor is a
+        // conditional's type when an arm is untyped: the typer then hands on the other arm's
+        // type (`combineTernary`'s last fallback), which is no statement of C 6.5.15p5.
+        env.resolveExpressionType = [&s, &tree, cfg](NodeId node, std::uint32_t curScopeOpaque)
+            -> std::optional<CstCastTarget> {
+            ScopeId const scope{curScopeOpaque};
+            preStampLiteralLeaves(s, *cfg, tree, node);
+            auto const& hirCfg = tree.schema().hirLowering();
+            if (node.valid() && tree.kind(node) == NodeKind::Internal
+                && hirCfg.ternaryExprRule.valid()
+                && tree.rule(node).v == hirCfg.ternaryExprRule.v) {
+                std::size_t operands = 0;
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (operands++ > 0 && !subtreeType(s, tree, c, scope).valid())
+                        return std::nullopt;
+                }
+                if (operands != 3) return std::nullopt;
+            }
+            TypeId const t = subtreeType(s, tree, node, scope);
+            if (!t.valid()) return std::nullopt;
+            return classifyCstCastTarget(s.lattice.interner(), t, s.charIsUnsigned);
         };
         // FC6: fold `sizeof(T)` in an array dimension (`int a[sizeof(T)]`). The
         // engine dispatches the `sizeofRule` node here (ahead of its wrapper-
@@ -4477,12 +5110,26 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                         // identifier (`sizeof b` / `sizeof(b[0])`) resolves
                         // its leaf type by scope-lookup (leaves are not yet
                         // Pass-2-stamped at this declaration-type stage).
+                        // ★ P69 (lane `cs`, D-C-SIZEOF-OPERAND-LITERALS-ARE-UNTYPED-IN-A-DECLARATIONS-CONSTANT):
+                        // and its LITERAL leaves pre-stamped through the ONE walk the
+                        // `auto` and `typeof` arms take — unstamped, a literal typed as
+                        // nothing and `combineBinary` took the OTHER operand's type, so
+                        // `sizeof(g + 4)` of a `char g[16]` folded to 16 (the array) in an
+                        // array bound or an enumerator, where gcc, clang and MSVC fold 8.
+                        preStampLiteralLeaves(s, *cfg, tree, operand);
                         sized = subtreeType(s, tree, operand, fromScope);
                     }
                 }
                 break;  // the single sizeof form
             }
             if (!sized.valid()) return std::nullopt;
+            // P69 (lane `cs`): an array of unknown size yields what the language
+            // states for one (`sizeof.incompleteArraySize`, MSVC's 0) — the same
+            // answer the HIR fold and the lowering give (`foldLayoutQuery`,
+            // `lowerSizeof`); the warning is Pass 2's, once per `sizeof`.
+            if (cfg->sizeofIncompleteArraySize.has_value()
+                && s.lattice.interner().isIncompleteArray(sized))
+                return *cfg->sizeofIncompleteArraySize;
             // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: `sizeof` asks the
             // OPERAND question, not the object one, so this fold routes through
             // `operandLayout` — identical to `computeLayout` for every type with a
@@ -4536,6 +5183,9 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                     // const-context scope is threaded in for identifier operands).
                     for (NodeId opnd : visibleChildren(tree, form)) {
                         if (tree.kind(opnd) == NodeKind::Internal) {
+                            // P69 (lane `cs`): its literal leaves pre-stamped, as the
+                            // sizeof value arm's are (D-C-SIZEOF-OPERAND-LITERALS-ARE-UNTYPED-IN-A-DECLARATIONS-CONSTANT).
+                            preStampLiteralLeaves(s, *cfg, tree, opnd);
                             queried = subtreeType(s, tree, opnd, fromScope);
                             break;
                         }
@@ -4602,28 +5252,18 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                                         s.charIsUnsigned);
         };
         // c43: resolve a struct/union field's byte offset + type for `&((T*)0)->M`.
-        // Looks the field name up in the container's MEMBER SCOPE (Pass-1 binds
-        // fields there with their declaration-order `fieldIndex`), guards bit-fields
-        // (no byte offset — taking their address is illegal C), and reads the offset
-        // from the SAME computeLayout the sizeof / codegen paths use (per-target via
-        // aggregateLayout — no target branch here). nullopt ⇒ the member fold fails
-        // loud (unknown field / not-yet-completed composite / no layout params).
+        // ★ P69 (lane `cs`): the lookup is `memberOffsetIn` — the ONE member rule every
+        // constant asks, shared with the HIR lowering's fold of the same spelling (see
+        // `anon_member_search::memberByteOffset` for what it finds and why the scope
+        // walk that stood here was wrong both ways). The offset comes from the SAME
+        // computeLayout the sizeof / codegen paths use (per-target via aggregateLayout —
+        // no target branch here). nullopt ⇒ the member fold fails loud (not a member /
+        // a bit-field / a not-yet-completed composite / no layout params).
         env.resolveFieldOffset = [&s, &tree](TypeId container, NodeId fieldTok)
             -> std::optional<CstFieldResolution> {
-            if (!s.aggregateLayout.has_value()) return std::nullopt;
-            TypeInterner const& in = s.lattice.interner();
-            TypeKind const ck = in.kind(container);
-            if (ck != TypeKind::Struct && ck != TypeKind::Union) return std::nullopt;
-            auto const scopeIt = s.compositeScopeByType.find(container.v);
-            if (scopeIt == s.compositeScopeByType.end()) return std::nullopt;
-            SymbolId const fsym = s.scopes.lookup(scopeIt->second, tree.text(fieldTok));
-            if (!fsym.valid()) return std::nullopt;
-            SymbolRecord const& frec = s.symbols.at(fsym);
-            std::uint32_t const idx = frec.fieldIndex;
-            if (in.fieldBitWidth(container, idx).has_value()) return std::nullopt;  // bit-field
-            auto const layout = computeLayout(container, in, *s.aggregateLayout, s.dataModel);
-            if (!layout || idx >= layout->fieldOffsets.size()) return std::nullopt;
-            return CstFieldResolution{layout->fieldOffsets[idx], frec.type};
+            auto const member = memberOffsetIn(s, container, tree.text(fieldTok));
+            if (!member.found()) return std::nullopt;
+            return CstFieldResolution{member.offset, member.type};
         };
         // P31: the compile-time-answer operators in a const-expr context —
         // `int a[__builtin_offsetof(struct S, b)]`,
@@ -4668,6 +5308,14 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             }
             if (!arm.valid()) return std::nullopt;
             return arm;
+        };
+        // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): a call of a
+        // builtin whose verb has a constant form (`__builtin_expect(1, 1)`,
+        // `__builtin_popcount(7)`, `__builtin_object_size(g, 0)`) — the callee resolved from
+        // this scope, its operands converted by its declared parameters.
+        env.resolveBuiltinCall = [&s, &tree, cfg, fromScope](NodeId node)
+            -> std::optional<CstBuiltinCall> {
+            return builtinCallPlan(s, *cfg, tree, node, fromScope);
         };
     }
     // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
@@ -4812,53 +5460,56 @@ foldCompileTimeAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 
     // ONE member step, shared by the leading name and every `.field` follower —
     // and it is the SAME lookup `env.resolveFieldOffset` performs for the
-    // `&((T*)0)->m` spine: the composite's own member scope for the field index,
-    // then `computeLayout` for the byte offset. Two lookups would be two answers
-    // to "where does this member live".
+    // `&((T*)0)->m` spine. ★ P69 (lane `cs`): the same FUNCTION now, not the same
+    // text written twice — `memberOffsetIn`, the one member rule every constant asks
+    // (`anon_member_search::memberByteOffset`: the composite's OWN member, or one
+    // promoted through its anonymous members; never a name of an enclosing scope).
+    // Two lookups would be two answers to "where does this member live"; what stays
+    // here is the sentence for each way there is no answer.
     std::uint64_t offset = 0;
     auto stepField = [&](NodeId nameTok) -> bool {
-        TypeKind const ck = in.kind(container);
-        if (ck != TypeKind::Struct && ck != TypeKind::Union) {
-            (void)refuse(nameTok,
-                std::format("'{}' cannot be reached: the type it is looked up in "
-                            "is not a struct or union", tree.text(nameTok)));
-            return false;
+        using anon_member_search::MemberOffsetStatus;
+        auto const member = memberOffsetIn(s, container, tree.text(nameTok));
+        switch (member.status) {
+            case MemberOffsetStatus::Found:
+                offset   += member.offset;
+                container = member.type;
+                return true;
+            case MemberOffsetStatus::NotAComposite:
+                (void)refuse(nameTok,
+                    std::format("'{}' cannot be reached: the type it is looked up in "
+                                "is not a struct or union", tree.text(nameTok)));
+                return false;
+            case MemberOffsetStatus::Incomplete:
+                (void)refuse(nameTok,
+                    std::format("'{}' cannot be reached: its containing struct/union "
+                                "is INCOMPLETE here, so it has no layout yet",
+                                tree.text(nameTok)));
+                return false;
+            case MemberOffsetStatus::NotAMember:
+                (void)refuse(nameTok,
+                    std::format("'{}' is not a member of that struct/union",
+                                tree.text(nameTok)));
+                return false;
+            case MemberOffsetStatus::Ambiguous:
+                (void)refuse(nameTok,
+                    std::format("'{}' names two different members of that struct/union, "
+                                "each reached through one of its anonymous members",
+                                tree.text(nameTok)));
+                return false;
+            case MemberOffsetStatus::BitField:
+                (void)refuse(nameTok,
+                    std::format("'{}' is a BIT-FIELD, which has no byte offset (C "
+                                "6.5.3.2 also forbids taking its address)",
+                                tree.text(nameTok)));
+                return false;
+            case MemberOffsetStatus::NoLayout:
+                (void)refuse(nameTok,
+                    std::format("'{}' has no computable layout offset in its "
+                                "containing type", tree.text(nameTok)));
+                return false;
         }
-        auto const scopeIt = s.compositeScopeByType.find(container.v);
-        if (scopeIt == s.compositeScopeByType.end()) {
-            (void)refuse(nameTok,
-                std::format("'{}' cannot be reached: its containing struct/union "
-                            "is INCOMPLETE here, so it has no layout yet",
-                            tree.text(nameTok)));
-            return false;
-        }
-        SymbolId const fsym = s.scopes.lookup(scopeIt->second, tree.text(nameTok));
-        if (!fsym.valid()) {
-            (void)refuse(nameTok,
-                std::format("'{}' is not a member of that struct/union",
-                            tree.text(nameTok)));
-            return false;
-        }
-        SymbolRecord const& frec = s.symbols.at(fsym);
-        std::uint32_t const idx = frec.fieldIndex;
-        if (in.fieldBitWidth(container, idx).has_value()) {
-            (void)refuse(nameTok,
-                std::format("'{}' is a BIT-FIELD, which has no byte offset (C "
-                            "6.5.3.2 also forbids taking its address)",
-                            tree.text(nameTok)));
-            return false;
-        }
-        auto const layout = computeLayout(container, in, *s.aggregateLayout,
-                                          s.dataModel);
-        if (!layout || idx >= layout->fieldOffsets.size()) {
-            (void)refuse(nameTok,
-                std::format("'{}' has no computable layout offset in its "
-                            "containing type", tree.text(nameTok)));
-            return false;
-        }
-        offset += layout->fieldOffsets[idx];
-        container = frec.type;
-        return true;
+        return false;
     };
 
     // `[i]` — a CONSTANT index times the element stride. A non-constant index is
@@ -5030,11 +5681,28 @@ genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Pass 2's loud re-resolve of the same node. The resolved TypeIds and the
     // benign interner side effects persist; only the reports are dropped.
     auto const snap = s.reporter.snapshotForRollback();
+    // ★ P69 (lane `lm`): THE PREPARATION A PASS-1.5 TYPE QUERY NEEDS BELONGS TO THE CALL
+    // (`preStampLiteralLeaves`'s own words), AND THIS CALL DID NOT MAKE IT. Before the
+    // expression pass a literal leaf carries no type, so the controlling expression of
+    // `_Generic(0, int: 42, default: 9)` had none — and the promise two paragraphs up
+    // ("NEVER a guessed association") was kept by nobody: `selectGenericAssociation`
+    // matched no typed association and handed back `default`. ✔MEASURED 2026-10-10 (pe64,
+    // baseline and release): `enum { EV = _Generic(0, int: 42, default: 9) };` was 9 and
+    // `static char arr[_Generic(0, int: 3, default: 7)];` had 7 elements, in silence — and
+    // so for a controlling `1.5`, `1.5f`, `'a'`, `"ab"`, `0 + 1L`, `1 + 1u`, `-1`, `1ull`,
+    // `1 ? 1 : 2L`, `(0)`, in an enumerator, an array bound that is no block-scope
+    // object's, a bit-field width and a designator's index; the same selection in a
+    // static assertion or a statement (the expression pass) was right, and the six
+    // references select the typed association everywhere.
+    preStampLiteralLeaves(s, cfg, tree, kids[cfg.genericControlChild]);
     TypeId const controllingType =
         subtreeType(s, tree, kids[cfg.genericControlChild], here);
     GenericSelection const sel =
         selectGenericAssociation(s, cfg, tree, node, here, controllingType);
     s.reporter.truncateTo(snap);
+    // An unresolved controlling type selects NOTHING: `default` is the association for
+    // a type no other names, never for a type that is not known yet.
+    if (!sel.controllingResolved) return InvalidNode;
     return sel.selected.valid() ? sel.selected : InvalidNode;
 }
 
@@ -5087,15 +5755,98 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     return r.value;
 }
 
+// ── THE INITIALIZER DESCENTS OF THIS FILE TAKE THEIR STEPS BY ONE STATEMENT ─────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// What a wrapper is — a node that is nothing but grouping — is stated ONCE, for this tier
+// and for the HIR lowering: `nodeSaysSomethingItself` (`core/types/decl_prefix_strip.hpp`,
+// where the measurement that made it one statement is told). It is the static-initializer
+// check's own list (lane `cs`), lifted out of that check; the two functions below are this
+// file's walk through it and the one pair of operators that says nothing.
+
+// Descend the wrappers above `n` to the first node that says something itself — or that
+// has no single Internal child to pass through to (a leaf; a node with several operands
+// the statement does not name). Returns `n` itself when nothing is interposed; never
+// leaves the subtree. `what` names the descent for the one failure a strict-descendant
+// walk can have: a cyclic, malformed tree (`failOnCyclicTree`).
+[[nodiscard]] NodeId
+peelGroupingWrappers(SemanticConfig const& cfg, Tree const& tree, NodeId n, char const* what) {
+    auto const& hirCfg = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
+    for (std::size_t guard = 0; n.valid(); ++guard) {
+        if (guard > bound) failOnCyclicTree(what);
+        if (tree.kind(n) != NodeKind::Internal
+            || nodeSaysSomethingItself(cfg, hirCfg, tree, n)) {
+            return n;
+        }
+        NodeId sole{};
+        bool multiple = false;
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (sole.valid()) { multiple = true; break; }
+            sole = c;
+        }
+        if (multiple || !sole.valid()) return n;
+        n = sole;
+    }
+    return n;
+}
+
+// THE ONE PAIR OF OPERATORS THAT SAYS NOTHING. `&*E` is `E` and `*&E` designates `E`
+// (C 6.5.3.2p3: "neither that operator nor the & operator is evaluated and the result is
+// as if both were omitted"; p4 for the other order) — the rule the static-initializer
+// check states for itself. `E` when `n` is the operator `outer` applied (through wrappers)
+// to the operator `inner`, else an invalid node. A descent that stops at every operator
+// asks this where the pair was crossed before: ✔MEASURED 2026-10-10, gcc 13.3.0, MinGW
+// gcc 13.2.0 and AppleClang 21 take `constexpr int *p = &*(int *)0;` and clang 18.1.3
+// folds `(*&s).m` of a constant structure — both were read right only because every
+// operator was a wrapper.
+[[nodiscard]] NodeId
+cancelledUnaryPair(Tree const& tree, NodeId n, std::string_view outer, std::string_view inner) {
+    auto const& hirCfg = tree.schema().hirLowering();
+    auto const operandIf = [&](NodeId node, std::string_view target) -> NodeId {
+        if (!node.valid() || tree.kind(node) != NodeKind::Internal
+            || !hirCfg.unaryExprRule.valid() || tree.rule(node).v != hirCfg.unaryExprRule.v) {
+            return {};
+        }
+        NodeId opTok{}, operand{};
+        std::size_t operands = 0;
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) == NodeKind::Token) {
+                if (!opTok.valid()) opTok = c;
+            } else {
+                operand = c;
+                ++operands;
+            }
+        }
+        if (!opTok.valid() || operands != 1) return {};
+        for (auto const& op : hirCfg.unaryOps) {
+            if (op.token.v == tree.tokenKind(opTok).v) {
+                return op.target == target ? operand : NodeId{};
+            }
+        }
+        return {};
+    };
+    NodeId const under = operandIf(n, outer);
+    if (!under.valid()) return {};
+    return operandIf(peelGroupingWrappers(tree.schema().semantics(), tree, under,
+                                          "the cancelled operator pair"),
+                     inner);
+}
+
 // ── P33: the two constexpr-initializer predicates ──────────────────────────
 //
 // Descend through the TRANSPARENT wrappers an initializer position interposes
 // (`initValue`'s alt node, paren groups, the expression carrier) to the first
-// node that actually says something — one with 0 or 2+ Internal children, or one
-// whose rule this engine recognizes. The SAME descent shape the FC17.5 empty-brace
-// arm uses, extracted so the brace-list arm and the empty-brace arm cannot drift
-// on what "the initializer node" means. Returns `node` itself when nothing is
-// interposed; never leaves the subtree.
+// node that actually says something (`nodeSaysSomethingItself` — a brace list among
+// them; a string literal has no child to pass through to). The SAME descent the
+// FC17.5 empty-brace arm uses, extracted so the brace-list arm and the empty-brace
+// arm cannot drift on what "the initializer node" means. Returns `node` itself when
+// nothing is interposed; never leaves the subtree.
+// ★ P69 (lane `lm`): THIS WALKED THROUGH EVERY NODE WITH ONE INTERNAL CHILD — it
+// knew the brace list and the string literal and counted for the rest, so `-5`
+// answered as `5` and `sizeof(int)` as its type name. (The analysis state it takes
+// is not read any more: the statement needs the tree's own schema alone.)
 // ★ P68 round 13 (lane `cs`): NO DEPTH CAP. This loop stopped after 64 wrappers and
 // returned the wrapper it had reached AS IF it were the initializer — so a constexpr
 // pointer whose null cast sat inside 64 or more parentheses was refused, the cast never
@@ -5103,27 +5854,9 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
 // longer than the tree has nodes can only mean a cyclic (malformed) tree
 // (`failOnCyclicTree`).
 [[nodiscard]] NodeId
-descendInitWrappers(EngineState const& s, Tree const& tree, NodeId node) {
-    NodeId walk = node;
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t step = 0; walk.valid(); ++step) {
-        if (step > bound) failOnCyclicTree("the initializer wrapper descent");
-        if (tree.kind(walk) != NodeKind::Internal) return walk;
-        if (s.idx().braceInitListRule.valid()
-            && tree.rule(walk).v == s.idx().braceInitListRule.v) return walk;
-        if (s.idx().stringLiteralExprRule.valid()
-            && tree.rule(walk).v == s.idx().stringLiteralExprRule.v) return walk;
-        NodeId sole{};
-        bool   multiple = false;
-        for (NodeId c : visibleChildren(tree, walk)) {
-            if (tree.kind(c) != NodeKind::Internal) continue;
-            if (sole.valid()) { multiple = true; break; }
-            sole = c;
-        }
-        if (multiple || !sole.valid()) return walk;
-        walk = sole;
-    }
-    return walk;
+descendInitWrappers(EngineState const&, Tree const& tree, NodeId node) {
+    return peelGroupingWrappers(tree.schema().semantics(), tree, node,
+                                "the initializer wrapper descent");
 }
 
 // ★★ P33 (D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL, C 6.3.2.3p3 + 6.6): is `node` a
@@ -5168,6 +5901,29 @@ constexprPointerCastFoldsToNull(EngineState& s, SemanticConfig const& cfg,
         if (step > bound) failOnCyclicTree("the constexpr null pointer cast chain");
         cur = descendInitWrappers(s, tree, cur);
         if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) return false;
+        // `&*E` IS `E` (`cancelledUnaryPair`): gcc takes `constexpr int *p = &*(int *)0;`.
+        // Any OTHER operator over the cast is not the cast — `!(int *)0` is the integer 1,
+        // and was admitted here as a null pointer while the descent walked through it.
+        if (NodeId const same = cancelledUnaryPair(tree, cur, "AddressOf", "Deref");
+            same.valid()) {
+            cur = same;
+            continue;
+        }
+        // ★ P69 (lane `lm`): THIS IS A QUESTION OF VALUE, and a statement expression of
+        // ONE expression has that expression's value
+        // (`soleExpressionOfStatementExpression`, beside the statement of what a wrapper
+        // is). The descent above stops at the construct, as it must for a question of
+        // form — and with it this test refused `constexpr int *p = ({ (int *)0; });`,
+        // which gcc 13, mingw-w64 gcc 13.2 and AppleClang 21 accept (✔MEASURED
+        // 2026-10-12; clang 18 refuses it). What the expression inside is, is asked of
+        // it by the same loop: `({ (int *)8; })` and `({ !(int *)0; })` are refused
+        // here as they are when written bare.
+        if (NodeId const inside = soleExpressionOfStatementExpression(
+                tree.schema().hirLowering(), tree, cur);
+            inside.valid()) {
+            cur = inside;
+            continue;
+        }
         auto const it = s.idx().castByRule.find(tree.rule(cur).v);
         if (it == s.idx().castByRule.end()) return false;
         auto const& cr = tree.schema().semantics().castRules[it->second];
@@ -5264,11 +6020,43 @@ constexprScalarInitIsConstant(EngineState& s, SemanticConfig const& cfg,
 //     full-value) → else S_ConstexprNonConstantInitializer;
 //   * any OTHER kind             → S_ConstexprUnsupportedType (the fail-loud
 //     catch-all — never silent).
-void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
-                                 Tree const& tree, NodeId dNode,
-                                 NodeId nameNode, SymbolId sym, ScopeId here) {
+//
+// ★ P69: SPLIT IN TWO, so one rule serves two askers. `validateConstexprObject` is
+// every arm that reads only the OBJECT's type and its initializer; the declarator-only
+// arms (a function, the declarator's own variably-modified witness, finding the
+// initializer) stay in `validateConstexprDeclarator` below it. A C23 `constexpr`
+// COMPOUND LITERAL is the other asker (C23 6.5.3.6p4: it is judged as the definition
+// `constexpr typeof(T) ID = { IL };`) — D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR.
+// `nameNode` is where an object-level diagnostic points.
+//
+// P69 (lane `cs`, D-C-A-NAMED-CONSTANT-MEMBER-IS-NOT-AN-INTEGER-CONSTANT-EXPRESSION): does
+// `value` NAME a constexpr object? Such an object was validated at its own declaration, so
+// its value is a constant, and C23 6.7.2's own example initializes a constexpr structure from
+// one: `constexpr struct S s2 = s;` — ✔MEASURED, gcc 13.3.0 -std=c2x builds it (lane `cs`'s
+// probe rm3b m14), where the element walk below refused it. A merely `const` object is not a
+// named constant (C23 6.6p7) and stays refused — the measurement P33's walk was written from.
+// Only the measured shape, the bare name, is admitted.
+[[nodiscard]] bool namesAConstexprObject(EngineState& s, SemanticConfig const& cfg,
+                                         Tree const& tree, NodeId value, ScopeId here) {
+    if (!value.valid()) return false;
+    SymbolId sym{};
+    if (tree.kind(value) == NodeKind::Token) {
+        if (tree.tokenKind(value).v != cfg.identifierToken.v) return false;
+        sym = s.scopes.lookup(here, tree.text(value));
+    } else {
+        auto const named = extractNameNode(tree, value, NameMatchMode::Self,
+                                           cfg.identifierToken);
+        if (!named.node.valid()) return false;
+        sym = s.scopes.lookup(here, named.name);
+    }
+    if (!sym.valid()) return false;
     SymbolRecord const& rec = s.symbols.at(sym);
-    TypeId const declTy = rec.type;
+    return rec.kind == DeclarationKind::Variable && rec.isConstexpr;
+}
+
+void validateConstexprObject(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                             TypeId declTy, NodeId initNode, NodeId nameNode, ScopeId here,
+                             bool declaratorVariablyModified) {
     auto const emit = [&](DiagnosticCode code, NodeId at) {
         ParseDiagnostic d;
         d.code     = code;
@@ -5280,11 +6068,6 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
     };
     if (!declTy.valid()) return;   // cascade — the type failure already reported
     TypeInterner const& in = s.lattice.interner();
-    if (in.kind(declTy) == TypeKind::FnSig
-        || rec.kind == DeclarationKind::Function) {
-        emit(DiagnosticCode::S_ConstexprFunctionNotSupported, nameNode);
-        return;
-    }
     if (in.isVolatileQualified(declTy)) {
         emit(DiagnosticCode::S_ConstexprInvalidQualifier, nameNode);
         return;
@@ -5336,48 +6119,14 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
     //
     // The bound is located through the SHARED `arraySuffixBoundNode` (the one
     // locator every array-suffix site agrees on) and folded by the SHARED
-    // `constIntExpr` — no second reading of what an array bound is.
-    bool variablyModified = in.isVlaArray(declTy) || in.typeContainsVla(declTy);
-    if (aggregate && !variablyModified && cfg.declarators.has_value()) {
-        auto const& dc = *cfg.declarators;
-        std::vector<NodeId> stack{dNode};
-        for (int guard = 0; guard < 16384 && !stack.empty() && !variablyModified;
-             ++guard) {
-            NodeId const c = stack.back();
-            stack.pop_back();
-            if (tree.kind(c) != NodeKind::Internal) continue;
-            if (tree.rule(c).v == dc.arraySuffixRule.v) {
-                auto const bound =
-                    arraySuffixBoundNode(tree, c, dc.arraySuffixModifierTokens);
-                if (bound.has_value()
-                    && !constIntExpr(s, tree, *bound, here, &cfg).has_value()) {
-                    variablyModified = true;
-                }
-                continue;   // a suffix's own bound is not a nested declarator
-            }
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-        }
-    }
+    // `constIntExpr` — no second reading of what an array bound is. (That scan is
+    // the declarator's, in `validateConstexprDeclarator`; it arrives here as
+    // `declaratorVariablyModified`.)
+    bool const variablyModified = declaratorVariablyModified || in.isVlaArray(declTy)
+                               || in.typeContainsVla(declTy);
     if (aggregate && variablyModified) {
         emit(DiagnosticCode::S_ConstexprUnsupportedType, nameNode);
         return;
-    }
-    // The initializer subtree — the Internal child of the init-declarator that
-    // is NOT the declarator (`[declarator, '=', initValue]`; the loop's own
-    // discovery pattern). A bare declarator (rule != initDeclaratorRule — the
-    // very carriers the F1 hook-hoist exists for) has no init slot at all.
-    NodeId initNode{};
-    if (cfg.declarators.has_value()
-        && tree.rule(dNode) == cfg.declarators->initDeclaratorRule) {
-        for (NodeId c : visibleChildren(tree, dNode)) {
-            if (tree.kind(c) != NodeKind::Internal) continue;
-            if (tree.rule(c) == cfg.declarators->declaratorRule) continue;
-            // TF-C62 / TF-C88: an after-declarator DECORATION (attribute or asm
-            // label) is not the initializer.
-            if (isDeclaratorDecorationNode(tree, *cfg.declarators, c)) continue;
-            initNode = c;
-            break;
-        }
     }
     if (!initNode.valid()) {
         emit(DiagnosticCode::S_ConstexprMissingInitializer, nameNode);
@@ -5390,10 +6139,12 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
     // zero = the null pointer constant). `constExprValue` cannot fold a brace
     // list (it is not an expression), so without this arm the HIR-side scalar
     // `{}` lift would stay S_ConstexprNonConstantInitializer-rejected under
-    // constexpr. ONLY the truly-empty list is admitted here; `{5}` folds via
-    // the normal single-child-descent path below, and a malformed multi-element
-    // `{1,2}` falls through to the arithmetic/pointer arms' loud rejection
-    // (the HIR lowering also rejects it — S_InvalidScalarInitializer). The
+    // constexpr. ONLY the truly-empty list is admitted here; any other scalar
+    // brace list is folded by the arithmetic arm below through the constant
+    // evaluator, which reads a scalar's braces as their FIRST undesignated
+    // element, level by level (`valueStepChild`, P69 lane `lm`) — so `{5}`,
+    // `{{5}}` and `{5, 7}` are 5, as gcc 13.3.0 -std=c2x folds them (✔MEASURED
+    // 2026-10-16), and the lowering warns for the extra braces and the excess. The
     // descent skips TOKEN children (`{`/`}` are the brace list's own tokens)
     // and stops at the first node with 0 or 2+ Internal children, so a
     // compound literal `(int){}` (two Internal children) is NOT admitted — a
@@ -5459,6 +6210,20 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
                 emit(DiagnosticCode::S_ConstexprNonConstantInitializer, raw);
                 return;
             }
+            // ★ P69 (lane `lm`): `*&E` DESIGNATES `E` (`cancelledUnaryPair`, C 6.5.3.2p4) —
+            // the one pair of operators this walk must still cross now that the descent
+            // stops at every operator. ✔MEASURED 2026-10-10: gcc 13.2.0 / 13.3.0 and
+            // AppleClang 21 take `constexpr struct W w = { *&s, 2 };` and `constexpr struct
+            // S t = *&s;`, which were admitted here only because the descent walked through
+            // both operators to the name. Any OTHER operator over a constant object is
+            // judged as what it is: `{ &k }` is an address, not the object `k`, and those
+            // three refuse it (a `constexpr` pointer is null) where this walk took it for
+            // the object under the `&`.
+            if (NodeId const designated = cancelledUnaryPair(tree, value, "Deref", "AddressOf");
+                designated.valid()) {
+                pending.push_back(designated);
+                continue;
+            }
             bool const isBrace =
                 tree.kind(value) == NodeKind::Internal
                 && s.idx().braceInitListRule.valid()
@@ -5486,6 +6251,8 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
             if (tree.kind(value) == NodeKind::Internal
                 && s.idx().stringLiteralExprRule.valid()
                 && tree.rule(value).v == s.idx().stringLiteralExprRule.v) continue;
+            // P69: an element initialized WHOLE by a named constexpr object.
+            if (namesAConstexprObject(s, cfg, tree, value, here)) continue;
             if (constexprScalarInitIsConstant(s, cfg, tree, value, here)) continue;
             emit(DiagnosticCode::S_ConstexprNonConstantInitializer, value);
             return;
@@ -5524,6 +6291,72 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         return;
     }
     emit(DiagnosticCode::S_ConstexprUnsupportedType, nameNode);
+}
+
+// The DECLARATOR half: a function is not a constexpr object; the declarator's own array
+// bounds are the second witness of a variably modified type (see the ★★ TWO TESTS note in
+// `validateConstexprObject`); and the initializer is the init-declarator's child.
+void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
+                                 Tree const& tree, NodeId dNode,
+                                 NodeId nameNode, SymbolId sym, ScopeId here) {
+    SymbolRecord const& rec = s.symbols.at(sym);
+    TypeId const declTy = rec.type;
+    if (!declTy.valid()) return;   // cascade — the type failure already reported
+    TypeInterner const& in = s.lattice.interner();
+    if (in.kind(declTy) == TypeKind::FnSig
+        || rec.kind == DeclarationKind::Function) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ConstexprFunctionNotSupported;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = std::string{tree.text(nameNode)};
+        s.reporter.report(std::move(d));
+        return;
+    }
+    TypeKind const k = in.kind(declTy);
+    bool const aggregate =
+        k == TypeKind::Array || k == TypeKind::Struct || k == TypeKind::Union;
+    bool variablyModified = false;
+    if (aggregate && !in.isVlaArray(declTy) && !in.typeContainsVla(declTy)
+        && cfg.declarators.has_value()) {
+        auto const& dc = *cfg.declarators;
+        std::vector<NodeId> stack{dNode};
+        for (int guard = 0; guard < 16384 && !stack.empty() && !variablyModified;
+             ++guard) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c).v == dc.arraySuffixRule.v) {
+                auto const bound =
+                    arraySuffixBoundNode(tree, c, dc.arraySuffixModifierTokens);
+                if (bound.has_value()
+                    && !constIntExpr(s, tree, *bound, here, &cfg).has_value()) {
+                    variablyModified = true;
+                }
+                continue;   // a suffix's own bound is not a nested declarator
+            }
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        }
+    }
+    // The initializer subtree — the Internal child of the init-declarator that
+    // is NOT the declarator (`[declarator, '=', initValue]`; the loop's own
+    // discovery pattern). A bare declarator (rule != initDeclaratorRule — the
+    // very carriers the F1 hook-hoist exists for) has no init slot at all.
+    NodeId initNode{};
+    if (cfg.declarators.has_value()
+        && tree.rule(dNode) == cfg.declarators->initDeclaratorRule) {
+        for (NodeId c : visibleChildren(tree, dNode)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c) == cfg.declarators->declaratorRule) continue;
+            // TF-C62 / TF-C88: an after-declarator DECORATION (attribute or asm
+            // label) is not the initializer.
+            if (isDeclaratorDecorationNode(tree, *cfg.declarators, c)) continue;
+            initNode = c;
+            break;
+        }
+    }
+    validateConstexprObject(s, cfg, tree, declTy, initNode, nameNode, here, variablyModified);
 }
 
 // SE-arrays: if `decl` configures an array declarator suffix and a node of that
@@ -5603,9 +6436,9 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // form that `allowFlexibleArray` (a struct field) is a flexible/incomplete
     // array (C99 §6.7.2.1). It is an INCOMPLETE type, legal only as a struct's
     // LAST field; the type_layout engine lays a FAM struct out correctly and
-    // fails loud on a non-last FAM. A standalone `T x[]` (a local/global — NOT
-    // `allowFlexibleArray`) keeps the `S_NonConstantArrayLength` error below.
-    // Distinct from a present-but-non-constant length (`T x[n]`), always an error.
+    // fails loud on a non-last FAM. A standalone `T x[]` (a local/global) is the same
+    // incomplete type (P69: the arm below), refused where it is an OBJECT's type.
+    // Distinct from a present-but-non-constant length (`T x[n]`).
     bool const absentLength =
         !lenNode.valid() || tree.kind(lenNode) != NodeKind::Internal;
     // c82: `paramAdjustments` (C 6.7.6.3p7 parameter adjustment) admits the
@@ -5621,9 +6454,17 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // declares an `arraySuffix` facet today, so this arm is unreachable in
     // practice; it is written anyway because the two resolvers drifting is the
     // failure mode this pairing exists to prevent.
-    if (absentLength
-        && (decl.allowFlexibleArray || decl.paramAdjustments
-            || decl.kind == DeclarationKind::Type)) {
+    // P69 (lane `cs`): kept arm-for-arm with the declarator-mode twin, which now
+    // builds the incomplete array for an absent bound on EVERY row (C 6.7.6.2p4) and
+    // judges the object, not the row; the element rule (C 6.7.6.2p1) is that twin's
+    // too.
+    if (absentLength) {
+        if (s.lattice.interner().isIncompleteArray(base)) {
+            emit(DiagnosticCode::S_ArrayElementTypeIncomplete,
+                 "an array's element type cannot be an array of unknown size — only "
+                 "the outermost bound of an array may be omitted (C 6.7.6.2p1)");
+            return InvalidType;
+        }
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
@@ -6068,6 +6909,14 @@ declarationNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
                          NodeId declNode, DeclarationRule const& decl) {
     NoreturnSpelling out = specifierPrefixNamesNoreturn(cfg, tree, declNode, decl);
     if (decl.kind == DeclarationKind::Type) return out;   // the fork, above
+    // P69 round 4 (lane `cs`): the runs written INSIDE the head are the
+    // declaration's too (`headAttributeRuns` — the list the attribute fold and the
+    // lowering's linkage fold read), so `void __attribute__((noreturn))` written
+    // between two specifiers of the return type confers as the prefix spelling does.
+    for (NodeId run : headAttributeRuns(
+             cfg, tree, declarationHeadNode(tree, declNode, decl))) {
+        scanNoreturnSpelling(cfg, tree, run, out);
+    }
     // ★★★ P56
     // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY): the
     // slot loop now asks the CONFIG which slots are declaration-level. It used
@@ -6217,6 +7066,28 @@ declaratorTrailingNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
             }
             break;
         }
+    }
+    return out;
+}
+
+// ★★ P69 round 4 (lane `cs`) — THE FOURTH ROOT: a `noreturn` written INSIDE the
+// declarator, beside the declared name (`void (* __attribute__((noreturn)) np)
+// (void)`). Which specifiers stand there is `nameAdjacentAttributeSpecifiers`'s
+// answer, the one the attribute fold and the lowering's linkage fold read, so the
+// three cannot see different positions.
+// ✔MEASURED (probe ta8, gcc 13.3.0): a function whose only way out calls through
+// such a pointer draws no -Wreturn-type — the pointer IS noreturn. clang 18.1.3
+// agrees about the pointer and then refuses to initialize it from a function that
+// is not declared noreturn; the two differ on the initializer, not on the position.
+// ⛔ The `kind: "type"` exclusion of the two folds above is kept here for their
+// reason: on a function-type typedef the references split on what `noreturn` means.
+[[nodiscard]] NoreturnSpelling
+declaratorNameAdjacentNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                                    NodeId dNode, DeclarationRule const& decl) {
+    NoreturnSpelling out;
+    if (decl.kind == DeclarationKind::Type) return out;   // the fork, untouched
+    for (NodeId an : nameAdjacentAttributeSpecifiers(tree, cfg, dNode)) {
+        scanNoreturnSpelling(cfg, tree, an, out);
     }
     return out;
 }
@@ -6377,13 +7248,17 @@ struct SpecifierStorageFacts {
     NodeId conflictFirst{};
     NodeId conflictSecond{};
 };
+// The scan itself, over ANY specifier run rooted at `prefix` and judged by ONE
+// `linkageSpecifiers` map — a declaration's own prefix (`scanSpecifierPrefixStorage`
+// below), or a C23 compound literal's storage-class specifiers judged as the
+// declaration row of its scope (P69, `judgeCompoundLiteralStorage`), so the two can
+// never fold a facet or an exclusion group differently.
 [[nodiscard]] SpecifierStorageFacts
-scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
-                           NodeId declNode, DeclarationRule const& decl) {
+scanSpecifierStorage(SemanticConfig const& cfg, Tree const& tree, NodeId prefix,
+                     std::unordered_map<std::string, LinkageSpecifierEffect> const& specifiers,
+                     std::vector<RuleId> const& ignoredRules) {
     SpecifierStorageFacts out;
-    if (decl.linkageSpecifiers.empty()) return out;
-    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
-    if (!prefix.valid()) return out;
+    if (specifiers.empty() || !prefix.valid()) return out;
     // C 6.7.1p2 bookkeeping: every prefix token that resolved to an entry
     // declaring an `exclusiveGroup`, with the spelling the user wrote (the
     // diagnostic must show the source, never a derived key).
@@ -6399,7 +7274,7 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) == NodeKind::Internal) {
             bool skip = false;
-            for (RuleId rid : decl.linkageSpecifierIgnoredRules) {
+            for (RuleId rid : ignoredRules) {
                 if (tree.rule(c).v == rid.v) { skip = true; break; }
             }
             // ★★ AN ATTRIBUTE CLAUSE NAME IS NOT A DECLARATION SPECIFIER.
@@ -6471,8 +7346,8 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
             for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
             continue;
         }
-        auto it = decl.linkageSpecifiers.find(std::string{tree.text(c)});
-        if (it == decl.linkageSpecifiers.end()) continue;
+        auto it = specifiers.find(std::string{tree.text(c)});
+        if (it == specifiers.end()) continue;
         if (it->second.threadStorage) out.threadStorage = true;
         if (it->second.staticStorage) out.staticStorage = true;
         if (it->second.nonDefining)   out.nonDefining   = true;
@@ -6528,6 +7403,16 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
         }
     }
     return out;
+}
+
+[[nodiscard]] SpecifierStorageFacts
+scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
+                           NodeId declNode, DeclarationRule const& decl) {
+    if (decl.linkageSpecifiers.empty()) return {};
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return {};
+    return scanSpecifierStorage(cfg, tree, prefix, decl.linkageSpecifiers,
+                                decl.linkageSpecifierIgnoredRules);
 }
 
 // ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): IS THIS
@@ -6676,6 +7561,37 @@ struct AttributeSemanticsFacts {
     // nullopt = no `aligned` clause (or every one of them errored / folded to the
     // 6.7.5p3 no-op zero).
     std::optional<std::uint32_t> alignment;
+    // P69 (lane `cs`): the clause whose request stands in `alignment` — read only
+    // to order two requests of a row that takes the LAST one (`foldAlignmentRequest`).
+    NodeId                       alignmentClause{};
+    // ★★ P69 (lane `cs`) — THE REQUEST OF AN `Align` ROW THAT ONLY RAISES
+    // (`AttributeSemanticsRow::alignOnTypeAliasOnlyRaises`), kept APART from
+    // `alignment` because the two mean different things in exactly one place: a
+    // type alias takes `alignment` EXACTLY (GNU `aligned(2)` on an `int` alias makes
+    // a 2-aligned type) and takes this one only when it is LARGER than what the
+    // aliased type already has. On an object and on a member both only raise. One
+    // number could not carry both: folded together, a raise-only 1 would weaken an
+    // alias, or an exact 2 would be lost behind a raise-only 16.
+    std::optional<std::uint32_t> alignmentFloor;
+    NodeId                       alignmentFloorClause{};
+
+    // P69 (lane `cs`): every `alias("target")` clause of the declaration, in the
+    // order folded. `target` is the clause's ONE string argument, decoded; nullopt
+    // when the clause has none, or more than one (both refused by name at the
+    // declarator). More than one clause on one declaration is refused there too:
+    // every reference refuses the attribute twice, with one target or two.
+    struct SymbolAliasClause {
+        std::optional<std::string> target;
+        NodeId                     clauseNode{};
+        NodeId                     nameToken{};
+    };
+    std::vector<SymbolAliasClause> symbolAliases;
+    // P69 (lane `cs`): the `common` / `nocommon` clauses (the last of each kind
+    // folded), kept as clauses so the declarator can say which one it ignores.
+    NodeId commonClause{};
+    NodeId commonNameToken{};
+    NodeId noCommonClause{};
+    NodeId noCommonNameToken{};
 
     // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): EVERY MATCHED
     // CLAUSE, kept as itself so the decl-kind gate can REPORT.
@@ -6699,6 +7615,7 @@ struct AttributeSemanticsFacts {
         std::string                  name;          // dunder-normalized spelling
         AttributeSemanticsRow const* row = nullptr; // the matched effects row
         NodeId                       clauseNode{};  // the clause, for the span
+        NodeId                       nameToken{};   // the token `name` was read from
     };
     std::vector<KindScopedClause> kindScopedClauses;
 };
@@ -6837,6 +7754,36 @@ attrNodeAppertainment(SemanticConfig const& cfg, Tree const& tree,
     return cfg.identifierToken.valid() && kind == cfg.identifierToken;
 }
 
+// ★★ P69 (lane `cs`) — THE NAME TOKEN OF ONE ATTRIBUTE CLAUSE: the LAST
+// clause-name token among the clause node's DIRECT visible children (the final
+// segment of a `ns::name`), with one exclusion.
+//
+// THE SPECIFIER'S OPENING TOKEN IS ITS FRAME, NEVER A NAME. The clause-name class
+// admits every keyword kind (a clause may be named `const`), and the token that
+// opens a specifier is a keyword — so "the last name-shaped direct child" of an
+// EMPTY specifier (`__attribute__(())`, `__declspec()`) used to be the introducer
+// itself, and an attribute nobody wrote was reported by that name. Clause #1 of a
+// specifier IS the specifier node, so that is the one node whose first token is
+// skipped, and only when a spelling row (`spelling`, the clause's own) says that
+// token opens the frame. Every reader of a clause's name asks here.
+[[nodiscard]] NodeId
+attrClauseNameToken(SemanticConfig const& cfg, Tree const& tree, NodeId clauseNode,
+                    AttributeSpelling const* spelling) {
+    bool skipOpeningToken =
+        spelling != nullptr && cfg.attrSpecRule.valid()
+        && tree.kind(clauseNode) == NodeKind::Internal
+        && tree.rule(clauseNode).v == cfg.attrSpecRule.v;
+    NodeId nameTok{};
+    for (NodeId c : visibleChildren(tree, clauseNode)) {
+        if (tree.kind(c) != NodeKind::Token) continue;
+        if (skipOpeningToken) { skipOpeningToken = false; continue; }
+        if (isAttrClauseNameToken(cfg, tree.tokenKind(c))) {
+            nameTok = c;   // LAST name token wins → the ::-final segment
+        }
+    }
+    return nameTok;
+}
+
 // TF-C73: enumerate the CLAUSES of ONE attribute node, and report which FORM it
 // is (return true = the C23 `[[...]]` standard form, whose unknown names are
 // standard-IGNORABLE; false = the GNU `__attribute__` form, whose unknown names
@@ -6896,6 +7843,123 @@ collectAttrClauses(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode,
             if (tree.kind(g) == NodeKind::Internal) stack.push_back(g);
     }
     return false;   // the GNU, fail-loud form
+}
+
+// ★★ P69 (lane `cs`) — THREAD STORAGE REQUESTED BY AN ATTRIBUTE CLAUSE
+// (`__declspec(thread)`), READ WHEN THE SYMBOL IS RECORDED.
+//
+// A storage keyword is a token of the specifier run and `scanSpecifierStorage`
+// finds it there. A storage REQUEST written as an attribute clause is not: it is
+// one clause of a specifier, in any of the positions a declaration's attributes
+// are read at, and its name means storage only in the spelling that says so. So
+// the declaration row keys it by the clause's QUALIFIED name
+// (`linkageSpecifiers["<qualifier>(<name>)"]`, `attributeSemantics.spellings`),
+// and this scan reads ONLY such keys: the plain name of a clause is never looked
+// up in the linkage map here, or `__attribute__((thread_local))` — not an
+// attribute in any toolchain — would confer thread storage through the keyword's
+// entry.
+//
+// It must be answered at RECORD time, not by the attribute fold a pass later:
+// `SymbolRecord::isThreadLocal` is what the redeclaration merge compares, at
+// declare time, and what every later tier reads.
+//
+// The roots are the ones the attribute fold, the noreturn fold and the lowering's
+// linkage fold read, so that a request is honoured wherever it is accepted:
+//   * the declaration's: its specifier prefix, the runs inside its type head
+//     (`headAttributeRuns` — which include a specifier written after a composite
+//     body when its spelling says that is the declaration's), and its
+//     declaration-appertaining slots (`int __declspec(thread) x;`, cl's own
+//     documented placement);
+//   * the declarator's own: the specifiers beside its name, its
+//     declarator-appertaining trailing runs, and — for the last declarator — the
+//     declarator-appertaining slots of the declaration.
+struct AttributeStorageRequest {
+    bool thread = false;
+    // Whether EVERY specifier that requested thread storage is one that yields
+    // when another declaration disagrees (`threadStorageYieldsOnMismatch`).
+    // Meaningful only when `thread`.
+    bool everyRequestYields = true;
+};
+
+void scanAttributeStorage(SemanticConfig const& cfg, Tree const& tree, NodeId root,
+                          DeclarationRule const& decl, AttributeStorageRequest& out) {
+    if (!root.valid()) return;
+    std::vector<NodeId> attrNodes;
+    collectAttrNodes(cfg, tree, root, attrNodes);
+    std::vector<NodeId> clauses;
+    for (NodeId an : attrNodes) {
+        AttributeSpelling const* const spelling = attributeSpellingOf(cfg, tree, an);
+        if (spelling == nullptr || spelling->qualifier.empty()) continue;
+        clauses.clear();
+        (void)collectAttrClauses(cfg, tree, an, clauses);
+        for (NodeId cl : clauses) {
+            NodeId const nameTok = attrClauseNameToken(cfg, tree, cl, spelling);
+            if (!nameTok.valid()) continue;
+            auto const it = decl.linkageSpecifiers.find(
+                spelling->qualified(stripDunder(tree.text(nameTok))));
+            if (it == decl.linkageSpecifiers.end() || !it->second.threadStorage) {
+                continue;
+            }
+            out.thread = true;
+            if (!it->second.threadStorageYieldsOnMismatch) {
+                out.everyRequestYields = false;
+            }
+        }
+    }
+}
+
+[[nodiscard]] AttributeStorageRequest
+declaratorAttributeStorage(SemanticConfig const& cfg, Tree const& tree,
+                           NodeId declNode, DeclarationRule const& decl,
+                           NodeId dNode, bool isLastDeclarator) {
+    AttributeStorageRequest out;
+    if (cfg.attributeSpellings.empty()) return out;
+    // Most rows key no thread storage by a qualified name, and for them this must
+    // cost one pass over a small map and no tree walk.
+    bool keyed = false;
+    for (auto const& [key, effect] : decl.linkageSpecifiers) {
+        if (effect.threadStorage && key.find('(') != std::string::npos) {
+            keyed = true;
+            break;
+        }
+    }
+    if (!keyed) return out;
+    scanAttributeStorage(cfg, tree, specifierPrefixChild(tree, declNode, decl), decl,
+                         out);
+    for (NodeId run :
+         headAttributeRuns(cfg, tree, declarationHeadNode(tree, declNode, decl))) {
+        scanAttributeStorage(cfg, tree, run, decl, out);
+    }
+    for (NodeId slot : visibleChildren(tree, declNode)) {
+        if (tree.kind(slot) != NodeKind::Internal) continue;
+        for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+            if (tree.rule(slot).v != sr.rule.v) continue;
+            if (sr.appertainsTo == AttrAppertainment::Declaration
+                || (sr.appertainsTo == AttrAppertainment::Declarator
+                    && isLastDeclarator)) {
+                scanAttributeStorage(cfg, tree, slot, decl, out);
+            }
+            break;
+        }
+    }
+    if (!dNode.valid() || !cfg.declarators.has_value()) return out;
+    for (NodeId an : nameAdjacentAttributeSpecifiers(tree, cfg, dNode)) {
+        scanAttributeStorage(cfg, tree, an, decl, out);
+    }
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (tree.kind(dNode) != NodeKind::Internal) return out;
+    for (NodeId c : visibleChildren(tree, dNode)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        for (AttrRunRule const& ar : dc.afterDeclaratorAttrRules) {
+            if (tree.rule(c).v != ar.rule.v) continue;
+            if (runAppertainmentFor(tree, dc, ar, dNode)
+                == AttrAppertainment::Declarator) {
+                scanAttributeStorage(cfg, tree, c, decl, out);
+            }
+            break;
+        }
+    }
+    return out;
 }
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): extract ONE attribute clause from a
@@ -6963,6 +8027,17 @@ struct AttributeClause {
     std::string_view                name;      // dunder-normalized final name segment
     std::optional<std::string>      message;   // decoded string argument (nullopt = NONE)
     AttributeSemanticsRow const*    row = nullptr;   // matched effect row (nullptr = unmodelled)
+    // The token `name` was read from. It is what the declaration-kind gate hands
+    // the model when it ignores the clause (`attributeNameIgnoredForKind`), so
+    // the linkage fold one tier down can skip exactly this name.
+    NodeId                          nameToken{};
+    // P69 (lane `cs`): the spelling the clause is written in
+    // (`attributeSemantics.spellings`; nullptr = a specifier with no spelling
+    // row, and every clause of the standard form). `row` was looked up under
+    // the spelling's QUALIFIED name first and under `name` second, so a reader
+    // that needs the row never repeats the lookup by `name` alone — it would
+    // miss every row that exists only under a qualified name.
+    AttributeSpelling const*        spelling = nullptr;
 };
 //
 // ★ TF-C73 `emitDiagnostics` — the DOUBLE-FIRE gate. The two `failLoud` calls
@@ -6980,22 +8055,29 @@ struct AttributeClause {
 extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
                      Tree const& tree, NodeId clauseNode,
                      bool emitDiagnostics) {
-    NodeId nameTok{};
-    for (NodeId c : visibleChildren(tree, clauseNode)) {
-        if (tree.kind(c) != NodeKind::Token) continue;
-        if (isAttrClauseNameToken(cfg, tree.tokenKind(c))) {
-            nameTok = c;   // LAST name token wins → the ::-final segment
-        }
-    }
+    AttributeSpelling const* const spelling =
+        enclosingAttributeSpelling(cfg, tree, clauseNode);
+    NodeId const nameTok = attrClauseNameToken(cfg, tree, clauseNode, spelling);
     if (!nameTok.valid()) return std::nullopt;
     AttributeClause out;
-    out.name = stripDunder(tree.text(nameTok));
-    for (auto const& r : cfg.attributeEffects) {
-        for (auto const& nm : r.names) {
-            if (out.name == nm) { out.row = &r; break; }
+    out.name      = stripDunder(tree.text(nameTok));
+    out.nameToken = nameTok;
+    out.spelling  = spelling;
+    // The row: under the spelling's QUALIFIED name first (`__declspec(align)` is
+    // not GNU `aligned`'s rule, and `__declspec(thread)` is nothing in the GNU
+    // spelling), then under the plain name every spelling shares.
+    auto const rowNamed = [&](std::string_view key) -> AttributeSemanticsRow const* {
+        for (auto const& r : cfg.attributeEffects) {
+            for (auto const& nm : r.names) {
+                if (key == nm) return &r;
+            }
         }
-        if (out.row != nullptr) break;
+        return nullptr;
+    };
+    if (spelling != nullptr && !spelling->qualifier.empty()) {
+        out.row = rowNamed(spelling->qualified(out.name));
     }
+    if (out.row == nullptr) out.row = rowNamed(out.name);
     if (!s.idx().stringLiteralBodyToken.valid()) return out;
     // A string-literal ARGUMENT node: the language's declared string-expression
     // rule when it has one, else any node the shared chokepoint can decode (one
@@ -7084,6 +8166,66 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
                                  "string argument", out.name));
     }
     return out;
+}
+
+// ★★ P69 (lane `cs`) — ONE ALIGNMENT REQUEST MEETS THE ONE ALREADY STANDING.
+//
+// `value` / `standing` are one slot of one declaration's (or one definition's)
+// folded requests: the alignment that stands and the clause that asked for it.
+// `want` is what `clauseNode`, a clause of `row`, asks for. How the two meet is the
+// ROW's statement and nothing here knows a spelling:
+//   * a row that takes the LARGEST (the default; C 6.7.5p6's rule for `alignas`,
+//     and GNU `aligned`'s) — the larger stands, nothing is discarded;
+//   * a row that takes the LAST (`alignRepeatTakesLast`) — the one written later in
+//     the source stands, and the other is returned as DISCARDED so the emitting
+//     visit can say so. Source order is read from the spans, never from the order
+//     the roots happen to be scanned in: a declaration's attribute positions are
+//     visited prefix first and declarator runs last, which is not always the order
+//     they were written in.
+// The same clause met twice (a declaration-level request copied into each
+// declarator's facts and then seen again) is not a repeat.
+[[nodiscard]] NodeId
+foldAlignmentRequest(Tree const& tree, AttributeSemanticsRow const& row,
+                     std::optional<std::uint32_t>& value, NodeId& standing,
+                     std::uint32_t want, NodeId clauseNode) {
+    if (!value.has_value()) {
+        value    = want;
+        standing = clauseNode;
+        return {};
+    }
+    if (standing.valid() && standing.v == clauseNode.v) return {};
+    if (!row.alignRepeatTakesLast) {
+        if (want > *value) {
+            value    = want;
+            standing = clauseNode;
+        }
+        return {};
+    }
+    bool const thisIsLater =
+        !standing.valid()
+        || tree.span(clauseNode).start() >= tree.span(standing).start();
+    NodeId const discarded = thisIsLater ? standing : clauseNode;
+    if (thisIsLater) {
+        value    = want;
+        standing = clauseNode;
+    }
+    return discarded;
+}
+
+// The warning for a request `foldAlignmentRequest` returned as discarded. One
+// sentence, issued by whichever scan is the emitting visit of that clause.
+void reportDiscardedAlignmentRequest(EngineState& s, Tree const& tree,
+                                     NodeId discarded, std::string_view name) {
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+    d.severity = DiagnosticSeverity::Warning;
+    d.buffer   = tree.source().id();
+    d.span     = tree.span(discarded);
+    d.actual   = std::format(
+        "attribute '{}' is ignored and its effect was discarded: it is written "
+        "more than once on this declaration, and the one written last is the one "
+        "that stands", name);
+    s.reporter.report(std::move(d));
 }
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the attribute-semantics effects
@@ -7261,7 +8403,8 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                             bool emitUnknown, AttributeSemanticsFacts& out,
                             ScopeId fromScope = {},
                             DeclarationRule const* owningDecl = nullptr,
-                            bool appertainsToType = false) {
+                            bool appertainsToType = false,
+                            bool withinDeclarator = false) {
     if (!startNode.valid()) return;
     if (cfg.attributeEffects.empty()) return;
     if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
@@ -7365,6 +8508,30 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
         //     throwaway sink's are discarded, so it never fired for a
         //     type-grain run. Reporting here is what replaces it, with a reason
         //     that is actually true of the position.
+        //
+        // ★ P69 round 4 (lane `cs`): the two verbs judged PER ATTRIBUTE SPECIFIER
+        // (`callingConvention`, `unsupported`) are no declaration's to fold — their
+        // answer is the same wherever the specifier stands, and Pass 2 gives it
+        // once (`judgeAttributeSpecifier`). Returned BEFORE the type-grain arm so
+        // a refused attribute is not also reported as "ignored", and before the
+        // decl-kind record so that gate has nothing to say about it either.
+        if (row->effect == AttributeEffect::CallingConvention
+            || row->effect == AttributeEffect::Unsupported) {
+            return;
+        }
+        // ★ P69 round 4 (lane `cs`): `withinDeclarator` SAYS THE ROOT IS A RUN
+        // WRITTEN INSIDE THE DECLARATOR, BESIDE THE DECLARED NAME (`int *
+        // __attribute__((…)) p`). Every clause there is this declarator's own —
+        // folded exactly as the after-declarator run is — EXCEPT one whose row
+        // stays with the type that position forms (`AttributeSemanticsRow::
+        // staysWithTypeInDeclarator`): `aligned` is the pointer's, applied by the
+        // type machinery (`typePositionAligned`), and `packed` / `unused` /
+        // `deprecated` decorate a type that has nothing to pack, to mark used or
+        // to deprecate. Neither is folded here and neither is recorded for the
+        // decl-kind gate; what there is to say about them Pass 2 says once
+        // (`judgeAttributeSpecifier`), with the reason that is true of the
+        // position.
+        if (withinDeclarator && row->staysWithTypeInDeclarator) return;
         if (appertainsToType) {
             if (emitUnknown) {
                 ParseDiagnostic d;
@@ -7394,15 +8561,16 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
         //
         // A `none`-verb clause is recorded too and exempted STRUCTURALLY at the
         // gate (`appliesTo.empty()`); the loader is what makes that equivalent to
-        // "the verb is `none`", by REQUIRING a non-empty `appliesTo` on every
-        // other verb and REFUSING the key on `none`.
+        // "the row declares no kind axis", by REQUIRING a non-empty `appliesTo` on
+        // every verb that names an effect on the declared entity. (The two verbs
+        // judged per attribute specifier never get here: the branch above.)
         //
         // `clause->name` is COPIED, not moved: the Align arm below still formats
         // with it (and it is a `string_view` into the tree, so it is a copy either
         // way at this boundary).
         out.kindScopedClauses.push_back(
             AttributeSemanticsFacts::KindScopedClause{
-                std::string{clause->name}, row, clauseNode});
+                std::string{clause->name}, row, clauseNode, clause->nameToken});
         switch (row->effect) {
             case AttributeEffect::SuppressUnused:
                 out.maybeUnused = true;
@@ -7422,8 +8590,39 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // through the SAME `foldAlignmentOperand` ladder `alignas` uses —
                 // one power-of-two check, one >256 cap, one non-constant check, the
                 // same three diagnostic codes. MAX-fold per C 6.7.5p6.
+                // P69 (lane `cs`): which slot the request lands in, and how it
+                // meets one already there, are the ROW's (`foldAlignmentRequest`).
+                bool const raiseOnly = row->alignOnTypeAliasOnlyRaises;
+                auto& slotValue  = raiseOnly ? out.alignmentFloor : out.alignment;
+                auto& slotClause = raiseOnly ? out.alignmentFloorClause
+                                             : out.alignmentClause;
+                auto const meet = [&](std::uint32_t want) {
+                    NodeId const discarded = foldAlignmentRequest(
+                        tree, *row, slotValue, slotClause, want, clauseNode);
+                    if (discarded.valid() && emitUnknown) {
+                        reportDiscardedAlignmentRequest(s, tree, discarded,
+                                                        clause->name);
+                    }
+                };
                 NodeId const operand =
                     attrClauseArgOperand(cfg, tree, clauseNode);
+                if (!operand.valid() && row->alignWithoutOperandIsIgnored) {
+                    // A row whose bare form asks for nothing: said, never applied.
+                    if (emitUnknown) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                        d.severity = DiagnosticSeverity::Warning;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(clauseNode);
+                        d.actual   = std::format(
+                            "attribute '{}' is ignored and its effect was "
+                            "discarded: it names no alignment, and written this "
+                            "way a request without one asks for nothing",
+                            clause->name);
+                        s.reporter.report(std::move(d));
+                    }
+                    break;
+                }
                 if (!operand.valid()) {
                     // ★★★ P66 (lane `ag`) — BARE `__attribute__((aligned))` IS THE
                     // TARGET'S DECLARED MAXIMUM, READ FROM THE TARGET.
@@ -7441,17 +8640,13 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                     // matrix and for why a missing block confers nothing SILENTLY.
                     // The MAX cross-clause fold below applies to it unchanged, so
                     // `((aligned(32), aligned))` is 32.
-                    if (auto const m = targetMaxUsefulAlignment(s)) {
-                        if (!out.alignment.has_value() || *m > *out.alignment)
-                            out.alignment = m;
-                    }
+                    if (auto const m = targetMaxUsefulAlignment(s)) meet(*m);
                     break;
                 }
                 if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
                                                   /*diagNode=*/clauseNode,
                                                   fromScope)) {
-                    if (!out.alignment.has_value() || *a > *out.alignment)
-                        out.alignment = a;
+                    meet(*a);
                 }
                 break;
             }
@@ -7604,6 +8799,31 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // sizeof, same _Alignof, wrong bytes.
                 out.packField = true;
                 break;
+            case AttributeEffect::SymbolAlias:
+                // P69 (lane `cs`): the clause and its one string, kept as written —
+                // the target is resolved by symbol name at the end of the unit
+                // (`resolveSymbolAliases`), where every definition is known, and
+                // what the declarator can say about the clause it says there. The
+                // same clause met twice (a declaration-level clause copied into the
+                // declarator's facts and reached again) is one clause.
+                if (std::ranges::none_of(out.symbolAliases, [&](auto const& a) {
+                        return a.clauseNode.v == clauseNode.v;
+                    })) {
+                    out.symbolAliases.push_back(AttributeSemanticsFacts::SymbolAliasClause{
+                        clause->message, clauseNode, clause->nameToken});
+                }
+                break;
+            case AttributeEffect::TentativeMayBeCommon:
+                out.commonClause    = clauseNode;
+                out.commonNameToken = clause->nameToken;
+                break;
+            case AttributeEffect::TentativeNeverCommon:
+                out.noCommonClause    = clauseNode;
+                out.noCommonNameToken = clause->nameToken;
+                break;
+            case AttributeEffect::CallingConvention:
+            case AttributeEffect::Unsupported:
+                break;   // not reached: returned above, judged once by Pass 2
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
         }
@@ -7615,9 +8835,401 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
     collectAttrNodes(cfg, tree, startNode, attrNodes);
     std::vector<NodeId> clauses;
     for (NodeId an : attrNodes) {
+        // ★ P69 round 4 (lane `cs`): a diagnostic-owning scan (`emitUnknown` — the
+        // once-per-declaration visit) OWNS the specifiers it walks. Pass 2 visits
+        // every attribute specifier of the tree and gives a POSITIONAL reading —
+        // a type name's, a pointer layer's, a parenthesized declarator's — only to
+        // the ones nobody owns, so none is judged twice and none by nobody.
+        if (emitUnknown) {
+            s.attrSpecifiersJudgedByADeclaration.insert(
+                (static_cast<std::uint64_t>(tree.id().v) << 32) | an.v);
+        }
         clauses.clear();
         bool const stdForm = collectAttrClauses(cfg, tree, an, clauses);
         for (NodeId cl : clauses) foldClause(cl, stdForm);
+    }
+}
+
+// ★★ P69 round 4 (lane `cs`) — `aligned(N)` WRITTEN AT A TYPE POSITION.
+//
+// `aligned` is the one attribute of the table that MEANS something where no entity
+// is declared: directly in a type name, in a pointer layer, at the start of a
+// parenthesized declarator. `roots` are the attribute specifiers (or runs) of ONE
+// such position and `ty` is the type that position decorates; the answer is `ty`
+// carrying the requested alignment as its own skin — the same skin a typedef's
+// `aligned` mints (`resolveDeclTypesPost`'s type-alias arm), under the same
+// conditions and for the reasons that arm states: no layout parameters ⇒ nothing
+// is minted, and a request EQUAL to natural mints nothing because it would cost
+// type identity for no gain. A request below natural LOWERS, as it does on a
+// typedef. Several requests at one position take the largest; a bare `aligned` is
+// the target's largest useful alignment (the fold's own rules, unchanged).
+//
+// ✔MEASURED (lane `cs`'s probes ta4, ta6 and ta8; gcc 13.3.0 = mingw-w64 gcc 13.2.0
+// on every cell). In a TYPE NAME: `sizeof` / `_Alignof` of `__attribute__((aligned
+// (16))) int` are 4 / 16; of `… int *` and `int __attribute__((aligned(16))) *`,
+// 8 / 16 with a 4-aligned pointee (the WHOLE named type); of `int *
+// __attribute__((aligned(16)))`, 8 / 16; of `int * __attribute__((aligned(16))) *`,
+// an 8-aligned pointer to a 16-aligned one; `… int [3]` is 12 bytes aligned to 16;
+// `__attribute__((aligned(1))) int` is 4 / 1; two requests of 16 and 32 give 32.
+// The C23 spelling after the base (`int [[gnu::aligned(16)]] *`) aligns the BASE.
+// In a DECLARATOR: `int * __attribute__((aligned(16))) p;` is 8 / 16 on gcc AND
+// clang; `int (__attribute__((aligned(16))) arr)[2];` is 8 / 16 on both.
+//
+// ⚠ THE REFERENCES SPLIT ON THE TYPE-NAME CELLS, AND THIS IS GCC'S READING. clang
+// 18.1.3 and Apple clang ignore the attribute in a type name ("'aligned' attribute
+// ignored when parsing type") and refuse the C23 spelling after a base outright.
+// Decided for gcc's: the attribute is GNU's, gcc's manual makes it a type attribute
+// that a specifier list takes, and this compiler already carries that fact as the
+// typedef's alignment skin. The cost is stated in the row: `_Alignof` of such a
+// type name is gcc's answer, not clang's.
+//
+// A TYPE WITH NO LAYOUT TAKES NO SKIN — the request is compared with the type's
+// natural alignment, and the layout that would state it does not exist — unless it
+// is an array awaiting its initializer (below). That is ONE rule, and it covers:
+//   * a FUNCTION type (`computeLayout` gives none), and the measurement agrees —
+//     `int (__attribute__((aligned(16))) *pf)(int)` leaves `pf` an ordinary
+//     8-aligned pointer on gcc (clang aligns the pointer; gcc's is the reading
+//     taken, for the reason above). P69 (lane `cs`): a separate early return for a
+//     function type stood here too; its mutation arm SURVIVED main's Mac sweep of
+//     checkpoint 17 (no case can tell the two apart, because the no-layout rule
+//     already says it), so it is gone and the one rule is the statement;
+//   * an incomplete structure, `void`, a variably modified array.
+// ⚠ FOR A VARIABLY MODIFIED ARRAY THAT IS A GAP AND NOT A READING
+// (D-C-AN-ATTRIBUTE-AFTER-A-REFERRED-TAG-NAMES-ANOTHER-TAG-AND-ONE-IN-A-TYPE-NAME-IS-REFUSED
+// carries it as owed). Such a type HAS an alignment — its element's (C23 6.5.4.4
+// paragraph 3) — and ✔MEASURED gcc 13.3.0 and mingw-w64 gcc answer 16 for
+// `__alignof__(__attribute__((aligned(16))) int[n])` where this compiler answers
+// 4 and says nothing; clang 18.1.3 and Apple clang answer 4 too, and say that the
+// attribute is ignored. Minting the skin here would not be the whole of it: an
+// object of such a type is allocated at run time with its BASE element's
+// alignment, so the alignment would be claimed and not delivered. The skin and the
+// allocation are owed together.
+// An INCOMPLETE ARRAY is the exception that is minted without a layout: the type
+// name of a compound literal, `(__attribute__((aligned(16))) int[]){ 1, 2 }`, is
+// completed from its initializer, the completion keeps the skin
+// (`completeIncompleteArrayFromInit`), and gcc reports 16 for it.
+//
+// NET-SILENT. The type resolver visits one type name more than once, and the
+// operand ladder reports unconditionally, so what this reports is rolled back; the
+// operand's diagnostics are given ONCE, by Pass 2 (`judgeAttributeSpecifier`).
+[[nodiscard]] TypeId
+typePositionAligned(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                    std::span<NodeId const> roots, TypeId ty, ScopeId scope) {
+    if (!ty.valid() || roots.empty() || !s.aggregateLayout.has_value()) return ty;
+    if (cfg.attributeEffects.empty()) return ty;
+    TypeInterner& in = s.lattice.interner();
+    AttributeSemanticsFacts facts;
+    auto const snap = s.reporter.snapshotForRollback();
+    for (NodeId root : roots) {
+        scanAttributeSemantics(s, cfg, tree, root, /*emitUnknown=*/false, facts, scope);
+    }
+    s.reporter.truncateTo(snap);
+    if (!facts.alignment.has_value() && !facts.alignmentFloor.has_value()) return ty;
+    TypeId result = ty;
+    if (facts.alignment.has_value()) {
+        std::uint32_t const want = *facts.alignment;
+        auto const lay = computeLayout(result, in, *s.aggregateLayout, s.dataModel);
+        if (!(lay.has_value() ? want == lay->align.bytes()
+                              : !in.isIncompleteArray(result))) {
+            TypeId const aligned = in.typeAligned(result, want);
+            if (aligned.valid()) result = aligned;
+        }
+    }
+    // P69 (lane `cs`): the request of a row that only RAISES — taken when it is
+    // larger than the alignment the type has by now, and no request at all
+    // otherwise. A type with no layout yet has no alignment to compare with, so
+    // nothing is raised: guessing there could LOWER what its element requires.
+    if (facts.alignmentFloor.has_value()) {
+        auto const lay = computeLayout(result, in, *s.aggregateLayout, s.dataModel);
+        if (lay.has_value() && *facts.alignmentFloor > lay->align.bytes()) {
+            TypeId const raised = in.typeAligned(result, *facts.alignmentFloor);
+            if (raised.valid()) result = raised;
+        }
+    }
+    return result;
+}
+
+// ★★ P69 round 4 (lane `cs`) — WHERE AN ATTRIBUTE SPECIFIER STANDS, as far as Pass 2
+// needs to know it. Read off the specifier's PARENT by role (the declarators'
+// pointer layer and group, the attribute table's type-name rule and specifier-run
+// wrapper, the composite attribute list of a tag that is only referred to) — never
+// by a rule name.
+enum class AttributeSpecifierPlace : std::uint8_t {
+    // A position with a reader of its own that this cycle did not change: a
+    // declaration's specifier prefix, its attribute slots, the run after a
+    // declarator, a composite DEFINITION's lists, a statement, an enumerator.
+    Elsewhere,
+    // Inside a declarator: a pointer layer, or the start of a parenthesized one.
+    InDeclarator,
+    // Decorating a type outside any declarator: directly in a type name, among a
+    // type's specifiers, after a tag that is only referred to.
+    OnAType,
+};
+[[nodiscard]] AttributeSpecifierPlace
+attributeSpecifierPlace(EngineState const& s, SemanticConfig const& cfg,
+                        Tree const& tree, NodeId attrNode) {
+    NodeId const parent = tree.parent(attrNode);
+    if (!parent.valid() || tree.kind(parent) != NodeKind::Internal) {
+        return AttributeSpecifierPlace::Elsewhere;
+    }
+    RuleId const pr = tree.rule(parent);
+    if (cfg.declarators.has_value()
+        && (pr == cfg.declarators->pointerLayerRule
+            || pr == cfg.declarators->groupRule)) {
+        return AttributeSpecifierPlace::InDeclarator;
+    }
+    if (cfg.attrTypeNameRule.valid() && pr.v == cfg.attrTypeNameRule.v) {
+        return AttributeSpecifierPlace::OnAType;
+    }
+    if (cfg.attrSpecifierRunRule.valid() && pr.v == cfg.attrSpecifierRunRule.v) {
+        return AttributeSpecifierPlace::OnAType;
+    }
+    if (!cfg.compositeAttrListRule.valid()) return AttributeSpecifierPlace::Elsewhere;
+    // The list after a tag: the specifier hangs off it, possibly through one
+    // wrapper level. It is a type position only when the tag is REFERRED to —
+    // a definition's list is the composite's own, and the composite scan reads it.
+    NodeId list = parent;
+    for (int up = 0; up < 2 && list.valid(); ++up) {
+        if (tree.kind(list) == NodeKind::Internal
+            && tree.rule(list).v == cfg.compositeAttrListRule.v) {
+            break;
+        }
+        list = tree.parent(list);
+    }
+    if (!list.valid() || tree.kind(list) != NodeKind::Internal
+        || tree.rule(list).v != cfg.compositeAttrListRule.v) {
+        return AttributeSpecifierPlace::Elsewhere;
+    }
+    NodeId const spec = tree.parent(list);
+    if (!spec.valid() || tree.kind(spec) != NodeKind::Internal) {
+        return AttributeSpecifierPlace::Elsewhere;
+    }
+    auto const dIt = s.idx().declByRule.find(tree.rule(spec).v);
+    if (dIt == s.idx().declByRule.end()
+        || isDefinitionAtNode(cfg.declarations[dIt->second], tree, spec)) {
+        return AttributeSpecifierPlace::Elsewhere;
+    }
+    return AttributeSpecifierPlace::OnAType;
+}
+
+// ★★ P69 round 4 (lane `cs`) — EVERY ATTRIBUTE SPECIFIER OF THE TREE, JUDGED ONCE.
+// Pass 2 calls this for each attribute-specifier node it visits (it visits every
+// node), so what is said here is said at EVERY position an attribute can be
+// written — the ones a declaration folds and the ones nothing folds.
+//
+// (1) THE TWO VERBS WHOSE ANSWER DOES NOT DEPEND ON WHAT IS DECLARED, at every
+//     position: `unsupported` — refused by name with the row's own reason
+//     (`S_AttributeNotHonoured`); `callingConvention` — three-valued against the
+//     pair being compiled for (see `AttributeEffect::CallingConvention`).
+//
+// (2) A SPECIFIER THAT DECORATES A TYPE. Which ones do:
+//       * one NO declaration folded, standing in a type name, among a type's
+//         specifiers, after a referred tag, in a pointer layer or at the start of a
+//         parenthesized declarator — every clause of it;
+//       * one a declarator folded as standing beside its name
+//         (`nameAdjacentAttributeSpecifiers`) — only the clauses whose row keeps
+//         them on the type that position forms
+//         (`AttributeSemanticsRow::staysWithTypeInDeclarator`); the declarator's
+//         fold has already given the rest to the declared entity and said what
+//         there was to say about them.
+//     What is said of such a clause:
+//       * an UNKNOWN name is warned as unknown, wherever it stands;
+//       * `aligned` is applied by the type machinery (`typePositionAligned`), in
+//         silence; its OPERAND is validated here, once, with the diagnostics the
+//         same operand draws in a declaration;
+//       * a name whose row says what it applies to, and that applies neither to a
+//         type nor to a function pointer, is warned as IGNORED, by name. gcc says
+//         so at each of these cells ("does not apply to types", "ignored for type
+//         'int *'"), and where it matters most the references' LAYOUTS differ:
+//         `struct { char c; int * __attribute__((packed)) m; }` puts `m` at 8 on
+//         gcc, which ignores the attribute and warns, and at 1 on clang, which
+//         applies it. This compiler takes gcc's layout and says that it did.
+//       * every other known name is silent. No reference changes a size, an
+//         alignment or a `_Generic` selection for it at these positions (probes
+//         ta1, ta2, ta7: 31 names at four positions). ⓘ A name that applies to a
+//         function pointer is silent at ALL of them, although gcc warns where the
+//         decorated type is not one (`int * __attribute__((format(printf, 1, 2)))
+//         *pp`): whether it is one is the resolver's knowledge, not this visit's,
+//         no layout depends on it, and this compiler is never louder than gcc.
+void judgeAttributeSpecifier(EngineState& s, SemanticConfig const& cfg,
+                             Tree const& tree, NodeId attrNode, ScopeId here) {
+    if (cfg.attributeEffects.empty()) return;
+    bool const owned = s.attrSpecifiersJudgedByADeclaration.contains(
+        (static_cast<std::uint64_t>(tree.id().v) << 32) | attrNode.v);
+    AttributeSpecifierPlace const place =
+        attributeSpecifierPlace(s, cfg, tree, attrNode);
+    // Folded by its declarator as standing beside the name: only the clauses that
+    // stay with the type are still to be judged.
+    bool const besideAName = owned && place == AttributeSpecifierPlace::InDeclarator;
+    // Folded by nobody, and decorating a type.
+    bool const onATypeUnfolded = !owned && place != AttributeSpecifierPlace::Elsewhere;
+    auto const reportAt = [&](NodeId at, DiagnosticCode code,
+                              DiagnosticSeverity severity, std::string text) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = severity;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at);
+        d.actual   = std::move(text);
+        s.reporter.report(std::move(d));
+    };
+    // ★★ P69 (lane `cs`) — A SPELLING THAT DOES NOT EXIST FOR THIS OBJECT FORMAT IS
+    // REFUSED BY NAME, ONCE PER SPECIFIER, BEFORE ANY CLAUSE IS LOOKED AT. Which
+    // formats a spelling exists for is the language document's statement
+    // (`attributeSemantics.spellings[].availableObjectFormats`); the engine compares
+    // the active format with that list and names neither a spelling nor a format.
+    // With NO format in scope the question has no answer, and "unknown" must not
+    // read as "available": the specifier is refused for that reason, stated.
+    //
+    // ✔MEASURED for the one shipped case (`__declspec`): off Windows clang 18.1.3
+    // and Apple clang refuse the word by name ("'__declspec' attributes are not
+    // enabled") and gcc 13.3.0 gives a syntax error; mingw-w64 gcc and cl run it. An error rather than a warning, because
+    // the fold above this pass may already have applied what the clauses say, and
+    // a build that carries on would carry effects of a spelling it does not have.
+    if (AttributeSpelling const* const spelling =
+            attributeSpellingOf(cfg, tree, attrNode);
+        spelling != nullptr
+        && !spelling->availableFor(
+               s.activeFormat.has_value()
+                   ? std::optional<ObjectFormatKind>{s.activeFormat->kind()}
+                   : std::nullopt)) {
+        std::string formats;
+        for (ObjectFormatKind f : spelling->availableObjectFormats) {
+            if (!formats.empty()) formats += ", ";
+            formats += '\'';
+            formats += objectFormatKindName(f);
+            formats += '\'';
+        }
+        std::string_view opener;
+        for (NodeId c : visibleChildren(tree, attrNode)) {
+            if (tree.kind(c) == NodeKind::Token) opener = tree.text(c);
+            break;
+        }
+        reportAt(attrNode, DiagnosticCode::S_AttributeNotHonoured,
+                 DiagnosticSeverity::Error,
+                 s.activeFormat.has_value()
+                     ? std::format(
+                           "'{}' attribute specifiers are not available for the "
+                           "object format '{}': this spelling exists only for {}, "
+                           "and nothing written in it can be honoured here",
+                           opener, objectFormatKindName(s.activeFormat->kind()),
+                           formats)
+                     : std::format(
+                           "'{}' attribute specifiers exist only for the object "
+                           "format(s) {}, and this analysis runs with no object "
+                           "format in scope: whether the spelling is available "
+                           "cannot be answered, so nothing written in it can be "
+                           "honoured",
+                           opener, formats));
+        return;
+    }
+    std::vector<NodeId> clauses;
+    bool const stdForm = collectAttrClauses(cfg, tree, attrNode, clauses);
+    for (NodeId cl : clauses) {
+        // A folded specifier's malformed-argument diagnostics were its fold's.
+        auto clause = extractOneAttrClause(s, cfg, tree, cl,
+                                           /*emitDiagnostics=*/onATypeUnfolded);
+        if (!clause.has_value()) continue;
+        AttributeSemanticsRow const* const row = clause->row;
+        if (row != nullptr && row->effect == AttributeEffect::Unsupported) {
+            reportAt(cl, DiagnosticCode::S_AttributeNotHonoured,
+                     DiagnosticSeverity::Error,
+                     std::format("attribute '{}' cannot be honoured: {}",
+                                 clause->name, row->reason));
+            continue;
+        }
+        if (row != nullptr && row->effect == AttributeEffect::CallingConvention) {
+            if (!s.activeCallingConvention.has_value() || s.target == nullptr) {
+                reportAt(cl, DiagnosticCode::S_AttributeNotHonoured,
+                         DiagnosticSeverity::Error,
+                         std::format(
+                             "attribute '{}' selects a calling convention, and this "
+                             "analysis runs with no target pair in scope: there is "
+                             "no active convention to compare it with, so it can be "
+                             "neither confirmed nor applied",
+                             clause->name));
+                continue;
+            }
+            std::string const& active = *s.activeCallingConvention;
+            if (std::ranges::find(row->conventions, active)
+                != row->conventions.end()) {
+                // The convention the pair already compiles for: the attribute
+                // states what every call of this unit already is. Silent, as gcc
+                // and clang are.
+                continue;
+            }
+            // Another convention this target's toolchains emit — one this
+            // compiler implements for another object format, or one its target
+            // document lists as known and not implemented.
+            std::string const* foreign = nullptr;
+            for (std::string const& id : row->conventions) {
+                if (s.target->callingConventionStanding(id)
+                    != TargetSchema::CallingConventionStanding::Unknown) {
+                    foreign = &id;
+                    break;
+                }
+            }
+            if (foreign != nullptr) {
+                reportAt(cl, DiagnosticCode::S_AttributeNotHonoured,
+                         DiagnosticSeverity::Error,
+                         std::format(
+                             "attribute '{}' selects the calling convention '{}', "
+                             "but this unit is compiled for '{}': a function of "
+                             "another convention would be called — and would "
+                             "receive its arguments — by the wrong sequence, and "
+                             "a per-function convention is not something this "
+                             "compiler emits",
+                             clause->name, *foreign, active));
+            } else {
+                // No convention of this target at all: a word its toolchains do
+                // not have, and it takes the path an unknown name takes.
+                reportAt(cl, DiagnosticCode::S_UnknownAttribute,
+                         DiagnosticSeverity::Warning, std::string{tree.text(cl)});
+            }
+            continue;
+        }
+        if (row == nullptr) {
+            if (onATypeUnfolded
+                && (stdForm || !languageModelsAttributeName(cfg, clause->name))) {
+                reportAt(cl, DiagnosticCode::S_UnknownAttribute,
+                         DiagnosticSeverity::Warning, std::string{tree.text(cl)});
+            }
+            continue;
+        }
+        if (!(onATypeUnfolded
+              || (besideAName && row->staysWithTypeInDeclarator))) {
+            continue;
+        }
+        if (row->effect == AttributeEffect::Align) {
+            // Applied by the type machinery, net-silently; validated here, once.
+            // A bare `aligned` has no operand and nothing to validate.
+            NodeId const operand = attrClauseArgOperand(cfg, tree, cl);
+            if (operand.valid()) {
+                (void)foldAlignmentOperand(s, cfg, tree, operand, /*diagNode=*/cl,
+                                           here);
+            }
+            continue;
+        }
+        if (row->appliesTo.empty()) continue;   // the row declares no kind axis
+        if (std::ranges::any_of(row->appliesTo, [](AttributeAppliesKind ak) {
+                return ak == AttributeAppliesKind::Type
+                    || ak == AttributeAppliesKind::FunctionPointer;
+            })) {
+            continue;
+        }
+        std::string allowed;
+        for (AttributeAppliesKind ak : row->appliesTo) {
+            if (!allowed.empty()) allowed += ", ";
+            allowed += attributeAppliesKindName(ak);
+        }
+        reportAt(cl, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                 DiagnosticSeverity::Warning,
+                 std::format(
+                     "attribute '{}' is ignored and its effect was discarded: "
+                     "written here it decorates a type, not a declared entity, "
+                     "and this language declares the attribute applicable to {} "
+                     "only",
+                     clause->name, allowed));
     }
 }
 
@@ -7809,6 +9421,116 @@ struct CompositeAttrFacts {
     std::string                  deprecatedMessage;
 };
 
+// ★★ P69 (lane `cs`) — AN ALIGNMENT REQUEST WRITTEN BEFORE A DEFINITION, AMONG ITS
+// DECLARATION'S SPECIFIERS, THAT IS THE DEFINED TYPE'S.
+//
+// Where an attribute written before a declaration's type specifier lands is, by
+// default, the declared entities'. An `Align` row may say otherwise for the shapes
+// it lists (`AttributeSemanticsRow::leadingDecoratesDefinitionOf`): when the
+// declaration's type specifier DEFINES one of them, the request aligns that type.
+// ✔MEASURED on cl 19.51 for the one shipped row (`__declspec(align)`):
+//   `__declspec(align(32)) struct S { int a; } s;`  type 32, sizeof 32, a later
+//                                                   `struct S` object 32
+//   `__declspec(align(32)) struct S { int a; };`    the same, with no declarator
+//   `typedef __declspec(align(32)) struct F {…} F_t;` and the `typedef` written
+//                                                   second: alias AND tag 32
+//   `__declspec(align(32)) struct O { struct I { int a; } i; } o;`   O 32, I 4
+//   `__declspec(align(32)) struct S w;`             (refers only) S untouched
+//   `__declspec(align(32)) enum E { A } e;`         the enum type 4, `e` 32
+//
+// `specNode` is a node of the declaration row `specRow`. The answer is every clause
+// that (1) belongs to a row listing `specNode`'s shape, (2) stands among the
+// specifiers of the declaration whose OWN type specifier `specNode` is, and (3) is
+// written before it. "Own" is the same notion `headAttributeRuns` walks down to: a
+// definition reached from the declaration's head without crossing an attribute
+// specifier, a nested type name or another declaration row — so a tag defined
+// inside the body, in an initializer or inside a `typeof` operand is someone
+// else's. It is established here by walking UP, which costs the depth of the
+// definition and nothing when no row lists the shape (the first test).
+struct LeadingDefinitionRequest {
+    NodeId                       clause{};
+    AttributeSemanticsRow const* row = nullptr;
+};
+
+[[nodiscard]] std::vector<LeadingDefinitionRequest>
+leadingDefinitionAlignmentRequests(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId specNode,
+                                   DeclarationRule const* specRow) {
+    std::vector<LeadingDefinitionRequest> out;
+    if (specRow == nullptr || !specNode.valid()) return out;
+    RuleId const specRule = tree.rule(specNode);
+    auto const listsThisShape = [&](AttributeSemanticsRow const& r) {
+        return std::ranges::find(r.leadingDecoratesDefinitionOf, specRule)
+            != r.leadingDecoratesDefinitionOf.end();
+    };
+    if (std::ranges::none_of(cfg.attributeEffects, listsThisShape)) return out;
+    if (!isDefinitionAtNode(*specRow, tree, specNode)) return out;
+
+    // Up to the nearest declaration row: the declaration this definition sits in.
+    NodeId                 declNode{};
+    DeclarationRule const* decl = nullptr;
+    std::vector<NodeId>    between;   // strictly between the definition and it
+    for (NodeId cur = tree.parent(specNode); cur.valid(); cur = tree.parent(cur)) {
+        if (tree.kind(cur) != NodeKind::Internal) return out;
+        RuleId const r = tree.rule(cur);
+        if (auto const it = s.idx().declByRule.find(r.v);
+            it != s.idx().declByRule.end()) {
+            declNode = cur;
+            decl     = &cfg.declarations[it->second];
+            break;
+        }
+        if (isAttributeSpecifierRule(cfg, r)) return out;   // inside an argument
+        between.push_back(cur);
+    }
+    if (!declNode.valid()) return out;
+    NodeId const head = declarationHeadNode(tree, declNode, *decl);
+    if (!head.valid()) return out;
+    // The path must rise INTO the head: a definition in an initializer or in a
+    // declarator rises into some other child of the declaration.
+    if ((between.empty() ? specNode : between.back()).v != head.v) return out;
+    // … and must not cross a nested type name (its specifiers are its own).
+    for (NodeId p : between) {
+        if (p.v != head.v && cfg.attrTypeNameRule.valid()
+            && tree.rule(p).v == cfg.attrTypeNameRule.v) {
+            return out;
+        }
+    }
+
+    // The declaration's attribute positions, exactly the roots its own fold reads.
+    std::vector<NodeId> roots;
+    if (NodeId const prefix = specifierPrefixChild(tree, declNode, *decl);
+        prefix.valid()) {
+        roots.push_back(prefix);
+    }
+    for (NodeId run : headAttributeRuns(cfg, tree, head)) roots.push_back(run);
+    for (NodeId slot : visibleChildren(tree, declNode)) {
+        if (tree.kind(slot) != NodeKind::Internal) continue;
+        for (AttrRunRule const& sr : decl->declarationAttrSlotRules) {
+            if (sr.appertainsTo != AttrAppertainment::Declaration) continue;
+            if (tree.rule(slot).v == sr.rule.v) { roots.push_back(slot); break; }
+        }
+    }
+    auto const definitionStart = tree.span(specNode).start();
+    std::vector<NodeId> attrNodes;
+    for (NodeId root : roots) collectAttrNodes(cfg, tree, root, attrNodes);
+    std::vector<NodeId> clauses;
+    for (NodeId an : attrNodes) {
+        // Written after the definition began: the declared entities', as ever.
+        if (!(tree.span(an).start() < definitionStart)) continue;
+        clauses.clear();
+        (void)collectAttrClauses(cfg, tree, an, clauses);
+        for (NodeId cl : clauses) {
+            auto const clause =
+                extractOneAttrClause(s, cfg, tree, cl, /*emitDiagnostics=*/false);
+            if (!clause.has_value() || clause->row == nullptr) continue;
+            if (clause->row->effect != AttributeEffect::Align) continue;
+            if (!listsThisShape(*clause->row)) continue;
+            out.push_back(LeadingDefinitionRequest{cl, clause->row});
+        }
+    }
+    return out;
+}
+
 // FC16 (D-CSUBSET-PACKED) + TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): scan a
 // struct/union specifier node's composite-attribute surfaces for the honored
 // whole-composite attributes — `packed`, and a GNU/C23 `aligned(N)`.
@@ -7897,15 +9619,89 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         slotRules  = owningDecl->declarationAttrSlotRules;
     }
     std::vector<NodeId> roots;
+    // ★★ P69 (lane `cs`) — THE SPECIFIERS AFTER THE BODY THAT ARE NOT THIS TYPE'S.
+    // A spelling may say that a specifier written after a composite's body is the
+    // DECLARATION's (`AttributeSpelling::afterCompositeBodyIsTheDeclarations`);
+    // `headAttributeRuns` hands exactly those to the declaration's readers, through
+    // the one function called here, so they are taken OUT of this scan: read by
+    // both, `struct S { int a; } __declspec(align(32)) s;` would align the TYPE
+    // (its size 32) where cl 19.51 leaves it at 4 and aligns only `s` — ✔MEASURED.
+    std::vector<NodeId> declarationsOwn;
+    bool pastBody = false;
     for (NodeId c : visibleChildren(tree, specNode)) {
         if (tree.kind(c) != NodeKind::Internal) continue;
-        if (tree.rule(c).v == cfg.compositeAttrListRule.v) { roots.push_back(c); continue; }
+        if (owningDecl != nullptr && owningDecl->definesWhenChildRule.has_value()
+            && tree.rule(c).v == owningDecl->definesWhenChildRule->v) {
+            pastBody = true;
+            continue;
+        }
+        if (tree.rule(c).v == cfg.compositeAttrListRule.v) {
+            roots.push_back(c);
+            if (pastBody) {
+                appendDeclarationSpecifiersAfterBody(cfg, tree, c, declarationsOwn);
+            }
+            continue;
+        }
         for (AttrRunRule const& sr : slotRules) {
             if (sr.appertainsTo != AttrAppertainment::Declaration) continue;
             if (tree.rule(c).v == sr.rule.v) { roots.push_back(c); break; }
         }
     }
-    if (roots.empty()) return facts;
+    // ★★ P69 (lane `cs`) — THE ALIGNMENT REQUESTS WRITTEN BEFORE THIS DEFINITION,
+    // AMONG ITS DECLARATION'S SPECIFIERS, THAT ARE THE TYPE'S
+    // (`AttributeSemanticsRow::leadingDecoratesDefinitionOf`). Folded only by the
+    // emitting visit, like every alignment request here.
+    std::vector<LeadingDefinitionRequest> const leading =
+        emitDiagnostics
+            ? leadingDefinitionAlignmentRequests(s, cfg, tree, specNode, owningDecl)
+            : std::vector<LeadingDefinitionRequest>{};
+    if (roots.empty() && leading.empty()) return facts;
+    // One slot per repeat rule (`foldAlignmentRequest`); the definition's alignment
+    // is the larger of what stands in the two.
+    std::optional<std::uint32_t> largestRequest;
+    NodeId                       largestRequestClause{};
+    std::optional<std::uint32_t> lastRequest;
+    NodeId                       lastRequestClause{};
+    auto const meetAlignment = [&](AttributeSemanticsRow const& row,
+                                   std::uint32_t want, NodeId clauseNode,
+                                   std::string_view name, bool report) {
+        bool const takesLast = row.alignRepeatTakesLast;
+        NodeId const discarded = foldAlignmentRequest(
+            tree, row, takesLast ? lastRequest : largestRequest,
+            takesLast ? lastRequestClause : largestRequestClause, want, clauseNode);
+        if (discarded.valid() && report) {
+            reportDiscardedAlignmentRequest(s, tree, discarded, name);
+        }
+    };
+    auto const settleAlignment = [&] {
+        for (auto const& v : {largestRequest, lastRequest}) {
+            if (v.has_value()
+                && (!facts.alignment.has_value() || *v > *facts.alignment)) {
+                facts.alignment = v;
+            }
+        }
+    };
+    for (LeadingDefinitionRequest const& lead : leading) {
+        // The declaration's own fold reads the same clause and reports whatever is
+        // wrong with its operand; here the operand is only evaluated.
+        auto const snap = s.reporter.snapshotForRollback();
+        std::optional<std::uint32_t> want;
+        if (NodeId const operand = attrClauseArgOperand(cfg, tree, lead.clause);
+            operand.valid()) {
+            want = foldAlignmentOperand(s, cfg, tree, operand,
+                                        /*diagNode=*/lead.clause, fromScope);
+        } else if (!lead.row->alignWithoutOperandIsIgnored) {
+            want = targetMaxUsefulAlignment(s);
+        }
+        s.reporter.truncateTo(snap);
+        if (want.has_value()) {
+            meetAlignment(*lead.row, *want, lead.clause, {}, /*report=*/false);
+        }
+    }
+    if (roots.empty()) {
+        settleAlignment();
+        return facts;
+    }
     // ★★ TF-C73 — THE SILENT MISCOMPILE THIS LOOP USED TO BE.
     // This scan previously treated a whole attribute NODE as one unit: it walked
     // the entire subtree looking for ANY identifier naming `packed`, and on a hit
@@ -7922,6 +9718,12 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // unknown GNU name still fails loud no matter which position it sits in.
     std::vector<NodeId> attrNodes;
     for (NodeId root : roots) collectAttrNodes(cfg, tree, root, attrNodes);
+    if (!declarationsOwn.empty()) {
+        std::erase_if(attrNodes, [&](NodeId a) {
+            return std::ranges::any_of(declarationsOwn,
+                                       [&](NodeId d) { return d.v == a.v; });
+        });
+    }
     std::vector<NodeId> clauses;
     for (NodeId attr : attrNodes) {
         // The STRICT (GNU) form's unknown names are meaningful → fail loud (typo
@@ -8007,15 +9809,30 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // would multiply one bad `aligned(3)` into one diagnostic per member.
             // The probe reads only `.packed`, so skipping the fold loses nothing.
             if (emitDiagnostics) {
-                AttributeSemanticsRow const* alignRow = nullptr;
-                for (AttributeSemanticsRow const& row : cfg.attributeEffects) {
-                    if (row.effect != AttributeEffect::Align) continue;
-                    for (std::string const& nm : row.names)
-                        if (id == nm) { alignRow = &row; break; }
-                    if (alignRow != nullptr) break;
-                }
+                // P69 (lane `cs`): THE CLAUSE'S OWN ROW, never a second lookup by
+                // the plain name — `extractOneAttrClause` found it under the
+                // spelling's qualified name first, and a row that exists only
+                // under a qualified name (`struct __declspec(align(32)) S`) is
+                // invisible to a search for the word between the parentheses.
+                AttributeSemanticsRow const* const alignRow =
+                    clause->row != nullptr
+                        && clause->row->effect == AttributeEffect::Align
+                        ? clause->row : nullptr;
                 if (alignRow != nullptr) {
                     NodeId const operand = attrClauseArgOperand(cfg, tree, cl);
+                    if (!operand.valid() && alignRow->alignWithoutOperandIsIgnored) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                        d.severity = DiagnosticSeverity::Warning;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(cl);
+                        d.actual   = std::format(
+                            "attribute '{}' is ignored and its effect was "
+                            "discarded: it names no alignment, and written this "
+                            "way a request without one asks for nothing", id);
+                        s.reporter.report(std::move(d));
+                        continue;   // judged — never "unknown"
+                    }
                     if (!operand.valid()) {
                         // ★★★ P66 (lane `ag`) — THE COMPOSITE ARM OF THE BARE FORM,
                         // AND IT READS THE SAME DECLARED TARGET QUANTITY THROUGH THE
@@ -8030,15 +9847,13 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // AND sizeof 16 on all four (16 = both shipped targets'
                         // declared `aggregateLayout.maxAlignment`).
                         if (auto const m = targetMaxUsefulAlignment(s)) {
-                            if (!facts.alignment.has_value() || *m > *facts.alignment)
-                                facts.alignment = m;
+                            meetAlignment(*alignRow, *m, cl, id, /*report=*/true);
                         }
                         continue;   // honored — never "unknown"
                     }
                     if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
                                                       /*diagNode=*/cl, fromScope)) {
-                        if (!facts.alignment.has_value() || *a > *facts.alignment)
-                            facts.alignment = a;
+                        meetAlignment(*alignRow, *a, cl, id, /*report=*/true);
                     }
                     continue;   // honored (or already diagnosed) — never "unknown"
                 }
@@ -8129,6 +9944,7 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
         }
     }
+    settleAlignment();
     return facts;
 }
 
@@ -8555,9 +10371,20 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       bool allowFlexibleArray = false,
                       bool paramDecay = false,
                       bool allowInitInferredArray = false,
-                      bool typeAliasRow = false) {
+                      bool typeAliasRow = false,
+                      bool innerIsUnspecifiedSize = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
+    // P69 (lane `cs`): C 6.7.6.2p1 — an array's element type shall be complete. An
+    // array of unknown size is not; an UNSPECIFIED-size `[*]` is a variable length
+    // array type (6.7.6.2p4), complete, though it is built here as the same
+    // size-less array a `[]` builds — so the fold says which suffix built `inner`
+    // (`int f(int p[][*]);`, `int f(int p[*][*]);` are prototypes gcc 13.3.0 and
+    // clang 18.1.3 accept).
+    auto const elementOfUnknownSize = [&] {
+        return !innerIsUnspecifiedSize && inner.valid()
+            && s.lattice.interner().isIncompleteArray(inner);
+    };
     if (isFnSuffixRule(r, dc)) {
         // ★★ C 6.7.6.3p1 — "A function declarator shall not specify a return type
         // that is a function type or an array type." `inner` IS the return type this
@@ -8666,6 +10493,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             }
             return InvalidType;
         }
+        // P69 (lane `cs`): the element rule of the bracket arm below (C 6.7.6.2p1),
+        // for the one other suffix that builds an array.
+        if (elementOfUnknownSize()) {
+            if (emitOnMiss) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_ArrayElementTypeIncomplete;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(suffix);
+                d.actual   = "an array's element type cannot be an array of unknown "
+                             "size — only the outermost bound of an array may be "
+                             "omitted (C 6.7.6.2p1): `" + std::string{tree.text(suffix)}
+                             + "`";
+                s.reporter.report(std::move(d));
+            }
+            return InvalidType;
+        }
         return s.lattice.interner().incompleteArray(inner);
     }
     if (r == dc.arraySuffixRule) {
@@ -8702,6 +10546,22 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                  "an array declarator's `static` / type-qualifier / `*` decoration "
                  "is permitted only on a function parameter (C 6.7.6.2p1, "
                  "6.7.6.3p7)");
+            return InvalidType;
+        }
+        // P69 (lane `cs`): C 6.7.6.2p1 — "The element type shall not be an
+        // incomplete or function type." `inner` is the element this suffix wraps
+        // (suffixes fold right to left), so an ARRAY OF UNKNOWN SIZE here is an
+        // omitted bound that is not the outermost one: `int a[3][]`, `int
+        // (*p)[2][]`, a parameter's `int a[][]`. Refused by gcc 13.3.0 and clang
+        // 18.1.3 ("array type has incomplete element type"). Asked here, once for
+        // every row, because an omitted bound now builds the incomplete array
+        // wherever it is written (the arm at the end of this branch) — the object
+        // and position checks downstream judge the OUTERMOST type, and this is the
+        // one place the element is in hand.
+        if (elementOfUnknownSize()) {
+            emit(DiagnosticCode::S_ArrayElementTypeIncomplete,
+                 "an array's element type cannot be an array of unknown size — only "
+                 "the outermost bound of an array may be omitted (C 6.7.6.2p1)");
             return InvalidType;
         }
         // The length is whichever of the suffix's visible children
@@ -8764,6 +10624,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // was 0). Both are now the VLA the programmer wrote, and the
             // initializer constraint is judged at the declarator loop where the
             // initializer is in scope.
+            //   ★ P69 (lane `cs`): A PRESENT bound on that row is NOT a flexible
+            // member. This arm used to take it too (`struct S { int x; int a[n]; }`
+            // became a flexible member — READ, the composite guard admits a last
+            // incomplete-array member — laid out with no room for the `n` elements
+            // the program indexes), and the legacy twin `applyArraySuffix` refuses
+            // it. A member, and an object with linkage, cannot have a variably
+            // modified type (C 6.7.2.1p9, 6.7.6.2p2): its bound must be an integer
+            // constant expression, and one that does not fold is refused by name.
+            // The refusal kept the multi-dimensional member (`int a[n][m]`) from
+            // reading as an array of an array of unknown size.
+            if (allowFlexibleArray && hasPresentLength) {
+                emit(DiagnosticCode::S_NonConstantArrayLength,
+                     "a structure or union member, or an object with linkage, cannot "
+                     "have a variably modified type: its array bound must be an "
+                     "integer constant expression (C 6.7.2.1p9, 6.7.6.2p2)");
+                return InvalidType;
+            }
             if (allowFlexibleArray || (allowInitInferredArray && !hasPresentLength))
                 return s.lattice.interner().incompleteArray(inner);
             // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM,
@@ -8789,7 +10666,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // `typedef int vm_page_info_data_t[];`.
             //   ★ WHY `typeAliasRow` AND NOT `allowFlexibleArray`. Reusing the FAM
             // flag was tried and MEASURED WRONG: it is tested ABOVE the VLA arm (a
-            // struct field's `int a[n]` is deliberately a FAM, not a VLA member), so
+            // struct field's runtime bound is no VLA member — refused there by name,
+            // S_NonConstantArrayLength, since P69), so
             // a typedef carrying it made `typedef int R[n];` stop building a vlaArray
             // and silently become an incomplete array instead. The two are different
             // rules. C's own distinction is TYPE-vs-OBJECT — 6.7.6.2p1 lets a type be
@@ -8801,10 +10679,30 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // a non-last / sole member keeps S_FlexibleArrayNotLast / SoleMember.
             if (typeAliasRow)
                 return s.lattice.interner().incompleteArray(inner);
-            emit(DiagnosticCode::S_NonConstantArrayLength,
-                 "an array declarator in this position needs a length, and it "
-                 "must be an integer constant expression (C 6.7.6.2)");
-            return InvalidType;
+            // ★★ P69 (lane `cs`) — AND ON EVERY OTHER ROW AN ABSENT BOUND IS THE SAME
+            // INCOMPLETE TYPE (C 6.7.6.2p4: "If the size is not present, the array
+            // type is an incomplete type"). This arm used to REFUSE it
+            // (`S_NonConstantArrayLength`), which judged the bound by the ROW that
+            // carries it — parameter, flexible-array row, initializer, type alias —
+            // and never by WHERE the array sits in the declared type. ✔MEASURED
+            // (probe sz, part 2): `static int (*p)[];` was refused while `static int
+            // (*p)[] = &buf;` was accepted (the init-inference relaxation reached
+            // the pointee by accident), and the type names `int (*)[]` (a cast, a
+            // `_Generic` association) and `int[]` were refused; gcc 13.3.0 and clang
+            // 18.1.3 build and run all of them, and MSVC 19.51 all that it parses.
+            // An incomplete type is a legal pointee and a legal type name; what C
+            // forbids is an OBJECT of it, and that is judged where the object is:
+            //   * an object definition of incomplete type — `S_IncompleteTypeObject`
+            //     (a block-scope `int a[];`, a `static` one), the arm that already
+            //     refuses an object of `typedef int T[];`;
+            //   * a file-scope TENTATIVE definition — completed with one element at
+            //     the end of the unit, warned (`S_TentativeArrayAssumedOneElement`,
+            //     C 6.9.2p2), unless a later declaration completes it;
+            //   * an omitted bound that is not the outermost — refused above
+            //     (`S_ArrayElementTypeIncomplete`), the element being in hand there;
+            //   * `sizeof` of it — the language document's statement
+            //     (`sizeof.incompleteArraySize`), else refused by name.
+            return s.lattice.interner().incompleteArray(inner);
         }
         // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a
         // TRAILING `uint64_t ns_threadids[0];` member — MEASURED at
@@ -8904,7 +10802,12 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
             continue;
         }
-        RuleId const cr = tree.rule(c);
+        // A parser recovery (Error) child has no rule — the Token test above
+        // establishes neither of NodeKind's other two arms
+        // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+        std::optional<RuleId> const scanned = tree.ruleIfInternal(c);
+        if (!scanned.has_value()) continue;
+        RuleId const cr = *scanned;
         // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the bare-`[*]` suffix is a THIRD
         // array-suffix role alongside fn/array — collect it so `applyDeclarator-
         // Suffix` folds it (a param `[*]` decays like `[]`; a non-param is a
@@ -8921,9 +10824,13 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
+        bool const innerIsUnspecifiedSize =
+            i + 1 < suffixes.size() && dc.arrayStarSuffixRule.has_value()
+            && tree.rule(suffixes[i + 1]) == *dc.arrayStarSuffixRule;
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
                                   emitOnMiss, allowFlexibleArray, paramDecay,
-                                  allowInitInferredArray, typeAliasRow);
+                                  allowInitInferredArray, typeAliasRow,
+                                  innerIsUnspecifiedSize);
         if (!t.valid()) return InvalidType;
     }
 
@@ -8954,6 +10861,17 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // this recursion; `a[][n]` has no group — but the reset prevents a latent
         // over-lenient accept on an exotic `int (*p[])[n]`). `allowInitInferredArray`
         // stays a DISTINCT signal (c47 init-inferred fn-ptr arrays), not collapsed.
+        //
+        // ★ P69 round 4 (lane `cs`): `aligned` written at the START of the
+        // parenthesized declarator decorates the type the group derives FROM — `t`,
+        // with every suffix already folded and none of the group's own layers yet.
+        // `int (__attribute__((aligned(16))) arr)[2];` is an 8-byte array aligned
+        // to 16 on every reference; `int (__attribute__((aligned(16))) *pf)(int)`
+        // asks it of a FUNCTION type, which takes none (`typePositionAligned`).
+        if (auto const groupSpecifiers = directAttributeSpecifiers(tree, group);
+            !groupSpecifiers.empty()) {
+            t = typePositionAligned(s, cfg, tree, groupSpecifiers, t, scope);
+        }
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
                                       /*allowFlexibleArray=*/false,
                                       /*allowInitInferredArray=*/allowInitInferredArray,
@@ -9034,6 +10952,17 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                                         &s.idx().declByRule)) {
                 t = s.lattice.interner().atomicQualified(t);
             }
+            // ★ P69 round 4 (lane `cs`): `aligned` written IN this layer is THIS
+            // pointer's own alignment, exactly as an east qualifier is this
+            // pointer's own qualifier — at an inner level as much as beside the
+            // name (`struct { char c; int * __attribute__((aligned(16))) m, n; }`
+            // puts `m` at 16 and the `int` `n` at 24 on every reference; `int *
+            // __attribute__((aligned(16))) *pp` is an 8-aligned pointer to a
+            // 16-aligned pointer on gcc). See `typePositionAligned`.
+            if (auto const layerSpecifiers = directAttributeSpecifiers(tree, c);
+                !layerSpecifiers.empty()) {
+                t = typePositionAligned(s, cfg, tree, layerSpecifiers, t, scope);
+            }
             continue;
         }
         if (cr == dc.directRule && !direct.valid()) direct = c;
@@ -9053,10 +10982,17 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
 // the positioned gate site. Same nested-decl-rule descent stop as
 // `subtreeContainsToken` (each nested decl row runs its own gate scan, so
 // stopping prevents a double-fire on the same token).
+// ★ P69: and a C23 compound literal's STORAGE-CLASS SPECIFIERS (`storageChild` of a
+// `semantics.compoundLiterals` row, when `cfg` is given) are the literal's, never the
+// enclosing declaration's: `for (int *p = &(static int){ 0 }; …)` names no `static` of
+// the for-init declaration (D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR).
 [[nodiscard]] NodeId
 findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
                    std::unordered_map<std::uint32_t, std::size_t> const*
-                       declByRule) {
+                       declByRule,
+                   SemanticConfig const* cfg = nullptr,
+                   std::unordered_map<std::uint32_t, std::size_t> const*
+                       compoundLiteralByRule = nullptr) {
     if (!node.valid() || !kind.valid()) return {};
     std::vector<NodeId> stack{node};
     bool firstPop = true;
@@ -9071,11 +11007,29 @@ findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
             && declByRule->contains(tree.rule(cur).v)) {
             continue;
         }
+        // ★ P69 round 4: an attribute specifier is opaque to this scan too, the
+        // root included — the twin of `subtreeContainsToken`'s stop.
+        if (isAttributeSpecifierNode(tree, cur)) {
+            firstPop = false;
+            continue;
+        }
         firstPop = false;
+        NodeId skip{};
+        if (cfg != nullptr && compoundLiteralByRule != nullptr
+            && tree.kind(cur) == NodeKind::Internal) {
+            if (auto const cl = compoundLiteralByRule->find(tree.rule(cur).v);
+                cl != compoundLiteralByRule->end()) {
+                auto const& row = cfg->compoundLiteralRules[cl->second];
+                auto const vk = visibleChildren(tree, cur);
+                if (row.storageChild.has_value() && *row.storageChild < vk.size())
+                    skip = vk[*row.storageChild];
+            }
+        }
         auto const cs = tree.children(cur);
         // Reverse-push so pop order is left-to-right (source order — the
         // FIRST occurrence positions the diagnostic).
         for (auto it = cs.rbegin(); it != cs.rend(); ++it) {
+            if (skip.valid() && it->v == skip.v) continue;
             if (!isEmptySpace(tree.flags(*it))) stack.push_back(*it);
         }
     }
@@ -9740,39 +11694,17 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
         return r.valid() && n.valid() && tree.kind(n) == NodeKind::Internal && tree.rule(n).v == r.v;
     };
     auto const isUnevaluated = [&](NodeId n) {
-        return isRule(n, hirCfg.sizeofRule) || isRule(n, hirCfg.alignofRule)
-            || isRule(n, cfg.sizeofTypeRule) || isRule(n, cfg.sizeofValueRule)
-            || isRule(n, cfg.alignofTypeRule) || isRule(n, cfg.alignofValueRule);
-    };
-    auto const isOperatorNode = [&](NodeId n) {
-        if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
-        std::uint32_t const r = tree.rule(n).v;
-        return isRule(n, hirCfg.unaryExprRule) || isRule(n, hirCfg.binaryExprRule)
-            || isRule(n, hirCfg.postfixExprRule) || isRule(n, hirCfg.ternaryExprRule)
-            || isRule(n, hirCfg.labelAddressRule) || isRule(n, hirCfg.chooseExprRule)
-            || isRule(n, hirCfg.stmtExprRule) || isRule(n, cfg.genericRule)
-            || isRule(n, s.idx().braceInitListRule) || isRule(n, s.idx().stringLiteralExprRule)
-            || isUnevaluated(n)
-            || s.idx().castByRule.contains(r) || s.idx().compoundLiteralByRule.contains(r);
+        return nodeIsAnUnevaluatedOperandForm(cfg, hirCfg, tree, n);
     };
     // Descend the transparent single-child wrappers (a paren group, the expression carriers)
-    // — never through an operator, a cast, a literal form or a selection.
+    // — never through an operator, a cast, a brace list or a selection. What a wrapper IS
+    // was first written HERE; it is one statement for both tiers now
+    // (`nodeSaysSomethingItself`) and this check takes its steps through it like every
+    // other descent. (Its entry for the string literal went with the move: a string
+    // literal's node has no Internal child, so the walk below stops at it either way.)
     std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
     auto const peel = [&](NodeId n) {
-        for (std::size_t guard = 0; n.valid(); ++guard) {
-            if (guard > bound) failOnCyclicTree("the static initializer check's wrapper peel");
-            if (tree.kind(n) != NodeKind::Internal || isOperatorNode(n)) return n;
-            NodeId sole{};
-            bool multiple = false;
-            for (NodeId c : visibleChildren(tree, n)) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                if (sole.valid()) { multiple = true; break; }
-                sole = c;
-            }
-            if (multiple || !sole.valid()) return n;
-            n = sole;
-        }
-        return n;
+        return peelGroupingWrappers(cfg, tree, n, "the static initializer check's wrapper peel");
     };
     auto const operatorOf = [&](NodeId n, std::vector<HirOperatorEntry> const& ops)
         -> HirOperatorEntry const* {
@@ -9797,7 +11729,9 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
         NodeId id{};
         for (NodeId c : visibleChildren(tree, n)) {
             if (tree.kind(c) == NodeKind::Internal) return NodeId{};
-            if (tree.tokenKind(c) == cfg.identifierToken) id = c;
+            // Not Internal is not Token: a parser recovery (Error) child is
+            // neither ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+            if (tree.tokenKindIfToken(c) == cfg.identifierToken) id = c;
         }
         return id;
     };
@@ -9911,7 +11845,17 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
             bool const addressed = it.use == StaticInitUse::Address
                                 || (it.use == StaticInitUse::Value
                                     && typeKindOf(cur) == TypeKind::Array);
-            if (addressed && !outsideFunctionBodies) {
+            // P69: the literal's storage as its own typing arm decided it — its position, or
+            // a C23 storage-class specifier: `static int *p = &(static int){ 42 };` in a
+            // function is an address constant (gcc -std=c2x builds it, run
+            // 20260930-212829-175f46fc b22). Absent facts (an untyped literal), the position
+            // alone answers, as it did before. A THREAD literal's address is the producer's
+            // S_ThreadLocalAddressNotConstant, as a declared thread-local object's is.
+            CompoundLiteralFacts const* clFacts = s.compoundLiteralFacts.tryGet(cur);
+            bool const automaticStorage =
+                clFacts != nullptr ? clFacts->storage == CompoundLiteralFacts::Storage::Automatic
+                                   : !outsideFunctionBodies;
+            if (addressed && automaticStorage) {
                 prove(cur, "takes the address of a compound literal of automatic storage "
                            "duration (C 6.5.2.5p5), which is not an address constant (6.6p9)");
                 continue;
@@ -10021,6 +11965,24 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
             if (op->target == "PreInc" || op->target == "PreDec") {
                 prove(cur, "increments or decrements an object");
                 continue;
+            }
+            // `*&E` DESIGNATES `E` — C 6.5.3.2p3: "the result is as if both were omitted" — so
+            // no address is formed and neither operator is proof; `E` is walked as `*&E` was
+            // used. gcc -std=c2x and clang build `static int x = *&(int){ 42 };` in a function
+            // body, whose literal is automatic (P69, probe c11,
+            // D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT); the evaluator
+            // folds the same pair the same way.
+            if (op->target == "Deref") {
+                NodeId const inner = peel(ops[0]);
+                if (isRule(inner, hirCfg.unaryExprRule)) {
+                    HirOperatorEntry const* innerOp = operatorOf(inner, hirCfg.unaryOps);
+                    auto const innerOps = internals(inner);
+                    if (innerOp != nullptr && innerOp->target == "AddressOf"
+                        && innerOps.size() == 1) {
+                        work.push_back({innerOps[0], it.use, it.volatileRead, it.narrowedBy});
+                        continue;
+                    }
+                }
             }
             // `*p` (its operand's value is used; the read itself is no proof — `*f` of a
             // function builds on all four), `-`, `!`, `~`. `*p` IS an address — `p`'s value —
@@ -10188,13 +12150,23 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
     return out;
 }
 
-// The declaration-level hook: walk every element of `initNode` (brace lists iteratively; a
-// string literal for a character array is a string literal) and report each element's first
-// provably non-constant construct, or its first admitted comma operator. `fileScope`: the
-// declaration is at file scope (its compound literals are static, C 6.5.2.5p5).
+// The declaration-level hook: walk every element of `initNode` that initializes something of
+// `object`, the declared type (`forEachPlacedBraceValue`; a string literal for a character
+// array is a string literal), and report each one's first provably non-constant construct, or
+// its first admitted comma operator. `fileScope`: the declaration is at file scope (its
+// compound literals are static, C 6.5.2.5p5).
+// ★ P69 (lane `lm`, the scalar brace closure): AN ELEMENT THAT INITIALIZES NOTHING IS NO
+// CONSTNESS QUESTION. This walked every element of every brace list, blind to the type, so an
+// EXCESS element — dropped unevaluated by the lowering (C 6.7.9p2's constraint, warned) — was
+// refused as not constant. ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0, every program
+// RUN): both build `static int v = {42, g()};`, `static int v = {{42, g()}};`, `static int
+// a[1] = {42, g()};`, `static struct S s = {42, g()};`, `static union U u = {42, g()};`,
+// `static int a[1][1] = {{42, g()}};` and `static struct S s = {{40, g()}, 2};` with the
+// excess warning alone, `g()` never called; clang builds `static char s[] = {"*", g()};` too
+// (gcc refuses it). Both refuse a call where it INITIALIZES something: `{g(), 42}`.
 void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                               NodeId initNode, ScopeId here, StaticInitializerRule const& rule,
-                               bool fileScope) {
+                               NodeId initNode, TypeId object, ScopeId here,
+                               StaticInitializerRule const& rule, bool fileScope) {
     auto const report = [&](DiagnosticCode code, DiagnosticSeverity sev, NodeId at,
                             std::string message) {
         ParseDiagnostic d;
@@ -10205,29 +12177,9 @@ void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree c
         d.actual   = std::move(message);
         s.reporter.report(std::move(d));
     };
-    std::vector<NodeId> pending{initNode};
-    std::size_t const bound = tree.nodeCount() + 1;   // strict descendants of one declaration
-    for (std::size_t guard = 0; !pending.empty(); ++guard) {
-        if (guard > bound) failOnCyclicTree("the static initializer element walk");
-        NodeId const raw = pending.back();
-        pending.pop_back();
-        NodeId const v = descendInitWrappers(s, tree, raw);
-        if (!v.valid()) continue;
-        if (tree.kind(v) == NodeKind::Internal && s.idx().braceInitListRule.valid()
-            && tree.rule(v).v == s.idx().braceInitListRule.v) {
-            for (NodeId el : visibleChildren(tree, v)) {
-                if (tree.kind(el) != NodeKind::Internal) continue;
-                if (s.idx().initElementRule.valid() && tree.rule(el).v != s.idx().initElementRule.v)
-                    continue;
-                // An element's VALUE is its last Internal child (a designator precedes it; a
-                // designator's own constant expression is the designator machinery's).
-                NodeId last{};
-                for (NodeId c : visibleChildren(tree, el))
-                    if (tree.kind(c) == NodeKind::Internal) last = c;
-                if (last.valid()) pending.push_back(last);
-            }
-            continue;
-        }
+    // One value that initializes something: its first provably non-constant construct, or its
+    // first admitted comma operator.
+    auto const check = [&](NodeId raw) {
         StaticInitializerFinding const f =
             findNonConstantInStaticInitializer(s, cfg, tree, raw, here, rule.otherConstantForms,
                                                fileScope);
@@ -10244,7 +12196,18 @@ void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree c
                                "names it; the language admits it as a constant)",
                                tree.text(f.comma)));
         }
+    };
+    NodeId const v = descendInitWrappers(s, tree, initNode);
+    if (!v.valid()) return;
+    if (tree.kind(v) == NodeKind::Internal && s.idx().braceInitListRule.valid()
+        && tree.rule(v).v == s.idx().braceInitListRule.v) {
+        // A designator in a scalar's braces is the element judge's refusal
+        // (`checkBraceInitializerElements`); its value initializes nothing.
+        forEachPlacedBraceValue(s, tree, v, object, here,
+                                [&](NodeId value, TypeId) { check(value); }, [](NodeId) {});
+        return;
     }
+    check(initNode);
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -10396,19 +12359,52 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
         // prefix). The merge still proceeds below — the error already gates
         // compilation, and keeping the binding intact avoids diagnostic
         // cascades on later uses.
+        //
+        // ★★ P69 (lane `cs`) — A REQUEST THAT YIELDS IS IGNORED, NOT REFUSED. When
+        // the thread storage of the side that has it came only from specifiers
+        // whose linkage entry says so (`SymbolRecord::
+        // threadStorageYieldsOnMismatch`; c: `__declspec(thread)`), the pair is
+        // accepted, the request is warned as ignored, and the object is ONE SHARED
+        // OBJECT — the flag is cleared on BOTH records (the internal-linkage
+        // precedent just below: the next merge in a chain, and the lowering, read
+        // whichever record survives). ✔MEASURED, cl 19.51 and mingw-w64 gcc 13:
+        // `extern __declspec(thread) int e; int e = 1;` builds on both, and a
+        // write from a second thread is read by main on both — one object. (cl
+        // refuses the opposite order; mingw-w64 gcc, which ignores the modifier
+        // everywhere, runs it shared, and that is the answer taken for both.)
         if (category(priorRec) == DeclarationKind::Variable
             && priorRec.isThreadLocal != s.symbols.at(newId).isThreadLocal) {
+            SymbolRecord& newRec = s.symbols.at(newId);
+            bool const priorIsThreadSide = priorRec.isThreadLocal;
+            bool const yields =
+                (priorIsThreadSide ? priorRec : newRec).threadStorageYieldsOnMismatch;
             ParseDiagnostic d;
-            d.code     = DiagnosticCode::S_ThreadLocalRedeclarationMismatch;
-            d.severity = DiagnosticSeverity::Error;
-            d.buffer   = tree.source().id();
-            d.span     = tree.span(nameNode);
-            d.actual   = std::format(
-                "'{}' — this declaration {} thread_local but a prior "
-                "declaration of the same name {} (C 6.7.1p3 requires the "
-                "specifier on every declaration)", name,
-                s.symbols.at(newId).isThreadLocal ? "is" : "is NOT",
-                priorRec.isThreadLocal ? "is" : "is not");
+            d.buffer = tree.source().id();
+            d.span   = tree.span(nameNode);
+            if (yields) {
+                d.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                d.severity = DiagnosticSeverity::Warning;
+                d.actual   = std::format(
+                    "the thread-storage request on {} declaration of '{}' is "
+                    "ignored and its effect was discarded: {} declaration of the "
+                    "same object makes no such request, so '{}' is one object "
+                    "shared by every thread",
+                    priorIsThreadSide ? "a prior" : "this", name,
+                    priorIsThreadSide ? "this" : "a prior", name);
+                priorRec.isThreadLocal                 = false;
+                newRec.isThreadLocal                   = false;
+                priorRec.threadStorageYieldsOnMismatch = false;
+                newRec.threadStorageYieldsOnMismatch   = false;
+            } else {
+                d.code     = DiagnosticCode::S_ThreadLocalRedeclarationMismatch;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "'{}' — this declaration {} thread_local but a prior "
+                    "declaration of the same name {} (C 6.7.1p3 requires the "
+                    "specifier on every declaration)", name,
+                    newRec.isThreadLocal ? "is" : "is NOT",
+                    priorRec.isThreadLocal ? "is" : "is not");
+            }
             if (priorRec.tree.v == tree.id().v) {
                 d.related.push_back(RelatedLocation{
                     tree.source().id(),
@@ -10739,7 +12735,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // own gates), so one use site fires exactly once.
             for (auto const& gate : decl.gatedMarkers) {
                 NodeId const hit = findTokenInSubtree(
-                    tree, node, gate.token, &s.idx().declByRule);
+                    tree, node, gate.token, &s.idx().declByRule, &cfg,
+                    &s.idx().compoundLiteralByRule);
                 if (!hit.valid()) continue;
                 ParseDiagnostic d;
                 d.code     = gate.code;
@@ -11273,6 +13270,27 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         if (scanSpecifierPrefixStorage(cfg, tree, node, decl)
                                 .threadStorage) {
                             rec.isThreadLocal = true;
+                        } else if (effectiveKind == DeclarationKind::Variable
+                                   && !isProto) {
+                            // P69 (lane `cs`): THREAD STORAGE REQUESTED BY AN
+                            // ATTRIBUTE CLAUSE (`declaratorAttributeStorage` —
+                            // every position this declarator's attributes are read
+                            // at). Only an OBJECT is marked: on a function the
+                            // clause's own effects row says it is ignored, and the
+                            // kind gate warns exactly that (mingw-w64 gcc's answer;
+                            // cl refuses), where marking the function would turn the
+                            // warning into C 6.7.1's error for a keyword nobody
+                            // wrote. Not reached when the KEYWORD is present: then
+                            // the storage is the keyword's and never yields.
+                            AttributeStorageRequest const byAttribute =
+                                declaratorAttributeStorage(
+                                    cfg, tree, node, decl, dNode,
+                                    dNode.v == declarators.back().v);
+                            if (byAttribute.thread) {
+                                rec.isThreadLocal = true;
+                                rec.threadStorageYieldsOnMismatch =
+                                    byAttribute.everyRequestYields;
+                            }
                         }
                         // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH,
                         // C 6.2.2p3): a specifier whose linkageSpecifiers
@@ -11691,6 +13709,19 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // same scan; Pass 2 + the merge own the consequences.
                     if (scanSpecifierPrefixStorage(cfg, tree, node, decl).threadStorage) {
                         rec.isThreadLocal = true;
+                    } else if (effectiveKind == DeclarationKind::Variable) {
+                        // P69 (lane `cs`): the positional-path mirror of the
+                        // declarator-mode mint's attribute-clause request. A
+                        // positional row has one name and no declarator, so the
+                        // declaration's own positions are all there is to read.
+                        AttributeStorageRequest const byAttribute =
+                            declaratorAttributeStorage(cfg, tree, node, decl, NodeId{},
+                                                       /*isLastDeclarator=*/true);
+                        if (byAttribute.thread) {
+                            rec.isThreadLocal = true;
+                            rec.threadStorageYieldsOnMismatch =
+                                byAttribute.everyRequestYields;
+                        }
                     }
                     // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH): the
                     // positional-path mirror of the declarator-mode
@@ -11805,6 +13836,153 @@ childScopeFor(EngineState& s, Tree const& tree, NodeId node, ScopeId current) {
     return current;
 }
 
+// The scope a declaration's declarators BIND in, from the scope Pass 1.5 hands
+// the declaration's visit. The walker passes `childScopeFor(node, current)`: the
+// child scope the declaration node itself opens when its row is a `scopes` rule
+// (✔MEASURED: a file-scope declaration is visited with such a scope, not with the
+// file scope), so the declarators' scope is that scope's PARENT — `childScopeFor`
+// read backwards. A node that opened no scope was visited with `current` itself.
+[[nodiscard]] ScopeId
+scopeBindingDeclaratorsOf(EngineState const& s, Tree const& tree, NodeId node,
+                          ScopeId here) {
+    auto const& scopes = s.scopes.scopes();
+    if (here.valid() && here.v < scopes.size() && scopes[here.v].anchor.v == node.v
+        && scopes[here.v].tree.v == tree.id().v)
+        return scopes[here.v].parent;
+    return here;
+}
+
+// P69 (lane `cs`) — C 6.2.7p4 FOR AN ARRAY OF UNKNOWN SIZE. A redeclaration of an
+// object whose prior declaration is visible makes the identifier's type, FROM THAT
+// DECLARATION ON, the composite of the two; the composite of an array of unknown size
+// and one of known size (the same element) is the known one (6.2.7p3). Every use of a
+// redeclared name binds to ONE record, its merge's survivor, so the composite is put
+// on every record of the merge when the declaration that completes it is resolved —
+// in Pass 1.5's own order: a bound written AFTER `int v[]; int v[10];` reads ten
+// elements (gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 give it ten, ✔MEASURED
+// probe fs cell 2), and one written between the two still reads the array of unknown
+// size (cl's 0, ✔MEASURED probe sz cell 2). A later declaration of unknown size takes
+// the size a prior one gave (`int v[10]; int v[];`). Two different known sizes, or
+// two element types, are no composite: the post-1.5 sweep refuses them.
+// The same holds one pointer down (C 6.7.6.2p6): `int (*p)[]; int (*p)[3];` is one
+// object whose type is the composite `int (*)[3]` (✔MEASURED, lane `cs` probe ak
+// cells 5, 6 and 9: gcc 13.3.0 and clang 18.1.3 read `sizeof *p` as 12 after the
+// second declaration, in either order), so a bound written after the declaration
+// that completes it reads three elements here too.
+void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
+    auto const partners = s.redeclarationPartners.find(sym.v);
+    if (partners == s.redeclarationPartners.end()) return;
+    auto& in = s.lattice.interner();
+    auto const elementOf = [&](TypeId t) -> TypeId {
+        if (!t.valid() || in.kind(t) != TypeKind::Array) return InvalidType;
+        auto const ops = in.operands(t);
+        return ops.empty() ? InvalidType : ops[0];
+    };
+    // Two declared types of the merge that have a composite: at the top, arrays of one
+    // element one of which has no size; below a pointer, C's compatibility.
+    auto const composable = [&](TypeId x, TypeId y) {
+        if (!x.valid() || !y.valid()) return false;
+        if (x.v == y.v) return true;
+        if (in.kind(x) == TypeKind::Array || in.kind(y) == TypeKind::Array)
+            return elementOf(x).valid() && elementOf(x).v == elementOf(y).v
+                && (in.isIncompleteArray(x) || in.isIncompleteArray(y));
+        return in.kind(x) == TypeKind::Ptr && in.qualifierBits(x) == in.qualifierBits(y)
+            && sameOrEnumCompatible(in, in.stripVolatile(x), in.stripVolatile(y));
+    };
+    TypeId const mine = s.symbols.at(sym).type;
+    if (!mine.valid()
+        || (in.kind(mine) != TypeKind::Array && in.kind(mine) != TypeKind::Ptr))
+        return;
+    // The merge, as every record reachable through the partners.
+    std::vector<SymbolId> group{sym};
+    for (std::size_t i = 0; i < group.size(); ++i) {
+        auto const it = s.redeclarationPartners.find(group[i].v);
+        if (it == s.redeclarationPartners.end()) continue;
+        for (SymbolId const p : it->second)
+            if (std::find_if(group.begin(), group.end(),
+                             [&](SymbolId g) { return g.v == p.v; }) == group.end())
+                group.push_back(p);
+    }
+    // The composite: this declaration's type, completed by every resolved record of the
+    // merge that knows a size it does not (`completerOfCompatible`). A pair where each
+    // knows a size the other does not has none either spells, and changes nothing.
+    TypeId composite = mine;
+    for (SymbolId const r : group) {
+        TypeId const t = s.symbols.at(r).type;
+        if (!composable(composite, t)) continue;
+        if (TypeId const c = completerOfCompatible(in, composite, t); c.valid())
+            composite = c;
+    }
+    for (SymbolId const r : group) {
+        SymbolRecord& rec = s.symbols.at(r);
+        // A record Pass 1.5 has not reached yet has no type: nothing to compose.
+        if (rec.kind != DeclarationKind::Variable || !rec.type.valid()
+            || rec.type.v == composite.v || !composable(rec.type, composite))
+            continue;
+        rec.type = composite;
+        if (rec.declNode.valid()) s.nodeToType.set(rec.declNode, composite);
+    }
+}
+
+// P69 (lane `cs`) — C 6.2.7p4 AT A USE. Every use of a redeclared name binds to ONE
+// record, its merge's survivor, and the survivor holds the merge's composite
+// (`composeArrayRedeclaration`) — what the object IS. But the identifier's type at a
+// use is the composite of the declarations written BEFORE that use: an array a LATER
+// declaration completes is still an array of unknown size there (`extern int a[];
+// … sizeof a … int a[3];`: cl reads 0 with C4034, gcc 13.3.0 and clang 18.1.3 refuse —
+// ✔MEASURED, probe sz cell 2), and one an EARLIER declaration completed has its size
+// (`int v[10]; int v[]; … sizeof v` is 40). Asked by both readers of a name's type at a
+// use: Pass 2's reference stamp and `subtreeType`'s leaf (Pass 1.5's constants).
+// EVERY composite the merge builds is read so, the one a pointer down included
+// (`composeArrayRedeclaration`): between `int (*p)[];` and `int (*p)[3];` a use reads
+// `int (*)[]`, so `sizeof *p` there asks the size of an array of unknown size
+// (✔MEASURED, probe rv cell 13: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and
+// Apple clang refuse it; cl 19.51 gives 0 with C4034, probe rv3 cell 1 — the language
+// document's `sizeof.incompleteArraySize`; it read the composite's 12 before). The declarations written
+// before the use are composed as the merge composes them (`completerOfCompatible`);
+// a name with no partner, or a type the merge never composes, is the record's own.
+[[nodiscard]] TypeId typeVisibleAt(EngineState const& s, Tree const& tree, SymbolId sym,
+                                   NodeId at) {
+    TypeId const t = s.symbols.at(sym).type;
+    auto const& in = s.lattice.interner();
+    // The types a merge composes. A record Pass 1.5 has not typed yet (an invalid `t`,
+    // asked by a constant evaluated before the record's own pass) reads the declarations
+    // written so far like any other.
+    auto const composed = [&](TypeId ty) {
+        return ty.valid() && (in.kind(ty) == TypeKind::Array || in.kind(ty) == TypeKind::Ptr);
+    };
+    if (t.valid() && !composed(t)) return t;
+    if (!at.valid() || !s.redeclarationPartners.contains(sym.v)) return t;
+    std::vector<SymbolId> group{sym};
+    for (std::size_t i = 0; i < group.size(); ++i) {
+        auto const it = s.redeclarationPartners.find(group[i].v);
+        if (it == s.redeclarationPartners.end()) continue;
+        for (SymbolId const p : it->second)
+            if (std::find_if(group.begin(), group.end(),
+                             [&](SymbolId g) { return g.v == p.v; }) == group.end())
+                group.push_back(p);
+    }
+    auto const where = tree.span(at).start();
+    TypeId visible = InvalidType;
+    for (SymbolId const r : group) {
+        SymbolRecord const& rec = s.symbols.at(r);
+        if (rec.tree.v == tree.id().v && rec.declNode.valid()
+            && tree.span(rec.declNode).start() > where)
+            continue;   // written after the use
+        auto const own = s.ownDeclaredType.find(r.v);
+        TypeId const written = own != s.ownDeclaredType.end() ? own->second : rec.type;
+        if (!composed(written) || (t.valid() && in.kind(written) != in.kind(t))) continue;
+        if (!visible.valid()) {
+            visible = written;
+        } else if (in.kind(written) != in.kind(visible)) {
+            continue;
+        } else if (TypeId const c = completerOfCompatible(in, visible, written); c.valid()) {
+            visible = c;
+        }
+    }
+    return visible.valid() ? visible : t;
+}
+
 // GAP A: find the scope (anywhere in the tree) whose anchor IS `node` —
 // used to key a function's result type on the scope its body opens. The
 // body scope can be nested under an intermediate scope (e.g. c's
@@ -11898,6 +14076,19 @@ struct EngineAnonAccess {
     }
 };
 
+// P69 (lane `cs`): declared above `buildConstEvalEnv`, where its first asker is. No
+// layout parameters (a target-less analysis) is "no computable layout", never a guess.
+anon_member_search::MemberOffset
+memberOffsetIn(EngineState const& s, TypeId container, std::string_view name) {
+    if (!s.aggregateLayout.has_value()) {
+        return anon_member_search::MemberOffset{
+            anon_member_search::MemberOffsetStatus::NoLayout, 0, TypeId{}};
+    }
+    return anon_member_search::memberByteOffset(s.lattice.interner(), container, name,
+                                                EngineAnonAccess{s}, *s.aggregateLayout,
+                                                s.dataModel);
+}
+
 // P68 round 9 (lane `cs`): the placement cursor's view of the DECLARED types
 // (`initializer_cursor.hpp`). The HIR tier's view answers the same questions with
 // the representation projections of the same members, which differ only for a
@@ -11970,20 +14161,59 @@ private:
     return out;
 }
 
-// Peel single-child wrappers off `n` until `rule` (or a node with several internal
-// children, or a leaf). The brace walks' transparent-wrapper descent — the HIR tier's
-// `peelToBraceInitOrCore` / `peelToDesignatorLeaf` take the same steps.
+// ── A COMPILE-TIME SELECTION'S RESULT (cycle P69 round 1, lane `lm`) ────────────────────
+// `_Generic` and `__builtin_choose_expr` say something themselves (THE statement,
+// `nodeSaysSomethingItself`), and what they say is one of their operands: a descent asking
+// a VALUE question — which expression is a bit-field's value, which object a pointer
+// designates, which string a builtin folds, what an array is initialized by — takes the
+// step to that operand BY NAME, here, and never by counting children. The result is
+// Pass 2's record once it has made one; before that the ONE selector of each.
+[[nodiscard]] bool nodeIsASelection(SemanticConfig const& sem, Tree const& tree, NodeId n) {
+    if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
+    std::uint32_t const r = tree.rule(n).v;
+    auto const& hc = tree.schema().hirLowering();
+    return (sem.genericRule.valid() && r == sem.genericRule.v)
+        || (hc.chooseExprRule.valid() && r == hc.chooseExprRule.v)
+        || (sem.builtinChooseExprRule.valid() && r == sem.builtinChooseExprRule.v);
+}
+
+[[nodiscard]] NodeId selectionResultOf(EngineState& s, SemanticConfig const& sem,
+                                       Tree const& tree, NodeId sel, ScopeId scope) {
+    if (NodeId const* rec = s.nodeToSelectedExpr.tryGet(sel); rec != nullptr && rec->valid())
+        return *rec;
+    if (sem.genericRule.valid() && tree.rule(sel).v == sem.genericRule.v)
+        return genericSelectedArm(s, sem, tree, sel, scope);
+    return chooseExprSelectedArm(s, sem, tree, sel, scope, /*loud=*/false);
+}
+
+// The node of `rule` that `n` IS — `n` itself, or what stands under its wrappers — else an
+// invalid node. The brace walks' descent: "is this element's value a brace list", "is it
+// the string literal that initializes the array", "is this child a designator". The HIR
+// tier's `peelToBraceInitOrCore` takes its steps by the same statement.
+// ★ P69 (lane `lm`): A WRAPPER IS WHAT THE ONE STATEMENT SAYS IT IS
+// (`nodeSaysSomethingItself`). This peeled EVERY node with one Internal child, so the
+// operand of an operator answered for the expression: ✔MEASURED 2026-10-10, `char s[] =
+// { *"abc" };`, `{ !"abc" }` and `{ sizeof "abc" }` were sized as the string under the
+// operator (four elements), and at file scope the element after one was warned as "in
+// excess of the string literal that leads its braces" and dropped. gcc, clang,
+// AppleClang, MinGW gcc and MSVC build each as the one-element array it is. No depth cap
+// either: the walk went 64 wrappers deep and then answered "no" — every step is to a
+// strict descendant, so the tree's node count bounds it.
 [[nodiscard]] NodeId peelSingleChildrenTo(Tree const& tree, NodeId n, RuleId rule) {
+    if (!rule.valid()) return {};
+    SemanticConfig const& cfg = tree.schema().semantics();
+    auto const& hirCfg = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;
     NodeId cur = n;
-    for (int guard = 0; guard < 64 && cur.valid() && tree.kind(cur) == NodeKind::Internal;
-         ++guard) {
-        if (rule.valid() && tree.rule(cur).v == rule.v) return cur;
+    for (std::size_t guard = 0; cur.valid() && tree.kind(cur) == NodeKind::Internal; ++guard) {
+        if (guard > bound) failOnCyclicTree("the brace walks' wrapper peel");
+        if (tree.rule(cur).v == rule.v) return cur;
+        if (nodeSaysSomethingItself(cfg, hirCfg, tree, cur)) return {};
         auto const inner = internalChildrenOf(tree, cur);
-        if (inner.size() != 1) break;
+        if (inner.size() != 1) return {};
         cur = inner.front();
     }
-    return (cur.valid() && tree.kind(cur) == NodeKind::Internal && rule.valid()
-            && tree.rule(cur).v == rule.v) ? cur : NodeId{};
+    return {};
 }
 
 // C 6.7.9p14: the string literal an initializer VALUE is, when the character array
@@ -12018,6 +14248,81 @@ private:
                ? lit : NodeId{};
 }
 
+// C 6.7.9p13-p14: does a brace element's (non-list) VALUE initialize an aggregate or
+// union subobject of type `t` WHOLE — a string for a character array, an expression of
+// the structure's or union's own type — instead of being elided into its first member?
+// The placement cursor's `initializesWhole` question, answered one way for every caller.
+[[nodiscard]] bool braceValueInitializesWhole(EngineState& s, SchemaIndexes const& idx,
+                                              Tree const& tree, NodeId value, TypeId t,
+                                              ScopeId scope) {
+    TypeInterner& interner = s.lattice.interner();
+    TypeKind const k = interner.kind(t);
+    if (k == TypeKind::Array)
+        return stringLiteralInitializingArray(s, idx, tree, value, t).valid();
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    TypeId const vt = subtreeType(s, tree, value, scope);
+    // ★ P69 (lane `lm`): THE ANSWER IS HANDED TO THE LOWERING, NOT DERIVED THERE AGAIN.
+    // The HIR tier asks the placement cursor this same question and had only the type
+    // STAMPS to answer it from — and an operator's node carries none, by this tier's own
+    // design (`nodeToType` is the door the lowering prefers over the type it computes
+    // itself, so a derived expression type is never stamped on it). ✔MEASURED 2026-10-10:
+    // this tier sized `struct S arr[] = { src[1], src[0], src[1] };` as three structures
+    // (and so `{ *p, … }`, `{ (0 ? s : s), … }`, `{ (0, s), … }`, `{ *(&s + 0), … }`, a
+    // call with no argument), while the lowering, finding an array and an `int` stamped
+    // under `src[1]`, put the element into the structure's FIRST MEMBER — two tiers, two
+    // placements, a verifier failure ("ConstructAggregate … child[0] type … doesn't match
+    // field type"), where all six references build and run every one. The lowering
+    // cannot type the value by lowering it first: the placement is decided before
+    // anything is lowered, so that an element in excess stays unevaluated. So the type
+    // derived HERE is the fact it reads, under the node both tiers reach by the one
+    // statement of what a wrapper is.
+    if (vt.valid()) {
+        s.braceElementValueTypes.set(
+            peelGroupingWrappers(tree.schema().semantics(), tree, value,
+                                 "a brace element's value"),
+            vt);
+    }
+    return vt.valid() && interner.stripVolatile(vt) == interner.stripVolatile(t);
+}
+
+// One MEMBER NAME of a structure or union type, resolved to the index path the placement
+// cursor takes — the member's own `fieldIndex`, after the indices of the anonymous
+// members it is promoted through (C 6.7.2.1p13) — and the member's type. nullopt for a
+// name the type does not have (or names ambiguously), or a type with no member scope.
+// Shared by a designator `.m` and a constant's member access `c.m` (P69), so the two
+// cannot place one member at two paths.
+struct ResolvedMemberPath {
+    std::vector<std::uint64_t> indices;
+    TypeId                     type{};
+    std::optional<std::uint32_t> bitFieldWidth{};   // the member is a bit-field of this width
+};
+[[nodiscard]] std::optional<ResolvedMemberPath>
+resolveMemberPath(EngineState& s, TypeId container, std::string_view name) {
+    TypeInterner& interner = s.lattice.interner();
+    if (name.empty() || !container.valid()) return std::nullopt;
+    ScopeId memberScope{};
+    auto const it = s.compositeScopeByType.find(interner.stripVolatile(container).v);
+    if (it != s.compositeScopeByType.end()) memberScope = it->second;
+    EngineAnonAccess const access{s};
+    ScopeRecord const* sr = access.scope(memberScope);
+    if (sr == nullptr) return std::nullopt;
+    SymbolRecord const* rec = nullptr;
+    ResolvedMemberPath out;
+    if (auto const hit = sr->bindings.find(name); hit != sr->bindings.end()) {
+        rec = access.record(hit->second);
+    } else if (auto const promoted =
+                   anon_member_search::findPromotedMember(memberScope, name, access);
+               promoted.has_value() && !promoted->ambiguous) {
+        rec = access.record(promoted->symbol);
+        out.indices.assign(promoted->anonIndices.begin(), promoted->anonIndices.end());
+    }
+    if (rec == nullptr || rec->kind != DeclarationKind::Variable) return std::nullopt;
+    out.indices.push_back(rec->fieldIndex);
+    out.type = rec->type;
+    out.bitFieldWidth = rec->bitFieldWidth;
+    return out;
+}
+
 // One brace element's designation, resolved to member / element indices against
 // `object` — the path the placement cursor takes, at FULL width (the cursor, not this
 // resolver, decides what fits its index space) — and its value node. `resolved` is
@@ -12050,31 +14355,11 @@ resolveBraceElement(EngineState& s, Tree const& tree, NodeId element, TypeId obj
                     break;
                 }
             }
-            ScopeId memberScope{};
-            if (cur.valid()) {
-                auto const it = s.compositeScopeByType.find(interner.stripVolatile(cur).v);
-                if (it != s.compositeScopeByType.end()) memberScope = it->second;
-            }
-            EngineAnonAccess const access{s};
-            ScopeRecord const* sr = access.scope(memberScope);
-            if (name.empty() || sr == nullptr) { out.resolved = false; return out; }
-            SymbolRecord const* rec = nullptr;
-            std::vector<std::uint32_t> anonIndices;
-            if (auto const hit = sr->bindings.find(name); hit != sr->bindings.end()) {
-                rec = access.record(hit->second);
-            } else if (auto const promoted =
-                           anon_member_search::findPromotedMember(memberScope, name, access);
-                       promoted.has_value() && !promoted->ambiguous) {
-                rec = access.record(promoted->symbol);
-                anonIndices = promoted->anonIndices;
-            }
-            if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
-                out.resolved = false;
-                return out;
-            }
-            out.designator.insert(out.designator.end(), anonIndices.begin(), anonIndices.end());
-            out.designator.push_back(rec->fieldIndex);
-            cur = rec->type;
+            auto const member = resolveMemberPath(s, cur, name);
+            if (!member.has_value()) { out.resolved = false; return out; }
+            out.designator.insert(out.designator.end(), member->indices.begin(),
+                                  member->indices.end());
+            cur = member->type;
             continue;
         }
         if (asIndex.valid()) {
@@ -12138,6 +14423,19 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
     auto const ops = interner.operands(declTy);
     if (ops.empty() || !ops[0].valid()) return declTy;   // malformed — leave as-is
     TypeId const elem = ops[0];
+    // P69 round 4 (lane `cs`): THE ARRAY'S OWN TYPE-LEVEL ALIGNMENT SURVIVES ITS
+    // COMPLETION. The completed type is built from the ELEMENT, so a decoration on
+    // the incomplete array itself would be left behind — and since this cycle one
+    // can be there: `(__attribute__((aligned(16))) int[]){ 1, 2 }` requests the
+    // alignment in the type name, before the initializer gives the bound.
+    // ✔MEASURED (lane `cs`'s probe ta8 a16): `__alignof__` of that literal is 16 on
+    // gcc 13.3.0 (clang 18.1.3 and Apple clang ignore the attribute in a type name
+    // and say so).
+    std::uint32_t const keepAlign = interner.typeAlignOverride(declTy);
+    auto const completed = [&](TypeId sized) {
+        return keepAlign != 0 && sized.valid()
+                   ? interner.typeAligned(sized, keepAlign) : sized;
+    };
 
     // An incomplete-array VARIABLE reaches this helper ONLY with an initializer
     // that must SIZE it (C 6.7.9). If the initializer cannot determine a positive
@@ -12166,14 +14464,39 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
         s.reporter.report(std::move(d));
         return InvalidType;
     };
+    // An initializer that is neither a string literal nor a brace list sizes nothing
+    // (C 6.7.9p14, p16): the same refusal, naming why.
+    auto failNeither = [&]() -> TypeId {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ArrayLengthOutOfRange;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(initNode);
+        d.actual   = "an array of unknown size takes its length from a string literal or a "
+                     "brace list (C 6.7.9p14, p16, p22), and this initializer is neither: `"
+                     + std::string{tree.text(initNode)} + "`";
+        s.reporter.report(std::move(d));
+        return InvalidType;
+    };
 
-    // Descend the initializer subtree to the FIRST string-literal expr OR brace
-    // list (the init may sit under transparent wrappers — `initValue`, paren
-    // groups). Both rule kinds are mutually exclusive at a given init position.
-    std::vector<NodeId> stack{initNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) != NodeKind::Internal) continue;
+    // WHAT THE INITIALIZER IS — a string literal or a brace list — under GROUPING only, by
+    // THE statement of what a wrapper is (`nodeSaysSomethingItself`), and through a
+    // compile-time selection to its RESULT (`selectionResultOf`; C 6.5.1.1p3).
+    // ★ P69 (lane `lm`, the review's B): this searched ANY node, depth first and the LAST
+    // child first, for the first string literal or brace list, and stopped in silence after
+    // 8192 nodes. ✔MEASURED 2026-10-15 (pe64, both pipelines): `char s[] = (0, "abc");`,
+    // `(1 ? "abc" : "de")` and `({ "abc"; })` were sized from the literal inside them and
+    // then refused for the type — gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2
+    // refuse each as no array initializer at all; `_Generic(0, int: "abc")` is four
+    // elements on all four and on DSS (READ, not run: with two string associations the
+    // search took whichever literal it met first, not the selected one's). Every step is
+    // to a strict descendant: the tree's node count bounds it, LOUD past it.
+    SemanticConfig const& semCfg = tree.schema().semantics();
+    auto const& hirCfg = tree.schema().hirLowering();
+    std::size_t const searchBound = tree.nodeCount() + 1;
+    NodeId c = initNode;
+    for (std::size_t step = 0; c.valid() && tree.kind(c) == NodeKind::Internal; ++step) {
+        if (step > searchBound) failOnCyclicTree("the initializer search of an array of unknown size");
         RuleId const r = tree.rule(c);
         if (idx.stringLiteralExprRule.valid()
             && idx.stringLiteralBodyToken.valid()
@@ -12189,8 +14512,8 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                 // (fail loud later), exactly like a malformed escape.
                 TypeKind const ek = interner.kind(elem);
                 if (ek == TypeKind::Char || ek == TypeKind::Byte) {
-                    return interner.array(
-                        elem, static_cast<std::int64_t>(decoded->size() + 1));
+                    return completed(interner.array(
+                        elem, static_cast<std::int64_t>(decoded->size() + 1)));
                 }
                 // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE: `&outcome` carries each
                 // `\x`/octal escape's RAW VALUE and its offset, so a byte escape
@@ -12202,8 +14525,8 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                 // width and the value) — never a guessed size.
                 WideEncodeResult enc;
                 if (!encodeWideString(*decoded, ek, enc, &outcome)) {
-                    return interner.array(
-                        elem, static_cast<std::int64_t>(enc.codeUnits + 1));
+                    return completed(interner.array(
+                        elem, static_cast<std::int64_t>(enc.codeUnits + 1)));
                 }
             }
             return declTy;   // malformed escape / wide encode error — stay incomplete
@@ -12227,8 +14550,7 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                 if (NodeId const lit =
                         stringLiteralInitializingArray(s, idx, tree, lead.front(), declTy);
                     lit.valid()) {
-                    stack.clear();
-                    stack.push_back(lit);
+                    c = lit;
                     continue;
                 }
             }
@@ -12246,17 +14568,7 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                     peelSingleChildrenTo(tree, el.value, idx.braceInitListRule).valid();
                 initializer_cursor::Placement const placed = cursor.place(
                     std::span<std::uint64_t const>{el.designator}, isList, [&](TypeId t) {
-                        // C 6.7.9p13-p14: the value initializes the subobject WHOLE —
-                        // a string for a character array, an expression of the
-                        // structure's or union's own type — instead of being elided
-                        // into its first member.
-                        TypeKind const k = interner.kind(t);
-                        if (k == TypeKind::Array)
-                            return stringLiteralInitializingArray(s, idx, tree, el.value, t)
-                                .valid();
-                        if (k != TypeKind::Struct && k != TypeKind::Union) return false;
-                        TypeId const vt = subtreeType(s, tree, el.value, scope);
-                        return vt.valid() && interner.stripVolatile(vt) == interner.stripVolatile(t);
+                        return braceValueInitializesWhole(s, idx, tree, el.value, t, scope);
                     });
                 // P68 round 9 (lane `cs`): an element the cursor cannot hold — an index
                 // designator (or the positional run after one) sizing this array past
@@ -12287,11 +14599,255 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
             }
             std::int64_t const size = cursor.extent();
             if (size <= 0) return failUnsized();
-            return interner.array(elem, size);
+            return completed(interner.array(elem, size));
         }
-        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        // Neither: a selection is its RESULT; any other node that says something itself is
+        // no string literal and no brace list (an operator over a string is an expression
+        // of its own, C 6.7.9p14); grouping is stepped through.
+        if (nodeIsASelection(semCfg, tree, c)) {
+            c = selectionResultOf(s, semCfg, tree, c, scope);
+            continue;
+        }
+        if (nodeSaysSomethingItself(semCfg, hirCfg, tree, c)) break;
+        auto const inner = internalChildrenOf(tree, c);
+        if (inner.size() != 1) break;
+        c = inner.front();
     }
-    return failUnsized();   // no string/brace initializer found — fail loud, no hang
+    return failNeither();   // no string literal and no brace list: fail loud, no hang
+}
+
+// The kinds whose objects are SCALARS (C 6.2.5p21: the arithmetic types and the pointer
+// types; C23 adds `nullptr_t`) — the subobjects a brace element is judged against as
+// `T x = e;` is judged. A SIMD vector, a matrix or an extension kind is none of them: the
+// HIR lowering keeps its own verdict on those.
+[[nodiscard]] bool isScalarObjectKind(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::Bool:
+        case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
+        case TypeKind::I64: case TypeKind::I128:
+        case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+        case TypeKind::U64: case TypeKind::U128:
+        case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
+        case TypeKind::F80: case TypeKind::F128:
+        case TypeKind::Char:
+        case TypeKind::Byte:
+        case TypeKind::Enum:
+        case TypeKind::Ptr:
+        case TypeKind::FnPtr:
+        case TypeKind::NullptrT:
+        case TypeKind::BitInt:
+        case TypeKind::Complex:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// ── THE VALUES A BRACE LIST GIVES ITS OBJECT (cycle P69 round 1, lane `lm`) ──────────────
+// Every element VALUE of `braceList` that initializes something of `object`, handed to
+// `onValue` with the type of the subobject it initializes — placed exactly where the HIR
+// lowering places it: the ONE placement cursor (`initializer_cursor.hpp`) over the declared
+// types, the designator resolver and the whole-value test the array sizing uses. What
+// initializes nothing is never handed on: an EXCESS element (C 6.7.9p2's constraint — the
+// lowering warns and drops it unevaluated, as gcc and clang do), an out-of-range or
+// unresolved designation (the lowering refuses each loudly), an element after the string
+// literal that initializes a character array (C 6.7.9p14; that string is the value).
+// A SCALAR's braces (C 6.7.9p11: "a single expression, optionally enclosed in braces") give
+// their FIRST element, and a brace list standing as that element is stepped through, level by
+// level, to the value; `{}` at any level gives nothing — the zero value. gcc and clang build
+// every such shape with a warning and initialize the scalar from that first value
+// (✔MEASURED 2026-10-16, clang 18.1.3 and gcc 13.3.0, every program RUN: `{{42}}`, `{{{42}}}`,
+// `{42, 7}`, `{{42}, 7}`, `{{42, 7}}` are 42, `{{}}` is 0, an excess call never runs); the
+// lowering takes the same steps and warns where they warn. A DESIGNATOR met in a scalar's
+// braces, at any level, is handed to `onScalarDesignator` (the element it designates in) and
+// ends that scalar's walk: C 6.7.9p6-p7 give designators to arrays, structures and unions.
+// One statement for the two walks that ask it — the element judge
+// (`checkBraceInitializerElements`) and the static-initializer check
+// (`validateStaticInitializer`) — so neither can judge an element the other skips.
+// NOT RECURSIVE: one heap frame per aggregate level, one loop for a scalar's levels
+// (feedback-no-input-proportional-recursion); a nested list is walked before the element
+// after it, so the values come in source order.
+void forEachPlacedBraceValue(EngineState& s, Tree const& tree, NodeId braceList, TypeId object,
+                             ScopeId scope,
+                             std::function<void(NodeId value, TypeId slot)> const& onValue,
+                             std::function<void(NodeId element)> const& onScalarDesignator) {
+    SchemaIndexes const& idx = s.idx();
+    if (!braceList.valid() || !object.valid() || !idx.braceInitListRule.valid()
+        || !idx.initElementRule.valid())
+        return;
+    SemanticBraceView const view{s};
+    auto const elementsOf = [&](NodeId list) {
+        std::vector<NodeId> out;
+        for (NodeId e : visibleChildren(tree, list))
+            if (tree.kind(e) == NodeKind::Internal && tree.rule(e).v == idx.initElementRule.v)
+                out.push_back(e);
+        return out;
+    };
+
+    struct Level {
+        TypeId                     object;
+        std::vector<NodeId>        elements;
+        std::size_t                next = 0;
+        initializer_cursor::Cursor cursor;
+    };
+    std::vector<Level> stack;
+    std::size_t const bound = tree.nodeCount() + 1;   // each level is a strict descendant
+    // Open one brace list against the type it initializes: a scalar's is walked to its value
+    // at once; a character array's list led by the string literal that initializes it IS that
+    // string; any other aggregate's list opens a level.
+    auto const open = [&](NodeId list, TypeId t) {
+        if (!t.valid()) return;
+        std::vector<NodeId> elements = elementsOf(list);
+        if (view.shape(t) == initializer_cursor::Shape::Scalar) {
+            for (std::size_t guard = 0; !elements.empty(); ++guard) {
+                if (guard > bound) failOnCyclicTree("the scalar brace levels");
+                auto const parts = internalChildrenOf(tree, elements.front());
+                if (parts.size() > 1) {   // a designation and its value
+                    onScalarDesignator(elements.front());
+                    return;
+                }
+                if (parts.size() != 1) return;   // no value: a malformed tree the lowering refuses
+                NodeId const inner = peelSingleChildrenTo(tree, parts.front(),
+                                                          idx.braceInitListRule);
+                if (!inner.valid()) {
+                    onValue(parts.front(), t);
+                    return;
+                }
+                elements = elementsOf(inner);
+            }
+            return;   // `{}` at some level: the zero value
+        }
+        if (elements.empty()) return;
+        if (view.shape(t) == initializer_cursor::Shape::Array) {
+            if (auto const lead = internalChildrenOf(tree, elements.front());
+                lead.size() == 1
+                && stringLiteralInitializingArray(s, idx, tree, lead.front(), t).valid()) {
+                onValue(lead.front(), t);
+                return;
+            }
+        }
+        stack.push_back(Level{t, std::move(elements), 0, initializer_cursor::Cursor{t, view}});
+    };
+
+    open(braceList, object);
+    while (!stack.empty()) {
+        Level& lv = stack.back();
+        if (lv.next >= lv.elements.size()) {
+            stack.pop_back();
+            continue;
+        }
+        NodeId const e = lv.elements[lv.next++];
+        ResolvedBraceElement const el = resolveBraceElement(s, tree, e, lv.object, scope);
+        if (!el.resolved) continue;   // an unresolved designation: the lowering refuses it
+        NodeId const list = peelSingleChildrenTo(tree, el.value, idx.braceInitListRule);
+        initializer_cursor::Placement const placed = lv.cursor.place(
+            std::span<std::uint64_t const>{el.designator}, list.valid(), [&](TypeId t) {
+                return braceValueInitializesWhole(s, idx, tree, el.value, t, scope);
+            });
+        if (placed.kind != initializer_cursor::Placement::Kind::Assign) continue;
+        if (list.valid()) {
+            open(list, placed.type);   // may push a level: `lv` is not read after this
+            continue;
+        }
+        onValue(el.value, placed.type);
+    }
+}
+
+// ── P69 (lane `cs`): THE SIMPLE-ASSIGNMENT CONSTRAINT OF A BRACE ELEMENT ──────────────
+// (D-C-A-INCOMPATIBLE-BRACE-ELEMENT-IS-REFUSED-BY-AN-INTERNAL-VERIFIER-FAILURE)
+//
+// C 6.7.9p11 (C23 6.7.11p12): the initializer of a SCALAR is a single expression,
+// optionally braced, and "the same type constraints and conversions as for simple
+// assignment apply" — so a brace element is judged, once it is placed in the scalar
+// subobject it initializes, exactly as the plain initializer `T x = e;` is in Pass 2's
+// declaration check: admitted by the ordinary rules (`isAssignableUnder`), as a null
+// pointer constant, or as a conversion the language makes WITH a diagnostic — and
+// refused S_TypeMismatch at the element otherwise. Nothing judged an element before HIR,
+// whose verifier then refused it with an INTERNAL message (H_VerifierFailure,
+// "ConstructAggregate … child type doesn't match"; a scalar's braced `int x = { s };`
+// with I_StoreValueTypeMismatch, from the MIR tier). ✔MEASURED before this check (lane
+// `cs`'s probes br1-br3, the pe64 build): a structure into an `int`, a pointer, a
+// `double`, a `_Bool`, a `_Complex` or a union's first member, a designated `.in.v = s`,
+// an element elided into ANOTHER structure's member, `(struct S){ s }` and `int *a[1] =
+// { d }` for a `double d` — each refused by the verifier, where gcc 13.3.0 and clang
+// 18.1.3 refuse it at the element ("incompatible types when initializing type 'int'
+// using type 'struct S'").
+//
+// Each element is placed exactly where the HIR lowering will place it: the ONE
+// placement cursor (`initializer_cursor.hpp`) over the declared types, the designator
+// resolver and the whole-value test the array sizing uses. A conversion admitted WITH a
+// diagnostic is left to the lowering, which reports it where it realizes it
+// (`reportDiagnosedBraceElement`) — each element is judged ONCE. The elements come from
+// `forEachPlacedBraceValue`: a scalar's braces are judged by their first value, through
+// every level (P69, lane `lm`, the scalar brace closure — `int x = {{ s }};` puts a
+// structure in an `int`, and gcc 13.3.0 and clang 18.1.3 refuse it at the element,
+// ✔MEASURED 2026-10-16), and what initializes nothing is not judged — an excess element,
+// as gcc and clang judge none (`int v = {42, "x"};` builds on both), and an unresolved or
+// out-of-range designator, which the lowering refuses loudly in its own words. A
+// DESIGNATOR in a scalar's braces, at any level, is refused here (S_InvalidScalarInitializer):
+// both references refuse `{.x = 42}`, `{[0] = 42}` and `{{[0] = 42}}` on an `int`.
+void checkBraceInitializerElements(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId braceList, TypeId object,
+                                   ScopeId scope) {
+    SchemaIndexes const& idx = s.idx();
+    if (!braceList.valid() || !object.valid() || !idx.braceInitListRule.valid()
+        || !idx.initElementRule.valid())
+        return;
+    TypeInterner& interner = s.lattice.interner();
+    auto const& rules = tree.schema().semantics().pointerConversions;
+    auto const category = [&](TypeId t) -> std::string_view {
+        switch (interner.kind(t)) {
+            case TypeKind::Struct: return "a structure";
+            case TypeKind::Union:  return "a union";
+            case TypeKind::Array:  return "an array";
+            case TypeKind::FnSig:  return "a function";
+            case TypeKind::Ptr:
+            case TypeKind::FnPtr:  return "a pointer";
+            case TypeKind::Void:   return "a void expression";
+            default:               break;
+        }
+        if (isIntegerKindForConversion(interner.kind(t))) return "an integer";
+        if (isArithmetic(interner, t) || interner.kind(t) == TypeKind::Complex)
+            return "an arithmetic value";
+        return "a value of another type";
+    };
+    // One element's value against the scalar `slot` it initializes — `slot x = value;`.
+    auto const judge = [&](NodeId value, TypeId slot) {
+        if (!value.valid() || !slot.valid() || !isScalarObjectKind(interner.kind(slot))) return;
+        TypeId const vt = subtreeType(s, tree, value, scope);
+        if (!vt.valid()) return;   // an untyped value: its own report, or the lowering's
+        if (isAssignableUnder(cfg, interner, slot, vt,
+                              /*charArrayFromStringLiteralInit=*/false))
+            return;
+        if (admitsNullPointerConstant(s, tree, slot, value, rules, scope, cfg)) return;
+        if (diagnosedConversion(interner, slot, vt, rules) != DiagnosedConversion::None)
+            return;   // admitted WITH a diagnostic: the lowering reports it
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_TypeMismatch;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(value);
+        d.actual   = std::format(
+            "`{}` is {}, and what this brace element initializes is {}: an element that "
+            "initializes a scalar takes the type constraints of simple assignment (C 6.7.9p11), "
+            "as the initializer of a scalar declaration does",
+            tree.text(value), category(vt), category(slot));
+        s.reporter.report(std::move(d));
+    };
+    // C 6.7.9p6-p7: a designator names a subobject of an array, a structure or a union.
+    auto const refuseScalarDesignator = [&](NodeId element) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_InvalidScalarInitializer;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(element);
+        d.actual   = std::format(
+            "`{}` designates a subobject of what it initializes, and that is a scalar: a "
+            "designator names a member of a structure or a union, or an element of an array "
+            "(C 6.7.9p6-p7)", tree.text(element));
+        s.reporter.report(std::move(d));
+    };
+    forEachPlacedBraceValue(s, tree, braceList, object, scope, judge, refuseScalarDesignator);
 }
 
 // P68 round 9 (lane `cs`): THE TYPE OF A COMPOUND LITERAL `( type-name ) { … }` — the
@@ -12321,6 +14877,485 @@ compoundLiteralType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
     return completeIncompleteArrayFromInit(s, s.idx(), tree, braceNode, target, scope);
+}
+
+// ── P69: A COMPOUND LITERAL IS AN OBJECT, AND THIS TIER SAYS WHICH KIND ────────────────
+// (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT,
+//  D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR)
+
+// Does `scope` lie inside a function BODY — is some scope on its parent chain the one a
+// function definition's body opens? The chain `checkReturn` walks for the enclosing result
+// (`fnResultByScope`), asked for a different answer: a compound literal outside every
+// function body has static storage duration (C 6.5.2.5p5), and a C23 literal's
+// storage-class specifiers are judged as a FILE-scope or a BLOCK-scope definition's
+// (C23 6.5.3.6p4). A scope's own identity cannot say it: a file-scope declaration's
+// initializer is walked in a child scope of the file scope (see
+// `findNonConstantInStaticInitializer`).
+[[nodiscard]] bool scopeIsInsideAFunctionBody(EngineState const& s, ScopeId scope) {
+    auto const& scopes = s.scopes.scopes();
+    for (ScopeId cur = scope; cur.valid() && cur.v < scopes.size(); cur = scopes[cur.v].parent)
+        if (s.fnResultByScope.contains(cur.v)) return true;
+    return false;
+}
+
+// How many array levels `type` begins with — the level its element's qualifiers sit at in a
+// qualifier spine (an array's qualifiers are its elements', C 6.7.3p10).
+[[nodiscard]] unsigned leadingArrayLevels(TypeInterner const& in, TypeId type) {
+    unsigned n = 0;
+    for (TypeId t = type; t.valid() && in.kind(t) == TypeKind::Array && n < 64;) {
+        auto const ops = in.operands(t);
+        if (ops.empty()) break;
+        t = ops[0];
+        ++n;
+    }
+    return n;
+}
+
+// Is a compound literal's OBJECT const-qualified at `level` of its derivation — level 0 the
+// object itself, each subscript one level deeper? Its type NAME's qualifier spine answers
+// (the one the static-initializer check and `_Generic` read — `const` is not interned), and
+// a `constexpr` specifier adds const at the level its array spine ends on (C23 6.7.2p16), as
+// the facts this tier recorded say. A type name whose qualifiers cannot be read makes no
+// claim. The const-lvalue walk asks this for `(const int){ 0 } = 5`, `((const int[]){ 1 })[0]
+// = 5` and `(constexpr int){ 0 } = 5`, which every reference that parses them refuses.
+[[nodiscard]] bool
+compoundLiteralConstAt(EngineState const& s, SemanticConfig const& cfg, Tree const& tree,
+                       NodeId node, std::uint32_t typeChild, unsigned level) {
+    if (CompoundLiteralFacts const* f = s.compoundLiteralFacts.tryGet(node);
+        f != nullptr && f->isConstexpr) {
+        TypeId const t = s.typeAt(node);
+        if (t.valid() && level == leadingArrayLevels(s.lattice.interner(), t)) return true;
+    }
+    auto const kids = visibleChildren(tree, node);
+    if (typeChild >= kids.size()) return false;
+    std::optional<QualifierSpine> const sp =
+        typeNameQualifierSpine(s, cfg, tree, kids[typeChild]);
+    return sp.has_value() && level < sp->levels && level < 64
+        && ((sp->constBits >> level) & 1u) != 0u;
+}
+
+// The OBJECT facts of one compound literal — `CompoundLiteralFacts` — decided from its
+// position and, for C23's form, its storage-class specifiers, with every constraint those
+// specifiers break REPORTED here (once: this runs from the literal's own typing arm).
+//
+// C23 6.5.3.6p4 judges the specifiers as if the literal were the definition `SC typeof(T)
+// ID = { IL };` in its own scope, so they are read by THAT scope's declaration row
+// (`storageAsFileScopeDeclaration` / `storageAsBlockScopeDeclaration`) through the SAME
+// scan a declaration's prefix takes (`scanSpecifierStorage`): its facets say static,
+// thread and `register`, its `storage-class` group refuses two storage classes, and its
+// `constexpr` exceptions admit `static constexpr` / `register constexpr`. What the row does
+// not map, that scope's declaration does not admit. ✔MEASURED gcc 13.3.0 -std=c2x (the one
+// reference that builds these literals; runs 20260930-212759-cd6e2714, -212815-0195cf2c,
+// -212829-175f46fc, -212850-b8162830): it builds `static`, `register`, `constexpr`, `static
+// constexpr`, `register constexpr`, `static thread_local` in a function, `thread_local` at
+// file scope; it refuses file-scope `register` ("file-scope compound literal specifies
+// 'register'"), a block-scope `thread_local` without `static` ("compound literal implicitly
+// auto and declared '_Thread_local'"), a repeated specifier ("duplicate 'static'").
+[[nodiscard]] CompoundLiteralFacts
+judgeCompoundLiteral(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                     CompoundLiteralRule const& cl, TypeId type, ScopeId here) {
+    CompoundLiteralFacts f;
+    auto const report = [&](DiagnosticCode code, NodeId at, std::string message) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at);
+        d.actual   = std::move(message);
+        s.reporter.report(std::move(d));
+    };
+    bool const blockScope = scopeIsInsideAFunctionBody(s, here);
+    bool staticStorage = !blockScope;   // C 6.5.2.5p5
+    bool threadStorage = false;
+    auto const kids = visibleChildren(tree, node);
+    if (cl.storageChild.has_value() && *cl.storageChild < kids.size()) {
+        NodeId const specs = kids[*cl.storageChild];
+        RuleId const asRule = blockScope ? cl.storageAsBlockScopeDeclaration
+                                         : cl.storageAsFileScopeDeclaration;
+        std::string_view const where = blockScope ? "block-scope" : "file-scope";
+        auto const di = s.idx().declByRule.find(asRule.v);
+        if (di == s.idx().declByRule.end()) {
+            // The loader admits only a `declarations` row here; reaching this is a broken
+            // index, and the literal's storage is then unknown — refuse, never guess.
+            report(DiagnosticCode::S_CompoundLiteralStorageClassInvalid, specs,
+                   std::format("internal: the {} declaration row this compound literal's "
+                               "storage-class specifiers are judged by is not indexed", where));
+            return f;
+        }
+        DeclarationRule const& decl = cfg.declarations[di->second];
+        // The specifier tokens, in SOURCE order (a pre-order walk pushing children reversed).
+        std::vector<NodeId> toks;
+        {
+            std::vector<NodeId> stack{specs};
+            std::size_t const bound = tree.nodeCount() + 1;
+            for (std::size_t guard = 0; !stack.empty(); ++guard) {
+                if (guard > bound) failOnCyclicTree("the compound literal specifier walk");
+                NodeId const c = stack.back();
+                stack.pop_back();
+                if (tree.kind(c) == NodeKind::Token) { toks.push_back(c); continue; }
+                auto const ks = visibleChildren(tree, c);
+                for (std::size_t i = ks.size(); i-- > 0;) stack.push_back(ks[i]);
+            }
+        }
+        for (std::size_t i = 0; i < toks.size(); ++i) {
+            std::string const text{tree.text(toks[i])};
+            if (cfg.constexprKeywordToken.has_value()
+                && tree.tokenKind(toks[i]) == *cfg.constexprKeywordToken) {
+                f.isConstexpr = true;
+            }
+            if (!decl.linkageSpecifiers.contains(text)) {
+                report(DiagnosticCode::S_CompoundLiteralStorageClassInvalid, toks[i],
+                       std::format("'{}' is not a storage-class specifier a {} definition "
+                                   "admits, and C23 6.5.3.6p4 judges this compound literal as "
+                                   "the definition `{} typeof(T) ID = {{ ... }};` there (gcc: "
+                                   "\"{} compound literal specifies '{}'\")",
+                                   text, where, text, where, text));
+            }
+            if (cl.repeatedStorageSpecifierRefused) {
+                for (std::size_t j = 0; j < i; ++j) {
+                    if (tree.text(toks[j]) != text) continue;
+                    report(DiagnosticCode::S_CompoundLiteralStorageClassInvalid, toks[i],
+                           std::format("this compound literal names '{}' twice, which C23 "
+                                       "6.5.3.6 (footnote 97) makes a constraint violation "
+                                       "(gcc: \"duplicate '{}'\")", text, text));
+                    break;
+                }
+            }
+        }
+        SpecifierStorageFacts const sf = scanSpecifierStorage(
+            cfg, tree, specs, decl.linkageSpecifiers, decl.linkageSpecifierIgnoredRules);
+        if (!sf.conflictGroup.empty()) {
+            report(DiagnosticCode::S_ConflictingStorageClassSpecifiers, sf.conflictSecond,
+                   std::format("'{}' and '{}' are both {} specifiers — a compound literal, like "
+                               "the definition it stands for, may carry at most one",
+                               tree.text(sf.conflictFirst), tree.text(sf.conflictSecond),
+                               sf.conflictGroup));
+        }
+        f.addressNotTakeable = sf.addressNotTakeable;
+        if (sf.staticStorage) staticStorage = true;
+        threadStorage = sf.threadStorage;
+        if (threadStorage) {
+            // The two pairings a thread-storage DECLARATION is refused (C 6.7.1p2; C23 6.7.2):
+            // with `constexpr`, and with a `threadLocal.incompatibleSpecifierTokens` token.
+            NodeId incompatible{};
+            for (NodeId t : toks) {
+                for (SchemaTokenId k : cfg.threadLocalIncompatibleTokens)
+                    if (tree.tokenKind(t) == k) { incompatible = t; break; }
+                if (incompatible.valid()) break;
+            }
+            if (f.isConstexpr) {
+                report(DiagnosticCode::S_ThreadLocalInvalidCombination, specs,
+                       "a thread-storage specifier may not be combined with 'constexpr' "
+                       "(C23 6.7.2)");
+            } else if (incompatible.valid()) {
+                report(DiagnosticCode::S_ThreadLocalInvalidCombination, incompatible,
+                       std::format("'{}' may not be combined with a thread-storage specifier "
+                                   "(C 6.7.1p2 admits only 'static' or 'extern')",
+                                   tree.text(incompatible)));
+            } else if (blockScope && !sf.staticStorage) {
+                // C 6.7.1p3, asked of the block-scope definition the literal stands for.
+                report(DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern, specs,
+                       "a block-scope thread_local compound literal requires 'static' (C "
+                       "6.7.1p3, asked of the definition C23 6.5.3.6p4 reads it as; gcc: "
+                       "\"compound literal implicitly auto and declared '_Thread_local'\")");
+            }
+        }
+    }
+    using St = CompoundLiteralFacts::Storage;
+    f.storage = threadStorage ? St::Thread : staticStorage ? St::Static : St::Automatic;
+    f.isConst = f.isConstexpr
+        || compoundLiteralConstAt(s, cfg, tree, node, cl.typeChild,
+                                  leadingArrayLevels(s.lattice.interner(), type));
+    return f;
+}
+
+// ── P69 (lane `cs`, C23 6.6p6-p7): THE CONSTANT SUBOBJECT A CONSTANT EXPRESSION NAMES ──
+//
+// C23 6.6p6: "A compound literal with storage-class specifier constexpr is a compound
+// literal constant, as is a postfix expression that applies the . member access operator
+// to a compound literal constant of structure or union type, even recursively"; 6.6p7
+// says the same of a NAMED constant (a `constexpr` object). Their values are the
+// initializer values that initialize them — and an integer constant expression may use
+// them. This is `CstConstantSubobjectResolver` for the semantic tier: it finds WHICH
+// initializer value initializes the named subobject (the placement cursor, element by
+// element, exactly as the lowering places them: brace elision, designators, their
+// continuation; the LAST initializer of a subobject wins, C 6.7.9p19), follows a member
+// initialized WHOLE by another constant (`constexpr struct S s2 = s;`, C23 6.7.2's own
+// example), and reports a subobject no initializer names as zero-initialized.
+//
+// ★ WHICH OBJECTS COUNT. Every compound literal that is not volatile (a `constexpr` one by
+// 6.6p6; any other as clang 18.1.3 -std=c2x folds it — `(int){ 42 }`, `(const int){ 3 }`,
+// `(struct S){ 1, 42 }.b` in an array bound, a `case`, an enumerator and a static assertion,
+// runs 20260930-185149-8dd835aa x11, 20260930-215342-bd6f89d0 m01-m06,
+// 20260930-223027-5e3e2305 n01-n05 — one working reference makes it required), and every
+// NAMED object the named-constant resolver already admits (`resolveConstSymbolInit`:
+// `isConst`, a visible initializer): `constexpr` ones by 6.6p7, const ones as clang folds
+// `s.b` of a `const struct S` (m05). A NON-const named object's member is refused, as clang
+// refuses it (n06: "variable length array declaration not allowed at file scope").
+// ★ WHAT IS REFUSED (nullopt), as gcc 13.3.0 refuses it: a union member other than the
+// one its initializer made current (run 20260930-215414-bc6d1ef1 m11), an element of an
+// array member (m12 — only `.` is a constant's access), a volatile object, a member of
+// aggregate type (an integer constant expression reads a scalar), a pointer through `->`.
+// It reports nothing — the consumer owns the diagnostic — and it records ONE thing: where
+// it asks whether a brace element initializes a subobject whole, the answer is written as
+// that element's value type (`braceValueInitializesWhole` → `s.braceElementValueTypes`),
+// the fact the lowering places the element by. (This comment said "it stamps nothing"
+// until the fold that added that write.) Bounded
+// by the tree's node count (each step moves to a strictly smaller subobject path or to a
+// different constant's initializer, and a revisited initializer is refused). The answer
+// is the model's `ConstantSubobjectFact`; `constantSubobjectAsCst` makes it the engine's.
+[[nodiscard]] std::optional<ConstantSubobjectFact>
+resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const& cfg,
+                         NodeId node, ScopeId scope) {
+    TypeInterner& in = s.lattice.interner();
+    auto const& hirCfg = tree.schema().hirLowering();
+    SchemaIndexes const& idx = s.idx();
+    std::size_t const bound = tree.nodeCount() + 1;
+    auto const isRule = [&](NodeId n, RuleId r) {
+        return r.valid() && n.valid() && tree.kind(n) == NodeKind::Internal
+            && tree.rule(n).v == r.v;
+    };
+    auto const compoundLiteralRow = [&](NodeId n) -> CompoundLiteralRule const* {
+        if (!n.valid() || tree.kind(n) != NodeKind::Internal) return nullptr;
+        auto const it = idx.compoundLiteralByRule.find(tree.rule(n).v);
+        return it == idx.compoundLiteralByRule.end() ? nullptr
+                                                     : &cfg.compoundLiteralRules[it->second];
+    };
+    // The `.` member access `n` is, as (base, member-name token) — never `->`.
+    auto const memberAccess = [&](NodeId n) -> std::optional<std::pair<NodeId, NodeId>> {
+        if (!isRule(n, hirCfg.postfixExprRule)) return std::nullopt;
+        NodeId base{}, opTok{}, follower{};
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) == NodeKind::Token) { if (!opTok.valid()) opTok = c; continue; }
+            if (!base.valid()) base = c;
+            else if (!follower.valid()) follower = c;
+        }
+        if (!base.valid() || !opTok.valid() || !follower.valid()) return std::nullopt;
+        HirOperatorEntry const* e = nullptr;
+        for (auto const& op : hirCfg.postfixOps)
+            if (op.token.v == tree.tokenKind(opTok).v) { e = &op; break; }
+        if (e == nullptr || e->target != "MemberAccess") return std::nullopt;
+        NodeId name{};
+        if (tree.kind(follower) == NodeKind::Token) {
+            name = follower;
+        } else {
+            for (NodeId c : visibleChildren(tree, follower))
+                if (tree.kind(c) == NodeKind::Token
+                    && tree.tokenKind(c).v == cfg.identifierToken.v) { name = c; break; }
+        }
+        if (!name.valid()) return std::nullopt;
+        return std::pair{base, name};
+    };
+    // The wrappers above a base or a whole-aggregate initializer, by the ONE statement
+    // of what a wrapper is (`nodeSaysSomethingItself`): a member access and a compound
+    // literal say something themselves — and so does every operator, except the pair
+    // that says nothing: `(*&s).m` is `s.m` (`cancelledUnaryPair`). (This counted
+    // children too: it crossed any node with one Internal child that was neither a
+    // member access nor a compound literal, `*p` and `&s` alone included.)
+    // ★ "WHICH CONSTANT OBJECT IS THIS THE VALUE OF" IS A QUESTION OF VALUE, so the peel
+    // also takes the step of a statement expression of ONE expression
+    // (`soleExpressionOfStatementExpression`): `({ h; }).b`, `const struct S g = ({ h;
+    // });` and `{ ({ h; }), 2 }` read the constant `h`, as clang 18 and AppleClang 21
+    // fold them (✔MEASURED 2026-10-12; gcc refuses each as no constant). Stopped at the
+    // construct, the three were refused here.
+    auto const peel = [&](NodeId n) {
+        for (std::size_t guard = 0;; ++guard) {
+            if (guard > bound) failOnCyclicTree("the constant subobject peel");
+            n = peelGroupingWrappers(cfg, tree, n, "the constant subobject peel");
+            if (NodeId const designated = cancelledUnaryPair(tree, n, "Deref", "AddressOf");
+                designated.valid()) {
+                n = designated;
+                continue;
+            }
+            if (NodeId const inside = soleExpressionOfStatementExpression(hirCfg, tree, n);
+                inside.valid()) {
+                n = inside;
+                continue;
+            }
+            return n;
+        }
+    };
+    // A constant ROOT: its initializer, its type and the scope its initializer reads in.
+    struct Root { NodeId init{}; TypeId type{}; ScopeId scope{}; };
+    auto const rootOf = [&](NodeId n, ScopeId at) -> std::optional<Root> {
+        n = peel(n);
+        if (CompoundLiteralRule const* row = compoundLiteralRow(n)) {
+            // EVERY compound literal whose value an integer constant expression reads is
+            // read from its initializer — a `constexpr` one by C23 6.6p6, the rest as clang
+            // 18.1.3 -std=c2x folds them (GNU folding, run 20260930-223027-5e3e2305: even a
+            // NON-const `(int){ 42 }` and `(struct S){ 1, 42 }.b` in a static assertion, an
+            // array bound, a case label and an enumerator). Nothing can change the object
+            // between its initialization and that read: the expression reading it is
+            // side-effect free. A VOLATILE one is the exception — reading it is an access.
+            // (Its facts may not be recorded yet — an array bound folds at Pass 1.5 — so the
+            // type is resolved here, purely.)
+            TypeId const t = compoundLiteralType(s, cfg, tree, n, row->typeChild, at,
+                                                 /*emitOnMiss=*/false);
+            if (!t.valid() || in.isVolatileObjectType(t)) return std::nullopt;
+            auto const kids = visibleChildren(tree, n);
+            NodeId brace{};
+            for (NodeId c : kids)
+                if (isRule(c, idx.braceInitListRule)) { brace = c; break; }
+            if (!brace.valid()) return std::nullopt;
+            return Root{brace, t, at};
+        }
+        NodeId id = n;
+        if (tree.kind(id) == NodeKind::Internal) {
+            auto const name = extractNameNode(tree, id, NameMatchMode::Self,
+                                              cfg.identifierToken);
+            id = name.node;
+        }
+        if (!id.valid() || tree.kind(id) != NodeKind::Token
+            || tree.tokenKind(id).v != cfg.identifierToken.v) return std::nullopt;
+        SymbolId const sym = s.scopes.lookup(at, tree.text(id));
+        if (!sym.valid()) return std::nullopt;
+        SymbolRecord const& rec = s.symbols.at(sym);
+        if (rec.kind != DeclarationKind::Variable || !rec.type.valid()
+            || in.isVolatileObjectType(rec.type)) return std::nullopt;
+        auto const init = resolveConstSymbolInit(s, tree, cfg, at, tree.text(id));
+        if (!init.has_value() || !init->initExpr.valid()) return std::nullopt;
+        return Root{init->initExpr, rec.type, ScopeId{init->initScopeOpaque}};
+    };
+
+    // 1. The member names, OUTERMOST access last: `r.a.b` is (r, [a, b]).
+    std::vector<NodeId> names;
+    NodeId cur = peel(node);
+    for (std::size_t guard = 0;; ++guard) {
+        if (guard > bound) failOnCyclicTree("the constant member chain");
+        auto const m = memberAccess(cur);
+        if (!m.has_value()) break;
+        names.push_back(m->second);
+        cur = peel(m->first);
+    }
+    std::reverse(names.begin(), names.end());
+    std::optional<Root> root = rootOf(cur, scope);
+    if (!root.has_value()) return std::nullopt;
+
+    // 2. The target: the index path through the root's type, and the scalar it ends on.
+    std::vector<std::uint64_t> target;
+    std::vector<bool>          unionLevel;   // per `target` step: its container is a union
+    TypeId type = root->type;
+    // The LAST member named, when it is a bit-field: its width (the read is reduced to it).
+    std::optional<std::uint32_t> bitFieldWidth;
+    for (NodeId name : names) {
+        TypeKind const k = in.kind(type);
+        if (k != TypeKind::Struct && k != TypeKind::Union) return std::nullopt;
+        auto const member = resolveMemberPath(s, type, tree.text(name));
+        if (!member.has_value()) return std::nullopt;
+        // Each index of the path steps one container deeper (an anonymous member's own
+        // index first); only the outermost step's container is `type` itself.
+        TypeId container = type;
+        for (std::uint64_t i : member->indices) {
+            unionLevel.push_back(in.kind(container) == TypeKind::Union);
+            target.push_back(i);
+            auto const ops = in.operands(container);
+            if (i >= ops.size()) return std::nullopt;
+            container = ops[static_cast<std::size_t>(i)];
+        }
+        type = member->type;
+        bitFieldWidth = member->bitFieldWidth;
+        if (in.isVolatileObjectType(type)) return std::nullopt;
+    }
+    TypeKind const scalarKind = in.kind(type);
+    if (scalarKind == TypeKind::Struct || scalarKind == TypeKind::Union
+        || scalarKind == TypeKind::Array) return std::nullopt;
+
+    // 3. The initializer value at `target`, one brace list (or constant) at a time.
+    NodeId   init   = root->init;
+    TypeId   object = root->type;
+    ScopeId  at     = root->scope;
+    std::size_t done = 0;   // `target[0..done)` is consumed: `object` is that subobject
+    std::unordered_set<std::uint32_t> visited;
+    for (std::size_t guard = 0;; ++guard) {
+        if (guard > bound) failOnCyclicTree("the constant subobject walk");
+        NodeId const value = descendInitWrappers(s, tree, init);
+        if (!value.valid() || !visited.insert(value.v).second) return std::nullopt;
+        bool const isList = isRule(value, idx.braceInitListRule);
+        if (!isList) {
+            if (done == target.size()) return ConstantSubobjectFact{value, at, type, false, bitFieldWidth};
+            // An aggregate initialized WHOLE by another constant: continue in it.
+            std::optional<Root> next = rootOf(value, at);
+            if (!next.has_value()) return std::nullopt;
+            init = next->init;
+            at   = next->scope;
+            continue;
+        }
+        std::vector<NodeId> elements;
+        for (NodeId e : visibleChildren(tree, value))
+            if (isRule(e, idx.initElementRule)) elements.push_back(e);
+        if (done == target.size()) {
+            // A scalar in braces (`{ 42 }`, C 6.7.9p11): its first element; `{}` is zero.
+            if (elements.empty()) return ConstantSubobjectFact{{}, at, type, true, bitFieldWidth};
+            ResolvedBraceElement const el = resolveBraceElement(s, tree, elements.front(),
+                                                                object, at);
+            if (!el.resolved || !el.designator.empty()) return std::nullopt;
+            init = el.value;
+            continue;
+        }
+        // Place every element, as the lowering will; keep the LAST one that initializes
+        // the target or an aggregate containing it, and each union's current member.
+        SemanticBraceView const view{s};
+        initializer_cursor::Cursor cursor{object, view};
+        std::span<std::uint64_t const> const want{target.data() + done, target.size() - done};
+        std::optional<std::pair<std::vector<std::uint32_t>, NodeId>> hit;
+        std::vector<std::optional<std::uint32_t>> active(want.size());   // per union level
+        for (NodeId e : elements) {
+            ResolvedBraceElement const el = resolveBraceElement(s, tree, e, object, at);
+            if (!el.resolved) return std::nullopt;   // the lowering refuses it loudly
+            bool const elIsList = peelSingleChildrenTo(tree, el.value,
+                                                       idx.braceInitListRule).valid();
+            initializer_cursor::Placement const p = cursor.place(
+                std::span<std::uint64_t const>{el.designator}, elIsList, [&](TypeId t) {
+                    return braceValueInitializesWhole(s, idx, tree, el.value, t, at);
+                });
+            if (p.kind != initializer_cursor::Placement::Kind::Assign) continue;
+            // `common`: how far this placement follows the target's path.
+            std::size_t common = 0;
+            while (common < p.path.size() && common < want.size()
+                   && p.path[common] == want[common]) ++common;
+            // Every union on the target's path this placement passes through takes its
+            // member — the one it follows, or (at the divergence) another one.
+            std::size_t const reach = std::min({common + 1, p.path.size(), want.size()});
+            for (std::size_t k = 0; k < reach; ++k)
+                if (unionLevel[done + k]) active[k] = p.path[k];
+            if (common == p.path.size()) {
+                hit = std::pair{p.path, el.value};   // the newest initializer of the target
+            } else if (common < want.size() && unionLevel[done + common] && hit.has_value()
+                       && hit->first.size() > common) {
+                hit.reset();   // a union on the way switched member: the old value is gone
+            }
+            // (A divergence at a STRUCTURE level leaves the target's initializer alone.)
+        }
+        // A union level whose current member is not the one named: not a constant.
+        for (std::size_t k = 0; k < want.size(); ++k)
+            if (unionLevel[done + k] && active[k].has_value() && *active[k] != want[k])
+                return std::nullopt;
+        if (!hit.has_value()) {
+            // No initializer names it: zero — unless a union level on the way was never
+            // initialized and the member named is not its first (whose bytes the zero
+            // initialization defines, C 6.7.9p10).
+            for (std::size_t k = 0; k < want.size(); ++k)
+                if (unionLevel[done + k] && !active[k].has_value() && want[k] != 0)
+                    return std::nullopt;
+            return ConstantSubobjectFact{{}, at, type, true, bitFieldWidth};
+        }
+        // Step into the subobject the hit initializes.
+        TypeId subobject = object;
+        for (std::uint32_t i : hit->first) {
+            auto const ops = in.operands(subobject);
+            TypeKind const k = in.kind(subobject);
+            if (k == TypeKind::Array) {
+                if (ops.empty()) return std::nullopt;
+                subobject = ops[0];
+            } else {
+                if (i >= ops.size()) return std::nullopt;
+                subobject = ops[i];
+            }
+        }
+        done  += hit->first.size();
+        object = subobject;
+        init   = hit->second;
+    }
 }
 
 // ── FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the Pass-1.5
@@ -12983,6 +16018,29 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         s, cfg, tree, specifierPrefixChild(tree, node, decl),
                         /*emitUnknown=*/true, declAttrFacts, here,
                         /*owningDecl=*/&decl);
+                    // ★★ P69 round 4 (lane `cs`) — ROOTS (a'): THE RUNS WRITTEN
+                    // INSIDE THE HEAD (`headAttributeRuns`: among the type's
+                    // specifiers, after a tag that is only referred to). In a
+                    // declaration they are the DECLARATION's, exactly as the
+                    // prefix is: ✔MEASURED (probe ta3; gcc 13.3.0, clang 18.1.3,
+                    // Apple clang, mingw-w64 gcc) `unsigned __attribute__((aligned
+                    // (16))) int v;` makes `v` a 4-byte object aligned to 16,
+                    // `unsigned __attribute__((aligned(16))) int *q;` a 16-aligned
+                    // POINTER to a 4-aligned int, and a member written so sits at
+                    // offset 16 — the entity, never the specifier's type. They come
+                    // after the prefix and before the slots, which is their source
+                    // order (first-non-empty-wins must keep meaning the leftmost
+                    // spelling).
+                    // ⚠ BEFORE THIS CYCLE THE SECOND OF THE TWO WAS READ AS A TAG
+                    // NAME: `struct S __attribute__((aligned(16))) w;` looked up a
+                    // tag called `aligned`, and with a `struct aligned` in scope
+                    // `w` silently took THAT structure's size.
+                    for (NodeId run : headAttributeRuns(
+                             cfg, tree, declarationHeadNode(tree, node, decl))) {
+                        scanAttributeSemantics(s, cfg, tree, run,
+                                               /*emitUnknown=*/true, declAttrFacts,
+                                               here, /*owningDecl=*/&decl);
+                    }
                     // ★★★ P56
                     // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
                     // ONLY THE `declaration`-GRAIN SLOTS FOLD INTO THE SHARED
@@ -13119,7 +16177,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // initNode.valid()` and hand the OR to the resolver's
                         // `allowFlexibleArray` parameter. The resolver tests that
                         // parameter ABOVE its VLA arm (deliberately — a struct
-                        // field's non-constant bound is a FAM, not a VLA member),
+                        // field's non-constant bound is no VLA member, and is refused
+                        // there by name since P69),
                         // so ANY initialized declarator with a PRESENT-but-non-
                         // constant bound took the FAM path: the written `argc`
                         // bound was DISCARDED and the object re-sized from the
@@ -13169,7 +16228,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             decl.allowFlexibleArray
                             || declarationIsNonDefining(
                                    cfg, tree, node, decl, dNode,
-                                   here.v == fileScopeOf(s, tree, here).v);
+                                   scopeBindingDeclaratorsOf(s, tree, node, here).v
+                                       == fileScopeOf(s, tree, here).v);
                         // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
                         // TYPE rather than an object may name an INCOMPLETE array
                         // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
@@ -13270,6 +16330,11 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
+                            if (s.symbols.at(sym).kind == DeclarationKind::Variable
+                                && s.redeclarationPartners.contains(sym.v)) {
+                                s.ownDeclaredType[sym.v] = declTy;
+                                composeArrayRedeclaration(s, sym);
+                            }
                             // VLA C4b (D-CSUBSET-VLA, design-audit I1): a VLA-typedef
                             // OBJECT (`typedef int R[n]; R a;`) derives its VLA-ness
                             // entirely from the head alias — nothing else records WHICH
@@ -13430,7 +16495,10 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 NodeId const headNode = kids[*decl.headChild];
                                 HeadTypedefs const typedefs{s.typedefNamedByToken,
                                                             s.symbols,
-                                                            s.lattice.interner()};
+                                                            s.lattice.interner(),
+                                                            &s.typeofClaimByNode,
+                                                            &s.nodeToType,
+                                                            &s.fnTypedefClaims};
                                 if (auto const td = typedefs.of(tree, headNode)) {
                                     std::array<RuleId, 2> const typeofOpaqueRules{
                                         cfg.typeofTypeRule, cfg.typeofValueRule};
@@ -13459,6 +16527,37 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         /*headIsArray=*/typedefs.in.kind(td->type)
                                             == TypeKind::Array,
                                         rec);
+                                }
+                            }
+                            // ★ P69 (lane `cs`,
+                            // D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED):
+                            // a FUNCTION typedef's own function claim — its result AND its
+                            // parameters — recorded now that its head is resolved, keyed by
+                            // the typedef. Its `qualSpine` describes the RESULT only (its
+                            // function suffix is no level), so without this the parameters'
+                            // `const` reached no declaration or type name spelled with it:
+                            // ✔MEASURED (P68 round 8), gcc 13.3.0, clang 18.1.3 and mingw-w64
+                            // 13.2.0 refuse `typedef int F(const char *); int f(F *); int
+                            // f(int (*)(char *));` which DSS accepted.
+                            if (auto const& trec = s.symbols.at(sym);
+                                trec.kind == DeclarationKind::Type && trec.type.valid()
+                                && s.lattice.interner().kind(trec.type) == TypeKind::FnSig) {
+                                HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols,
+                                                            s.lattice.interner(),
+                                                            &s.typeofClaimByNode,
+                                                            &s.nodeToType,
+                                                            &s.fnTypedefClaims};
+                                if (auto q = harvestFunctionQualification(
+                                        s.lattice.interner(), s.idx(), tree, trec, trec.type,
+                                        typedefs)) {
+                                    // The RESULT is the typedef's own spine already; what
+                                    // no level of it can hold is the PARAMETERS.
+                                    q->result.reset();
+                                    if (!q->empty()) {
+                                        s.fnTypedefClaims[sym.v] =
+                                            std::make_shared<DeclaredQualification const>(
+                                                std::move(*q));
+                                    }
                                 }
                             }
                             // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT
@@ -13579,14 +16678,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     return t.valid()
                                         && ti.kind(t) == TypeKind::Void;
                                 };
+                            // P69 (lane `cs`): a file-scope TENTATIVE definition of an
+                            // array of unknown size is not refused here — C 6.9.2p2
+                            // completes it at the end of the unit, from a later
+                            // declaration or with one element (`completeTentative
+                            // Arrays`), and gcc 13.3.0 and clang 18.1.3 both build it
+                            // (✔MEASURED, probe fs).
+                            bool const tentativeIncompleteArray =
+                                s.symbols.at(sym).isTentativeDefinition
+                                && s.lattice.interner().isIncompleteArray(declTy);
                             if (s.symbols.at(sym).kind
                                         == DeclarationKind::Variable
                                 && decl.requireNamedDeclarators
                                 && !s.symbols.at(sym).isExternDeclaration
                                 && (s.lattice.interner()
                                         .isIncompleteComposite(declTy)
-                                    || s.lattice.interner()
-                                           .isIncompleteArray(declTy)
+                                    || (s.lattice.interner()
+                                            .isIncompleteArray(declTy)
+                                        && !tentativeIncompleteArray)
                                     || arrayElementIsVoid(declTy)
                                     || (declTy.valid()
                                         && s.lattice.interner().kind(declTy)
@@ -13835,6 +16944,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // give `struct S { void (*p)(int), (*q)(int)
                         // __attribute__((__noreturn__)); };` to `q` alone.
                         NoreturnSpelling nrHere = declNoreturn;
+                        nrHere |= declaratorNameAdjacentNamesNoreturn(cfg, tree,
+                                                                      dNode, decl);
                         nrHere |= declaratorTrailingNamesNoreturn(cfg, tree, dNode);
                         nrHere |= declaratorSlotNamesNoreturn(
                             cfg, tree, node, decl,
@@ -14067,6 +17178,27 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // decl-kind gate across four more verbs", answered by not
                         // moving them at all.
                         AttributeSemanticsFacts attrFacts = declAttrFacts;
+                        // ★★ P69 round 4 (lane `cs`) — THE SPECIFIERS WRITTEN INSIDE
+                        // THIS DECLARATOR, BESIDE ITS NAME (`int * __attribute__
+                        // ((weak)) p;`, `static void * __attribute__((constructor))
+                        // init(void)`). `nameAdjacentAttributeSpecifiers` says which
+                        // they are — the same answer the noreturn fold above and the
+                        // lowering's linkage fold read — and they fold HERE, into
+                        // this declarator's private copy and before its trailing
+                        // run (source order), as that run folds: `int *
+                        // __attribute__((weak)) p = 0, q = 0;` is weak for `p`
+                        // alone on gcc and clang. `withinDeclarator` leaves on the
+                        // TYPE the few names whose row says they stay there
+                        // (`aligned`, `packed`, `unused`, `deprecated`); Pass 2 says
+                        // what there is to say about those.
+                        for (NodeId an :
+                                 nameAdjacentAttributeSpecifiers(tree, cfg, dNode)) {
+                            scanAttributeSemantics(
+                                s, cfg, tree, an, /*emitUnknown=*/true, attrFacts,
+                                here, /*owningDecl=*/&decl,
+                                /*appertainsToType=*/false,
+                                /*withinDeclarator=*/true);
+                        }
                         if (cfg.declarators.has_value()
                             && tree.kind(dNode) == NodeKind::Internal) {
                             DeclaratorConfig const& dcHere = *cfg.declarators;
@@ -14238,7 +17370,10 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // ★ THE `appliesTo.empty()` SKIP MEANS "THIS ROW DECLARES
                         // NO KIND AXIS", AND IT IS A PROPERTY OF THE CONFIG RATHER
                         // THAN A VERB TEST. The loader REQUIRES a non-empty
-                        // `appliesTo` on every verb but `none`, so for a firing
+                        // `appliesTo` on every verb that names an effect on the
+                        // declared entity (all but `none` and the two judged per
+                        // attribute specifier, which never reach this loop's
+                        // effects), so for such a
                         // verb an empty set is impossible and the
                         // [[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]] "a row that
                         // forgot the key" trap cannot occur.
@@ -14361,6 +17496,21 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         return declarationSatisfiesAppliesKind(
                                             ak, eff, isFnPointerObject);
                                     })) continue;
+                            // P69 (lane `cs`): THE GATE'S VERDICT IS A FACT OF THE
+                            // MODEL, not only a diagnostic. "Its effect was
+                            // discarded" has to be true of every effect the name
+                            // has, and one of them is not this tier's to discard:
+                            // a name of the LINKAGE vocabulary (`selectany`,
+                            // `weak`, `visibility`) is applied by the CST→HIR
+                            // linkage fold, which reads the same tokens again and
+                            // knows nothing of the kind axis. Recorded BEFORE the
+                            // once-per-clause dedup and independent of what the
+                            // reporter stores, so a suppressed or repeated warning
+                            // cannot leave the effect applied
+                            // (`SemanticModel::attributeNameIgnoredForKind`).
+                            if (ksc.nameToken.valid())
+                                s.attributeNamesIgnoredForKind.set(ksc.nameToken,
+                                                                   true);
                             if (std::ranges::find(declKindAttrReported,
                                                   ksc.clauseNode.v)
                                 != declKindAttrReported.end()) continue;
@@ -14390,6 +17540,190 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 "applicable to {} only",
                                 ksc.name, declarationKindName(eff), allowed);
                             s.reporter.report(std::move(d));
+                        }
+                        // ★★ P69 (lane `cs`) — `alias`, `common` AND `nocommon` ON THIS
+                        // DECLARATOR. Each clause the declaration-kind gate above
+                        // kept (a name it ignored for this kind of entity was said
+                        // there and is not applied here). What the declarator alone
+                        // decides is decided here, once per clause; what needs every
+                        // definition of the unit — the alias's target, and whether
+                        // another declaration defines the name — waits for
+                        // `resolveSymbolAliases` at the end of the unit.
+                        {
+                            auto const clauseKept = [&](NodeId nameToken) {
+                                if (!nameToken.valid()) return true;
+                                bool const* ignored =
+                                    s.attributeNamesIgnoredForKind.tryGet(nameToken);
+                                return ignored == nullptr || !*ignored;
+                            };
+                            auto const reportClauseOnce =
+                                [&](NodeId clauseNode, DiagnosticCode code,
+                                    DiagnosticSeverity severity, std::string actual) {
+                                    std::uint64_t const key =
+                                        (static_cast<std::uint64_t>(tree.id().v) << 32)
+                                        | clauseNode.v;
+                                    if (!s.attributeClausesReported.insert(key).second)
+                                        return;
+                                    ParseDiagnostic d;
+                                    d.code     = code;
+                                    d.severity = severity;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(clauseNode.valid() ? clauseNode
+                                                                              : nameNode);
+                                    d.actual   = std::move(actual);
+                                    s.reporter.report(std::move(d));
+                                };
+                            std::string const declaredName{tree.text(nameNode)};
+                            std::vector<AttributeSemanticsFacts::SymbolAliasClause const*>
+                                aliasClauses;
+                            for (auto const& clause : attrFacts.symbolAliases)
+                                if (clauseKept(clause.nameToken))
+                                    aliasClauses.push_back(&clause);
+                            if (!aliasClauses.empty()) {
+                                auto const& alias = *aliasClauses.front();
+                                // Where the DECLARATION stands, not the scope its
+                                // own node opened.
+                                ScopeId const declScope =
+                                    scopeBindingDeclaratorsOf(s, tree, node, here);
+                                bool const atFileScopeHere =
+                                    declScope.v == fileScopeOf(s, tree, declScope).v;
+                                if (s.symbolAliasUnsupported.has_value()) {
+                                    // The format's own refusal (the Mach-O documents):
+                                    // the platform's C compilers refuse every alias.
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_AttributeNotHonoured,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "attribute 'alias' on '{}' cannot be honoured "
+                                            "here: {}",
+                                            declaredName,
+                                            symbolAliasUnsupportedSentence(
+                                                *s.symbolAliasUnsupported)));
+                                } else if (!atFileScopeHere) {
+                                    // ✔MEASURED (probe al2 cell 12): gcc ignores the
+                                    // attribute at block scope and the link fails;
+                                    // clang's link fails. No reference makes a
+                                    // program, so the name is refused.
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_AttributeNotHonoured,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "attribute 'alias' on '{}' cannot be honoured "
+                                            "at block scope: an alias is a second name of "
+                                            "a definition of the unit, and no reference "
+                                            "makes a program of one written in a block",
+                                            declaredName));
+                                } else if (aliasClauses.size() > 1) {
+                                    // ✔MEASURED (probe al3 cell 10): the attribute
+                                    // twice, even with one target, is refused by all.
+                                    reportClauseOnce(
+                                        aliasClauses[1]->clauseNode,
+                                        DiagnosticCode::S_RedeclaredSymbol,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "'{}' — a declaration may make its name the "
+                                            "alias of one definition, and this one writes "
+                                            "'alias' more than once",
+                                            declaredName));
+                                } else if (!alias.target.has_value()) {
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_SymbolAliasTargetInvalid,
+                                        DiagnosticSeverity::Error,
+                                        std::format(
+                                            "attribute 'alias' on '{}' takes exactly one "
+                                            "argument, a string naming the symbol of the "
+                                            "definition '{}' becomes a second name of",
+                                            declaredName, declaredName));
+                                } else if (isFunctionForm) {
+                                    // ✔MEASURED (probe al2 cell 5): gcc 13.3.0 and
+                                    // mingw-w64 gcc 13.2.0 run the body and warn the
+                                    // attribute ignored; clang 18.1.3 refuses. gcc's
+                                    // reading: the body stands.
+                                    reportClauseOnce(
+                                        alias.clauseNode,
+                                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                                        DiagnosticSeverity::Warning,
+                                        std::format(
+                                            "attribute 'alias' is ignored on '{}' and its "
+                                            "effect was discarded: this declaration "
+                                            "defines the function, and a function with a "
+                                            "body of its own is not a second name of "
+                                            "another",
+                                            declaredName));
+                                } else {
+                                    // Written `extern` — the specifiers' answer, which an
+                                    // initializer does not override.
+                                    bool const writtenExtern =
+                                        declarationIsNonDefining(cfg, tree, node, decl);
+                                    if (initNode.valid() && writtenExtern) {
+                                        // ✔MEASURED (probe al2 cell 11, al3 cell 1,
+                                        // probe rv cell 16): gcc and mingw-w64 keep the
+                                        // alias and drop the initializer, warned; clang
+                                        // refuses. gcc's. Without `extern` the
+                                        // declaration is a definition of its own,
+                                        // refused at the end of the unit (probe rv cell
+                                        // 10, rv2 cell 1: refused by all).
+                                        reportClauseOnce(
+                                            alias.clauseNode,
+                                            DiagnosticCode::S_SymbolAliasInitializerIgnored,
+                                            DiagnosticSeverity::Warning,
+                                            std::format(
+                                                "'{}' is an alias of '{}', which has the "
+                                                "storage and the value; the initializer "
+                                                "written here is ignored",
+                                                declaredName, *alias.target));
+                                    }
+                                    s.pendingSymbolAliases.push_back(
+                                        EngineState::PendingSymbolAlias{
+                                            sym, *alias.target, alias.clauseNode,
+                                            nameNode, tree.id(),
+                                            /*wroteInitializer=*/initNode.valid(),
+                                            writtenExtern});
+                                }
+                            }
+                            bool const commonKept = attrFacts.commonClause.valid()
+                                && clauseKept(attrFacts.commonNameToken);
+                            bool const noCommonKept = attrFacts.noCommonClause.valid()
+                                && clauseKept(attrFacts.noCommonNameToken);
+                            if (commonKept && !s.formatStatesCommons) {
+                                reportClauseOnce(
+                                    attrFacts.commonClause,
+                                    DiagnosticCode::S_AttributeNotHonoured,
+                                    DiagnosticSeverity::Error,
+                                    std::format(
+                                        "attribute 'common' on '{}' cannot be honoured "
+                                        "here: the active object format states no common "
+                                        "definition, so none can be stated for this "
+                                        "object",
+                                        declaredName));
+                            } else if (commonKept) {
+                                // Whether the `common` takes effect is asked ONCE, where
+                                // it is read (`resolveSymbolAliases`): an object some
+                                // declaration of the unit initializes — this one or
+                                // another — is a definition, and `common` on it is
+                                // nothing (probe fs; probe rv cells 11-12).
+                                s.symbolsWritingCommon.insert(sym.v);
+                            }
+                            if (noCommonKept && commonKept) {
+                                // ✔MEASURED (probe fs cell 18): gcc and mingw-w64 gcc
+                                // ignore `nocommon` beside `common`, warned; clang is
+                                // silent. gcc's reading, said.
+                                reportClauseOnce(
+                                    attrFacts.noCommonClause,
+                                    DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                                    DiagnosticSeverity::Warning,
+                                    std::format(
+                                        "attribute 'nocommon' is ignored on '{}' and its "
+                                        "effect was discarded: 'common' on the same "
+                                        "declaration keeps it a tentative definition "
+                                        "that may be a common",
+                                        declaredName));
+                            } else if (noCommonKept) {
+                                s.symbols.at(sym).tentativeNeverCommon = true;
+                            }
                         }
                         // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): mark a FUNCTION symbol the
                         // declaration annotated `noinline`. Gated on `isFnSig` —
@@ -14875,6 +18209,73 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     alRec.explicitAlignment = want;
                             }
                         }
+                        // ★★ P69 (lane `cs`) — THE REQUEST OF A ROW THAT ONLY
+                        // RAISES (`AttributeSemanticsFacts::alignmentFloor`), applied
+                        // AFTER the exact one so that it meets the type as that one
+                        // left it.
+                        //   * a TYPE ALIAS takes it only when it is LARGER than the
+                        //     aliased type's alignment (✔MEASURED, cl 19.51:
+                        //     `typedef __declspec(align(1)) int t;` stays 4,
+                        //     `typedef __declspec(align(32)) int t;` is 32 and a
+                        //     member of it sits at 32);
+                        //   * an OBJECT or a MEMBER is raised to it, as by any
+                        //     alignment request;
+                        //   * a FUNCTION takes nothing: the row does not list the
+                        //     kind, so the kind gate above has already said the
+                        //     clause is ignored, and saying it twice — or refusing
+                        //     here what was just warned as ignored — would be two
+                        //     verdicts on one clause;
+                        //   * a BIT-FIELD is refused, as for every alignment
+                        //     request on one: this compiler's layout gives a
+                        //     bit-field's storage unit no alignment of its own.
+                        if (attrFacts.alignmentFloor.has_value()) {
+                            std::uint32_t const floorWant = *attrFacts.alignmentFloor;
+                            DeclarationKind const fdk = effectiveDeclarationKind();
+                            if (fdk == DeclarationKind::Function) {
+                                // Ignored, and already said so by the kind gate.
+                            } else if (s.symbols.at(sym).bitFieldWidth.has_value()) {
+                                bool const floorFromDeclLevel =
+                                    declAttrFacts.alignmentFloor.has_value()
+                                    && attrFacts.alignmentFloor
+                                           == declAttrFacts.alignmentFloor;
+                                if (!(floorFromDeclLevel && attrAlignContextReported)) {
+                                    if (floorFromDeclLevel)
+                                        attrAlignContextReported = true;
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(nameNode);
+                                    d.actual   = "an alignment attribute on a "
+                                                 "bit-field member";
+                                    s.reporter.report(std::move(d));
+                                }
+                            } else if (fdk == DeclarationKind::Type) {
+                                TypeId const aliased =
+                                    s.symbols.at(sym).type.valid()
+                                        ? s.symbols.at(sym).type : declTy;
+                                if (aliased.valid() && s.aggregateLayout.has_value()) {
+                                    auto const lay = computeLayout(
+                                        aliased, s.lattice.interner(),
+                                        *s.aggregateLayout, s.dataModel);
+                                    if (lay.has_value()
+                                        && floorWant > lay->align.bytes()) {
+                                        TypeId const raised =
+                                            s.lattice.interner().typeAligned(
+                                                aliased, floorWant);
+                                        if (raised.valid()) {
+                                            s.symbols.at(sym).type = raised;
+                                            s.nodeToType.set(nameNode, raised);
+                                        }
+                                    }
+                                }
+                            } else {
+                                auto& alRec = s.symbols.at(sym);
+                                if (!alRec.explicitAlignment.has_value()
+                                    || *alRec.explicitAlignment < floorWant)
+                                    alRec.explicitAlignment = floorWant;
+                            }
+                        }
                         if (isFunctionForm && declarators.size() == 1) {
                             // C 6.9.1 definition constraints, checked LOUD:
                             //  * the named direct-declarator must carry a
@@ -15099,6 +18500,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 if (bodyScope.valid()) {
                                     s.fnResultByScope[bodyScope.v] =
                                         s.lattice.interner().fnResult(declTy);
+                                    s.fnSymbolByScope[bodyScope.v] = sym;
                                 }
                             }
                             // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the
@@ -16632,6 +20034,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 scopeAnchoredAt(s, tree, bodyNode);
                             if (bodyScope.valid()) {
                                 s.fnResultByScope[bodyScope.v] = returnTy;
+                                s.fnSymbolByScope[bodyScope.v] = sym;
                             }
                         }
                     } else if (returnTy.valid()) {
@@ -17028,6 +20431,29 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                         case IntegerLadderStatus::Typed:
                             litTy = s.lattice.interner().primitive(r.kind,
                                                                    r.vocabularyName);
+                            // P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+                            // the ladder READ the literal past its signed list as the
+                            // rule's `decimalPastRange` type — the constraint violation
+                            // C 6.4.4p2 requires a diagnostic for, here a WARNING (the
+                            // literal is typed and compiled, as both references that
+                            // diagnose it do). The condition is the ladder's own
+                            // report, never a re-parsed suffix. A suppressible code, so
+                            // the Pass-1.5 pre-stamp's second visit of the same span
+                            // collapses in the reporter's duplicate window.
+                            if (r.reinterpretedUnsigned) {
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned;
+                                d.severity = DiagnosticSeverity::Warning;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(node);
+                                d.actual   = std::format(
+                                    "integer constant '{}' is too large for every signed "
+                                    "type its suffix admits and is read as '{}'",
+                                    text, r.vocabularyName.empty()
+                                              ? std::string_view{"unsigned"}
+                                              : r.vocabularyName);
+                                s.reporter.report(std::move(d));
+                            }
                             break;
                         case IntegerLadderStatus::TooLarge:
                             fits = false;
@@ -17614,6 +21040,21 @@ stampedOperandMayBePointer(EngineState const& s, Tree const& tree, NodeId n) {
 // and reports through here, so the class, its code and its sentence cannot drift
 // between the sites. Returns true when the pair is admitted (and reported); the
 // caller reports its own refusal otherwise, exactly as before.
+// The report itself, for a class already decided — by `diagnosedConversion` below, or
+// (P69, lane `cs`) by a pair's qualifier spines where the TypeIds cannot decide it
+// (`reportQualifierIncompatiblePointer`).
+void reportDiagnosedClass(EngineState& s, Tree const& tree, NodeId at,
+                          DiagnosedConversion cls, DiagnosedConversionSite site) {
+    ParseDiagnostic d;
+    d.code       = diagnosedConversionCode(cls);
+    d.severity   = DiagnosticSeverity::Warning;
+    d.buffer     = tree.source().id();
+    d.span       = tree.span(at);
+    d.actual     = diagnosedConversionSentence(cls, site, tree.text(at));
+    d.suggestion = "cast the operand explicitly if the conversion is intended";
+    s.reporter.report(std::move(d));
+}
+
 [[nodiscard]] bool
 reportDiagnosedConversion(EngineState& s, Tree const& tree, NodeId at,
                           TypeId target, TypeId source,
@@ -17622,13 +21063,50 @@ reportDiagnosedConversion(EngineState& s, Tree const& tree, NodeId at,
     DiagnosedConversion const cls =
         diagnosedConversion(s.lattice.interner(), target, source, rules);
     if (cls == DiagnosedConversion::None) return false;
+    reportDiagnosedClass(s, tree, at, cls, site);
+    return true;
+}
+
+// P69 (lane `cs`, D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST): a
+// conversion — initialization, assignment, argument, return — between two pointers the
+// ordinary rules ADMITTED because their TypeIds are one, whose pointees a qualifier the
+// interner does not carry makes incompatible ("A POINTER PAIR THE INTERNER CALLS
+// COMPATIBLE, AND C DOES NOT", beside `expressionQualifierSpine`'s declaration).
+// `targetSpine` is the converted-to object's own (level 0 the pointer). Reported as the
+// class the TypeIds would have been reported under had they carried the qualifier: the
+// IncompatiblePointer warning where the language converts such a pair with a diagnostic,
+// the S_TypeMismatch refusal every other incompatible pair gets where it does not.
+// Returns true when it reported.
+[[nodiscard]] bool
+reportQualifierIncompatiblePointer(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId sourceNode,
+                                   TypeId targetType,
+                                   std::optional<QualifierSpine> const& targetSpine,
+                                   TypeId sourceType, ScopeId here,
+                                   DiagnosedConversionSite site) {
+    auto const& in = s.lattice.interner();
+    if (!targetSpine.has_value()
+        || !pointeesCanDivergeInAQualifier(in, targetType, sourceType))
+        return false;
+    // The target must BE a pointer (a function designator or an array converts only as
+    // a source); its spine's level 0 is then its pointer, as the source's is.
+    if (!targetType.valid() || in.kind(in.stripVolatile(targetType)) != TypeKind::Ptr)
+        return false;
+    if (!pointeeSpinesDiverge(targetSpine,
+                              pointerValueSpine(s, cfg, tree, sourceNode, sourceType, here)))
+        return false;
+    auto const& rules = tree.schema().semantics().pointerConversions;
+    if (rules.incompatiblePointerConvertsDiagnosed) {
+        reportDiagnosedClass(s, tree, sourceNode, DiagnosedConversion::IncompatiblePointer,
+                             site);
+        return true;
+    }
     ParseDiagnostic d;
-    d.code       = diagnosedConversionCode(cls);
-    d.severity   = DiagnosticSeverity::Warning;
-    d.buffer     = tree.source().id();
-    d.span       = tree.span(at);
-    d.actual     = diagnosedConversionSentence(cls, site, tree.text(at));
-    d.suggestion = "cast the operand explicitly if the conversion is intended";
+    d.code     = DiagnosticCode::S_TypeMismatch;
+    d.severity = DiagnosticSeverity::Error;
+    d.buffer   = tree.source().id();
+    d.span     = tree.span(sourceNode);
+    d.actual   = std::string{tree.text(sourceNode)};
     s.reporter.report(std::move(d));
     return true;
 }
@@ -17783,7 +21261,11 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
                 s.scopes.lookup(here, std::string{tree.text(cur)}), levels),
                     false};
         }
-        std::uint32_t const r = tree.rule(cur).v;
+        // A parser recovery (Error) node designates nothing: no claim
+        // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+        std::optional<RuleId> const scanned = tree.ruleIfInternal(cur);
+        if (!scanned.has_value()) return {};
+        std::uint32_t const r = scanned->v;
         if (hirCfg.unaryExprRule.valid() && r == hirCfg.unaryExprRule.v) {
             auto const tgt = targetOf(cur, hirCfg.unaryOps);
             NodeId const operand = firstInternal(cur);
@@ -17930,6 +21412,34 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
             levels = mr.dereferences ? 1u : 0u;     // `->` is `(*E).f`
             cur    = object;
             continue;
+        }
+        // P69: a compound literal DESIGNATES an object (C 6.5.2.5p4), qualified as its
+        // type name says at this level — `(const int){ 0 } = 5`, `((const int[]){ 1 })[0]
+        // = 5` and `(const struct S){ 0 }.v = 5` are refused by every reference
+        // (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT).
+        if (auto const clIt = s.idx().compoundLiteralByRule.find(r);
+            clIt != s.idx().compoundLiteralByRule.end()) {
+            return {compoundLiteralConstAt(s, cfg, tree, cur,
+                                           cfg.compoundLiteralRules[clIt->second].typeChild,
+                                           levels),
+                    false};
+        }
+        // P69 (D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS, the cast half): a CAST met on the
+        // way down names the type the designation continues through, so its type name's
+        // spine answers at this level — `*(const char *)q = 'x'` writes a const char
+        // however `q` was declared, and `*(char *)cq = 'x'` does not (C 6.5.4 discards the
+        // qualifier explicitly). ✔MEASURED (P68 round 9): gcc 13.3.0, clang 18.1.3,
+        // mingw-w64 13.2.0 and MSVC 19.51 (C2166) refuse the first. Level 0 is the cast's
+        // own rvalue, which designates nothing.
+        if (auto const castIt = s.idx().castByRule.find(r);
+            castIt != s.idx().castByRule.end()) {
+            if (levels == 0) return {};
+            auto const& crow = cfg.castRules[castIt->second];
+            auto const ck = visibleChildren(tree, cur);
+            if (crow.typeChild >= ck.size()) return {};
+            return {spineConstAt(typeNameQualifierSpine(s, cfg, tree, ck[crow.typeChild]),
+                                 levels),
+                    false};
         }
         // ⚠ AN IDENTIFIER OPERAND IS AN INTERNAL NODE WRAPPING ONE TOKEN, not a
         // bare Token, so the leaf test above is not the one that fires in
@@ -18104,6 +21614,31 @@ void reportWriteToConstLvalue(EngineState& s, SemanticConfig const& cfg,
 void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId here, int loopDepth) {
     auto const k = tree.kind(node);
+
+    // ── A STATEMENT EXPRESSION OUTSIDE EVERY FUNCTION BODY (P69, lane `lm`) ─────────────
+    // is refused HERE, at its own node, wherever it stands: GNU C gives the construct a
+    // frame only inside a function (gcc: "braced-group within expression allowed only
+    // inside a function"; clang: "statement expression not allowed at file scope"). The
+    // refusal lived in the lowering alone, which never meets one that is unevaluated or
+    // folded first: ✔MEASURED 2026-10-15 (pe64, both pipelines), `static char
+    // arr[_Generic(({ 1; }), int: 1, default: 2)];`, the same selection in a file-scope
+    // static assertion and in a bit-field's width were ACCEPTED where gcc 13, clang 18,
+    // AppleClang 21 and mingw-w64 gcc 13.2 refuse each. "Inside a function body" is the
+    // chain `checkReturn` walks (`scopeIsInsideAFunctionBody`); the words are the one
+    // statement both tiers say (`kStatementExprOutsideAFunctionBody`).
+    if (k == NodeKind::Internal) {
+        RuleId const stmtExpr = tree.schema().hirLowering().stmtExprRule;
+        if (stmtExpr.valid() && tree.rule(node).v == stmtExpr.v
+            && !scopeIsInsideAFunctionBody(s, here)) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_StatementExprAtFileScope;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = std::string{kStatementExprOutsideAFunctionBody};
+            s.reporter.report(std::move(d));
+        }
+    }
 
     // C23 §6.5 (D-CSUBSET-NULLPTR): the fail-loud operator gate. `nullptr`
     // (TypeKind::NullptrT) is a null pointer constant, NOT an arithmetic value;
@@ -18535,8 +22070,19 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     SymbolNamespace const lookupNs =
                         ref.isTagReference ? SymbolNamespace::Tag
                                            : SymbolNamespace::Ordinary;
-                    SymbolId const found =
+                    SymbolId found =
                         s.scopes.lookup(here, resolved.name, lookupNs);
+                    // ★ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN):
+                    // a LIBRARY builtin (`__builtin_strlen`) is bound by no scope; its first
+                    // use in the tree binds it to the library function it calls
+                    // (`resolveLibraryBuiltinUse`), which a refusal reports at this use.
+                    bool libraryBuiltinRefused = false;
+                    if (!found.valid() && lookupNs == SymbolNamespace::Ordinary
+                        && !cfg.libraryBuiltins.libraryFunctionOf(resolved.name).empty()) {
+                        found = resolveLibraryBuiltinUse(s, cfg, tree, resolved.name,
+                                                         resolved.node);
+                        libraryBuiltinRefused = !found.valid();
+                    }
                     if (found.valid()) {
                         s.nodeToSymbol.set(resolved.node, found);
                         s.usesBySymbol[found.v].push_back(resolved.node);
@@ -18578,9 +22124,11 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                   "string here, as gcc and clang read it";
                             s.reporter.report(std::move(d));
                         }
-                        if (rec.type.valid()) {
-                            s.nodeToType.set(resolved.node, rec.type);
-                            s.nodeToType.set(node, rec.type);
+                        if (TypeId const visible =
+                                typeVisibleAt(s, tree, found, resolved.node);
+                            visible.valid()) {
+                            s.nodeToType.set(resolved.node, visible);
+                            s.nodeToType.set(node, visible);
                         }
                     } else {
                         // Hard (must-resolve) iff `hardParents` is empty (the
@@ -18609,7 +22157,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 all build
                         // them and run 42 — and `struct Z *p = (struct Z *)&x;`
                         // compiled, because the DECLARATION minted the tag first.
-                        bool hard = ref.hardParents.empty() && !ref.isTagReference;
+                        bool hard = ref.hardParents.empty() && !ref.isTagReference
+                                    && !libraryBuiltinRefused;   // P69: already reported
                         if (!hard && !ref.isTagReference) {
                             NodeId refParent = tree.parent(node);
                             if (refParent.valid()
@@ -18658,7 +22207,10 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     resolveTypeNode(s, cfg, tree, typeNode, here);
                 if (target.valid()) {
                     s.nodeToType.set(typeNode, target);
-                    s.nodeToType.set(node, target);
+                    // The cast EXPRESSION is a value (`subtreeType`'s "THE VALUE LAW"):
+                    // the named type without its own level's qualifiers. The type
+                    // child keeps the type as named.
+                    s.nodeToType.set(node, valueConversion(s.lattice.interner(), target));
                     TypeId const operandTy =
                         subtreeType(s, tree, operandNode);
                     // FC3.5 sweep-c3 (D-CSUBSET-CAST-VOID-DISCARD): the
@@ -18700,6 +22252,39 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // default: 0)` silently took `default`. The core still comes from the
         // TARGET (both current models make it 64-bit), so this also carries the
         // ILP32 width for free once such a target exists.
+        // ★ P69 (lane `cs`) — WHAT `sizeof` OF AN INCOMPLETE TYPE IS, said once per
+        // `sizeof`, where the expression is typed (C 6.5.3.4p1 is a constraint of
+        // the EXPRESSION). An array of unknown size: the language's statement
+        // (`sizeof.incompleteArraySize` — MSVC's 0, C4034), warned as the extension
+        // it is; with no statement, refused. An incomplete structure or union:
+        // refused by every reference (gcc 13.3.0, clang 18.1.3, MSVC 19.51 C2027 —
+        // ✔MEASURED, probe sz), and refused here by name; before this, only the HIR
+        // tier refused it, as a lowering it could not perform.
+        auto const judgeSizeofOperand = [&](TypeId sized) {
+            if (!sized.valid()) return;
+            auto const& in = s.lattice.interner();
+            bool const unknownSizeArray = in.isIncompleteArray(sized);
+            if (!unknownSizeArray && !in.isIncompleteComposite(sized)) return;
+            ParseDiagnostic d;
+            d.buffer = tree.source().id();
+            d.span   = tree.span(node);
+            if (unknownSizeArray && cfg.sizeofIncompleteArraySize.has_value()) {
+                d.code     = DiagnosticCode::S_SizeofIncompleteArrayIsZero;
+                d.severity = DiagnosticSeverity::Warning;
+                d.actual   = std::format(
+                    "`sizeof` of an array of unknown size is {} — MSVC's extension "
+                    "(warning C4034); ISO C makes it a constraint violation "
+                    "(6.5.3.4p1): `{}`",
+                    *cfg.sizeofIncompleteArraySize, tree.text(node));
+            } else {
+                d.code     = DiagnosticCode::S_SizeofIncompleteType;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "`sizeof` of an incomplete type, which has no size "
+                    "(C 6.5.3.4p1): `{}`", tree.text(node));
+            }
+            s.reporter.report(std::move(d));
+        };
         if (cfg.sizeofTypeRule.valid() && rule.v == cfg.sizeofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.sizeofTypeChild < kids.size()) {
@@ -18707,6 +22292,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 TypeId const sized = resolveTypeNode(s, cfg, tree, typeNode, here);
                 if (sized.valid()) s.nodeToType.set(typeNode, sized);
                 // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
+                judgeSizeofOperand(sized);
             }
             s.nodeToType.set(node,
                              synthesizedType(s.lattice.interner(),
@@ -18750,6 +22336,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (tree.kind(opnd) != NodeKind::Internal) continue;
                 if (TypeId t = subtreeType(s, tree, opnd, here); t.valid()) {
                     s.nodeToType.set(opnd, t);
+                    judgeSizeofOperand(t);   // P69 (lane `cs`), above
                 }
                 break;  // the single operand child
             }
@@ -18919,6 +22506,16 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (cfg.vaEndApChild < kids.size()) checkAp(kids[cfg.vaEndApChild]);
                 s.nodeToType.set(node, in.primitive(TypeKind::Void));
             }
+            // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` — both
+            // operands are va_lists (C 7.16.1.2), and the expression is `void`.
+            if (cfg.vaCopyRule.valid() && rule.v == cfg.vaCopyRule.v) {
+                auto kids = visibleChildren(tree, node);
+                if (cfg.vaCopyDestinationChild < kids.size())
+                    checkAp(kids[cfg.vaCopyDestinationChild]);
+                if (cfg.vaCopySourceChild < kids.size())
+                    checkAp(kids[cfg.vaCopySourceChild]);
+                s.nodeToType.set(node, in.primitive(TypeKind::Void));
+            }
         }
 
         // FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF):
@@ -18930,8 +22527,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // `resolveStampedTypeBelow` probe) and the node itself (the
         // literal's RESULT type for enclosing checks). NO cast-matrix
         // validation — a compound literal is C 6.5.2.5 postfix
-        // syntax, not a conversion; per-element legality lives in the
-        // HIR brace-init lowering. Pre-sweep only struct-ref type
+        // syntax, not a conversion; each element is judged against the
+        // subobject it initializes (`checkBraceInitializerElements`, below),
+        // and placed by the HIR brace-init lowering. Pre-sweep only struct-ref type
         // children resolved (via the struct-name machinery); builtin
         // keywords and typedef names stamped NOTHING and the HIR
         // lowering fail-louded on every scalar compound literal.
@@ -18958,6 +22556,51 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (target.valid()) {
                     s.nodeToType.set(typeNode, target);
                     s.nodeToType.set(node, target);
+                    // P69: the literal is an OBJECT, and this is where what KIND of
+                    // object is known (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT):
+                    // its storage, its const-ness, its C23 specifiers' constraints.
+                    CompoundLiteralFacts const facts =
+                        judgeCompoundLiteral(s, cfg, tree, node, clRule, target, here);
+                    s.compoundLiteralFacts.set(node, facts);
+                    // The literal's value as a constant subobject (C23 6.6p6, and the
+                    // GNU folding clang applies to every literal), for the CST→HIR tier's
+                    // evaluator — the same answer this tier's folds read.
+                    if (auto const fact =
+                            resolveConstantSubobject(s, tree, cfg, node, here)) {
+                        s.constantSubobjects.set(node, *fact);
+                    }
+                    // Its initializer answers to what the definition it stands for would
+                    // (C23 6.5.3.6p4): a `constexpr` one's to the constexpr object rules
+                    // (C23 6.7.2p5-p6 — the SAME validation a declared constexpr object
+                    // gets), a static or thread one's to C 6.7.9p4's constant-initializer
+                    // rule. gcc -std=c2x refuses `(static int){ x }` and `(constexpr int){
+                    // x }` with "initializer element is not constant" (runs
+                    // 20260930-212759-cd6e2714 b06, 20260930-185219-ff240d50 x12).
+                    NodeId braceNode{};
+                    for (NodeId c : kids) {
+                        if (s.idx().braceInitListRule.valid()
+                            && tree.kind(c) == NodeKind::Internal
+                            && tree.rule(c).v == s.idx().braceInitListRule.v) {
+                            braceNode = c;
+                            break;
+                        }
+                    }
+                    if (braceNode.valid()) {
+                        if (facts.isConstexpr) {
+                            validateConstexprObject(s, cfg, tree, target, braceNode, node,
+                                                    here, /*declaratorVariablyModified=*/false);
+                        } else if (facts.storage != CompoundLiteralFacts::Storage::Automatic
+                                   && cfg.staticInitializers.has_value()) {
+                            validateStaticInitializer(
+                                s, cfg, tree, braceNode, target, here, *cfg.staticInitializers,
+                                /*fileScope=*/!scopeIsInsideAFunctionBody(s, here));
+                        }
+                        // P69 (lane `cs`): each element against the subobject it
+                        // initializes, as a declaration's brace list is judged
+                        // (`checkBraceInitializerElements`) — `(struct S){ s }` puts a
+                        // structure in an `int`.
+                        checkBraceInitializerElements(s, cfg, tree, braceNode, target, here);
+                    }
                 }
                 // target invalid ⇒ resolveTypeNode already emitted
                 // S_UnknownType (fail loud); the literal stays untyped
@@ -19051,6 +22694,14 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     if (mr.fieldType.valid()) {
                         s.nodeToType.set(mr.nameNode, mr.fieldType);
                         s.nodeToType.set(node, mr.fieldType);
+                    }
+                    // P69 (C23 6.6p6-p7): a constant's `.member` — recorded for the
+                    // CST→HIR tier's evaluator, which reads the same answer.
+                    if (!mr.dereferences) {
+                        if (auto const fact =
+                                resolveConstantSubobject(s, tree, cfg, node, here)) {
+                            s.constantSubobjects.set(node, *fact);
+                        }
                     }
                     break;
                 }
@@ -19201,8 +22852,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             bool const staticStorage = fileScope || rec.isThreadLocal
                                 || scanSpecifierPrefixStorage(cfg, tree, node, decl).staticStorage;
                             if (staticStorage && (fileScope || !rec.isExternDeclaration)) {
-                                validateStaticInitializer(s, cfg, tree, initNode, here,
-                                                          *cfg.staticInitializers, fileScope);
+                                validateStaticInitializer(s, cfg, tree, initNode, rec.type,
+                                                          here, *cfg.staticInitializers,
+                                                          fileScope);
                             }
                         }
                         // The init's type = the first stamped type along
@@ -19210,11 +22862,12 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // expression → operand/binaryExpr/...). An
                         // aggregate brace-init list (multi-child) yields
                         // none and is deliberately SKIPPED here — its
-                        // per-element checks live in the HIR brace-init
-                        // lowering, contextually typed by the declared
-                        // type; a DFS into the braces would surface a
-                        // member literal's type and false-fire
-                        // S_TypeMismatch against the aggregate.
+                        // ELEMENTS are judged one by one against the
+                        // subobjects they initialize, below
+                        // (`checkBraceInitializerElements`, P69); a DFS
+                        // into the braces would surface a member literal's
+                        // type and false-fire S_TypeMismatch against the
+                        // aggregate.
                         TypeId initTy = InvalidType;
                         NodeId walkEnd{};
                         for (NodeId walk = initNode; walk.valid();) {
@@ -19246,8 +22899,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // (isAssignable still decides — void*/qualifier/null/string
                         // admissions are byte-identical); only the address-of
                         // initializer now REACHES it. The brace-init-list form is
-                        // EXCLUDED: its per-element checks live in the HIR brace-init
-                        // lowering (contextually typed by the declared type), and
+                        // EXCLUDED: its elements are judged per subobject by
+                        // `checkBraceInitializerElements` (below), and
                         // `subtreeType` would DFS into the braces and surface an
                         // element literal's type — false-firing S_TypeMismatch
                         // against the aggregate (the exact hazard the stamped walk
@@ -19293,10 +22946,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 s.nodeToType.set(nameNode, initTy);
                             }
                         } else if (initTy.valid()
-                                   && !isAssignableUnder(
+                                   && isAssignableUnder(
                                           cfg, s.lattice.interner(), rec.type, initTy,
                                           /*charArrayFromStringLiteralInit=*/
-                                          initIsStringLiteral(s, tree, initNode))
+                                          initIsStringLiteral(s, tree, initNode))) {
+                            // P69 (lane `cs`): a pair the TypeIds admit may still point
+                            // to types a qualifier they do not carry keeps apart (`int
+                            // (*p)(const char *) = g;` over `int g(char *)`).
+                            (void)reportQualifierIncompatiblePointer(
+                                s, cfg, tree, initNode, rec.type, rec.qualSpine, initTy,
+                                here, DiagnosedConversionSite::Initialization);
+                        } else if (initTy.valid()
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -19315,6 +22975,16 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             d.span     = tree.span(initNode);
                             d.actual   = std::string{tree.text(initNode)};
                             s.reporter.report(std::move(d));
+                        }
+                        // P69 (lane `cs`, D-C-A-INCOMPATIBLE-BRACE-ELEMENT-IS-REFUSED-BY-AN-INTERNAL-VERIFIER-FAILURE):
+                        // a brace list's ELEMENTS take the constraint the plain
+                        // initializer above takes, each against the subobject it
+                        // initializes (C 6.7.9p11).
+                        if (NodeId const braceList = peelSingleChildrenTo(
+                                tree, initNode, s.idx().braceInitListRule);
+                            braceList.valid() && rec.type.valid()) {
+                            checkBraceInitializerElements(s, cfg, tree, braceList, rec.type,
+                                                          here);
                         }
                     }
                 }
@@ -19345,10 +23015,16 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 s.nodeToType.set(resolved.node, initTy);
                             }
                         } else if (initTy.valid()
-                                   && !isAssignableUnder(
+                                   && isAssignableUnder(
                                           cfg, s.lattice.interner(), rec.type, initTy,
                                           /*charArrayFromStringLiteralInit=*/
-                                          initIsStringLiteral(s, tree, initNode))
+                                          initIsStringLiteral(s, tree, initNode))) {
+                            // P69 (lane `cs`): the qualifier the TypeIds cannot see —
+                            // the declarator-mode site above states it.
+                            (void)reportQualifierIncompatiblePointer(
+                                s, cfg, tree, initNode, rec.type, rec.qualSpine, initTy,
+                                here, DiagnosedConversionSite::Initialization);
+                        } else if (initTy.valid()
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -19462,9 +23138,21 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         auto const& ptrRules =
                             tree.schema().semantics().pointerConversions;
                         if (lhsTy.valid() && rhsTy.valid()
-                            && !isAssignableUnder(cfg, s.lattice.interner(), lhsTy,
-                                                  rhsTy,
-                                                  /*charArrayFromStringLiteralInit=*/false)
+                            && isAssignableUnder(cfg, s.lattice.interner(), lhsTy,
+                                                 rhsTy,
+                                                 /*charArrayFromStringLiteralInit=*/false)) {
+                            // P69 (lane `cs`): the qualifier the TypeIds cannot see (`p =
+                            // g;` into an `int (*)(const char *)` from `int g(char *)`).
+                            // The pre-filter spares every other assignment the left
+                            // operand's spine walk.
+                            if (pointeesCanDivergeInAQualifier(s.lattice.interner(), lhsTy,
+                                                               rhsTy)) {
+                                (void)reportQualifierIncompatiblePointer(
+                                    s, cfg, tree, rhsN, lhsTy,
+                                    expressionQualifierSpine(s, cfg, tree, lhsN, here),
+                                    rhsTy, here, DiagnosedConversionSite::Assignment);
+                            }
+                        } else if (lhsTy.valid() && rhsTy.valid()
                             && !admitsNullPointerConstant(
                                    s, tree, lhsTy, rhsN, ptrRules, here, cfg)
                             // P68 round 9: a class the language converts WITH A
@@ -19522,6 +23210,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             std::vector<NodeId> arms;
             for (NodeId c : visibleChildren(tree, node)) {
                 if (tree.kind(c) != NodeKind::Token) arms.push_back(c);
+            }
+            // P69 (lane `lm`): the conditional's type as the typer gives it, recorded for
+            // the lowering's constant evaluator (the model's `conditionalTypeFor`) — only
+            // when the typer typed BOTH arms: with one untyped it hands on the other arm's
+            // type (`combineTernary`'s last fallback), which is no balance of the two.
+            if (arms.size() == 3 && subtreeType(s, tree, arms[1], here).valid()
+                && subtreeType(s, tree, arms[2], here).valid()) {
+                if (TypeId const conditionalT = subtreeType(s, tree, node, here);
+                    conditionalT.valid()) {
+                    s.conditionalTypes.set(node, conditionalT);
+                }
             }
             // The cheap pre-filter (see `stampedOperandMayBePointer`): this
             // constraint needs ONE arm to contribute a pointer, so a definitive
@@ -19613,6 +23312,20 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         (void)reportDiagnosedConversion(
                             s, tree, node, in.pointer(thenP), elseT, ptrRulesT,
                             DiagnosedConversionSite::Conditional);
+                    } else if (ptrRulesT.incompatiblePointerConvertsDiagnosed
+                               && pointeesCanDivergeInAQualifier(in, thenT, elseT)
+                               && pointeeSpinesDiverge(
+                                      pointerValueSpine(s, cfg, tree, arms[1], thenT, here),
+                                      pointerValueSpine(s, cfg, tree, arms[2], elseT, here))) {
+                        // P69 (lane `cs`): the pairing only the arms' spines see
+                        // ("A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES
+                        // NOT") — `subtreeType` typed it `void *`; the node is
+                        // STAMPED so the HIR `combineTernary`, whose TypeIds cannot see
+                        // the qualifier, converts both arms to that type.
+                        s.nodeToType.set(node, in.pointer(in.primitive(TypeKind::Void)));
+                        reportDiagnosedClass(s, tree, node,
+                                             DiagnosedConversion::IncompatiblePointer,
+                                             DiagnosedConversionSite::Conditional);
                     }
                 }
             }
@@ -19690,6 +23403,19 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         (void)reportDiagnosedConversion(
                             s, tree, node, in.pointer(lp), rt, ptrRulesC,
                             DiagnosedConversionSite::Comparison);
+                    } else if (ptrRulesC.incompatiblePointerConvertsDiagnosed
+                               && pointeesCanDivergeInAQualifier(in, lt, rt)
+                               && pointeeSpinesDiverge(
+                                      pointerValueSpine(s, cfg, tree, lhsN, lt, here),
+                                      pointerValueSpine(s, cfg, tree, rhsN, rt, here))) {
+                        // P69 (lane `cs`): the pairing only the operands' spines see
+                        // — `&f_plain == &f_const`, `pp == qq` over `char **` / `const
+                        // char **`. ✔MEASURED (probe r4f v01, v04): gcc 13.3.0 and
+                        // clang 18.1.3 warn "comparison of distinct pointer types",
+                        // MSVC 19.51 is silent; all three run it.
+                        reportDiagnosedClass(s, tree, node,
+                                             DiagnosedConversion::IncompatiblePointer,
+                                             DiagnosedConversionSite::Comparison);
                     }
                 } else if (lp.valid() != rp.valid()) {
                     NodeId const intN = lp.valid() ? rhsN : lhsN;
@@ -20522,6 +24248,15 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                discardedFacts);
     }
 
+    // P69 round 4 (lane `cs`): EVERY attribute specifier of the tree gets its one
+    // position-independent judgement here (a name this compiler cannot honour, a
+    // calling convention) and, where it decorates a type, its positional one. A
+    // specifier a declaration folded is recognized by the fold's own mark, so
+    // nothing is said twice; see `judgeAttributeSpecifier`.
+    if (k == NodeKind::Internal && isAttributeSpecifierNode(tree, node)) {
+        judgeAttributeSpecifier(s, cfg, tree, node, here);
+    }
+
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic ( ctrl ,
     // assoc-list )` generic selection. The SELECTION is a compile-time decision
     // made here (the point with the resolved controlling type + the machinery to
@@ -20902,7 +24637,10 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // `int x = f();` initializer-type-flow). Set BEFORE arity/arg checks so
     // the result type is present even when an arg mismatch is reported (the
     // call's value type is its declared result regardless of arg errors).
-    s.nodeToType.set(node, s.lattice.interner().fnResult(fnSig));
+    // (A VALUE: `subtreeType`'s "THE VALUE LAW" — a result type declared `volatile`
+    // or `_Atomic` is not what the call expression has.)
+    s.nodeToType.set(node, valueConversion(s.lattice.interner(),
+                                           s.lattice.interner().fnResult(fnSig)));
 
     // Collect arg expression nodes (visible children of the args subtree
     // that are NOT separators). The argsChild subtree is a comma-separated
@@ -21027,12 +24765,49 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // The same descent helper already powers checkReturn (`subtreeType`
     // is defined below).
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
+    // P69 (lane `cs`): the callee's PARAMETER claims — the qualifiers its FnSig does not
+    // carry — read once, off the callee's own spine (its function level sits at 1 once
+    // a designator has become a pointer), and only when an argument's pair could
+    // diverge in one (`reportQualifierIncompatiblePointer`).
+    std::optional<std::shared_ptr<DeclaredQualification const>> calleeParams;
+    auto const paramClaim = [&](std::size_t i) -> std::optional<QualifierSpine> {
+        if (!calleeParams.has_value()) {
+            calleeParams.emplace();
+            if (call.calleeChild < kids.size()) {
+                NodeId const callee = kids[call.calleeChild];
+                auto const sp = pointerValueSpine(s, cfg, tree, callee,
+                                                  subtreeType(s, tree, callee, scope),
+                                                  scope);
+                if (sp.has_value()) {
+                    for (auto const& [lv, claim] : sp->fnParams) {
+                        if (lv == 1) { *calleeParams = claim; break; }
+                    }
+                }
+            }
+        }
+        auto const& c = *calleeParams;
+        if (c == nullptr || i >= c->params.size()) return std::nullopt;
+        return c->params[i];
+    };
     for (std::size_t i = 0; i < checkCount && i < argNodes.size(); ++i) {
         if (argIncomplete[i]) continue;   // refused above; no second verdict
         TypeId argTy = subtreeType(s, tree, argNodes[i]);
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
-        if (!isAssignableUnder(cfg, s.lattice.interner(), params[i], argTy,
-                               /*charArrayFromStringLiteralInit=*/false)) {
+        if (isAssignableUnder(cfg, s.lattice.interner(), params[i], argTy,
+                              /*charArrayFromStringLiteralInit=*/false)) {
+            // P69 (lane `cs`): the qualifier the TypeIds cannot see — `call(g)` into an
+            // `int (*)(const char *)` parameter from `int g(char *)`, `h(pp)` into a
+            // `const char **` from a `char **` (✔MEASURED, probe r4f v02/v05: gcc
+            // 13.3.0 warns, clang 18.1.3 refuses the first and warns on the second,
+            // MSVC 19.51 builds both).
+            if (pointeesCanDivergeInAQualifier(s.lattice.interner(), params[i], argTy)) {
+                (void)reportQualifierIncompatiblePointer(
+                    s, cfg, tree, argNodes[i], params[i], paramClaim(i), argTy, scope,
+                    DiagnosedConversionSite::Argument);
+            }
+            continue;
+        }
+        {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -21084,6 +24859,846 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
                 s.reporter.report(std::move(d));
             }
         }
+    }
+}
+
+// ── WHICH EXPRESSION IS A BIT-FIELD'S VALUE, ASKED BY THIS TIER ─────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// The width of the bit-field `n` is the value of, or nothing: THE statement
+// (`bitFieldValueWidth`, core/types/decl_prefix_strip.hpp) asked with this tier's two
+// answers — a member access's field by `resolveMemberAccess`, a selection's winner by
+// Pass 2's record or, before Pass 2 has made one, by the ONE selector. Every semantic
+// question of "is this a bit-field's value" asks HERE: the operators' typing
+// (`subtreeType`, C 6.3.1.1p2's promotion by width) and the third operand of the overflow
+// predicates (`overflowPredicateTarget`: a bit-field's value is checked at its width) — and
+// the constant evaluator's operators (`buildConstEvalEnv`'s `resolveBitFieldValueType`),
+// which promote from the field's DECLARED type: `fieldTypeOut`, when given, receives it.
+[[nodiscard]] std::optional<std::uint32_t>
+semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const& tree,
+                           NodeId n, ScopeId scope, TypeId* fieldTypeOut) {
+    return bitFieldValueWidth(
+        sem, tree.schema().hirLowering(), tree, n,
+        [&](NodeId m) -> std::optional<std::uint32_t> {
+            auto const mr = resolveMemberAccess(s, sem, tree, m, scope);
+            if (mr.status != MemberResolution::Status::Ok || !mr.fieldSym.valid())
+                return std::nullopt;
+            if (fieldTypeOut != nullptr) *fieldTypeOut = s.symbols.at(mr.fieldSym).type;
+            return s.symbols.at(mr.fieldSym).bitFieldWidth;
+        },
+        [&](NodeId sel) -> NodeId { return selectionResultOf(s, sem, tree, sel, scope); });
+}
+
+// ══ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the GNU builtins'
+// semantic half — what a call of one MEANS beyond its declared signature ══════════════════
+//
+// The rows in `semantics.builtinFunctions` declare each builtin's signature and the verb it
+// lowers to; three verbs carry a rule the signature cannot state, and this block owns each:
+//   * `object_size` — a COMPILE-TIME answer (`objectSizeAnswer`), its `type` operand an
+//     integer constant expression 0..3;
+//   * the three overflow verbs' type-GENERIC form — any two integer operands and a pointer
+//     to a modifiable integer object;
+//   * `quiet_nan` — a STRING-LITERAL operand folds; any other makes the call the row's
+//     `libraryFallback`.
+// And the library builtins (`semantics.libraryBuiltins`): `__builtin_strlen` binds, on its
+// first use in a tree, to the library function (`resolveLibraryBuiltinUse`).
+
+// The node a grouping chain stands for — the node that carries the expression's own shape:
+// down through the wrappers to the first node that says something itself, by THE statement
+// of what a wrapper is (`nodeSaysSomethingItself`, core/types/decl_prefix_strip.hpp — the
+// one both tiers' descents take their steps by).
+// ★ P69 (lane `lm`, the review's B): this stopped at a list of its own — the operators,
+// the cast, the conditional and the compound literals — so it stepped THROUGH every other
+// construct with one operand: `sizeof e` and `_Alignof` (the operand answered for the
+// size), a statement expression (its item, then the item's expression). And it stopped in
+// silence past its bound, handing back the node it had reached as if the walk had ended;
+// every step is to a strict descendant, so a walk past the node count is a cyclic node
+// graph, and that stops the process (`failOnCyclicTree`) — a stop no program can reach.
+[[nodiscard]] NodeId peelBuiltinOperand(Tree const& tree, NodeId n) {
+    SemanticConfig const& sem = tree.schema().semantics();
+    auto const& hc = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t step = 0; n.valid(); ++step) {
+        if (step > bound) failOnCyclicTree("the builtin operand peel");
+        if (tree.kind(n) != NodeKind::Internal) return n;
+        if (nodeSaysSomethingItself(sem, hc, tree, n)) return n;
+        NodeId only{};
+        std::size_t internals = 0;
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) == NodeKind::Token) continue;
+            ++internals;
+            only = c;
+        }
+        if (internals != 1) {
+            // No non-token child: a leaf shape (a string literal's token run) or a bare
+            // token wrapper — a wrapper holding exactly ONE token is that token.
+            if (internals == 0) {
+                auto const kids = visibleChildren(tree, n);
+                if (kids.size() == 1) return kids[0];
+            }
+            return n;
+        }
+        n = only;
+    }
+    return n;
+}
+
+// The node a builtin's operand stands for when the question is its VALUE — which object a
+// pointer designates (`__builtin_object_size`), which string `__builtin_nan` folds: down the
+// grouping (`peelBuiltinOperand`), into a compile-time selection's result
+// (`selectionResultOf`), and into a statement expression of ONE expression statement
+// (`soleExpressionOfStatementExpression`) — the steps THE statement leaves to a descent that
+// asks a value, each by name (P69, lane `lm`). ✔MEASURED 2026-10-15 (gcc 13, clang 18,
+// AppleClang 21, mingw-w64 gcc 13.2): `__builtin_object_size` of `_Generic(0, int: buf)`,
+// `__builtin_choose_expr(1, buf, 0)` and `({ buf; })` over `char buf[10]` is 10 on all four,
+// where this tier answered the unknown -1 for each; `__builtin_nan(_Generic(0, int: "1"))`
+// folds as a static initializer on all four, where this tier refused it; and
+// `__builtin_nan(({ "1"; }))` folds on gcc and mingw-w64 gcc (both clangs refuse it: one
+// working reference makes it required). Every step is to a strict descendant: the node count
+// bounds it, LOUD past it.
+[[nodiscard]] NodeId builtinOperandValueCore(EngineState& s, SemanticConfig const& cfg,
+                                             Tree const& tree, NodeId n, ScopeId scope) {
+    auto const& hc = tree.schema().hirLowering();
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t step = 0;; ++step) {
+        if (step > bound) failOnCyclicTree("the builtin operand's value peel");
+        n = peelBuiltinOperand(tree, n);
+        if (!n.valid() || tree.kind(n) != NodeKind::Internal) return n;
+        if (nodeIsASelection(cfg, tree, n)) {
+            NodeId const result = selectionResultOf(s, cfg, tree, n, scope);
+            if (!result.valid()) return n;
+            n = result;
+            continue;
+        }
+        if (NodeId const value = soleExpressionOfStatementExpression(hc, tree, n); value.valid()) {
+            n = value;
+            continue;
+        }
+        return n;
+    }
+}
+
+// The `hirLowering` op-table entry of the operator token directly under `node`.
+[[nodiscard]] HirOperatorEntry const*
+builtinOperandOperator(Tree const& tree, NodeId node, std::vector<HirOperatorEntry> const& ops) {
+    for (NodeId c : visibleChildren(tree, node)) {
+        if (tree.kind(c) != NodeKind::Token) continue;
+        for (auto const& e : ops)
+            if (e.token.v == tree.tokenKind(c).v) return &e;
+    }
+    return nullptr;
+}
+
+// Does evaluating `node` have a side effect C would perform — a call, an assignment, an
+// increment or decrement, a statement expression, a `va_*` operation? gcc's manual: when an
+// operand of `__builtin_object_size` has one, the answer is the unknown one (and the operand
+// is never evaluated either way).
+[[nodiscard]] bool builtinOperandHasSideEffects(Tree const& tree, NodeId node) {
+    auto const& hc = tree.schema().hirLowering();
+    std::vector<NodeId> stack{node};
+    std::size_t visited = 0;
+    std::size_t const bound = tree.nodeCount() + 1;
+    while (!stack.empty()) {
+        // Every node is visited once (a tree): past the node count the graph is cyclic.
+        if (++visited > bound) failOnCyclicTree("the builtin operand's side-effect walk");
+        NodeId const n = stack.back();
+        stack.pop_back();
+        if (!n.valid() || tree.kind(n) != NodeKind::Internal) continue;
+        std::uint32_t const r = tree.rule(n).v;
+        // ★ P69 (lane `lm`): a statement expression is read for the effects it HOLDS — one
+        // whose body is a single expression statement is that expression (✔MEASURED
+        // 2026-10-15: `__builtin_object_size(({ buf; }), 0)` is 10 on gcc 13, clang 18,
+        // AppleClang 21 and mingw-w64 gcc 13.2; this answered the unknown -1). Any other
+        // body may declare, branch or jump, and is taken to have one.
+        if (hc.stmtExprRule.valid() && r == hc.stmtExprRule.v) {
+            NodeId const value = soleExpressionOfStatementExpression(hc, tree, n);
+            if (!value.valid()) return true;
+            stack.push_back(value);
+            continue;
+        }
+        if ((hc.vaStartRule.valid() && r == hc.vaStartRule.v)
+            || (hc.vaArgRule.valid() && r == hc.vaArgRule.v)
+            || (hc.vaEndRule.valid() && r == hc.vaEndRule.v)
+            || (hc.vaCopyRule.valid() && r == hc.vaCopyRule.v))
+            return true;
+        if (r == hc.postfixExprRule.v) {
+            if (auto const* e = builtinOperandOperator(tree, n, hc.postfixOps);
+                e != nullptr && (e->target == "Call" || e->target == "PostInc"
+                                 || e->target == "PostDec"))
+                return true;
+        } else if (r == hc.unaryExprRule.v) {
+            if (auto const* e = builtinOperandOperator(tree, n, hc.unaryOps);
+                e != nullptr && (e->target == "PreInc" || e->target == "PreDec"))
+                return true;
+        } else if (r == hc.binaryExprRule.v) {
+            if (auto const* e = builtinOperandOperator(tree, n, hc.binaryOps);
+                e != nullptr && e->target == "Assign")
+                return true;
+        }
+        for (NodeId c : visibleChildren(tree, n)) stack.push_back(c);
+    }
+    return false;
+}
+
+// Where a pointer points, in bytes, within the object (and the closest surrounding
+// subobject) it points into — when the semantic tier can SEE which object that is.
+struct DesignatedBytes {
+    std::uint64_t objectSize      = 0;
+    std::int64_t  objectOffset    = 0;
+    std::uint64_t subobjectSize   = 0;
+    std::int64_t  subobjectOffset = 0;
+};
+
+// The byte size of a complete object type, or nullopt (incomplete, a function, no layout).
+[[nodiscard]] std::optional<std::uint64_t>
+builtinObjectBytes(EngineState const& s, TypeId t) {
+    if (!t.valid() || !s.aggregateLayout.has_value()) return std::nullopt;
+    auto const& in = s.lattice.interner();
+    if (in.kind(t) == TypeKind::FnSig || in.kind(t) == TypeKind::Void) return std::nullopt;
+    auto const lay = computeLayout(t, in, *s.aggregateLayout, s.dataModel);
+    if (!lay.has_value() || lay->size == 0) return std::nullopt;
+    return lay->size;
+}
+
+// The two halves of the designation, as one explicit walk: a pointer-valued expression
+// (`designatePointer`) and an lvalue (`designateLvalue`) refer to each other through `&`,
+// `*`, `[]`, `->` and an array's decay. Bounded by the operand's own node count — every
+// step descends to a strict descendant.
+[[nodiscard]] std::optional<DesignatedBytes>
+designateBuiltinOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                        NodeId start, ScopeId here, bool startIsLvalue) {
+    auto const& hc = tree.schema().hirLowering();
+    auto& in = s.lattice.interner();
+    // One step of the walk: the node, whether it is read as an lvalue, and the adjustments
+    // to apply once the inner designation is known (applied innermost-first on unwind).
+    struct Adjust {
+        enum class Kind : std::uint8_t { Offset, Member, CastToPointer } kind;
+        std::int64_t  bytes = 0;          // Offset / Member: added to both offsets
+        std::uint64_t memberSize = 0;     // Member: the new subobject's size
+    };
+    std::vector<Adjust> adjusts;
+    NodeId n = start;
+    bool lvalue = startIsLvalue;
+    std::size_t const bound = tree.nodeCount() + 1;
+    std::optional<DesignatedBytes> base;
+    for (std::size_t step = 0;; ++step) {
+        // Every step is to a strict descendant: past the node count the graph is cyclic
+        // (P69, lane `lm`: this ended in silence and answered "no object").
+        if (step > bound) failOnCyclicTree("the builtin operand's designation");
+        n = builtinOperandValueCore(s, cfg, tree, n, here);
+        if (!n.valid()) return std::nullopt;
+        TypeId const t = subtreeType(s, tree, n, here);
+        TypeKind const tk = t.valid() ? in.kind(t) : TypeKind::Void;
+        // A pointer-valued expression whose value is an ARRAY decays: it designates that
+        // array as an lvalue — the array is then the subobject (`&buf[2]`, type 1: the
+        // array's remaining bytes; gcc and clang agree).
+        if (!lvalue && tk == TypeKind::Array) lvalue = true;
+        if (tree.kind(n) == NodeKind::Token) {
+            // A bare identifier: an OBJECT, if that is what it names.
+            if (!lvalue || !cfg.identifierToken.valid()
+                || tree.tokenKind(n).v != cfg.identifierToken.v)
+                return std::nullopt;
+            SymbolId const sym = s.scopes.lookup(here, tree.text(n));
+            if (!sym.valid()) return std::nullopt;
+            auto const& rec = s.symbols.at(sym);
+            if (rec.kind != DeclarationKind::Variable) return std::nullopt;
+            auto const bytes = builtinObjectBytes(s, rec.type);
+            if (!bytes.has_value()) return std::nullopt;
+            base = DesignatedBytes{*bytes, 0, *bytes, 0};
+            break;
+        }
+        // A parser recovery (Error) node designates no object
+        // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+        std::optional<RuleId> const scanned = tree.ruleIfInternal(n);
+        if (!scanned.has_value()) return std::nullopt;
+        std::uint32_t const r = scanned->v;
+        auto const kids = visibleChildren(tree, n);
+        std::vector<NodeId> inner;
+        for (NodeId c : kids)
+            if (tree.kind(c) != NodeKind::Token) inner.push_back(c);
+        if (s.idx().compoundLiteralByRule.contains(r) || inner.empty()) {
+            // A compound literal, or a string literal's token run: an unnamed OBJECT of the
+            // node's own type (clang sizes `(int[]){1, 2, 3}` as 12; gcc answers unknown).
+            if (!lvalue) return std::nullopt;
+            auto const bytes = builtinObjectBytes(s, t);
+            if (!bytes.has_value()) return std::nullopt;
+            base = DesignatedBytes{*bytes, 0, *bytes, 0};
+            break;
+        }
+        if (r == hc.castRule.v) {
+            // `(T *)p`: a pointer conversion keeps the address and drops the subobject —
+            // the converted pointer points into the OBJECT (clang: `(char *)&s + 4`, type 1,
+            // is the whole object's remaining bytes).
+            if (lvalue || tk != TypeKind::Ptr) return std::nullopt;
+            adjusts.push_back({Adjust::Kind::CastToPointer});
+            n = kids.back();
+            continue;
+        }
+        if (r == hc.unaryExprRule.v) {
+            auto const* e = builtinOperandOperator(tree, n, hc.unaryOps);
+            if (e == nullptr || inner.size() != 1) return std::nullopt;
+            if (!lvalue && e->target == "AddressOf") { lvalue = true; n = inner[0]; continue; }
+            if (lvalue && e->target == "Deref") { lvalue = false; n = inner[0]; continue; }
+            return std::nullopt;
+        }
+        if (r == hc.binaryExprRule.v) {
+            // `p + k`, `k + p`, `p - k` with `k` an integer constant expression.
+            if (lvalue || inner.size() != 2) return std::nullopt;
+            auto const* e = builtinOperandOperator(tree, n, hc.binaryOps);
+            if (e == nullptr || (e->target != "Add" && e->target != "Sub")) return std::nullopt;
+            auto const isPointerish = [&](NodeId x) {
+                TypeId const xt = subtreeType(s, tree, x, here);
+                if (!xt.valid()) return false;
+                TypeKind const xk = in.kind(xt);
+                return xk == TypeKind::Ptr || xk == TypeKind::Array;
+            };
+            std::size_t const pi = isPointerish(inner[0]) ? 0 : (isPointerish(inner[1]) ? 1 : 2);
+            if (pi == 2 || (e->target == "Sub" && pi != 0)) return std::nullopt;
+            NodeId const pN = inner[pi];
+            NodeId const kN = inner[1 - pi];
+            if (isPointerish(kN)) return std::nullopt;   // `p - q` is not a pointer
+            auto const k = constIntExpr(s, tree, kN, here, &cfg);
+            if (!k.has_value()) return std::nullopt;
+            TypeId const pt = subtreeType(s, tree, pN, here);
+            auto const ops = in.operands(pt);
+            if (ops.empty()) return std::nullopt;
+            auto const elem = builtinObjectBytes(s, ops[0]);
+            if (!elem.has_value()) return std::nullopt;
+            std::int64_t const delta = (e->target == "Sub" ? -*k : *k)
+                                     * static_cast<std::int64_t>(*elem);
+            adjusts.push_back({Adjust::Kind::Offset, delta});
+            n = pN;
+            continue;
+        }
+        if (r == hc.postfixExprRule.v) {
+            auto const* e = builtinOperandOperator(tree, n, hc.postfixOps);
+            if (e == nullptr || inner.empty()) return std::nullopt;
+            if (e->target == "Index") {
+                // `a[k]` (an lvalue): the element's bytes from the array's start; the
+                // subobject stays the array (gcc and clang: `&buf[2]`, type 1, is 8 of 10).
+                if (!lvalue || inner.size() != 2) return std::nullopt;
+                auto const isPointerish = [&](NodeId x) {
+                    TypeId const xt = subtreeType(s, tree, x, here);
+                    if (!xt.valid()) return false;
+                    TypeKind const xk = in.kind(xt);
+                    return xk == TypeKind::Ptr || xk == TypeKind::Array;
+                };
+                NodeId baseN = inner[0], idxN = inner[1];
+                if (!isPointerish(baseN) && isPointerish(idxN)) std::swap(baseN, idxN);
+                auto const k = constIntExpr(s, tree, idxN, here, &cfg);
+                if (!k.has_value()) return std::nullopt;
+                auto const elem = builtinObjectBytes(s, t);
+                if (!elem.has_value()) return std::nullopt;
+                adjusts.push_back({Adjust::Kind::Offset,
+                                   *k * static_cast<std::int64_t>(*elem)});
+                TypeId const bt = subtreeType(s, tree, baseN, here);
+                lvalue = bt.valid() && in.kind(bt) == TypeKind::Array;
+                n = baseN;
+                continue;
+            }
+            if (e->target == "MemberAccess" || e->target == "MemberAccessThruPtr") {
+                if (!lvalue) return std::nullopt;
+                bool const thruPtr = e->target == "MemberAccessThruPtr";
+                NodeId const baseN = inner[0];
+                TypeId bt = subtreeType(s, tree, baseN, here);
+                if (thruPtr) {
+                    if (!bt.valid() || in.kind(bt) != TypeKind::Ptr) return std::nullopt;
+                    auto const ops = in.operands(bt);
+                    if (ops.empty()) return std::nullopt;
+                    bt = ops[0];
+                }
+                if (!bt.valid() || inner.size() < 2) return std::nullopt;
+                // The member name: the first identifier token of the follower subtree.
+                NodeId nameTok{};
+                std::vector<NodeId> ws{inner[1]};
+                while (!ws.empty() && !nameTok.valid()) {
+                    NodeId const x = ws.back();
+                    ws.pop_back();
+                    if (tree.kind(x) == NodeKind::Token) {
+                        if (cfg.identifierToken.valid()
+                            && tree.tokenKind(x).v == cfg.identifierToken.v)
+                            nameTok = x;
+                        continue;
+                    }
+                    auto const xk = visibleChildren(tree, x);
+                    for (auto it = xk.rbegin(); it != xk.rend(); ++it) ws.push_back(*it);
+                }
+                if (!nameTok.valid()) return std::nullopt;
+                // ★ P69 (lane `cs`): the ONE member rule every constant asks
+                // (`memberOffsetIn`) — a member promoted through anonymous members is
+                // the subobject it names, at the SUM of the offsets crossed; a
+                // bit-field, or a name that is no member, designates no bytes.
+                auto const member = memberOffsetIn(s, bt, tree.text(nameTok));
+                if (!member.found()) return std::nullopt;
+                auto const memberBytes = builtinObjectBytes(s, member.type);
+                if (!memberBytes.has_value()) return std::nullopt;
+                adjusts.push_back({Adjust::Kind::Member,
+                                   static_cast<std::int64_t>(member.offset),
+                                   *memberBytes});
+                lvalue = !thruPtr;
+                n = baseN;
+                continue;
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    if (!base.has_value()) return std::nullopt;
+    // Unwind: innermost adjustment first.
+    DesignatedBytes d = *base;
+    for (auto it = adjusts.rbegin(); it != adjusts.rend(); ++it) {
+        switch (it->kind) {
+            case Adjust::Kind::Offset:
+                d.objectOffset    += it->bytes;
+                d.subobjectOffset += it->bytes;
+                break;
+            case Adjust::Kind::Member:
+                d.objectOffset   += it->bytes;
+                d.subobjectSize   = it->memberSize;
+                d.subobjectOffset = 0;
+                break;
+            case Adjust::Kind::CastToPointer:
+                d.subobjectSize   = d.objectSize;
+                d.subobjectOffset = d.objectOffset;
+                break;
+        }
+    }
+    return d;
+}
+
+// The NaN payload a `__builtin_nan` string spells, by gcc's own parser (`real_nan`): leading
+// white space, an optional sign (ignored), a `0x` / `0` base prefix, then digits of that base,
+// and the WHOLE string consumed — otherwise nullopt (the call is the library's `nan`). The
+// digits accumulate modulo 2^128 — a binary128 long double keeps payload bits 0..110, every
+// narrower format fewer — and the caller keeps the bits its format holds.
+// ✔MEASURED (lane `cs`'s probe r5s s10): "" is payload 0, "1" is 1, "0x10" is 16, on gcc
+// 13.3.0 and clang 18.1.3 alike.
+[[nodiscard]] std::optional<NanPayload> gnuNanPayload(std::string_view text) {
+    std::size_t i = 0;
+    // gcc's `ISSPACE`: the C locale's white space.
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n'
+                               || text[i] == '\v' || text[i] == '\f' || text[i] == '\r'))
+        ++i;
+    if (i < text.size() && (text[i] == '-' || text[i] == '+')) ++i;
+    unsigned base = 10;
+    if (i < text.size() && text[i] == '0') {
+        ++i;
+        if (i < text.size() && (text[i] == 'x' || text[i] == 'X')) { base = 16; ++i; }
+        else base = 8;
+    }
+    NanPayload value;
+    for (; i < text.size(); ++i) {
+        char const c = text[i];
+        unsigned d = 16;
+        if (c >= '0' && c <= '9') d = static_cast<unsigned>(c - '0');
+        else if (c >= 'a' && c <= 'f') d = static_cast<unsigned>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = static_cast<unsigned>(c - 'A' + 10);
+        if (d >= base) return std::nullopt;   // not wholly consumed
+        // value = value * base + d over the 128-bit (hi, lo) pair, in 32-bit halves of `lo`
+        // so no partial product overflows (base <= 16, d < 16).
+        std::uint64_t const low  = (value.lo & 0xFFFF'FFFFull) * base + d;
+        std::uint64_t const high = (value.lo >> 32) * base + (low >> 32);
+        value.lo = (high << 32) | (low & 0xFFFF'FFFFull);
+        value.hi = value.hi * base + (high >> 32);
+    }
+    return value;
+}
+
+// `__builtin_object_size(p, type)` — see the block comment above `DesignatedBytes`'s use:
+// gcc's manual and the two references' measured answers.
+[[nodiscard]] std::uint64_t
+objectSizeAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                 NodeId pointerOperand, ScopeId here, std::int64_t type) {
+    // gcc's manual: when the size cannot be determined, (size_t)-1 for types 0 and 1 and 0
+    // for types 2 and 3; and "if there are any side effects in them, it returns" those.
+    // ✔MEASURED 2026-10-01 (lane `cs`'s probes r5s s13/s14 + r5t t03/t04, gcc 13.3.0 and
+    // clang 18.1.3 at -O0, both modes): a named object (local or static), an array decay
+    // plus a constant offset, `&s.a[1]` per subobject and a string literal are answered
+    // exactly; a pointer VARIABLE or parameter, a runtime offset and an operand with a side
+    // effect (`q++`, never incremented) answer unknown. Where the two split, clang is
+    // followed — a pointer cast makes the object the subobject, an offset outside the object
+    // answers 0, a compound literal is an object — each inside gcc's documented contract.
+    std::uint64_t const unknown = (type & 2) != 0 ? 0u : ~std::uint64_t{0};
+    if (builtinOperandHasSideEffects(tree, pointerOperand)) return unknown;
+    auto const d = designateBuiltinOperand(s, cfg, tree, pointerOperand, here,
+                                           /*startIsLvalue=*/false);
+    if (!d.has_value()) return unknown;
+    bool const sub = (type & 1) != 0;
+    std::uint64_t const size = sub ? d->subobjectSize : d->objectSize;
+    std::int64_t const off   = sub ? d->subobjectOffset : d->objectOffset;
+    if (off < 0 || static_cast<std::uint64_t>(off) > size) return 0;
+    return size - static_cast<std::uint64_t>(off);
+}
+
+// The callee symbol of a builtin call node, through the language's call rule — or
+// InvalidSymbol (not a call, not a direct name, not a builtin with a verb).
+[[nodiscard]] SymbolId
+builtinCalleeOf(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                ScopeId here, std::vector<NodeId>* argsOut, NodeId* nameOut) {
+    if (!node.valid() || tree.kind(node) != NodeKind::Internal) return InvalidSymbol;
+    auto const callIt = s.idx().callByRule.find(tree.rule(node).v);
+    if (callIt == s.idx().callByRule.end()) return InvalidSymbol;
+    CallRule const& call = cfg.callRules[callIt->second];
+    auto const kids = visibleChildren(tree, node);
+    if (call.operatorToken.has_value()) {
+        bool gated = false;
+        for (NodeId k : kids)
+            if (tree.kind(k) == NodeKind::Token && tree.tokenKind(k) == *call.operatorToken) {
+                gated = true;
+                break;
+            }
+        if (!gated) return InvalidSymbol;
+    }
+    if (call.calleeChild >= kids.size()) return InvalidSymbol;
+    auto const resolved = extractNameNode(tree, kids[call.calleeChild], NameMatchMode::Self,
+                                          cfg.identifierToken);
+    if (!resolved.node.valid() || tree.kind(resolved.node) != NodeKind::Token
+        || !cfg.identifierToken.valid()
+        || tree.tokenKind(resolved.node) != cfg.identifierToken)
+        return InvalidSymbol;
+    SymbolId sym = InvalidSymbol;
+    if (SymbolId const* bound = s.nodeToSymbol.tryGet(resolved.node)) sym = *bound;
+    if (!sym.valid()) sym = s.scopes.lookup(here, resolved.name);
+    if (!sym.valid() || s.symbols.at(sym).builtinLowering == BuiltinLowering::None)
+        return InvalidSymbol;
+    if (argsOut != nullptr && call.argsChild < kids.size())
+        gatherArgExpressions(tree, kids[call.argsChild], *argsOut);
+    if (nameOut != nullptr) *nameOut = resolved.node;
+    return sym;
+}
+
+// ── `__builtin_*_overflow_p` (gcc): THE CAST TARGET, AND THE COMPILE-TIME ANSWER ─────────────
+// gcc's manual: the first two operands are promoted to infinite precision, the operation is
+// performed, and the result is "cast to the type of the third argument" — with "no integral
+// argument promotions" on it, and "if the third argument is a bit-field, the type used for the
+// result cast has the precision and signedness of the given bit-field". The call is true when
+// the cast changed the value. ✔MEASURED (lane `cs`'s probes p01-p05, gcc 13.3.0, both modes).
+struct OverflowPredicateTarget {
+    TypeId       type{};      // what the lowering casts to (a bit-field's is `_BitInt(width)`)
+    std::int64_t bits = 0;
+    bool         isSigned = false;
+};
+
+// An integer type's width and signedness, its enumeration's underlying type's for an
+// enumeration; nullopt for any other type.
+[[nodiscard]] std::optional<OverflowPredicateTarget>
+integerShapeOf(EngineState& s, TypeId t) {
+    auto& in = s.lattice.interner();
+    if (!t.valid()) return std::nullopt;
+    TypeId const u = enumUnderlyingOrSelf(in, in.stripVolatile(t));
+    if (!u.valid()) return std::nullopt;
+    OverflowPredicateTarget out;
+    out.type = u;
+    switch (in.kind(u)) {
+        case TypeKind::Bool: out.bits = 1;  out.isSigned = false; return out;
+        case TypeKind::Char: out.bits = 8;  out.isSigned = !s.charIsUnsigned.value_or(false);
+                             return out;
+        case TypeKind::I8:   out.bits = 8;   out.isSigned = true;  return out;
+        case TypeKind::U8:   out.bits = 8;   out.isSigned = false; return out;
+        case TypeKind::I16:  out.bits = 16;  out.isSigned = true;  return out;
+        case TypeKind::U16:  out.bits = 16;  out.isSigned = false; return out;
+        case TypeKind::I32:  out.bits = 32;  out.isSigned = true;  return out;
+        case TypeKind::U32:  out.bits = 32;  out.isSigned = false; return out;
+        case TypeKind::I64:  out.bits = 64;  out.isSigned = true;  return out;
+        case TypeKind::U64:  out.bits = 64;  out.isSigned = false; return out;
+        case TypeKind::I128: out.bits = 128; out.isSigned = true;  return out;
+        case TypeKind::U128: out.bits = 128; out.isSigned = false; return out;
+        case TypeKind::BitInt:
+            out.bits = in.bitIntWidth(u);
+            out.isSigned = in.bitIntIsSigned(u);
+            return out;
+        default:
+            return std::nullopt;
+    }
+}
+
+// The third operand's cast target: its own type, or — a bit-field's VALUE — the bit-field's
+// width at its declared type's signedness, as `_BitInt(width)`.
+// ★ P69 (lane `lm`): WHICH OPERAND IS A BIT-FIELD'S VALUE IS THE ONE STATEMENT
+// (`semanticBitFieldValueWidth` → `bitFieldValueWidth`), the one the operators' typing asks.
+// This re-derived it: a member access under the builtin peel — so `(0, v.b)`, `(v.b = 0)`,
+// `++v.b`, `_Generic(0, int: v.b)` and `__builtin_choose_expr(1, v.b, 0)` were checked at
+// the field's declared type, never at its width.
+[[nodiscard]] std::optional<OverflowPredicateTarget>
+overflowPredicateTarget(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                        NodeId operand, ScopeId scope) {
+    auto target = integerShapeOf(s, subtreeType(s, tree, operand, scope));
+    if (!target.has_value()) return std::nullopt;
+    if (auto const w = semanticBitFieldValueWidth(s, cfg, tree, operand, scope); w.has_value()) {
+        target->bits = static_cast<std::int64_t>(*w);
+        target->type = s.lattice.interner().bitInt(target->bits, target->isSigned);
+    }
+    return target;
+}
+
+// The call's answer at compile time: both value operands integer constant expressions of at
+// most 64 bits, and the third without a side effect (its VALUE is never read — p03: gcc folds
+// `__builtin_add_overflow_p(INT_MAX, 1, x)` for a variable `x`). nullopt otherwise.
+[[nodiscard]] std::optional<bool>
+overflowPredicateAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                        BuiltinLowering verb, std::span<NodeId const> args, ScopeId scope) {
+    if (args.size() != 3 || builtinOperandHasSideEffects(tree, args[2])) return std::nullopt;
+    auto const target = overflowPredicateTarget(s, cfg, tree, args[2], scope);
+    if (!target.has_value()) return std::nullopt;
+    // 130 signed bits hold every exact sum, difference and product of two 64-bit operands.
+    constexpr std::uint32_t kExact = 130;
+    BitIntValue operand[2];
+    for (std::size_t i = 0; i < 2; ++i) {
+        auto const shape = integerShapeOf(s, subtreeType(s, tree, args[i], scope));
+        if (!shape.has_value() || shape->bits > 64) return std::nullopt;
+        auto const v = constIntExpr(s, tree, args[i], scope, &cfg);
+        if (!v.has_value()) return std::nullopt;
+        operand[i] = shape->isSigned
+            ? BitIntValue::fromI64(*v, kExact, true)
+            : BitIntValue::fromU64(static_cast<std::uint64_t>(*v), kExact, true);
+    }
+    BitIntValue const exact =
+        verb == BuiltinLowering::AddOverflowP ? BitIntValue::add(operand[0], operand[1], kExact, true)
+      : verb == BuiltinLowering::SubOverflowP ? BitIntValue::sub(operand[0], operand[1], kExact, true)
+                                              : BitIntValue::mul(operand[0], operand[1], kExact, true);
+    BitIntValue const cast = exact.withType(static_cast<std::uint32_t>(target->bits),
+                                            target->isSigned)
+                                  .withType(kExact, true);
+    return BitIntValue::compare(cast, exact, kExact, true) != 0;
+}
+
+// The CST constant evaluator's plan for a builtin CALL (`CstBuiltinCall`): its verb, its
+// operands with the conversions its declared parameters apply, its result type — or, for
+// `object_size` and the `_p` overflow predicates, the answer itself.
+[[nodiscard]] std::optional<CstBuiltinCall>
+builtinCallPlan(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                ScopeId fromScope) {
+    std::vector<NodeId> args;
+    SymbolId const sym = builtinCalleeOf(s, cfg, tree, node, fromScope, &args, nullptr);
+    if (!sym.valid()) return std::nullopt;
+    auto const& rec = s.symbols.at(sym);
+    auto const& in = s.lattice.interner();
+    if (!rec.type.valid() || in.kind(rec.type) != TypeKind::FnSig) return std::nullopt;
+    if (rec.genericPointee.has_value()) return std::nullopt;   // a per-call signature
+    auto const result = classifyCstCastTarget(in, in.fnResult(rec.type), s.charIsUnsigned);
+    if (!result.has_value()) return std::nullopt;
+    // The operands' types are asked below (object_size's designation, the `_p` target) at
+    // whatever pass asks for the constant — Pass 1.5 for an array bound or an enumerator —
+    // so their literal leaves are pre-stamped first, as every Pass-1.5 `subtreeType`
+    // caller's are (D-C-SIZEOF-OPERAND-LITERALS-ARE-UNTYPED-IN-A-DECLARATIONS-CONSTANT).
+    for (NodeId const a : args) preStampLiteralLeaves(s, cfg, tree, a);
+    CstBuiltinCall plan;
+    plan.verb       = rec.builtinLowering;
+    plan.args       = args;
+    plan.resultType = *result;
+    auto const params = in.fnParams(rec.type);
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (i < params.size())
+            plan.argTypes.push_back(classifyCstCastTarget(in, params[i], s.charIsUnsigned));
+        else
+            plan.argTypes.push_back(std::nullopt);
+    }
+    if (plan.verb == BuiltinLowering::ObjectSize) {
+        if (std::uint64_t const* v = s.nodeToFoldedConstant.tryGet(node)) {
+            plan.answer = *v;
+        } else {
+            if (args.size() != 2) return std::nullopt;
+            auto const type = constIntExpr(s, tree, args[1], fromScope, &cfg);
+            if (!type.has_value() || *type < 0 || *type > 3) return std::nullopt;
+            plan.answer = objectSizeAnswer(s, cfg, tree, args[0], fromScope, *type);
+        }
+    }
+    if (builtinLoweringIsOverflowPredicate(plan.verb)) {
+        if (std::uint64_t const* v = s.nodeToFoldedConstant.tryGet(node)) {
+            plan.answer = *v;
+        } else {
+            auto const answer = overflowPredicateAnswer(s, cfg, tree, plan.verb, args, fromScope);
+            if (!answer.has_value()) return std::nullopt;   // not an integer constant expression
+            plan.answer = *answer ? 1u : 0u;
+        }
+    }
+    return plan;
+}
+
+// `__builtin_<name>`, met where no scope binds it: the library function `name` it calls
+// (`semantics.libraryBuiltins`), bound for this tree — or InvalidSymbol (not a library
+// builtin, or refused, which `resolveLibraryFunction` reported at `at`).
+[[nodiscard]] SymbolId
+resolveLibraryBuiltinUse(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                         std::string_view spelled, NodeId at) {
+    std::string_view const lib = cfg.libraryBuiltins.libraryFunctionOf(spelled);
+    if (lib.empty() || !s.resolveLibraryFunction) return InvalidSymbol;
+    return s.resolveLibraryFunction(tree, lib, at);
+}
+
+// The verb rules a builtin's signature cannot state, at its call. Run after the ordinary
+// signature check, on the direct call of a builtin symbol.
+void checkBuiltinVerbCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                          NodeId node, NodeId calleeName, SymbolId calleeSym, ScopeId scope,
+                          std::span<NodeId const> args) {
+    auto const& rec = s.symbols.at(calleeSym);
+    auto& in = s.lattice.interner();
+    auto const report = [&](DiagnosticCode code, NodeId at, std::string msg) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at.valid() ? at : node);
+        d.actual   = std::move(msg);
+        s.reporter.report(std::move(d));
+    };
+    switch (rec.builtinLowering) {
+        case BuiltinLowering::ObjectSize: {
+            // ✔MEASURED (lane `cs`'s probe r5s s33): gcc 13.3.0 and clang 18.1.3 both refuse
+            // a `type` that is not an integer constant expression 0..3.
+            if (args.size() != 2) return;   // the arity check already spoke
+            auto const type = constIntExpr(s, tree, args[1], scope, &cfg);
+            if (!type.has_value() || *type < 0 || *type > 3) {
+                report(DiagnosticCode::S_BuiltinArgumentNotConstant, args[1],
+                       std::format("'{}': its second operand must be an integer constant "
+                                   "expression from 0 to 3 (which bytes to count)", rec.name));
+                return;
+            }
+            s.nodeToFoldedConstant.set(
+                node, objectSizeAnswer(s, cfg, tree, args[0], scope, *type));
+            return;
+        }
+        case BuiltinLowering::AddOverflow:
+        case BuiltinLowering::SubOverflow:
+        case BuiltinLowering::MulOverflow: {
+            // The typed spellings (`__builtin_sadd_overflow`) are fully declared; only the
+            // type-GENERIC form — an empty variadic list — states its operand rule here.
+            if (!rec.type.valid() || in.kind(rec.type) != TypeKind::FnSig
+                || !in.fnParams(rec.type).empty())
+                return;
+            if (args.size() != 3) {
+                report(DiagnosticCode::S_BuiltinOverflowOperandType, node,
+                       std::format("'{}' takes exactly three operands (two integers and a "
+                                   "pointer to the integer object receiving the result); {} "
+                                   "given", rec.name, args.size()));
+                return;
+            }
+            auto const isIntegerType = [&](TypeId t) {
+                if (!t.valid()) return false;
+                TypeKind const k = in.kind(in.stripVolatile(t));
+                using namespace detail::type_rules;
+                return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Enum
+                    || k == TypeKind::BitInt || signedIntRank(k) != 0
+                    || unsignedIntRank(k) != 0;
+            };
+            for (std::size_t i = 0; i < 2; ++i) {
+                TypeId const t = subtreeType(s, tree, args[i], scope);
+                if (t.valid() && !isIntegerType(t)) {
+                    report(DiagnosticCode::S_BuiltinOverflowOperandType, args[i],
+                           std::format("'{}': operand {} must have an integer type",
+                                       rec.name, i + 1));
+                }
+            }
+            // ✔MEASURED (lane `cs`'s probes r5s s17/s18/s34, r5t t01/t02): gcc 13.3.0 and
+            // clang 18.1.3 refuse a `double *` result; clang ACCEPTS a `_Bool *` and an
+            // enumeration pointer (a `_Bool` result keeps the infinite-precision value's low
+            // bit) where gcc refuses — the union accepts both. Both refuse a pointer to const.
+            TypeId const rt = subtreeType(s, tree, args[2], scope);
+            if (!rt.valid()) return;
+            bool resultOk = in.kind(rt) == TypeKind::Ptr && !in.operands(rt).empty()
+                         && isIntegerType(in.operands(rt)[0]);
+            if (resultOk) {
+                auto const spine = expressionQualifierSpine(s, cfg, tree, args[2], scope);
+                if (spine.has_value() && spine->levels >= 2 && (spine->constBits & 2u) != 0)
+                    resultOk = false;
+            }
+            if (!resultOk) {
+                report(DiagnosticCode::S_BuiltinOverflowOperandType, args[2],
+                       std::format("'{}': the third operand must point to a modifiable "
+                                   "integer object (the result is stored there)", rec.name));
+            }
+            return;
+        }
+        case BuiltinLowering::AddOverflowP:
+        case BuiltinLowering::SubOverflowP:
+        case BuiltinLowering::MulOverflowP: {
+            // ✔MEASURED (lane `cs`'s probes p06-p11, gcc 13.3.0, both modes): a third operand
+            // of an enumerated, boolean or non-integer type is refused ("has enumerated type",
+            // "has boolean type", "does not have integral type"), as is a non-integer first or
+            // second operand; `_Bool` and enumeration FIRST operands are accepted.
+            if (args.size() != 3) {
+                report(DiagnosticCode::S_BuiltinOverflowOperandType, node,
+                       std::format("'{}' takes exactly three operands (two integers and an "
+                                   "integer expression whose type the result is cast to); {} "
+                                   "given", rec.name, args.size()));
+                return;
+            }
+            bool ok = true;
+            for (std::size_t i = 0; i < 2; ++i) {
+                TypeId const t = subtreeType(s, tree, args[i], scope);
+                if (t.valid() && !integerShapeOf(s, t).has_value()) {
+                    report(DiagnosticCode::S_BuiltinOverflowOperandType, args[i],
+                           std::format("'{}': operand {} must have an integer type",
+                                       rec.name, i + 1));
+                    ok = false;
+                }
+            }
+            TypeId const t3 = subtreeType(s, tree, args[2], scope);
+            if (!t3.valid()) return;
+            TypeKind const k3 = in.kind(in.stripVolatile(t3));
+            if (k3 == TypeKind::Enum || k3 == TypeKind::Bool
+                || !integerShapeOf(s, t3).has_value()) {
+                report(DiagnosticCode::S_BuiltinOverflowOperandType, args[2],
+                       std::format("'{}': the third operand {} — it must have an integer type "
+                                   "other than an enumerated or boolean one (the result is "
+                                   "cast to it)", rec.name,
+                                   k3 == TypeKind::Enum   ? "has an enumerated type"
+                                   : k3 == TypeKind::Bool ? "has a boolean type"
+                                                          : "does not have an integer type"));
+                return;
+            }
+            if (!ok) return;
+            auto const target = overflowPredicateTarget(s, cfg, tree, args[2], scope);
+            if (!target.has_value()) return;
+            s.overflowPredicateTargets.set(node, target->type);
+            if (auto const answer = overflowPredicateAnswer(s, cfg, tree, rec.builtinLowering,
+                                                            args, scope))
+                s.nodeToFoldedConstant.set(node, *answer ? 1u : 0u);
+            return;
+        }
+        case BuiltinLowering::QuietNan: {
+            // A STRING LITERAL whose text gcc's parser consumes wholly folds: its payload is
+            // recorded on the call, and CST→HIR builds the NaN literal from it. Any other
+            // operand makes the call the row's `libraryFallback` (gcc and clang call libm's
+            // `nan`: lane `cs`'s probe r5s s12) — bound exactly as `__builtin_<name>` binds a
+            // library builtin.
+            if (args.size() != 1) return;
+            NodeId const op = builtinOperandValueCore(s, cfg, tree, args[0], scope);
+            if (op.valid() && tree.kind(op) == NodeKind::Internal) {
+                bool tokensOnly = true;
+                for (NodeId c : visibleChildren(tree, op))
+                    if (tree.kind(c) != NodeKind::Token) { tokensOnly = false; break; }
+                TypeId const t = subtreeType(s, tree, op, scope);
+                if (tokensOnly && t.valid() && in.kind(t) == TypeKind::Array) {
+                    if (auto const text = decodeAdjacentStringBodies(
+                            tree, op, s.idx().stringLiteralBodyToken)) {
+                        if (auto const payload = gnuNanPayload(*text)) {
+                            s.nanPayloads.set(node, *payload);
+                            return;
+                        }
+                    }
+                }
+            }
+            std::string fallback;
+            for (BuiltinFunctionMapping const& bf : cfg.builtinFunctions)
+                if (bf.name == rec.name) { fallback = bf.libraryFallback; break; }
+            if (fallback.empty() || !s.resolveLibraryFunction) {
+                report(DiagnosticCode::S_BuiltinArgumentNotConstant, args[0],
+                       std::format("'{}' folds only a string-literal operand, and this "
+                                   "language names no library function to call otherwise",
+                                   rec.name));
+                return;
+            }
+            SymbolId const lib = s.resolveLibraryFunction(tree, fallback, calleeName);
+            if (!lib.valid()) return;   // refused, and reported, by the binder
+            s.nodeToSymbol.set(calleeName, lib);
+            s.usesBySymbol[lib.v].push_back(calleeName);
+            if (TypeId const lt = s.symbols.at(lib).type; lt.valid())
+                s.nodeToType.set(calleeName, lt);
+            return;
+        }
+        default:
+            return;
     }
 }
 
@@ -21222,8 +25837,12 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (cur.valid() && tree.kind(cur) == NodeKind::Token
             && cfg.identifierToken.valid()
             && tree.tokenKind(cur) == cfg.identifierToken) {
-            SymbolId const sym =
+            SymbolId sym =
                 s.scopes.lookup(scope, std::string{tree.text(cur)});
+            // P69 (lane `cs`): `(__builtin_strlen)(s)` — the library builtin's binding.
+            if (!sym.valid()
+                && !cfg.libraryBuiltins.libraryFunctionOf(tree.text(cur)).empty())
+                sym = resolveLibraryBuiltinUse(s, cfg, tree, tree.text(cur), cur);
             if (!sym.valid()) {
                 if (coveredByRefRule) {
                     return;  // ref-rule path already emitted (or will)
@@ -21291,7 +25910,11 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         s.reporter.report(std::move(d));
         return;
     }
-    SymbolId const calleeSym = s.scopes.lookup(scope, resolved.name);
+    SymbolId calleeSym = s.scopes.lookup(scope, resolved.name);
+    // P69 (lane `cs`): a library builtin's binding, made (and cached per tree) where Pass 2
+    // first met the name — the same answer here, never a second report.
+    if (!calleeSym.valid() && !cfg.libraryBuiltins.libraryFunctionOf(resolved.name).empty())
+        calleeSym = resolveLibraryBuiltinUse(s, cfg, tree, resolved.name, resolved.node);
     if (!calleeSym.valid()) {
         // The callee is a bare Identifier; the reference-rules path may
         // not cover this position (e.g. tsql's `callExpr` callee is the
@@ -21531,6 +26154,14 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
     checkCallAgainstSig(s, cfg, tree, node, kids, call, checkedSig,
                         s.symbols.at(calleeSym).variadicBuiltin, scope);
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the rules a
+    // builtin's VERB carries that its declared signature cannot state.
+    if (s.symbols.at(calleeSym).builtinLowering != BuiltinLowering::None) {
+        std::vector<NodeId> verbArgs;
+        if (call.argsChild < kids.size())
+            gatherArgExpressions(tree, kids[call.argsChild], verbArgs);
+        checkBuiltinVerbCall(s, cfg, tree, node, resolved.node, calleeSym, scope, verbArgs);
+    }
 }
 
 // D-LANG-NULL-POINTER-CONSTANT (step 13.3, 2026-06-02): per C §6.3.2.3.3,
@@ -21795,6 +26426,30 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return ot;
     };
     auto const& hirCfg = tree.schema().hirLowering();
+    // ★ P69 (lane `lm`, D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT): AN OPERAND
+    // THAT IS A BIT-FIELD'S VALUE HAS ITS PROMOTED TYPE (C 6.3.1.1p2 — by the field's WIDTH,
+    // `bitFieldPromotedType`), and WHICH operand is one is the ONE statement both tiers ask
+    // (`bitFieldValueWidth`, decl_prefix_strip.hpp). Every operator read its operand at the
+    // field's declared type: ✔MEASURED 2026-10-15 (pe64, both pipelines, images run),
+    // `_Generic(v.b + 0, …)` over `unsigned b : 3` selected `unsigned int` and
+    // `v.b - 6 < 0` ran 0 where gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2 say
+    // `int` and 1 — in 305 of the matrix's cells. ⚠ THIS MOVES WITH THE LOWERING's
+    // `asBitFieldValue` (cst_to_hir.cpp), AND NEITHER ALONE: this tier answers `sizeof`,
+    // `_Generic`, `typeof` and `auto`, the lowering computes the value.
+    // A selection's winner is Pass 2's record when it has made one; before that the ONE
+    // selector picks it — whose controlling type this walk derived already (the operand was
+    // typed before its operator asks), so the query is answered by the derived record and
+    // nests no deeper than the `__builtin_choose_expr` arm of `enter` already does.
+    auto const bitFieldOperandType = [&](NodeId operandN, TypeId t) -> TypeId {
+        if (!arith.has_value() || !t.valid() || !operandN.valid()) return t;
+        // No width changes a plain `int`, a floating, a pointer or an aggregate type:
+        // the walk is asked only of a type a bit-field's promotion can change.
+        if (bitFieldPromotedType(interner, t, 1, *arith).v == t.v) return t;
+        auto const width = semanticBitFieldValueWidth(
+            const_cast<EngineState&>(s), sem, tree, operandN, scope);   // NOLINT — const note above
+        if (!width.has_value()) return t;
+        return bitFieldPromotedType(interner, t, *width, *arith);
+    };
 
     // ── leaf typing: an identifier resolves to its symbol's type by scope ──
     // A literal token is Pass-2-stamped (handled by the `typeAt` short-circuit in
@@ -21810,7 +26465,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         if (!scope.valid()) return InvalidType;
         SymbolId const sym = s.scopes.lookup(scope, tree.text(tok));
         if (!sym.valid()) return InvalidType;
-        return s.symbols.at(sym).type;
+        return typeVisibleAt(s, tree, sym, tok);
     };
     // The visible operator token + its `hirLowering` op-table entry — the entry's
     // `target` (HIR op NAME / special tag) the law dispatches on, matching
@@ -21843,7 +26498,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return arrayToPointerDecay(interner, t);
     };
     auto const combineBinary =
-        [&](HirOperatorEntry const* e, TypeId lt, TypeId rt) -> TypeId {
+        [&](HirOperatorEntry const* e, TypeId lt, TypeId rt, NodeId lhsN,
+            NodeId rhsN) -> TypeId {
         // D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE: `&&`/`||` yield C's `int`
         // (6.5.13p3 / 6.5.14p3), config-driven — the SSA carrier stays i1/Bool by
         // design (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE).
@@ -21869,8 +26525,21 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // The decay verb is the SHARED `arrayToPointerDecay` for the same reason
         // the ternary's is -- a second copy is how the two tiers start
         // disagreeing about the type they are both describing.
-        if (e->target == "Comma")  return decayArray(rt);           // value of RHS
+        // ★ P69 (lane `lm`): THE WHOLE CONVERSION, NOT THE ARRAY'S THIRD OF IT
+        // (`valueConversion`) — and it is no longer this arm's: the frame that
+        // finishes on ANY binary operator converts its type (see "THE VALUE LAW" where
+        // the frames end). ✔MEASURED 2026-10-12: `sizeof((0, f))` over a function
+        // was 1 and `typeof((0, v))` kept `volatile` / `_Atomic`, where gcc 13, clang
+        // 18, AppleClang 21 and mingw-w64 gcc 13.2 say 8 and drop them.
+        if (e->target == "Comma")  return rt;   // the RHS's, read as a value below
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
+        // ★ P69 (lane `lm`): every other operator reads a bit-field operand at its
+        // promoted type (`bitFieldOperandType`) — the shift's left operand, the
+        // comparisons and the arithmetic alike. The comma and the assignments above hand
+        // on their operand's type: whether THEY are a bit-field's value is the walk's
+        // question, asked by the operator they are an operand of.
+        lt = bitFieldOperandType(lhsN, lt);
+        rt = bitFieldOperandType(rhsN, rt);
         // P68 round 9 (lane `cs`): an operation the POINTER HALF of the operand
         // constraints refuses (`p * 2`, `5 - p`, `p + 1.5` — pass2Post's SE4e reports
         // it, asking this same predicate) HAS no type. Handing it the fallback's
@@ -21978,7 +26647,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         if (common.valid()) return common;
         return lt.valid() ? lt : rt;
     };
-    auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot) -> TypeId {
+    auto const combineUnary = [&](HirOperatorEntry const* e, TypeId ot,
+                                  NodeId operandN) -> TypeId {
         if (e->target == "AddressOf") return ot.valid() ? interner.pointer(ot) : InvalidType;
         if (e->target == "Deref") {
             // D-CSUBSET-ARRAY-DECAY-IN-DEREF (C 6.3.2.1p3): unary `*` on an ARRAY
@@ -21999,6 +26669,9 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // also lowers prefix ++/-- to a SeqExpr whose result type is the lvalue
         // type, so the two tiers agree.
         if (e->target == "PreInc" || e->target == "PreDec") return ot;
+        // ★ P69 (lane `lm`): `+`, `-` and `~` promote a bit-field operand by its width
+        // (`bitFieldOperandType`) — `-v.b` over `unsigned b : 3` is an `int`.
+        ot = bitFieldOperandType(operandN, ot);
         // P68 round 9 (lane `cs`): unary `+`/`-`/`~` of a pointer is refused by
         // pass2Post's SE4e through this same predicate, and a refused operation has
         // no type (see `combineBinary`) — `long r = -p;` drew a second diagnostic.
@@ -22056,6 +26729,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     };
     auto const combineTernary = [&](TypeId thenT, TypeId elseT,
                                     NodeId thenN, NodeId elseN) -> TypeId {
+        // ★ P69 (lane `lm`): an arm that is a bit-field's value is balanced at its
+        // promoted type (`bitFieldOperandType`): `1 ? v.b : v.b` over `unsigned b : 3` is
+        // an `int` on all four references (C 6.5.15p5 applies the usual arithmetic
+        // conversions, whose first step is the promotion).
+        thenT = bitFieldOperandType(thenN, thenT);
+        elseT = bitFieldOperandType(elseN, elseT);
         TypeId const common = commonArithType(thenT, elseT);
         if (common.valid()) return common;
         // C 6.5.15p6: a conditional with ONE arm a pointer and the OTHER a
@@ -22248,6 +26927,22 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                                            sem.pointerConversions)) {
                 return interner.pointer(interner.primitive(TypeKind::Void));
             }
+            // ★ P69 (lane `cs`, D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST):
+            // the SAME `void *` for two arms whose TypeIds DO pair, pointing to types a
+            // qualifier the interner does not carry keeps apart — `c ? &f_plain :
+            // &f_const` over `int (char *)` / `int (const char *)`, `c ? pp : qq` over
+            // `char **` / `const char **`. ✔MEASURED (probe r4e u01-u03, u07, u08): gcc
+            // 13.3.0 and clang 18.1.3 type every one `void *` with "pointer type
+            // mismatch", MSVC 19.51 an arm's type — the fork decided above. Read off the
+            // arms' spines ("A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES
+            // NOT"); the HIR `combineTernary` realizes the stamp, SE4b reports it.
+            if (pointeesCanDivergeInAQualifier(interner, thenT, elseT)) {
+                EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT — const note above
+                if (pointeeSpinesDiverge(
+                        pointerValueSpine(mutS, sem, tree, thenN, thenT, scope),
+                        pointerValueSpine(mutS, sem, tree, elseN, elseT, scope)))
+                    return interner.pointer(interner.primitive(TypeKind::Void));
+            }
         }
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
     };
@@ -22256,7 +26951,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     struct Frame {
         NodeId node;
         enum class Kind : std::uint8_t {
-            Binary, Unary, Postfix, Ternary, Wrapper, Generic
+            Binary, Unary, Postfix, Ternary, Wrapper, Generic, StatementValue
         } kind;
         std::uint8_t           phase;
         NodeId                  n0;     // binary lhs / unary operand / postfix base
@@ -22373,6 +27068,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                                      /*emitOnMiss=*/false,
                                      /*emitTypeUse=*/false);
             mut.reporter.truncateTo(snap);
+            // A cast's value is no lvalue (C 6.5.4p5): its type is the NAMED one
+            // without the qualifiers of its own level — "THE VALUE LAW", where the
+            // frames end; this arm builds no frame, so it says it here.
+            result = valueConversion(mut.lattice.interner(), result);
             return;
         }
         if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
@@ -22420,57 +27119,28 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // Returning InvalidType here is what makes the two agree: leaving the old
         // descent in place for that shape would let `sizeof(({ int y = 1; }))` fold
         // to 4 — a silent answer to a question the language says has none.
+        //
+        // ★ P69 (lane `lm`): THE BODY IS READ BY THE ONE READER
+        // (`statementExpressionBody`, `core/types/decl_prefix_strip.hpp` — this arm
+        // held its own copy of the item peel, capped at 128 steps), AND THE TYPE IS
+        // THE VALUE'S, CONVERTED (`valueConversion`, `type_rules.hpp`). The value of
+        // the last expression is no lvalue: an array is the pointer to its first
+        // element and a function the pointer to it, and no qualifier of the type it
+        // was read at stays. This arm handed on the last expression's type as it
+        // stood: ✔MEASURED 2026-10-12, `sizeof(({ "abc"; }))` was 4 and `sizeof(({ a;
+        // }))` over an `int a[3]` was 12 where gcc 13, clang 18, AppleClang 21 and
+        // mingw-w64 gcc 13.2 all say 8 — a silent wrong constant — and an array
+        // "initialized" by `({ "abc"; })` passed this tier for the lowering to refuse
+        // by an internal sentence.
+        // ⚠ THIS MOVES WITH `lowerStatementExpr` (`cst_to_hir.cpp`), AND NEITHER
+        // ALONE — the comma's two halves (`combineBinary` here, `combineComma` there)
+        // say the same of themselves, and for the same reason: `lowerSizeof` reads
+        // THIS tier's stamp.
         if (hirCfg.stmtExprRule.valid() && r.v == hirCfg.stmtExprRule.v) {
-            NodeId lastItem{};
-            for (NodeId c : visibleChildren(tree, node)) {
-                if (tree.kind(c) == NodeKind::Token) continue;   // ( { } )
-                lastItem = c;
-            }
-            // Peel transparent single-child wrappers to the item's core, stopping
-            // where the lowering stops: at a token, at an expression node, or at
-            // the first rule that carries a HIR mapping of its own.
-            NodeId core = lastItem;
-            for (int guard = 0; guard < 128 && core.valid(); ++guard) {
-                if (tree.kind(core) != NodeKind::Internal) break;
-                std::uint32_t const cv = tree.rule(core).v;
-                if (cv == hirCfg.binaryExprRule.v || cv == hirCfg.unaryExprRule.v
-                    || cv == hirCfg.postfixExprRule.v || cv == hirCfg.operandRule.v
-                    || (hirCfg.ternaryExprRule.valid()
-                        && cv == hirCfg.ternaryExprRule.v)) {
-                    break;
-                }
-                bool mapped = false;
-                for (auto const& m : hirCfg.ruleMappings) {
-                    if (m.rule.v == cv) { mapped = true; break; }
-                }
-                if (mapped) break;
-                NodeId sole{};
-                bool many = false;
-                for (NodeId c : visibleChildren(tree, core)) {
-                    if (tree.kind(c) == NodeKind::Token) continue;
-                    if (sole.valid()) { many = true; break; }
-                    sole = c;
-                }
-                if (many || !sole.valid()) break;
-                core = sole;
-            }
-            NodeId valueNode{};
-            if (core.valid() && tree.kind(core) == NodeKind::Internal) {
-                for (auto const& m : hirCfg.ruleMappings) {
-                    if (m.rule.v != tree.rule(core).v) continue;
-                    if (m.hirKind != "ExprStmt") break;
-                    for (NodeId c : visibleChildren(tree, core)) {
-                        if (tree.kind(c) == NodeKind::Token) continue;
-                        valueNode = c;
-                        break;
-                    }
-                    break;
-                }
-            }
-            if (!valueNode.valid()) { result = InvalidType; return; }   // `void`
-            std::vector<NodeId> only{valueNode};
-            work.push_back(Frame{node, Frame::Kind::Wrapper, 0, {}, {}, nullptr,
-                                 std::move(only), 0, {}});
+            StatementExpressionBody const body = statementExpressionBody(hirCfg, tree, node);
+            if (!body.value.valid()) { result = InvalidType; return; }   // `void`
+            work.push_back(Frame{node, Frame::Kind::StatementValue, 0, body.value, {},
+                                 nullptr, {}, 0, {}});
             return;
         }
         // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──
@@ -22581,6 +27251,9 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // reference into `work` and the pop dangles it.
         std::size_t const depthBefore = work.size();
         NodeId const      framedNode  = work.back().node;
+        // Set by the arm that finishes a frame whose expression is NO LVALUE (see
+        // "THE VALUE LAW" below the switch).
+        bool finishedOnAValue = false;
         Frame& f = work.back();
         switch (f.kind) {
         case Frame::Kind::Binary:
@@ -22589,14 +27262,18 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 f.c0 = result; f.phase = 2; NodeId n = f.n1; enter(n);
             } else {
                 HirOperatorEntry const* e = f.e; TypeId lt = f.c0;
-                work.pop_back(); result = combineBinary(e, lt, result);
+                NodeId const lhsN = f.n0, rhsN = f.n1;   // CAPTURED before the pop
+                work.pop_back(); result = combineBinary(e, lt, result, lhsN, rhsN);
+                finishedOnAValue = true;   // every binary operator: `=` and `,` too
             }
             break;
         case Frame::Kind::Unary:
             if (f.phase == 0) { f.phase = 1; NodeId n = f.n0; enter(n); }
             else {
                 HirOperatorEntry const* e = f.e;
-                work.pop_back(); result = combineUnary(e, result);
+                NodeId const operandN = f.n0;            // CAPTURED before the pop
+                work.pop_back(); result = combineUnary(e, result, operandN);
+                finishedOnAValue = e->target != "Deref";   // `*E` alone designates an object
             }
             break;
         case Frame::Kind::Postfix:
@@ -22618,6 +27295,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 TypeId baseT = f.phase == 2 ? f.c0   : result;
                 work.pop_back();
                 result = combinePostfix(node, e, baseT, subT);
+                // `E[i]` and a member designate an object; `E++`, `E--` and a call's
+                // result are values.
+                finishedOnAValue = e->target == "PostInc" || e->target == "PostDec"
+                                || e->target == "Call";
             }
             break;
         case Frame::Kind::Ternary:
@@ -22635,6 +27316,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 NodeId elseN = f.list[2];
                 work.pop_back();
                 result = combineTernary(thenT, result, thenN, elseN);
+                finishedOnAValue = true;
             }
             break;
         // ★★ THE TRANSPARENT-WRAPPER AMBIGUITY GUARD
@@ -22688,6 +27370,16 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 ++f.idx; f.phase = 0;                  // keep scanning
             }
             break;
+        case Frame::Kind::StatementValue:
+            // A statement expression: the type of its last expression (`n0`), as a
+            // VALUE (see the arm that pushes this frame).
+            if (f.phase == 0) {
+                f.phase = 1; NodeId n = f.n0; enter(n);
+            } else {
+                work.pop_back();
+                finishedOnAValue = true;
+            }
+            break;
         case Frame::Kind::Generic:
             if (f.phase == 0) {
                 // Type the controlling expression on THIS work-stack (flat — a
@@ -22709,6 +27401,24 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             break;
         }
         if (work.size() < depthBefore) {
+            // ★ P69 (lane `lm`): THE VALUE LAW, SAID ONCE FOR EVERY FORM (C 6.3.2.1p2-p4;
+            // `valueConversion`, `type_rules.hpp`). An expression that is no lvalue has
+            // no qualifier at its own level — and an array or a function read as a value
+            // is the pointer. The forms: every binary operator's result (an assignment's
+            // and the comma's with it), every unary one's but `*E`, `E++` / `E--`, a
+            // call's result, a conditional, a statement expression's value; the cast arm,
+            // which builds no frame, says it for itself. The comma and the statement
+            // expression each said it alone; the others handed on the type of the OBJECT
+            // they read: ✔MEASURED 2026-10-12 (23 questions, `__typeof__(E) y;` read by
+            // `_Generic(&y, int *: 41, volatile int *: 42, default: 43)`; gcc 13,
+            // mingw-w64 gcc 13.2, clang 18 and AppleClang 21 agree in every one), a `y`
+            // declared by `typeof` of `(volatile int)m`, `+v`, `-v`, `f()` returning
+            // `volatile int`, `v = 1`, `v += 1`, `v++`, `++v`, `v--` or `--v` was
+            // `volatile` where the four declare a plain `int`. The `const` / `restrict`
+            // half of the sentence is the spine's (`expressionQualifierSpine`). The
+            // Pass-2 stamps of a cast node and of a call node never reach this line and
+            // say the same where they are set.
+            if (finishedOnAValue) result = valueConversion(interner, result);
             // This frame finished: `result` is the type of `framedNode`, derived
             // (not stamped — the stamp arm never builds a frame). Record it under
             // the scope it was derived in so the next walk that meets this node
@@ -22786,10 +27496,18 @@ typeDerivationLevels(TypeInterner const& in, TypeId t) {
 // carrying each parameter row's own spine (`paramRowSpine`, the one reader the
 // function-declaration harvest uses).
 //
-// NO CLAIM for a FUNCTION type name (a function suffix with no group — not an
-// object type), for arrays beside a function suffix on one direct (the declarator
-// walk refuses to guess their order too), for a `typeof` head (its operand's
-// qualifiers are D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS'), and for a language that
+// A FUNCTION type name — the function suffix at the name's own outermost level,
+// `void (const char *)` — claims a Fn level 0, the shape a function designator's
+// spine has, with its parameter rows' claims. A `typeof` head claims what the
+// resolver recorded for its operand (`HeadTypedefs` reads `typeofClaimByNode`), and a
+// qualifier written beside it (`const typeof(x)`) qualifies it as a head qualifier
+// qualifies a typedef.
+//
+// NO CLAIM for arrays beside a function suffix on one direct (the declarator walk
+// refuses to guess their order too), for a `typeof` head whose operand made no claim
+// or is not resolved yet (the head's own one-level base would misplace a pointer
+// operand's levels), for a shape this walk does not read (a star after the abstract
+// declarator, a head part after the stars, past 63 levels), and for a language that
 // declares no `const` token.
 [[nodiscard]] std::optional<QualifierSpine>
 typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
@@ -22827,6 +27545,7 @@ typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
 
     bool headConst = false;
     bool sawStar = false;
+    bool typeofHead = false;
     NodeId absDirect{};
     std::vector<NodeId> layers;   // source order: the first is the INNERMOST pointer
     for (NodeId c : visibleChildren(tree, typeNode)) {
@@ -22845,8 +27564,13 @@ typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
         }
         if (sawStar || absDirect.valid())
             return std::nullopt;            // something after the stars this walk does not know
+        // P69 (D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS): a `typeof` head claims what the
+        // resolver recorded for it (`HeadTypedefs`, below) — a qualifier INSIDE its operand
+        // is part of that claim (`hasToken` treats the operand as opaque), one written
+        // beside it (`const typeof(x)`) qualifies it as a head qualifier qualifies a
+        // typedef.
         if (containsRule(c, cfg.typeofTypeRule) || containsRule(c, cfg.typeofValueRule))
-            return std::nullopt;            // a typeof head
+            typeofHead = true;
         if (hasToken(c, *cfg.constMarker)) headConst = true;
     }
 
@@ -22894,10 +27618,12 @@ typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
     std::vector<Ctor> ctors;
     for (std::size_t li = chain.size(); li-- > 0;) {
         DeclaratorChainLevel const& lvl = chain[li];
-        if (lvl.fnSuffix.valid()) {
-            if (!lvl.group.valid()) return std::nullopt;   // a function TYPE name
-            ctors.push_back(Ctor{false, false, lvl.fnSuffix});
-        }
+        // A function suffix is a Fn level. P69 (lane `cs`): a function TYPE name — the
+        // suffix at the name's own outermost level, `void (const char *)` — spells it at
+        // level 0, the shape a function designator's spine has; it used to make no claim
+        // at all, which left `typeof(void (const char *))` claiming nothing (✔MEASURED,
+        // probe r4k k01/k07: gcc 13.3.0 and clang 18.1.3 tell it from `void (char *)`).
+        if (lvl.fnSuffix.valid()) ctors.push_back(Ctor{false, false, lvl.fnSuffix});
         for (std::size_t i = 0; i < lvl.arrays; ++i) ctors.push_back(Ctor{});
         for (std::size_t i = lvl.layers.size(); i-- > 0;) {
             NodeId const layer = lvl.layers[i];
@@ -22914,8 +27640,12 @@ typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
     // of the typedef the head names, after the Fn level a name DERIVING from a
     // function typedef gets back (the declarator walk's `insertFnLevel`).
     QualifierSpine sp;
-    HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, s.lattice.interner()};
+    HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, s.lattice.interner(),
+                                &s.typeofClaimByNode, &s.nodeToType, &s.fnTypedefClaims};
     std::optional<TypedefQualification> const td = typedefs.of(tree, typeNode);
+    // A typeof head whose operand made no claim (or was not resolved yet): the head's
+    // own one-level base would misplace a pointer operand's levels — no claim instead.
+    if (typeofHead && !td.has_value()) return std::nullopt;
     std::optional<QualifierSpine> typedefBase;
     if (td.has_value()) {
         bool const headRestrict = false;   // a head `restrict` is the resolver's constraint
@@ -22936,6 +27666,11 @@ typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
     } else if (headConst) {
         sp.constBits |= std::uint64_t{1} << (levels - 1);
     }
+    // P69 (D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED): the Fn level a
+    // type name deriving from a function typedef gets back carries its parameter claims
+    // — `_Generic(p, FC *: …)` compares `FC`'s `const char *` parameter (r4k).
+    if (insertFnLevel && td->fnClaim != nullptr)
+        sp.fnParams.emplace_back(static_cast<std::uint8_t>(lead - 1), td->fnClaim);
     for (std::size_t i = 0; i < ctors.size(); ++i) {
         if (ctors[i].isConst)    sp.constBits    |= std::uint64_t{1} << i;
         if (ctors[i].isRestrict) sp.restrictBits |= std::uint64_t{1} << i;
@@ -23033,14 +27768,31 @@ typeNameOutermostLayerIsVolatileOrAtomic(EngineState const& s, SemanticConfig co
 //   * a cast → its type name's spine (level 0 dropped: C 6.5.4p5); a compound
 //     literal → its type name's; a call → the callee's RESULT spine (a function's
 //     declared spine IS its result's; a pointer to function drops its two levels);
-//   * `a, b` → `b`; an assignment, `++`/`--` → the object's; pointer ± integer →
-//     the pointer operand's (the one `E1[E2]` itself picks); `?:` → both arms, the
-//     result's pointee carrying the qualifiers of BOTH (C 6.5.16p6);
+//   * `a, b` → `b`; a statement expression → its last expression; an assignment,
+//     `++`/`--` → the object's; pointer ± integer → the pointer operand's (the one
+//     `E1[E2]` itself picks); `?:` → both arms, the result's pointee carrying the
+//     qualifiers of BOTH (C 6.5.16p6); `__builtin_choose_expr` → the arm chosen;
 //   * any other value (a literal, arithmetic, a comparison) → unqualified, of its
 //     TypeId's shape.
 // One conditional is followed; a conditional inside one of its arms answers no
 // claim, as does any shape not listed. Level 0 of the result is whatever the
 // expression's own type is; the `_Generic` consumer clears it (lvalue conversion).
+//
+// ★ P69 (lane `lm`): AN EXPRESSION THAT IS NO LVALUE HAS NO QUALIFIER AT LEVEL 0, AND
+// THAT IS SAID ONCE (`finish`). A cast, a call, a conditional, the comma, a statement
+// expression, an assignment, `++` / `--` and pointer arithmetic each MARK the point of
+// the walk where a value is read; `finish` clears level 0 there and nowhere else, the
+// levels below — what the value points to — untouched (and a function designator read
+// as a value is the pointer to it: one level prepended). Three of them cleared it
+// inline and the rest handed the object's own qualifier on: ✔MEASURED 2026-10-12 (20
+// questions, `__typeof__(E) y;` read by `_Generic(&y, …)`; gcc 13, mingw-w64 gcc
+// 13.2, clang 18 and AppleClang 21 agree in every one), `typeof((0, cp))` and
+// `typeof(({ cp; }))` over a `const int *const cp` declared a `const` pointer where
+// the four declare a plain pointer to `const int`. The `volatile` / `_Atomic` half of
+// the same sentence is the TypeId's, and `subtreeType` says it (`valueConversion`).
+// ⚠ It is the OBJECT's qualifier a value has lost: a member keeps what its own
+// declaration says (`f().m` over a `const int m` is `const int` on all four), which
+// is why the member arm below marks nothing.
 [[nodiscard]] std::optional<QualifierSpine>
 expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                          NodeId expr, ScopeId here) {
@@ -23051,11 +27803,17 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
         std::optional<QualifierSpine> spine;
         bool level0Known = true;   // false ⇒ a step exposing level 0 makes no claim
     };
+    // A point of the walk at which the expression read is a VALUE (see `finish`).
+    struct ValueAt {
+        std::size_t steps;            // how many of the path's steps lie OUTSIDE it
+        bool        functionDecays;   // a function designator read there: the pointer to it
+    };
     struct Path {
-        Base              base;
-        std::vector<Step> steps;   // outside-in
-        bool              forked = false;
-        NodeId            armA{}, armB{};
+        Base                 base;
+        std::vector<Step>    steps;    // outside-in
+        std::vector<ValueAt> values;   // in the order the walk met them
+        bool                 forked = false;
+        NodeId               armA{}, armB{};
     };
     auto const unqualified = [&](TypeId t) -> std::optional<QualifierSpine> {
         auto const levels = typeDerivationLevels(in, t);
@@ -23106,7 +27864,9 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 || in.kind(rec.type) != TypeKind::FnSig) {
                 return {};
             }
-            HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, in};
+            HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, in,
+                                        &s.typeofClaimByNode, &s.nodeToType,
+                                        &s.fnTypedefClaims};
             auto const q = harvestFunctionQualification(in, s.idx(), tree, rec, rec.type,
                                                         typedefs);
             if (!q.has_value() || !q->result.has_value() || q->result->levels >= 63)
@@ -23147,6 +27907,13 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
     auto const walk = [&](NodeId start) -> Path {
         Path out;
         NodeId cur = start;
+        // The expression the walk stands on is read as a VALUE; `operand`, when given,
+        // is the expression whose value it is (a function designator there decays).
+        auto const readAsAValue = [&](NodeId operand = NodeId{}) {
+            TypeId const t = operand.valid() ? subtreeType(s, tree, operand, here) : InvalidType;
+            out.values.push_back(
+                ValueAt{out.steps.size(), t.valid() && in.kind(t) == TypeKind::FnSig});
+        };
         for (int guard = 0; guard < 512 && cur.valid(); ++guard) {
             if (tree.kind(cur) == NodeKind::Token) {
                 if (isIdentifier(cur)) {
@@ -23157,14 +27924,22 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 if (t.valid()) out.base = {unqualified(t), true};
                 return out;
             }
-            std::uint32_t const r = tree.rule(cur).v;
+            // A parser recovery (Error) node: no base, so no claim
+            // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+            std::optional<RuleId> const scanned = tree.ruleIfInternal(cur);
+            if (!scanned.has_value()) return out;
+            std::uint32_t const r = scanned->v;
             auto const ops = internals(cur);
             if (hirCfg.unaryExprRule.valid() && r == hirCfg.unaryExprRule.v) {
                 auto const tgt = targetOf(cur, hirCfg.unaryOps);
                 if (ops.empty()) return out;
                 if (tgt == "Deref")     { out.steps.push_back(Step::Drop);    cur = ops[0]; continue; }
                 if (tgt == "AddressOf") { out.steps.push_back(Step::Prepend); cur = ops[0]; continue; }
-                if (tgt == "PreInc" || tgt == "PreDec") { cur = ops[0]; continue; }
+                if (tgt == "PreInc" || tgt == "PreDec") {
+                    readAsAValue();
+                    cur = ops[0];
+                    continue;
+                }
                 out.base = {unqualified(subtreeType(s, tree, cur, here)), true};
                 return out;
             }
@@ -23178,13 +27953,18 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                     if (e != nullptr) break;
                 }
                 if (e == nullptr) return out;
-                if (e->target == "Comma")  { cur = ops[1]; continue; }
-                if (e->target == "Assign") { cur = ops[0]; continue; }
+                if (e->target == "Comma")  { readAsAValue(ops[1]); cur = ops[1]; continue; }
+                if (e->target == "Assign") { readAsAValue(); cur = ops[0]; continue; }
                 if (e->target == "Add" || e->target == "Sub") {
                     auto const which = indexContainerOperand(
                         in, subtreeType(s, tree, ops[0], here), subtreeType(s, tree, ops[1], here));
-                    if (which == IndexContainerOperand::Base) { cur = ops[0]; continue; }
+                    if (which == IndexContainerOperand::Base) {
+                        readAsAValue();
+                        cur = ops[0];
+                        continue;
+                    }
                     if (e->target == "Add" && which == IndexContainerOperand::Subscript) {
+                        readAsAValue();
                         cur = ops[1];
                         continue;
                     }
@@ -23208,7 +27988,11 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                     out.steps.push_back(Step::Drop);
                     continue;
                 }
-                if ((tgt == "PostInc" || tgt == "PostDec") && !ops.empty()) { cur = ops[0]; continue; }
+                if ((tgt == "PostInc" || tgt == "PostDec") && !ops.empty()) {
+                    readAsAValue();
+                    cur = ops[0];
+                    continue;
+                }
                 if (tgt == "Call" && !ops.empty()) {
                     SymbolId const sym = namedSymbol(ops[0]);   // a NAMED callee only
                     if (!sym.valid()) return out;
@@ -23220,8 +28004,7 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                     else if (isFnPointerType(in, rec.type)) drop = 2;     // [Ptr, Fn] above the result
                     else return out;
                     if (drop != 0 && !shiftQualifierSpine(sp, -drop)) return out;
-                    sp.constBits    &= ~std::uint64_t{1};   // a call's value is an rvalue
-                    sp.restrictBits &= ~std::uint64_t{1};
+                    readAsAValue();   // a call's result
                     out.base = {sp, true};
                     return out;
                 }
@@ -23271,17 +28054,33 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 cur = *selected;
                 continue;
             }
-            // A cast: its type name's spine, level 0 dropped (the value is an rvalue).
+            // `__builtin_choose_expr`: the arm its constant condition chooses, as that
+            // arm stands — an lvalue when the arm is one. No arm ⇒ no claim.
+            if (cfg.builtinChooseExprRule.valid() && r == cfg.builtinChooseExprRule.v) {
+                NodeId const arm = chooseExprSelectedArm(s, cfg, tree, cur, here,
+                                                         /*loud=*/false);
+                if (!arm.valid()) return out;
+                cur = arm;
+                continue;
+            }
+            // A GNU statement expression: the VALUE of its last expression (the one
+            // reader of its body, `statementExpressionBody`); a body that yields
+            // nothing makes no claim.
+            if (hirCfg.stmtExprRule.valid() && r == hirCfg.stmtExprRule.v) {
+                StatementExpressionBody const body = statementExpressionBody(hirCfg, tree, cur);
+                if (!body.value.valid()) return out;
+                readAsAValue(body.value);
+                cur = body.value;
+                continue;
+            }
+            // A cast: its type name's spine, read as a value.
             if (auto const castIt = s.idx().castByRule.find(r);
                 castIt != s.idx().castByRule.end()) {
                 auto const& cr = cfg.castRules[castIt->second];
                 auto const kids = visibleChildren(tree, cur);
                 if (cr.typeChild >= kids.size()) return out;
                 auto sp = typeNameQualifierSpine(s, cfg, tree, kids[cr.typeChild]);
-                if (sp.has_value()) {
-                    sp->constBits    &= ~std::uint64_t{1};
-                    sp->restrictBits &= ~std::uint64_t{1};
-                }
+                readAsAValue();
                 out.base = {sp, true};
                 return out;
             }
@@ -23324,13 +28123,30 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
         return out;
     };
     // Apply a path's steps, inside-out, to its base.
-    auto const finish = [&](Base const& base, std::vector<Step> const& steps)
+    auto const finish = [&](Base const& base, std::vector<Step> const& steps,
+                            std::vector<ValueAt> const& values)
         -> std::optional<QualifierSpine> {
         if (!base.spine.has_value()) return std::nullopt;
         QualifierSpine sp = *base.spine;
-        int level0At = 0;   // where the base's own level 0 now sits (-1 = dropped)
-        for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
-            if (*it == Step::Drop) {
+        bool level0Known = base.level0Known;
+        int  level0At    = 0;   // where the base's own level 0 now sits (-1 = dropped)
+        for (std::size_t outside = steps.size();; --outside) {
+            // `sp` is the type of the expression that `outside` steps still lie
+            // outside of. ★ THE VALUE LAW, SAID ONCE: where that expression is read
+            // as a VALUE it has no qualifier at level 0 — whatever the object it was
+            // read from had — and a function designator is the pointer to itself.
+            for (ValueAt const& v : values) {
+                if (v.steps != outside) continue;
+                if (v.functionDecays) {
+                    if (!shiftQualifierSpine(sp, +1)) return std::nullopt;
+                    if (level0At >= 0) ++level0At;
+                }
+                sp.constBits    &= ~std::uint64_t{1};
+                sp.restrictBits &= ~std::uint64_t{1};
+                if (level0At == 0) level0Known = true;   // it is known now: unqualified
+            }
+            if (outside == 0) break;
+            if (steps[outside - 1] == Step::Drop) {
                 if (!shiftQualifierSpine(sp, -1)) return std::nullopt;
                 if (level0At >= 0) --level0At;
             } else {
@@ -23338,41 +28154,88 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 if (level0At >= 0) ++level0At;
             }
         }
-        if (!base.level0Known && level0At >= 1) return std::nullopt;
+        if (!level0Known && level0At >= 1) return std::nullopt;
         return sp;
     };
 
     Path const top = walk(expr);
-    if (!top.forked) return finish(top.base, top.steps);
+    if (!top.forked) return finish(top.base, top.steps, top.values);
     Path const a = walk(top.armA);
     Path const b = walk(top.armB);
     if (a.forked || b.forked) return std::nullopt;
-    auto const sa = finish(a.base, a.steps);
-    auto const sb = finish(b.base, b.steps);
+    auto sa = finish(a.base, a.steps, a.values);
+    auto sb = finish(b.base, b.steps, b.values);
     if (!sa.has_value() || !sb.has_value()) return std::nullopt;
+    // P69 (lane `cs`): an arm that is a function DESIGNATOR is converted to a pointer
+    // to itself (C 6.3.2.1p4) — one unqualified level above its Fn level — so `c ? f :
+    // &g` lines its two function levels up (✔MEASURED, probe r4e u03/u04).
+    for (auto const& [arm, sp] : {std::pair{top.armA, &sa}, std::pair{top.armB, &sb}}) {
+        TypeId const t = subtreeType(s, tree, arm, here);
+        if (t.valid() && in.kind(t) == TypeKind::FnSig && !shiftQualifierSpine(**sp, +1))
+            return std::nullopt;
+    }
     QualifierSpine joined;
     if (sa->levels == 1 && sb->levels > 1) {
         joined = *sb;   // a pointer beside an integer (a null pointer constant)
     } else if (sb->levels == 1 && sa->levels > 1) {
         joined = *sa;
-    } else if (sa->levels == sb->levels
-               && (sa->constBits >> 2) == (sb->constBits >> 2)
-               && (sa->restrictBits >> 2) == (sb->restrictBits >> 2)) {
-        // Compatible arms: the pointee carries BOTH arms' qualifiers (C 6.5.16p6).
+    } else if (sa->levels == sb->levels && !pointeeSpinesDiverge(sa, sb)) {
+        // Compatible arms: the pointee carries BOTH arms' qualifiers (C 6.5.16p6), and
+        // the composite takes a function level's parameter claim from whichever arm
+        // makes it (where both do, they agree — that is what compatible means here).
         joined = *sa;
         joined.constBits    |= sb->constBits & 0b10u;
         joined.restrictBits |= sb->restrictBits & 0b10u;
+        for (auto const& [lv, claim] : sb->fnParams) {
+            bool const claimed = std::ranges::any_of(
+                joined.fnParams, [lv = lv](auto const& e) { return e.first == lv; });
+            if (!claimed) joined.fnParams.emplace_back(lv, claim);
+        }
     } else {
-        // Arms of different shapes: the result is a pointer to (qualified) void
+        // Arms of different shapes — or of one shape whose pointees differ in a
+        // qualifier below their own top level, a parameter's included (P69, lane
+        // `cs`; `pointeeSpinesDiverge`): the result is a pointer to (qualified) void
         // (6.5.16p6, and row 1's `void *` for incompatible arms) — one pointer level
         // over a base carrying both pointees' qualifiers.
         joined.levels       = 2;
         joined.constBits    = (sa->constBits | sb->constBits) & 0b10u;
         joined.restrictBits = (sa->restrictBits | sb->restrictBits) & 0b10u;
     }
-    joined.constBits    &= ~std::uint64_t{1};   // the conditional's value is an rvalue
-    joined.restrictBits &= ~std::uint64_t{1};
-    return finish(Base{joined, true}, top.steps);
+    // The conditional is a value where the walk forked: inside every step it had taken.
+    std::vector<ValueAt> values = top.values;
+    values.push_back(ValueAt{top.steps.size(), false});
+    return finish(Base{joined, true}, top.steps, values);
+}
+
+// The three halves of "A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES NOT"
+// (declared, and explained, beside `expressionQualifierSpine`'s declaration).
+[[nodiscard]] bool pointeesCanDivergeInAQualifier(TypeInterner const& in, TypeId a,
+                                                  TypeId b) {
+    auto const deep = [&in](TypeId t) {
+        TypeId const p = contributedPointee(in, t);
+        if (!p.valid()) return false;
+        TypeKind const k = in.kind(in.stripVolatile(p));
+        return k == TypeKind::Ptr || k == TypeKind::FnSig;
+    };
+    return deep(a) && deep(b);
+}
+
+[[nodiscard]] std::optional<QualifierSpine>
+pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                  NodeId expr, TypeId exprType, ScopeId here) {
+    auto sp = expressionQualifierSpine(s, cfg, tree, expr, here);
+    if (!sp.has_value()) return std::nullopt;
+    auto const& in = s.lattice.interner();
+    if (exprType.valid() && in.kind(in.stripVolatile(exprType)) == TypeKind::FnSig
+        && !shiftQualifierSpine(*sp, +1))
+        return std::nullopt;
+    return sp;
+}
+
+[[nodiscard]] bool pointeeSpinesDiverge(std::optional<QualifierSpine> const& a,
+                                        std::optional<QualifierSpine> const& b) {
+    return a.has_value() && b.has_value()
+        && detail::redecl::spinesDiverge(*a, *b, /*ignoredLevels=*/0b11u);
 }
 
 // The ONE generic-selection chokepoint (forward-declared above). Extracted from
@@ -23406,12 +28269,14 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
     // default: 3)`, exit 42 on gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC
     // 19.51; DSS exited 3 on both — the undecayed ARRAY type matched no pointer
     // association, so `default` was selected in silence.
-    TypeId ctrlConv = controllingType.valid()
-        ? in.stripVolatile(controllingType) : InvalidType;
-    if (ctrlConv.valid()) {
-        ctrlConv = arrayToPointerDecay(in, ctrlConv);
-        if (in.kind(ctrlConv) == TypeKind::FnSig) ctrlConv = in.pointer(ctrlConv);
-    }
+    // ★ P69 (lane `lm`): THE THREE STEPS ARE ONE FUNCTION NOW (`valueConversion`,
+    // `type_rules.hpp`), which the comma and the statement expression read too — they
+    // stood here inline, and here alone were all three applied. What stays this
+    // function's own is the strip after it: a type-level ALIGNMENT is no qualifier
+    // and the conversion keeps it, but it is no part of which association a type is
+    // compatible with.
+    TypeId const ctrlConv = controllingType.valid()
+        ? in.stripVolatile(valueConversion(in, controllingType)) : InvalidType;
     sel.controllingResolved = ctrlConv.valid();
 
     // ★ P68 round 9 (lane `cs`): THE QUALIFIER AXIS THE INTERNER DOES NOT CARRY.
@@ -23719,8 +28584,9 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                  NodeId node, ScopeId scope, ReturnRule const& ret) {
     (void)cfg;
     // Walk the scope parent chain for the nearest enclosing function result.
-    TypeId fnResult = InvalidType;
-    bool   foundFn  = false;
+    TypeId   fnResult = InvalidType;
+    bool     foundFn  = false;
+    SymbolId fnSym{};
     auto const& scopes = s.scopes.scopes();
     for (ScopeId cur = scope; cur.valid() && cur.v < scopes.size();
          cur = scopes[cur.v].parent) {
@@ -23728,6 +28594,9 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (it != s.fnResultByScope.end()) {
             fnResult = it->second;
             foundFn  = true;
+            if (auto const symIt = s.fnSymbolByScope.find(cur.v);
+                symIt != s.fnSymbolByScope.end())
+                fnSym = symIt->second;
             break;
         }
     }
@@ -23792,6 +28661,376 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             return;
         }
         emitMismatch(valueNode);
+    } else if (fnSym.valid()
+               && pointeesCanDivergeInAQualifier(s.lattice.interner(), fnResult, exprTy)) {
+        // P69 (lane `cs`): the qualifier the TypeIds cannot see — `return g;` from an
+        // `int (*pick(void))(const char *)` over `int g(char *)` (✔MEASURED, probe r4f
+        // v03: gcc 13.3.0 warns, clang 18.1.3 refuses, MSVC 19.51 warns C4090). A
+        // function's declared spine IS its result's (level 0 the returned pointer).
+        (void)reportQualifierIncompatiblePointer(
+            s, cfg, tree, valueNode, fnResult, s.symbols.at(fnSym).qualSpine, exprTy,
+            scope, DiagnosedConversionSite::Return);
+    }
+}
+
+// ★★ P69 (lane `cs`) — THE END OF THE UNIT FOR `alias("target")`.
+//
+// Each declaration whose declarator kept an `alias` clause left one pending entry
+// (`EngineState::pendingSymbolAliases`). Only here is every definition of the unit
+// known, so only here can three questions be answered, each by what the references
+// do (✔MEASURED, probes al2 and al3: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0):
+//   1. IS THE NAME DEFINED OTHERWISE? An alias declaration IS the definition of its
+//      name: a second alias declaration of it, a definition of it elsewhere (a body,
+//      an initializer), an object alias with external linkage not written `extern`,
+//      a `static` one with an initializer — each refused by all ("redefinition",
+//      "defined both normally and as 'alias' attribute"). A TENTATIVE declaration of
+//      the name is no definition beside it: the alias absorbs it.
+//   2. WHAT IS THE TARGET? The definition of the unit whose SYMBOL name the string
+//      is — an asm label's when the definition has one — reached through any chain
+//      of aliases. Undefined, only declared, a C99 inline definition, a cycle, an
+//      empty name: refused by all. A common (`common` written on a tentative
+//      definition no declaration initializes): refused by all. A thread-local and a
+//      non-thread-local storage: refused here — the two storages cannot be one.
+//   3. HOW ARE ITS USES REACHED? An alias with external linkage is reached BY NAME:
+//      its declaration stays a reference to the name (an import of it), and the
+//      definition the alias makes — one more symbol row on the target's
+//      definition — answers it, or a strong definition of another unit does when
+//      the alias is weak, which is what a weak alias is for. An alias with
+//      INTERNAL linkage has no name another unit or a reference row can reach, so
+//      its uses are bound here to the target itself (the same address).
+// A variable an alias names is a DEFINITION of the unit and never a common: its
+// tentative mark is cleared (`tentativeNeverCommon`).
+// The REDECLARATION GROUPS of the unit: the survivor of each record's merge (absorbed
+// → survivor, along any chain of merges) and the records each survivor absorbed. A
+// chain is followed to its end, with no cap: the walk stops at a record that absorbed
+// nothing, or at the first record it meets twice (a cycle, which no merge makes).
+struct RedeclarationGroups {
+    std::unordered_map<std::uint32_t, SymbolId>              survivorOfAbsorbed;
+    std::unordered_map<std::uint32_t, std::vector<SymbolId>> absorbedBy;   // survivor → records
+    [[nodiscard]] SymbolId survivorOf(SymbolId id) const {
+        std::unordered_set<std::uint32_t> met{id.v};
+        for (;;) {
+            auto const it = survivorOfAbsorbed.find(id.v);
+            if (it == survivorOfAbsorbed.end() || !met.insert(it->second.v).second) return id;
+            id = it->second;
+        }
+    }
+};
+
+[[nodiscard]] RedeclarationGroups redeclarationGroupsOf(EngineState const& s) {
+    RedeclarationGroups g;
+    for (auto const& [survivor, absorbed] : s.mergedFnDecls)
+        if (survivor.valid() && absorbed.valid() && survivor.v != absorbed.v)
+            g.survivorOfAbsorbed[absorbed.v] = survivor;
+    for (auto const& [absorbedV, survivor] : g.survivorOfAbsorbed)
+        g.absorbedBy[g.survivorOf(survivor).v].push_back(SymbolId{absorbedV});
+    return g;
+}
+
+// ★ P69 (lane `cs`) — WHICH DECLARATION'S `nocommon` A TENTATIVE DEFINITION KEEPS.
+// Each declarator's `nocommon` marked its OWN record; the lowering reads the merge
+// SURVIVOR's. The LAST tentative declaration of the name decides (✔MEASURED, probe
+// rv cells 14 and 15, nm under -fcommon): `int t; int t __attribute__((nocommon));`
+// is a `.bss` definition on gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0, and
+// `int t __attribute__((nocommon)); int t;` is a COMMON on gcc and mingw-w64 gcc and
+// a `.bss` definition on clang — gcc copies the later declaration's mark, clang
+// inherits the attribute. A MEANING split, decided for gcc's reading: it is the one
+// under which two units each written so LINK (their commons fold), where clang
+// refuses them as two definitions — and one reference that builds a program makes
+// it one this compiler builds. An alias naming the variable overrides both (after
+// this, `resolveSymbolAliases`).
+void settleNoCommon(EngineState& s, std::span<Tree const> trees) {
+    RedeclarationGroups const groups = redeclarationGroupsOf(s);
+    if (groups.absorbedBy.empty()) return;
+    std::unordered_map<std::uint32_t, std::size_t> treeOrder;
+    for (std::size_t i = 0; i < trees.size(); ++i) treeOrder[trees[i].id().v] = i;
+    auto const positionOf = [&](SymbolRecord const& rec) {
+        auto const t = treeOrder.find(rec.tree.v);
+        std::size_t const tree = t == treeOrder.end() ? trees.size() : t->second;
+        std::uint32_t const at = (t != treeOrder.end() && rec.declNode.valid())
+                                     ? trees[tree].span(rec.declNode).start()
+                                     : 0u;
+        return std::pair{tree, at};
+    };
+    for (auto const& [survivorV, absorbed] : groups.absorbedBy) {
+        SymbolRecord& survivor = s.symbols.at(SymbolId{survivorV});
+        if (survivor.kind != DeclarationKind::Variable) continue;
+        SymbolRecord const* last = nullptr;
+        auto const consider = [&](SymbolRecord const& rec) {
+            if (!rec.isTentativeDefinition) return;
+            if (last == nullptr || positionOf(*last) < positionOf(rec)) last = &rec;
+        };
+        consider(survivor);
+        for (SymbolId const r : absorbed) consider(s.symbols.at(r));
+        if (last != nullptr) survivor.tentativeNeverCommon = last->tentativeNeverCommon;
+    }
+}
+
+void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
+    if (s.pendingSymbolAliases.empty()) return;
+    std::unordered_map<std::uint32_t, Tree const*> treeById;
+    for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+    auto const atFileScope = [&](SymbolRecord const& rec) {
+        auto const it = treeById.find(rec.tree.v);
+        return it != treeById.end()
+            && rec.scope.v == fileScopeOf(s, *it->second, rec.scope).v;
+    };
+    RedeclarationGroups const groups = redeclarationGroupsOf(s);
+    auto const survivorOf = [&](SymbolId id) { return groups.survivorOf(id); };
+    auto const& groupOf = groups.absorbedBy;
+    auto const symbolNameOf = [](SymbolRecord const& rec) -> std::string const& {
+        return rec.asmName.empty() ? rec.name : rec.asmName;
+    };
+    // A DEFINITION of the unit, as the record that survived its merge: a function
+    // with a body, or an object this unit gives storage (an initializer, or a
+    // tentative definition).
+    auto const defines = [&](SymbolRecord const& rec) {
+        if (rec.isAbsorbedProto || !atFileScope(rec)) return false;
+        if (rec.kind == DeclarationKind::Function)
+            return !rec.isProtoDeclaration && !rec.isExternDeclaration;
+        if (rec.kind == DeclarationKind::Variable)
+            return !rec.isExternDeclaration && !rec.isProtoDeclaration
+                && !rec.isEnumerator && !rec.isInjectedConstant;
+        return false;
+    };
+    auto const report = [&](EngineState::PendingSymbolAlias const& p, DiagnosticCode code,
+                            std::string actual) {
+        auto const it = treeById.find(p.tree.v);
+        if (it == treeById.end()) return;
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = it->second->source().id();
+        d.span     = it->second->span(p.clauseNode.valid() ? p.clauseNode : p.nameNode);
+        d.actual   = std::move(actual);
+        s.reporter.report(std::move(d));
+    };
+    // 1. One alias declaration per name, and no other definition of it.
+    std::unordered_map<std::uint32_t, std::size_t> aliasOfSurvivor;   // survivor → pending
+    std::unordered_map<std::string, std::size_t> aliasNamed;          // symbol name → pending
+    for (std::size_t i = 0; i < s.pendingSymbolAliases.size(); ++i) {
+        auto const& p = s.pendingSymbolAliases[i];
+        SymbolId const survivor = survivorOf(p.declared);
+        SymbolRecord const& sRec = s.symbols.at(survivor);
+        if (aliasOfSurvivor.contains(survivor.v)) {
+            report(p, DiagnosticCode::S_RedeclaredSymbol,
+                   std::format("'{}' — a name may be the alias of one definition, and "
+                               "another declaration already makes it one",
+                               sRec.name));
+            continue;
+        }
+        // The alias declaration itself. A function's is a prototype. An object's is
+        // written `extern` (an initializer of its own ignored, warned where written),
+        // or `static` with no initializer (✔MEASURED, probe rv cells 1-3: gcc 13.3.0,
+        // clang 18.1.3 and mingw-w64 gcc 13.2.0 run a `static` alias of a `static`
+        // object, an `extern` one of a `static` object and a `static` one of an
+        // external object, -O0 and -O2). Written with external linkage and no
+        // `extern`, or `static` with an initializer, it is a definition of its own
+        // (probe al2 cell 10, rv cell 10, rv2 cell 1: refused by all three).
+        SymbolRecord const& dRec = s.symbols.at(p.declared);
+        bool const objectAlias = dRec.kind == DeclarationKind::Variable;
+        bool const declarationIsTheAlias = !objectAlias || p.writtenExtern
+            || (dRec.isInternalLinkage && !p.wroteInitializer);
+        // Another declaration DEFINING the name: a function body, or an object's
+        // initializer. A TENTATIVE declaration of an object is none — the alias is the
+        // definition, and absorbs it (✔MEASURED, probe rv2 cells 2-4: gcc runs a
+        // tentative declaration written before the alias and one written after it;
+        // clang refuses the first, "alias definition after tentative definition", and
+        // runs the second — one reference that runs it makes it accepted).
+        std::vector<SymbolId> named{survivor};
+        if (auto const g = groupOf.find(survivor.v); g != groupOf.end())
+            named.insert(named.end(), g->second.begin(), g->second.end());
+        bool definedOtherwise = false;
+        for (SymbolId const r : named) {
+            if (r.v == p.declared.v) continue;
+            SymbolRecord const& rec = s.symbols.at(r);
+            if (!atFileScope(rec) || rec.isExternDeclaration || rec.isProtoDeclaration)
+                continue;
+            if (rec.kind == DeclarationKind::Function)
+                definedOtherwise = true;
+            else if (rec.kind == DeclarationKind::Variable && !rec.isTentativeDefinition
+                     && !rec.isEnumerator && !rec.isInjectedConstant)
+                definedOtherwise = true;
+        }
+        if (!declarationIsTheAlias || definedOtherwise) {
+            report(p, DiagnosticCode::S_RedeclaredSymbol,
+                   std::format("'{}' is defined both as an alias and by a declaration of "
+                               "its own{} — an alias is the definition of its name",
+                               sRec.name,
+                               definedOtherwise ? ""
+                               : p.wroteInitializer && dRec.isInternalLinkage
+                                   // The `static` form takes no initializer at all: an
+                                   // alias has no storage, so no value, of its own — with
+                                   // none it is the alias (cs-28 item 9).
+                                   ? " (a `static` object alias takes no initializer: an "
+                                     "alias has no storage, and so no value, of its own)"
+                               : p.wroteInitializer
+                                   ? " (an object alias with an initializer is written "
+                                     "`extern`, and the initializer is ignored)"
+                                   : " (an object alias with external linkage is written "
+                                     "`extern`)"));
+            continue;
+        }
+        aliasOfSurvivor.emplace(survivor.v, i);
+        aliasNamed.emplace(symbolNameOf(sRec), i);
+    }
+    // The definitions an alias can name. A name an alias declaration defines is no
+    // definition of its own, whatever its records look like — a `static` object alias
+    // and a tentative declaration it absorbed are each a tentative definition by their
+    // shape — so it is reached as an alias (`aliasNamed`), never as the end of a chain:
+    // an alias of it ends at ITS target, and an alias that names itself is a cycle.
+    std::unordered_map<std::string, SymbolId> definitionNamed;
+    {
+        std::size_t const count = s.symbols.records().size();
+        for (std::size_t i = 1; i < count; ++i) {
+            SymbolId const id{static_cast<std::uint32_t>(i)};
+            SymbolRecord const& rec = s.symbols.at(id);
+            if (defines(rec) && !aliasOfSurvivor.contains(survivorOf(id).v))
+                definitionNamed.emplace(symbolNameOf(rec), id);
+        }
+    }
+    // 2. Each alias's target, through any chain of aliases.
+    for (auto const& [survivorV, index] : aliasOfSurvivor) {
+        auto const& p = s.pendingSymbolAliases[index];
+        SymbolId const survivor{survivorV};
+        SymbolRecord& sRec = s.symbols.at(survivor);
+        auto const refuse = [&](std::string why) {
+            report(p, DiagnosticCode::S_SymbolAliasTargetInvalid,
+                   std::format("'{}' cannot be an alias of '{}': {}", sRec.name, p.target,
+                               why));
+        };
+        if (p.target.empty()) {
+            refuse("the target's symbol name is empty");
+            continue;
+        }
+        std::string name = p.target;
+        std::unordered_set<std::string> visited{symbolNameOf(sRec)};
+        SymbolId target{};
+        std::string why;
+        // Followed to its end: each step either ends the walk or names an alias not
+        // met before (`visited`), and the unit holds finitely many.
+        for (;;) {
+            if (auto const def = definitionNamed.find(name); def != definitionNamed.end()) {
+                target = def->second;
+                break;
+            }
+            auto const next = aliasNamed.find(name);
+            if (next == aliasNamed.end()) {
+                why = std::format("no definition of a symbol named '{}' is in this unit "
+                                  "(an alias names a definition of its own unit, by its "
+                                  "symbol name)", name);
+                break;
+            }
+            if (!visited.insert(name).second) {
+                why = "the aliases name each other in a cycle, and none of them is a "
+                      "definition";
+                break;
+            }
+            name = s.pendingSymbolAliases[next->second].target;
+        }
+        if (!target.valid()) {
+            refuse(why);
+            continue;
+        }
+        SymbolRecord& tRec = s.symbols.at(target);
+        if (tRec.kind == DeclarationKind::Function && tRec.isInline
+            && !tRec.isInternalLinkage) {
+            refuse(std::format("'{}' is an inline definition, which gives the unit no "
+                               "external definition to name", tRec.name));
+            continue;
+        }
+        // A COMMON is what `common` makes of a tentative definition no declaration of
+        // the unit initialized. Where one is initialized there is no common to name
+        // (✔MEASURED, probe rv cells 11 and 12: `int g __attribute__((common)) = 5;`,
+        // and `common` on a tentative declaration beside `int g = 5;`, each aliased and
+        // run, 42 on gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0).
+        std::vector<SymbolId> targetRecords{target};
+        if (auto const g = groupOf.find(target.v); g != groupOf.end())
+            targetRecords.insert(targetRecords.end(), g->second.begin(), g->second.end());
+        bool targetWritesCommon = false;
+        bool targetInitialized  = false;
+        for (SymbolId const r : targetRecords) {
+            SymbolRecord const& rec = s.symbols.at(r);
+            targetWritesCommon = targetWritesCommon || s.symbolsWritingCommon.contains(r.v);
+            targetInitialized  = targetInitialized
+                || (rec.kind == DeclarationKind::Variable && atFileScope(rec)
+                    && !rec.isExternDeclaration && !rec.isProtoDeclaration
+                    && !rec.isTentativeDefinition);
+        }
+        if (targetWritesCommon && !targetInitialized) {
+            refuse(std::format("'{}' is declared `common`, and a common cannot be given "
+                               "a second name", tRec.name));
+            continue;
+        }
+        if (sRec.isThreadLocal != tRec.isThreadLocal) {
+            refuse(std::format("'{}' is {}thread-local and '{}' is {}: one storage cannot "
+                               "be both", sRec.name, sRec.isThreadLocal ? "" : "not ",
+                               tRec.name, tRec.isThreadLocal ? "thread-local"
+                                                             : "not"));
+            continue;
+        }
+        sRec.aliasTarget = target;
+        if (tRec.kind == DeclarationKind::Variable) tRec.tentativeNeverCommon = true;
+        // The alias is the definition of its name: the declaration that survived its
+        // merge (a `static` alias's own, or a tentative one it absorbed) is no
+        // tentative definition — no storage of its own, no C 6.9.2p2 completion, no
+        // common.
+        if (sRec.kind == DeclarationKind::Variable) sRec.isTentativeDefinition = false;
+        // 3. An alias with internal linkage: its uses are the target's.
+        if (sRec.isInternalLinkage) {
+            std::vector<SymbolId> group{survivor};
+            if (auto const g = groupOf.find(survivor.v); g != groupOf.end())
+                group.insert(group.end(), g->second.begin(), g->second.end());
+            auto& targetUses = s.usesBySymbol[target.v];
+            for (SymbolId const r : group) {
+                auto const uses = s.usesBySymbol.find(r.v);
+                if (uses == s.usesBySymbol.end()) continue;
+                for (NodeId const use : uses->second) {
+                    s.nodeToSymbol.set(use, target);
+                    targetUses.push_back(use);
+                }
+                uses->second.clear();
+            }
+        }
+    }
+}
+
+// ★ P69 (lane `cs`) — C 6.9.2p2 AT THE END OF THE UNIT. A file-scope TENTATIVE
+// definition of an array of unknown size that no declaration of the unit completed
+// (a later `int v[10];` did, through the redeclaration sweep's composite) is
+// completed here with ONE element, zero-initialized, and the warning both
+// references give says so (✔MEASURED, probe fs: gcc 13.3.0 "array 'v' assumed to
+// have one element", clang 18.1.3 "tentative array definition assumed to have one
+// element"; the program runs on both). After Pass 2 on purpose: a use before the
+// end of the unit sees the array of unknown size C says it is there.
+void completeTentativeArrays(EngineState& s, std::span<Tree const> trees) {
+    std::unordered_map<std::uint32_t, Tree const*> treeById;
+    for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+    auto& interner = s.lattice.interner();
+    std::size_t const count = s.symbols.records().size();
+    for (std::size_t i = 1; i < count; ++i) {
+        SymbolRecord& rec = s.symbols.at(SymbolId{static_cast<std::uint32_t>(i)});
+        if (!rec.isTentativeDefinition || rec.isAbsorbedProto) continue;
+        if (rec.kind != DeclarationKind::Variable || !rec.type.valid()) continue;
+        if (!interner.isIncompleteArray(rec.type)) continue;
+        auto const element = interner.operands(rec.type);
+        if (element.empty() || !element[0].valid()) continue;
+        TypeId const completed = interner.array(element[0], 1);
+        rec.type = completed;
+        if (rec.declNode.valid()) s.nodeToType.set(rec.declNode, completed);
+        auto const it = treeById.find(rec.tree.v);
+        if (it == treeById.end()) continue;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_TentativeArrayAssumedOneElement;
+        d.severity = DiagnosticSeverity::Warning;
+        d.buffer   = it->second->source().id();
+        d.span     = it->second->span(rec.declNode.valid() ? rec.declNode
+                                                           : rec.declRuleNode);
+        d.actual   = std::format("the tentative definition of the array '{}' is "
+                                 "completed with one element at the end of the unit "
+                                 "(C 6.9.2p2): no declaration gives it a size",
+                                 rec.name);
+        s.reporter.report(std::move(d));
     }
 }
 
@@ -23813,7 +29052,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  LongDoubleFormat longDoubleFormat,
                                  TargetSchema const* target,
                                  RuntimeLibraryRoleResolver const* roleResolver,
-                                 EnumCompatibleTypeRule enumCompatibleTypeRule);
+                                 EnumCompatibleTypeRule enumCompatibleTypeRule,
+                                 std::optional<std::string_view> activeCallingConvention,
+                                 std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
+                                 bool formatStatesCommons);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DiagnosticBudget budget,
@@ -23826,7 +29068,10 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       TargetSchema const* target,
                       std::size_t deepRecursionReserveBytes,
                       RuntimeLibraryRoleResolver const* roleResolver,
-                      EnumCompatibleTypeRule enumCompatibleTypeRule) {
+                      EnumCompatibleTypeRule enumCompatibleTypeRule,
+                      std::optional<std::string_view> activeCallingConvention,
+                      std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
+                      bool formatStatesCommons) {
     // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
     // `activeFormat` and `roleResolver` are two statements about the SAME format,
     // and nothing but this check makes them agree. A caller passing one format's
@@ -23876,7 +29121,9 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
             return analyzeImpl(std::move(cu), budget, dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
                                std::move(activeTarget), longDoubleFormat, target,
-                               roleResolver, enumCompatibleTypeRule);
+                               roleResolver, enumCompatibleTypeRule,
+                               activeCallingConvention, symbolAliasUnsupported,
+                               formatStatesCommons);
         });
 }
 
@@ -23890,7 +29137,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  LongDoubleFormat longDoubleFormat,
                                  TargetSchema const* target,
                                  RuntimeLibraryRoleResolver const* roleResolver,
-                                 EnumCompatibleTypeRule enumCompatibleTypeRule) {
+                                 EnumCompatibleTypeRule enumCompatibleTypeRule,
+                                 std::optional<std::string_view> activeCallingConvention,
+                                 std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
+                                 bool formatStatesCommons) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -23915,6 +29165,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // Plan 25: own the arch-name string (the caller's string_view may be
     // transient) so the shipped-struct variant selector reads a stable value.
     if (activeTarget.has_value()) s.activeTarget = std::string{*activeTarget};
+    if (activeCallingConvention.has_value())
+        s.activeCallingConvention = std::string{*activeCallingConvention};
+    s.symbolAliasUnsupported = symbolAliasUnsupported;
+    s.formatStatesCommons = formatStatesCommons;
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so
@@ -25171,7 +30425,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // shared `constantLiteralForSymbol` builder bit_casts it back when the
             // symbol's type is a float kind (the integer path reads `enumValue`
             // directly). `type` is the constant's own float scalar (F32/F64).
+            // ★ P69 round 4, D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR:
+            // THE `#undef` RULE above, for the float constants too. Every one is a
+            // C MACRO (7.12p3-5), and the splice now defines it as one, so for a
+            // consumer that preprocesses the splice is the ONE owner: injecting it
+            // here as well would resurrect `INFINITY` after `#undef INFINITY`,
+            // which every reference refuses.
             for (auto const& fc : desc->floatConstants) {
+                if (consumerPreprocesses) continue;
                 if (userDeclaredNames.contains(fc.name)) continue;
                 if (!injectedNames.insert(fc.name).second) continue;  // first wins
                 SymbolRecord rec;
@@ -25411,6 +30672,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             s.scopes.injectBinding(rec.scope, rec.name, target);
             s.mergedFnDecls.push_back({target, sid});
         }
+    }
+
+    for (auto const& [survivor, absorbed] : s.mergedFnDecls) {
+        if (!survivor.valid() || !absorbed.valid() || survivor.v == absorbed.v) continue;
+        s.redeclarationPartners[survivor.v].push_back(absorbed);
+        s.redeclarationPartners[absorbed.v].push_back(survivor);
     }
 
     // Pass 1.5 per tree: resolve declaration types + function signatures.
@@ -25743,8 +31010,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // variably modified AND qualified alike (the `const` / `restrict`
                 // a TypeId does not carry — P68 round 8, lane `ht`). Anything else
                 // falls through to fail loud.
+                auto const fnClaimOf = [&s](SymbolId sym) -> DeclaredQualification const* {
+                    auto const it = s.fnTypedefClaims.find(sym.v);
+                    return it == s.fnTypedefClaims.end() ? nullptr : it->second.get();
+                };
                 if (!variablyModified && sRec.type.v == aRec.type.v
-                    && !typedefRedefinitionQualifiersDiverge(in, sRec, aRec))
+                    && !typedefRedefinitionQualifiersDiverge(in, sRec, aRec,
+                                                             fnClaimOf(survivor),
+                                                             fnClaimOf(absorbed)))
                     continue;
                 auto aTreeIt = treeById.find(aRec.tree.v);
                 if (aTreeIt == treeById.end()) continue;
@@ -25819,7 +31092,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                               aTreeIt2->second->schema().schemaId().v);
                     std::optional<DeclaredQualification> sQual;
                     std::optional<DeclaredQualification> aQual;
-                    HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, in};
+                    HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, in,
+                                                &s.typeofClaimByNode, &s.nodeToType,
+                                                &s.fnTypedefClaims};
                     if (sIdxIt != s.schemaIndexes.end())
                         sQual = harvestFunctionQualification(
                             in, sIdxIt->second, *sTreeIt2->second, sRec, sRec.type,
@@ -25869,8 +31144,16 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 auto& in = s.lattice.interner();
                 if (in.qualifierBits(sRec.type) == in.qualifierBits(aRec.type)
                     && sameOrEnumCompatible(in, in.stripVolatile(sRec.type),
-                                            in.stripVolatile(aRec.type)))
+                                            in.stripVolatile(aRec.type))) {
+                    // P69 (lane `cs`): two pointers to arrays, one of a size the other
+                    // leaves unknown (`extern int (*p)[]; int (*p)[3];`), are compatible
+                    // (C 6.7.6.2p6), and the object's type is their COMPOSITE (C 6.2.7p3)
+                    // on every record — the statement Pass 1.5 made at the declaration
+                    // that completed it, for a record whose type another path set (the
+                    // array arm below says the same).
+                    composeArrayRedeclaration(s, absorbed);
                     continue;
+                }
             }
             // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
             // SAME element type are compatible when ONE side is INCOMPLETE — the
@@ -25893,8 +31176,20 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     auto const sOps = in.operands(sRec.type);
                     auto const aOps = in.operands(aRec.type);
                     if (!sOps.empty() && !aOps.empty()
-                        && sOps[0].valid() && sOps[0].v == aOps[0].v)
+                        && sOps[0].valid() && sOps[0].v == aOps[0].v) {
+                        // P69 (lane `cs`): AND EVERY RECORD OF THE MERGE HOLDS THE
+                        // COMPOSITE (C 6.2.7p3: the composite of an array of unknown
+                        // size and one of known size is the known one). Pass 1.5 put
+                        // it there at the declaration that completed it; this is the
+                        // same statement, for a record whose type another path set.
+                        // The survivor is the record the lowering reads: had it kept
+                        // `int[]` (`int v[]; int v[10];`, the earlier survives), the
+                        // object would have been completed with one element instead
+                        // of ten (✔MEASURED, probe fs cell 2: gcc 13.3.0, clang
+                        // 18.1.3 and mingw-w64 gcc 13.2.0 give it ten).
+                        composeArrayRedeclaration(s, absorbed);
                         continue;   // same element type + one incomplete → compatible
+                    }
                 }
             }
             auto aTreeIt = treeById.find(aRec.tree.v);
@@ -25918,6 +31213,62 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             s.reporter.report(std::move(d));
         }
     }
+
+    // ★ P69 (lane `cs`): the SHIM-CORE COMPANION mint — every non-recipe row of the
+    // descriptor declaring `name`, minted import-only, NON-EAGER and bound in no scope (the
+    // realization pass's "SHIM-CORE COMPANIONS" comment states why each rule below exists).
+    // Lifted out of that pass verbatim so the library-builtin binder before Pass 2 applies
+    // the SAME rule when `__builtin_printf` reaches pe's printf shim; `userDeclares` answers
+    // whether a name is the program's own (goal-2: never shadowed, never double-imported).
+    auto const mintShimCompanions = [&](std::string const& name, auto const& userDeclares) {
+        std::array<NamedTypeBinding, 1> namedTypeStorage{};
+        std::span<NamedTypeBinding const> namedTypes{};
+        if (vaListBuiltinType.has_value()) {
+            namedTypeStorage[0] = NamedTypeBinding{"va_list", *vaListBuiltinType};
+            namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(), 1};
+        }
+        std::optional<std::string_view> const activeTargetView =
+            s.activeTarget.has_value() ? std::optional<std::string_view>{*s.activeTarget}
+                                       : std::nullopt;
+        auto surface = ffi::realizeShippedDescriptorSurfaceFor(
+            name, s.lattice.interner(), s.lattice.registry(),
+            s.dataModel, activeTargetView,
+            objectFormatKindOf(s.activeFormat), namedTypes,
+            s.roleResolver, &pairFacts);
+        if (!surface.has_value()) return;
+        for (auto& [coreName, core] : *surface) {
+            // The declared name itself is already handled by the caller, and a name the
+            // USER declared is theirs (goal-2) — never shadow or double-import either.
+            if (coreName == name) continue;
+            if (userDeclares(coreName)) continue;
+            // ⛔ A COMPANION THAT IS ITSELF A `synthesize` ROW IS NOT A CORE, AND IMPORTING
+            // IT WOULD BE LETHAL. stdio.json's pe arm realizes printf/fprintf/sprintf/
+            // vfprintf/sscanf as SHIMS precisely because ucrtbase exports none of them, so
+            // planting an import for one is a binary that fails to LOAD (0xC0000139). A shim
+            // is also never something another shim's body calls: the bodies call the
+            // `__stdio_common_v*` CORES, which are ordinary recipe-less rows. Skipping them
+            // also stops synthesizing four unreachable shim bodies per printf.
+            if (!core.recipeId.empty()) continue;
+            // A name the `#include` path already injected owns the import; first-wins,
+            // exactly as injection does.
+            if (!injectedNames.insert(coreName).second) continue;
+            SymbolRecord rec;
+            rec.name     = coreName;
+            rec.scope    = cuRoot;
+            rec.tree     = InvalidTree;   // not a user decl
+            rec.kind     = core.isFunction ? DeclarationKind::Function
+                                           : DeclarationKind::Variable;
+            rec.type     = core.signature;
+            rec.linkName = core.linkName;
+            SymbolId const id = s.symbols.mint(rec);
+            shippedExterns.push_back(ShippedExternSymbol{
+                id, coreName, core.signature, core.library,
+                core.isFunction,
+                /*recipeId=*/std::string{},   // gated above: never a shim
+                core.version, core.linkName,
+                /*eagerImport=*/false});
+        }
+    };
 
     // ══ THE PLATFORM REALIZATION PASS ════════════════════════════════════════
     //
@@ -26047,11 +31398,29 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // behavior that predates this pass.
             if (realized.has_value()) {
                 for (auto& [name, real] : *realized) {
-                    // ONLY a fully realized row produces a binding. `Unknown`,
-                    // `UnavailableForFormat` and `NoLibraryForFormat` all mean
-                    // "the platform states no image for this name here" ⇒ leave it
-                    // unbound for the link tier. Enumerated, not fallen through.
-                    if (real.status != ffi::ShippedRealizationStatus::Realized)
+                    // ONLY a row the platform gives a BODY produces a binding: an
+                    // image to import (`Realized`) or DSS's shipped source
+                    // (`ProvidedByShippedSource`). `Unknown`, `UnavailableForFormat`
+                    // and `NoLibraryForFormat` all mean "the platform states no body
+                    // for this name here" ⇒ leave it unbound for the link tier.
+                    // Enumerated, not fallen through.
+                    //
+                    // ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM):
+                    // a shipped-source row is bound EXACTLY as the `#include` path
+                    // binds it — no image (its library map has none for this format:
+                    // a descriptor-level source leaves the key absent, a symbol-level
+                    // one supersedes the inherited import with an empty image) and the
+                    // row's LINK NAME, which the runtime unit's archive member defines.
+                    // Skipping it left a hand-written `extern int printf(const char *,
+                    // ...);` referencing the plain name once printf's row became DSS's
+                    // source under `__dss_isoc23_printf`: undefined on pe (ucrtbase
+                    // exports no printf) and libSystem's pre-C23 printf on Mach-O —
+                    // two spellings of one declaration (C23 6.2.2p5, 7.1.4p2) binding
+                    // two bodies. A user's own DEFINITION of the name is unaffected: no
+                    // extern is synthesized for a definition, so it keeps its own name.
+                    bool const shippedSource =
+                        real.status == ffi::ShippedRealizationStatus::ProvidedByShippedSource;
+                    if (real.status != ffi::ShippedRealizationStatus::Realized && !shippedSource)
                         continue;
                     bool const isShim = !real.recipeId.empty();
                     suppressedShippedLibraries.emplace(
@@ -26067,7 +31436,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                 // rather than inventing silence
                                                 // into a statement.
                                                 nullptr,
-                                                real.linkName});
+                                                real.linkName,
+                                                shippedSource ? real.shippedSourcePath
+                                                              : std::string{}});
                     if (!isShim) continue;
                     // ★★ SHIM-CORE COMPANIONS — the one part of a `synthesize`
                     // row's realization that is NOT on the row itself.
@@ -26097,49 +31468,13 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // existing reference gate prunes it to exactly the rows the
                     // emitted body referenced. Precision from a mechanism already in
                     // the tree — and nothing here needs editing when a recipe lands.
-                    auto surface = ffi::realizeShippedDescriptorSurfaceFor(
-                        name, s.lattice.interner(), s.lattice.registry(),
-                        s.dataModel, activeTargetView,
-                        objectFormatKindOf(s.activeFormat), namedTypes,
-                        s.roleResolver, &pairFacts);
-                    if (!surface.has_value()) continue;
-                    for (auto& [coreName, core] : *surface) {
-                        // The declared name itself is already handled above, and a
-                        // name the USER declared is theirs (goal-2) — never shadow
-                        // or double-import either.
-                        if (coreName == name) continue;
-                        if (userOrdinaryDecls.contains(coreName)) continue;
-                        // ⛔ A COMPANION THAT IS ITSELF A `synthesize` ROW IS NOT A
-                        // CORE, AND IMPORTING IT WOULD BE LETHAL. stdio.json's pe
-                        // arm realizes printf/fprintf/sprintf/vfprintf/sscanf as
-                        // SHIMS precisely because ucrtbase exports none of them, so
-                        // planting an import for one is a binary that fails to LOAD
-                        // (0xC0000139) — the exact defect this whole pass exists to
-                        // close. A shim is also never something another shim's body
-                        // calls: the bodies call the `__stdio_common_v*` CORES, which
-                        // are ordinary recipe-less rows. Skipping them also stops
-                        // synthesizing four unreachable shim bodies per printf.
-                        if (!core.recipeId.empty()) continue;
-                        // A name the `#include` path already injected owns the
-                        // import; first-wins, exactly as injection does.
-                        if (!injectedNames.insert(coreName).second) continue;
-                        SymbolRecord rec;
-                        rec.name     = coreName;
-                        rec.scope    = cuRoot;
-                        rec.tree     = InvalidTree;   // not a user decl
-                        rec.kind     = core.isFunction
-                                           ? DeclarationKind::Function
-                                           : DeclarationKind::Variable;
-                        rec.type     = core.signature;
-                        rec.linkName = core.linkName;
-                        SymbolId const id = s.symbols.mint(rec);
-                        shippedExterns.push_back(ShippedExternSymbol{
-                            id, coreName, core.signature, core.library,
-                            core.isFunction,
-                            /*recipeId=*/std::string{},   // gated above: never a shim
-                            core.version, core.linkName,
-                            /*eagerImport=*/false});
-                    }
+                    // P69 (lane `cs`): the mint itself is `mintShimCompanions` (defined
+                    // before this pass), shared with the library-builtin binder — a
+                    // `__builtin_printf` on pe is the same recipe row reached by another
+                    // spelling. The rule it applies is the one this comment states.
+                    mintShimCompanions(name, [&](std::string const& n) {
+                        return userOrdinaryDecls.contains(n);
+                    });
                 }
             }
         }
@@ -26237,7 +31572,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             if (shippedIt->second.qualification != nullptr) {
                 userQual = harvestFunctionQualification(
                     in, s.idx(), tree, rec, rec.type,
-                    HeadTypedefs{s.typedefNamedByToken, s.symbols, in});
+                    HeadTypedefs{s.typedefNamedByToken, s.symbols, in,
+                                 &s.typeofClaimByNode, &s.nodeToType, &s.fnTypedefClaims});
             }
             DeclaredFunction const userDecl{
                 rec.type, userQual.has_value() ? &*userQual : nullptr};
@@ -26368,6 +31704,190 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         }
     }
 
+    // ★ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): THE LIBRARY
+    // FUNCTION BINDER Pass 2 calls for a library builtin (`__builtin_strlen`) and for a
+    // builtin's `libraryFallback` (`__builtin_nan(s)` with a non-literal `s`).
+    //
+    // gcc's rule is that `__builtin_<name>` IS the library function `name`, whether or not
+    // the program declared it: ✔MEASURED 2026-10-01 (lane `cs`'s probes r5s s25-s29) gcc
+    // 13.3.0 and clang 18.1.3 call it with no header at all, with a header plus the
+    // program's own prototype, and with a LOCAL `int strlen` in scope. So the binding is,
+    // per tree and per name, ONE of:
+    //   (1) the function the tree itself declares under that name at FILE scope — its own
+    //       prototype or definition, or the one its `#include` injected (the CU root the
+    //       tree's root scope sees) — so `__builtin_strlen` and `strlen` are one function;
+    //   (2) otherwise the platform's REALIZATION of the name, exactly the one a bare
+    //       prototype of it gets in the realization pass above (the shipped-descriptor
+    //       corpus), minted IMPORT-ONLY: bound in no scope, so `strlen` itself stays
+    //       undeclared in a unit that never included <string.h>; non-eager, so the linker's
+    //       reference gate keeps it only where a call references it; and a recipe row (pe's
+    //       printf shim) brings its companions through the same `mintShimCompanions`. A row
+    //       whose body is SHIPPED SOURCE here is minted the same way but bound as the
+    //       `#include` path binds it — no image, resolved at the link tier against the
+    //       runtime unit (D-C-LIBRARY-BUILTIN-REFUSES-A-SHIPPED-SOURCE-BODY).
+    // A name the platform does not provide on this target is REFUSED at the use
+    // (S_LibraryBuiltinUnavailable), naming the function and why — never an unbound import
+    // whose signature nothing declares.
+    std::unordered_map<std::string, SymbolId> libraryImportByName;   // (2), once per CU
+    std::unordered_map<std::string, std::string> libraryImportRefusal;
+    // P69 review n12: a refused use is REPORTED at every use, once per use — Pass 2 resolves
+    // one call's callee in two arms (its reference, then the call), so the use, not the
+    // name, is what is remembered: the tree and the use's span.
+    std::set<std::tuple<std::uint32_t, ByteOffset, ByteOffset>> libraryRefusalReportedAt;
+    s.resolveLibraryFunction = [&](Tree const& tree, std::string_view lib,
+                                   NodeId at) -> SymbolId {
+        auto const key = std::make_pair(tree.id().v, std::string{lib});
+        std::string const name{lib};
+        auto const reportRefusal = [&] {
+            SourceSpan const span = tree.span(at);
+            if (!libraryRefusalReportedAt.emplace(tree.id().v, span.start(), span.end())
+                     .second)
+                return;   // this use is already reported
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_LibraryBuiltinUnavailable;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = span;
+            auto const why = libraryImportRefusal.find(name);
+            d.actual   = std::format(
+                "'{}' calls the C library function '{}', which this translation unit does "
+                "not declare and the platform does not provide here: {}",
+                tree.text(at), name,
+                why != libraryImportRefusal.end() ? why->second : std::string{"unknown"});
+            s.reporter.report(std::move(d));
+        };
+        if (auto const it = s.libraryFunctionByTree.find(key);
+            it != s.libraryFunctionByTree.end()) {
+            if (!it->second.valid()) reportRefusal();
+            return it->second;
+        }
+        auto& in = s.lattice.interner();
+        SymbolId bound = InvalidSymbol;
+        if (auto const rootIt = treeRootScope.find(tree.id().v);
+            rootIt != treeRootScope.end()) {
+            SymbolId const own = s.scopes.lookup(rootIt->second, lib);
+            if (own.valid()) {
+                auto const& rec = s.symbols.at(own);
+                if (rec.kind == DeclarationKind::Function && rec.type.valid()
+                    && in.kind(rec.type) == TypeKind::FnSig
+                    && rec.builtinLowering == BuiltinLowering::None)
+                    bound = own;
+            }
+        }
+        if (!bound.valid()) {
+            if (auto const memo = libraryImportByName.find(name);
+                memo != libraryImportByName.end()) {
+                bound = memo->second;
+            } else {
+                std::string why;
+                std::array<NamedTypeBinding, 1> namedTypeStorage{};
+                std::span<NamedTypeBinding const> namedTypes{};
+                if (vaListBuiltinType.has_value()) {
+                    namedTypeStorage[0] = NamedTypeBinding{"va_list", *vaListBuiltinType};
+                    namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(), 1};
+                }
+                std::optional<std::string_view> const activeTargetView =
+                    s.activeTarget.has_value()
+                        ? std::optional<std::string_view>{*s.activeTarget}
+                        : std::nullopt;
+                std::array<std::string, 1> const names{name};
+                auto realized = ffi::realizeShippedExternSymbols(
+                    names, in, s.lattice.registry(), s.reporter, s.dataModel,
+                    activeTargetView, objectFormatKindOf(s.activeFormat), namedTypes,
+                    s.roleResolver, &pairFacts);
+                auto it = realized.has_value() ? realized->find(name)
+                                               : decltype(realized->find(name)){};
+                if (!realized.has_value()) {
+                    why = "the shipped-library corpus could not be located";
+                } else if (it == realized->end()) {
+                    why = "no shipped-library descriptor declares it";
+                } else {
+                    auto& real = it->second;
+                    switch (real.status) {
+                        // A row the platform declares here with NO image for this format
+                        // (`NoLibraryForFormat`) binds exactly as a realized one: its
+                        // signature and link name are known, and the reference routes
+                        // UNBOUND to the link tier — "never a compile error", the descriptor
+                        // reader's own rule (`shippedLibraryImageForFormat`): a sibling unit
+                        // or an operator-named library may provide it.
+                        case ffi::ShippedRealizationStatus::NoLibraryForFormat:
+                        case ffi::ShippedRealizationStatus::Realized:
+                        case ffi::ShippedRealizationStatus::ProvidedByShippedSource:
+                            if (!real.isFunction || !real.signature.valid()
+                                || in.kind(real.signature) != TypeKind::FnSig) {
+                                why = "the platform declares it as an object, not a function";
+                                break;
+                            }
+                            {
+                                SymbolRecord rec;
+                                rec.name         = name;
+                                rec.scope        = cuRoot;
+                                rec.tree         = InvalidTree;   // not a user decl
+                                rec.kind         = DeclarationKind::Function;
+                                rec.type         = real.signature;
+                                rec.linkName     = real.linkName;
+                                rec.isNoreturn   = real.noreturn;
+                                rec.returnsTwice = real.returnsTwice;
+                                bound = s.symbols.mint(rec);
+                                // P69 (lane `lm`, D-C-LIBRARY-BUILTIN-REFUSES-A-SHIPPED-SOURCE-BODY):
+                                // a row whose body is SHIPPED SOURCE on this target — the printf
+                                // and scanf families on pe and Mach-O, whose C23 conversions DSS's
+                                // platform runtime owns — binds EXACTLY as the `#include` path and a
+                                // bare prototype bind it: no image, the row's LINK NAME, non-eager,
+                                // and its source path, so the reference resolves at the link tier
+                                // against the runtime unit's archive member (the include path's
+                                // shipped-source arm above). Refusing it refused `__builtin_printf`
+                                // on the two formats, where mingw-w64 gcc and clang call printf.
+                                if (real.status
+                                    == ffi::ShippedRealizationStatus::ProvidedByShippedSource) {
+                                    shippedExterns.push_back(ShippedExternSymbol{
+                                        bound, name, real.signature, /*library=*/{},
+                                        /*isFunction=*/true, /*recipeId=*/std::string{},
+                                        real.version, real.linkName, /*eagerImport=*/false,
+                                        real.shippedSourcePath});
+                                    injectedNames.insert(name);
+                                    break;
+                                }
+                                bool const isShim = !real.recipeId.empty();
+                                shippedExterns.push_back(ShippedExternSymbol{
+                                    bound, name, real.signature, std::move(real.library),
+                                    /*isFunction=*/true, real.recipeId, real.version,
+                                    real.linkName, /*eagerImport=*/false});
+                                injectedNames.insert(name);
+                                if (isShim) {
+                                    mintShimCompanions(name, [&](std::string const& n) {
+                                        for (auto const& [treeV, scope] : treeRootScope) {
+                                            for (auto const& [bn, ns, bsym] :
+                                                 s.scopes.bindingsOf(scope)) {
+                                                if (bn == n && ns == SymbolNamespace::Ordinary
+                                                    && bsym.valid()
+                                                    && s.symbols.at(bsym).tree.v == treeV)
+                                                    return true;
+                                            }
+                                        }
+                                        return false;
+                                    });
+                                }
+                            }
+                            break;
+                        case ffi::ShippedRealizationStatus::UnavailableForFormat:
+                            why = "the platform's descriptor declares it, but not on this "
+                                  "target's object format";
+                            break;
+                        case ffi::ShippedRealizationStatus::Unknown:
+                            why = "no shipped-library descriptor declares it";
+                            break;
+                    }
+                }
+                libraryImportByName.emplace(name, bound);
+                if (!bound.valid()) libraryImportRefusal.emplace(name, why);
+            }
+        }
+        if (!bound.valid()) reportRefusal();
+        s.libraryFunctionByTree.emplace(key, bound);
+        return bound;
+    };
+
     // Pass 2 per tree, against that tree's root scope. Loop-context depth
     // starts at 0 (GAP C).
     // Drop Pass 1.5's derived expression types: this pass stamps references,
@@ -26380,6 +31900,19 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         s.activate(tree.schema());
         pass2(s, *s.idx().cfg, tree, tree.root(), treeRootScope.at(tree.id().v), 0);
     }
+    // P69 (lane `cs`): the binder captured this function's realization state, and the
+    // extern list it appends to is handed to the model below — no caller past Pass 2.
+    s.resolveLibraryFunction = {};
+
+    // P69 (lane `cs`): the end of the unit — every definition is known and every use
+    // is bound. Each alias finds its target (and an internal-linkage alias's uses
+    // become the target's), and a tentative array no declaration completed takes one
+    // element (C 6.9.2p2). Before the unused-variable sweep below, which reads the
+    // use index the first may move. Which declaration's `nocommon` a merged tentative
+    // definition keeps is settled first, so an alias naming it overrides that.
+    settleNoCommon(s, trees);
+    resolveSymbolAliases(s, trees);
+    completeTentativeArrays(s, trees);
 
     // D8: unused-variable warnings. After Pass 2 has fully populated the
     // SE7 reverse use-index (`usesBySymbol`), any symbol whose minting
@@ -26511,6 +32044,13 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
         std::move(s.nullPointerConstantNodes),
+        std::move(s.compoundLiteralFacts),
+        std::move(s.constantSubobjects),
+        std::move(s.nanPayloads),
+        std::move(s.overflowPredicateTargets),
+        std::move(s.braceElementValueTypes),
+        std::move(s.conditionalTypes),
+        std::move(s.attributeNamesIgnoredForKind),
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),
         dataModel,
@@ -26525,6 +32065,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // ratio over an ALGORITHM's counters instead of over a wall clock.
         s.exprTypeQueries,
         s.exprTypeNodeVisits,
+        // The layout parameters this analysis sized every type with, carried so the
+        // HIR lowering folds `sizeof` / `_Alignof` in a condition and in an index
+        // designator through the SAME block (`SemanticModel::aggregateLayout`).
+        s.aggregateLayout,
     };
 }
 

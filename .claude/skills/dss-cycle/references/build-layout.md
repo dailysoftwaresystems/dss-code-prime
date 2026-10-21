@@ -23,12 +23,15 @@ complete). It is part of the fail-loud gate, not housekeeping advice.
    subdirectory; never add a sibling.
 3. **A worktree gets the same rule applied at ITS root** — `<worktree>/build/<name>`. A worktree must
    never build into the main tree's `build/`, and the main tree must never build into a worktree's.
-4. **Lane builds are TEMPORARY.** A `build/lane-*` tree is deleted as soon as that lane's work is
-   folded AND the gate that covers it is green. ⏳ SCRIPT-ERA (superseded 2026-09-24: a lane builds inside its own worktree, `<worktree>/build/<variant>`, which goes with the worktree when it is landed or deleted, so the completion check is that no lane worktree survives its landing; see worktrees.md) **A cycle may not be reported complete while any
-   `build/lane-*` survives** — same shape as the anchor-balance gate: the report is a receipt, so the
-   check has to be mechanical. SUPERSEDED 2026-09-24 by lane builds inside lane worktrees — the check is now that no lane worktree survives its landing, which `dssharness list-worktree` shows (see worktrees.md)
-5. **The same applies to agent worktrees.** A worktree whose work is folded is removed after its last
-   review by `lane-fold.py land`, which removes its host copies too, and its build tree goes with it. Verify the fold by **CONTAINMENT** of the
+4. **Lane builds are TEMPORARY.** A lane builds inside its own agent worktree,
+   `<worktree>/build/<variant>`, which goes with the worktree. **A cycle may not be reported complete while
+   any of its set's agents is still open after its last review** — same shape as the anchor-balance gate: the
+   report is a receipt, so the check has to be mechanical: `dssharness list-orchestrator <o>` shows every agent
+   and whether it is deleted.
+5. **The same applies to every worktree.** An agent whose work is folded is removed after its last
+   review by `delete-agent`, which removes its host copies too, and its build tree goes with it
+   (orchestration.md); a probe's worktree, with its build, goes with `delete-worktree` (worktrees.md).
+   Verify the fold by **CONTAINMENT** of the
    lane's contribution, never by byte-identity with the main tree — later edits legitimately stack on
    top, so `diff -q` reporting DIFFERS proves nothing either way.
 
@@ -62,8 +65,9 @@ does not reduce the number of build trees or make them share one.
 ⛔ **Do not delete a build tree to make a gate figure reachable.** A gate that cannot be re-measured
 because its build tree was cleaned is a gate that did not run. Clean AFTER the green, never before.
 
-⛔ **A lane build is not a cache.** If you find yourself keeping `build/lane-x` "in case", the lane is
-not folded — finish the fold.
+⛔ **A lane build is not a cache.** A folded lane's worktree build is kept until its last review, by
+design; if you find yourself keeping one past that "in case", the lane is not finished — finish it and
+`delete-agent`.
 
 ## Migration status — NOT yet done, and it is not a `mv`
 

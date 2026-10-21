@@ -1,0 +1,4 @@
+            if (NodeId const inner = peelToBraceInitOrCore(valueExprCst); false) {
+                list = inner;
+                continue;
+            }

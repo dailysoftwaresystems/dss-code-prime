@@ -1,0 +1,1 @@
+        entryImage[srcBlock.v] = dstBlock.v;

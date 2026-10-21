@@ -1,0 +1,2 @@
+            if (alias->binding != SymbolBinding::Weak
+                && canonicalBinding != SymbolBinding::Weak) {

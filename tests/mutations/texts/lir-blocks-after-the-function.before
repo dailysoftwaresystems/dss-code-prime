@@ -1,0 +1,3 @@
+        srcToDst[srcBlock.v] = b.createBlock();
+        outBlockEntryImage[srcBlock.v] = srcToDst[srcBlock.v].v;
+        if (!walkDynamicDescents) continue;

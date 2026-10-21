@@ -1,0 +1,3 @@
+            -> std::optional<CstBuiltinCall> {
+            if (node.valid()) return std::nullopt;
+            return builtinCallPlan(s, *cfg, tree, node, fromScope);

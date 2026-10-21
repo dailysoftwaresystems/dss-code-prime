@@ -1,0 +1,1 @@
+    return next((w for w in command[1:] if isinstance(w, str) and SELF_TEST_FLAG.match(w)), None)

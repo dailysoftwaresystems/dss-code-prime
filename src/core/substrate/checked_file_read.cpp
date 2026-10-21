@@ -137,7 +137,7 @@ readFileChecked(fs::path const& path) {
     // directory; on POSIX it succeeds and the first read fails with EISDIR,
     // which without this check would surface as an empty file.
     std::error_code ec;
-    if (!fs::is_regular_file(path, ec)) {
+    if (reachedKind(path, ec) != EntryKind::File) {
         return std::unexpected(FileReadError{
             FileReadFailure::NotARegularFile,
             "'" + shown + "' is not a regular file"});

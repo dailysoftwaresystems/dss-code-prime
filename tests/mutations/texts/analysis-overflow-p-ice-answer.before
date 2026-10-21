@@ -1,0 +1,2 @@
+    if (builtinLoweringIsOverflowPredicate(plan.verb)) {
+        if (std::uint64_t const* v = s.nodeToFoldedConstant.tryGet(node)) {

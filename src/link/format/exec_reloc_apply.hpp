@@ -105,7 +105,8 @@
 //   * kind unregistered (target)     → K_RelocationKindMismatch
 //   * widthBytes == 0                → K_RelocationKindMismatch (D-LK6-1)
 //   * rel.offset + width > fn.bytes  → K_RelocationKindMismatch
-//   * value out of signed widthBytes → K_RelocationKindMismatch
+//   * Linear value outside the row's `fieldRange` → K_RelocationKindMismatch
+//       (`linearFieldHolds`; the instruction formulas: their signed fields)
 //
 // Format-side `fmt.relocationByKind(rel.kind)` is checked by the
 // caller (it's format-specific and the diagnostic wording differs);
@@ -305,16 +306,15 @@ namespace dss::link::format {
                         static_cast<std::int64_t>(S) + A
                         + (tri->pcRelative ? -static_cast<std::int64_t>(P) : 0)
                         + tri->addendBias;
-                    if (tri->widthBytes < 8) {
-                        if (!fitsSignedNBits(value, 8 * tri->widthBytes)) {
-                            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                                 prefixStr + ": relocation '" + tri->name
-                                     + "' value " + std::to_string(value)
-                                     + " does not fit signed in widthBytes="
-                                     + std::to_string(static_cast<int>(tri->widthBytes))
-                                     + " — would silently truncate.");
-                            return false;
-                        }
+                    // The field's range is the row's (`linearFieldHolds`, the
+                    // one check every Linear writer asks — P69 fold 3c).
+                    if (std::string why; !linearFieldHolds(*tri, value, why)) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' value " + std::to_string(value)
+                                 + " is outside " + why
+                                 + " — would silently truncate.");
+                        return false;
                     }
                     auto const uVal = static_cast<std::uint64_t>(value);
                     for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {

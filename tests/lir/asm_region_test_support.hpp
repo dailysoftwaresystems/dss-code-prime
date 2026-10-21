@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace dss::test_support {
@@ -111,13 +112,14 @@ asmSlotRoleOf(LirAsmRegion const& r, LirReg reg) {
     return std::nullopt;
 }
 
-// Run the LIR pipeline exactly as `compile_pipeline` does, from the MIR→LIR
-// output up to and INCLUDING the asm-region expansion — the module callconv
-// would receive. Every stage's paired check runs too; a failure is a test
-// failure and yields nullopt.
+// The module the asm-region expansion RECEIVES: the LIR pipeline exactly as
+// `compile_pipeline` runs it, from the MIR→LIR output up to and including the
+// peephole. A pin about what the expansion itself returns (its block entry
+// image) starts here and calls `expandAsmRegions` on the result. Every stage's
+// refusal is a test failure and yields nullopt.
 [[nodiscard]] inline std::optional<Lir>
-lirThroughAsmExpansion(Lir const& lowered, TargetSchema const& schema,
-                       std::uint16_t ccIndex = 0) {
+lirReadyForAsmExpansion(Lir const& lowered, TargetSchema const& schema,
+                        std::uint16_t ccIndex = 0) {
     DiagnosticReporter rep;
     auto wide = lowerWideCallArgs(lowered, schema, ccIndex, rep);
     if (!wide.ok) { ADD_FAILURE() << "wide-call lowering refused"; return std::nullopt; }
@@ -130,18 +132,30 @@ lirThroughAsmExpansion(Lir const& lowered, TargetSchema const& schema,
     if (!legal.ok()) { ADD_FAILURE() << "legalize refused"; return std::nullopt; }
     auto peeped = runLirPeephole(legal.lir, schema, rep);
     if (!peeped.ok()) { ADD_FAILURE() << "peephole refused"; return std::nullopt; }
-    if (peeped.lir.asmRegionPool().empty()) {
-        EXPECT_EQ(rep.errorCount(), 0u);
-        return std::move(peeped.lir);
-    }
-    auto expanded = expandAsmRegions(peeped.lir, schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << (rep.all().empty() ? std::string{} : rep.all().front().actual);
+    return std::move(peeped.lir);
+}
+
+// Run the LIR pipeline exactly as `compile_pipeline` does, from the MIR→LIR
+// output up to and INCLUDING the asm-region expansion — the module callconv
+// would receive. Every stage's paired check runs too; a failure is a test
+// failure and yields nullopt.
+[[nodiscard]] inline std::optional<Lir>
+lirThroughAsmExpansion(Lir const& lowered, TargetSchema const& schema,
+                       std::uint16_t ccIndex = 0) {
+    auto ready = lirReadyForAsmExpansion(lowered, schema, ccIndex);
+    if (!ready.has_value()) return std::nullopt;
+    if (ready->asmRegionPool().empty()) return ready;
+    DiagnosticReporter rep;
+    auto expanded = expandAsmRegions(*ready, schema, rep);
     if (!expanded.ok) {
         ADD_FAILURE() << "asm-region expansion refused: "
                       << (rep.all().empty() ? std::string{}
                                             : rep.all().back().actual);
         return std::nullopt;
     }
-    EXPECT_TRUE(verifyLirAsmRegionExpansion(peeped.lir, expanded.lir, schema, rep));
+    EXPECT_TRUE(verifyLirAsmRegionExpansion(*ready, expanded.lir, schema, rep));
     EXPECT_TRUE(verifyLirPostRegalloc(expanded.lir, schema, rep));
     EXPECT_EQ(rep.errorCount(), 0u)
         << (rep.all().empty() ? std::string{} : rep.all().front().actual);

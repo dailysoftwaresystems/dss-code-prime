@@ -165,11 +165,13 @@ void appendLine(std::string&          out,
         case PredefinedMacroKind::TypeName:
         case PredefinedMacroKind::TypeLimit:
         case PredefinedMacroKind::TypeSuffix:
+        case PredefinedMacroKind::TypeFormat:
             // P68 round 9: the spelling, the spelled limit or the suffix the
             // merge REALIZED for this (language × pair) — printed as the text
             // the preprocessor will see (a `type-suffix` may be EMPTY, as
             // `__INT8_C_SUFFIX__` is under every reference); the kind beside it
-            // says the value was derived from a type, not declared.
+            // says the value was derived from a type, not declared. P69: and a
+            // `type-format` row's format string literal (`"ld"`), the same way.
             return pm.value;
         case PredefinedMacroKind::Date:
             // Quoted exactly as the materializer quotes it, so the dumped
@@ -380,7 +382,8 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     //   · a FUNCTION-LIKE config predefine is lowered to a "<built-in>" prologue
     //     `#define`, i.e. an ORDINARY macro, so the `--define` hits C 6.10.3p2
     //     instead → `P0014` ("incompatible redefinition"). Confirmed with
-    //     `--define __declspec=z`.
+    //     `--define __declspec=z` while that name was a function-like predefine
+    //     (the function-like one on pe is `_declspec` since).
     // Reproducing that two-route decision here would be a SECOND owner of it, and
     // the routes differ by a property (`isFunctionLike`) whose consequences live in
     // the directive handler. So the note reports the CONDITION and names the rules;

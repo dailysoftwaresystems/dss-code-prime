@@ -1,0 +1,8 @@
+        if (!declared.has_value()) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "elf::readRelocatableObject: section #" + std::to_string(i)
+                + " declares sh_addralign " + std::to_string(s.addrAlign)
+                + ", which is not a power of two no greater than 2^31: no "
+                  "alignment its bytes can be placed at.");
+        }
+        s.alignment = *declared;

@@ -1,0 +1,3 @@
+                        coll.emit(DiagnosticCode::C_MissingField, lbPath + "/functions",
+                                  "'functions' is required and must be a non-empty array "
+                                  "of library function names");

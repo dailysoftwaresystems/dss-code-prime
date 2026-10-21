@@ -1,0 +1,6 @@
+        if (NodeId const se = soleExpressionOfStatementExpression(hirCfg, tree, n); se.valid()) {
+            n = se;
+            continue;
+        }
+        if (nodeSaysSomethingItself(cfg, hirCfg, tree, n)) return std::nullopt;
+        NodeId sole{};

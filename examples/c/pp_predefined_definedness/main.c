@@ -16,8 +16,11 @@
  * -- a fixture exercising only one of the two paths cannot see a divergence
  * between them, and a green there would mean nothing.
  *
- * PART B -- `#undef` composition, on `__declspec`. That is the one FUNCTION-LIKE
- * predefine c.lang.json declares, and `sbNameDefined` answers for it out of a
+ * PART B -- `#undef` composition, on `_declspec`: a FUNCTION-LIKE predefine of
+ * c.lang.json (cl's single-underscore spelling, `_declspec(x)` -> `__declspec(x)`;
+ * until cycle P69 the subject here was `__declspec` itself, which was then a
+ * function-like macro erasing its argument and is a keyword now, predefined
+ * object-like on pe). `sbNameDefined` answers for it out of a
  * walk over the effective predefined list -- a CONFIG list no directive can
  * subtract from -- while the authoritative pass holds it in its ordinary macro
  * table, where `#undef` DOES erase it. The tolerated skew is pre-scan MORE live;
@@ -27,7 +30,7 @@
  * `P_PreprocessorIncludeError` (the authoritative pass refuses rather than drop);
  * mingw-w64 gcc 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all compile and RUN the
  * same shape (MEASURED 2026-09-03, each probed separately).
- *   `__declspec` is availableObjectFormats:[pe], so the pe leg is where PART B
+ *   `_declspec` is availableObjectFormats:[pe], so the pe leg is where PART B
  *   exercises the `#undef`-of-a-live-predefine path. On elf/macho the name is
  *   absent to begin with, so the SAME guards must reach the SAME verdicts by the
  *   other route -- which is itself worth pinning (a `#undef` of a name that was
@@ -42,6 +45,12 @@
  * the same source.
  *
  * ⚠ WHAT THE REFERENCES DO AND DO NOT SAY ABOUT THIS FILE'S EXIT CODE.
+ * (The figures below were measured while PART B's subject was `__declspec`; they
+ * have NOT been re-measured on the `_declspec` source. What is measured about the
+ * new subject, cycle P69: `_declspec` is not a macro on mingw-w64 gcc 13 nor on
+ * cl 19.51 -- `#ifdef _declspec` is false on both -- so on every reference PART
+ * B's six guards are asked of a name that is undefined before and after the
+ * `#undef`, and their verdicts cannot differ from the ones recorded here.)
  * ✔MEASURED 2026-09-03, each probed separately, on THIS source: mingw-w64 gcc
  * 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all exit 42. MSVC 19.51.36252
  * (/std:clatest /Zc:preprocessor) compiles it cleanly and exits 18 — and that is
@@ -140,13 +149,13 @@
 #endif
 
 /* ══ PART B ══ `#undef` must compose in the PRE-SCAN, not only in the
- * authoritative pass. After this line `__declspec` is undefined on EVERY
+ * authoritative pass. After this line `_declspec` is undefined on EVERY
  * target -- erased on pe, never present elsewhere. ════════════════════════ */
 
-#undef __declspec
+#undef _declspec
 
 #undef SPLICED
-#ifndef __declspec
+#ifndef _declspec
 #include "marker.h"
 #endif
 #ifdef SPLICED
@@ -156,7 +165,7 @@
 #endif
 
 #undef SPLICED
-#if !defined(__declspec)
+#if !defined(_declspec)
 #include "marker.h"
 #endif
 #ifdef SPLICED
@@ -167,7 +176,7 @@
 
 #undef SPLICED
 #if 0
-#elifndef __declspec
+#elifndef _declspec
 #include "marker.h"
 #endif
 #ifdef SPLICED
@@ -177,7 +186,7 @@
 #endif
 
 #undef SPLICED
-#ifdef __declspec
+#ifdef _declspec
 #include "marker.h"
 #endif
 #ifdef SPLICED
@@ -187,7 +196,7 @@
 #endif
 
 #undef SPLICED
-#if defined(__declspec)
+#if defined(_declspec)
 #include "marker.h"
 #endif
 #ifdef SPLICED
@@ -198,7 +207,7 @@
 
 #undef SPLICED
 #if 0
-#elifdef __declspec
+#elifdef _declspec
 #include "marker.h"
 #endif
 #ifdef SPLICED

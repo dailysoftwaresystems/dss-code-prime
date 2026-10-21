@@ -1,0 +1,13 @@
+{
+  "$comment": "AN ALIAS OF A SELECT-ANY COPY THAT LOSES (P69 round 1, lane cs, the review of checkpoint 27; D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE). PE discards a losing select-any copy WHOLE (the PE documents' `supersededDefinition`), so an alias that copy carries goes with it: the cross-unit election settles the copy's own name first and withdraws the alias from its name's election when the copy lost (`resolveSettlingCarriedNames`), and the alias's own unit reads its target's kept copy. Three names, one per cell of lane cs's probe mj1 (clang-cl 19.1.5 objects at /Od and /O2 linked by link.exe 14.51 and lld-link 19.1.5; mingw-w64 gcc 13.2.0 at -O0 and -O2 linked by GNU ld 2.42; the units in this order). `one_m`, a weak definition beside the losing copy's alias: lld-link links it and main and a.c read the weak 5; b.c's own use reads 5 at /Od and 7 at /O2, a split inside lld-link decided 7 (in its own unit the alias IS its target, and the target is the select-any object whose one definition is the kept copy); link.exe links garbage, GNU ld refuses (`one_m` undefined); DSS read 7 for a.c in silence and refused main's read until this fold. `both_m`, an alias in each unit: GNU ld and lld-link link it and every use reads 7; link.exe refuses (LNK2005); DSS refused it as two definitions until this fold. `own_m`, the losing copy's alias alone: link.exe links it and b.c reads 7 at /O2; GNU ld and lld-link refuse (`own_m` undefined from b.c's object); no unit defines the name, and DSS no longer leaves it an external name of the program. The ELF control, where the losing copy's bytes are kept and its alias stays in the election, is examples/c/two_units_alias_of_a_weak_copy_that_loses_elf. Every return before 42 names the first fact that failed. The `release` arm pins that the optimizer reads none of these values from a copy that may lose.",
+  "language": "c",
+  "sources": ["main.c", "a.c", "b.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

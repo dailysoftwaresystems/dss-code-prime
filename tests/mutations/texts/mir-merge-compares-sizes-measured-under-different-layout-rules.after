@@ -1,0 +1,1 @@
+                if (false && firstRule.has_value() && !sameRule(*firstRule, *rule)) {

@@ -158,7 +158,9 @@ spellingBackends() {
     static std::map<std::string, std::set<WeakDefinitionDialect>> const kRows{
         { "elf",   { WeakDefinitionDialect::SymbolBinding } },
         { "macho", { WeakDefinitionDialect::SymbolFlag    } },
-        { "pe",    { WeakDefinitionDialect::Comdat        } },
+        // TWO since P69: the COMDAT, and the weak external naming a default
+        // (`pe.cpp`, THE WEAK-EXTERNAL ARM).
+        { "pe",    { WeakDefinitionDialect::Comdat, WeakDefinitionDialect::WeakExternal } },
         { "spirv", {} },
         { "wasm",  {} },
     };
@@ -958,10 +960,17 @@ TEST(WeakDefinitionDialect, TheGateRefusesADialectTheWalkerCannotSpell) {
     EXPECT_NE(diagText(rep).find("symbol-binding"), std::string::npos)
         << diagText(rep);
 
-    // …and the SAME schema asked by the walker that DOES spell `comdat` passes.
+    // …and the SAME schema asked by the walker that DOES spell what it states
+    // passes. Since P69 this document states TWO spellings — `comdat`, and
+    // `weak-external` for an overridable definition (`byKind`) — and the gate
+    // passes a walker only if it writes every one of them: the PE walker's own
+    // set. (A walker that spells `comdat` alone is refused by name:
+    // `TheGateRefusesAPerKindDialectTheWalkerCannotSpell`.)
     DiagnosticReporter ok;
-    EXPECT_TRUE(dss::link::format::requireWeakDefinitionDialect(
-        mod, **fmt, WeakDefinitionDialect::Comdat, "probe::encode", ok));
+    WeakDefinitionDialect const peWalker[] = {WeakDefinitionDialect::Comdat,
+                                              WeakDefinitionDialect::WeakExternal};
+    EXPECT_TRUE(dss::link::format::requireWeakDefinitionDialects(
+        mod, **fmt, peWalker, "probe::encode", ok));
     EXPECT_EQ(ok.errorCount(), 0u) << diagText(ok);
 }
 
@@ -995,4 +1004,177 @@ TEST(WeakDefinitionDialect, TheGateSeesAWeakALIASOfAStrongDefinition) {
     EXPECT_FALSE(dss::link::format::requireWeakDefinitionDialect(
         mod, **fmt, WeakDefinitionDialect::SymbolBinding, "probe::encode", rep));
     EXPECT_TRUE(sawLacksDialect(rep)) << diagText(rep);
+}
+
+// ── P69 fold 2: the per-kind weak-definition dialect (`weakDefinition.byKind`) ──
+// ═════════════════════════════════════════════════════════════════════════
+// 6. THE PER-KIND STATEMENT (P69) — `weakDefinition.byKind`. A format with two
+//    MECHANISMS for a weak definition says which KIND takes which; its walker
+//    asks per definition (the writer half of
+//    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER).
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST(WeakDefinitionDialect, AKindTakesItsOwnDialectAndEveryOtherTheBlocks) {
+    // The two PE relocatable documents: an OVERRIDABLE definition is a weak
+    // external, a SELECT-ANY one and one that states no kind the COMDAT.
+    for (char const* name : {"pe64-x86_64-windows", "pe64-x86_64-windows-staticlib"}) {
+        SCOPED_TRACE(name);
+        auto const loaded = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(loaded.has_value()) << rejectSummary(loaded);
+        ObjectFormatSchema const& f = **loaded;
+        EXPECT_EQ(f.weakDefinitionDialectFor(WeakDefinitionKind::Overridable),
+                  std::optional{WeakDefinitionDialect::WeakExternal});
+        EXPECT_EQ(f.weakDefinitionDialectFor(WeakDefinitionKind::SelectAny),
+                  std::optional{WeakDefinitionDialect::Comdat});
+        EXPECT_EQ(f.weakDefinitionDialectFor(std::nullopt),
+                  std::optional{WeakDefinitionDialect::Comdat})
+            << "a definition that states no kind takes the block's dialect";
+        EXPECT_EQ(f.weakDefinitionDialectsStated(),
+                  (std::vector{WeakDefinitionDialect::Comdat, WeakDefinitionDialect::WeakExternal}));
+    }
+    // CONTROL — a format with ONE spelling answers it for every kind and for
+    // none, and states one dialect.
+    for (auto const& [name, dialect] :
+         std::vector<std::pair<char const*, WeakDefinitionDialect>>{
+             {"elf64-x86_64-linux", WeakDefinitionDialect::SymbolBinding},
+             {"macho64-arm64-darwin", WeakDefinitionDialect::SymbolFlag}}) {
+        SCOPED_TRACE(name);
+        auto const loaded = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(loaded.has_value()) << rejectSummary(loaded);
+        for (auto const kind : std::vector<std::optional<WeakDefinitionKind>>{
+                 WeakDefinitionKind::Overridable, WeakDefinitionKind::SelectAny, std::nullopt}) {
+            EXPECT_EQ((*loaded)->weakDefinitionDialectFor(kind), std::optional{dialect});
+        }
+        EXPECT_EQ((*loaded)->weakDefinitionDialectsStated(), std::vector{dialect});
+    }
+    // CONTROL — a format that has not answered answers for no kind.
+    auto const exec = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(exec.has_value()) << rejectSummary(exec);
+    EXPECT_FALSE((*exec)->weakDefinitionDialectFor(WeakDefinitionKind::Overridable).has_value());
+    EXPECT_FALSE((*exec)->weakDefinitionDialectFor(std::nullopt).has_value());
+    EXPECT_TRUE((*exec)->weakDefinitionDialectsStated().empty());
+}
+
+TEST(WeakDefinitionDialect, APerKindDialectIsCheckedAsTheBlocksIs) {
+    // A key that is no kind of weak definition.
+    {
+        json doc = shippedPeObjectDoc();
+        doc["weakDefinition"]["byKind"]["overidable"] = "weak-external";   // the typo
+        auto const r = ObjectFormatSchema::loadFromText(doc.dump(), "weakdef-bykind-typo");
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(countAtPath(r, "/weakDefinition/byKind/overidable"), 1u) << rejectSummary(r);
+        auto const quoted = quotedTokens(messageAtPath(r, "/weakDefinition/byKind/overidable"));
+        for (auto const& kind : allNames(kWeakDefinitionKindTable)) {
+            EXPECT_EQ(quotedCount(quoted, kind), 1u) << "the refusal names every kind once: " << kind;
+        }
+    }
+    // A value that is no dialect, and one that is not a string.
+    for (json const& bad : {json("selectany"), json(1), json::object()}) {
+        json doc = shippedPeObjectDoc();
+        doc["weakDefinition"]["byKind"]["overridable"] = bad;
+        auto const r = ObjectFormatSchema::loadFromText(doc.dump(), "weakdef-bykind-value");
+        ASSERT_FALSE(r.has_value()) << bad.dump();
+        EXPECT_EQ(countAtPath(r, "/weakDefinition/byKind/overridable"), 1u) << rejectSummary(r);
+    }
+    // A dialect THIS document's backend does not write: refused at load, naming
+    // the walker — the same both-ends check `dialect` gets.
+    {
+        json doc = shippedDoc("elf64-x86_64-linux");
+        doc["weakDefinition"]["byKind"]["overridable"] = "weak-external";
+        auto const r = ObjectFormatSchema::loadFromText(doc.dump(), "weakdef-bykind-xkind");
+        ASSERT_FALSE(r.has_value()) << "an ELF document giving a kind the COFF dialect must be refused at LOAD";
+        EXPECT_EQ(countAtPath(r, "/weakDefinition/byKind/overridable"), 1u) << rejectSummary(r);
+        auto const msg = messageAtPath(r, "/weakDefinition/byKind/overridable");
+        EXPECT_NE(msg.find("'elf'"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("'weak-external'"), std::string::npos) << msg;
+    }
+    // Not an object, and an object that states nothing.
+    for (json const& bad : {json("weak-external"), json::object(), json::array()}) {
+        json doc = shippedPeObjectDoc();
+        doc["weakDefinition"]["byKind"] = bad;
+        auto const r = ObjectFormatSchema::loadFromText(doc.dump(), "weakdef-bykind-shape");
+        ASSERT_FALSE(r.has_value()) << bad.dump();
+        EXPECT_EQ(countAtPath(r, "/weakDefinition/byKind"), 1u) << rejectSummary(r);
+    }
+    // CONTROLS — the shipped document loads, and so does one that states BOTH
+    // kinds (an entry equal to the block's dialect is a statement, not an error)
+    // and one that states none (the key is optional).
+    {
+        json both = shippedPeObjectDoc();
+        both["weakDefinition"]["byKind"]["select-any"] = "comdat";
+        auto const r = ObjectFormatSchema::loadFromText(both.dump(), "weakdef-bykind-both");
+        ASSERT_TRUE(r.has_value()) << rejectSummary(r);
+        EXPECT_EQ((*r)->weakDefinitionDialectFor(WeakDefinitionKind::SelectAny),
+                  std::optional{WeakDefinitionDialect::Comdat});
+        EXPECT_EQ((*r)->weakDefinitionDialectFor(WeakDefinitionKind::Overridable),
+                  std::optional{WeakDefinitionDialect::WeakExternal});
+        json none = shippedPeObjectDoc();
+        none["weakDefinition"].erase("byKind");
+        auto const one = ObjectFormatSchema::loadFromText(none.dump(), "weakdef-bykind-none");
+        ASSERT_TRUE(one.has_value()) << rejectSummary(one);
+        EXPECT_EQ((*one)->weakDefinitionDialectFor(WeakDefinitionKind::Overridable),
+                  std::optional{WeakDefinitionDialect::Comdat})
+            << "without the key every kind takes the block's dialect";
+    }
+}
+
+TEST(WeakDefinitionDialect, HandBuiltPerKindEntriesNeedTheBlockAndRealNames) {
+    dss::detail::ObjectFormatData data;
+    data.name               = "synth-weakdef-bykind";
+    data.backend            = dss::link::objectFormatBackendByConfigName("elf");
+    data.dataModel          = DataModel::Lp64;
+    data.headerNameMatching = HeaderNameMatching::CaseSensitive;
+    data.cSymbolDecoration.scheme = CSymbolDecorationScheme::None;
+    data.elf.fileClass      = 2;   // ELFCLASS64
+    data.elf.dataEncoding   = 1;   // ELFDATA2LSB
+    data.elf.machine        = 62;  // EM_X86_64
+    auto const atKey = [&] {
+        std::size_t n = 0;
+        for (auto const& d : data.validate()) {
+            if (d.path == "/weakDefinition/byKind") ++n;
+        }
+        return n;
+    };
+    // Entries beside NO block.
+    data.weakDefinitionByKind = {{WeakDefinitionKind::Overridable, WeakDefinitionDialect::SymbolBinding}};
+    EXPECT_EQ(atKey(), 1u) << "per-kind entries depart from a block's dialect; with no block they say nothing";
+    // CONTROL — the same entry beside its block is fine.
+    data.weakDefinition = WeakDefinition{WeakDefinitionDialect::SymbolBinding};
+    EXPECT_EQ(atKey(), 0u);
+    // An entry whose dialect is the sentinel, and one kind stated twice.
+    data.weakDefinitionByKind = {{WeakDefinitionKind::Overridable, WeakDefinitionDialect::Unspecified}};
+    EXPECT_EQ(atKey(), 1u);
+    data.weakDefinitionByKind = {{WeakDefinitionKind::Overridable, WeakDefinitionDialect::SymbolBinding},
+                                 {WeakDefinitionKind::Overridable, WeakDefinitionDialect::SymbolBinding}};
+    EXPECT_EQ(atKey(), 1u);
+}
+
+TEST(WeakDefinitionDialect, TheGateRefusesAPerKindDialectTheWalkerCannotSpell) {
+    // The shipped PE object document answers with TWO dialects. A walker that
+    // writes only one of them is refused the moment the module holds a weak
+    // definition — naming the one it lacks — and the walker that writes both
+    // passes. (The module's own weak definition states no kind: the check is of
+    // the DOCUMENT against the walker, so a document that gives some kind a
+    // spelling the walker lacks cannot wait for a definition of that kind.)
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+    AssembledModule mod = strongPlusWeakModule("weakfn", "strongfn");
+
+    DiagnosticReporter rep;
+    EXPECT_FALSE(dss::link::format::requireWeakDefinitionDialect(
+        mod, **fmt, WeakDefinitionDialect::Comdat, "probe::encode", rep));
+    EXPECT_TRUE(sawLacksDialect(rep)) << diagText(rep);
+    EXPECT_NE(diagText(rep).find("'weak-external'"), std::string::npos) << diagText(rep);
+
+    static constexpr WeakDefinitionDialect kBoth[] = {WeakDefinitionDialect::Comdat,
+                                                      WeakDefinitionDialect::WeakExternal};
+    DiagnosticReporter ok;
+    EXPECT_TRUE(dss::link::format::requireWeakDefinitionDialects(mod, **fmt, kBoth, "probe::encode", ok));
+    EXPECT_EQ(ok.errorCount(), 0u) << diagText(ok);
+
+    // CONTROL — no weak definition, no question: the one-dialect walker passes.
+    DiagnosticReporter free;
+    EXPECT_TRUE(dss::link::format::requireWeakDefinitionDialect(
+        strongOnlyModule("strongfn"), **fmt, WeakDefinitionDialect::Comdat, "probe::encode", free));
+    EXPECT_EQ(free.errorCount(), 0u) << diagText(free);
 }

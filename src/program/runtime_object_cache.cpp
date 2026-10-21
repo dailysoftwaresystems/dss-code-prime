@@ -220,7 +220,7 @@ static_assert(kPathDigestChars == kPathDigestBytes * 8u / 5u);
 [[nodiscard]] std::expected<std::string, std::string>
 readWholeFile(fs::path const& path, std::string_view role) {
     std::error_code ec;
-    if (!fs::is_regular_file(path, ec) || ec) {
+    if (core::reachedKind(path, ec) != core::EntryKind::File || ec) {
         return std::unexpected(std::format(
             "runtime object cache: the {} '{}' does not exist or is not a "
             "regular file, so its content digest cannot enter the cache key. "
@@ -529,7 +529,7 @@ private:
 readKeyDocumentBeside(fs::path const& artifactPath) {
     fs::path const   documentPath = runtimeKeyDocumentPath(artifactPath);
     std::error_code  ec;
-    if (!fs::exists(documentPath, ec) || ec) return std::optional<std::string>{};
+    if (core::reachedKind(documentPath, ec) == core::EntryKind::Absent || ec) return std::optional<std::string>{};
 
     // ⚠ NOT-A-REGULAR-FILE IS A REFUSAL, AND THE GUARD IS LOAD-BEARING RATHER
     // THAN DEFENSIVE — ✔MEASURED on the WSL x86_64 leg, invisible on Windows.
@@ -540,7 +540,7 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
     // open simply fails and `!in` catches it, which is exactly why a one-leg
     // gate would have shipped this. The sibling reader above already guards
     // with `is_regular_file`; this one did not, and that asymmetry WAS the bug.
-    if (!fs::is_regular_file(documentPath, ec) || ec) {
+    if (core::reachedKind(documentPath, ec) != core::EntryKind::File || ec) {
         return std::unexpected(std::format(
             "the key document '{}' exists but is NOT A REGULAR FILE, so the "
             "stored key cannot be read and a hit cannot be verified. This is a "
@@ -750,8 +750,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         // WHY — a "could not claim a unique temporary file after 10000
         // attempts" message names the directory and explains nothing.
         std::error_code    entryEc;
-        auto const         entry = fs::symlink_status(candidate, entryEc);
-        if (!fs::exists(entry)) {
+        if (core::entryKind(candidate, entryEc) == core::EntryKind::Absent || entryEc) {
             return std::unexpected(unwritableMissRefusal(
                 key,
                 std::format("could not open the temporary file '{}' for "
@@ -792,7 +791,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     }
 
     std::error_code ec;
-    if (fs::exists(destination, ec) && !ec) return {};  // the temp is discarded
+    if (core::reachedKind(destination, ec) != core::EntryKind::Absent && !ec) return {};  // the temp is discarded
     ec.clear();
 
     // ── THE COMMIT IS THE LINKER'S, FOR THE SAME REASON THE CLAIM IS ─────────
@@ -815,7 +814,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         // A concurrent winner landed between the check and the rename. Same
         // key, same bytes — success, and the guard discards our temp.
         std::error_code probeEc;
-        if (fs::exists(destination, probeEc) && !probeEc) return {};
+        if (core::reachedKind(destination, probeEc) != core::EntryKind::Absent && !probeEc) return {};
         return std::unexpected(unwritableMissRefusal(
             key,
             std::format("could not rename '{}' into place as '{}': {}.{}",
@@ -949,7 +948,7 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
                             fs::path const&                objectFormatsDir,
                             ArchiveSiblingRequester const& requester) {
     std::error_code ec;
-    if (!fs::is_directory(objectFormatsDir, ec) || ec) {
+    if (core::reachedKind(objectFormatsDir, ec) != core::EntryKind::Directory || ec) {
         return std::unexpected(std::format(
             "{}: the object-format directory '{}' does not "
             "exist or is not a directory, so the archive-writing sibling of "
@@ -1488,7 +1487,7 @@ lookupRuntimeObject(RuntimeObjectKey const& key) {
     // FALLING THROUGH. Falling through would silently tolerate a corrupt or
     // foreign file in the packaged tree, and "silently tolerate" on a
     // content-addressed store is how a wrong object gets linked.
-    if (fs::is_regular_file(key.shippedArtifactPath, ec) && !ec) {
+    if (core::reachedKind(key.shippedArtifactPath, ec) == core::EntryKind::File && !ec) {
         if (auto refusal = verifyKeyDocumentBeside(key, key.shippedArtifactPath);
             refusal.has_value()) {
             return std::unexpected(std::move(*refusal));
@@ -1503,7 +1502,7 @@ lookupRuntimeObject(RuntimeObjectKey const& key) {
     // store REFUSES on exactly this state), so there is no artifact to pass
     // over — only a location no writer could have reached.
     if (!key.userArtifactPath.empty()
-        && fs::is_regular_file(key.userArtifactPath, ec) && !ec) {
+        && core::reachedKind(key.userArtifactPath, ec) == core::EntryKind::File && !ec) {
         if (auto refusal = verifyKeyDocumentBeside(key, key.userArtifactPath);
             refusal.has_value()) {
             return std::unexpected(std::move(*refusal));
@@ -1551,7 +1550,7 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
     std::error_code ec;
     if (!directory.empty()) {
         fs::create_directories(directory, ec);
-        if (ec && !fs::is_directory(directory)) {
+        if (std::error_code dirEc; ec && core::reachedKind(directory, dirEc) != core::EntryKind::Directory) {
             // The arm an INSTALLED compiler hits when the resolved root is not
             // writable — a read-only volume, a quota, a path whose parent is
             // not a directory. It carries the OS reason verbatim, because

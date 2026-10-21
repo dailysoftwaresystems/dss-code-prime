@@ -1,0 +1,2 @@
+    if (n.kind != NodeKind::Token) treeFatal("Tree::tokenKind on non-Token node");
+    return n.tokenKind;

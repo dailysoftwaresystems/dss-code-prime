@@ -1,0 +1,3 @@
+                                                std::nullopt);
+            if (!folded.has_value()) return std::nullopt;
+            return normalizeToType(std::move(*folded), src_.instType(oldId));

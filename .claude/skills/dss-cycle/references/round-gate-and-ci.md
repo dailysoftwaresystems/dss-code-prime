@@ -6,6 +6,7 @@ a hard stop is in `triggers-and-hard-stops.md`.
 
 ## Contents
 - The end-of-round gate is `{Debug, Release} × four legs` — eight runs (operator ruling 2026-09-14)
+- The sweep of the mutation arms is a step of the same gate (2026-10-10)
 - CI is expensive to RUN and free to READ — and the two rules are opposite
 - The measurement that produced the ruling — and the three corrections it took
 
@@ -31,6 +32,29 @@ leg NAME now, and `dssharness legs` lists every one that can run.
 ★ **The whole gate is ONE invocation: `dssharness test --legs gate`** — `legSets.gate` in
 `.harness-config/config.json` names the eight legs, and each leg's ledger carries its run's count.
 
+### ★★★★ THE SWEEP OF THE MUTATION ARMS IS A STEP OF THE SAME GATE — 2026-10-10
+
+The eight runs prove that every pin's test is GREEN on every leg. They do not prove that any of them can go
+RED — that is the sweep's half, and a round owes both:
+
+- **At the round's close, in the main tree, beside the eight runs: every arm of
+  `tests/mutations/arms.registry`, on the ONE leg its `S` row names** — one `dssharness check-mutations --legs
+  <leg> --json` per leg that an `S` row names. Each is a leg command like any other: in the background, its
+  whole output through the redactor; a whole leg in one command, never cut into batches by hand; and a run that
+  is not yours is never touched (`dss-harness.md`, STOPPING A RUN).
+- **Per fold, the fold's own arms** (`--arms <ids>`), swept by the orchestrator from the main tree on the bytes
+  the fold landed as. A lane writes its arms and hands back; a fold is never held for their sweep, and an arm
+  that does not read `passed` goes back to its lane (who sweeps: `mutation-arms.md`).
+- **Every arm must read `passed`.** A leg is read by its own line — its arms counted by verdict — never by the
+  command's exit code alone; `21` is never a pass, and `7` measured nothing.
+- **A leg that did not reach its arms is STATED with the tool's reason, never skipped** — the same rule a
+  declined leg of the eight has.
+- **A row that rests on a pin closes only on arms that passed on the bytes it closes on.** A fold is handed
+  back with its arms written and unswept: it names them, and closes nothing that rests on one until they passed.
+
+The declaration of an arm, the verdicts, the command lines, what a sweep costs and which trees a leg can be
+swept from are in `mutation-arms.md`.
+
 ### ⚠⚠ CI IS EXPENSIVE TO **RUN** AND FREE TO **READ** — AND THE TWO RULES ARE OPPOSITE
 
 - ⛔ **NEVER make CI run.** The Pipeline workflow is `pull_request`-triggered and gated on a
@@ -41,6 +65,20 @@ leg NAME now, and `dssharness legs` lists every one that can run.
   round owes.
 - ✅ **ALWAYS read whatever verdict already exists.** Reading costs nothing, and step 0 now does it
   with `dssharness check-ci-legs`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
+- ★★★ **THE ONE EXCEPTION IS A PR EXIT THE OPERATOR ORDERS — and then the pipes are the cycle's own
+  last steps.** Operator, 2026-10-08, verbatim: *"on finishing this cycle I'll turn on the pipes and
+  try to merge this PR, so this cycle finishes with commit + push + enable "Run Pipes" in PR and
+  monitor CI until green"*. When — and ONLY when — the operator has said a cycle ends this way:
+  1. the cycle's close is everything it always was (every lane re-reviewed clean, the eight runs, the
+     sqlite recompile and `veryquick`, the final review, the handoff rewritten, commit, push);
+  2. THEN the session adds the `Run Pipes` label to the PR itself, and says it did;
+  3. THEN it watches the verdict to GREEN — a red leg is diagnosed and FIXED (a fix, never a re-run
+     for luck), the fix goes through the fold checks and is pushed, which starts the next run — and
+     reports each leg with its build type; the cycle is not finished, and its orchestrator is not
+     deleted, while a leg is red or unread;
+  4. the MERGE stays the operator's.
+  Without that instruction for the PR in hand, the ban above is whole: no label, no re-run, no push
+  to obtain a verdict. The instruction is per PR exit; it is not a standing licence.
 
 ★ **This corrects a framing I first wrote into a row, and the correction is the point.** I filed
 *"no step of `/dss-cycle` reads CI at all"* as though the READING were the defect, and then
@@ -78,6 +116,13 @@ while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on tha
      the TREE, not the machine — **so which legs execute it is a CONFIGURATION decision, and a
      leg that skips it can never see a guard-only defect.** Derive the leg set from the run you
      are looking at (the per-leg totals differ by exactly the guard count), never from memory.
+     ★★ **AND A SELF-TEST IS NOT A REPO GUARD.** An entry that self-tests a program reads the program's
+     own fixtures, and that verdict CAN depend on the host — case, path separators, path spelling, what
+     the host's git does — so it never carries `repo-guard` and every leg runs it, the indirect ones
+     included. An entry self-tests when it carries the `self-test` label, which the helpers that
+     register one give it. The rule is stated where `repo-guard` is given (the root `CMakeLists.txt`),
+     and `harness/repo_guard_label_check` refuses a build in which an entry carries both labels, or
+     asks a program for its self-test on its command line without the `self-test` label.
      ★★★ **AND THE LEG SET IS DECLARED, NOT DECIDED THREE TIMES.** ✔MEASURED 2026-09-16, while
      three hand-written drivers still existed: each chose its own default, so one passed
      `-LE repo-guard` on the two ssh legs while another ran every guard on WSL — Windows **2207**,

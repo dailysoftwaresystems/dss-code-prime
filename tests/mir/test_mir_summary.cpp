@@ -40,6 +40,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/summary/mir_summary.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -194,9 +195,11 @@ TEST(MirSummary, SummaryCarriesLinkageAndDirectives) {
     MirBuilder mb;
     // Weak + hidden + noinline + always_inline + no-optimize, all at once, so
     // a field that is dropped or crossed with its neighbour shows up here.
-    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Weak,
-                   SymbolVisibility::Hidden, /*noInline=*/true,
-                   /*alwaysInline=*/true, /*noOptimize=*/true);
+    mb.addFunction(fnSig, SymbolId{50},
+                   dss::test_support::linkageOf(SymbolBinding::Weak,
+                                                SymbolVisibility::Hidden),
+                   /*noInline=*/true, /*alwaysInline=*/true,
+                   /*noOptimize=*/true);
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
     mb.addReturn(mb.addConst(i32Lit(7), i32));

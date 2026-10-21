@@ -1,0 +1,1 @@
+        if (landing >= first && landing <= last) {

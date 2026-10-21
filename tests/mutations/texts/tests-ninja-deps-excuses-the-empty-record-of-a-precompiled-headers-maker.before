@@ -1,0 +1,1 @@
+    if any(w.startswith(_PCH_MAKE_FLAGS) or w == "-emit-pch" for w in words):

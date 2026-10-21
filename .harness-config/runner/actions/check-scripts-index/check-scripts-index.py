@@ -76,7 +76,11 @@ THE CONTRACT, and every clause is a way the index can lie:
  12. every PROGRAM (a file with a `__main__` guard) that loads another program -- by path,
      through `sys.path`, or by importing a module beside it -- switches bytecode writing off
      at MODULE level before its first load: a `__pycache__` written beside another action
-     moves the inputs of a `requireInputsUnmoved` action (see `bytecode_refusal`).
+     moves the inputs of a `requireInputsUnmoved` action (see `bytecode_refusal`);
+ 13. every verb a program offers is started by a step, or recorded and verified (`verb_census`);
+ 14. every argument that names a path a program WRITES -- its dest one of WRITTEN_DESTS -- takes
+     owning-tree's `written_path_arg(<its own flag>)` as its argparse `type=`: argparse alone takes
+     `--out=--help` as that path (`written_path_census`).
 
 ⚠ Clauses 5-8 exist because an INDEPENDENT AUDIT got the first draft of this
 guard to report GREEN over each of them, and clause 9's arm was passing for the
@@ -87,10 +91,10 @@ Exit codes: 0 OK · 1 index disagrees with the tree, or an action is unreachable
 2 the scan collapsed (structural failure: fix the scan, never lower the floor) ·
 3 usage error.
 
-Usage:
-    python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py            # verify
-    python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py --write    # regenerate
-    python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py --selftest # prove it fails
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-scripts-index                           # verify, then the self-test
+    dssharness run check-scripts-index-write                     # --write: regenerate, this machine's tree
+    dssharness run check-scripts-index --manual-step self-test   # --selftest: prove it fails
 """
 from __future__ import annotations
 
@@ -185,8 +189,11 @@ FORBIDDEN_EXTS = (".sh", ".ps1")
 ACTION_EXTS = (".yml", ".yaml")
 
 # The two directory names DssHarness gives every action for a run's working space and
-# kept output, at whatever depth it is grouped. Both are gitignored run output, never
-# tracked (`dssharness help runners`), so nothing in one is a program of this repository.
+# kept output, at whatever depth it is grouped (`dssharness help runners`). Both are
+# gitignored, so a walk leaves them out as it leaves out everything git ignores -- the
+# tree's own `.gitignore`, asked through `owning-tree`'s `TreeIgnores`, the one statement
+# every walker asks. The names stay here for the LAYOUT rule alone: a GROUP directory so
+# named is refused, as the tool refuses the name anywhere along an action path.
 RUN_DIRS = ("build", "artifacts")
 
 # What a GROUP directory may hold directly besides directories: this index's own
@@ -294,12 +301,25 @@ def primary_script(action_dir, name):
     return cand if os.path.isfile(cand) else None
 
 
-def forbidden_programs(base):
-    """Every `.sh`/`.ps1` under the actions root `base`, actions-relative, sorted -- the
-    tool's run directories and bytecode caches excepted (ignored output, never the tree's)."""
+def walk_tree(ignores, top):
+    """`ignores.walk(top)` (`owning-tree`'s `TreeIgnores`: what git ignores in the tree, and
+    `.git`, left out), directories in sorted order; a directory the walk cannot list, or a path
+    the reader cannot answer as git does, collapses -- never a walk that read less than it says."""
+    ot = _owning_tree()
+    try:
+        for dirpath, dirs, files in ignores.walk(top):
+            dirs.sort()
+            yield dirpath, dirs, files
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
+
+
+def forbidden_programs(base, ignores):
+    """Every `.sh`/`.ps1` under the actions root `base`, actions-relative, sorted -- less what
+    the tree leaves out (the tool's run directories and bytecode caches among it: ignored
+    output, never the tree's)."""
     found = []
-    for dirpath, dirs, files in os.walk(base):
-        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and d.lower() not in RUN_DIRS)
+    for dirpath, _dirs, files in walk_tree(ignores, base):
         for f in sorted(files):
             if os.path.splitext(f)[1].lower() in FORBIDDEN_EXTS:
                 found.append(_rel(base, os.path.join(dirpath, f)))
@@ -637,18 +657,19 @@ def _rel(root, path):
     return os.path.relpath(path, root).replace(os.sep, "/")
 
 
-def _scan_action(root, base, directory, afile):
+def _scan_action(root, base, directory, afile, ignores=None):
     """One action directory -> an Entry, refusing every layout it cannot index."""
     name = os.path.basename(directory)
     rel = _rel(base, directory)
+    ignores = ignores if ignores is not None else _owning_tree().TreeIgnores(root)
 
     # NOTHING BURIED, NOTHING NESTED. A program one level deeper than its action file is
     # as invisible as a loose one; an action inside an action has two owners, which the
     # tool refuses too (`ActionPath.RefuseNesting`). Assets in subdirectories stay fine
-    # -- only programs and action files are refused -- and the tool's own run
-    # directories are skipped: they are ignored output at any depth.
-    for sub_dir, dirs, files in os.walk(directory):
-        dirs[:] = [d for d in dirs if d != "__pycache__" and d.lower() not in RUN_DIRS]
+    # -- only programs and action files are refused -- and what the tree leaves out is not
+    # walked: the tool's own run directories and bytecode caches are ignored output at any
+    # depth.
+    for sub_dir, dirs, files in walk_tree(ignores, directory):
         if os.path.abspath(sub_dir) == os.path.abspath(directory):
             continue
         inner = action_file(sub_dir)
@@ -710,7 +731,12 @@ def scan(root):
     # NO SHELL AND NO POWERSHELL, anywhere under the actions root (operator ruling
     # 2026-09-21): an action's entry point is its `.yml`, and what the `.yml` starts is
     # Python. A `.sh` or `.ps1` is specific to one OS, which is the reason it was ruled out.
-    shells = forbidden_programs(base)
+    ot = _owning_tree()
+    try:
+        ignores = ot.TreeIgnores(root)
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
+    shells = forbidden_programs(base, ignores)
     if shells:
         raise Collapse(
             "%d shell/PowerShell program(s) sit under %s: %s. An action ships no .sh and no "
@@ -742,7 +768,7 @@ def scan(root):
         found = 0
         for n in sorted(os.listdir(directory)):
             sub = os.path.join(directory, n)
-            if not os.path.isdir(sub) or n == "__pycache__" or bytecode_husk(sub):
+            if not os.path.isdir(sub):
                 continue
             if n.lower() in RUN_DIRS:
                 raise Collapse(
@@ -750,9 +776,15 @@ def scan(root):
                     "action already owns one of that name for a run's output, which is "
                     "gitignored, so DssHarness refuses the name anywhere along an action "
                     "path." % (rel, n, n))
+            try:
+                left_out = ignores.leaves_out(ignores.rel(sub), True)
+            except ot.Refusal as exc:
+                raise Collapse(str(exc))
+            if left_out or bytecode_husk(sub):
+                continue
             afile = action_file(sub)
             if afile is not None:
-                entries.append(_scan_action(root, base, sub, afile))
+                entries.append(_scan_action(root, base, sub, afile, ignores))
                 found += 1
                 continue
             if primary_script(sub, n) is not None:
@@ -812,6 +844,883 @@ def runner_actions(root):
             if isinstance(r, dict) and r.get("action")}
 
 
+# ── CLAUSE 13: EVERY VERB A PROGRAM OFFERS IS STARTED BY A STEP (2026-09-30, cycle P69) ─────────────────────────
+# ★★★ THE OPERATOR'S ORDER OF 2026-09-24 routes the repository's operations through DssHarness, and work an action
+# owns but a plain run must not do is a MANUAL STEP of that action. A verb a program offers that no step, no ctest
+# entry and no reached program starts is a script someone must start BY HAND -- the class the registry row on
+# action program verbs measured at five instances plus a heuristic tail, and which grows unseen unless a guard
+# counts it. So every command-line token a program dispatches on is either REACHED -- a token on a run line of a
+# step that starts the program (anchor-rows' `--step` table included), or after the program's path in an
+# `add_test` COMMAND of the root CMakeLists.txt -- or RECORDED in `verbs.json` under a category this clause
+# VERIFIES every run; a record that no longer verifies is as red as a missing one. There is no category for
+# "run by hand". ⚠ A pipe FILTER is no exception to write down: it dispatches on no token (standard input is the
+# no-argument form), and a runner step could not feed it anyway -- a step reads no standard input (✔MEASURED
+# 2026-09-30, run 20260930-164007-b87cbb24).
+# ★★ AND A VERB'S LEGS FIT IT: a step that WRITES this machine's tree (declared in `verbs.json` as a tree writer,
+# and any step whose run line carries a write token must be declared one) is reachable through a runner of ONE
+# leg that names no other host, whose `steps` name it -- and every `dssharness run <runner> --manual-step <step>`
+# a program prints names such a runner for such a step (a two-leg runner's `--manual-step write` rewrote the WSL
+# leg's synced copy too: the round-13 audit's F1-A11). This clause is the ONE statement of that fact; the guards
+# that each re-checked their own runner no longer do. A step whose write goes into its OWN KEPT OUTPUT (`persist`,
+# its `outputs`, `{stepBuild}` on its run line) writes no tree: it may run on any leg, its file pulled back and
+# reviewed -- and it is never declared a tree writer (2026-10-01, the P69 review's MAJOR 2).
+VERBS_REL = os.path.join(ACTIONS_REL, "check-scripts-index", "verbs.json")
+CMAKE_REL = "CMakeLists.txt"
+_OPTION = re.compile(r"^--[a-z][a-z0-9-]*$")
+_BARE_VERB = re.compile(r"^[a-z][a-z0-9-]*$")
+HELP_TOKENS = frozenset(("--help", "-h"))
+# The tokens that make a run line a WRITE of the tree, and so a step that must be declared a tree writer.
+WRITE_TOKENS = frozenset(("--write", "--apply", "--update", "--regen", "--baseline", "--insert"))
+VERB_CATEGORIES = ("driven", "self-driven", "alias", "test-source")
+_RUN_TOKEN = re.compile(r'"[^"]*"|[^\s"]+')
+_REMEDY = re.compile(r"dssharness run ([A-Za-z0-9_.-]+)(?:[^\n`'\"]*?--manual-step ([A-Za-z0-9_,-]+))?")
+# A program of an action started by hand: any Python launcher (`python`, `python3`, `python3.12`, `python.exe`, the
+# Windows `py -3`), any slash -- a Windows path is one too (the P69 review: the rule saw forward slashes alone).
+_SCRIPT_REMEDY = re.compile(r"(?i)\b(?:python(?:3(?:\.\d+)?)?(?:\.exe)?|py(?:\.exe)?\s+-3)\s+\S*\.harness-config"
+                            r"[\\/]+runner[\\/]+actions[\\/]+\S+\.py\b")
+
+
+def yml_steps(path):
+    """-> [{name, manual, unmoved, persist, outputs, run: [lines], inputs: [names]}] of one action file, read in the
+    ONE layout every action here keeps (a step at two spaces, its keys at four, a `run: |` block below, inputs at
+    six, `outputs` an inline list) -- which `verb_census` holds: a file this reader finds no step in is a COLLAPSE,
+    never an action with nothing to reach."""
+    steps, cur, where = [], None, None
+    for raw in io.open(path, "r", encoding="utf-8").read().splitlines():
+        if raw.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^  - name: *['\"]?([^'\"\s]+)['\"]?\s*$", raw)
+        if m:
+            cur, where = {"name": m.group(1), "manual": False, "unmoved": False, "run": [], "inputs": [],
+                          "persist": False, "outputs": []}, None
+            steps.append(cur)
+            continue
+        if cur is None:
+            continue
+        if re.match(r"^\S", raw):
+            cur, where = None, None
+            continue
+        key = re.match(r"^    ([A-Za-z]+):\s*(.*)$", raw)
+        if key:
+            where = {"run": "run", "inputs": "inputs"}.get(key.group(1))
+            if key.group(1) == "manual":
+                cur["manual"] = key.group(2).strip() == "true"
+            elif key.group(1) == "requireInputsUnmoved":
+                cur["unmoved"] = key.group(2).strip() == "true"
+            elif key.group(1) == "persist":
+                cur["persist"] = key.group(2).strip() == "true"
+            elif key.group(1) == "outputs":
+                cur["outputs"] = [s.strip().strip("'\"") for s in key.group(2).strip().strip("[]").split(",")
+                                  if s.strip()]
+            continue
+        if where == "run" and raw.strip():
+            cur["run"].append(raw.strip())
+        elif where == "inputs":
+            m = re.match(r"^      ([A-Za-z_][A-Za-z0-9_]*):\s*$", raw)
+            if m:
+                cur["inputs"].append(m.group(1))
+    return steps
+
+
+def run_tokens(line):
+    """A run line as DssHarness splits it: whitespace, double quotes only, no escapes; `--x=v` is also `--x`."""
+    out = []
+    for t in _RUN_TOKEN.findall(line):
+        t = t.strip('"')
+        out.append(t)
+        if t.startswith("--") and "=" in t:
+            out.append(t.split("=", 1)[0])
+    return out
+
+
+def _const(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+# ★★ WHICH EXPRESSIONS CARRY THE COMMAND LINE: a DATA PATH, never a variable's NAME. The first draft seeded every
+# name spelled `argv`, `args` or `argv_` and walked every constant inside a tainted side, and ✔MEASURED 2026-09-30 on
+# this tree it counted record fields (`row["kind"] == "armed"`, a subscript KEY), an argparse Namespace's values and
+# a child process's argv (`spawn(argv, ...)`) as verbs: 40 of `harness_legs.py`'s 58 unreached tokens were data. So
+# the taint starts ONLY at `sys.argv` and flows -- per SCOPE, so a name is tainted where its value came from the
+# command line and nowhere else -- into a name assigned from (or looping over) a tainted value; through the
+# conversions that keep the elements (`list`, `tuple`, `sorted`, ...), a conditional, a boolean choice, a
+# concatenation, a comprehension over it and a method called on it (`a.partition("=")`); and from a call's tainted
+# argument into the called function's parameter. An argparse Namespace (`ap.parse_args(argv)`) is NOT tainted: its
+# options are counted where they are DECLARED (`add_argument`), and a choice among one option's values is not a verb.
+# ★ WHAT a tainted value is decides what its comparison declares, so the taint keeps three KINDS: the LIST (`argv`,
+# a slice of it), one whole TOKEN of it (`argv[0]`, a loop variable over it) and a PART of one (what a method
+# returns: `a.partition("=")`, and so an input's value after `name=`). An option (`--x`) is declared against any of
+# the three; a bare verb only against a whole token, or by membership in the list (`"clean" in argv`) -- the second
+# draft took `liveOnly=true`'s `true` for a verb. Only the LITERAL side of a comparison is read (and a module-level
+# tuple, list or set of literals it names) -- never a constant inside the tainted side, where a subscript key sits.
+_NODES = {}
+
+
+def _all_nodes(tree):
+    """Every node of a parsed program, in ast.walk's order, walked ONCE: the census asks each program several
+    questions (its surface, its passed literals, its imports, its remedies), and a walk per question was most of
+    its time (✔MEASURED 2026-09-30, census_profile: 5.4 million ast.walk steps for one census)."""
+    got = _NODES.get(id(tree))
+    if got is None or got[0] is not tree:
+        got = (tree, list(ast.walk(tree)))
+        _NODES[id(tree)] = got
+    return got[1]
+
+
+_TAINT_KEEPERS = frozenset(("list", "tuple", "iter", "sorted", "reversed", "enumerate", "zip"))
+_SCOPES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_LIST, _TOKEN, _PART = "list", "token", "part"
+
+
+class ArgvTaint(object):
+    """The command line's data path through one parsed program (the block above says how it flows)."""
+
+    def __init__(self, tree):
+        self.tree = tree
+        self.parent = {}
+        for n in _all_nodes(tree):
+            for c in ast.iter_child_nodes(n):
+                self.parent[id(c)] = n
+        self.defs = {}
+        for n in _all_nodes(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.defs.setdefault(n.name, []).append(n)
+        self.names = {}          # id(scope node) -> {name: {kind, ...}}
+        self.collections = {}    # module-level NAME = (literal, ...) -> its literals
+        for n in tree.body:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                lits = _display_literals(n.value)
+                if lits is not None:
+                    self.collections[n.targets[0].id] = lits
+        # the nodes a pass reads, collected ONCE: a pass over them repeats, a walk of the whole program need not
+        self.binders = [n for n in _all_nodes(tree) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                                                   ast.NamedExpr, ast.For, ast.AsyncFor,
+                                                                   ast.comprehension, ast.Call))]
+        for _ in range(12):
+            if not self._pass():
+                break
+
+    def scope_of(self, node):
+        n = self.parent.get(id(node))
+        while n is not None and not isinstance(n, _SCOPES):
+            n = self.parent.get(id(n))
+        return self.tree if n is None else n
+
+    def _chain(self, scope):
+        """The scope and every scope enclosing it: a closure reads its enclosing scopes' names."""
+        out = [scope]
+        while scope is not self.tree:
+            scope = self.scope_of(scope)
+            out.append(scope)
+        return out
+
+    def kinds(self, node, scope=None):
+        """-> the set of kinds `node` carries (empty: it does not carry the command line)."""
+        scope = self.scope_of(node) if scope is None else scope
+        if isinstance(node, ast.Attribute):
+            if node.attr == "argv" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+                return {_LIST}
+            return {_PART} if self.kinds(node.value, scope) else set()
+        if isinstance(node, ast.Name):
+            out = set()
+            for s in self._chain(scope):
+                out |= self.names.get(id(s), {}).get(node.id, set())
+            return out
+        if isinstance(node, ast.Starred):
+            return self.kinds(node.value, scope)
+        if isinstance(node, ast.Subscript):
+            k = self.kinds(node.value, scope)
+            if not k:
+                return set()
+            if isinstance(node.slice, ast.Slice):
+                return {_LIST if x == _LIST else _PART for x in k}
+            return {_TOKEN if x == _LIST else _PART for x in k}
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                return {_PART} if self.kinds(node.func.value, scope) else set()
+            if isinstance(node.func, ast.Name) and node.func.id in _TAINT_KEEPERS:
+                k = set()
+                for a in node.args:
+                    k |= self.kinds(a, scope)
+                return {_LIST} if _LIST in k else ({_PART} if k else set())
+            return set()
+        if isinstance(node, ast.IfExp):
+            return self.kinds(node.body, scope) | self.kinds(node.orelse, scope)
+        if isinstance(node, ast.BoolOp):
+            out = set()
+            for v in node.values:
+                out |= self.kinds(v, scope)
+            return out
+        if isinstance(node, ast.BinOp):
+            k = self.kinds(node.left, scope) | self.kinds(node.right, scope)
+            return {_LIST} if _LIST in k else ({_PART} if k else set())
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            return {_LIST} if any(self.kinds(g.iter, scope) for g in node.generators) else set()
+        if isinstance(node, ast.NamedExpr):
+            return self.kinds(node.value, scope)
+        return set()
+
+    def tainted(self, node, scope=None):
+        return bool(self.kinds(node, scope))
+
+    def _add(self, scope, name, kinds):
+        have = self.names.setdefault(id(scope), {}).setdefault(name, set())
+        if kinds <= have:
+            return False
+        have |= kinds
+        return True
+
+    def _bind(self, target, kinds, scope, element):
+        """Bind `target` to a value of `kinds`; `element` means one ELEMENT of it (a loop, an unpacking)."""
+        if element:
+            kinds = {_TOKEN if k == _LIST else _PART for k in kinds}
+        grew = False
+        if isinstance(target, ast.Name):
+            grew |= self._add(scope, target.id, kinds)
+        elif isinstance(target, ast.Starred):
+            grew |= self._bind(target.value, {_LIST if k == _TOKEN else k for k in kinds} if element else kinds,
+                               scope, False)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for e in target.elts:
+                grew |= self._bind(e, {_TOKEN if k == _LIST else _PART for k in kinds} if not element else kinds,
+                                   scope, False)
+        return grew
+
+    def _pass(self):
+        grew = False
+        for n in self.binders:
+            if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                scope = self.scope_of(n)
+                # `t, inline = argv[i], None`: a tuple assigned from a tuple display binds PAIRWISE.
+                if isinstance(n.value, (ast.Tuple, ast.List)):
+                    for t in targets:
+                        if isinstance(t, (ast.Tuple, ast.List)) and len(t.elts) == len(n.value.elts):
+                            for te, ve in zip(t.elts, n.value.elts):
+                                kv = self.kinds(ve)
+                                if kv:
+                                    grew |= self._bind(te, kv, scope, False)
+                    continue
+                k = self.kinds(n.value) if n.value is not None else set()
+                if k:
+                    for t in targets:
+                        grew |= self._bind(t, k, scope, False)
+            elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                k = self.kinds(n.iter)
+                if k:
+                    grew |= self._bind(n.target, k, self.scope_of(n), True)
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in self.defs:
+                for d in self.defs[n.func.id]:
+                    params = [a.arg for a in d.args.posonlyargs + d.args.args]
+                    for i, a in enumerate(n.args):
+                        if isinstance(a, ast.Starred):
+                            break
+                        k = self.kinds(a) if i < len(params) else set()
+                        if k:
+                            grew |= self._add(d, params[i], k)
+                    for kw in n.keywords:
+                        k = self.kinds(kw.value) if kw.arg else set()
+                        if k:
+                            grew |= self._add(d, kw.arg, k)
+        return grew
+
+    def literals(self, side):
+        """The string literals a NON-tainted comparison side offers: itself, a display's elements, or the elements
+        of the module-level collection it names."""
+        lits = _display_literals(side)
+        if lits is not None:
+            return lits
+        if isinstance(side, ast.Name):
+            return self.collections.get(side.id, [])
+        c = _const(side)
+        return [c] if c is not None else []
+
+
+def _display_literals(node):
+    """A tuple/list/set display of string literals, or `frozenset(...)`/`set(...)`/`tuple(...)` of one -> its
+    literals; anything else -> None."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("frozenset", "set", "tuple") \
+            and len(node.args) == 1:
+        node = node.args[0]
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [c for c in (_const(e) for e in node.elts) if c is not None]
+    return None
+
+
+def program_surface(tree):
+    """-> {token: kind} a PROGRAM dispatches on: `add_parser` names, `add_argument` long options, and the literals a
+    comparison (==, !=, in, not in) or a `startswith` holds against the COMMAND LINE (`ArgvTaint`) -- an option
+    (`--x`) against any part of it, a bare verb only against a whole token of it or by membership in it."""
+    taint = ArgvTaint(tree)
+    found = {}
+    # ★ An option DECLARED IN A LOOP (`for flag in ("--sqlite-dir", "--dss", ...): p.add_argument(flag, ...)`) is
+    # declared as surely as a literal one: the loop variable stands for every literal the loop walks. ✔MEASURED
+    # 2026-09-30: benchmark_speedtest1 declares seven options that way, and the census could not see five of them.
+    looped = {}
+    for n in _all_nodes(tree):
+        if isinstance(n, (ast.For, ast.AsyncFor)) and isinstance(n.target, ast.Name):
+            lits = taint.literals(n.iter)
+            if lits:
+                looped.setdefault(n.target.id, []).extend(lits)
+    for n in _all_nodes(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr == "add_parser" and n.args and _const(n.args[0]):
+                found.setdefault(_const(n.args[0]), "subcommand")
+            elif n.func.attr == "add_argument":
+                for a in n.args:
+                    for c in ([_const(a)] if _const(a) else looped.get(a.id, []) if isinstance(a, ast.Name) else []):
+                        if c and _OPTION.match(c):
+                            found.setdefault(c, "option")
+            elif n.func.attr == "startswith" and taint.tainted(n.func.value):
+                for a in n.args:
+                    for c in taint.literals(a):
+                        if _OPTION.match(c.rstrip("=")):
+                            found.setdefault(c.rstrip("="), "option")
+        elif isinstance(n, ast.Compare):
+            sides = [n.left] + list(n.comparators)
+            hot = [(s, taint.kinds(s)) for s in sides]
+            hot = [(s, k) for s, k in hot if k]
+            if not hot:
+                continue
+            bare = any(_TOKEN in k for _s, k in hot) or (
+                any(_LIST in k for _s, k in hot) and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops))
+            for s in sides:
+                if any(s is h for h, _k in hot):
+                    continue
+                for c in taint.literals(s):
+                    if _OPTION.match(c):
+                        found.setdefault(c, "option")
+                    elif bare and _BARE_VERB.match(c) and len(c) > 2:
+                        found.setdefault(c, "verb")
+    return found
+
+
+_LITERALS = {}
+
+
+def argument_literals(tree):
+    """(Computed once per parsed program -- `_argument_literals` says what it is.)"""
+    got = _LITERALS.get(id(tree))
+    if got is None or got[0] is not tree:
+        got = (tree, _argument_literals(tree))
+        _LITERALS[id(tree)] = got
+    return got[1]
+
+
+def _argument_literals(tree):
+    """The string constants a program PASSES: elements of a list, tuple or set display, and call arguments --
+    never a comparison's operand (that is where a token is dispatched on), nor a display bound to a name a
+    comparison reads (`known = ("--a", "--b")` then `a not in known`: a declaration spelled in two statements --
+    ✔MEASURED 2026-09-30, such a tuple made every option of `check-line-endings` look self-driven), nor an
+    add_argument/add_parser argument (where it is declared). How a `driven` or `self-driven` record is verified: by
+    position in the parsed program, never by the text appearing somewhere in it."""
+    skip, member_of = set(), set()
+    for n in _all_nodes(tree):
+        if isinstance(n, ast.Compare):
+            skip.update(id(s) for s in ast.walk(n))
+            # the NAMES a membership test reads (`a not in known`): what such a name holds is a vocabulary
+            sides = [n.left] + list(n.comparators)
+            for op, right in zip(n.ops, sides[1:]):
+                if isinstance(op, (ast.In, ast.NotIn)) and isinstance(right, ast.Name):
+                    member_of.add(right.id)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("add_argument",
+                                                                                               "add_parser"):
+            skip.update(id(s) for s in ast.walk(n))
+    # ...and only a display of LITERALS ALONE bound to such a name is a declaration. `argv = [python, gen, "--tus",
+    # tus]` is a command line whatever later compares it, and `plan = resolver.json([...])` passes its list (both
+    # ✔MEASURED 2026-09-30 in the sqlite driver: an unqualified rule hid eleven passed options).
+    for n in _all_nodes(tree):
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in member_of for t in n.targets):
+            lits = _display_literals(n.value)
+            shown = n.value.args[0] if isinstance(n.value, ast.Call) and n.value.args else n.value
+            if lits is not None and len(lits) == len(getattr(shown, "elts", ())):
+                skip.update(id(s) for s in ast.walk(n.value))
+    out = set()
+    for n in _all_nodes(tree):
+        elts = []
+        if isinstance(n, (ast.List, ast.Tuple, ast.Set)):
+            elts = n.elts
+        elif isinstance(n, ast.Call):
+            elts = list(n.args) + [k.value for k in n.keywords]
+        for e in elts:
+            c = _const(e)
+            if c is not None and id(e) not in skip:
+                out.add(c)
+                if c.startswith("--") and "=" in c:
+                    out.add(c.split("=", 1)[0])
+    # ★ A FORMATTED OPTION TOKEN IS PASSED AS SURELY AS A LITERAL ONE (2026-09-30): `"--failure=%s" % t` and
+    # `f"--assert-translated={a}"` hand the child `--failure` and `--assert-translated`, and the sqlite driver's
+    # modules spell every repeated option that way. Only the option NAME before `=` is counted, never the value.
+    for n in _all_nodes(tree):
+        lead = None
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mod):
+            lead = _const(n.left)
+        elif isinstance(n, ast.JoinedStr) and n.values:
+            lead = _const(n.values[0])
+        if lead and id(n) not in skip and "=" in lead and _OPTION.match(lead.split("=", 1)[0]):
+            out.add(lead.split("=", 1)[0])
+    return out
+
+
+_INDEX = {}
+
+
+def _index(tree):
+    """-> (the program's string constants, the module names it imports), walked ONCE per parsed program: the census
+    asks both of every pair of programs, and `harness_legs.py` alone is some 19 000 lines (✔MEASURED 2026-09-30: a
+    walk per question took the census past two minutes). The tree is kept beside its id, so a reused id is a miss."""
+    got = _INDEX.get(id(tree))
+    if got is None or got[0] is not tree:
+        consts, imports = [], set()
+        for n in _all_nodes(tree):
+            c = _const(n)
+            if c is not None:
+                consts.append(c)
+            elif isinstance(n, ast.Import):
+                imports.update(a.name.split(".")[0] for a in n.names)
+            elif isinstance(n, ast.ImportFrom) and n.module:
+                imports.add(n.module.split(".")[0])
+        got = (tree, consts, imports)
+        _INDEX[id(tree)] = got
+    return got[1], got[2]
+
+
+def imports_module(tree, module):
+    """Does the parsed program IMPORT `module` by name (`import m`, `import m as x`, `from m import y`)?"""
+    return module in _index(tree)[1]
+
+
+def running_set(parsed, started):
+    """The programs whose code RUNS: every started one, and -- to a fixpoint -- every module a running one imports
+    by name (the sqlite driver imports `sqlite_units`, whose code starts `harness_legs.py` with the tokens it
+    passes: the process is the driver's, the argument literals are the module's)."""
+    by_module = {}
+    for q in parsed:
+        by_module.setdefault(os.path.splitext(os.path.basename(q))[0], []).append(q)
+    running, stack = set(started), sorted(started)
+    while stack:
+        p = stack.pop()
+        if p not in parsed:
+            continue
+        for module in _index(parsed[p])[1]:
+            for q in by_module.get(module, ()):
+                if q not in running:
+                    running.add(q)
+                    stack.append(q)
+    return running
+
+
+def references_program(tree, basename):
+    """Does the parsed program name `basename` (a `.py` file of the same action) -- a string holding its file name,
+    or an import of its module?"""
+    consts, imports = _index(tree)
+    return os.path.splitext(basename)[0] in imports or any(basename in c for c in consts)
+
+
+def step_table(tree):
+    """anchor-rows' convention: a module-level `STEP_INPUTS` mapping verb -> ((input, kind), ...). -> {verb: [the
+    options its inputs become]} (a `dir` input is positional, every other kind `--<kebab>`)."""
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "STEP_INPUTS" for t in n.targets):
+            table = {}
+            for pair in ast.walk(n.value):
+                if isinstance(pair, ast.Tuple) and len(pair.elts) == 2 and _const(pair.elts[0]) \
+                        and isinstance(pair.elts[1], ast.Tuple):
+                    opts = []
+                    for inp in pair.elts[1].elts:
+                        if isinstance(inp, ast.Tuple) and len(inp.elts) == 2 and _const(inp.elts[1]) != "dir":
+                            opts.append("--" + re.sub(r"([A-Z])", lambda m: "-" + m.group(1).lower(),
+                                                      _const(inp.elts[0])))
+                    table[_const(pair.elts[0])] = opts
+            return table
+    return {}
+
+
+def ctest_tokens(root):
+    """{action-relative program path: tokens after it} from every `add_test` COMMAND in the root CMakeLists.txt."""
+    path = os.path.join(root, CMAKE_REL)
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    text = io.open(path, "r", encoding="utf-8").read()
+    for block in re.finditer(r"add_test\s*\((.*?)\)\s*\n", text, re.S):
+        body = block.group(1)
+        m = re.search(r"\.harness-config/runner/actions/([^\s\"]+\.py)\"?(.*?)(?:WORKING_DIRECTORY|$)", body, re.S)
+        if m:
+            toks = [t.strip('"') for t in re.findall(r'"[^"]*"|\S+', m.group(2))]
+            out.setdefault(m.group(1), set()).update(t.split("=", 1)[0] if t.startswith("--") else t for t in toks)
+    return out
+
+
+def load_config(root):
+    ot = _owning_tree()
+    return json.loads(ot.strip_jsonc(io.open(os.path.join(root, CONFIG_REL), "r", encoding="utf-8").read(),
+                                     CONFIG_REL.replace(os.sep, "/")))
+
+
+def verb_census(root, entries):
+    """Clause 13 -> (problems, counts). `counts` says how many tokens were REACHED, RECORDED and left RED."""
+    base = os.path.join(root, ACTIONS_REL)
+    cfg = load_config(root)
+    runners = cfg.get("predefinedRunners") or {}
+    legs = cfg.get("legs") or {}
+    try:
+        record = json.loads(io.open(os.path.join(root, VERBS_REL), "r", encoding="utf-8").read())
+    except (OSError, ValueError) as exc:
+        raise Collapse("%s cannot be read (%s): the verb census has no record to verify, so it would pass over "
+                       "nothing" % (VERBS_REL.replace(os.sep, "/"), exc))
+    records = record.get("verbs") or []
+    writers = set(record.get("treeWriters") or [])
+    problems, counts = [], {"programs": 0, "tokens": 0, "reached": 0, "recorded": 0, "red": 0}
+    ctest = ctest_tokens(root)
+    parsed, surfaces, reached, started = {}, {}, {}, set()
+    steps_of = {}
+    for e in entries:
+        adir = os.path.join(base, *e.rel.split("/"))
+        steps = yml_steps(os.path.join(root, e.action_file))
+        if not steps:
+            raise Collapse("%s declares no step this clause can read -- a census over an action with no step would "
+                           "report every verb unreached, or none" % e.action_file)
+        steps_of[e.rel] = steps
+        for sib in e.siblings:
+            prog = "%s/%s" % (e.rel, sib)
+            text = io.open(os.path.join(adir, sib), "r", encoding="utf-8").read()
+            try:
+                tree = ast.parse(text, filename=sib)
+            except SyntaxError as exc:
+                raise Collapse("%s cannot be parsed, so its verbs cannot be counted: %s" % (prog, exc))
+            parsed[prog] = tree
+            if "__main__" not in text:
+                continue
+            surfaces[prog] = program_surface(tree)
+            got = set(ctest.get(prog, set()))
+            if prog in ctest:
+                started.add(prog)
+            table = step_table(tree)
+            for st in steps:
+                for line in st["run"]:
+                    toks = run_tokens(line)
+                    if not any(t in ("./" + sib, sib) or t.endswith("/" + sib) for t in toks):
+                        continue
+                    started.add(prog)
+                    got.update(toks)
+                    if "--step" in toks and toks.index("--step") + 1 < len(toks):
+                        verb = toks[toks.index("--step") + 1]
+                        got.add(verb)
+                        got.update(table.get(verb, []))
+            reached[prog] = got
+    by_prog = {}
+    for r in records:
+        by_prog.setdefault(r.get("program"), []).append(r)
+
+    running = running_set(parsed, started)
+
+    literals_of, tie_of = {}, {}
+
+    def ties(b, basename):
+        """`b` names the program -- or imports a module that does (ONE step: the sqlite driver's modules call
+        `run.resolver.call([...])` and `sqlite_common` holds the program's path)."""
+        if (b, basename) not in tie_of:
+            tie_of[(b, basename)] = references_program(parsed[b], basename) or any(
+                q != b and imports_module(parsed[b], os.path.splitext(os.path.basename(q))[0])
+                and references_program(parsed[q], basename) for q in parsed)
+        return tie_of[(b, basename)]
+
+    def driven_by(prog, token, bys):
+        for b in bys:
+            t = parsed.get(b)
+            if t is None or b not in running or not ties(b, os.path.basename(prog)):
+                continue
+            if b not in literals_of:
+                literals_of[b] = argument_literals(t)
+            if token in literals_of[b]:
+                return True
+        return False
+
+    # A program a RUNNING program starts is itself started -- a `driven` record says so, and so does a running
+    # program holding the program's FILE NAME as a string of its own, exactly (`"harness_legs.py"`, or a path
+    # ending in it): the sqlite driver's Step 0 starts each suite by name, from a tuple its loop reads, with no
+    # argument a record could name. A sentence that merely mentions a file is never exactly its name. Iterated to a
+    # fixpoint.
+    for _ in range(8):
+        grew = False
+        for r in records:
+            if r.get("category") == "driven" and r.get("program") in surfaces and r["program"] not in started \
+                    and any(b in running for b in _as_list(r.get("by"))):
+                started.add(r["program"])
+                grew = True
+        for prog in surfaces:
+            if prog in started:
+                continue
+            name = os.path.basename(prog)
+            if any(any(c == name or c.replace("\\", "/").endswith("/" + name) for c in _index(parsed[b])[0])
+                   for b in running if b != prog):
+                started.add(prog)
+                grew = True
+        running = running_set(parsed, started)
+        if not grew:
+            break
+    for prog in sorted(surfaces):
+        counts["programs"] += 1
+        recs = by_prog.get(prog, [])
+        for token in sorted(surfaces[prog]):
+            counts["tokens"] += 1
+            if token in HELP_TOKENS:
+                counts["reached"] += 1
+                continue
+            if token in reached[prog]:
+                counts["reached"] += 1
+                if any(r.get("token") == token for r in recs):
+                    problems.append("%s: %s is RECORDED in %s but a step or ctest entry reaches it -- a stale "
+                                    "record; remove it" % (prog, token, VERBS_REL.replace(os.sep, "/")))
+                continue
+            # an exact record wins over the program's `*` record: a token its program passes to itself is
+            # self-driven although every other token of that program is driven
+            rec = next((r for r in recs if r.get("token") == token), None) or \
+                next((r for r in recs if r.get("token") == "*"), None)
+            why = _verify_record(rec, prog, token, parsed, reached, running, driven_by, root, recs) if rec else \
+                "no step, no ctest entry and no record reaches it"
+            if why:
+                counts["red"] += 1
+                problems.append("%s: the verb %s is started by nothing (%s). Make it a MANUAL step of its action "
+                                "(anchor-rows' STEP_INPUTS/--step pattern), retire it, or record in %s the "
+                                "category that reaches it (%s)"
+                                % (prog, token, why, VERBS_REL.replace(os.sep, "/"), ", ".join(VERB_CATEGORIES)))
+            else:
+                counts["recorded"] += 1
+        for r in recs:
+            if r.get("token") not in ("*",) and r.get("token") not in surfaces[prog]:
+                problems.append("%s: %s records %s, which the program no longer dispatches on -- a stale record"
+                                % (prog, VERBS_REL.replace(os.sep, "/"), r.get("token")))
+    for prog in sorted(set(by_prog) - set(surfaces) - {None}):
+        problems.append("%s records verbs of %s, which is not a program of any action (no `__main__`)"
+                        % (VERBS_REL.replace(os.sep, "/"), prog))
+    problems.extend(_leg_fit(steps_of, runners, legs, writers))
+    problems.extend(_remedies(parsed, runners, legs, writers))
+    return problems, counts
+
+
+def _as_list(v):
+    return v if isinstance(v, list) else [v] if v else []
+
+
+def _verify_record(rec, prog, token, parsed, reached, running, driven_by, root, recs=None):
+    """None when `rec` verifies for `token`, else why not."""
+    cat = rec.get("category")
+    if cat not in VERB_CATEGORIES:
+        return "its record's category %r is not one of %s" % (cat, ", ".join(VERB_CATEGORIES))
+    if not rec.get("why"):
+        return "its record states no `why`"
+    if cat == "driven":
+        bys = _as_list(rec.get("by"))
+        if not bys:
+            return "a `driven` record names no program by `by`"
+        if not driven_by(prog, token, bys):
+            return ("recorded driven by %s, but no REACHED one of them names %s and passes %s in an argument list"
+                    % (", ".join(bys), os.path.basename(prog), token))
+        return None
+    if cat == "self-driven":
+        if prog not in running:
+            return "recorded self-driven, but nothing starts the program itself"
+        if token not in argument_literals(parsed[prog]):
+            return "recorded self-driven, but the program never passes %s in an argument list" % token
+        return None
+    if cat == "alias":
+        of = rec.get("of")
+        covered = bool(of) and of in reached.get(prog, set())
+        if not covered and of and recs:
+            # the spelling it aliases may itself be reached through a record (`--self-test`, which the sqlite
+            # driver's Step 0 passes each suite): judged the same way, never through another alias
+            base = next((r for r in recs if r.get("token") == of), None) or \
+                next((r for r in recs if r.get("token") == "*"), None)
+            covered = base is not None and base.get("category") != "alias" and not _verify_record(
+                base, prog, of, parsed, reached, running, driven_by, root)
+        if not covered:
+            return "recorded an alias of %r, which nothing reaches" % of
+        for n in ast.walk(parsed[prog]):
+            if isinstance(n, (ast.Compare, ast.Tuple, ast.List, ast.Call)):
+                consts = {_const(s) for s in ast.walk(n)}
+                if token in consts and of in consts:
+                    return None
+        return "recorded an alias of %s, but no one comparison or declaration holds both" % of
+    source = rec.get("by")
+    path = os.path.join(root, *str(source).split("/")) if source else None
+    if not path or not os.path.isfile(path):
+        return "recorded reached by the test source %r, which does not exist" % source
+    text = io.open(path, "r", encoding="utf-8", errors="replace").read()
+    if os.path.basename(prog) not in text or token not in text:
+        return "recorded reached by %s, which does not name both %s and %s" % (source, os.path.basename(prog), token)
+    return None
+
+
+def _one_leg_here(runner, legs):
+    names = runner.get("legs") or []
+    leg = legs.get(names[0]) if len(names) == 1 else None
+    return isinstance(leg, dict) and not any(k in leg for k in ("wsl", "ssh"))
+
+
+def persists_its_write(st):
+    """A step whose write goes into its OWN build directory and is KEPT -- `persist: true`, its `outputs` named, and
+    `{stepBuild}` on its run line -- writes no tree: what it made is pulled back (`dssharness sync --pull`) and
+    reviewed, so it may run on any leg (2026-10-01, the P69 review's MAJOR 2: pragma-profile-census's update)."""
+    return bool(st.get("persist") and st.get("outputs") and any("{stepBuild}" in line for line in st["run"]))
+
+
+def _leg_fit(steps_of, runners, legs, writers):
+    problems = []
+    declared = set()
+    for rel, steps in steps_of.items():
+        for st in steps:
+            key = "%s/%s" % (rel, st["name"])
+            writes = any(t in WRITE_TOKENS for line in st["run"] for t in run_tokens(line))
+            if persists_its_write(st):
+                if key in writers:
+                    declared.add(key)
+                    problems.append("%s is declared a tree writer, but its write goes into its own kept output "
+                                    "(`persist`, `outputs`, `{stepBuild}`), which writes no tree -- a stale record "
+                                    "in %s" % (key, VERBS_REL.replace(os.sep, "/")))
+                continue
+            if key in writers:
+                declared.add(key)
+                if not st["manual"] or st["unmoved"]:
+                    problems.append("%s is declared a tree writer but is %s -- a writer is a MANUAL step without "
+                                    "requireInputsUnmoved" % (key, "not manual" if not st["manual"]
+                                                              else "requireInputsUnmoved"))
+                action = "%s/%s.yml" % (rel, rel.split("/")[-1])
+                # A one-leg runner of this tree reaches the step when its `steps` name it, or when it names none --
+                # then `--manual-step <step>` runs it there (anchor-rows' `rows`).
+                if not any(r.get("action") == action and (st["name"] in (r.get("steps") or [])
+                                                          or not r.get("steps"))
+                           and _one_leg_here(r, legs) for r in runners.values() if isinstance(r, dict)):
+                    problems.append("%s writes this machine's tree, but no runner of ONE leg of this machine's own "
+                                    "tree names it in `steps` -- following a remedy through a runner of several "
+                                    "legs writes every leg's synced copy" % key)
+            elif writes:
+                problems.append("%s carries a write token on its run line but is not declared a tree writer in %s"
+                                % (key, VERBS_REL.replace(os.sep, "/")))
+    for key in sorted(writers - declared):
+        problems.append("%s declares the tree writer %s, which no action file holds -- a stale record"
+                        % (VERBS_REL.replace(os.sep, "/"), key))
+    return problems
+
+
+def _remedies(parsed, runners, legs, writers):
+    """A printed remedy names a runner that exists, fits the step it names, and never a script started by hand --
+    and a DOCSTRING is printed text too (`--help`, a reader's first stop): its USAGE block names the harness step
+    (the P69 review: the docstrings were exempt, and sixteen programs taught a start by hand there)."""
+    problems = []
+    writer_steps = {w.rsplit("/", 1)[-1] for w in writers}
+    for prog, tree in sorted(parsed.items()):
+        for n in _all_nodes(tree):
+            c = _const(n)
+            if c is None:
+                continue
+            if _SCRIPT_REMEDY.search(c):
+                problems.append("%s line %d prints a remedy that starts an action's program by hand (%r) -- name "
+                                "the harness step instead" % (prog, n.lineno, _SCRIPT_REMEDY.search(c).group(0)))
+            for m in _REMEDY.finditer(c):   # a template (`%s`, `<runner>`, `{x}`) never matches a runner's name
+                name, step = m.group(1), m.group(2)
+                if name not in runners:
+                    problems.append("%s line %d names the runner %r, which config.json does not declare"
+                                    % (prog, n.lineno, name))
+                    continue
+                r = runners[name]
+                # ★ Without `--manual-step`, the remedy runs whatever the runner's `steps` name -- which is how a
+                # writer's own runner is named (`dssharness run check-scripts-index-write`). Judged the same way.
+                runs = step.split(",") if step else (list(r.get("steps") or []) if isinstance(r, dict) else [])
+                if isinstance(r, dict) and any(s in writer_steps for s in runs) and not _one_leg_here(r, legs):
+                    problems.append("%s line %d names `dssharness run %s%s`: that runner has several legs, so "
+                                    "the write reaches every leg's synced copy -- name the writer's one-leg runner"
+                                    % (prog, n.lineno, name, (" --manual-step %s" % step) if step else ""))
+    return problems
+
+
+# ── CLAUSE 14: every argument that names a path a program WRITES takes owning-tree's type ────────────────────────
+# A path to write never begins with `-` (owning-tree's `written_path` states why). A program that reads its command
+# line with argparse says so by `type=<owning-tree>.written_path_arg("<its own flag>")` on each such argument:
+# argparse alone takes `--out=--help` and `--out -` verbatim. WHICH argument names a path to write is said by its
+# DEST, one of WRITTEN_DESTS -- the repository's convention, a fact of the program rather than a guess at its help
+# text. Both directions are refused (such a dest without the type, the type on another dest), so is a type naming
+# another flag than its argument's, and the vocabulary is checked against the arguments: a word no argument uses
+# is a hand copy compared with nothing. An argument that takes no value (`store_true` and its kin) names no path.
+WRITTEN_DESTS = ("cfg_dest", "dest", "dest_dir", "json", "json_out", "log", "md_out", "oracle_dir", "oracle_log",
+                 "out", "output", "scratch", "workdir")
+WRITTEN_TYPE = "written_path_arg"
+_VALUELESS_ACTIONS = ("store_true", "store_false", "store_const", "append_const", "count", "help", "version")
+
+
+def _argument_dest(call):
+    """argparse's dest for one `add_argument` call -- its `dest=`, else its first long option, else its first name,
+    a `-` read as `_` -- and the name it is given first; (None, None) for a call that names nothing readable."""
+    names = [a.value for a in call.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+    if not names:
+        return None, None
+    dest = next((k.value.value for k in call.keywords
+                 if k.arg == "dest" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)), None)
+    if dest is None:
+        longs = [n for n in names if n.startswith("--")]
+        dest = (longs[0] if longs else names[0]).lstrip("-").replace("-", "_")
+    return dest, names[0]
+
+
+def _typed_flag(call):
+    """The flag a `type=<...>written_path_arg(<flag>)` hands, "" when it hands none this reader can read, None when
+    the argument takes no such type."""
+    for k in call.keywords:
+        if k.arg == "type" and isinstance(k.value, ast.Call):
+            f = k.value.func
+            name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+            if name.lstrip("_") == WRITTEN_TYPE:
+                a = k.value.args
+                return a[0].value if a and isinstance(a[0], ast.Constant) and isinstance(a[0].value, str) else ""
+    return None
+
+
+def written_path_census(root, entries):
+    """Clause 14 -> (problems, how many arguments take the type)."""
+    base = os.path.join(root, ACTIONS_REL)
+    problems, used, typed = [], set(), 0
+    for e in entries:
+        adir = os.path.join(base, *e.rel.split("/"))
+        for sib in e.siblings:
+            prog = "%s/%s" % (e.rel, sib)
+            try:
+                tree = ast.parse(io.open(os.path.join(adir, sib), "r", encoding="utf-8").read(), filename=sib)
+            except SyntaxError as exc:
+                raise Collapse("%s cannot be parsed, so its arguments cannot be read: %s" % (prog, exc))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "add_argument"):
+                    continue
+                if any(k.arg == "action" and isinstance(k.value, ast.Constant) and k.value.value in _VALUELESS_ACTIONS
+                       for k in node.keywords):
+                    continue
+                dest, name = _argument_dest(node)
+                if dest is None:
+                    continue
+                flag = _typed_flag(node)
+                where = "%s line %d: the argument %s" % (prog, node.lineno, name)
+                if dest in WRITTEN_DESTS and flag is None:
+                    problems.append("%s names a path to write (its dest `%s`) and takes no `type=...%s(\"%s\")` -- "
+                                    "argparse alone takes `%s=--help` as that path" % (where, dest, WRITTEN_TYPE,
+                                                                                       name, name))
+                elif dest in WRITTEN_DESTS:
+                    used.add(dest)
+                    typed += 1
+                    if flag != name:
+                        problems.append("%s takes `%s(\"%s\")`, which names another flag than its own: the refusal "
+                                        "would name the wrong option" % (where, WRITTEN_TYPE, flag))
+                elif flag is not None:
+                    problems.append("%s takes `%s`, but its dest `%s` is no word of WRITTEN_DESTS: a path to write is "
+                                    "named by one, so either the dest is renamed or the type does not belong"
+                                    % (where, WRITTEN_TYPE, dest))
+    for w in WRITTEN_DESTS:
+        if w not in used:
+            problems.append("WRITTEN_DESTS holds `%s`, which no argument of any program takes with `%s` -- a word of "
+                            "the convention that names nothing" % (w, WRITTEN_TYPE))
+    return problems, typed
+
+
 def render(entries):
     """The generated table body. Identical in both documents by construction."""
     out = [
@@ -845,7 +1754,7 @@ def splice(doc_text, body, doc_rel):
     return doc_text[:b] + BEGIN + "\n" + body + "\n" + doc_text[t:]
 
 
-def run(root, write):
+def run(root, write, census=True, written=None):
     # ★★★ THE GUARD'S OWN CONFIGURATION IS PART OF WHAT IT CHECKS. Both documents
     # are named constants, and dropping either from DOC_RELS would stop verifying
     # it while every message still claimed both were machine-checked. ✔MEASURED
@@ -911,11 +1820,40 @@ def run(root, write):
         print("  `dssharness run <runner>` reaches an action ONLY through predefinedRunners;")
         print("  an action without an entry is a program nothing can start, and an entry")
         print("  without an action refuses the day someone runs it.")
-    if problems or unreached or dangling:
+    # ── CLAUSE 13: every verb a program offers is started by a step, or recorded and verified ──
+    # (`census=False` only in a self-test arm that judges another clause: the census reads every program of the
+    # mirror, and each such arm would pay for it again.)
+    verb_problems, counts = verb_census(root, entries) if census else ([], None)
+    if verb_problems:
+        print("check-scripts-index: FAIL -- %d verb census problem(s):" % len(verb_problems))
+        for p in verb_problems:
+            print("    %s" % p)
+        print("")
+        print("  Work an action owns but a plain run must not do is a MANUAL step of that action (the")
+        print("  operator's order of 2026-09-24): never a program started by hand.")
+    # ── CLAUSE 14: a path to write is refused when it begins with `-`, by its argument's type ──
+    # (the same `census` gate by default: a self-test arm of another clause does not read every program again)
+    written_problems, typed = written_path_census(root, entries) if (census if written is None else written) \
+        else ([], None)
+    if written_problems:
+        print("check-scripts-index: FAIL -- %d path-to-write argument problem(s):" % len(written_problems))
+        for p in written_problems:
+            print("    %s" % p)
+        print("")
+        print("  A path a program writes never begins with `-`; owning-tree's `written_path` says why, and")
+        print("  `written_path_arg(<flag>)` is argparse's `type=` that refuses one, naming the flag.")
+    if problems or unreached or dangling or verb_problems or written_problems:
         return EXIT_DISAGREE
 
+    census_said = ("verb census: %d program(s), %d token(s) -- %d reached by a step or a ctest entry, %d recorded "
+                   "and verified, %d red" % (counts["programs"], counts["tokens"], counts["reached"],
+                                              counts["recorded"], counts["red"])) if counts else \
+        "verb census: not run in this self-test arm"
+    written_said = ("%d path-to-write argument(s), each with its type" % typed) if typed is not None else \
+        "path-to-write arguments: not read in this self-test arm"
     print("check-scripts-index: OK (%d actions, both indexes agree with the tree and with "
-          "each action's own PURPOSE line, and every action has a runner)" % len(entries))
+          "each action's own PURPOSE line, and every action has a runner; %s; %s)"
+          % (len(entries), census_said, written_said))
     return EXIT_OK
 
 
@@ -929,7 +1867,7 @@ def run(root, write):
 _RAN = None   # set by selftest() so every arm is counted where it is judged
 
 
-def _arm(label, root, expect, says=None, not_says=None):
+def _arm(label, root, expect, says=None, not_says=None, census=False, written=False):
     """Run the guard against a mutated mirror and judge the WHOLE verdict.
 
     ★★★ `says` / `not_says` are the load-bearing halves, not decoration.
@@ -944,7 +1882,7 @@ def _arm(label, root, expect, says=None, not_says=None):
     detail = ""
     try:
         with contextlib.redirect_stdout(buf):
-            rc = run(root, write=False)
+            rc = run(root, write=False, census=census, written=written)
     except Collapse as exc:
         rc = EXIT_COLLAPSE
         detail = str(exc)
@@ -969,28 +1907,33 @@ def _arm(label, root, expect, says=None, not_says=None):
     return ok
 
 
-def remedy_runner_fact():
-    """-> (ok, detail): the runner WRITE_VERB names is declared in this tree's config.json, runs this action's
-    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
-    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
-    too). Read from config, never assumed: a second leg added there reds the self-test."""
-    cfg = _owning_tree().load_jsonc(os.path.join(repo_root(), CONFIG_REL))
-    name = WRITE_VERB.split()[-1]
-    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
-    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
-    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
-    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
-    ok = (isinstance(runner, dict) and runner.get("action") == "check-scripts-index/check-scripts-index.yml"
-          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
-    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
+# ⓘ `remedy_runner_fact()` (P68 round 13, F1-A11) retired on 2026-09-30 with its arm 2c: clause 13 is the ONE
+# statement that a remedy names a runner config.json declares, and that a writer's runner has ONE leg of this
+# machine's own tree -- for every program, not for this one alone (arms 22y..22z1).
 
 
 def _mirror(root, dst):
-    """The REAL actions tree, config and both index documents, copied -- without run
-    output and bytecode, which are not the repository's."""
-    shutil.copytree(os.path.join(root, ACTIONS_REL), os.path.join(dst, ACTIONS_REL),
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", *RUN_DIRS))
-    for rel in (CONFIG_REL,) + DOC_RELS:
+    """The REAL actions tree, config and both index documents, copied -- less what the live
+    tree leaves out (run output and bytecode among it, which are not the repository's) -- with
+    the tree's own `.gitignore`, so a walk of the mirror leaves out what a walk of the tree does,
+    and what the verb census reads beside them: the root CMakeLists.txt (a ctest COMMAND reaches
+    a verb) and each test source a `test-source` record names."""
+    live = _owning_tree().TreeIgnores(root)
+
+    def left_out(dirpath, names):
+        out = []
+        for n in names:
+            full = os.path.join(dirpath, n)
+            if live.leaves_out(live.rel(full), os.path.isdir(full) and not os.path.islink(full)):
+                out.append(n)
+        return out
+    shutil.copytree(os.path.join(root, ACTIONS_REL), os.path.join(dst, ACTIONS_REL), ignore=left_out)
+    try:
+        sources = [str(r.get("by")) for r in json.loads(_read(os.path.join(root, VERBS_REL))).get("verbs", [])
+                   if r.get("category") == "test-source" and r.get("by")]
+    except (OSError, ValueError):
+        sources = []
+    for rel in (".gitignore", CONFIG_REL, CMAKE_REL) + DOC_RELS + tuple(s.replace("/", os.sep) for s in sources):
         d = os.path.join(dst, rel)
         if os.path.isfile(d):
             continue
@@ -1114,7 +2057,195 @@ def _newcomer(tmp, rel, runner):
 # defeated its own purpose: deleting a document from DOC_RELS then lowered BOTH
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
-EXPECTED_ARMS = 55
+# The 2c arm retired (M6); clause 13's fixture arms, 30, then 32 (22w2 and 22w3, the widened remedy rule), then 35
+# (22v1 to 22v3, a write into its own kept output); and the one arm numbered 23, CENSUS-WIRED; then clause 14's six
+# (24 to 24f, every argument that names a path to write takes owning-tree's type).
+EXPECTED_ARMS = 55 - 1 + 35 + 1 + 6
+
+
+# ── CLAUSE 13's ARMS, over a SYNTHESIZED fixture ───────────────────────────────────────────────────────────────
+# ★ The census reads every program of a tree, so an arm over the mirror costs a whole census; these arms build a
+# fixture of three small actions instead and ask `verb_census` directly, judging the MESSAGE of each problem. The
+# one arm over the mirror (23) proves `run()` refuses on what the census finds.
+_FX_ACTIONS = ".harness-config/runner/actions/"
+# ★ A REMEDY IN A FIXTURE IS COMPOSED, NEVER WRITTEN LITERALLY (check-doc-census's `_mark()` rule): the census reads
+# every string of every action program, this one's included, so a literal `dssharness run alpha` or a `python3` start
+# of `<actions>/alpha/alpha.py` here is a claim about THIS tree's runners and scripts -- deliberately wrong ones.
+# ✔MEASURED 2026-09-30: written literally, arms 22w-22z1's five fixtures were five census problems of the live tree.
+# Composing is not an exemption: those arms assert the census catches the same text written literally in a
+# synthesized program.
+_FX_RUN = "dssharness" + " run "
+_FX_BY_HAND = "python3 " + _FX_ACTIONS + "alpha/alpha.py"
+_FX_CONFIG = json.dumps({
+    "legs": {"here": {"host": "local"}, "far": {"host": "wsl", "wsl": "fixture"}},
+    "predefinedRunners": {"alpha": {"legs": ["here", "far"], "action": "alpha/alpha.yml"},
+                          "alpha-write": {"legs": ["here"], "steps": ["write"], "action": "alpha/alpha.yml"},
+                          "beta": {"legs": ["here"], "action": "beta/beta.yml"}}})
+_FX_ALPHA_YML = ("# PURPOSE: a census fixture.\nname: alpha\nsteps:\n"
+                 "  - name: go\n    workingDirectoryRoot: action\n    run: |\n      python3 ./alpha.py --go\n"
+                 "  - name: write\n    manual: true\n    workingDirectoryRoot: action\n    run: |\n"
+                 "      python3 ./alpha.py --write\n")
+_FX_ALPHA = ('import subprocess\nimport sys\n\n\ndef main(argv):\n    if "--go" in argv:\n        return 0\n'
+             '    if "--write" in argv:\n        return 0\n%s    return 2\n\n\nif __name__ == "__main__":\n'
+             '    sys.exit(main(sys.argv[1:]))\n')
+_FX_BETA_YML = ("# PURPOSE: a census fixture driver.\nname: beta\nsteps:\n"
+                "  - name: drive\n    workingDirectoryRoot: action\n    run: |\n      python3 ./beta.py\n")
+_FX_BETA = 'import subprocess\nimport sys\n%s\n\nif __name__ == "__main__":\n%s'
+
+
+def _fx(alpha_extra="", beta_body="    pass\n", beta_head="", verbs=(), writers=("alpha/write",), extra=None,
+        config=None):
+    files = {_FX_ACTIONS + "alpha/alpha.yml": _FX_ALPHA_YML,
+             _FX_ACTIONS + "alpha/alpha.py": _FX_ALPHA % alpha_extra,
+             _FX_ACTIONS + "beta/beta.yml": _FX_BETA_YML,
+             _FX_ACTIONS + "beta/beta.py": _FX_BETA % (beta_head, beta_body),
+             CONFIG_REL.replace(os.sep, "/"): config or _FX_CONFIG,
+             VERBS_REL.replace(os.sep, "/"): json.dumps({"treeWriters": list(writers), "verbs": list(verbs)})}
+    files.update(extra or {})
+    return files
+
+
+def _rec(token, category, **kw):
+    r = {"program": "alpha/alpha.py", "token": token, "category": category, "why": "a fixture"}
+    r.update(kw)
+    return r
+
+
+def _census_case(label, files, expect=(), clean=False):
+    """An arm: `files` written into a fresh tree, the census run over its actions, the verdict judged by message --
+    `clean` wants no problem at all, `expect` wants each needle inside some problem."""
+    root = tempfile.mkdtemp(prefix="scripts-index-census-")
+    try:
+        for rel, text in files.items():
+            _write(os.path.join(root, *rel.split("/")), text)
+        base = os.path.join(root, ACTIONS_REL)
+        entries = []
+        for dp, _dn, fn in os.walk(base):
+            name = os.path.basename(dp)
+            if name + ".yml" in fn:
+                rel = os.path.relpath(dp, base).replace(os.sep, "/")
+                entries.append(Entry(name, rel, os.path.join(dp, name + ".yml"),
+                                     name + ".py" if name + ".py" in fn else None,
+                                     sorted(f for f in fn if f.endswith(".py")), "a census fixture"))
+        try:
+            problems, _counts = verb_census(root, entries)
+        except Collapse as exc:
+            problems = ["COLLAPSE: %s" % exc]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    if _RAN is not None:
+        _RAN.append(label)
+    missing = [w for w in expect if not any(w in p for p in problems)]
+    ok = (not problems) if clean else (bool(problems) and not missing)
+    why = "" if ok else ("wanted no problem, got %r" % problems[:3] if clean else
+                         "never said %r; said %r" % (missing[:1], problems[:3]))
+    print("scripts-index: self-test arm %-26s %s" % (label, "as expected" if ok else "FAILED (%s)" % why[:400]))
+    return ok
+
+
+def _census_arms():
+    """Every family clause 13 verifies or refuses, each red arm beside its control."""
+    ok = True
+    idle = '    if "--zz-idle" in argv:\n        return 0\n'
+    ok &= _census_case("22 CENSUS-GREEN", _fx(), clean=True)
+    ok &= _census_case("22a UNREACHED-OPTION", _fx(idle), expect=("--zz-idle is started by nothing",))
+    ok &= _census_case("22b CTEST-REACHES-IT", _fx(idle, extra={"CMakeLists.txt": (
+        'add_test(NAME fx COMMAND py "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/alpha/alpha.py" '
+        '--zz-idle\n    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")\n')}), clean=True)
+    driven = _rec("--zz-idle", "driven", by=["beta/beta.py"])
+    ok &= _census_case("22c DRIVEN", _fx(idle, beta_body='    subprocess.run([sys.executable, "alpha.py", '
+                                                          '"--zz-idle"])\n', verbs=[driven]), clean=True)
+    ok &= _census_case("22d DRIVEN-LITERAL-GONE", _fx(idle, beta_body='    subprocess.run([sys.executable, '
+                                                                      '"alpha.py"])\n', verbs=[driven]),
+                       expect=("recorded driven by beta/beta.py",))
+    ok &= _census_case("22e DRIVEN-THROUGH-AN-IMPORT", _fx(
+        idle, beta_head="import resolver\n", beta_body='    resolver.call(["--zz-idle"])\n', verbs=[driven],
+        extra={_FX_ACTIONS + "beta/resolver.py": 'ALPHA = "alpha.py"\n\n\ndef call(args):\n'
+                                                 '    return [ALPHA] + list(args)\n'}), clean=True)
+    ok &= _census_case("22f FORMATTED-OPTION-PASSES", _fx(idle, beta_body='    subprocess.run([sys.executable, '
+                                                                          '"alpha.py", "--zz-idle=%s" % 1])\n',
+                                                          verbs=[driven]), clean=True)
+    selfd = _rec("--zz-idle", "self-driven")
+    ok &= _census_case("22g SELF-DRIVEN", _fx(idle + '    subprocess.run([sys.executable, __file__, '
+                                                     '"--zz-idle"])\n', verbs=[selfd]), clean=True)
+    ok &= _census_case("22h SELF-DRIVEN-NEVER-PASSED", _fx(idle, verbs=[selfd]),
+                       expect=("never passes --zz-idle",))
+    ok &= _census_case("22i A-DECLARATION-PASSES-NOTHING", _fx(
+        idle + '    known = ("--go", "--write", "--zz-idle")\n    if [a for a in argv if a not in known]:\n'
+               '        return 2\n', verbs=[selfd]), expect=("never passes --zz-idle",))
+    gogo = '    if argv and argv[0] in ("--go", "--zz-gogo"):\n        return 0\n'
+    ok &= _census_case("22j ALIAS", _fx(gogo, verbs=[_rec("--zz-gogo", "alias", of="--go")]), clean=True)
+    ok &= _census_case("22k ALIAS-OF-NOTHING", _fx(gogo, verbs=[_rec("--zz-gogo", "alias", of="--nowhere")]),
+                       expect=("alias of '--nowhere', which nothing reaches",))
+    src = {"tests/fx_test.cpp": '// runs alpha.py --zz-idle\n'}
+    ok &= _census_case("22l TEST-SOURCE", _fx(idle, verbs=[_rec("--zz-idle", "test-source",
+                                                                by="tests/fx_test.cpp")], extra=src), clean=True)
+    ok &= _census_case("22m TEST-SOURCE-MISSING", _fx(idle, verbs=[_rec("--zz-idle", "test-source",
+                                                                        by="tests/none.cpp")]),
+                       expect=("which does not exist",))
+    nowhy = _rec("--zz-idle", "self-driven")
+    del nowhy["why"]
+    ok &= _census_case("22n RECORD-STATES-NO-WHY", _fx(idle, verbs=[nowhy]), expect=("states no `why`",))
+    ok &= _census_case("22o UNKNOWN-CATEGORY", _fx(idle, verbs=[_rec("--zz-idle", "by-hand")]),
+                       expect=("is not one of",))
+    ok &= _census_case("22p STALE-RECORD", _fx(verbs=[_rec("--zz-gone", "self-driven")]),
+                       expect=("which the program no longer dispatches on",))
+    ok &= _census_case("22q RECORDED-BUT-REACHED", _fx(verbs=[_rec("--go", "self-driven")]),
+                       expect=("a stale record; remove it",))
+    ok &= _census_case("22r DATA-IS-NOT-A-VERB", _fx(
+        '    import json\n    row = json.loads("{}")\n    if row.get("kind") == "armed":\n        return 0\n'
+        '    child = ["wsl.exe", "-e"]\n    if child[0] == "wsl.exe":\n        return 0\n'), clean=True)
+    ok &= _census_case("22s BARE-VERB-UNREACHED", _fx('    if argv and argv[0] == "cleanup":\n        return 0\n'),
+                       expect=("cleanup is started by nothing",))
+    ok &= _census_case("22t LOOP-DECLARED-OPTION", _fx(
+        '    import argparse\n    p = argparse.ArgumentParser()\n    for flag in ("--zz-loop",):\n'
+        '        p.add_argument(flag)\n'), expect=("--zz-loop is started by nothing",))
+    ok &= _census_case("22u WRITE-TOKEN-UNDECLARED", _fx(writers=()),
+                       expect=("carries a write token on its run line but is not declared a tree writer",))
+    two_legs = json.loads(_FX_CONFIG)
+    del two_legs["predefinedRunners"]["alpha-write"]
+    ok &= _census_case("22v WRITER-WITHOUT-ONE-LEG-RUNNER", _fx(config=json.dumps(two_legs)),
+                       expect=("no runner of ONE leg of this machine's own tree names it",))
+    # A write into the step's OWN kept output writes no tree (2026-10-01, the P69 review's MAJOR 2): it runs on any
+    # leg, needs no declaration, and a declaration of it is stale. Each half of the rule is load-bearing.
+    keeps = {_FX_ACTIONS + "alpha/alpha.yml": _FX_ALPHA_YML.replace(
+        "      python3 ./alpha.py --write\n",
+        "      python3 ./alpha.py --write {stepBuild}\n    outputs: [made.txt]\n    persist: true\n")}
+    bare = {_FX_ACTIONS + "alpha/alpha.yml": _FX_ALPHA_YML.replace(
+        "      python3 ./alpha.py --write\n", "      python3 ./alpha.py --write {stepBuild}\n")}
+    ok &= _census_case("22v1 KEPT-OUTPUT-WRITER-ON-ANY-LEGS", _fx(writers=(), config=json.dumps(two_legs),
+                                                                  extra=keeps), clean=True)
+    ok &= _census_case("22v2 STEPBUILD-WRITE-NOT-KEPT", _fx(writers=(), config=json.dumps(two_legs), extra=bare),
+                       expect=("carries a write token on its run line but is not declared a tree writer",))
+    ok &= _census_case("22v3 KEPT-OUTPUT-WRITER-DECLARED", _fx(extra=keeps),
+                       expect=("its write goes into its own kept output",))
+    ok &= _census_case("22w SCRIPT-REMEDY", _fx('    print("run %s --go")\n' % _FX_BY_HAND),
+                       expect=("starts an action's program by hand",))
+    ok &= _census_case("22x SCRIPT-REMEDY-IN-A-DOCSTRING", _fx(extra={_FX_ACTIONS + "alpha/alpha.py": (
+        '"""Usage: %s --go"""\n' % _FX_BY_HAND + _FX_ALPHA % "")}),
+        expect=("starts an action's program by hand",))
+    ok &= _census_case("22w2 SCRIPT-REMEDY-WINDOWS-PATH", _fx('    print(r"run %s --go")\n' % _FX_BY_HAND.replace(
+        "python3 ", "python ").replace("/", "\\")), expect=("starts an action's program by hand",))
+    ok &= _census_case("22w3 SCRIPT-REMEDY-PY-LAUNCHER", _fx('    print("run %s --go")\n' % _FX_BY_HAND.replace(
+        "python3 ", "py -3 ")), expect=("starts an action's program by hand",))
+    ok &= _census_case("22y REMEDY-UNKNOWN-RUNNER", _fx('    print("%szz-nosuch")\n' % _FX_RUN),
+                       expect=("names the runner 'zz-nosuch', which config.json does not declare",))
+    ok &= _census_case("22z REMEDY-WRITER-ON-TWO-LEGS", _fx('    print("%salpha --manual-step write")\n' % _FX_RUN),
+                       expect=("that runner has several legs",))
+    ok &= _census_case("22z1 REMEDY-WRITER-ONE-LEG", _fx('    print("%salpha-write")\n' % _FX_RUN), clean=True)
+    gamma = {_FX_ACTIONS + "gamma/gamma.yml": "# PURPOSE: a census fixture.\nname: gamma\nsteps:\n"
+                                              "  - name: nothing\n    workingDirectoryRoot: action\n    run: |\n"
+                                              "      python3 ./other.py\n",
+             _FX_ACTIONS + "gamma/other.py": "print('x')\n",
+             _FX_ACTIONS + "gamma/gamma.py": ('import subprocess\nimport sys\n\nif __name__ == "__main__":\n'
+                                              '    if "--zz-child" in sys.argv:\n        sys.exit(0)\n'
+                                              '    subprocess.run([sys.executable, __file__, "--zz-child"])\n')}
+    childrec = {"program": "gamma/gamma.py", "token": "--zz-child", "category": "self-driven", "why": "a fixture"}
+    ok &= _census_case("22z2 STARTED-BY-ITS-FILE-NAME", _fx(beta_head='GAMMA = "gamma.py"\n', verbs=[childrec],
+                                                            extra=gamma), clean=True)
+    ok &= _census_case("22z3 STARTED-BY-NOTHING", _fx(verbs=[childrec], extra=gamma),
+                       expect=("nothing starts the program itself",))
+    return ok
 
 
 def selftest(root):
@@ -1160,13 +2291,6 @@ def selftest(root):
         shutil.move(gone, os.path.join(stash, SELFTEST_SUBJECT))
         ok &= _arm("2 INDEX-ENTRY-NOT-AN-ACTION", tmp, EXIT_DISAGREE, says=(README_REL, WRITE_VERB))
         shutil.move(os.path.join(stash, SELFTEST_SUBJECT), gone)
-        # 2c -- ...and the runner that remedy names runs `write` alone, on ONE leg of this machine's own tree
-        # (F1-A11). A property of the TREE, counted like every arm.
-        _fact_ok, _fact_detail = remedy_runner_fact()
-        ran.append("2c REMEDY-RUNNER-ONE-LEG")
-        print("scripts-index: self-test arm %-26s %s" % ("2c REMEDY-RUNNER-ONE-LEG", "as expected" if _fact_ok
-                                                          else "FAILED (%s)" % _fact_detail[:300]))
-        ok &= _fact_ok
         shutil.rmtree(stash, ignore_errors=True)
         ok &= _arm("2b RESTORED", tmp, EXIT_OK)
 
@@ -1432,6 +2556,43 @@ def selftest(root):
         _write(lib, lib_text + body % 'os.path.join(tempfile.mkdtemp(), "copy.py")')
         ok &= _arm("21h A-CHILD-OF-A-TEMP-COPY", tmp, EXIT_OK, not_says="sqlite_compiler.py line")
         _write(lib, lib_text)
+
+        # ── clause 13, over a synthesized fixture, then ONCE over the mirror ─────────────────────────────────
+        ok &= _census_arms()
+        prog = os.path.join(acts, SELFTEST_SUBJECT, SELFTEST_SUBJECT + ".py")
+        pristine_prog = _read(prog)
+        _write(prog, pristine_prog + '\n\nif "--zz-selftest-unreached" in sys.argv:\n    pass\n')
+        ok &= _arm("23 CENSUS-WIRED", tmp, EXIT_DISAGREE, census=True,
+                   says=("verb census problem", "--zz-selftest-unreached is started by nothing"))
+        _write(prog, pristine_prog)
+
+        # ── clause 14: a path-to-write argument takes owning-tree's type (EXIT_DISAGREE) ─────────────────────────
+        # ★ Each arm sabotages a REAL argument of the mirror; the green arms around them are the control: every
+        # other path-to-write argument of this tree takes its type.
+        rlp = os.path.join(acts, "read-leg-path", "read-leg-path.py")
+        rlp_text = _read(rlp)
+        typed_out = 'ap.add_argument("--out", required=True, type=_written_path_arg("--out"))'
+        _write(rlp, _sabotage(rlp_text, typed_out, 'ap.add_argument("--out", required=True)'))
+        ok &= _arm("24 WRITTEN-PATH-WITHOUT-ITS-TYPE", tmp, EXIT_DISAGREE, written=True,
+                   says=("path-to-write argument problem", "read-leg-path/read-leg-path.py line", "takes no `type="))
+        _write(rlp, _sabotage(rlp_text, typed_out, typed_out.replace('_arg("--out")', '_arg("--path")')))
+        ok &= _arm("24b WRITTEN-PATH-TYPE-NAMES-ANOTHER-FLAG", tmp, EXIT_DISAGREE, written=True,
+                   says="which names another flag than its own")
+        _write(rlp, _sabotage(rlp_text, typed_out, typed_out.replace('("--out", required', '("--report", required')))
+        ok &= _arm("24c WRITTEN-PATH-TYPE-ON-ANOTHER-DEST", tmp, EXIT_DISAGREE, written=True,
+                   says="its dest `report` is no word of WRITTEN_DESTS")
+        _write(rlp, _sabotage(rlp_text, typed_out, typed_out + '\n    ap.add_argument("--json", action="store_true")'))
+        ok &= _arm("24d A-FLAG-WITH-NO-VALUE-NAMES-NO-PATH", tmp, EXIT_OK, written=True,
+                   not_says="path-to-write argument problem")
+        _write(rlp, rlp_text)
+        held = WRITTEN_DESTS
+        globals()["WRITTEN_DESTS"] = held + ("zz_selftest_dest",)
+        try:
+            ok &= _arm("24e A-WORD-NO-ARGUMENT-TAKES", tmp, EXIT_DISAGREE, written=True,
+                       says="WRITTEN_DESTS holds `zz_selftest_dest`, which no argument")
+        finally:
+            globals()["WRITTEN_DESTS"] = held
+        ok &= _arm("24f RESTORED", tmp, EXIT_OK, written=True)
 
         ok &= _arm("19 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:

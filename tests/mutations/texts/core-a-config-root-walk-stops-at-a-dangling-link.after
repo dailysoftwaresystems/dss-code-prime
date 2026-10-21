@@ -1,0 +1,1 @@
+    return fs::is_directory(p, ec);

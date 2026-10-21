@@ -1,0 +1,3 @@
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          lbPath + "/functions",
+                                          "each 'functions' entry must be a non-empty string");

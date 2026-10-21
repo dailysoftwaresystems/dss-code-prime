@@ -1,0 +1,1 @@
+        if (core::reachedKind(lit, fec) != core::EntryKind::Absent && !fec) {
