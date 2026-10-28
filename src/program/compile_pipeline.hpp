@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -134,8 +135,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->28 exported declarations
-// — <!--census:source:program.exportedFunctions-->23 exported functions plus
+//     <!--census:source:program.exportedDecls-->29 exported declarations
+// — <!--census:source:program.exportedFunctions-->24 exported functions plus
 // <!--census:source:program.exportedStructs-->5 exported structs (`CuMirModule`,
 // `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
 //
@@ -1080,10 +1081,40 @@ buildCuHir(CompilationUnit const&         cu,
 // special case: its buildCuMir call is a Unit site, its pre-lower call is a
 // Program site, and both fall out of the config — never a driver `if` on
 // stage content.
+//
+// ★★ THE UNIT STAGE IS NEVER A MODULE'S LAST: a module is lowered only after a
+// PROGRAM-stage optimize has run on it. `optimizeModule` relies on it -- a
+// fixpoint the Unit stage truncates is resumed by the Program stage, so only
+// the Program stage reports a truncation
+// (D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES) --
+// and `tests/opt/test_fixpoint_report_stage.cpp` holds every production route
+// to it through `pipeline_testing::setStageObserver`: a route that lowers a module whose
+// last optimize was not Program-stage is red there. A NEW lowering route is
+// added to that test's table.
 enum class PipelineStage : std::uint8_t {
     Unit = 0,     // per-CU build (buildCuMir)
     Program = 1,  // final module pre-lower (merged / N==1 / archive member)
 };
+
+// One event of the stage topology, for its test seam: a module optimized at a
+// stage, or a module lowered (`stage` is then unused). `module` is the address
+// of the `Mir` acted on -- a module is lowered where it was last optimized.
+struct StageEvent {
+    enum class Kind : std::uint8_t { Optimized, Lowered };
+    Kind          kind;
+    PipelineStage stage;
+    void const*   module;
+};
+
+namespace pipeline_testing {
+// THE TEST SEAM of the stage topology above: called on every successful
+// `optimizeModule` and on entry to every lowering of a module
+// (`lowerCuMirToAssembly`, `lowerMergedToAssembly`). Empty (the default) in
+// every build; a test sets it, drives a route, and clears it. The events come
+// from a CU pool's workers, two at once; the seam hands them to the observer one
+// at a time, so the observer takes no lock of its own.
+DSS_EXPORT void setStageObserver(std::function<void(StageEvent const&)> observer);
+}  // namespace pipeline_testing
 
 [[nodiscard]] DSS_EXPORT bool
 optimizeModule(Mir&                  mir,

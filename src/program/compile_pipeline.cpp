@@ -65,6 +65,7 @@
 #include "opt/passes/prune_unreachable.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +74,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <latch>   // D-OPT11-LAZY-IMPORT-EDGE: the thin stage batch join
 #include <limits>
@@ -127,6 +129,41 @@ namespace {
 // cross-CU calls — made intra-module DIRECT by the cycle-25 merge — get inlined
 // (D-OPT7-1). Agnostic: no language/target/format branch — the pipeline is
 // config-driven and `optimize` is target-blind at the MIR tier.
+// The stage topology's test seam (compile_pipeline.hpp, beside `PipelineStage`):
+// empty in every build. Its events come from a CU pool's workers -- each unit's
+// `buildCuMir`, the thin-LTO import stage, each archive member -- so two can
+// arrive at once: the seam hands them to its observer ONE AT A TIME, under its
+// own lock, and an observer needs none. `armed` keeps every build that sets no
+// observer off that lock.
+namespace {
+struct StageSeam {
+    std::mutex                             lock;
+    std::function<void(StageEvent const&)> observer;
+    std::atomic<bool>                      armed{false};
+};
+
+[[nodiscard]] StageSeam& stageSeam() {
+    static StageSeam seam;
+    return seam;
+}
+
+void reportStage(StageEvent const& event) {
+    StageSeam& seam = stageSeam();
+    if (!seam.armed.load(std::memory_order_acquire)) return;
+    std::scoped_lock const hold{seam.lock};
+    if (seam.observer) seam.observer(event);
+}
+}  // namespace
+
+namespace pipeline_testing {
+void setStageObserver(std::function<void(StageEvent const&)> observer) {
+    StageSeam&             seam = stageSeam();
+    std::scoped_lock const hold{seam.lock};
+    seam.armed.store(static_cast<bool>(observer), std::memory_order_release);
+    seam.observer = std::move(observer);
+}
+}  // namespace pipeline_testing
+
 bool optimizeModule(Mir&                  mir,
                     TargetSchema const&   target,
                     TypeInterner const&   interner,
@@ -249,8 +286,18 @@ bool optimizeModule(Mir&                  mir,
         opts.preemptibleDefinitionBindings,
         // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: relayed
         // to the Dce leaf's root predicate (the declaration says why).
-        extent, entryRoots);
-    return optResult.ok && tierClean(reporter, optEntry);
+        extent, entryRoots,
+        // D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES:
+        // the UNIT stage is never the last a module receives -- every route
+        // that builds a CU lowers it only after a PROGRAM-stage optimize (the
+        // N>1 merged module, the N==1 sole CU, each archive member: the
+        // topology `PipelineStage` states) -- so a fixpoint truncated here is
+        // resumed, whatever schedule ran: the `unitPipeline` document, the
+        // config's own when it names none, or an override.
+        /*laterStageResumes=*/stage == PipelineStage::Unit);
+    bool const optimized = optResult.ok && tierClean(reporter, optEntry);
+    if (optimized) reportStage({StageEvent::Kind::Optimized, stage, &mir});
+    return optimized;
 }
 
 // ══ VERIFY THE POST-SYNTHESIS MODULE — ONE DEFINITION, BOTH DRIVER SEAMS ═════
@@ -2416,6 +2463,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::string_view                  wideFloatSoftcallLibrary,
                      DiagnosticReporter&               reporter,
                      std::optional<AtomicsRuntime> const& atomicsRuntime) {
+    reportStage({StageEvent::Kind::Lowered, PipelineStage::Program, &cuMir.mir});
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
@@ -2640,6 +2688,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // P69 fold 3b: the document's facts, pre-resolved in
                       // program.cpp (see the declaration).
                       CommonsStatement const& commons) {
+    reportStage({StageEvent::Kind::Lowered, PipelineStage::Program, &merged.mir});
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.

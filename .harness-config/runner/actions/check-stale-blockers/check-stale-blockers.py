@@ -81,6 +81,28 @@ import anchors  # noqa: E402
 # sibling's own file, which sits in the same tree as this one.
 ROOT = anchors.ROOT
 
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(HERE), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("check-stale-blockers: cannot find %s -- what each kind of its arguments refuses is "
+                             "said there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 WIKILINK = re.compile(r"\[\[([A-Za-z0-9_-]+)\]\]")
 
 
@@ -162,7 +184,8 @@ def self_test():
 
 def main(argv):
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--band", default="", help="one band, P0..P5; empty reports every band")
+    ap.add_argument("--band", default="", help="one band, P0..P5; empty reports every band",
+                    type=_path_types().text_arg("--band"))
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
 

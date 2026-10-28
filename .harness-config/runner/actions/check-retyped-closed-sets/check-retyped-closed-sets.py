@@ -151,21 +151,36 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):        # pragma: no cover - old/odd stream
         pass
 
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. A missing owner is a structural
+    failure (exit 2)."""
+    if not _PATH_TYPES_OWNER:
+        path = Path(__file__).resolve().parent.parent / "owning-tree" / "owning-tree.py"
+        if not path.is_file():
+            print("check-retyped-closed-sets: cannot find %s -- this census's tree, and what each kind of its "
+                  "arguments refuses, are resolved there and nowhere else" % path, file=sys.stderr)
+            sys.exit(2)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 def _own_tree():
     """The tree THIS FILE lives in, by `owning-tree`'s walk -- never a count of parents.
 
     `parents[2]` named `.harness-config/runner` the day this file moved out of `scripts/`
     (2026-09-18); a census pointed at the wrong root counts nothing. The owner is loaded as
-    a SIBLING and a missing owner is a structural failure (exit 2).
+    a SIBLING (`_path_types`) and a missing owner is a structural failure (exit 2).
     """
-    path = Path(__file__).resolve().parent.parent / "owning-tree" / "owning-tree.py"
-    if not path.is_file():
-        print("check-retyped-closed-sets: cannot find %s -- this census's tree is resolved "
-              "there and nowhere else" % path, file=sys.stderr)
-        sys.exit(2)
-    spec = importlib.util.spec_from_file_location("dss_owning_tree", str(path))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _path_types()
     try:
         return Path(mod.resolve(__file__))
     except mod.Refusal as exc:
@@ -546,13 +561,13 @@ def _flag(value):
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="census diagnostics that retype a closed vocabulary")
-    ap.add_argument("paths", nargs="*", metavar="PATH-SUBSTRING")
+    ap.add_argument("paths", nargs="*", metavar="PATH-SUBSTRING", type=_path_types().text_arg("paths"))
     ap.add_argument("--min-tokens", type=int, default=2,
                     help="how many vocabulary tokens a literal must carry to "
                          "count (default 2). 2 HIDES EVERY ONE-ELEMENT SET, "
                          "and two live drifts were found there -- run 1 before "
                          "calling a file clean")
-    ap.add_argument("--bare", type=_flag, nargs="?", const=True, default=False,
+    ap.add_argument("--bare", type=_path_types().text_arg("--bare", then=_flag), nargs="?", const=True, default=False,
                     help="also match UNQUOTED vocabulary runs (noisy; finds the "
                          "`(a / b / c)` shape no quoted regex can see)")
     ap.add_argument("--vocab", action="store_true",

@@ -322,24 +322,26 @@ def stage_one_cfg(key, answers, sqlite_cfg_h, dest_root):
     return out, "; ".join(notes)
 
 
-_WRITTEN_PATH_OWNER = []
+_PATH_TYPES_OWNER = []
 
 
-def _written_path_arg(flag):
-    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
-    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
-    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
-    if not _WRITTEN_PATH_OWNER:
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
         import importlib.util
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
         if not os.path.isfile(path):
-            raise SystemExit("stage-zinc: cannot find %s -- what a path to write may be is said there and nowhere else"
-                             % path)
+            raise SystemExit("stage-zinc: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
         spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        _WRITTEN_PATH_OWNER.append(mod)
-    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
 
 
 def main(argv=None):
@@ -360,21 +362,24 @@ def main(argv=None):
             pass   # a redirected/wrapped stream that cannot be reconfigured
     p = argparse.ArgumentParser(prog="stage-zinc.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--zlib-h", required=True, help="the deriving host's zlib.h")
-    p.add_argument("--zconf-h", required=True, help="the deriving host's zconf.h")
-    p.add_argument("--dest", required=True, type=_written_path_arg("--dest"),
+    p.add_argument("--zlib-h", required=True, help="the deriving host's zlib.h",
+                   type=_path_types().read_path_arg("--zlib-h"))
+    p.add_argument("--zconf-h", required=True, help="the deriving host's zconf.h",
+                   type=_path_types().read_path_arg("--zconf-h"))
+    p.add_argument("--dest", required=True, type=_path_types().written_path_arg("--dest"),
                    help="the zinc/ ROOT — one subdirectory is written per stage")
     p.add_argument("--sqlite-cfg-h", default="",
                    help="the DERIVING host's generated sqlite_cfg.h (the one its "
-                        "./configure wrote into the sqlite build dir)")
-    p.add_argument("--cfg-dest", default=None, type=_written_path_arg("--cfg-dest"),
+                        "./configure wrote into the sqlite build dir)",
+                   type=_path_types().read_path_arg("--sqlite-cfg-h", empty_means_absent=True))
+    p.add_argument("--cfg-dest", default=None, type=_path_types().written_path_arg("--cfg-dest"),
                    help="the cfg/ ROOT — one subdirectory is written per TARGET "
                         "OS, each holding that target's sqlite_cfg.h. A SEPARATE "
                         "root from --dest on purpose: the two families are keyed "
                         "differently (recipeTransform vs target OS) and a shared "
                         "root would let a transform named 'linux' collide with a "
                         "target OS named 'linux'.")
-    p.add_argument("--catalogue", default=harness_legs.CATALOGUE)
+    p.add_argument("--catalogue", default=harness_legs.CATALOGUE, type=_path_types().read_path_arg("--catalogue"))
     args = p.parse_args(argv)
 
     # ★ THE sqlite_cfg.h PAIR IS OPTIONAL *HERE* AND MANDATORY AT THE POINT OF USE,

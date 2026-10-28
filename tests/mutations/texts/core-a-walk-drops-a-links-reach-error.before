@@ -1,0 +1,1 @@
+            entry.reaches = reachedKind(entry.path, entry.reachError);

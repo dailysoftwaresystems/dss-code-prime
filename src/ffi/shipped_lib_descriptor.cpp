@@ -5733,16 +5733,20 @@ struct CorpusIndex {
     idx.root = std::move(root);
     // The descriptors, collected by the substrate's walk -- which never descends a
     // link on any build (libstdc++ on Windows cannot tell one from what it
-    // reaches: the substrate's header). A root that cannot be listed is an EMPTY
-    // index, as the iterator's construction error was; a directory BELOW it that
-    // cannot be listed throws, as the iterator's `operator++` did.
+    // reaches: the substrate's header). An ABSENT root is an EMPTY index (there
+    // is no corpus to know); anything the walk could not read -- the root, a
+    // directory below it, a link whose reach it cannot examine -- THROWS, naming
+    // where, because an index built from part of the corpus would call a symbol
+    // it never read "unknown".
     std::vector<fs::path> descriptors;
+    std::error_code       rootEc;
+    if (core::reachedKind(idx.root, rootEc) == core::EntryKind::Absent && !rootEc) return idx;
     auto const walk = core::walkTree(idx.root, [&](core::TreeEntry const& entry) {
         if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
             descriptors.push_back(entry.path);
         return core::WalkStep::Continue;
     });
-    if (walk.error && walk.where != idx.root)
+    if (walk.error)
         throw fs::filesystem_error("the shipped descriptor corpus could not be walked", walk.where, walk.error);
     for (fs::path const& descriptor : descriptors) {
         std::ifstream in(descriptor, std::ios::binary);
@@ -5767,7 +5771,7 @@ struct CorpusIndex {
             continue;
         }
         std::error_code relEc;
-        auto rel = fs::relative(descriptor, idx.root, relEc);
+        auto rel = core::reachedRelative(descriptor, idx.root, relEc);
         std::string const relPath =
             // ASYMMETRIC ON PURPOSE. `rel` is a RELATIVE path — no root, so no
             // authority to lose — while the fallback arm is the ABSOLUTE entry
@@ -6490,19 +6494,32 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
                       DiagnosticReporter&          reporter) {
     std::vector<ShippedSourceClaim> claims;
     std::error_code ec;
-    if (core::reachedKind(descriptorDir, ec) != core::EntryKind::Directory) return claims;
+    auto const      kind = core::reachedKind(descriptorDir, ec);
+    if (ec) {
+        emitMalformed(reporter,
+            "shipped-lib descriptor directory '" + core::genericSpelling(descriptorDir)
+            + "' cannot be examined (" + ec.message() + "), so no descriptor's "
+              "shipped-source claim under it could be read");
+        return claims;
+    }
+    if (kind != core::EntryKind::Directory) return claims;
     // The substrate's walk: it never descends a link on any build (libstdc++ on
-    // Windows cannot tell one from what it reaches -- the substrate's header). A
-    // directory it cannot list ends the walk, as the iterator's error did.
+    // Windows cannot tell one from what it reaches -- the substrate's header).
+    // Anything it could not read ends the walk and is REFUSED, naming where: the
+    // claims of the descriptors beyond it were never read, and every rule below
+    // reads this list as the whole of them.
     std::vector<std::filesystem::path> descriptors;
-    static_cast<void>(core::walkTree(
-        descriptorDir,
-        [&](core::TreeEntry const& entry) {
-            if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-                descriptors.push_back(entry.path);
-            return core::WalkStep::Continue;
-        },
-        core::TreeWalkOptions{.skipPermissionDenied = true}));
+    auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
+        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+            descriptors.push_back(entry.path);
+        return core::WalkStep::Continue;
+    });
+    if (walk.error) {
+        emitMalformed(reporter,
+            "shipped-lib descriptor directory '" + core::genericSpelling(descriptorDir)
+            + "' could not be read whole: the walk stopped at '" + core::genericSpelling(walk.where) + "' ("
+            + walk.error.message() + "), so the claims of the descriptors beyond it were never read");
+    }
     for (std::filesystem::path const& descriptor : descriptors) {
         json const* const docPtr = cachedDescriptorJson(descriptor, reporter);
         if (!docPtr) continue;   // a broken descriptor is the full read's business
@@ -6787,24 +6804,43 @@ bool validateShippedSourceTree(
               "build (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R2/R4)");
         return false;
     }
-    for (std::filesystem::directory_iterator tierIt{runtimeRootDir, ec}, tierEnd;
-         tierIt != tierEnd; tierIt.increment(ec)) {
-        if (ec) break;
-        if (core::reachedKind(tierIt->path(), ec) != core::EntryKind::Directory) continue;
-        std::filesystem::path const authored = tierIt->path() / "src";
-        if (core::reachedKind(authored, ec) != core::EntryKind::Directory) continue;
-        // The substrate's walk: it never descends a link on any build (libstdc++
-        // on Windows cannot tell one from what it reaches -- the substrate's
-        // header). A directory it cannot list ends this tier's walk, as the
-        // iterator's error did.
+    // The tiers -- every entry of the root that reaches a directory -- and each
+    // tier's authored files, by the substrate's walk: it never descends a link on
+    // any build (libstdc++ on Windows cannot tell one from what it reaches -- the
+    // substrate's header). An ABSENT root holds no file to refuse; anything the
+    // walks could not read is REFUSED, naming where, because a file under it was
+    // never checked against its declarers and a sweep must not pass over it
+    // (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R2/R4, both refusals below).
+    auto const unread = [&](std::filesystem::path const& subject, core::TreeWalk const& walk) {
+        emitMalformed(reporter,
+            "shipped-source tree: '" + core::genericSpelling(subject) + "' could not be read whole: the walk "
+            "stopped at '" + core::genericSpelling(walk.where) + "' (" + walk.error.message() + "), so no file "
+            "beyond it was checked against its declarers");
+    };
+    std::vector<std::filesystem::path> tiers;
+    if (core::reachedKind(runtimeRootDir, ec) != core::EntryKind::Absent || ec) {
+        auto const tierWalk = core::walkTree(runtimeRootDir, [&](core::TreeEntry const& entry) {
+            if (entry.reaches == core::EntryKind::Directory) tiers.push_back(entry.path);
+            return core::WalkStep::Prune;
+        });
+        if (tierWalk.error) unread(runtimeRootDir, tierWalk);
+    }
+    for (std::filesystem::path const& tier : tiers) {
+        std::filesystem::path const authored = tier / "src";
+        auto const authoredKind = core::reachedKind(authored, ec);
+        if (ec) {
+            emitMalformed(reporter,
+                "shipped-source tree: '" + core::genericSpelling(authored) + "' cannot be examined ("
+                + ec.message() + "), so no file under it was checked against its declarers");
+            continue;
+        }
+        if (authoredKind != core::EntryKind::Directory) continue;
         std::vector<std::filesystem::path> authoredFiles;
-        static_cast<void>(core::walkTree(
-            authored,
-            [&](core::TreeEntry const& entry) {
-                if (entry.reaches == core::EntryKind::File) authoredFiles.push_back(entry.path);
-                return core::WalkStep::Continue;
-            },
-            core::TreeWalkOptions{.skipPermissionDenied = true}));
+        auto const authoredWalk = core::walkTree(authored, [&](core::TreeEntry const& entry) {
+            if (entry.reaches == core::EntryKind::File) authoredFiles.push_back(entry.path);
+            return core::WalkStep::Continue;
+        });
+        if (authoredWalk.error) unread(authored, authoredWalk);
         for (std::filesystem::path const& p : authoredFiles) {
             if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
             emitMalformed(reporter,
@@ -6972,17 +7008,21 @@ bool validateShippedIncludeClosure(
     }
 
     // The substrate's walk: it never descends a link on any build (libstdc++ on
-    // Windows cannot tell one from what it reaches -- the substrate's header). A
-    // directory it cannot list ends the walk, as the iterator's error did.
+    // Windows cannot tell one from what it reaches -- the substrate's header).
+    // Anything it could not read ends the walk and is REFUSED, naming where: a
+    // sweep that did not read the whole corpus cannot say its closures hold.
     std::vector<std::filesystem::path> descriptors;
-    static_cast<void>(core::walkTree(
-        descriptorDir,
-        [&](core::TreeEntry const& entry) {
-            if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-                descriptors.push_back(entry.path);
-            return core::WalkStep::Continue;
-        },
-        core::TreeWalkOptions{.skipPermissionDenied = true}));
+    auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
+        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+            descriptors.push_back(entry.path);
+        return core::WalkStep::Continue;
+    });
+    if (walk.error) {
+        emitCorpusInvariant(reporter,
+            "shipped-lib corpus sweep: '" + core::genericSpelling(descriptorDir)
+            + "' could not be read whole: the walk stopped at '" + core::genericSpelling(walk.where) + "' ("
+            + walk.error.message() + "), so the descriptors beyond it were never swept");
+    }
     // Deterministic order on every host (a directory iteration order is the
     // filesystem's, and a sweep that reports its failures in a host-dependent
     // order is a sweep whose output cannot be diffed).

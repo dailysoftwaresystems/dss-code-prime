@@ -236,8 +236,8 @@ def consumers_main(args, out=None, err=None, lock_factory=None):
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
     p = _Parser(prog="sqlite_stage.py consumers", add_help=False)
-    p.add_argument("--root", required=True)
-    p.add_argument("--prune", nargs="+", default=None)
+    p.add_argument("--root", required=True, type=C.owning_tree_module().read_path_arg("--root"))
+    p.add_argument("--prune", nargs="+", default=None, type=C.owning_tree_module().path_part_arg("--prune"))
     try:
         a = p.parse_args(args)
     except _UsageError as exc:
@@ -2395,18 +2395,21 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
     env = dict(os.environ if environ is None else environ)
     p = _Parser(prog="sqlite_stage.py derive", add_help=False)
     p.add_argument("--out", required=True, type=C.owning_tree_module().written_path_arg("--out"))
-    p.add_argument("--sqlite-dir", required=True)
-    p.add_argument("--sqlite-repo-url", default=DEFAULT_SQLITE_REPO_URL)
-    p.add_argument("--tcl-version", default="")
-    p.add_argument("--jobs", default="")
-    p.add_argument("--stage-build-json", required=True)
-    p.add_argument("--tier", required=True)
-    p.add_argument("--test-file", default="")
-    p.add_argument("--consumer-of", default="")   # the consuming output tree, as its host spells it (2026-10-01)
+    p.add_argument("--sqlite-dir", required=True, type=C.owning_tree_module().written_path_arg("--sqlite-dir"))
+    p.add_argument("--sqlite-repo-url", default=DEFAULT_SQLITE_REPO_URL,
+                   type=C.owning_tree_module().text_arg("--sqlite-repo-url"))
+    p.add_argument("--tcl-version", default="",
+                   type=C.owning_tree_module().path_part_arg("--tcl-version", empty_means_absent=True))
+    p.add_argument("--jobs", default="", type=C.owning_tree_module().text_arg("--jobs"))
+    p.add_argument("--stage-build-json", required=True, type=C.owning_tree_module().read_path_arg("--stage-build-json"))
+    p.add_argument("--tier", required=True, type=C.owning_tree_module().path_part_arg("--tier"))
+    p.add_argument("--test-file", default="", type=C.owning_tree_module().text_arg("--test-file"))
+    # the consuming output tree, as its host spells it (2026-10-01)
+    p.add_argument("--consumer-of", default="", type=C.owning_tree_module().text_arg("--consumer-of"))
     try:
+        # A missing --sqlite-dir and a blank one are refused here, by the parser: the flag is required and its type
+        # refuses a value that names no path -- the caller names the checkout the derive stages from.
         a = p.parse_args(args)
-        if not a.sqlite_dir.strip():
-            raise _UsageError("--sqlite-dir names nothing: the caller names the checkout the derive stages from")
     except _UsageError as exc:
         err.write("sqlite_stage.py derive: %s\n%s" % (exc, p.format_usage()))
         return 2
@@ -3298,7 +3301,8 @@ def _st_derive(t):
     rc2, o2, e2 = run(base[:2] + ["--sqlite-dir", "  "] + base[4:], lock=_FakeLock())
     t.check("a derive naming NO --sqlite-dir, or one of blanks, is a USAGE error (exit 2) and stages nothing -- the "
             "caller names the consumer's own checkout; the default this CLI had was the ONE clone every run shared",
-            rc == 2 and "--sqlite-dir" in e and rc2 == 2 and "names nothing" in e2 and len(calls) == n_calls, (e, e2))
+            rc == 2 and "--sqlite-dir" in e and rc2 == 2 and "--sqlite-dir names no path" in e2
+            and len(calls) == n_calls, (e, e2))
     # ★ --consumer-of (2026-10-01, the P69 review's MINOR 2): the record that lets a Windows tree's checkout go with
     # its tree, beside the checkout, written under the lock BEFORE the stage can fail.
     record = _j(tmp, CONSUMER_RECORD)

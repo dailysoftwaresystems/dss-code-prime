@@ -1,0 +1,2 @@
+                        PipelineStage::Unit, opt::ModuleExtent::LinkInput, {},
+                        reporter, cuMir->externImports)) {

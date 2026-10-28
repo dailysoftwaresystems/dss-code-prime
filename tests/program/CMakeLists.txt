@@ -542,6 +542,15 @@ dss_add_test(NAME program/test_macho_install_name_identity
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_synth_verify_seam_guard
              SOURCES test_synth_verify_seam_guard.cpp)
+# ★ `repo-guard`, SET BY HAND, beside its registration: the label scan of the top-level CMakeLists reads the
+# top directory's entries, and this one is registered here. Four of its five cases judge the SOURCE TREE
+# (src/program/compile_pipeline.cpp and src/program/program.cpp, read through the repository root), the same
+# bytes on every leg, so an indirect leg re-reading them learns nothing -- the ruling the label exists for
+# (stated where the top-level CMakeLists gives the label); its fifth proves its own blanker on text the binary
+# holds, which keeps the label (a tree-checking guard that also proves its own refusals). The mutation sweep
+# starts the binary itself and asks no label.
+set_property(TEST program/test_synth_verify_seam_guard APPEND PROPERTY LABELS "repo-guard")
+message(STATUS "repo-guard label applied to 1 additional test (program/test_synth_verify_seam_guard), registered in tests/program")
 
 # D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH (P63 remediation): the
 # BEHAVIOURAL half of the same closure. The seam guard above pins WHERE

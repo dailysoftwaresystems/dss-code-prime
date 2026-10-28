@@ -1,0 +1,2 @@
+        listEntries(dir, depth, listed.entries, ec);
+        if (ec) {

@@ -387,13 +387,53 @@ struct FsAnswer {
     std::string why;  // empty iff ok
 };
 
+// ★ EVERY QUESTION THIS RUNNER ASKS OF A PATH IS ASKED OF THE SUBSTRATE
+// (src/core/substrate/path_identity.hpp, compiled into this runner), never of
+// the library: libstdc++ on Windows answers a link from the LINK's own
+// attributes -- a link to a file is 0 bytes long and was written when the link
+// was made, a dangling link is a regular file (✔MEASURED 2026-10-20 and
+// 2026-10-21, the substrate's header) -- so the MinGW build of this runner read
+// another file than the one it named. These keep the library's `error_code`
+// contract: a size or a time of a path that reaches no file is an ERROR, named.
+[[nodiscard]] bool reachesSomething(fs::path const& p, std::error_code& ec) {
+    return dss::core::reachedKind(p, ec) != dss::core::EntryKind::Absent;
+}
+
+[[nodiscard]] bool reachesKind(fs::path const& p, dss::core::EntryKind kind, std::error_code& ec) {
+    return dss::core::reachedKind(p, ec) == kind && !ec;
+}
+
+// Why `p` has no size or time to give, when the substrate answered "nothing".
+[[nodiscard]] std::error_code whyNoFile(fs::path const& p) {
+    std::error_code kec;
+    auto const      kind = dss::core::reachedKind(p, kec);
+    if (kec) return kec;
+    if (kind == dss::core::EntryKind::Absent) return std::make_error_code(std::errc::no_such_file_or_directory);
+    if (kind == dss::core::EntryKind::Directory) return std::make_error_code(std::errc::is_a_directory);
+    return std::make_error_code(std::errc::not_supported);
+}
+
+// The size of the regular file `p` reaches; `ec` set (and 0) when it reaches none.
+[[nodiscard]] std::uintmax_t reachedSize(fs::path const& p, std::error_code& ec) {
+    auto const size = dss::core::reachedFileSize(p, ec);
+    if (!size && !ec) ec = whyNoFile(p);
+    return size.value_or(0);
+}
+
+// When the file `p` reaches was last written; `ec` set when it reaches nothing.
+[[nodiscard]] fs::file_time_type writtenAt(fs::path const& p, std::error_code& ec) {
+    auto const when = dss::core::reachedWriteTime(p, ec);
+    if (!when && !ec) ec = whyNoFile(p);
+    return when.value_or(fs::file_time_type{});
+}
+
 // `exists` with the failure kept SEPARATE from the answer. An unreadable path
 // is not an absent one — ELOOP on a self-referential symlink, EACCES on a
 // locked parent — and only the `error_code` overload can tell them apart; the
 // throwing form answers one of those two questions by aborting the run.
 [[nodiscard]] FsAnswer fileExists(fs::path const& p) {
     std::error_code ec;
-    bool const present = fs::exists(p, ec);
+    bool const present = reachesSomething(p, ec);
     if (ec) {
         return {false,
                 "cannot stat '" + p.generic_string() + "': " + ec.message()};
@@ -413,7 +453,7 @@ struct FsAnswer {
 // that sends the reader to look at a file that is not even there.
 [[nodiscard]] FsAnswer fileNonEmpty(fs::path const& p) {
     std::error_code ec;
-    auto const size = fs::file_size(p, ec);
+    auto const size = reachedSize(p, ec);
     if (ec) {
         return {false, "cannot read the size of '" + p.generic_string()
                            + "': " + ec.message()};
@@ -1728,7 +1768,7 @@ struct ProjectFacts {
     if (argv0.find('/') != std::string::npos
         || argv0.find('\\') != std::string::npos) {
         std::error_code ec;
-        bool const there = fs::exists(fs::path{argv0}, ec);
+        bool const there = reachesSomething(fs::path{argv0}, ec);
         return there && !ec;
     }
     return !findOnPath(argv0).empty();
@@ -1828,17 +1868,17 @@ resolvePrebuiltLibraryCli(PrebuiltLibrary const& lib,
     std::string    why;
     std::string    bytes;
     std::error_code ec;
-    if (bool const regular = fs::is_regular_file(resolved, ec); !regular || ec) {
+    if (bool const regular = reachesKind(resolved, dss::core::EntryKind::File, ec); !regular || ec) {
         // ⚠ The "never a skip" clause is on BOTH sub-branches, not just the
-        // clean-absence one: ✔MEASURED, `is_regular_file` reports a missing
-        // path through `ec` on this host, so putting the sentence on the other
-        // branch alone would have hidden it in exactly the commonest case.
+        // clean-absence one: a missing path is no regular file with no error,
+        // one that cannot be examined carries its error, and both are the
+        // same failure.
         why = "not a regular file at " + resolved.generic_string()
             + (ec ? " (" + ec.message() + ")" : "")
             + " — a library input the manifest asked for and the tree could not"
               " supply is a FAILURE, never a skip";
     } else {
-        auto const declaredSize = fs::file_size(resolved, ec);
+        auto const declaredSize = reachedSize(resolved, ec);
         std::ifstream in(resolved.string(), std::ios::binary);
         if (in) {
             bytes.assign(std::istreambuf_iterator<char>(in),
@@ -2175,9 +2215,9 @@ std::size_t dependencyImagesDiffered  = 0;
 // instrument above must never count an unreadable pair as a difference.
 [[nodiscard]] FsAnswer filesDiffer(fs::path const& a, fs::path const& b) {
     std::error_code ec;
-    auto const sizeA = fs::file_size(a, ec);
+    auto const sizeA = reachedSize(a, ec);
     if (ec) return {false, "cannot size '" + a.generic_string() + "'"};
-    auto const sizeB = fs::file_size(b, ec);
+    auto const sizeB = reachedSize(b, ec);
     if (ec) return {false, "cannot size '" + b.generic_string() + "'"};
     if (sizeA != sizeB) return {true, {}};
     std::ifstream fa(a.string(), std::ios::binary);
@@ -3450,14 +3490,22 @@ void runErrorExampleViaCli(std::string const& compiler,
         // on every build -- libstdc++ on Windows cannot tell one from what it
         // reaches (the substrate's header) -- and a file reached through a link
         // is still a file the build left.
-        static_cast<void>(dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
+        // A walk that could not read the whole directory did not look for
+        // leftovers there, so it FAILS this check, naming where it stopped --
+        // never a pass over the part it read.
+        auto const walk = dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
             if (entry.reaches == dss::core::EntryKind::File && entry.path.filename() != cliLog.filename())
                 leftovers.push_back(entry.path.generic_string());
             return dss::core::WalkStep::Continue;
-        }));
+        });
         check(exampleName + ": CLI writes NO artifact for a rejected build",
-              leftovers.empty(),
-              std::to_string(leftovers.size()) + " file(s) under "
+              leftovers.empty() && !walk.error,
+              walk.error
+                  ? "the walk of " + outDir.generic_string() + " stopped at "
+                        + walk.where.generic_string() + ": " + walk.error.message()
+                        + " — the directory was not read whole, so no leftover "
+                          "was ruled out"
+                  : std::to_string(leftovers.size()) + " file(s) under "
                   + outDir.generic_string() + ", first: "
                   + (leftovers.empty() ? std::string{} : leftovers.front())
                   + " — the compiler reported failure and produced the binary "
@@ -3525,7 +3573,7 @@ void runAllExamples(std::string const& compiler,
     // per-example failures, or one bad symlink would black out the whole
     // corpus. Both severities are counted, so RC is 1 in every case.
     std::error_code rootEc;
-    bool const rootIsDir = fs::is_directory(examplesRoot, rootEc);
+    bool const rootIsDir = reachesKind(examplesRoot, dss::core::EntryKind::Directory, rootEc);
     if (rootEc) {
         std::cerr << "[ERROR] cannot stat examples root "
                   << examplesRoot.generic_string() << ": " << rootEc.message()
@@ -3560,11 +3608,12 @@ void runAllExamples(std::string const& compiler,
          langIt.increment(langEc)) {
         if (langEc) break;  // reported after the loop
         auto const langPath = langIt->path();
-        // `is_directory(ec)`, NOT `is_directory()`: this reaches the filesystem
-        // whenever the entry's cached readdir type is a symlink or unknown, and
-        // a self-referential symlink answers ELOOP rather than yes-or-no.
+        // What the entry REACHES, asked of the substrate with the error kept
+        // apart: a self-referential symlink answers ELOOP rather than
+        // yes-or-no, and the library's cached answer on a MinGW build is the
+        // link's own.
         std::error_code langKindEc;
-        bool const langIsDir = langIt->is_directory(langKindEc);
+        bool const langIsDir = reachesKind(langIt->path(), dss::core::EntryKind::Directory, langKindEc);
         if (langKindEc) {
             std::cerr << "[ERROR] cannot stat corpus entry "
                       << langPath.generic_string() << ": "
@@ -3588,7 +3637,7 @@ void runAllExamples(std::string const& compiler,
             if (nameEc) break;  // reported after this inner loop
             auto const namePath = nameIt->path();
             std::error_code nameKindEc;
-            bool const nameIsDir = nameIt->is_directory(nameKindEc);
+            bool const nameIsDir = reachesKind(nameIt->path(), dss::core::EntryKind::Directory, nameKindEc);
             if (nameKindEc) {
                 std::cerr << "[ERROR] cannot stat corpus entry "
                           << namePath.generic_string() << ": "
@@ -3605,7 +3654,7 @@ void runAllExamples(std::string const& compiler,
             // print a green Results line, which is the failure mode this
             // defect is named for.
             std::error_code mpEc;
-            bool const haveManifest = fs::exists(mp, mpEc);
+            bool const haveManifest = reachesSomething(mp, mpEc);
             if (mpEc) {
                 std::cerr << "[ERROR] cannot stat manifest "
                           << mp.generic_string() << ": " << mpEc.message()
@@ -3987,7 +4036,7 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
     // could not be read". ★ A fail-loud message that names the wrong subsystem is
     // not fail-loud: it sends the reader to the one place the defect is not.
     std::size_t unreadableCells = 0;
-    if (fs::is_directory(g_cellDir, ec)) {
+    if (reachesKind(g_cellDir, dss::core::EntryKind::Directory, ec)) {
         for (fs::directory_iterator it(g_cellDir, ec), end; it != end && !ec;
              it.increment(ec)) {
             if (it->path().extension() != ".cell") continue;
@@ -6424,7 +6473,7 @@ void sweepStaleRemovalClaims(fs::path const& base, fs::file_time_type now) {
     fs::directory_iterator it(base / kReclaimDirName, ec);
     for (fs::directory_iterator const end; !ec && it != end; it.increment(ec)) {
         std::error_code tec;
-        auto const stamp = fs::last_write_time(it->path(), tec);
+        auto const stamp = writtenAt(it->path(), tec);
         if (!tec && now - stamp >= kRunningStaleAfter) stale.push_back(it->path());
     }
     for (auto const& claim : stale) releaseRemovalClaim(claim);
@@ -6452,14 +6501,14 @@ enum class Reclaim : std::uint8_t {
     bool const stillSelected = [&] {
         std::error_code sec;
         auto const running = root / kRunningName;
-        bool const sentinel = fs::exists(running, sec);
+        bool const sentinel = reachesSomething(running, sec);
         if (sec) return false;  // could not even ask: treat as LIVE
         if (sentinel) {
-            auto const stamp = fs::last_write_time(running, sec);
+            auto const stamp = writtenAt(running, sec);
             if (sec || now - stamp < kRunningStaleAfter) return false;
         }
-        if (!fs::exists(root / kRunInfoName, sec) || sec) return false;
-        auto const mtime = fs::last_write_time(root, sec);
+        if (!reachesSomething(root / kRunInfoName, sec) || sec) return false;
+        auto const mtime = writtenAt(root, sec);
         return !sec && mtime == scannedMtime;
     }();
     Reclaim outcome = Reclaim::NotOurs;
@@ -6533,28 +6582,27 @@ std::size_t pruneKeptRoots(fs::path const& base, fs::path const& mine) {
     for (fs::directory_iterator const end; it != end; it.increment(ec)) {
         if (ec) break;  // reported after the loop
         auto const p = it->path();
-        // `is_directory(dec)`, NOT `is_directory()`: same reason, and this one
-        // reaches the filesystem whenever the entry's cached type is a symlink
-        // or unknown.
+        // What the entry REACHES, asked of the substrate with the error kept
+        // apart, as the corpus walk above asks it.
         std::error_code dec;
-        if (p == mine || !it->is_directory(dec) || dec) continue;
+        if (p == mine || !reachesKind(p, dss::core::EntryKind::Directory, dec) || dec) continue;
         // Only ever remove a directory this runner demonstrably created.
         std::error_code iec;
-        if (!fs::exists(p / kRunInfoName, iec) || iec) continue;
+        if (!reachesSomething(p / kRunInfoName, iec) || iec) continue;
         // A sentinel we cannot READ counts as LIVE. The uncertainty is
         // asymmetric: keeping a dead root costs a little temp space, while
         // deleting a live one is the fixed-temp-path collision between two
         // concurrent runs over again.
         std::error_code rec;
         auto const running = p / kRunningName;
-        bool const sentinel = fs::exists(running, rec);
+        bool const sentinel = reachesSomething(running, rec);
         if (rec) continue;  // could not even ask
         if (sentinel) {
-            auto const stamp = fs::last_write_time(running, rec);
+            auto const stamp = writtenAt(running, rec);
             if (rec || now - stamp < kRunningStaleAfter) continue;  // maybe LIVE
         }
         std::error_code mec;
-        auto const mtime = fs::last_write_time(p, mec);
+        auto const mtime = writtenAt(p, mec);
         if (mec) continue;  // vanished under us — a sibling cleaning up
         prunable.emplace_back(mtime, p);
     }
@@ -6646,12 +6694,12 @@ void reportLegacyDebris(fs::path const& base) {
     // `temp_directory_path()` throws — unwanted on a best-effort path.
     auto const legacy = base.parent_path() / kLegacyBaseName;
     std::error_code lec;
-    auto const legacyStamp = fs::last_write_time(legacy, lec);
+    auto const legacyStamp = writtenAt(legacy, lec);
     if (lec) return;  // absent (the normal case), or unreadable — say nothing
 
     auto const marker = base / kLegacyNotedName;
     std::error_code mec;
-    auto const noted = fs::last_write_time(marker, mec);
+    auto const noted = writtenAt(marker, mec);
     bool const saidBefore = !mec;
     if (saidBefore && noted >= legacyStamp) {
         return;  // already said, and nothing has touched the tree since
@@ -6800,20 +6848,27 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         }
         std::ofstream((root / kRunInfoName).string())
             << "planted by the concurrent scratch-removal pin\n";
-        if (!fs::exists(root / kRunInfoName, ec)) {
+        if (!reachesSomething(root / kRunInfoName, ec)) {
             return "cannot plant '" + (root / kRunInfoName).generic_string()
                  + "'";
         }
         return {};
     };
 
-    auto const filesUnder = [](fs::path const& root) {
+    // The first walk that could not read a root, named: a count it returned is
+    // SHORT, and is reported as the walk's failure, never as a root "not whole".
+    std::string unwalked;
+    auto const filesUnder = [&unwalked](fs::path const& root) {
         std::size_t n = 0;
         // The substrate's walk: it never descends a link on any build.
-        static_cast<void>(dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
+        auto const walk = dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
             if (entry.reaches == dss::core::EntryKind::File) ++n;
             return dss::core::WalkStep::Continue;
-        }));
+        });
+        if (walk.error && unwalked.empty()) {
+            unwalked = "the walk of '" + root.generic_string() + "' stopped at '"
+                     + walk.where.generic_string() + "': " + walk.error.message();
+        }
         return n;
     };
     auto const claimsLeftIn = [](fs::path const& base) {
@@ -6852,7 +6907,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         for (fs::directory_iterator it(base, ec), end; !ec && it != end;
              it.increment(ec)) {
             std::error_code iec;
-            if (!fs::exists(it->path() / kRunInfoName, iec)) continue;
+            if (!reachesSomething(it->path() / kRunInfoName, iec)) continue;
             ++left;
             if (filesUnder(it->path()) != kPlantedFiles) ++broken;
         }
@@ -6865,6 +6920,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
               + std::to_string(left) + " root(s) left, "
               + std::to_string(broken) + " of them not whole";
         }
+        if (!unwalked.empty()) a = "round " + std::to_string(round) + ": " + unwalked;
     }
 
     // (b) a green release racing prunes that selected the SAME root. Planted
@@ -6877,7 +6933,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         planted = plant(root);
         if (!planted.empty()) break;
         std::error_code mec;
-        auto const selectedMtime = fs::last_write_time(root, mec);
+        auto const selectedMtime = writtenAt(root, mec);
         auto const now = fs::file_time_type::clock::now();
         std::vector<int> removed(static_cast<std::size_t>(kDeleters), 0);
         std::vector<int> warned(static_cast<std::size_t>(kDeleters), 0);
@@ -6950,7 +7006,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
             auto const early      = reclaimKeptRoot(root, olderScan, now);
             auto const earlyFiles = filesUnder(root);
             std::ofstream((root / kRunningName).string());
-            auto const currentScan = fs::last_write_time(root, mec);
+            auto const currentScan = writtenAt(root, mec);
             auto const live        = reclaimKeptRoot(root, currentScan, now);
             auto const liveFiles   = filesUnder(root);
             if (mec || early != Reclaim::NotOurs || earlyFiles != kPlantedFiles
@@ -6966,6 +7022,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
                   + (mec ? "; mtime unreadable: " + mec.message()
                          : std::string{});
             }
+            if (!unwalked.empty()) d = unwalked;
         }
     }
 

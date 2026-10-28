@@ -3163,11 +3163,11 @@ TEST(ExpandGlob, ARecursiveGlobNeverWalksThroughALinkAndMatchesALinkByWhatItReac
     writeText(dir / "src" / "a.c", "int a(void){return 0;}\n");
     writeText(elsewhere.path() / "beyond.c", "int beyond(void){return 0;}\n");
     writeText(elsewhere.path() / "named.c", "int named(void){return 0;}\n");
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(elsewhere.path(), dir / "src" / "linked", LinkTo::Directory));
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", dir / "src" / "via-link.c",
-                                                     LinkTo::File));
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c",
-                                                     LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path(), dir / "src" / "linked", LinkTo::Directory));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", dir / "src" / "via-link.c",
+                                                             LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c",
+                                                             LinkTo::File));
 
     std::vector<std::string> out;
     std::error_code ec;
@@ -3195,8 +3195,8 @@ TEST(ExpandGlob, ALiteralPatternNamingADanglingLinkMatchesNothing) {
     auto const dir = scratch.path();
     std::filesystem::create_directories(dir / "src");   // writeText makes no directory
     writeText(dir / "src" / "real.c", "int r(void){return 0;}\n");
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "src" / "real.c", dir / "src" / "via-link.c", LinkTo::File));
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "real.c", dir / "src" / "via-link.c", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c", LinkTo::File));
 
     std::error_code          ec;
     std::vector<std::string> viaLink;

@@ -697,11 +697,12 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
                      DiagnosticReporter&          reporter) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    if (core::reachedKind(headerDir, ec) != core::EntryKind::Directory) {
+    if (core::reachedKind(headerDir, ec) != core::EntryKind::Directory || ec) {
         return std::unexpected(HeaderReadError{
             HeaderReadErrorKind::FileOpenFailed,
             std::string{"readCHeaderDirectory: not a directory: "}
                 + core::genericSpelling(headerDir)
+                + (ec ? " (it cannot be examined: " + ec.message() + ")" : std::string{})
         });
     }
     if (importLibrary.empty()) {
@@ -710,15 +711,38 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
             "readCHeaderDirectory requires a non-empty importLibrary"
         });
     }
+    // The directory's own entries (a sub-directory is never descended), by the
+    // substrate's walk. A header is an entry NAMED `.h` by what it REACHES (the
+    // substrate's answer, never the library's: libstdc++ on Windows calls a
+    // dangling link a regular file). What the read cannot read FAILS it, naming
+    // it -- a listing that fails, and an entry named as a header whose reach
+    // cannot be examined (a looping link) -- because a header library read short
+    // would hand a partial surface on as the whole one. An entry NOT named as a
+    // header is none whatever it reaches, so its reach is never asked.
     std::vector<fs::path> headers;
-    for (auto const& entry : fs::directory_iterator{headerDir, ec}) {
-        if (ec) break;
-        // A header is an entry by what it REACHES (the substrate's answer, never the
-        // library's: libstdc++ on Windows calls a dangling link a regular file).
-        if (std::error_code kindEc; core::reachedKind(entry.path(), kindEc) != core::EntryKind::File) continue;
-        if (entry.path().extension() == ".h") {
-            headers.push_back(entry.path());
-        }
+    std::string           unreadable;
+    auto const walk = core::walkTree(
+        headerDir,
+        [&](core::TreeEntry const& entry) {
+            if (entry.path.extension() != ".h") return core::WalkStep::Prune;
+            if (entry.reachError) {
+                unreadable = "'" + core::genericSpelling(entry.path) + "' is named as a header but what it "
+                             "reaches cannot be examined (" + entry.reachError.message() + ")";
+                return core::WalkStep::Stop;
+            }
+            if (entry.reaches == core::EntryKind::File) headers.push_back(entry.path);
+            return core::WalkStep::Prune;
+        },
+        core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (!unreadable.empty() || walk.error) {
+        return std::unexpected(HeaderReadError{
+            HeaderReadErrorKind::FileOpenFailed,
+            std::string{"readCHeaderDirectory: '"} + core::genericSpelling(headerDir)
+                + "' could not be read whole: "
+                + (!unreadable.empty() ? unreadable
+                                       : "the walk stopped at '" + core::genericSpelling(walk.where) + "' ("
+                                             + walk.error.message() + ")")
+        });
     }
     // Deterministic order: alphabetical by filename — makes test
     // assertions stable across platforms when a directory-based

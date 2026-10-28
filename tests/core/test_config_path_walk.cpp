@@ -297,9 +297,8 @@ TEST(ConfigPathWalk, DirWalkPassesADanglingLinkAndFindsTheRealDirectory) {
     std::error_code ec;
     fs::create_directories(start / "src" / "dss-config", ec);
     ASSERT_FALSE(ec) << ec.message();
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(start / "no-such-dir", start / "src" / "dss-config" / "sources",
-                                                     dss::test_support::LinkTo::Directory))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(start / "no-such-dir", start / "src" / "dss-config" / "sources",
+                                                             dss::test_support::LinkTo::Directory));
 
     auto const got = findShippedConfigDir("sources", start);
     ASSERT_TRUE(got.has_value()) << "the walk found no config directory at all";

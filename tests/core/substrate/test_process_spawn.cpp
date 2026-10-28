@@ -1096,10 +1096,6 @@ TEST(ResolveExecutableOnPath, FindsANameOnPathAndNotOtherwise) {
                : std::string{});
 }
 
-// A command that already carries a directory component is NOT a PATH lookup —
-// it is taken as given. Pinned with a PATH that contains only a known-empty
-// directory, so a resolver that (wrongly) routed this through the search would
-// find nothing and fail here.
 // A DANGLING LINK IS NO PROGRAM, on every build: a PATH entry holding a dangling link named like the program is
 // passed over, and the search goes on to the entry that holds it -- what the MSVC and POSIX builds always did.
 // libstdc++ on Windows reads a dangling link's own attributes and calls it a regular file, so the MinGW build
@@ -1114,9 +1110,8 @@ TEST(ResolveExecutableOnPath, ADanglingLinkOnAnEarlierPathEntryIsPassedOver) {
 #else
     fs::path const link = earlier.path() / stem;
 #endif
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(earlier.path() / "no-such-program", link,
-                                                     dss::test_support::LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(earlier.path() / "no-such-program", link,
+                                                             dss::test_support::LinkTo::File));
 
     PathVarGuard guard;
     setPathVar(earlier.path().string() + std::string(1, kPathListSeparator) + ownDir.string());
@@ -1128,6 +1123,59 @@ TEST(ResolveExecutableOnPath, ADanglingLinkOnAnEarlierPathEntryIsPassedOver) {
     EXPECT_EQ(took, "the program") << "the search took " << took;
 }
 
+// A NAME HOLDING A WINDOWS WILDCARD IS NO PROGRAM. On Windows the candidate is classified by the record
+// `FindFirstFileW` returns, and the OS reads `<`, `>` and `"` as wildcards as well as `*` and `?` (DOS_STAR,
+// DOS_QM, DOS_DOT): ✔MEASURED 2026-10-21, `tool.ex>` and `tool"exe` each find `tool.exe`. An App Execution Alias
+// record is taken for a program from that record alone, so a wildcard spelling of one resolved to it. The record
+// here is made in a scratch directory (✔MEASURED 2026-10-21: any process may set the alias reparse tag on a file
+// it creates), so the case needs none of the host's own aliases; the name itself resolving is its control.
+// POSIX holds no wildcard in a file name: `<`, `>` and `"` are ordinary characters there.
+TEST(ResolveExecutableOnPath, ANameHoldingAWindowsWildcardIsNoProgram) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX file name holds no wildcard; the Windows legs ask this";
+#else
+    dss::test_support::ScratchDir dir{dss::test_support::Location::Temp, "process-spawn-wildcard"};
+    fs::path const record = dir.path() / "tool.exe";
+    {
+        HANDLE const file = ::CreateFileW(record.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        ASSERT_NE(file, INVALID_HANDLE_VALUE) << "cannot create " << record.string() << ": " << ::GetLastError();
+        // The alias layout: version 3, then four NUL-ended strings (package, app id, target, app type).
+        std::wstring const strings = std::wstring(L"Dss.Probe_0") + L'\0' + L"Dss.Probe_0!App" + L'\0'
+                                   + L"C:\\Windows\\System32\\cmd.exe" + L'\0' + L"0" + L'\0';
+        std::vector<unsigned char> buffer(12 + strings.size() * sizeof(wchar_t), 0);
+        ULONG const  tag     = 0x8000001BUL;   // IO_REPARSE_TAG_APPEXECLINK
+        USHORT const length  = static_cast<USHORT>(buffer.size() - 8);
+        ULONG const  version = 3;
+        std::memcpy(buffer.data(), &tag, sizeof tag);
+        std::memcpy(buffer.data() + 4, &length, sizeof length);
+        std::memcpy(buffer.data() + 8, &version, sizeof version);
+        std::memcpy(buffer.data() + 12, strings.data(), strings.size() * sizeof(wchar_t));
+        DWORD      returned = 0;
+        BOOL const set      = ::DeviceIoControl(file, FSCTL_SET_REPARSE_POINT, buffer.data(),
+                                                static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr);
+        DWORD const error = set ? ERROR_SUCCESS : ::GetLastError();
+        ::CloseHandle(file);
+        ASSERT_TRUE(set) << "the OS set no alias reparse point on " << record.string() << " (error " << error << ")";
+    }
+    PathVarGuard guard;
+    setPathVar(dir.path().string());
+    EXPECT_TRUE(resolveExecutableOnPath("tool.exe").has_value()) << "the alias record itself is no program: the "
+                                                                   "case cannot tell a wildcard from a miss";
+    // Each spelled with an extension, so the search tries it as given (a name without one is tried with PATHEXT
+    // appended, a spelling no record matches).
+    for (char const* spelled : {"tool.ex>", "tool.ex?", "tool.e*"}) {
+        auto const hit = resolveExecutableOnPath(spelled);
+        EXPECT_FALSE(hit.has_value()) << "`" << spelled << "` resolved to " << (hit ? hit->string() : std::string{})
+                                      << ": a wildcard found a program it does not name";
+    }
+#endif
+}
+
+// A command that already carries a directory component is NOT a PATH lookup —
+// it is taken as given. Pinned with a PATH that contains only a known-empty
+// directory, so a resolver that (wrongly) routed this through the search would
+// find nothing and fail here.
 TEST(ResolveExecutableOnPath, APathIsTakenAsGivenWithoutSearching) {
     PathVarGuard guard;
     dss::test_support::ScratchDir emptyDir{dss::test_support::Location::Temp,

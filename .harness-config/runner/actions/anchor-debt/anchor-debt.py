@@ -2448,7 +2448,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default="HEAD",
                     help="the git ref a change is judged against: a row that already existed there is DEBT, one the "
-                         "change added or edited is refused (default HEAD)")
+                         "change added or edited is refused (default HEAD)", type=_owning_tree().text_arg("--base"))
     ap.add_argument("--self-test", action="store_true",
                     help="check the instrument, not the registry")
     args = ap.parse_args()

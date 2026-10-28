@@ -190,8 +190,9 @@ endif()
 # (tests/test_support/os_link.hpp), so they run on the MinGW build -- whose library can neither make
 # a link nor see one -- as on every other.
 dss_add_test(NAME core/substrate/test_directory_tree    SOURCES substrate/test_directory_tree.cpp)
-# THE SOURCE GUARD of the substrate's filesystem questions: no std::filesystem kind, size, existence or
-# resolution query in src/ outside src/core/substrate/ (the guard's header states why).
+# THE SOURCE GUARD of the substrate's filesystem questions: no std::filesystem question whose answer depends on
+# how a link is read, in src/ outside src/core/substrate/ or in integrated_tests/ (the guard's header states
+# the class, the forms it refuses and why).
 dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_queries_guard.cpp)
 # ★ `repo-guard`, SET BY HAND, beside its registration: the label scan of the top-level CMakeLists reads the
 # top directory's entries, and this one is registered here. What it judges is the SOURCE TREE, the same

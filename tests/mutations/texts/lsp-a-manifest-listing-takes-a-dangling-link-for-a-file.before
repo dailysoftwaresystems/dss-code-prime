@@ -1,1 +1,1 @@
-        if (std::error_code kindEc; core::reachedKind(entry.path(), kindEc) != core::EntryKind::File) continue;
+            if (entry.reaches == core::EntryKind::File) out.push_back(entry.path);

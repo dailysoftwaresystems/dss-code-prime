@@ -18771,7 +18771,7 @@ def main(argv=None):
             pass   # a redirected/wrapped stream that cannot be reconfigured
     p = argparse.ArgumentParser(prog="harness_legs.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--catalogue", default=CATALOGUE)
+    p.add_argument("--catalogue", default=CATALOGUE, type=_owning_tree_module().read_path_arg("--catalogue"))
     # ── THE LIBRARY-PROVIDER VOCABULARY, PRINTED ─────────────────────────────
     # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
     # Same shape and same reason as `--verdict-vocabulary` below it: the closed
@@ -18826,17 +18826,20 @@ def main(argv=None):
                         "THIS instead of carrying its own reader; rc 2, naming "
                         "why, when there is not exactly one.")
     p.add_argument("--config-tree", default="", metavar="DIR",
+                   type=_owning_tree_module().read_path_arg("--config-tree", empty_means_absent=True),
                    help="with --wsl-distribution: the DSS tree whose configuration "
                         "is read (default: the tree this harness ships in)")
     p.add_argument("--path-translation", default=None,
                    help="the verb --translate-path / --assert-translated act "
-                        "under (a leg plan's run.pathTranslation)")
+                        "under (a leg plan's run.pathTranslation)",
+                   type=_owning_tree_module().text_arg("--path-translation"))
     p.add_argument("--translate-path", action="append", default=None,
                    metavar="PATH",
                    help="print PATH spelled the way the launcher declaring "
                         "--path-translation addresses it. Repeatable; one line "
                         "of output per PATH, in order. THIS is what keeps the "
-                        "translator named in one file instead of in the driver.")
+                        "translator named in one file instead of in the driver.",
+                   type=_owning_tree_module().read_path_arg("--translate-path"))
     p.add_argument("--assert-translated", action="append", default=None,
                    metavar="ARG",
                    help="verify no ARG is still a path in the namespace "
@@ -18847,7 +18850,8 @@ def main(argv=None):
                         "space-separated form would have argparse read that as "
                         "an option. The space form still works for a value that "
                         "does not begin with `-`, and misuse is a LOUD argparse "
-                        "error rather than a skipped check.")
+                        "error rather than a skipped check.",
+                   type=_owning_tree_module().command_words_arg("--assert-translated"))
     p.add_argument("--env-transfers", action="store_true",
                    help="print the closed environment-transfer vocabulary: "
                         "'<verb>\\t<carrier variable>', one per line")
@@ -18855,14 +18859,15 @@ def main(argv=None):
                    help="resolve --forward NAMEs under this verb (a leg plan's "
                         "run.envTransfer) and print the extra NAME=VALUE "
                         "assignments the driver must make. Prints NOTHING for a "
-                        "verb whose child simply inherits.")
+                        "verb whose child simply inherits.", type=_owning_tree_module().text_arg("--env-transfer"))
     p.add_argument("--forward", action="append", default=None, metavar="NAME",
                    help="an environment variable the launched process must see, "
                         "whose value is NAMESPACE-NEUTRAL. Repeatable. Its kind "
                         "must be DECLARED `opaque` in LAUNCH_FORWARD_KINDS; a "
                         "path-valued or unclassified name is REFUSED here and "
                         "names --forward-path in the diagnostic, so a HOST path "
-                        "cannot reach a foreign launcher by this door.")
+                        "cannot reach a foreign launcher by this door.",
+                   type=_owning_tree_module().text_arg("--forward"))
     p.add_argument("--forward-path", action="append", default=None,
                    metavar="NAME=VALUE",
                    help="a forwarded variable whose value is a path IN THIS "
@@ -18872,7 +18877,7 @@ def main(argv=None):
                         "carrier names it. ★ USE THE `=` FORM: a Windows path "
                         "may begin with a drive letter but a future value may "
                         "not, and the space form would have argparse read one "
-                        "starting with `-` as an option.")
+                        "starting with `-` as an option.", type=_owning_tree_module().read_path_arg("--forward-path"))
     p.add_argument("--forward-declared", action="append", default=None,
                    metavar="NAME",
                    help="a forwarded variable whose value the CATALOGUE wrote "
@@ -18880,7 +18885,8 @@ def main(argv=None):
                         "QEMU_LD_PREFIX). Repeatable. It is already in the "
                         "launcher's namespace by construction, so it crosses "
                         "verbatim and needs no declared kind — stated as its "
-                        "own flag so that fact is visible rather than inferred.")
+                        "own flag so that fact is visible rather than inferred.",
+                   type=_owning_tree_module().text_arg("--forward-declared"))
     p.add_argument("--registry-controls", default=None, metavar="REGISTRY",
                    help="print any _deferred-anchor-registry*.md row whose text "
                         "names one of the --for NAMEs (a leg label, a failing "
@@ -18892,12 +18898,12 @@ def main(argv=None):
                         "[D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE]. "
                         "⚠ ALWAYS exits 0: it runs "
                         "on a failure path and must never become one. A row is "
-                        "a POINTER, never a verdict.")
+                        "a POINTER, never a verdict.", type=_owning_tree_module().read_path_arg("--registry-controls"))
     p.add_argument("--for-leg", action="append", default=None, dest="for_legs",
                    metavar="LABEL",
                    help="a LEG LABEL to look up under --registry-controls. "
                         "Repeatable. Searched WHOLE: decomposing `elf64-x86_64` "
-                        "matched a third of the registry.")
+                        "matched a third of the registry.", type=_owning_tree_module().text_arg("--for-leg"))
     p.add_argument("--for-test", action="append", default=None, dest="for_tests",
                    metavar="NAME",
                    help="a FAILING TEST NAME to look up under "
@@ -18905,10 +18911,11 @@ def main(argv=None):
                         "family component, because that is how a row spells a "
                         "test family. When any is given, a row matching only "
                         "the leg is NOT printed — the leg alone is not a "
-                        "matched control.")
+                        "matched control.", type=_owning_tree_module().text_arg("--for-test"))
     p.add_argument("--carrier-current", default="", metavar="VALUE",
                    help="the carrier variable's existing value, so an operator's "
-                        "own setting is merged rather than clobbered")
+                        "own setting is merged rather than clobbered",
+                   type=_owning_tree_module().text_arg("--carrier-current"))
     p.add_argument("--resolve-target-cc", default=None, metavar="LABEL",
                    help="pick LABEL's target C compiler — the FIRST declared "
                         "targetCc candidate that is on PATH AND proves, via "
@@ -18922,7 +18929,8 @@ def main(argv=None):
                         "none qualifies — a candidate that cannot state its "
                         "target is REFUSED, never assumed, because the compiler "
                         "builds this leg's dlopen()ed loadext helper and a "
-                        "wrong-target one false-reds every loadext-* unit.")
+                        "wrong-target one false-reds every loadext-* unit.",
+                   type=_owning_tree_module().text_arg("--resolve-target-cc"))
     # ── the ATTRIBUTION ORACLE, per leg ─────────────────────────────────────
     p.add_argument("--oracle-report", default=None, metavar="LABEL",
                    help="print LABEL's ORACLE VERDICT — the lines a driver's "
@@ -18930,7 +18938,8 @@ def main(argv=None):
                         "is a DIFFERENT platform's binary is reported as having "
                         "NO ORACLE, in those terms, and the fallback control is "
                         "named. Needs --reference-target (what --identify-binary "
-                        "MEASURED off the reference) and --reference-path.")
+                        "MEASURED off the reference) and --reference-path.",
+                   type=_owning_tree_module().text_arg("--oracle-report"))
     p.add_argument("--reference-target", default="",
                    metavar="ARCH:CONTAINER:TARGETOS",
                    help="the run reference's own MEASURED target — the IDENTITY "
@@ -18941,14 +18950,16 @@ def main(argv=None):
                         "NO ORACLE over a control that was on disk. "
                         "Empty is the only other accepted value and means "
                         "UNMEASURED; a wrongly-shaped one is REFUSED, never "
-                        "guessed at.")
+                        "guessed at.", type=_owning_tree_module().text_arg("--reference-target"))
     p.add_argument("--reference-path", default="", metavar="PATH",
-                   help="the run reference binary, or empty when none survived")
+                   help="the run reference binary, or empty when none survived",
+                   type=_owning_tree_module().text_arg("--reference-path"))
     p.add_argument("--leg-oracle", default="", metavar="PATH",
                    help="this leg's OWN same-platform reference, when "
-                        "--build-reference-oracle produced one")
-    p.add_argument("--leg-oracle-cc", default="", metavar="CC")
-    p.add_argument("--leg-oracle-triple", default="", metavar="TRIPLE")
+                        "--build-reference-oracle produced one", type=_owning_tree_module().text_arg("--leg-oracle"))
+    p.add_argument("--leg-oracle-cc", default="", metavar="CC", type=_owning_tree_module().text_arg("--leg-oracle-cc"))
+    p.add_argument("--leg-oracle-triple", default="", metavar="TRIPLE",
+                   type=_owning_tree_module().text_arg("--leg-oracle-triple"))
     p.add_argument("--classify-abort", default=None, metavar="LABEL",
                    help="decide whether a fixture ABORT on LABEL is an EARNED "
                         "confound. Takes --abort '<permutation>/<file>'. rc 0 = "
@@ -18956,10 +18967,10 @@ def main(argv=None):
                         "`key: value` per line, for the driver to relay), rc 3 = "
                         "UNEARNED, which still fails the leg. Uses the SAME "
                         "`confounds` ledger as the unit matcher, through the "
-                        "`matches: abort-file` rows.")
+                        "`matches: abort-file` rows.", type=_owning_tree_module().text_arg("--classify-abort"))
     p.add_argument("--abort", default="", metavar="PERM/FILE",
                    help="the abort's LOCATION — permutation/file. NOT enough on "
-                        "its own: --abort-log supplies its IDENTITY.")
+                        "its own: --abort-log supplies its IDENTITY.", type=_owning_tree_module().text_arg("--abort"))
     p.add_argument("--abort-log", default="", metavar="PATH",
                    help="the ABORTED SEGMENT'S LOG. Its FATAL TAIL — everything "
                         "printed after the fixture last did its job — is the "
@@ -18967,25 +18978,28 @@ def main(argv=None):
                         "file pattern AND its `abortDiagnostic` both do. A log "
                         "yielding no diagnostic (a silent crash) or one that "
                         "cannot be read matches NOTHING: absence of evidence "
-                        "never satisfies a matcher.")
+                        "never satisfies a matcher.",
+                   type=_owning_tree_module().read_path_arg("--abort-log", empty_means_absent=True))
     p.add_argument("--build-reference-oracle", default=None, metavar="LABEL",
                    help="build LABEL's SAME-PLATFORM attribution oracle from "
                         "the leg's OWN manifest, with the compiler "
                         "--resolve-target-cc verifies against this leg's "
                         "target. Prints a JSON report; rc 0 built, 3 the build "
                         "failed, 4 no declared compiler on this host targets "
-                        "this leg (the leg then HAS NO ORACLE and says so).")
+                        "this leg (the leg then HAS NO ORACLE and says so).",
+                   type=_owning_tree_module().text_arg("--build-reference-oracle"))
     p.add_argument("--manifest", default="", metavar="PATH",
                    help="the leg's .dss-project.json — the SAME file dss "
                         "consumed, so the oracle compiles one declaration "
-                        "rather than a second, drifting copy of it")
+                        "rather than a second, drifting copy of it",
+                   type=_owning_tree_module().read_path_arg("--manifest", empty_means_absent=True))
     p.add_argument("--oracle-dir", default=None, metavar="DIR",
                    type=_owning_tree_module().written_path_arg("--oracle-dir"),
                    help="write the oracle into DIR under the name this leg's "
                         "TARGET requires (reference_oracle_name). A driver that "
                         "spells the suffix itself has a `.exe` branch in it.")
     p.add_argument("--oracle-log", default=None, metavar="PATH",
-                   type=_owning_tree_module().written_path_arg("--oracle-log"),
+                   type=_owning_tree_module().written_path_arg("--oracle-log", empty_means_absent=True),
                    help="where to write the reference compiler's own output")
     # ── PER-TU ATTRIBUTION OF A BUILD FAILURE ───────────────────────────────
     p.add_argument("--attribute-build", default=None, metavar="LABEL",
@@ -18998,9 +19012,11 @@ def main(argv=None):
                         "it; rc 0 = every rejected TU is upstream-attributable, "
                         "rc 3 = at least one is charged to dss. An amnesty is "
                         "granted only where the reference ACTUALLY failed on "
-                        "that TU AND an earned `matches: build-tu` row names it.")
+                        "that TU AND an earned `matches: build-tu` row names it.",
+                   type=_owning_tree_module().text_arg("--attribute-build"))
     p.add_argument("--compile-log", default="", metavar="PATH",
-                   help="dss's own build log for this leg")
+                   help="dss's own build log for this leg",
+                   type=_owning_tree_module().read_path_arg("--compile-log", empty_means_absent=True))
     # ── THE ROUND-CLOSE RECOMPILE'S PER-TU CENSUS ───────────────────────────
     p.add_argument("--recompile-verdicts", default=None, metavar="LABEL",
                    help="the round-close census: for EVERY TU of LABEL's manifest, "
@@ -19014,22 +19030,26 @@ def main(argv=None):
                         "`recompile: <leg> sqlite=<sha12> tus=N reference_ok=N dss_ok=N "
                         "blockers=N`, naming the stage's commit); rc 0 = no blocker and a "
                         "census that saw everything, rc 3 = a blocker or an INCOMPLETE census "
-                        "(a stage that is not the pin is one).")
+                        "(a stage that is not the pin is one).",
+                   type=_owning_tree_module().text_arg("--recompile-verdicts"))
     p.add_argument("--dss-build", default="", metavar="OUTCOME",
                    help="dsscp's build outcome for --recompile-verdicts: %s"
-                        % " | ".join(RECOMPILE_DSS_BUILDS))
+                        % " | ".join(RECOMPILE_DSS_BUILDS), type=_owning_tree_module().text_arg("--dss-build"))
     p.add_argument("--dss-build-detail", default="", metavar="TEXT",
-                   help="why dsscp's build `failed`, for --recompile-verdicts")
+                   help="why dsscp's build `failed`, for --recompile-verdicts",
+                   type=_owning_tree_module().text_arg("--dss-build-detail"))
     p.add_argument("--sqlite-head", default="", metavar="SHA",
                    help="the sqlite commit the recompile's STAGE recorded (its full sha), "
-                        "named in --recompile-verdicts' summary")
+                        "named in --recompile-verdicts' summary", type=_owning_tree_module().text_arg("--sqlite-head"))
     p.add_argument("--sqlite-pin", default="", metavar="SHA",
                    help="the PINNED sqlite commit (legs.json stageBuild.sqliteCommit, a full "
-                        "sha): a --sqlite-head that is not it makes the census INCOMPLETE")
+                        "sha): a --sqlite-head that is not it makes the census INCOMPLETE",
+                   type=_owning_tree_module().text_arg("--sqlite-pin"))
     p.add_argument("--oracle-status", default="", metavar="STATUS",
                    help="--build-reference-oracle's reported `status`, verbatim. "
                         "Only `built`/`build-failed` mean the control RAN; "
-                        "anything else grants no amnesty to anything.")
+                        "anything else grants no amnesty to anything.",
+                   type=_owning_tree_module().text_arg("--oracle-status"))
     # ── the loadext helper the corpus dlopen()s ─────────────────────────────
     # ONE implementation, called by the driver (`sqlite_units.py`) — the same
     # argument this module's header makes for putting the leg decision here.
@@ -19041,7 +19061,8 @@ def main(argv=None):
                         "under the leg's declared loadExtHelperName. DSS is the "
                         "primary/default builder; the leg's verified target C "
                         "compiler is an optional CONTROL. Prints a JSON report; "
-                        "rc 0 staged, 3 poisoned, 4 skipped-build-input-missing.")
+                        "rc 0 staged, 3 poisoned, 4 skipped-build-input-missing.",
+                   type=_owning_tree_module().text_arg("--build-loadext-helper"))
     # A REFUSE-TO-START QUERY, deliberately separate from --build-loadext-helper.
     # The driver resolves the operator's choice ONCE, at Step 6, before any leg
     # has been compiled: a typo'd DSS_LOADEXT_HELPER must stop the run in the
@@ -19055,25 +19076,31 @@ def main(argv=None):
     p.add_argument("--helper-builder", default=None, metavar="dss|reference",
                    help="which arm STAGES the helper (default: $%s, else 'dss'). "
                         "'reference' makes the corpus itself the differential."
-                        % LOADEXT_HELPER_BUILDER_ENV)
+                        % LOADEXT_HELPER_BUILDER_ENV, type=_owning_tree_module().text_arg("--helper-builder"))
     p.add_argument("--sqlite-src", default="", metavar="DIR",
                    help="the staged sqlite tree's src/ (holds %s + sqlite3ext.h)"
-                        % LOADEXT_HELPER_SOURCE)
+                        % LOADEXT_HELPER_SOURCE,
+                   type=_owning_tree_module().read_path_arg("--sqlite-src", empty_means_absent=True))
     p.add_argument("--sqlite-bld", default="", metavar="DIR",
-                   help="the build dir holding the GENERATED sqlite3.h")
+                   help="the build dir holding the GENERATED sqlite3.h",
+                   type=_owning_tree_module().text_arg("--sqlite-bld"))
     p.add_argument("--dest-dir", default=None, metavar="DIR",
                    type=_owning_tree_module().written_path_arg("--dest-dir"),
                    help="where the staged helper must land (the run's testdir)")
     p.add_argument("--work-dir", default="", metavar="DIR",
-                   help="scratch for the build outputs and their logs")
+                   help="scratch for the build outputs and their logs",
+                   type=_owning_tree_module().written_path_arg("--work-dir", empty_means_absent=True))
     p.add_argument("--dss-config", default="release", metavar="debug|release",
-                   help="the --config= DSS is given for the helper")
+                   help="the --config= DSS is given for the helper",
+                   type=_owning_tree_module().text_arg("--dss-config"))
     p.add_argument("--reference-cc", default="", metavar="CC",
                    help="the VERIFIED target compiler for the control arm, or "
                         "empty when this host has none (never a guess: it is "
-                        "whatever --resolve-target-cc accepted)")
+                        "whatever --resolve-target-cc accepted)",
+                   type=_owning_tree_module().read_path_arg("--reference-cc", empty_means_absent=True))
     p.add_argument("--reference-machine", default="", metavar="TRIPLE",
-                   help="the triple that compiler reported, for the log")
+                   help="the triple that compiler reported, for the log",
+                   type=_owning_tree_module().text_arg("--reference-machine"))
     p.add_argument("--acquire", default=None, metavar="LABEL",
                    help="materialise LABEL's declared `pinned-archive` libraries "
                         "(download -> verify pinned sha256 -> extract -> slice to "
@@ -19081,17 +19108,19 @@ def main(argv=None):
                         "JSON. IDEMPOTENT and OFFLINE-CAPABLE: a populated cache "
                         "makes no network call. Implemented HERE, once: the "
                         "driver (`sqlite_libs.py`) asks rather than "
-                        "acquiring anything itself.")
+                        "acquiring anything itself.", type=_owning_tree_module().text_arg("--acquire"))
     p.add_argument("--acquire-plan", default=None, metavar="LABEL",
                    help="print, as JSON, what --acquire WOULD do for LABEL — the "
                         "archives, digests and cache paths — touching neither the "
-                        "network nor the filesystem")
+                        "network nor the filesystem", type=_owning_tree_module().text_arg("--acquire-plan"))
     p.add_argument("--cache-root", default=None, metavar="DIR",
                    help="where acquired libraries are cached (default: "
                         "$DSS_HARNESS_CACHE_ROOT, else ~/.cache/dsscp). "
-                        "OUTSIDE the repository, always.")
+                        "OUTSIDE the repository, always.",
+                   type=_owning_tree_module().written_path_arg("--cache-root", empty_means_absent=True))
     # `--offline` also takes true/false (2026-09-30): the sqlite action's `legs-acquire` step hands it over.
-    p.add_argument("--offline", type=_offline_flag, nargs="?", const=True, default=False,
+    p.add_argument("--offline", type=_owning_tree_module().text_arg("--offline", then=_offline_flag), nargs="?",
+                   const=True, default=False,
                    help="refuse to reach the network: --acquire completes from "
                         "the cache or FAILS naming what is missing. It never "
                         "falls back to whatever else is on the machine.")
@@ -19099,17 +19128,20 @@ def main(argv=None):
                    help="print, one token per line, the argv that hands DSS the "
                         "library at PATH — including the import-name override "
                         "when --import-name is given. THIS is what keeps the "
-                        "compiler flag named in one file instead of in the driver.")
+                        "compiler flag named in one file instead of in the driver.",
+                   type=_owning_tree_module().text_arg("--resolve-library-argv"))
     p.add_argument("--import-name", default="", metavar="NAME",
                    help="the runtime identity to record for --resolve-library-argv "
                         "(a leg plan's build.libraries.tclImportName / "
                         "zImportName). "
-                        "Empty = the library's own embedded identity is correct.")
+                        "Empty = the library's own embedded identity is correct.",
+                   type=_owning_tree_module().text_arg("--import-name"))
     p.add_argument("--dss", default="", metavar="PATH",
                    help="the compiler --resolve-library-argv is being built for. "
                         "Given with a non-empty --import-name, its --help is "
                         "PROBED for override support and a compiler without it is "
-                        "a LOUD refusal, never a silently dropped override.")
+                        "a LOUD refusal, never a silently dropped override.",
+                   type=_owning_tree_module().read_path_arg("--dss", empty_means_absent=True))
     # ── the FOURTH, PER-LEG Tcl coherence check ────────────────────────────
     # The other three Tcl checks live in the driver's derive step
     # (`sqlite_stage.py`) and are all HOST-scoped. This one is per-LEG, so it
@@ -19124,12 +19156,14 @@ def main(argv=None):
                         "skipped — never a silent pass.")
     p.add_argument("--staged-tcl-header", default="", metavar="PATH",
                    help="the tcl.h the run actually stages (its TCL_VERSION is "
-                        "read from the FILE, not from the directory's name)")
+                        "read from the FILE, not from the directory's name)",
+                   type=_owning_tree_module().read_path_arg("--staged-tcl-header", empty_means_absent=True))
     p.add_argument("--leg-tcl-library", action="append", default=None,
                    metavar="LABEL=PATH",
                    help="a leg and the libtcl it resolved. Repeatable — pass "
                         "every leg that resolved one, so a run whose legs "
-                        "disagree WITH EACH OTHER is caught as well.")
+                        "disagree WITH EACH OTHER is caught as well.",
+                   type=_owning_tree_module().read_path_arg("--leg-tcl-library"))
     p.add_argument("--probe-environment", action="store_true",
                    help="RUN the declared environment-defect probes IN THIS "
                         "PROCESS'S OWN KERNEL and print the verdicts as JSON. The "
@@ -19159,7 +19193,7 @@ def main(argv=None):
                         "the child asks exactly the probes some leg IN THAT "
                         "KERNEL requires — the same `only` set the in-process arm "
                         "uses, so neither arm can quietly measure more or less "
-                        "than the other.")
+                        "than the other.", type=_owning_tree_module().text_arg("--probe-only"))
     p.add_argument("--probe-verdicts", default=None, metavar="FILE",
                    help="read probe verdicts from FILE instead of measuring. The "
                         "file maps a KERNEL to the verdicts measured in it "
@@ -19168,7 +19202,7 @@ def main(argv=None):
                         "shape is refused, because which kernel a verdict "
                         "describes is what decides whether it may excuse a leg. "
                         "For a caller that already probed, and for tests. Without "
-                        "it --plan MEASURES.")
+                        "it --plan MEASURES.", type=_owning_tree_module().read_path_arg("--probe-verdicts"))
     p.add_argument("--environment-probes", default="measure",
                    choices=("measure", "skip"), metavar="measure|skip",
                    help="`skip` resolves a plan WITHOUT measuring, which marks "
@@ -19191,27 +19225,36 @@ def main(argv=None):
                    help="read each --failure against the monitor timelines beside "
                         "each --segment-log and print EXCUSED/GENUINE per name "
                         "(TAB-separated) plus REPORT lines, for the ARMED rows "
-                        "named by --evidence-pattern")
-    p.add_argument("--evidence-probe", default=None, metavar="NAME")
-    p.add_argument("--watch-log", default="", metavar="PATH")
-    p.add_argument("--timeline", default="", metavar="PATH")
-    p.add_argument("--stop-file", default="", metavar="PATH")
+                        "named by --evidence-pattern", type=_owning_tree_module().text_arg("--attribute-unit-failures"))
+    p.add_argument("--evidence-probe", default=None, metavar="NAME",
+                   type=_owning_tree_module().path_part_arg("--evidence-probe"))
+    p.add_argument("--watch-log", default="", metavar="PATH",
+                   type=_owning_tree_module().read_path_arg("--watch-log", empty_means_absent=True))
+    p.add_argument("--timeline", default="", metavar="PATH",
+                   type=_owning_tree_module().written_path_arg("--timeline", empty_means_absent=True))
+    p.add_argument("--stop-file", default="", metavar="PATH",
+                   type=_owning_tree_module().read_path_arg("--stop-file", empty_means_absent=True))
     p.add_argument("--max-seconds", default=None, type=float, metavar="S")
-    p.add_argument("--run-filesystem", default=None, metavar="VERB")
+    p.add_argument("--run-filesystem", default=None, metavar="VERB",
+                   type=_owning_tree_module().text_arg("--run-filesystem"))
     p.add_argument("--segment-cap-seconds", default=None, type=float, metavar="S",
                    help="the segment's own absolute cap (DSS_SEGMENT_TIMEOUT); 0 "
                         "means none, and the monitor then lives at most "
                         "EXECUTION_UNCAPPED_LIFETIME_SECONDS")
-    p.add_argument("--segment-log", action="append", default=None, metavar="PATH")
+    p.add_argument("--segment-log", action="append", default=None, metavar="PATH",
+                   type=_owning_tree_module().read_path_arg("--segment-log"))
     p.add_argument("--evidence-pattern", action="append", default=None,
-                   metavar="WIRE")
-    p.add_argument("--failure", action="append", default=None, metavar="NAME")
-    p.add_argument("--tier-prefix", action="append", default=None, metavar="PFX")
-    p.add_argument("--leg-mode", default=None, choices=CONFOUND_SCOPES)
+                   metavar="WIRE", type=_owning_tree_module().option_text_arg("--evidence-pattern"))
+    p.add_argument("--failure", action="append", default=None, metavar="NAME",
+                   type=_owning_tree_module().text_arg("--failure"))
+    p.add_argument("--tier-prefix", action="append", default=None, metavar="PFX",
+                   type=_owning_tree_module().text_arg("--tier-prefix"))
+    p.add_argument("--leg-mode", default=None, choices=CONFOUND_SCOPES,
+                   type=_owning_tree_module().text_arg("--leg-mode"))
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
-    p.add_argument("--host-os", default=None)
-    p.add_argument("--host-arch", default=None)
+    p.add_argument("--host-os", default=None, type=_owning_tree_module().text_arg("--host-os"))
+    p.add_argument("--host-arch", default=None, type=_owning_tree_module().text_arg("--host-arch"))
     p.add_argument("--format", default="json", choices=("json",),
                    help="the transport of --plan, --stage-build and "
                         "--execution-monitor-argv: JSON, the only one. The "
@@ -19221,7 +19264,8 @@ def main(argv=None):
                         "a silent JSON answer.")
     p.add_argument("--launchers-available", default=None,
                    help="comma-separated launcher commands to treat as present "
-                        "(tests pin this so a plan is reproducible)")
+                        "(tests pin this so a plan is reproducible)",
+                   type=_owning_tree_module().text_arg("--launchers-available"))
     p.add_argument("--launchers-none", action="store_true",
                    help="treat every declared launcher as absent")
     p.add_argument("--run-fidelities", action="store_true",
@@ -19237,10 +19281,11 @@ def main(argv=None):
                         "the LAUNCHER's own filesystem, the launcher argv with "
                         "its working-directory option spliced in, and the argv "
                         "prefixes that create/clear/populate it. Needs "
-                        "--driver-run-dir. JSON on stdout.")
+                        "--driver-run-dir. JSON on stdout.", type=_owning_tree_module().text_arg("--run-dir-plan"))
     p.add_argument("--driver-run-dir", default="", metavar="DIR",
                    help="this driver's OWN run directory for the leg, as this "
-                        "driver spells it (--run-dir-plan)")
+                        "driver spells it (--run-dir-plan)",
+                   type=_owning_tree_module().read_path_arg("--driver-run-dir", empty_means_absent=True))
     # ── the SECOND registry: a precondition of THIS LEG'S RUN DIRECTORY ────
     # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
     p.add_argument("--corroborate-run-dir", default=None, metavar="LABEL",
@@ -19253,27 +19298,28 @@ def main(argv=None):
                         "environment probe structurally cannot be: probe "
                         "verdicts are filed per KERNEL, before any leg is "
                         "built, and --probe-environment takes no leg and no "
-                        "directory")
+                        "directory", type=_owning_tree_module().text_arg("--corroborate-run-dir"))
     p.add_argument("--supplied", action="append", default=None, metavar="WIRE",
                    help="one confound pattern the driver currently holds for "
                         "this leg, in wire form (--corroborate-run-dir). "
                         "Repeatable. A pattern matching no catalogue row passes "
-                        "through and is reported as an operator override")
+                        "through and is reported as an operator override",
+                   type=_owning_tree_module().text_arg("--supplied"))
     p.add_argument("--supplied-abort", action="append", default=None,
                    metavar="WIRE",
                    help="the same, for the ABORT half of the ledger "
-                        "(--corroborate-run-dir). Repeatable")
+                        "(--corroborate-run-dir). Repeatable", type=_owning_tree_module().text_arg("--supplied-abort"))
     p.add_argument("--measure-run-dir", default=None, metavar="DIR",
                    help="MEASURE the named `--precondition`s against this "
                         "directory and print {name: verdict} as JSON. The "
                         "in-process-only instrument --corroborate-run-dir "
                         "re-enters this script with when the run directory "
                         "lives on another filesystem; also runnable by hand, "
-                        "byte for byte, by an operator")
+                        "byte for byte, by an operator", type=_owning_tree_module().read_path_arg("--measure-run-dir"))
     p.add_argument("--precondition", action="append", default=None,
                    metavar="NAME",
                    help="restrict --measure-run-dir to these declared "
-                        "preconditions. Repeatable")
+                        "preconditions. Repeatable", type=_owning_tree_module().text_arg("--precondition"))
     # ── what a launcher needs BEYOND its own argv[0] ────────────────────────
     p.add_argument("--check-launcher", default=None, metavar="LABEL",
                    help="EXECUTE this leg's declared launcher prerequisites on "
@@ -19284,7 +19330,8 @@ def main(argv=None):
                         "probe argv built from its own runFilesystem) and this "
                         "runs them. Closes the hole where "
                         "`shutil.which('wsl.exe')` answered for a launcher whose "
-                        "real argv[0] is `qemu-aarch64` INSIDE the distro.")
+                        "real argv[0] is `qemu-aarch64` INSIDE the distro.",
+                   type=_owning_tree_module().text_arg("--check-launcher"))
     p.add_argument("--artifact", default="", metavar="PATH",
                    help="with --check-launcher: ALSO cross-check the built "
                         "binary's own PT_INTERP and DT_NEEDED against the "
@@ -19293,14 +19340,16 @@ def main(argv=None):
                         "GROW the list either: libgcc_s.so.1 is dlopen()ed by "
                         "glibc at pthread_exit and appears in no DT_NEEDED, "
                         "which is why the rows are declared prose with evidence "
-                        "rather than a computed set.")
+                        "rather than a computed set.",
+                   type=_owning_tree_module().read_path_arg("--artifact", empty_means_absent=True))
     p.add_argument("--identify-binary", default=None, metavar="PATH",
                    help="print '<arch>\\t<container>\\t<targetOs>' read from the "
                         "binary's OWN header (ELF e_machine + EI_OSABI, PE "
                         "Machine, Mach-O cputype). No external tool. rc 3 and a "
                         "named diagnostic on bytes it cannot identify — never a "
                         "default, because the caller is deciding whether a "
-                        "binary that would not run is this compiler's fault.")
+                        "binary that would not run is this compiler's fault.",
+                   type=_owning_tree_module().read_path_arg("--identify-binary"))
     p.add_argument("--launcher-for-target", default=None,
                    metavar="ARCH:CONTAINER:TARGETOS",
                    help="print the launcher argv THIS host runs that target's "
@@ -19309,7 +19358,8 @@ def main(argv=None):
                         "the triple --identify-binary prints, "
                         "so the two pipe together. Empty stdout + a NAMED reason "
                         "on stderr when the leg runs natively (rc 0) or when no "
-                        "leg matches / this host cannot run it (rc 3).")
+                        "leg matches / this host cannot run it (rc 3).",
+                   type=_owning_tree_module().text_arg("--launcher-for-target"))
     args = p.parse_args(argv)
 
     if not (args.verdict_vocabulary or args.verdict_classes or args.library_providers

@@ -511,15 +511,16 @@ def main(argv):
     # cycle P69): the `queue` step hands over every input it declares, defaults included -- a step is how this
     # queue is read, never this program started by hand (check-scripts-index clause 13).
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--band", type=_bands, default=(),
+    ap.add_argument("--band", type=_owning_tree().text_arg("--band", then=_bands), default=(),
                     help="the bands to list, comma-separated (P0,P1); empty lists every band")
-    ap.add_argument("--schedulable", type=_flag, nargs="?", const=True, default=False)
+    ap.add_argument("--schedulable", type=_owning_tree().text_arg("--schedulable", then=_flag), nargs="?",
+                    const=True, default=False)
     ap.add_argument("--top", type=int, default=0, help="at most this many rows; 0 lists every one")
     ap.add_argument("--counts", action="store_true")
     ap.add_argument("--json", default=None, metavar="PATH", type=_owning_tree().written_path_arg("--json"),
                     help="ALSO write the listed rows and the residue as JSON to PATH")
-    ap.add_argument("--evidence", type=_flag, nargs="?", const=True, default=False,
-                    help="print the phrase that banded each row")
+    ap.add_argument("--evidence", type=_owning_tree().text_arg("--evidence", then=_flag), nargs="?", const=True,
+                    default=False, help="print the phrase that banded each row")
     a = ap.parse_args(argv)
     if a.top < 0:
         ap.error("--top=%d: a count of rows is 0 (every one) or more" % a.top)

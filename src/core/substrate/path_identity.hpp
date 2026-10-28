@@ -295,12 +295,53 @@ enum class EntryKind : std::uint8_t {
 // is then empty.
 [[nodiscard]] DSS_EXPORT std::filesystem::path reachedPath(std::filesystem::path const& p, std::error_code& ec);
 
+// The path `p` REACHES, spelled relative to the path `base` REACHES -- every link on either side resolved
+// (`reachedPath`), then compared lexically: `std::filesystem::relative`'s answer, which the standard defines
+// as `weakly_canonical(p).lexically_relative(weakly_canonical(base))`. Empty when no relative spelling
+// exists (another root); `ec` is set when either resolution fails, and the answer is then empty.
+// ✔MEASURED 2026-10-21 (one probe, both Windows libraries, links made by the OS): libstdc++ on Windows
+// answers `relative` WITHOUT resolving a link -- `base/lnk/x.txt` from `base`, `lnk` naming a directory
+// outside it, is `lnk/x.txt` there and `../outside/x.txt` under MS STL -- so where one path lies from
+// another is asked here, never of the library.
+[[nodiscard]] DSS_EXPORT std::filesystem::path reachedRelative(std::filesystem::path const& p,
+                                                               std::filesystem::path const& base, std::error_code& ec);
+
+// The time the file `p` REACHES was last written, every link on the way followed -- or nothing, when
+// nothing is reached (nothing there, a dangling link); `ec` is set only when what it reaches cannot be
+// examined, and the answer is then nothing.
+// ✔MEASURED 2026-10-21 (one probe, both Windows libraries, every link made by the OS): libstdc++ on
+// Windows answers `last_write_time` of a file link with the LINK's own time (0 days old, beside a
+// target 1825 days old) where MS STL and libc++ answer the target's -- so when a file was written is
+// asked here, never of the library.
+[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::file_time_type>
+reachedWriteTime(std::filesystem::path const& p, std::error_code& ec);
+
+// Whether `a` and `b` REACH one file -- every link on the way followed, a hard link to it included: the
+// question `std::filesystem::equivalent` answers. Something absent on either side is no file: `false`,
+// `ec` clear. `ec` is set only when what either reaches cannot be examined, and the answer is then
+// `false`.
+// ✔MEASURED 2026-10-21: of a DANGLING link libstdc++ on Windows answers `equivalent` with no error,
+// MS STL and libc++ with one -- so this one answer is given on every build.
+[[nodiscard]] DSS_EXPORT bool reachedSameFile(std::filesystem::path const& a, std::filesystem::path const& b,
+                                              std::error_code& ec);
+
+// Add `add` to the permissions of the file `p` REACHES, every link on the way followed (on Windows, as
+// MS STL does: only the write bits mean anything there -- the read-only attribute; the others leave the
+// file as it is). `ec` is set when nothing is reached or the change is refused.
+// ✔MEASURED 2026-10-21: `permissions` through a link changes the TARGET under MS STL and libc++ and the
+// LINK's own attribute under libstdc++ on Windows.
+DSS_EXPORT void addReachedPermissions(std::filesystem::path const& p, std::filesystem::perms add,
+                                      std::error_code& ec);
+
 // One entry a walk yields.
 struct TreeEntry {
     std::filesystem::path path;     // the walked root joined with the entry's names, as listed
     EntryKind             kind;     // the entry itself (`Absent`: it went away while it was listed)
     EntryKind             reaches;  // `kind`, except a Link: what it reaches (`reachedKind`; `Absent` if dangling)
     std::size_t           depth;    // 0 for an entry directly under the root
+    // A Link whose reach could not be examined (a loop, a refusal): why. `reaches` is then `Absent`.
+    // Such an entry reaches a visitor only when the options hand it out; by default it ENDS the walk.
+    std::error_code       reachError{};
 };
 
 // What a walk does after the visitor has seen an entry: go on (descending it if it is a Directory),
@@ -311,11 +352,16 @@ struct TreeWalkOptions {
     // A directory the walk may not list is passed over in silence instead of ending the walk --
     // `std::filesystem::directory_options::skip_permission_denied`, for the walks that took it.
     bool skipPermissionDenied = false;
+    // A link whose reach cannot be examined is handed to the visitor with its `reachError` set, instead
+    // of ending the walk -- for a visitor that answers it itself. Off by default: a walk that cannot
+    // tell what a link reaches did not read the tree it was asked about, and says so.
+    bool handOutUnreadableLinks = false;
 };
 
 struct TreeWalk {
     std::error_code       error;    // set: the walk ended there and did NOT read the whole tree
-    std::filesystem::path where;    // the directory it could not list (the root itself when that failed)
+    std::filesystem::path where;    // the directory it could not list (the root itself when that failed),
+                                    // or the link whose reach it could not examine
     bool                  stopped = false;   // the visitor ended it
 };
 
@@ -323,7 +369,8 @@ struct TreeWalk {
 // next sibling of that directory, descending only a `Directory` the visitor did not prune -- NEVER
 // a link. Iterative: the work is an explicit stack of listed directories on the heap, so a deep
 // tree costs memory, never call stack. The first directory it cannot list ends the walk (`error`,
-// `where`) unless the options pass it over; the order within a directory is the filesystem's.
+// `where`) unless the options pass it over, and so does a link whose reach it cannot examine unless
+// the options hand it out; the order within a directory is the filesystem's.
 [[nodiscard]] DSS_EXPORT TreeWalk walkTree(std::filesystem::path const&                  root,
                                            std::function<WalkStep(TreeEntry const&)> const& visit,
                                            TreeWalkOptions                               options = {});
@@ -341,7 +388,28 @@ struct TreeRemoval {
 // directory itself after its entries; nothing is retried, so it ENDS whatever another deleter does,
 // and an entry that failed and is now gone was beaten to the outcome wanted -- only an entry still
 // there counts as a failure. An absent target is nothing to do.
+//
+// ★★★ RELATIVE TO A HANDLE, NEVER BY PATH, SO A LINK SWAPPED IN MID-REMOVAL IS NEVER FOLLOWED. Each
+// directory is opened WITHOUT following a link, listed through that handle, and each of its entries is
+// opened RELATIVE to it, again without following a link, and classified by what was OPENED -- not by
+// the listing, which an entry can outlive: a directory replaced by a link between its listing and its
+// descent is a link when it is opened, and is removed as one. POSIX: `openat(O_DIRECTORY | O_NOFOLLOW)`,
+// `fdopendir`, `unlinkat` -- the design libc++ ships (its comment: the path-based fallback "is vulnerable
+// to some race conditions"), and ✔MEASURED 2026-10-21 libstdc++'s on Linux (the swapped-in link was not
+// followed). Windows: handles opened with `FILE_OPEN_REPARSE_POINT`, each entry opened relative to its
+// directory's handle (`NtOpenFile` with a root directory), a directory by ONE opening that both lists and
+// deletes it (✔MEASURED 2026-10-22, both Windows builds: a listing handle `ReOpenFile`d from one opened for
+// removal alone is refused, ACCESS_DENIED), every entry deleted through its own handle. MS STL's
+// `remove_all` (READ, its <filesystem>) recurses BY PATH, and MinGW's libstdc++ cannot see a link at
+// all, so neither library is asked.
 [[nodiscard]] DSS_EXPORT TreeRemoval removeTree(std::filesystem::path const& target);
+
+// THE TEST SEAM of `removeTree`: called with each entry's path after its directory was listed and
+// before the entry is opened -- the window a swap would use. Empty (the default) in every build; a test
+// sets it to make the race deterministic, and clears it.
+namespace substrate_testing {
+DSS_EXPORT void setRemoveTreeEntryHook(std::function<void(std::filesystem::path const&)> hook);
+}  // namespace substrate_testing
 
 }  // namespace dss::core
 

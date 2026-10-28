@@ -480,24 +480,26 @@ def cmd_agg_trace(args):
     print('AGG-TRACE-OK')
 
 
-_WRITTEN_PATH_OWNER = []
+_PATH_TYPES_OWNER = []
 
 
-def _written_path_arg(flag):
-    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
-    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
-    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
-    if not _WRITTEN_PATH_OWNER:
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
         import importlib.util
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
         if not os.path.isfile(path):
-            raise SystemExit("profile-compile-support: cannot find %s -- what a path to write may be is said there and nowhere else"
-                             % path)
+            raise SystemExit("profile-compile-support: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
         spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        _WRITTEN_PATH_OWNER.append(mod)
-    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
 
 
 def main():
@@ -505,40 +507,47 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p = sub.add_parser('kit', help='build a relocatable profiling kit')
-    p.add_argument('--manifest', required=True, help='a real .dss-project.json')
+    p.add_argument('--manifest', required=True, help='a real .dss-project.json',
+                   type=_path_types().read_path_arg('--manifest'))
     p.add_argument('--root', action='append', default=[], metavar='NAME=PATH[;NAME=PATH...]',
-                   help='declare the roots every manifest path must fall under')
-    p.add_argument('--out', required=True, type=_written_path_arg("--out"))
+                   help='declare the roots every manifest path must fall under',
+                   type=_path_types().read_path_arg('--root'))
+    p.add_argument('--out', required=True, type=_path_types().written_path_arg("--out"))
     p.set_defaults(fn=cmd_kit)
 
     p = sub.add_parser('manifest', help='materialize a kit onto this host')
-    p.add_argument('--kit', required=True)
-    p.add_argument('--target', required=True, help='e.g. x86_64:elf64-x86_64-linux-exec')
-    p.add_argument('--out', required=True, type=_written_path_arg("--out"))
+    p.add_argument('--kit', required=True, type=_path_types().read_path_arg('--kit'))
+    p.add_argument('--target', required=True, help='e.g. x86_64:elf64-x86_64-linux-exec',
+                   type=_path_types().text_arg("--target"))
+    p.add_argument('--out', required=True, type=_path_types().written_path_arg("--out"))
     p.set_defaults(fn=cmd_manifest)
 
     p = sub.add_parser('build-type', help="read a compiler's CMake build type")
-    p.add_argument('binary')
-    p.add_argument('--require', help='refuse unless the build type is this')
+    p.add_argument('binary', type=_path_types().read_path_arg('binary'))
+    p.add_argument('--require', help='refuse unless the build type is this', type=_path_types().text_arg("--require"))
     p.set_defaults(fn=cmd_build_type)
 
     p = sub.add_parser('timed-gate', help='run under an in-process witness, timed monotonically')
-    p.add_argument('--log', required=True, type=_written_path_arg("--log"))
-    p.add_argument('--witness', required=True)
-    p.add_argument('command', nargs=argparse.REMAINDER)
+    p.add_argument('--log', required=True, type=_path_types().written_path_arg("--log"))
+    p.add_argument('--witness', required=True, type=_path_types().text_arg("--witness"))
+    p.add_argument('command', nargs=argparse.REMAINDER, type=_path_types().command_words_arg("command"))
     p.set_defaults(fn=cmd_timed_gate)
 
     p = sub.add_parser('gcc-reference', help='the gcc yardstick, same manifest')
-    p.add_argument('--manifest', required=True)
-    p.add_argument('--out', required=True, type=_written_path_arg("--out"))
+    p.add_argument('--manifest', required=True, type=_path_types().read_path_arg('--manifest'))
+    p.add_argument('--out', required=True, type=_path_types().written_path_arg("--out"))
     p.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
-    p.add_argument('--cc', required=True, help='the reference compiler (the step input referenceCc)')
-    p.add_argument('--opt', required=True, help='its optimization flag, as --opt=-O2 (referenceOpt)')
-    p.add_argument('--link-libs', required=True, help='its link libraries, one value (referenceLinkLibs)')
+    p.add_argument('--cc', required=True, help='the reference compiler (the step input referenceCc)',
+                   type=_path_types().read_path_arg('--cc'))
+    p.add_argument('--opt', required=True, help='its optimization flag, as --opt=-O2 (referenceOpt)',
+                   type=_path_types().command_words_arg("--opt"))
+    p.add_argument('--link-libs', required=True, help='its link libraries, one value (referenceLinkLibs)',
+                   type=_path_types().command_words_arg("--link-libs"))
     p.set_defaults(fn=cmd_gcc_reference)
 
     p = sub.add_parser('agg-trace', help='aggregate a DSS_OPT_TRACE log')
-    p.add_argument('trace', metavar='log', help='the DSS_OPT_TRACE log to read')
+    p.add_argument('trace', metavar='log', help='the DSS_OPT_TRACE log to read',
+                   type=_path_types().read_path_arg('trace'))
     p.set_defaults(fn=cmd_agg_trace)
 
     args = ap.parse_args()

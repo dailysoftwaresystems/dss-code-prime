@@ -312,7 +312,10 @@ enum class CandidateVerdict : std::uint8_t {
 // what the name is (`FindFirstFileW`, whose record carries a reparse point's tag): a directory is no
 // program, an execution alias is one, and anything else -- a file, or a symbolic link, which
 // CreateProcessW follows -- is one exactly when what it reaches is a regular file. A name holding a
-// wildcard is no file a Windows directory can hold (and would make `FindFirstFileW` a search).
+// wildcard is no file a Windows directory can hold (and would make `FindFirstFileW` a search): the
+// OS reads `<`, `>` and `"` as wildcards too (DOS_STAR, DOS_QM, DOS_DOT), not only `*` and `?` --
+// ✔MEASURED 2026-10-21, both Windows libraries, one probe: "python.ex>" and "python\"exe" each found
+// python.exe, "a<" found abc -- so a candidate holding any of the five is no program.
 // Windows keeps no execute bit, so there is no near-miss to report there.
 #if defined(_WIN32)
 constexpr DWORD kAppExecutionAliasTag = 0x8000001BUL;  // IO_REPARSE_TAG_APPEXECLINK (winnt.h)
@@ -322,7 +325,7 @@ CandidateVerdict classifyCandidate(fs::path const& candidate) {
     std::error_code ec;
 #if defined(_WIN32)
     std::wstring const wide = candidate.wstring();
-    if (wide.find_first_of(L"*?") != std::wstring::npos) {
+    if (wide.find_first_of(L"*?<>\"") != std::wstring::npos) {
         return CandidateVerdict::NotAFile;
     }
     WIN32_FIND_DATAW found{};

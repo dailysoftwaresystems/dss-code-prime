@@ -1914,19 +1914,19 @@ def main(argv):
     ap = _Parser(prog="anchor-rows.py", add_help=True)
     sub = ap.add_subparsers(dest="verb", required=True, parser_class=_Parser)
     s = sub.add_parser("stage")
-    s.add_argument("src")
-    s.add_argument("dst")
+    s.add_argument("src", type=ot().read_path_arg("src"))
+    s.add_argument("dst", type=ot().written_path_arg("dst"))
     # `extend`, never argparse's default `store`: a second `--only` must ADD its ids. With `store` it REPLACED the
     # first one's, and `--only A --only B` staged B alone -- a row dropped with nothing said (arm (u2)).
-    s.add_argument("--only", nargs="+", required=True, action="extend")
+    s.add_argument("--only", nargs="+", required=True, action="extend", type=ot().text_arg("--only"))
     # the ids the batch may CREATE (the audit's F1-A4): `extend`, like `--only`, so a second `--new` adds
-    s.add_argument("--new", nargs="+", action="extend", default=[])
+    s.add_argument("--new", nargs="+", action="extend", default=[], type=ot().text_arg("--new"))
     s.add_argument("--live-only", action="store_true")
     c = sub.add_parser("check")
-    c.add_argument("staged")
+    c.add_argument("staged", type=ot().read_path_arg("staged"))
     a = sub.add_parser("apply")
-    a.add_argument("staged")
-    a.add_argument("--accept-lost", action="append", default=[])
+    a.add_argument("staged", type=ot().read_path_arg("staged"))
+    a.add_argument("--accept-lost", action="append", default=[], type=ot().text_arg("--accept-lost"))
     args = ap.parse_args(argv)
     try:
         root = repo_root(override)

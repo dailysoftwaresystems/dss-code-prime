@@ -529,24 +529,26 @@ def self_test() -> int:
     return 0 if failed[0] == 0 else 1
 
 
-_WRITTEN_PATH_OWNER = []
+_PATH_TYPES_OWNER = []
 
 
-def _written_path_arg(flag):
-    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
-    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
-    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
-    if not _WRITTEN_PATH_OWNER:
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
         import importlib.util
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
         if not os.path.isfile(path):
-            raise SystemExit("pragma-profile-census: cannot find %s -- what a path to write may be is said there and nowhere else"
-                             % path)
+            raise SystemExit("pragma-profile-census: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
         spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        _WRITTEN_PATH_OWNER.append(mod)
-    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
 
 
 def main(argv: list[str]) -> int:
@@ -556,10 +558,12 @@ def main(argv: list[str]) -> int:
                                  description="Census the reached #pragma vocabulary of one corpus's own class.")
     ap.add_argument("--update", action="store_true",
                     help="regenerate the expected set with this class's lines, into --out (never the tracked file)")
-    ap.add_argument("--out", default=None, type=_written_path_arg("--out"),
+    ap.add_argument("--out", default=None, type=_path_types().written_path_arg("--out"),
                     help="with --update: the directory the regenerated set is written to")
-    ap.add_argument("--dss-bin", default=None, help="the compiler to measure: the leg's own build")
-    ap.add_argument("--manifest", required=True, help="the corpus manifest a sqlite run on this leg wrote")
+    ap.add_argument("--dss-bin", default=None, help="the compiler to measure: the leg's own build",
+                    type=_path_types().read_path_arg("--dss-bin"))
+    ap.add_argument("--manifest", required=True, help="the corpus manifest a sqlite run on this leg wrote",
+                    type=_path_types().read_path_arg("--manifest"))
     args = ap.parse_args(argv)
     if args.update and not args.out:
         die("--update writes the regenerated set into --out, the step's own directory, and never the tracked file "

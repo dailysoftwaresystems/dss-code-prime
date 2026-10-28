@@ -1,1 +1,1 @@
-the scan refused 5 of the 12 forbidden forms
+the scan refused 8 form(s): 2=exists 3=file_size 12=is_regular_file

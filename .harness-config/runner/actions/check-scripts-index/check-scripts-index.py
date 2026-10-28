@@ -78,9 +78,15 @@ THE CONTRACT, and every clause is a way the index can lie:
      at MODULE level before its first load: a `__pycache__` written beside another action
      moves the inputs of a `requireInputsUnmoved` action (see `bytecode_refusal`);
  13. every verb a program offers is started by a step, or recorded and verified (`verb_census`);
- 14. every argument that names a path a program WRITES -- its dest one of WRITTEN_DESTS -- takes
-     owning-tree's `written_path_arg(<its own flag>)` as its argparse `type=`: argparse alone takes
-     `--out=--help` as that path (`written_path_census`).
+ 14. every argument that takes a value DECLARES ITS KIND, naming its own flag, as its argparse
+     `type=`: one of owning-tree's `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`,
+     `option_text_arg` or `command_words_arg` -- or `type=int`/`float`, or a closed `choices` set:
+     argparse alone takes `--out=--help` as that value. The data path -- followed from what
+     `parse_args` returns, through this program's own assignments, conversions, path computations
+     and functions and the modules it imports or loads by path, into a call that asks the filesystem
+     -- CROSS-CHECKS the declaration: a text that reaches the filesystem is refused, and a path type
+     no followed route carries there collapses the scan (`path_arg_census`). How many arguments take
+     each kind that admits a leading `-` is pinned (`_DASH_KINDS`).
 
 ⚠ Clauses 5-8 exist because an INDEPENDENT AUDIT got the first draft of this
 guard to report GREEN over each of them, and clause 9's arm was passing for the
@@ -1635,18 +1641,1223 @@ def _remedies(parsed, runners, legs, writers):
     return problems
 
 
-# ── CLAUSE 14: every argument that names a path a program WRITES takes owning-tree's type ────────────────────────
-# A path to write never begins with `-` (owning-tree's `written_path` states why). A program that reads its command
-# line with argparse says so by `type=<owning-tree>.written_path_arg("<its own flag>")` on each such argument:
-# argparse alone takes `--out=--help` and `--out -` verbatim. WHICH argument names a path to write is said by its
-# DEST, one of WRITTEN_DESTS -- the repository's convention, a fact of the program rather than a guess at its help
-# text. Both directions are refused (such a dest without the type, the type on another dest), so is a type naming
-# another flag than its argument's, and the vocabulary is checked against the arguments: a word no argument uses
-# is a hand copy compared with nothing. An argument that takes no value (`store_true` and its kin) names no path.
-WRITTEN_DESTS = ("cfg_dest", "dest", "dest_dir", "json", "json_out", "log", "md_out", "oracle_dir", "oracle_log",
-                 "out", "output", "scratch", "workdir")
-WRITTEN_TYPE = "written_path_arg"
+# ── CLAUSE 14: every argument that takes a value DECLARES ITS KIND, and the data path cross-checks it ────────────────
+# A value a command line names never begins with `-` unless it is declared to (owning-tree's `read_path` /
+# `written_path` / `path_part` / `text` state why): argparse alone takes `--out=--help` and `--out -` verbatim. So a
+# program that reads its command line with argparse gives EVERY argument that takes a value its kind, as
+# `type=<owning-tree>.<one of KINDS>("<its own flag>")` -- a path it reads, a path it writes, a part of one it joins
+# under a place it names, a text (`text_arg`, the program's own conversion handed as `then=`), an option text
+# (`option_text_arg`: a value that may spell an option, `--match=-O2`), or a child's command words
+# (`command_words_arg`) -- unless argparse already holds it to values no option can be: a number (`type=int` /
+# `type=float`), or a closed `choices` set of literal words none of which begins with `-`. An argument that takes no
+# value (`store_true` and its kin) has no kind.
+# ★★ COMPLETENESS IS DECLARED, NEVER INFERRED: an argument that declares no kind is refused by itself. The first
+# drafts INFERRED which arguments name a path -- from a vocabulary of dests (`out`, `json`, ...: ✔MEASURED 2026-10-21,
+# it named the 26 arguments that already took a type and none of the 90 others whose value reaches the filesystem, in
+# 17 programs), then from the data path alone, which was shown blind twice in one fold: four arguments reached the
+# filesystem only through a module the program loads by path or a callable a name holds, and an argument the scan did
+# not SEE reach the filesystem was "no path" -- every blindness read as clean. Declared, a blindness can miss only a
+# MIS-declaration.
+# ★★ THE DATA PATH IS THE CROSS-CHECK. The scan follows each argument's value (`PathArgTaint`) from
+# what `parse_args` returns -- the Namespace through assignments and into this program's own functions (a call, a
+# method, a `set_defaults(fn=...)` dispatch, a return) and the modules it imports or LOADS BY PATH (owning-tree,
+# redact, a sibling), through conversions and path computations (`str`, `os.path.join`, `Path(...)`, `/`, `+`, an
+# f-string, a method of the value, a `self.` field it is stored in, a callable a name holds) into a call that ASKS THE
+# FILESYSTEM (`_FS_CALLS`, a `Path` method of `_FS_PATH_METHODS`, a child's `cwd=`, the program a child starts, a
+# temporary file's `dir=`). A value it hands a child as one of the child's ARGUMENTS is the child's to judge: the scan
+# follows this program only. A filesystem call these tables lack is a route the scan cannot see: add it here. A call
+# whose body the scan cannot read carries the value no further, so what the cross-check can miss is a text declared
+# on a value that reaches the filesystem only through such a call.
+# Refused: an argument that declares no kind; a kind naming another flag than its argument's; a TEXT (`text_arg`,
+# `option_text_arg`) whose value the scan sees reach the filesystem, or whose first word starts a child; COMMAND WORDS
+# whose value reaches the filesystem other than as the program of the child they are the command line of. A PATH
+# type on an argument no followed route carries to the filesystem COLLAPSES the scan (exit 2): the scan is blind to a
+# route that value takes, or the type does not belong there.
+# A number or a choice CAN be a part of a path (✔MEASURED 2026-10-21: profile-compile-support
+# spells `--jobs`, an int, into a directory's name), and what keeps it safe there is its own type: argparse has
+# already refused `--jobs=--help` (no number), and a number's spelling -- digits, a sign, a point, an exponent -- holds
+# no separator, no `..` and no drive, so it cannot name another place; a choice is a word the program wrote itself.
+# A name a program spells INTO a path (`--evidence-probe` -> `<log>.evidence-<probe>.jsonl`) is a part of one:
+# `path_part_arg`.
+# A LIST argument (`action="append"`, an `nargs`) whose words a program starts as a CHILD'S COMMAND LINE -- the first
+# word the program, the rest that program's own options, which may begin with `-` -- is the child's to judge: its
+# kind is `command_words_arg`, as is a value that is a child's options (`--flags=-std=c2x`).
+# ★ THE TWO KINDS THAT TAKE A LEADING `-` ARE ESCAPES FROM THE REFUSAL, so how many arguments declare each is PINNED
+# (`_DASH_KINDS`), and a count that moves is refused naming every one -- an escape any argument may take disarms the
+# guard. ✔MEASURED 2026-10-21:
+#   `option_text_arg`, 5 -- read-leg-path's `--match` (a pattern looked for in a leg's log: `-O2`, `-Werror`),
+#   harness_legs' `--evidence-pattern` (a confound's pattern, handed `--evidence-pattern=<it>`), and the URL-safe
+#   base64 of probe-reference-cc's `--src-b64` and `--batch-b64` and compile-and-keep's `--sources-b64` (its
+#   alphabet holds `-`);
+#   `command_words_arg`, 10 -- cli-smoke's `--launcher` and `--reference-launcher` and sqlite-round-trip's
+#   `--launcher` (a launcher's argv), profile-compile-support's `command` (the command line `timed-gate` runs) and
+#   its `--opt` and `--link-libs` (gcc's options), probe-reference-cc's `--flags` and `--dump` (a reference
+#   compiler's options, a dumper's argv) and prototype-census's `--flags`, and harness_legs' `--assert-translated`
+#   (a word of a launcher's argv).
+PATH_TYPES = ("read_path_arg", "written_path_arg", "path_part_arg")
+TEXT_KINDS = ("text_arg", "option_text_arg")
+WORDS_KIND = "command_words_arg"
+KINDS = PATH_TYPES + TEXT_KINDS + (WORDS_KIND,)
+_DASH_KINDS = {"option_text_arg": 5, "command_words_arg": 10}
 _VALUELESS_ACTIONS = ("store_true", "store_false", "store_const", "append_const", "count", "help", "version")
+
+# The calls that ask the filesystem, by dotted name -> which arguments carry the path: None for every argument, a
+# tuple of positional indexes (and the keyword each may also be passed as) for the rest.
+_ALL = None
+_FS_CALLS = {"open": ((0, "file"),), "io.open": ((0, "file"),), "codecs.open": ((0, "filename"),),
+             "os.open": ((0, "path"),), "glob.glob": ((0, "pathname"), (None, "root_dir")),
+             "glob.iglob": ((0, "pathname"), (None, "root_dir")),
+             "importlib.util.spec_from_file_location": ((1, "location"),), "runpy.run_path": ((0, "path_name"),),
+             "tarfile.open": ((0, "name"),)}
+for _fn in ("access", "chdir", "chmod", "chown", "lchown", "link", "listdir", "lstat", "makedirs", "mkdir", "readlink",
+            "remove", "removedirs", "rename", "renames", "replace", "rmdir", "scandir", "stat", "symlink", "truncate",
+            "unlink", "utime", "walk", "startfile"):
+    _FS_CALLS["os." + _fn] = _ALL
+for _fn in ("exists", "lexists", "isfile", "isdir", "islink", "ismount", "isjunction", "isdevdrive", "getsize",
+            "getmtime", "getatime", "getctime", "samefile", "realpath"):
+    _FS_CALLS["os.path." + _fn] = _ALL
+for _fn in ("copy", "copy2", "copyfile", "copyfileobj", "copymode", "copystat", "copytree", "move", "rmtree", "which",
+            "disk_usage", "chown", "make_archive", "unpack_archive"):
+    _FS_CALLS["shutil." + _fn] = _ALL
+# The calls that start a child: the program is the first element of the argv they are handed (a display), or their
+# `executable=`; the child's other arguments are its own to judge.
+_SPAWN_CALLS = frozenset(("subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
+                          "subprocess.Popen"))
+# The `Path` methods that touch the filesystem (the receiver is the path, and for the ones named in
+# _FS_PATH_TARGETS the first argument is a second one). `replace` is `str.replace` when it is handed two arguments.
+_FS_PATH_METHODS = frozenset(("exists", "is_file", "is_dir", "is_symlink", "is_mount", "is_junction", "is_socket",
+                              "is_fifo", "is_block_device", "is_char_device", "stat", "lstat", "open", "read_text",
+                              "read_bytes", "write_text", "write_bytes", "iterdir", "glob", "rglob", "walk", "mkdir",
+                              "rmdir", "unlink", "rename", "replace", "touch", "chmod", "lchmod", "resolve",
+                              "samefile", "symlink_to", "hardlink_to", "readlink"))
+_FS_PATH_TARGETS = frozenset(("rename", "replace", "samefile", "symlink_to", "hardlink_to"))
+# The calls that make a path -- a string -- of their arguments: the conversions, the `os.path` computations, the
+# `pathlib` constructors, `shutil.which` (it returns the program it found), the string transforms of `re` and
+# `shlex`, and the methods that join one
+# (_PATH_JOINS); the containers that hand on what they hold (_CONTAINER_KEEPERS), and the methods that put a value
+# into one (_CONTAINER_PUTS).
+_PATH_STRINGS = frozenset(("str", "os.fspath", "shutil.which", "re.sub", "re.subn", "shlex.quote", "shlex.split",
+                           "shlex.join", "glob.escape", "urllib.parse.quote", "urllib.parse.unquote"))
+_STRING_TRANSFORMS = frozenset(("sub", "subn"))     # a compiled pattern's: `_VAR_RE.sub(fn, path)`
+_PATH_JOINS = frozenset(("join", "format", "format_map", "joinpath", "with_name", "with_suffix", "with_stem",
+                         "relative_to"))
+_CONTAINER_KEEPERS = frozenset(("list", "tuple", "sorted", "set", "frozenset", "reversed", "iter", "next", "dict",
+                                "enumerate", "zip", "filter"))
+_CONTAINER_PUTS = frozenset(("append", "appendleft", "add", "insert", "extend", "update", "setdefault"))
+_OS_PATH_ANSWERS = frozenset(("exists", "lexists", "isfile", "isdir", "islink", "ismount", "isjunction", "isdevdrive",
+                              "getsize", "getmtime", "getatime", "getctime", "samefile", "isabs"))
+_PATH_MODULES = frozenset(("os.path", "posixpath", "ntpath"))
+_PATH_CLASSES = frozenset(("Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"))
+_NAMESPACE_CALLS = frozenset(("parse_args", "parse_intermixed_args"))
+_SPEC_FROM_PATH = "importlib.util.spec_from_file_location"
+_NAMESPACE_PAIR_CALLS = frozenset(("parse_known_args", "parse_known_intermixed_args"))
+
+
+def _dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+# ★★ HOW A VALUE IS FOLLOWED -- precisely enough that no argument is called a path because another one is. A value
+# is a set of ELEMENTS `(keys, carried)`: `value[keys...]` carries `carried`. What is carried is an argument's dest, a
+# MARKER of a parameter, an INSTANCE of one of the program's classes, or one of its FUNCTIONS (a callback).
+# · A dict display keeps each value under its key, so `report["leg"]` carries what `"leg"` was given and nothing of
+#   `"sqliteHead"` (✔MEASURED 2026-10-21: without the keys, one record of harness_legs.py carried 30 of its
+#   arguments into a `makedirs`). A list or tuple display keeps each element under its INDEX, so `a, b = f()` and a
+#   child's program are told apart from the rest; an element whose place the scan cannot know (appended, joined
+#   after another list, starred, comprehended) is UNPLACED: any place but the first.
+# · A child's PROGRAM is the first element of an argv the scan sees built (`[dss, "-c", src]`, `[dss] + flags`,
+#   `launcher + [dss, ...]`); a list handed on whole (`args.command`) or built by appending names no program it can
+#   see, and the child's other words are the child's own to judge. When the argv BEGINS with an argument's value
+#   (`args.launcher + [cli]`, a parameter holding it), the program is that value's first word: of a string argument,
+#   the value itself, judged as a path; of a list argument (`action="append"`, `nargs`), whose type judges every word,
+#   a command line -- its first word the program, the rest its options, which may begin with `-` (✔MEASURED
+#   2026-08-05: `--launcher=-x86_64`) -- so no per-word path type fits it, and it is the child's to judge.
+# · A function is read ONCE, as a SUMMARY: each parameter carries a marker of itself, so what the function returns,
+#   and what it hands the filesystem, is said in terms of its parameters, and each call replaces the markers by what
+#   THAT call passes -- a helper two arguments pass through is no bridge between them. A marker keeps the keys and
+#   attributes taken of it (`param["leg"]`, `cfg.out_dir`) and whether it was made a string (`str(param)`: every value
+#   inside it then counts).
+# · An instance field is the value shared between functions: `self.out = out` stores into its class's field, a call
+#   of the method that stores it replaces that method's markers in it, and `cfg.out` reads it wherever `cfg` carries
+#   an instance of that class. The Namespace is a value too, so `def main(args): open(args.out)` reached through a
+#   call is `out` reaching.
+# · A module the program imports from its own directory (`import harness_legs`, `from sqlite_common import die`) is
+#   read the same way, once, and a call of one of its functions uses that function's summary.
+# · So is a module it LOADS BY PATH: a function that hands `importlib.util.spec_from_file_location` a location spelled
+#   `..., "<directory>", "<module>.py"` (owning-tree, redact, an action beside it) or `<parameter> + ".py"` (a sibling
+#   by name) and returns what it loaded IS that module wherever its value goes -- `ot = _owning_tree();
+#   ot.load_jsonc(path)`, `_path_types().remove_tree(x)`, `C = _sibling("sqlite_common"); C.output_tree(root)`.
+# · A callable a NAME holds is the call it holds: a parameter's default (`isfile=os.path.isfile`), an alias
+#   (`_j = posixpath.join`), a name imported from a module (`from urllib.parse import unquote`).
+#   ✔MEASURED 2026-10-21: before these two, four arguments reached the filesystem only through such a module or such a
+#   name (benchmark_speedtest1's `--dss-src` and `--cc`, harness_legs' `--config-tree`, probe-reference-cc's `--tree`),
+#   and the scan called each of them clean.
+# Keys stop at _DEPTH (deeper is taken whole, never dropped).
+_DEPTH = 3
+_ANY_KEY = "\x00any"     # a key the program computes: it matches every key
+_ATTR = "\x00."         # an attribute taken of a marker: `_ATTR + name`
+_POSITION = "\x00i"         # an element of a list or tuple display: `_POSITION + str(position)`
+_ARGV0 = _POSITION + "0"   # the first -- of a child's argv, the program
+_UNPLACED = _POSITION + "?"  # an element at a place the scan cannot know: never the first
+_PROG = "\x00program"   # taken of a marker: the program of the argv the parameter is -- its first PLACED element
+_FIRST = "\x00first"    # (_FIRST, dest): the program is the FIRST WORD of that argument's value -- of a list
+#                         (`--launcher` tokens, a child's command line), that word only, which no per-word type judges
+_MARK = "\x00param"     # (_MARK, id(function), parameter, keys taken of it, made a string)
+_OBJ = "\x00instance"   # (_OBJ, class name)
+_FN = "\x00function"    # (_FN, id(function)) or (_FN, "subprocess.run") -- a callable handed on as a value
+_MOD = "\x00module"     # (_MOD, its PathArgTaint) -- a module the program loaded BY PATH, handed on as a value
+_NSV = ("\x00namespace",)  # the Namespace itself: an attribute of it is that argument's value
+_PASS_CAP = 400         # the fixpoint is monotone over a finite set; a run that does not settle is a defect, refused
+
+
+def _is_mark(d):
+    return isinstance(d, tuple) and d[0] == _MARK
+
+
+def _key_matches(want, have):
+    return want == have or want == _ANY_KEY or have == _ANY_KEY or (
+        have == _UNPLACED and want.startswith(_POSITION) and want != _ARGV0)
+
+
+def _project(elems, key):
+    """value[key] -- a str key, an int position, or _ANY_KEY: the elements under it, and what the value carries
+    whole."""
+    if isinstance(key, int):
+        key = _POSITION + str(key)
+    out = set()
+    for p, d in elems:
+        if p:
+            if _key_matches(key, p[0]):
+                out.add((p[1:], d))
+        elif _is_mark(d) and not d[4]:
+            out.add(((), (d[0], d[1], d[2], (d[3] + (key,))[:_DEPTH], False)))
+        elif (isinstance(d, str) or _is_mark(d)) and not _is_dict_key(key):
+            out.add(((), d))        # a string or a list of strings: a position of it carries it; a dict key cannot
+    return out
+
+
+def _is_dict_key(key):
+    """A key only a dict answers (`value["log"]`): an argument's value -- a string, or a list of them -- has none."""
+    return isinstance(key, str) and not key.startswith("\x00")
+
+
+def _whole(elems):
+    """The elements of a list put after something: each one at a place no longer known -- UNPLACED."""
+    return {(((_UNPLACED,) + (p[1:] if p and p[0].startswith(_POSITION) else p))[:_DEPTH], d) for p, d in elems}
+
+
+def _program(elems):
+    """The program of a child started with argv `elems`: its first placed element; of a parameter, its _PROG."""
+    out = set()
+    for p, d in elems:
+        if p and p[0] == _ARGV0:
+            out.add((p[1:], d))
+        elif not p and _is_mark(d) and not d[4]:
+            out.add(((), (d[0], d[1], d[2], (d[3] + (_PROG,))[:_DEPTH], False)))
+    return out
+
+
+def _stringify(elems):
+    """A string made of the value (`str`, an f-string, `+`, `os.path.join`): it carries every dest inside it."""
+    return {((), (d[0], d[1], d[2], d[3], True) if _is_mark(d) else d) for _, d in elems
+            if isinstance(d, str) or _is_mark(d)}
+
+
+def _nest(elems, key):
+    return {(((key,) + p)[:_DEPTH], d) for p, d in elems}
+
+
+def _makes_a_path(name):
+    """`name` (dotted) makes a path -- a string -- of its arguments."""
+    mod, _, fn = name.rpartition(".")
+    return name in _PATH_STRINGS or (mod in _PATH_MODULES and fn not in _OS_PATH_ANSWERS) or fn in _PATH_CLASSES
+
+
+def _a_table_callable(name):
+    """`name` (dotted) is a call the tables name: it asks the filesystem, starts a child, or makes a path."""
+    return bool(name) and (name in _FS_CALLS or name in _SPAWN_CALLS or name.startswith("tempfile.")
+                           or _makes_a_path(name))
+
+
+def _table_operands(name, call):
+    """[(operand, is a child's argv)] -- what a call of the tables' `name` hands the filesystem as a path; of a
+    child's argv, the program it starts."""
+    out = []
+    if name in _FS_CALLS:
+        spec = _FS_CALLS[name]
+        if spec is _ALL:
+            out += [(x, False) for x in list(call.args) + [k.value for k in call.keywords if k.arg]]
+        else:
+            for index, keyword in spec:
+                if index is not None and index < len(call.args):
+                    out.append((call.args[index], False))
+                out += [(k.value, False) for k in call.keywords if k.arg == keyword]
+    elif name in _SPAWN_CALLS:
+        if call.args:
+            out.append((call.args[0], True))
+        out += [(k.value, True) for k in call.keywords if k.arg == "args"]
+        out += [(k.value, False) for k in call.keywords if k.arg == "executable"]
+    elif name.startswith("tempfile."):
+        out += [(k.value, False) for k in call.keywords if k.arg == "dir"]
+    return out
+
+
+def _holds_display(node):
+    """A non-empty list display, or a `+` chain holding one: whatever is joined after it is never first."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return bool(node.elts)
+    return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and (
+        _holds_display(node.left) or _holds_display(node.right))
+
+
+class PathArgTaint(object):
+    """Which argparse dests of one parsed program reach the filesystem, by the data path the blocks above state.
+    `sinks[dest]` is the call (line, text) that asks the filesystem with its value."""
+
+    def __init__(self, tree, sibling=None, locate=None):
+        """`sibling(name)` -> the PathArgTaint of the module `name` beside this program, or None; `locate(directory,
+        file)` -> that of the module `file` this program loads by path from `directory` (None: its own), or None."""
+        self.tree = tree
+        self.sibling, self.locate = sibling, locate
+        self.foreign, self.modules, self.from_imports, self.aliases = {}, {}, {}, {}
+        self.parent, self.scopes = {}, {}
+        for n in _all_nodes(tree):
+            for c in ast.iter_child_nodes(n):
+                self.parent[id(c)] = n
+        self.functions, self.methods, self.inits, self.imported = {}, {}, {}, set()
+        self.by_id, self.class_of = {}, {}
+        for n in _all_nodes(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.by_id[id(n)] = n
+                owner = self.parent.get(id(n))
+                if isinstance(owner, ast.ClassDef):
+                    self.methods.setdefault(n.name, []).append(n)
+                    self.class_of[id(n)] = owner.name
+                else:
+                    self.functions.setdefault(n.name, []).append(n)
+            elif isinstance(n, ast.ClassDef):
+                self.inits[n.name] = [b for b in n.body if isinstance(b, ast.FunctionDef) and b.name == "__init__"]
+            elif isinstance(n, ast.Import):
+                self.imported |= {(a.asname or a.name).split(".")[0] for a in n.names}
+                for a in n.names:
+                    other = sibling(a.name) if sibling is not None and "." not in a.name else None
+                    if other is not None:
+                        self.modules[a.asname or a.name] = other
+                    elif a.asname:
+                        self.aliases[a.asname] = a.name             # `import os.path as osp`
+            elif isinstance(n, ast.ImportFrom):
+                self.imported |= {a.asname or a.name for a in n.names}
+                other = sibling(n.module) if sibling is not None and n.module and not n.level \
+                    and "." not in n.module else None
+                if other is not None:
+                    for a in n.names:
+                        self.from_imports[a.asname or a.name] = (other, a.name)
+                elif n.module and not n.level:
+                    for a in n.names:
+                        self.aliases[a.asname or a.name] = n.module + "." + a.name   # `from os.path import isfile`
+        # `set_defaults(fn=cmd_kit)`: the Namespace's `fn` is one of these functions, and `args.fn(args)` calls it
+        self.dispatch = {}
+        for n in _all_nodes(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "set_defaults":
+                for k in n.keywords:
+                    if k.arg and isinstance(k.value, ast.Name) and k.value.id in self.functions:
+                        self.dispatch.setdefault(k.arg, set()).add(k.value.id)
+        # a function that loads a module by path and hands it back: a call of it IS that module
+        self.loaders = {}        # id(function) -> the PathArgTaint it loads, or ("param", index) naming a sibling
+        for d in self.by_id.values():
+            got = self._loads(d)
+            if got is not None:
+                self.loaders[id(d)] = got
+        for n in tree.body:      # `mod = importlib.util.module_from_spec(spec)` at module level
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) \
+                    and isinstance(n.value, ast.Call) and _dotted(n.value.func) == "importlib.util.module_from_spec" \
+                    and n.value.args and isinstance(n.value.args[0], ast.Name):
+                spec = [s.value for s in tree.body if isinstance(s, ast.Assign) and isinstance(s.value, ast.Call)
+                        and self._name(s.value.func) == _SPEC_FROM_PATH
+                        and any(isinstance(t, ast.Name) and t.id == n.value.args[0].id for t in s.targets)]
+                got = self._location(spec[-1], None) if spec else None
+                if isinstance(got, PathArgTaint):
+                    self.modules[n.targets[0].id] = got
+        self.callees, self.operands = {}, {}
+        self.ns = {}             # id(scope) -> names bound to a Namespace
+        self.ns_fields = set()   # `self.args = ap.parse_args()`
+        self.vals = {}           # id(scope) -> {name: elements}
+        self.fields = {}         # (class, field) -> elements
+        self.returns = {}        # id(function) -> elements its return carries
+        self.returns_ns = set()  # id(function) of each function that returns a Namespace
+        self.reached = {}        # id(scope) -> {element: (line, text) of the call that asks the filesystem}
+        for d in self.by_id.values():
+            a = d.args
+            names = [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs] + [
+                x.arg for x in (a.vararg, a.kwarg) if x is not None]
+            table = self.vals[id(d)] = {p: {((), (_MARK, id(d), p, (), False))} for p in names}
+            if id(d) in self.class_of and names and names[0] in ("self", "cls"):
+                table[names[0]] = {((), (_OBJ, self.class_of[id(d)]))}
+            # a parameter's DEFAULT is what it holds when a call passes none: a callable there is followed
+            positional = a.posonlyargs + a.args
+            defaults = list(zip(positional[len(positional) - len(a.defaults):], a.defaults)) + [
+                (p, v) for p, v in zip(a.kwonlyargs, a.kw_defaults) if v is not None]
+            for p, v in defaults:
+                held = self._name(v)
+                if _a_table_callable(held):
+                    table[p.arg].add(((), (_FN, held)))
+                elif isinstance(v, ast.Name):
+                    table[p.arg] |= {((), (_FN, id(x))) for x in self._visible(v.id, self.scope_of(d))}
+        self.binders = [n for n in _all_nodes(tree) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                                                   ast.NamedExpr, ast.For, ast.AsyncFor,
+                                                                   ast.comprehension, ast.Call, ast.Return))]
+        for _ in range(_PASS_CAP):
+            if not self._pass():
+                break
+        else:
+            raise Collapse("clause 14's data path did not settle in %d passes: the taint is not monotone -- a defect "
+                           "of PathArgTaint" % _PASS_CAP)
+        self.sinks, self.first_word = {}, {}
+        for table in self.reached.values():
+            for (p, d), site in table.items():
+                if p:
+                    continue
+                if isinstance(d, str) and (d not in self.sinks or site < self.sinks[d]):
+                    self.sinks[d] = site
+                elif isinstance(d, tuple) and d[0] == _FIRST and (d[1] not in self.first_word
+                                                                  or site < self.first_word[d[1]]):
+                    self.first_word[d[1]] = site
+
+    # ── where a node stands ──
+    def scope_of(self, node):
+        got = self.scopes.get(id(node))
+        if got is None:
+            n = self.parent.get(id(node))
+            while n is not None and not isinstance(n, _SCOPES):
+                n = self.parent.get(id(n))
+            got = self.scopes[id(node)] = self.tree if n is None else n
+        return got
+
+    def _chain(self, scope):
+        out = [scope]
+        while scope is not self.tree:
+            scope = self.scope_of(scope)
+            out.append(scope)
+        return out
+
+    def _name(self, node):
+        """The dotted name `node` spells, its first part read through the program's import aliases."""
+        name = _dotted(node)
+        if not name:
+            return name
+        first, dot, rest = name.partition(".")
+        full = self.aliases.get(first)
+        return full + dot + rest if full else name
+
+    def _held(self, node, scope):
+        """The tables' callables (dotted names) a name holds as a value."""
+        return {d[1] for p, d in self.dests(node, scope)
+                if not p and isinstance(d, tuple) and d[0] == _FN and isinstance(d[1], str)}
+
+    def _loads(self, d):
+        """What function `d` loads by path and hands back -- the PathArgTaint of that module, or ("param", index) when
+        a parameter names the sibling -- or None: it loads no module, more than one, or hands back none."""
+        if not any(isinstance(r, ast.Return) and isinstance(r.value, (ast.Name, ast.Subscript)) for r in ast.walk(d)):
+            return None
+        got = {self._location(c, d) for c in ast.walk(d)
+               if isinstance(c, ast.Call) and self._name(c.func) == _SPEC_FROM_PATH}
+        got.discard(None)
+        return got.pop() if len(got) == 1 else None
+
+    def _location(self, spec, d):
+        """The module a `spec_from_file_location` call in function `d` (None: at module level) names, from the
+        literals its location is spelled with: `..., "<directory>", "<module>.py"` -> that module, `<parameter> +
+        ".py"` -> ("param", its index). None when the spelling names no module this scan can read."""
+        loc = spec.args[1] if len(spec.args) > 1 else next((k.value for k in spec.keywords if k.arg == "location"),
+                                                           None)
+        if loc is None:
+            return None
+        params = [x.arg for x in d.args.posonlyargs + d.args.args] if d is not None else []
+        words = self._spelling(loc, d, params, 0)
+        py = [i for i, w in enumerate(words) if isinstance(w, str) and w.endswith(".py")]
+        if not py:
+            return None
+        i = py[-1]
+        before = words[i - 1] if i else None
+        if words[i] == ".py":
+            return ("param", params.index(before[1])) if isinstance(before, tuple) else None
+        parts = [p for p in re.split(r"[\\/]", words[i]) if p]
+        if len(parts) > 1:
+            directory = parts[-2]
+        else:
+            directory = before if isinstance(before, str) and before not in ("", ".", "..") \
+                and not before.endswith(".py") else None
+        if self.locate is None or parts[-1] == ".py":
+            return None
+        return self.locate(directory, parts[-1])
+
+    def _spelling(self, node, d, params, depth):
+        """The string literals (and ("param", name) for a parameter of `d`) a location is spelled with, in order --
+        through the names it is assigned to in `d` and at module level."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, ast.Name):
+            if node.id in params:
+                return [("param", node.id)]
+            if depth >= 3:
+                return []
+            out = []
+            for where in ([ast.walk(d)] if d is not None else []) + [iter(self.tree.body)]:
+                for a in where:
+                    if isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == node.id
+                                                         for t in a.targets):
+                        out += self._spelling(a.value, d, params, depth + 1)
+                if out:
+                    return out
+            return out
+        out = []
+        for c in ast.iter_child_nodes(node):
+            out += self._spelling(c, d, params, depth)
+        return out
+
+    def _loaded(self, load, args, skip):
+        """The module one call of a loader hands back: its own, or the sibling the call names."""
+        if isinstance(load, PathArgTaint):
+            return load
+        index = load[1] - (1 if skip else 0)
+        node = args[index] if 0 <= index < len(args) else None
+        if self.sibling is None or not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            return None
+        return self.sibling(node.value)
+
+    def _visible(self, name, scope):
+        """The program's own functions a bare `name` names from `scope`: those defined in the nearest scope of its
+        chain that defines one (a nested `check` of one function is not another function's `check`)."""
+        defs = self.functions.get(name)
+        if not defs:
+            return []
+        for s in self._chain(scope):
+            got = [d for d in defs if self.scope_of(d) is s]
+            if got:
+                return got
+        return []
+
+    # ── the Namespace ──
+    def is_ns(self, node, scope=None):
+        scope = self.scope_of(node) if scope is None else scope
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _NAMESPACE_CALLS:
+                return True
+            return any(id(d) in self._of(d).returns_ns for d, _, _, _ in self._callees(node, scope))
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call) \
+                and isinstance(node.value.func, ast.Attribute) and node.value.func.attr in _NAMESPACE_PAIR_CALLS:
+            return isinstance(node.slice, ast.Constant) and node.slice.value == 0
+        if isinstance(node, ast.Name):
+            return any(node.id in self.ns.get(id(s), ()) for s in self._chain(scope))
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+            return node.attr in self.ns_fields
+        if isinstance(node, ast.NamedExpr):
+            return self.is_ns(node.value, scope)
+        return False
+
+    def _vars_of_ns(self, node, scope):
+        """`vars(ns)` or `ns.__dict__`."""
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "vars" and node.args:
+            return self.is_ns(node.args[0], scope)
+        return isinstance(node, ast.Attribute) and node.attr == "__dict__" and self.is_ns(node.value, scope)
+
+    # ── the program's own functions a call reaches ──
+    def _callees(self, call, scope):
+        """[(function, skips its `self`, positional argument nodes, keyword nodes)] for each of the program's own
+        functions `call` runs: a function by name, a class's `__init__`, a method (not of an imported module), the
+        function an executor is handed (`.submit(fn, ...)`, `Thread(target=fn, args=(...))`), and a function the
+        callee NAME carries as a value (`runner = runner or _spawn`)."""
+        got = self.callees.get(id(call))
+        if got is None:
+            got = self.callees[id(call)] = self._static_callees(call, scope)
+        f = call.func
+        if not got and not isinstance(f, ast.Attribute):
+            fns = {d for p, d in self.dests(f, scope) if not p and isinstance(d, tuple) and d[0] == _FN
+                   and d[1] in self.by_id}
+            if fns:
+                return [(self.by_id[x[1]], id(self.by_id[x[1]]) in self.class_of, call.args, call.keywords)
+                        for x in fns]
+        if not got and isinstance(f, ast.Attribute) and not self.is_ns(f.value, scope):
+            mods = {d[1] for p, d in self.dests(f.value, scope) if not p and isinstance(d, tuple) and d[0] == _MOD}
+            if mods:          # `ot.load_jsonc(path)`: a function of a module loaded by path
+                return [(d, skip, call.args, call.keywords) for m in mods for d, skip in self._foreign(m, f.attr)]
+        return got
+
+    def _of(self, d):
+        """The PathArgTaint that reads function `d`: this program's, or the imported module's."""
+        return self.foreign.get(id(d), self)
+
+    def _foreign(self, other, name):
+        """The module-level functions and the `__init__` of a class named `name` in another module."""
+        got = [(d, False) for d in other.functions.get(name, ()) if other.scope_of(d) is other.tree]
+        got += [(d, True) for d in other.inits.get(name, ())]
+        for d, _ in got:
+            self.foreign[id(d)] = other
+        return got
+
+    def _static_callees(self, call, scope):
+        f = call.func
+        out = []
+        if isinstance(f, ast.Name):
+            out += [(d, False, call.args, call.keywords) for d in self._visible(f.id, scope)]
+            out += [(d, True, call.args, call.keywords) for d in self.inits.get(f.id, ())]
+            if not out and f.id in self.from_imports:
+                other, name = self.from_imports[f.id]
+                out += [(d, skip, call.args, call.keywords) for d, skip in self._foreign(other, name)]
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in self.modules:
+            out += [(d, skip, call.args, call.keywords) for d, skip in self._foreign(self.modules[f.value.id],
+                                                                                     f.attr)]
+        elif isinstance(f, ast.Attribute):
+            root = _dotted(f.value)
+            if f.attr in self.methods and not (root and root.split(".")[0] in self.imported):
+                out += [(d, True, call.args, call.keywords) for d in self.methods[f.attr]]
+            if f.attr == "submit" and call.args and isinstance(call.args[0], ast.Name):
+                out += [(d, False, call.args[1:], call.keywords) for d in self._visible(call.args[0].id, scope)]
+        for k in call.keywords:
+            if k.arg == "target" and isinstance(k.value, ast.Name):
+                given = next((x.value.elts for x in call.keywords
+                              if x.arg == "args" and isinstance(x.value, (ast.Tuple, ast.List))), [])
+                out += [(d, False, given, []) for d in self._visible(k.value.id, scope)]
+        return out
+
+    def _arguments(self, d, skip_self, args, keywords, scope):
+        """{parameter: elements} one call passes `d`."""
+        a = d.args
+        params = [x.arg for x in a.posonlyargs + a.args]
+        if skip_self and params:
+            params = params[1:]
+        got = {}
+        for i, node in enumerate(args):
+            if isinstance(node, ast.Starred):
+                every = self.dests(node.value, scope)
+                for p in params[i:] + ([a.vararg.arg] if a.vararg is not None else []):
+                    got.setdefault(p, set()).update(_project(every, _ANY_KEY))
+                break
+            if i < len(params):
+                got.setdefault(params[i], set()).update(self.dests(node, scope))
+            elif a.vararg is not None:
+                got.setdefault(a.vararg.arg, set()).update(_nest(self.dests(node, scope), _ANY_KEY))
+        named = set(params) | {x.arg for x in a.kwonlyargs}
+        for k in keywords:
+            if k.arg is None:
+                spread = self.dests(k.value, scope)
+                for p in named:
+                    got.setdefault(p, set()).update(_project(spread, p))
+            elif k.arg in named:
+                got.setdefault(k.arg, set()).update(self.dests(k.value, scope))
+            elif a.kwarg is not None:
+                got.setdefault(a.kwarg.arg, set()).update(_nest(self.dests(k.value, scope), k.arg))
+        return got
+
+    def _apply(self, mark, arg, depth=0):
+        """The elements a marker stands for at one call, from the elements of the argument that call passes."""
+        keys, flat = mark[3], mark[4]
+        out = set()
+        for q, x in arg:
+            n = 0
+            while n < len(keys) and n < len(q) and (
+                    _key_matches(keys[n], q[n]) if keys[n] != _PROG else q[n] == _ARGV0):
+                n += 1
+            if n < len(keys) and n < len(q):
+                continue                                  # the argument's keys and the marker's part ways
+            if n < len(keys) and keys[n] == _PROG and not _is_mark(x):
+                if n == len(q) and n == len(keys) - 1 and isinstance(x, str):
+                    out.add(((), (_FIRST, x)))            # an argv that IS an argument's value: its first word
+                continue                                  # else an argv handed on whole: no program the scan sees
+            if n < len(keys) and n == len(q) and (x == _NSV or (isinstance(x, tuple) and x[0] == _OBJ)):
+                if keys[n].startswith(_ATTR) and depth < _DEPTH:   # an instance's field, the Namespace's argument
+                    inner = {((), keys[n][len(_ATTR):])} if x == _NSV else \
+                        self.fields.get((x[1], keys[n][len(_ATTR):]), ())
+                    out |= self._apply((mark[0], mark[1], mark[2], keys[n + 1:], flat), inner, depth + 1)
+                continue
+            if x == _NSV or (isinstance(x, tuple) and x[0] in (_OBJ, _FN, _MOD)):
+                if n == len(keys) and not flat:
+                    out.add((q[n:], x))
+                continue
+            if n < len(keys) and not _is_mark(x) and any(_is_dict_key(k) for k in keys[n:]):
+                continue                                  # a dict's key taken of an argument's string: nothing
+            rest = () if flat or n < len(keys) else q[n:]
+            if _is_mark(x):
+                x = (x[0], x[1], x[2], (x[3] + keys[n:])[:_DEPTH], x[4] or flat)
+            out.add((rest, x))
+        return out
+
+    def _substitute(self, elems, d, passed):
+        """`elems` of function `d`, with each of its markers replaced by what one call passes."""
+        out = set()
+        for p, x in elems:
+            if _is_mark(x) and x[1] == id(d):
+                for r, y in self._apply(x, passed.get(x[2], ())):
+                    out.add(((p + r)[:_DEPTH], y))
+            else:
+                out.add((p, x))
+        return out
+
+    def _attribute(self, elems, name):
+        """value.name: an instance's field, a marker's attribute, a path's own attribute (`p.parent`)."""
+        out = set()
+        for p, d in elems:
+            if p:
+                continue
+            if isinstance(d, str):
+                out.add(((), d))
+            elif _is_mark(d):
+                out.add(((), d if d[4] else (d[0], d[1], d[2], (d[3] + (_ATTR + name,))[:_DEPTH], False)))
+            elif d == _NSV:
+                out.add(((), name))
+            elif d[0] == _OBJ:
+                out |= self.fields.get((d[1], name), set())
+        return out
+
+    # ── what a node carries ──
+    def dests(self, node, scope=None):
+        scope = self.scope_of(node) if scope is None else scope
+        if isinstance(node, ast.Attribute):
+            if self.is_ns(node.value, scope):
+                return {((), node.attr)}
+            name = self._name(node)
+            if _a_table_callable(name):
+                return {((), (_FN, name))}
+            return self._attribute(self.dests(node.value, scope), node.attr)
+        if isinstance(node, ast.Name):
+            out = set()
+            for s in self._chain(scope):
+                got = self.vals.get(id(s), {}).get(node.id)
+                if got:
+                    out |= got
+            if any(node.id in self.ns.get(id(s), ()) for s in self._chain(scope)):
+                out.add(((), _NSV))
+            if not out:
+                out = {((), (_FN, id(d))) for d in self._visible(node.id, scope)}
+            if not out and _a_table_callable(self.aliases.get(node.id)):
+                out = {((), (_FN, self.aliases[node.id]))}
+            return out
+        if isinstance(node, ast.Call):
+            return self._call_dests(node, scope)
+        if isinstance(node, ast.Subscript):
+            if self._vars_of_ns(node.value, scope) and isinstance(node.slice, ast.Constant):
+                return {((), node.slice.value)}
+            s = node.slice
+            key = s.value if isinstance(s, ast.Constant) and (isinstance(s.value, str) or (
+                isinstance(s.value, int) and not isinstance(s.value, bool) and s.value >= 0)) else _ANY_KEY
+            got = self.dests(node.value, scope)
+            return _whole(got) if isinstance(s, ast.Slice) else _project(got, key)
+        if isinstance(node, ast.BinOp):
+            left, right = self.dests(node.left, scope), self.dests(node.right, scope)
+            lists = isinstance(node.op, ast.Add) and (
+                any(isinstance(x, (ast.List, ast.Tuple)) for x in (node.left, node.right))
+                or any(p and p[0].startswith(_POSITION) for p, _ in left | right))
+            if lists:   # a list joined to a list: the left one keeps its places; the right one's first is first only
+                #             after a list the scan cannot see into (`launcher + [dss, ...]`, the launcher maybe empty)
+                if _holds_display(node.left) or any(p and p[0] == _ARGV0 for p, _ in left):
+                    return left | _whole(right)
+                first = {((_ARGV0,), (_FIRST, d)) for p, d in left if not p and isinstance(d, str)} | {
+                    ((_ARGV0,), (d[0], d[1], d[2], (d[3] + (_PROG,))[:_DEPTH], False))
+                    for p, d in left if not p and _is_mark(d) and not d[4]}
+                return left | first | {e for e in right if e[0] and e[0][0] == _ARGV0} | _whole(
+                    {e for e in right if not (e[0] and e[0][0] == _ARGV0)})
+            return _stringify(left | right)
+        if isinstance(node, ast.JoinedStr):
+            out = set()
+            for v in node.values:
+                if isinstance(v, ast.FormattedValue):
+                    out |= self.dests(v.value, scope)
+            return _stringify(out)
+        if isinstance(node, ast.IfExp):
+            return self.dests(node.body, scope) | self.dests(node.orelse, scope)
+        if isinstance(node, ast.BoolOp):
+            out = set()
+            for v in node.values:
+                out |= self.dests(v, scope)
+            return out
+        if isinstance(node, (ast.List, ast.Tuple)):
+            out = set()
+            starred = False
+            for i, e in enumerate(node.elts):
+                got = self.dests(e, scope)
+                if isinstance(e, ast.Starred):
+                    out |= got if i == 0 else _whole(got)
+                    starred = True
+                else:
+                    out |= _nest(got, _ANY_KEY if starred else _POSITION + str(i))
+            return out
+        if isinstance(node, ast.Set):
+            out = set()
+            for e in node.elts:
+                out |= self.dests(e, scope)
+            return out
+        if isinstance(node, ast.Dict):
+            out = set()
+            for k, v in zip(node.keys, node.values):
+                got = self.dests(v, scope)
+                if k is None:
+                    out |= got                                    # `**other`: its keys are its own
+                elif isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    out |= _nest(got, k.value)
+                else:
+                    out |= _nest(got, _ANY_KEY)
+            return out
+        if isinstance(node, (ast.Starred, ast.NamedExpr, ast.Await)):
+            return self.dests(node.value, scope)
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            return _nest(self.dests(node.elt, scope), _UNPLACED)
+        if isinstance(node, ast.DictComp):
+            return _nest(self.dests(node.value, scope), _ANY_KEY)
+        return set()
+
+    def _call_dests(self, node, scope):
+        f = node.func
+        if isinstance(f, ast.Name) and f.id == "getattr" and len(node.args) >= 2 and isinstance(
+                node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+            if self.is_ns(node.args[0], scope):
+                return {((), node.args[1].value)}
+            return self._attribute(self.dests(node.args[0], scope), node.args[1].value)
+        if isinstance(f, ast.Attribute) and f.attr == "get" and self._vars_of_ns(f.value, scope) and node.args \
+                and isinstance(node.args[0], ast.Constant):
+            return {((), node.args[0].value)}
+        callees = self._callees(node, scope)
+        if callees:
+            out = set()
+            for d, skip, args, keywords in callees:
+                owner = self._of(d)
+                out |= self._substitute(owner.returns.get(id(d), ()), d,
+                                        self._arguments(d, skip, args, keywords, scope))
+                load = owner.loaders.get(id(d))
+                module = owner._loaded(load, args, skip) if load is not None else None
+                if module is not None:
+                    out.add(((), (_MOD, module)))
+                if d.name == "__init__" and id(d) in owner.class_of and owner is self:
+                    out.add(((), (_OBJ, self.class_of[id(d)])))
+            return out
+        if isinstance(f, ast.Name) and f.id in self.inits:
+            return {((), (_OBJ, f.id))}                    # a class of the program without an `__init__`
+        names = {self._name(f) or ""}
+        if isinstance(f, ast.Name):
+            names |= self._held(f, scope)          # a name holding `os.path.join`, `str`, ...
+        if any(_makes_a_path(n) for n in names) or (isinstance(f, ast.Attribute) and f.attr in _STRING_TRANSFORMS):
+            out = set()
+            for a in node.args:
+                out |= self.dests(a, scope)
+            return _stringify(out)
+        if "dict" in names:
+            return self._dict_call(node, scope)
+        if names & _CONTAINER_KEEPERS:
+            out = set()
+            for a in node.args:
+                out |= self.dests(a, scope)
+            return out
+        if not isinstance(f, ast.Attribute) or self.is_ns(f.value, scope):
+            return set()        # another module's function, or a dispatch (`args.fn(args)`): no argument's value
+        receiver = self.dests(f.value, scope)
+        if f.attr == "get" and node.args:
+            key = node.args[0].value if isinstance(node.args[0], ast.Constant) and isinstance(
+                node.args[0].value, str) else _ANY_KEY
+            out = _project(receiver, key)
+            for a in node.args[1:]:
+                out |= self.dests(a, scope)
+            return out
+        if f.attr in ("values", "items", "pop", "popitem", "setdefault", "copy"):
+            return receiver if f.attr == "copy" else _project(receiver, _ANY_KEY)
+        if f.attr in _PATH_JOINS:
+            out = set(receiver)
+            for a in node.args:
+                out |= self.dests(a, scope)
+            return _stringify(out)
+        return _stringify(receiver)     # a method of a string or a path: what it returns is made of it
+
+    def _dict_call(self, node, scope):
+        """`dict(mapping_or_pairs, key=value, ...)`: a mapping's keys stay; of pairs, the second element is the value
+        under a computed key and the first, a key, carries nothing; each keyword is its own key."""
+        out = set()
+        for a in node.args:
+            for p, d in self.dests(a, scope):
+                if p and p[0].startswith("\x00"):          # a position of an iterable of pairs
+                    rest = p[1:]
+                    if rest and rest[0] == _POSITION + "1":
+                        out.add(((_ANY_KEY,) + rest[1:], d))
+                    elif not (rest and rest[0] == _ARGV0):
+                        out.add(((_ANY_KEY,) + rest, d))
+                else:
+                    out.add((p, d))
+        for k in node.keywords:
+            got = self.dests(k.value, scope)
+            out |= _nest(got, k.arg) if k.arg else got
+        return out
+
+    # ── one pass over the program ──
+    def _add(self, table, key, elems):
+        have = table.setdefault(key, set())
+        if elems <= have:
+            return False
+        have |= elems
+        return True
+
+    def _reach(self, elems, site):
+        """Record what reaches the filesystem: a dest for good, a marker in the summary of ITS function -- wherever
+        the call stands (that function's body, a closure of it, a lambda it hands on)."""
+        grew = False
+        for e in elems:
+            if e[0] or not (isinstance(e[1], str) or _is_mark(e[1]) or (isinstance(e[1], tuple) and
+                                                                         e[1][0] == _FIRST)):
+                continue
+            table = self.reached.setdefault(e[1][1] if _is_mark(e[1]) else None, {})
+            if e not in table:
+                table[e] = site if not callable(site) else site()
+                grew = True
+        return grew
+
+    def _class_scope(self, scope):
+        """The class whose method `scope` is, or stands in."""
+        for s in self._chain(scope):
+            if id(s) in self.class_of:
+                return self.class_of[id(s)]
+        return None
+
+    def _bind(self, target, elems, scope):
+        if isinstance(target, ast.Name):
+            return self._add(self.vals.setdefault(id(scope), {}), target.id, elems)
+        if isinstance(target, ast.Starred):
+            return self._bind(target.value, _whole(elems), scope)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            grew = False
+            starred = False
+            for i, e in enumerate(target.elts):
+                starred |= isinstance(e, ast.Starred)
+                grew |= self._bind(e, _project(elems, _ANY_KEY if starred else i), scope)
+            return grew
+        if isinstance(target, ast.Attribute):
+            grew = False
+            for _, x in {e for e in self.dests(target.value, scope) if not e[0]}:
+                if isinstance(x, tuple) and x[0] == _OBJ:
+                    grew |= self._add(self.fields, (x[1], target.attr), elems)
+            return grew
+        if isinstance(target, ast.Subscript):
+            s = target.slice
+            key = s.value if isinstance(s, ast.Constant) and isinstance(s.value, str) else _ANY_KEY
+            return self._bind(target.value, _nest(elems, key), scope)
+        return False
+
+    def _pass(self):
+        grew = False
+        for n in self.binders:
+            if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                v = getattr(n, "value", None)
+                if v is None:
+                    continue
+                scope = self.scope_of(n)
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                if isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) \
+                        and v.func.attr in _NAMESPACE_PAIR_CALLS:
+                    for t in targets:
+                        first = t.elts[0] if isinstance(t, (ast.Tuple, ast.List)) and t.elts else t
+                        if isinstance(first, ast.Name):
+                            grew |= self._add(self.ns, id(scope), {first.id})
+                    continue
+                if self.is_ns(v, scope):
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            grew |= self._add(self.ns, id(scope), {t.id})
+                        elif isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self" \
+                                and t.attr not in self.ns_fields:
+                            self.ns_fields.add(t.attr)
+                            grew = True
+                    continue
+                if isinstance(v, (ast.Tuple, ast.List)):
+                    paired = [t for t in targets if isinstance(t, (ast.Tuple, ast.List)) and len(t.elts) == len(v.elts)
+                              and not any(isinstance(e, (ast.Starred,)) for e in t.elts + v.elts)]
+                    for t in paired:
+                        for te, ve in zip(t.elts, v.elts):
+                            got = self.dests(ve, scope)
+                            if got:
+                                grew |= self._bind(te, got, scope)
+                    targets = [t for t in targets if t not in paired]
+                got = self.dests(v, scope) if targets else set()
+                if isinstance(n, ast.AugAssign) and isinstance(n.op, ast.Add) and isinstance(n.target, ast.Name):
+                    got = _whole(got)      # `argv += [x]`: what is added is never first
+                if got:
+                    for t in targets:
+                        grew |= self._bind(t, got, scope)
+            elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                got = self.dests(n.iter)
+                if got:
+                    grew |= self._bind(n.target, _project(got, _ANY_KEY), self.scope_of(n))
+            elif isinstance(n, ast.Return):
+                fn = self.scope_of(n)
+                if n.value is None or not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if id(fn) not in self.returns_ns and self.is_ns(n.value):
+                    self.returns_ns.add(id(fn))
+                    grew = True
+                got = self.dests(n.value)
+                if got:
+                    grew |= self._add(self.returns, id(fn), got)
+            else:
+                grew |= self._call(n)
+        return grew
+
+    def _call(self, call):
+        scope = self.scope_of(call)
+        grew = False
+        site = lambda: (call.lineno, ast.unparse(call)[:72])   # noqa: E731 - read only when something reaches
+        for operand, program in self._fs_operands(call, scope):
+            got = self.dests(operand, scope)
+            if program:
+                got = _program(got)
+            if got:
+                grew |= self._reach(got, site)
+        f = call.func
+        if isinstance(f, ast.Name) and not self._callees(call, scope):
+            for held in self._held(f, scope):     # a name holding `subprocess.run`, `os.path.isfile`, ...
+                for operand, program in _table_operands(held, call):
+                    got = self.dests(operand, scope)
+                    if program:
+                        got = _program(got)
+                    if got:
+                        grew |= self._reach(got, site)
+        if isinstance(f, ast.Attribute) and f.attr in _CONTAINER_PUTS and call.args:
+            put = call.args[1] if f.attr == "insert" and len(call.args) > 1 else call.args[-1] \
+                if f.attr == "setdefault" else call.args[0]
+            got = self.dests(put, scope)
+            if got:
+                if f.attr == "setdefault" and isinstance(call.args[0], ast.Constant) \
+                        and isinstance(call.args[0].value, str):
+                    got = _nest(got, call.args[0].value)
+                elif f.attr in ("insert", "appendleft") and (f.attr == "appendleft" or (
+                        isinstance(call.args[0], ast.Constant) and call.args[0].value == 0)):
+                    got = _nest(got, _ARGV0)
+                elif f.attr == "extend":
+                    got = _whole(_project(got, _ANY_KEY))
+                elif f.attr != "update":
+                    got = _nest(got, _UNPLACED)
+                grew |= self._bind(f.value, got, scope)
+        callees = self._callees(call, scope)
+        if isinstance(f, ast.Attribute) and self.is_ns(f.value, scope):
+            callees = [(d, False, call.args, call.keywords) for name in self.dispatch.get(f.attr, ())
+                       for d in self.functions[name]]
+        for d, skip, args, keywords in callees:
+            a = d.args
+            params = [x.arg for x in a.posonlyargs + a.args]
+            if skip and params:
+                params = params[1:]
+            for i, node in enumerate(args):
+                if isinstance(node, ast.Starred):
+                    break
+                if i < len(params) and self.is_ns(node, scope):
+                    grew |= self._add(self.ns, id(d), {params[i]})
+            for k in keywords:
+                if k.arg and self.is_ns(k.value, scope):
+                    grew |= self._add(self.ns, id(d), {k.arg})
+            passed = None
+            inner = list(self._of(d).reached.get(id(d), {}).items())
+            if inner:
+                passed = self._arguments(d, skip, args, keywords, scope)
+                for e, where in inner:
+                    grew |= self._reach(self._substitute({e}, d, passed), where)
+            for field, elems in list(self.fields.items()):
+                if any(_is_mark(x) and x[1] == id(d) for _, x in elems):
+                    if passed is None:
+                        passed = self._arguments(d, skip, args, keywords, scope)
+                    grew |= self._add(self.fields, field, self._substitute(elems, d, passed))
+        return grew
+
+    def _fs_operands(self, call, scope):
+        """[(operand, is a child's argv)] -- what `call` hands the filesystem as a path; of a child's argv, the
+        program it starts. Static: computed once per call."""
+        got = self.operands.get(id(call))
+        if got is None:
+            got = self.operands[id(call)] = self._find_fs_operands(call, scope)
+        return got
+
+    def _find_fs_operands(self, call, scope):
+        name = self._name(call.func) or ""
+        out = _table_operands(name, call)
+        f = call.func
+        if name in _FS_CALLS or name in _SPAWN_CALLS or name.startswith("tempfile."):
+            pass
+        elif isinstance(f, ast.Attribute) and f.attr in _FS_PATH_METHODS and not (
+                f.attr == "replace" and (len(call.args) != 1 or call.keywords)) \
+                and not (_dotted(f.value) or "").split(".")[0] in self.imported:
+            out.append((f.value, False))
+            if f.attr in _FS_PATH_TARGETS and call.args:
+                out.append((call.args[0], False))
+        if not self._static_callees(call, scope):
+            out += [(k.value, False) for k in call.keywords if k.arg == "cwd"]
+        return out
+
+
+_PATH_CENSUS = {}   # (program, its text, its directory's texts) -> its arguments and sinks: an arm changes ONE program
+_TAINTS = {}        # (module, its directory's texts) -> its PathArgTaint, or None while it is being read (a cycle)
+
+
+def _directory_texts(directory):
+    """Every module of one directory, with its text: what a program there may import, and so what its reading
+    depends on."""
+    out = []
+    for name in sorted(os.listdir(directory)):
+        if name.endswith(".py"):
+            out.append((name, io.open(os.path.join(directory, name), "r", encoding="utf-8").read()))
+    return tuple(out)
+
+
+def _taint_of(path, prog, texts):
+    """The PathArgTaint of the module at `path`, reading the modules beside it it imports (`texts`: its
+    directory's). A module that imports one being read (a cycle) reads it as a module of no functions."""
+    key = (path, texts)
+    if key in _TAINTS:
+        return _TAINTS[key]
+    _TAINTS[key] = None
+    text = dict(texts)[os.path.basename(path)]
+    try:
+        tree = ast.parse(text, filename=os.path.basename(path))
+    except SyntaxError as exc:
+        raise Collapse("%s cannot be parsed, so its arguments cannot be read: %s" % (prog, exc))
+    directory = os.path.dirname(path)
+    names = dict(texts)
+    spelled = path.replace("\\", "/")
+    actions = path[:len(spelled) - len(prog) - 1] if spelled.endswith("/" + prog) else None
+
+    def sibling(module):
+        if module + ".py" not in names:
+            return None
+        return _taint_of(os.path.join(directory, module + ".py"), prog.rsplit("/", 1)[0] + "/" + module + ".py",
+                         texts)
+
+    def locate(where, module):
+        """A module this one loads by path: beside it, or `<the actions root>/<where>/<module>`."""
+        if where is None or where == os.path.basename(directory):
+            return sibling(module[:-3])
+        target = os.path.join(actions, where, module) if actions is not None else None
+        if target is None or not os.path.isfile(target):
+            return None
+        return _taint_of(target, where + "/" + module, _directory_texts(os.path.dirname(target)))
+    got = _TAINTS[key] = PathArgTaint(tree, sibling, locate)
+    return got
+
+
+def _declared_kind(call, looped=None):
+    """(the kind's name, the flag it hands -- "" when this reader cannot read it) for a `type=<...>.<one of
+    KINDS>(<flag>)`, None when the argument declares none of them. `looped` = (the loop's variable, the literal it
+    stands for here): a kind handed that variable hands that literal."""
+    for k in call.keywords:
+        if k.arg == "type" and isinstance(k.value, ast.Call):
+            f = k.value.func
+            name = (f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")).lstrip("_")
+            if name in KINDS:
+                a = k.value.args
+                if a and looped is not None and isinstance(a[0], ast.Name) and a[0].id == looped[0]:
+                    return name, looped[1]
+                return name, (a[0].value if a and isinstance(a[0], ast.Constant) and isinstance(a[0].value, str)
+                              else "")
+    return None
+
+
+def _looped_names(tree):
+    """{id(add_argument call): the literals its name walks} for every `add_argument(<loop variable>, ...)` inside a
+    `for <it> in (<literals>)` (or a module-level tuple of them): an option DECLARED IN A LOOP (`for flag in
+    ("--out", "--dss"): p.add_argument(flag, ...)`) is declared as surely as a literal one -- clause 13 reads it so
+    too. Each call takes the literals of ITS loop (the nearest that binds the name): two loops of one program may
+    share a variable's name."""
+    module = {}
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            lits = _display_literals(n.value)
+            if lits is not None:
+                module[n.targets[0].id] = lits
+    out = {}
+    for n in _all_nodes(tree):                         # breadth first: an inner loop is met after its outer one
+        if isinstance(n, (ast.For, ast.AsyncFor)) and isinstance(n.target, ast.Name):
+            lits = _display_literals(n.iter)
+            if lits is None and isinstance(n.iter, ast.Name):
+                lits = module.get(n.iter.id)
+            if not lits:
+                continue
+            for inner in ast.walk(n):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) \
+                        and inner.func.attr == "add_argument" and len(inner.args) == 1 \
+                        and isinstance(inner.args[0], ast.Name) and inner.args[0].id == n.target.id:
+                    out[id(inner)] = list(lits)
+    return out
+
+
+def _program_path_arguments(path, prog, texts=None):
+    """[(line, name, dest, (kind, flag) or None)] for every argument that takes a value, where each dest reaches the
+    filesystem -- {dest: (line, text)} -- counting a STRING argument whose first word is a child's program (its value
+    is that program), and the names of the LIST arguments so used and reaching it no other way (their words are a
+    command line: `_FIRST`, `command_words_arg`).
+    `texts`: the program's directory's modules, as `_directory_texts` reads them."""
+    texts = _directory_texts(os.path.dirname(path)) if texts is None else texts
+    key = (path, texts)
+    got = _PATH_CENSUS.get(key)
+    if got is not None:
+        return got
+    try:
+        tree = ast.parse(dict(texts)[os.path.basename(path)], filename=os.path.basename(path))
+    except SyntaxError as exc:
+        raise Collapse("%s cannot be parsed, so its arguments cannot be read: %s" % (prog, exc))
+    args = []
+    looped = _looped_names(tree)
+    for node in _all_nodes(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"):
+            continue
+        if any(k.arg == "action" and isinstance(k.value, ast.Constant) and k.value.value in _VALUELESS_ACTIONS
+               for k in node.keywords) or _restricted(node):
+            continue
+        first = node.args[0] if node.args else None
+        if id(node) in looped:
+            for lit in looped[id(node)]:
+                if lit.startswith("-"):
+                    args.append((node.lineno, lit, lit.lstrip("-").replace("-", "_"),
+                                 _declared_kind(node, (first.id, lit)), _takes_a_list(node)))
+            continue
+        dest, name = _argument_dest(node)
+        if dest is not None:
+            args.append((node.lineno, name, dest, _declared_kind(node), _takes_a_list(node)))
+    taint = _taint_of(path, prog, texts) if args else None
+    sinks, spared = {}, []
+    for line, name, dest, declared, listy in args:
+        site = taint.sinks.get(dest)
+        if site is None and listy and dest in taint.first_word:
+            spared.append(name)                 # a child's command line: `command_words_arg`
+        elif site is None:
+            site = taint.first_word.get(dest)
+        if site is not None:
+            sinks[dest] = site
+    args = [a[:4] for a in args]
+    got = (args, sinks, spared)
+    _PATH_CENSUS[key] = got
+    return got
+
+
+def _takes_a_list(call):
+    """argparse hands this argument's value on as a LIST of words (`action="append"` / `"extend"`, an `nargs` other
+    than `"?"`), each of which its `type=` judges alone."""
+    for k in call.keywords:
+        if k.arg == "action" and isinstance(k.value, ast.Constant) and k.value.value in ("append", "extend"):
+            return True
+        if k.arg == "nargs" and not (isinstance(k.value, ast.Constant) and k.value.value == "?"):
+            return True
+    return False
+
+
+def _restricted(call):
+    """An argument argparse already holds to values no option can be: a number (`type=int` / `type=float`), or a
+    closed `choices` set of literal words none of which begins with `-`."""
+    for k in call.keywords:
+        if k.arg == "type" and isinstance(k.value, ast.Name) and k.value.id in ("int", "float"):
+            return True
+        if k.arg == "choices" and isinstance(k.value, (ast.List, ast.Tuple, ast.Set)) and k.value.elts and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str) and not e.value.startswith("-")
+                for e in k.value.elts):
+            return True
+    return False
 
 
 def _argument_dest(call):
@@ -1663,62 +2874,56 @@ def _argument_dest(call):
     return dest, names[0]
 
 
-def _typed_flag(call):
-    """The flag a `type=<...>written_path_arg(<flag>)` hands, "" when it hands none this reader can read, None when
-    the argument takes no such type."""
-    for k in call.keywords:
-        if k.arg == "type" and isinstance(k.value, ast.Call):
-            f = k.value.func
-            name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
-            if name.lstrip("_") == WRITTEN_TYPE:
-                a = k.value.args
-                return a[0].value if a and isinstance(a[0], ast.Constant) and isinstance(a[0].value, str) else ""
-    return None
-
-
-def written_path_census(root, entries):
-    """Clause 14 -> (problems, how many arguments take the type)."""
+def path_arg_census(root, entries):
+    """Clause 14 -> (problems, {kind: how many arguments declare it}). Raises Collapse on a path type the data path
+    does not reach."""
     base = os.path.join(root, ACTIONS_REL)
-    problems, used, typed = [], set(), 0
+    problems, blind = [], []
+    declared_by = dict((kind, []) for kind in KINDS)
     for e in entries:
         adir = os.path.join(base, *e.rel.split("/"))
+        texts = _directory_texts(adir)
         for sib in e.siblings:
             prog = "%s/%s" % (e.rel, sib)
-            try:
-                tree = ast.parse(io.open(os.path.join(adir, sib), "r", encoding="utf-8").read(), filename=sib)
-            except SyntaxError as exc:
-                raise Collapse("%s cannot be parsed, so its arguments cannot be read: %s" % (prog, exc))
-            for node in ast.walk(tree):
-                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "add_argument"):
+            args, sinks, spared = _program_path_arguments(os.path.join(adir, sib), prog, texts)
+            for line, name, dest, declared in args:
+                where = "%s line %d: the argument %s" % (prog, line, name)
+                sink = sinks.get(dest)
+                said = (" -- its value reaches the filesystem (line %d: `%s`)" % sink) if sink else ""
+                if declared is None:
+                    problems.append("%s takes a value and declares no kind: `type=<owning-tree>.<one of %s>(\"%s\")`, "
+                                    "or `type=int`/`float`, or a closed `choices` set%s"
+                                    % (where, "/".join(KINDS), name, said))
                     continue
-                if any(k.arg == "action" and isinstance(k.value, ast.Constant) and k.value.value in _VALUELESS_ACTIONS
-                       for k in node.keywords):
-                    continue
-                dest, name = _argument_dest(node)
-                if dest is None:
-                    continue
-                flag = _typed_flag(node)
-                where = "%s line %d: the argument %s" % (prog, node.lineno, name)
-                if dest in WRITTEN_DESTS and flag is None:
-                    problems.append("%s names a path to write (its dest `%s`) and takes no `type=...%s(\"%s\")` -- "
-                                    "argparse alone takes `%s=--help` as that path" % (where, dest, WRITTEN_TYPE,
-                                                                                       name, name))
-                elif dest in WRITTEN_DESTS:
-                    used.add(dest)
-                    typed += 1
-                    if flag != name:
-                        problems.append("%s takes `%s(\"%s\")`, which names another flag than its own: the refusal "
-                                        "would name the wrong option" % (where, WRITTEN_TYPE, flag))
-                elif flag is not None:
-                    problems.append("%s takes `%s`, but its dest `%s` is no word of WRITTEN_DESTS: a path to write is "
-                                    "named by one, so either the dest is renamed or the type does not belong"
-                                    % (where, WRITTEN_TYPE, dest))
-    for w in WRITTEN_DESTS:
-        if w not in used:
-            problems.append("WRITTEN_DESTS holds `%s`, which no argument of any program takes with `%s` -- a word of "
-                            "the convention that names nothing" % (w, WRITTEN_TYPE))
-    return problems, typed
+                kind = declared[0]
+                declared_by[kind].append("%s %s" % (prog, name))
+                if declared[1] != name:
+                    problems.append("%s takes `%s(\"%s\")`, which names another flag than its own: the refusal "
+                                    "would name the wrong option" % (where, kind, declared[1]))
+                if kind in PATH_TYPES and sink is None:
+                    blind.append("%s takes `%s`, and no route the scan follows carries its value (dest `%s`) to the "
+                                 "filesystem" % (where, kind, dest))
+                elif kind in TEXT_KINDS and sink is not None:
+                    problems.append("%s declares `%s`%s: a path's kind belongs on it" % (where, kind, said))
+                elif kind in TEXT_KINDS and name in spared:
+                    problems.append("%s declares `%s`, and its first word starts a child: its words are a command "
+                                    "line -- `%s`" % (where, kind, WORDS_KIND))
+                elif kind == WORDS_KIND and sink is not None:
+                    problems.append("%s declares `%s`%s, other than as the program of the child its words are the "
+                                    "command line of: a path's kind belongs on it" % (where, kind, said))
+    for kind, measured in sorted(_DASH_KINDS.items()):
+        if len(declared_by[kind]) != measured:
+            problems.append("%d argument(s) declare `%s`, and the clause was measured on %d (`_DASH_KINDS`): %s -- a "
+                            "kind that takes a leading `-` is an escape from the refusal, and one more arguments take "
+                            "than it was measured on disarms the guard; read each, and move the count only with the "
+                            "reason in the clause's comment"
+                            % (len(declared_by[kind]), kind, measured, ", ".join(declared_by[kind]) or "none"))
+    if blind:
+        raise Collapse("clause 14 is blind to %d declared path argument(s) -- the scan cannot follow the route its "
+                       "value takes to the filesystem (follow it in PathArgTaint: an undeclared argument could take "
+                       "that route unseen), or the type does not belong on it:\n    %s"
+                       % (len(blind), "\n    ".join(blind)))
+    return problems, dict((kind, len(names)) for kind, names in declared_by.items())
 
 
 def render(entries):
@@ -1754,7 +2959,7 @@ def splice(doc_text, body, doc_rel):
     return doc_text[:b] + BEGIN + "\n" + body + "\n" + doc_text[t:]
 
 
-def run(root, write, census=True, written=None):
+def run(root, write, census=True, paths=None):
     # ★★★ THE GUARD'S OWN CONFIGURATION IS PART OF WHAT IT CHECKS. Both documents
     # are named constants, and dropping either from DOC_RELS would stop verifying
     # it while every message still claimed both were machine-checked. ✔MEASURED
@@ -1831,29 +3036,32 @@ def run(root, write, census=True, written=None):
         print("")
         print("  Work an action owns but a plain run must not do is a MANUAL step of that action (the")
         print("  operator's order of 2026-09-24): never a program started by hand.")
-    # ── CLAUSE 14: a path to write is refused when it begins with `-`, by its argument's type ──
+    # ── CLAUSE 14: every argument that takes a value declares its kind; the data path cross-checks it ──
     # (the same `census` gate by default: a self-test arm of another clause does not read every program again)
-    written_problems, typed = written_path_census(root, entries) if (census if written is None else written) \
-        else ([], None)
-    if written_problems:
-        print("check-scripts-index: FAIL -- %d path-to-write argument problem(s):" % len(written_problems))
-        for p in written_problems:
+    path_problems, kinds = path_arg_census(root, entries) if (census if paths is None else paths) else ([], None)
+    if path_problems:
+        print("check-scripts-index: FAIL -- %d value argument problem(s):" % len(path_problems))
+        for p in path_problems:
             print("    %s" % p)
         print("")
-        print("  A path a program writes never begins with `-`; owning-tree's `written_path` says why, and")
-        print("  `written_path_arg(<flag>)` is argparse's `type=` that refuses one, naming the flag.")
-    if problems or unreached or dangling or verb_problems or written_problems:
+        print("  A value a command line names never begins with `-` unless it is declared to: owning-tree's")
+        print("  `read_path`, `written_path`, `path_part` and `text` say why, and its `*_arg(<flag>)` kinds are")
+        print("  argparse's `type=` that refuses one, naming the flag.")
+    if problems or unreached or dangling or verb_problems or path_problems:
         return EXIT_DISAGREE
 
     census_said = ("verb census: %d program(s), %d token(s) -- %d reached by a step or a ctest entry, %d recorded "
                    "and verified, %d red" % (counts["programs"], counts["tokens"], counts["reached"],
                                               counts["recorded"], counts["red"])) if counts else \
         "verb census: not run in this self-test arm"
-    written_said = ("%d path-to-write argument(s), each with its type" % typed) if typed is not None else \
-        "path-to-write arguments: not read in this self-test arm"
+    paths_said = ("%d value argument(s), each declaring its kind -- %d path(s), each reaching the filesystem, %d "
+                  "text(s), %d option text(s), %d command words" % (
+                      sum(kinds.values()), sum(kinds[k] for k in PATH_TYPES), kinds["text_arg"],
+                      kinds["option_text_arg"], kinds[WORDS_KIND])) \
+        if kinds is not None else "value arguments: not read in this self-test arm"
     print("check-scripts-index: OK (%d actions, both indexes agree with the tree and with "
           "each action's own PURPOSE line, and every action has a runner; %s; %s)"
-          % (len(entries), census_said, written_said))
+          % (len(entries), census_said, paths_said))
     return EXIT_OK
 
 
@@ -1867,7 +3075,7 @@ def run(root, write, census=True, written=None):
 _RAN = None   # set by selftest() so every arm is counted where it is judged
 
 
-def _arm(label, root, expect, says=None, not_says=None, census=False, written=False):
+def _arm(label, root, expect, says=None, not_says=None, census=False, paths=False):
     """Run the guard against a mutated mirror and judge the WHOLE verdict.
 
     ★★★ `says` / `not_says` are the load-bearing halves, not decoration.
@@ -1882,7 +3090,7 @@ def _arm(label, root, expect, says=None, not_says=None, census=False, written=Fa
     detail = ""
     try:
         with contextlib.redirect_stdout(buf):
-            rc = run(root, write=False, census=census, written=written)
+            rc = run(root, write=False, census=census, paths=paths)
     except Collapse as exc:
         rc = EXIT_COLLAPSE
         detail = str(exc)
@@ -2058,9 +3266,10 @@ def _newcomer(tmp, rel, runner):
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
 # The 2c arm retired (M6); clause 13's fixture arms, 30, then 32 (22w2 and 22w3, the widened remedy rule), then 35
-# (22v1 to 22v3, a write into its own kept output); and the one arm numbered 23, CENSUS-WIRED; then clause 14's six
-# (24 to 24f, every argument that names a path to write takes owning-tree's type).
-EXPECTED_ARMS = 55 - 1 + 35 + 1 + 6
+# (22v1 to 22v3, a write into its own kept output); and the one arm numbered 23, CENSUS-WIRED; then clause 14's
+# seventeen (24 to 24p and 24z: every value argument declares its kind, each refusal of the cross-check, the dash
+# kinds' pin, and each route the data path follows proved by the argument that takes only it).
+EXPECTED_ARMS = 55 - 1 + 35 + 1 + 17
 
 
 # ── CLAUSE 13's ARMS, over a SYNTHESIZED fixture ───────────────────────────────────────────────────────────────
@@ -2566,33 +3775,71 @@ def selftest(root):
                    says=("verb census problem", "--zz-selftest-unreached is started by nothing"))
         _write(prog, pristine_prog)
 
-        # ── clause 14: a path-to-write argument takes owning-tree's type (EXIT_DISAGREE) ─────────────────────────
-        # ★ Each arm sabotages a REAL argument of the mirror; the green arms around them are the control: every
-        # other path-to-write argument of this tree takes its type.
-        rlp = os.path.join(acts, "read-leg-path", "read-leg-path.py")
-        rlp_text = _read(rlp)
-        typed_out = 'ap.add_argument("--out", required=True, type=_written_path_arg("--out"))'
-        _write(rlp, _sabotage(rlp_text, typed_out, 'ap.add_argument("--out", required=True)'))
-        ok &= _arm("24 WRITTEN-PATH-WITHOUT-ITS-TYPE", tmp, EXIT_DISAGREE, written=True,
-                   says=("path-to-write argument problem", "read-leg-path/read-leg-path.py line", "takes no `type="))
-        _write(rlp, _sabotage(rlp_text, typed_out, typed_out.replace('_arg("--out")', '_arg("--path")')))
-        ok &= _arm("24b WRITTEN-PATH-TYPE-NAMES-ANOTHER-FLAG", tmp, EXIT_DISAGREE, written=True,
-                   says="which names another flag than its own")
-        _write(rlp, _sabotage(rlp_text, typed_out, typed_out.replace('("--out", required', '("--report", required')))
-        ok &= _arm("24c WRITTEN-PATH-TYPE-ON-ANOTHER-DEST", tmp, EXIT_DISAGREE, written=True,
-                   says="its dest `report` is no word of WRITTEN_DESTS")
-        _write(rlp, _sabotage(rlp_text, typed_out, typed_out + '\n    ap.add_argument("--json", action="store_true")'))
-        ok &= _arm("24d A-FLAG-WITH-NO-VALUE-NAMES-NO-PATH", tmp, EXIT_OK, written=True,
-                   not_says="path-to-write argument problem")
-        _write(rlp, rlp_text)
-        held = WRITTEN_DESTS
-        globals()["WRITTEN_DESTS"] = held + ("zz_selftest_dest",)
-        try:
-            ok &= _arm("24e A-WORD-NO-ARGUMENT-TAKES", tmp, EXIT_DISAGREE, written=True,
-                       says="WRITTEN_DESTS holds `zz_selftest_dest`, which no argument")
-        finally:
-            globals()["WRITTEN_DESTS"] = held
-        ok &= _arm("24f RESTORED", tmp, EXIT_OK, written=True)
+        # ── clause 14: every value argument declares its kind; the data path cross-checks it (EXIT_DISAGREE) ───────
+        # ★ Each arm sabotages a REAL argument of the mirror and restores it; the green arms are the control, and the
+        # last one (RESTORED) proves the PRECISION of the cross-check over the whole tree: none of its texts is seen
+        # reaching the filesystem, so no route of PathArgTaint carries one argument's value as another's.
+        def clause14_arm(label, rel, old, new, expect, says=None, not_says=None):
+            path = os.path.join(acts, *rel.split("/"))
+            text = _read(path)
+            _write(path, _sabotage(text, old, new))
+            try:
+                return _arm(label, tmp, expect, says=says, not_says=not_says, paths=True)
+            finally:
+                _write(path, text)
+        rlp, typed_out = "read-leg-path/read-leg-path.py", 'type=_path_types().written_path_arg("--out")'
+        out_line = 'ap.add_argument("--out", required=True, %s)' % typed_out
+        ok &= clause14_arm("24 A-PATH-DECLARES-NO-KIND", rlp, out_line, 'ap.add_argument("--out", required=True)',
+                           EXIT_DISAGREE, says=("value argument problem", "read-leg-path/read-leg-path.py line",
+                                                "declares no kind", "its value reaches the filesystem"))
+        ok &= clause14_arm("24b A-KIND-NAMES-ANOTHER-FLAG", rlp, typed_out, typed_out.replace('"--out"', '"--path"'),
+                           EXIT_DISAGREE, says="which names another flag than its own")
+        ok &= clause14_arm("24c A-TEXT-THAT-REACHES-THE-FILESYSTEM", rlp, typed_out,
+                           'type=_path_types().text_arg("--out")', EXIT_DISAGREE,
+                           says=("declares `text_arg` -- its value reaches the filesystem", "a path's kind belongs"))
+        ok &= clause14_arm("24d A-PATH-TYPE-NO-ROUTE-CARRIES", rlp, out_line, out_line + (
+            '\n    ap.add_argument("--zz-unread", type=_path_types().read_path_arg("--zz-unread"))'), EXIT_COLLAPSE,
+                           says=("clause 14 is blind to 1 declared path argument", "--zz-unread"))
+        ok &= clause14_arm("24e A-FLAG-WITH-NO-VALUE-HAS-NO-KIND", rlp, out_line,
+                           out_line + '\n    ap.add_argument("--zz-json", action="store_true")', EXIT_OK,
+                           not_says="value argument problem")
+        ok &= clause14_arm("24f A-NUMBER-OR-A-CHOICE-HOLDS-ITSELF", rlp, out_line, out_line + (
+            '\n    ap.add_argument("--zz-count", type=int)\n    ap.add_argument("--zz-mode", choices=("a", "b"))'),
+                           EXIT_OK, not_says="value argument problem")
+        ok &= clause14_arm("24g A-CHOICE-OPENING-WITH-A-DASH", rlp, out_line,
+                           out_line + '\n    ap.add_argument("--zz-mode", choices=("a", "-b"))', EXIT_DISAGREE,
+                           says=("the argument --zz-mode", "declares no kind"))
+        base_kind = 'type=_owning_tree().text_arg("--base")'
+        ok &= clause14_arm("24h A-TEXT-DECLARES-NO-KIND", "anchor-debt/anchor-debt.py", ", " + base_kind, "",
+                           EXIT_DISAGREE, says=("anchor-debt/anchor-debt.py line", "the argument --base",
+                                                "declares no kind"), not_says="its value reaches the filesystem")
+        ok &= clause14_arm("24i A-DASH-KIND-TAKEN-ONCE-MORE", "anchor-debt/anchor-debt.py", base_kind,
+                           base_kind.replace("text_arg", "option_text_arg"), EXIT_DISAGREE,
+                           says=("6 argument(s) declare `option_text_arg`, and the clause was measured on 5",
+                                 "anchor-debt/anchor-debt.py --base"))
+        ok &= clause14_arm("24j COMMAND-WORDS-THAT-REACH-THE-FILESYSTEM", rlp, typed_out,
+                           'type=_path_types().command_words_arg("--out")', EXIT_DISAGREE,
+                           says="declares `command_words_arg` -- its value reaches the filesystem")
+        ok &= clause14_arm("24k A-TEXT-THAT-IS-A-COMMAND-LINE", "profile-compile/profile-compile-support.py",
+                           'command_words_arg("command")', 'text_arg("command")', EXIT_DISAGREE,
+                           says="its first word starts a child: its words are a command line")
+        # the routes the data path follows, each proved by the one argument that reaches the filesystem ONLY by it:
+        # declared a text, it is refused -- so the route is followed, and a blindness there would read clean
+        sqlite = "real-examples/c/sqlite/"
+        for label, rel, old in (
+                ("24l ROUTE-A-MODULE-LOADED-BY-PATH", sqlite + "harness_legs.py",
+                 'read_path_arg("--config-tree", empty_means_absent=True)'),
+                ("24m ROUTE-A-CALLABLE-A-DEFAULT-HOLDS", sqlite + "benchmark_speedtest1.py",
+                 'read_path_arg("--cc", empty_means_absent=True)'),
+                ("24n ROUTE-AN-ALIAS-OF-A-PATH-JOIN", sqlite + "sqlite_stage.py", 'path_part_arg("--tier")'),
+                ("24o ROUTE-A-SET-DEFAULTS-DISPATCH", "profile-compile/profile-compile-support.py",
+                 'written_path_arg("--log")'),
+                ("24p ROUTE-A-MODULE-IMPORTED-BESIDE-IT", sqlite + "stage-zinc.py", 'read_path_arg("--catalogue")')):
+            flag = old.split('"')[1]
+            ok &= clause14_arm(label, rel, old, 'text_arg("%s")' % flag, EXIT_DISAGREE,
+                               says=("the argument %s declares `text_arg` -- its value reaches the filesystem" % flag))
+        ok &= _arm("24z RESTORED", tmp, EXIT_OK, paths=True, says="each declaring its kind",
+                   not_says="value argument problem")
 
         ok &= _arm("19 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:

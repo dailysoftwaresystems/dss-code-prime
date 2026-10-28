@@ -1,1 +1,1 @@
-            return written_path(value, flag)
+            return kind(value, flag)

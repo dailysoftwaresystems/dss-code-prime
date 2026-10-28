@@ -120,10 +120,11 @@ std::optional<fs::path> runningExecutablePath() {
     buf.resize(std::char_traits<char>::length(buf.c_str()));
     return fs::path{buf};
 #else
-    // Linux (and the BSDs that provide it). `/proc/self/exe` is already fully
-    // symlink-resolved by the kernel.
+    // Linux (and the BSDs that provide it). `/proc/self/exe` is a link the
+    // kernel keeps to the running image, already fully resolved; where it leads
+    // is asked of the substrate, as every link question is.
     std::error_code ec;
-    fs::path const  exe = fs::read_symlink("/proc/self/exe", ec);
+    fs::path const  exe = core::reachedPath("/proc/self/exe", ec);
     if (ec || exe.empty()) return std::nullopt;
     return exe;
 #endif
@@ -620,14 +621,16 @@ configRootProvenanceNoteFor(ResolvedConfigRoot const&    resolved,
     // into the path. Tested in this order because the filesystem question is
     // only worth asking for the walk.
     //
-    // `equivalent`, never a string compare: a lane worktree reached through a
-    // junction, a mapped drive and a `..`-bearing spelling are all one
-    // directory, and a spelling-based answer would report a foreign tree where
-    // there is none. `ec` => one side is absent; the resolved root was just
-    // probed, so the absent side is the BUILD tree — a relocated binary, which
-    // genuinely is answering out of someone else's tree.
+    // One file reached (`core::reachedSameFile`, `equivalent`'s question asked
+    // of the substrate), never a string compare: a lane worktree reached
+    // through a junction, a mapped drive and a `..`-bearing spelling are all
+    // one directory, and a spelling-based answer would report a foreign tree
+    // where there is none. Not the same => one side is absent or another
+    // directory; the resolved root was just probed, so an absent side is the
+    // BUILD tree — a relocated binary, which genuinely is answering out of
+    // someone else's tree.
     bool const foreign = resolved.arm == ConfigRootArm::CwdWalk
-                      && !(fs::equivalent(resolved.root, mine, ec) && !ec);
+                      && !(core::reachedSameFile(resolved.root, mine, ec) && !ec);
 
     if (!foreign && !resolved.ignoredOverride.has_value()) return std::nullopt;
 

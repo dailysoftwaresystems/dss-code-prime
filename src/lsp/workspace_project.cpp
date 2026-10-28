@@ -89,27 +89,62 @@ namespace {
     return out;
 }
 
-// Collect every `*.dss-project.json` directly inside `root`, sorted.
+// Why the manifests of one workspace root could not all be read.
+struct ManifestScanFailure {
+    WorkspaceProjectErrorKind kind;
+    std::string               detail;
+};
+
+// Collect every `*.dss-project.json` directly inside `root` (the caller sorts).
 // SORTED, not directory order: two developers on two filesystems must get the
 // same answer out of the same tree, and the union below only stays
 // order-independent if the inputs are.
-void collectManifests(fs::path const& root, std::vector<fs::path>& out) {
-    std::error_code ec;
-    // Non-throwing overload: an unreadable / absent root contributes nothing
-    // and is reported by the caller as "no manifest found", with the root
-    // named. Throwing here would take down the LSP message loop for a mistyped
-    // rootUri.
-    for (auto const& entry : fs::directory_iterator(root, ec)) {
-        // A manifest is an entry by what it REACHES (the substrate's answer, never the
-        // library's: libstdc++ on Windows calls a dangling link a regular file).
-        if (std::error_code kindEc; core::reachedKind(entry.path(), kindEc) != core::EntryKind::File) continue;
-        const auto name = entry.path().filename().string();
-        if (name.size() < kProjectFileSuffix.size()) continue;
-        if (name.compare(name.size() - kProjectFileSuffix.size(),
-                         kProjectFileSuffix.size(),
-                         kProjectFileSuffix) != 0) continue;
-        out.push_back(entry.path());
+//
+// Never a throw -- that would take down the LSP message loop for a mistyped
+// rootUri. An ABSENT root contributes nothing, and the caller reports "no
+// manifest found" with the root named. Anything the substrate's walk could not
+// read is the returned FAILURE, naming it: a root that is there but cannot be
+// listed, and an entry named as a project file whose reach cannot be examined
+// (a looping link) -- a project file the editor could not read is not one it
+// may silently go without. A manifest is an entry by what it REACHES (the
+// substrate's answer, never the library's: libstdc++ on Windows calls a dangling
+// link a regular file); an entry NOT named as one is no manifest whatever it
+// reaches, so its reach is never asked.
+[[nodiscard]] std::optional<ManifestScanFailure> collectManifests(fs::path const& root,
+                                                                  std::vector<fs::path>& out) {
+    auto const named = [](fs::path const& p) {
+        std::string const name = p.filename().string();
+        return name.size() >= kProjectFileSuffix.size()
+            && name.compare(name.size() - kProjectFileSuffix.size(), kProjectFileSuffix.size(),
+                            kProjectFileSuffix) == 0;
+    };
+    std::error_code rootEc;
+    if (core::reachedKind(root, rootEc) == core::EntryKind::Absent && !rootEc) return std::nullopt;
+    std::optional<ManifestScanFailure> unreadable;
+    auto const walk = core::walkTree(
+        root,
+        [&](core::TreeEntry const& entry) {
+            if (!named(entry.path)) return core::WalkStep::Prune;
+            if (entry.reachError) {
+                unreadable = ManifestScanFailure{
+                    WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                    "project file `" + entry.path.string() + "` cannot be read: what it reaches cannot be "
+                        "examined (" + entry.reachError.message() + ")"};
+                return core::WalkStep::Stop;
+            }
+            if (entry.reaches == core::EntryKind::File) out.push_back(entry.path);
+            return core::WalkStep::Prune;
+        },
+        core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (unreadable) return unreadable;
+    if (walk.error) {
+        return ManifestScanFailure{
+            WorkspaceProjectErrorKind::ProjectFileNotFound,
+            "the workspace root `" + root.string() + "` could not be read: the walk stopped at `"
+                + walk.where.string() + "` (" + walk.error.message() + "), so no `"
+                + std::string{kProjectFileSuffix} + "` project file in it could be found"};
     }
+    return std::nullopt;
 }
 
 // Does THIS platform's path type model `//authority/...` as a root name?
@@ -351,7 +386,11 @@ WorkspacePreferenceResult resolveWorkspaceLanguagePreference(
     }
 
     std::vector<fs::path> manifests;
-    for (auto const& root : workspaceRoots) collectManifests(root, manifests);
+    for (auto const& root : workspaceRoots) {
+        if (auto failure = collectManifests(root, manifests)) {
+            return std::unexpected(WorkspaceProjectError{failure->kind, std::move(failure->detail)});
+        }
+    }
     std::sort(manifests.begin(), manifests.end());
 
     if (manifests.empty()) {
@@ -518,7 +557,11 @@ WorkspaceBuildResult resolveWorkspaceBuild(
                        "project file to read a build configuration from");
     }
     std::vector<fs::path> manifests;
-    for (auto const& root : workspaceRoots) collectManifests(root, manifests);
+    for (auto const& root : workspaceRoots) {
+        if (auto failure = collectManifests(root, manifests)) {
+            return refusal(failure->kind, DiagnosticCode::D_DirectoryScanFailed, std::move(failure->detail));
+        }
+    }
     std::sort(manifests.begin(), manifests.end());
     if (manifests.empty()) {
         return refusal(WorkspaceProjectErrorKind::ProjectFileNotFound,

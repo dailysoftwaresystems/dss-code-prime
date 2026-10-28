@@ -1,0 +1,3 @@
+        if(IS_DIRECTORY "${_dir}")
+            # file(REAL_PATH "${_dir}" _dir)
+        endif()

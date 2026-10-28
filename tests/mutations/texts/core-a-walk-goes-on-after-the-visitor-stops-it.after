@@ -1,0 +1,2 @@
+        if (false && step == WalkStep::Stop) {
+            walk.stopped = true;

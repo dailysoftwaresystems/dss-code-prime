@@ -8072,9 +8072,8 @@ TEST(Preprocessor, FC179EmbedThroughALinkIsTheBytesTheLinkReaches) {
     // The scratch root is the process's own, so a repeated run (the shuffled entry's `--gtest_repeat`) finds the
     // link the last repeat made; it is removed as itself first -- the OS refuses to make a link over one.
     ASSERT_EQ(dss::core::removeTree(dir / "via-link.bin").failures, 0u);
-    ASSERT_FALSE(test_support::makeSymbolicLink(dir / "real.bin", dir / "via-link.bin",
-                                                test_support::LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(test_support::makeSymbolicLink(dir / "real.bin", dir / "via-link.bin",
+                                                        test_support::LinkTo::File));
     {
         PreprocessResult r;
         auto inner = embedInner(embedInit("#embed \"via-link.bin\""), r, {dir});
@@ -8107,9 +8106,8 @@ TEST(Preprocessor, FC179EmbedThroughALinkIsTheBytesTheLinkReaches) {
 TEST(Preprocessor, FC179EmbedOfADanglingLinkIsNotFound) {
     auto dir = writeEmbedResource("dss_embed_dangling", "real.bin", "ABC");
     ASSERT_EQ(dss::core::removeTree(dir / "gone.bin").failures, 0u);   // a repeat's link, as above
-    ASSERT_FALSE(test_support::makeSymbolicLink(dir / "no-such.bin", dir / "gone.bin",
-                                                test_support::LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(test_support::makeSymbolicLink(dir / "no-such.bin", dir / "gone.bin",
+                                                        test_support::LinkTo::File));
     {
         PreprocessResult r;
         auto lexs = ppLexemesWithDirs(

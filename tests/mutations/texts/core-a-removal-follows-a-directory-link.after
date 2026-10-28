@@ -1,1 +1,1 @@
-            if (std::error_code rk; entry.kind == EntryKind::Directory || reachedKind(entry.path, rk) == EntryKind::Directory) {
+        int const opened = ::openat(top.dir.get(), name.c_str(), kOpenDirectoryOnly & ~O_NOFOLLOW);

@@ -128,11 +128,10 @@ TEST(ShippedConfigDocuments, ALinkIsADocumentByWhatItReachesAndADanglingLinkIsNo
     plant(dir / "c.lang.json");
     plant(scratch.path() / "elsewhere" / "named.lang.json");
     using dss::test_support::LinkTo;
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(scratch.path() / "elsewhere" / "named.lang.json",
-                                                     dir / "via-link.lang.json", LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(dir / "no-such.lang.json", dir / "gone.lang.json",
-                                                     LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "elsewhere" / "named.lang.json",
+                                                             dir / "via-link.lang.json", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "no-such.lang.json", dir / "gone.lang.json",
+                                                             LinkTo::File));
 
     auto const got = shippedConfigDocuments(dir, ".lang.json");
     ASSERT_TRUE(got.has_value()) << got.error();

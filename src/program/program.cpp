@@ -3369,9 +3369,10 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
     std::map<std::string, std::vector<std::string>> declarers;
     // The descriptors, collected by the substrate's walk -- which never descends a
     // link on any build (libstdc++ on Windows cannot tell one from what it
-    // reaches: the substrate's header). The corpus root that cannot be walked is
-    // the refusal below; a directory under it that cannot be listed ends the walk
-    // there, as the iterator's error did.
+    // reaches: the substrate's header). ANYTHING the walk could not read -- the
+    // corpus root, a directory under it, a link whose reach it cannot examine --
+    // is the refusal below, naming where it stopped: a descriptor beyond that
+    // point was never read, and it may be the very one that declares a unit.
     std::vector<fs::path> descriptors;
     auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
         if (entry.reaches == core::EntryKind::File
@@ -3379,11 +3380,12 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
             descriptors.push_back(entry.path);
         return core::WalkStep::Continue;
     });
-    if (walk.error && walk.where == descriptorDir) {
+    if (walk.error) {
         emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                    "shipped-source realization: the descriptor corpus at '"
                    + core::genericSpelling(descriptorDir)
-                   + "' could not be walked (" + walk.error.message()
+                   + "' could not be walked (stopped at '"
+                   + core::genericSpelling(walk.where) + "': " + walk.error.message()
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
                      "cache keys on their CONTENT (the unit includes their "
@@ -3395,7 +3397,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
             dss::ffi::readShippedSourcesForFormat(descriptor, formatKey);
         if (declared.empty()) continue;
         std::error_code relEc;
-        fs::path const rel = fs::relative(descriptor, configRoot, relEc);
+        fs::path const rel = core::reachedRelative(descriptor, configRoot, relEc);
         // A descriptor outside the config root cannot be spelled
         // config-root-relatively, and the key document's whole point is that it
         // is portable between an installed tree and a source tree — so the
@@ -3634,7 +3636,7 @@ void appendSchemaDocuments(
         std::string{label}, std::move(path), std::string{digest}});
     for (auto const& dep : referenced) {
         std::error_code relEc;
-        fs::path const  rel = fs::relative(fs::path{dep.path}, configRoot, relEc);
+        fs::path const  rel = core::reachedRelative(fs::path{dep.path}, configRoot, relEc);
         out.push_back(dss::runtime::LoadedConfigDocument{
             std::string{label} + "-ref",
             (relEc || rel.empty()) ? dep.path : rel.generic_string(),
@@ -3989,7 +3991,7 @@ buildDependencyArtifactKey(
                                      / (std::string{buildFormat.name()}
                                         + ".format.json");
             std::error_code relEc;
-            fs::path const  rel = fs::relative(formatDoc, configRoot, relEc);
+            fs::path const  rel = core::reachedRelative(formatDoc, configRoot, relEc);
             std::string const spelling =
                 (relEc || rel.empty()) ? core::genericSpelling(formatDoc)
                                        : rel.generic_string();

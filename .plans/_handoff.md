@@ -649,6 +649,27 @@ round's close; each checkpoint's commit message says what was and was not run on
   two of the ids this commit applies); its 89 arms `passed` on macos-arm64-debug in the lane. Three registry
   cross-refs that cited two rows of the retired harness registry (no row holds either id) now state the rule they
   cited instead.
+- **Checkpoint 34 (2026-10-28) = the harness lane's fold H4b**, folded AHEAD of f26b (it was ready and depends on
+  nothing of the C front end lane's): the filesystem questions H4 had left with the library (`fs::equivalent`,
+  `last_write_time`, `permissions`, `read_symlink`, `relative` — in the preprocessor, the config walk, the writer,
+  the shipped descriptors, the driver and the integrated runner) go through the substrate, so a MinGW build answers
+  a link as the MSVC and POSIX builds do (libstdc++ on Windows answers them from a link's own attributes, resolves no
+  link and empties a directory link's target in `remove_all` — ✔MEASURED by the lane); a Windows directory removal
+  opens each directory once with list-and-delete access (the OS refuses a ReOpenFile of a removal handle, ✔MEASURED
+  on cl and MinGW); a Unit-stage optimize no longer warns of a fixpoint cap the Program stage resumes — the warning
+  belongs to a module's LAST stage, which the driver tells the engine, and a test seam judges that every production
+  route lowers a module only after its Program stage. 3 rows applied:
+  `D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES` CLOSED;
+  `D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK` amended, open until main's sweep of its 13 Windows arms;
+  `D-HARNESS-SCRIPTS-INDEX-CENSUS-CANNOT-RESOLVE-A-CALL-IT-HANDS-A-PATH-VALUE` NEW, 🔵 DISCLOSED (P3; on its measured
+  size, the next cycle's first harness item). ✔MEASURED by the lane on ITS bytes — checkpoint 31 plus checkpoint 32's
+  content, WITHOUT L2a: finals3 (run 20261022-040852-3a4e9345, no filter) windows-x86_64-debug and
+  windows-x86_64-release 2878 of 2878, linux-arm64-debug and macos-arm64-debug 2855 of 2855; its 48
+  macos-arm64-debug arms passed (36 in 20261022-060751-f40e1a01, the 12 re-declared in 20261028-184000-8db67903).
+  The three paths L2a also changed merged three-way (compile_pipeline.hpp, program.cpp, tests/core/CMakeLists.txt),
+  the arm registry by arm (1132 arms, re-sorted); the MERGED tree was not run before this commit — its five-leg suite
+  and main's sweep of the 13 Windows arms follow it. Plan 30's §0, §1.1 and §8 are re-derived here (679 open rows;
+  PR #59 holds 93).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -701,7 +722,9 @@ round's close; each checkpoint's commit message says what was and was not run on
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the
-  foreign object that bound no library import (P0), every foreign PE object's unwind information dropped. IN MAIN
+  foreign object that bound no library import (P0 — PARTIAL, its row REOPENED 2026-10-28: an all-object link still
+  binds none of its client object's imports, and a foreign `strtol` stays unbound; the link lane's 3d), every foreign
+  PE object's unwind information dropped. IN MAIN
   SINCE CHECKPOINT 33 (the library lane's L2a): the `sizeof` of a VLA operand's side effects, the parenthesised name
   read as a cast, `case 0, 42:` / `case y:`, the exponential parenthesised call chain, `typeof` of a VLA. STILL IN THE
   LANES — SILENT miscompiles: a name used in a block BEFORE the block declares its own binds to the LATER declaration

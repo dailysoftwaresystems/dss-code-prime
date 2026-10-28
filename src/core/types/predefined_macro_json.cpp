@@ -116,16 +116,21 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
 
     // The substrate's walk: it never descends a link on any build (libstdc++ on
     // Windows cannot tell one from what it reaches -- the substrate's header). A
-    // directory it cannot list ends the sweep, as the iterator's error did.
+    // directory it cannot list, or a link whose reach it cannot examine, ends the
+    // walk -- and is itself a FINDING, naming where: a sweep that did not read the
+    // whole tree cannot say the tree agrees, and an empty answer would say it.
     std::vector<fs::path> files;
-    static_cast<void>(core::walkTree(
-        fs::path{configRootDir},
-        [&](core::TreeEntry const& entry) {
-            if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-                files.push_back(entry.path);
-            return core::WalkStep::Continue;
-        },
-        core::TreeWalkOptions{.skipPermissionDenied = true}));
+    auto const walk = core::walkTree(fs::path{configRootDir}, [&](core::TreeEntry const& entry) {
+        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
+            files.push_back(entry.path);
+        return core::WalkStep::Continue;
+    });
+    if (walk.error) {
+        out.push_back(std::format("the config tree '{}' could not be read whole: the walk stopped at '{}' ({}), so "
+                                  "no document beyond it was compared",
+                                  core::genericSpelling(fs::path{configRootDir}),
+                                  core::genericSpelling(walk.where), walk.error.message()));
+    }
     // Deterministic on every host: a directory iteration order is the
     // filesystem's, and "which document is FIRST" decides which one the message
     // names as the reference. A host-dependent reference makes the same defect

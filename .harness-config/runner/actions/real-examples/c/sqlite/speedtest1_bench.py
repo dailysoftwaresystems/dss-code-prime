@@ -1301,24 +1301,26 @@ def apply_scratch(path: str) -> str:
     return full
 
 
-_WRITTEN_PATH_OWNER = []
+_PATH_TYPES_OWNER = []
 
 
-def _written_path_arg(flag):
-    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
-    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
-    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
-    if not _WRITTEN_PATH_OWNER:
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
         import importlib.util
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
         if not os.path.isfile(path):
-            raise SystemExit("speedtest1_bench: cannot find %s -- what a path to write may be is said there and nowhere else"
-                             % path)
+            raise SystemExit("speedtest1_bench: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
         spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        _WRITTEN_PATH_OWNER.append(mod)
-    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
 
 
 def main() -> int:
@@ -1331,9 +1333,12 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--plan", help="path of the benchmark plan JSON a driver wrote")
-    ap.add_argument("--json-out", type=_written_path_arg("--json-out"), help="where to write the raw measurement JSON")
-    ap.add_argument("--md-out", type=_written_path_arg("--md-out"), help="where to write the README-ready markdown")
+    ap.add_argument("--plan", help="path of the benchmark plan JSON a driver wrote",
+                    type=_path_types().read_path_arg("--plan"))
+    ap.add_argument("--json-out", type=_path_types().written_path_arg("--json-out"),
+                    help="where to write the raw measurement JSON")
+    ap.add_argument("--md-out", type=_path_types().written_path_arg("--md-out"),
+                    help="where to write the README-ready markdown")
     ap.add_argument("--selftest", action="store_true",
                     help="prove the normalizer and every refusal actually refuse")
     ap.add_argument("--resolve-msvc", action="store_true",
@@ -1345,14 +1350,15 @@ def main() -> int:
                          "for a configure and a reference build. Exit 0 = it "
                          "compiles; 1 = THE COMPILER REFUSED (the stale-binary "
                          "signature); 3 = THE CHECK COULD NOT RUN (nothing was "
-                         "learned about the compiler)")
+                         "learned about the compiler)", type=_path_types().read_path_arg("--preflight-dss"))
     ap.add_argument("--config-root", metavar="DIR",
-                    help="the DSS_CONFIG_ROOT to pin for --preflight-dss")
+                    help="the DSS_CONFIG_ROOT to pin for --preflight-dss",
+                    type=_path_types().read_path_arg("--config-root"))
     ap.add_argument("--preflight-target", metavar="SPEC", default="",
                     help="the --target the MEASUREMENT will use, so the preflight "
                          "validates the same target document rather than whatever "
-                         "dsscp defaults to (see preflight_dss)")
-    ap.add_argument("--scratch", metavar="DIR", type=_written_path_arg("--scratch"),
+                         "dsscp defaults to (see preflight_dss)", type=_path_types().text_arg("--preflight-target"))
+    ap.add_argument("--scratch", metavar="DIR", type=_path_types().written_path_arg("--scratch"),
                     help="the existing directory this program's OWN temporaries go in -- the "
                          "vcvars script, the pre-flight probe, the timed databases (see "
                          "apply_scratch). The benchmark driver names one inside its output tree; "

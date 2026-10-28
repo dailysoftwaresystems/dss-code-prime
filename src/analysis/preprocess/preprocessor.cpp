@@ -1643,7 +1643,10 @@ preScanIncludeFile(fs::path const& path,
 // dedup — a bug whose only symptom was a correct-looking redefinition error.
 // The lesson is the one this project keeps paying for: an invariant that "cannot"
 // break is a claim about a platform, and it is worth exactly what it was measured
-// on. The scan below consults `fs::equivalent` and nothing else.
+// on. The scan below asks `core::reachedSameFile` -- `equivalent`'s question, asked
+// of the substrate, because libstdc++ on Windows answers it of a dangling link
+// with no error where MS STL and libc++ report one (✔MEASURED 2026-10-21, the
+// substrate's header) -- and nothing else.
 //
 // ★★ IT IS STILL NOT O(n^2), FOR A REASON THAT IS MEASURED RATHER THAN HOPED.
 // `files_` counts only files that ACTUALLY FIRED an include-once pragma — not
@@ -1674,7 +1677,7 @@ public:
         std::size_t& from = checkedUpTo_[canon];
         for (std::size_t k = from; k < files_.size(); ++k) {
             std::error_code ec;
-            if (fs::equivalent(p, files_[k], ec) && !ec) {
+            if (core::reachedSameFile(p, files_[k], ec) && !ec) {
                 from = files_.size();
                 spellings_.insert(canon);   // memoise: hash hit from now on
                 return true;

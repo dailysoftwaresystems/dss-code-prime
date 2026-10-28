@@ -590,6 +590,21 @@ struct OptResult {
                                             // both with NO default, so every route
                                             // that optimizes a real build answers.
                                             ModuleExtent extent = ModuleExtent::WholeImage,
-                                            std::span<SymbolId const> entryRoots = {});
+                                            std::span<SymbolId const> entryRoots = {},
+                                            // ★★ D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES:
+                                            // whether a LATER optimization stage
+                                            // resumes this module before it is
+                                            // lowered (the driver's UNIT stage,
+                                            // which every final module's PROGRAM
+                                            // stage follows). A fixpoint truncated
+                                            // here leaves no program incomplete --
+                                            // the later stage runs its own schedule
+                                            // over the result and reports its own
+                                            // truncation -- so it is said only under
+                                            // DSS_OPT_TRACE, never as the warning
+                                            // that tells a user to raise a cap.
+                                            // `false` (every direct caller): this
+                                            // run is the last the module receives.
+                                            bool laterStageResumes = false);
 
 } // namespace dss::opt

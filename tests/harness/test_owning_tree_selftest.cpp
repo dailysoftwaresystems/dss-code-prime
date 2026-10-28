@@ -4,8 +4,8 @@
 // "which DSS tree does this program belong to", of asking git about a tree without the caller's git
 // environment, and of "what does a walk of the tree leave out" — what git ignores there, read from the
 // tree's own `.gitignore` (`TreeIgnores`), the one answer every program that walks a tree from its root
-// asks — and of what a path a command line names for writing may be (`written_path`: never one that
-// begins with `-`). Run with `--self-test` it proves each answer, and that its root arms can fail, and
+// asks — and of what kind of value a command line names (a path never begins with `-`, nor a text
+// unless it is declared to). Run with `--self-test` it proves each answer, and that its root arms can fail, and
 // prints one verdict line per arm.
 //
 // This binary RUNS that self-test — once, by the command line the top-level CMakeLists composed at
@@ -194,6 +194,18 @@ namespace {
       "D4 written_path_arg: argparse refuses a path to write that begins with `-`, in either spelling, and an empty one, by its usage error naming the flag") \
     X(D5WrittenPathArgAPathHoldingADashOrSpellingALeadingOneAsXPassesTheTypeAsGivenTheControl,                         \
       "D5 written_path_arg: a path holding a dash, or spelling a leading one as `./-x`, passes the type as given (the control)") \
+    X(D6ReadPathAPathToReadThatBeginsWithOrIsEmptyIsRefusedNamingTheFlagADashedOneXAndABarePro,                        \
+      "D6 read_path: a path to read that begins with `-` or is empty is refused naming the flag; a dashed one, `./-x` and a bare program name are kept (the control)") \
+    X(D7PathPartAPartThatBeginsWithIsEmptyIsAbsoluteOrOnADriveOrHoldsAComponentIsRefusedNaming,                        \
+      "D7 path_part: a part that begins with `-`, is empty, is absolute or on a drive, or holds a `..` component is refused naming the flag; a name with `:` or `..` inside it, a relative path and `./-x` are kept (the control)") \
+    X(D8ReadPathArgPathPartArgArgparseRefusesAValueThatBeginsWithInEitherSpellingAndAnEmptyOne,                        \
+      "D8 read_path_arg / path_part_arg: argparse refuses a value that begins with `-`, in either spelling, and an empty one, by its usage error naming the flag; a plain name passes (the control)") \
+    X(D9EmptyMeansAbsentAnEmptyValueTheDefaultArgparseRunsTheTypeOverOrOneGivenPassesAsXIsStil,                        \
+      "D9 empty_means_absent: an empty value -- the default argparse runs the type over, or one given -- passes as '', `-x` is still refused, and without it the same empty default is refused (the pair)") \
+    X(D10TextArgATextThatBeginsWithIsRefusedNamingTheFlagInEitherSpellingBeforeTheProgramSOwnC,                        \
+      "D10 text_arg: a text that begins with `-` is refused naming the flag, in either spelling, BEFORE the program's own conversion (`then`) sees it; a word with a dash inside, an empty one and one with a space are kept, and `then` converts what passed (the control)") \
+    X(D11OptionTextArgCommandWordsArgAValueBeginningWithHandedAsASeparateWordIsRefusedByArgpar,                        \
+      "D11 option_text_arg / command_words_arg: a value beginning with `-` handed as a SEPARATE word is refused by argparse itself (`--match -O2`: expected one argument), and the `=` form keeps it as written (`--match=-O2`) -- the one spelling a caller writes on purpose") \
     X(X2TheSandboxFenceRefusesABoxInsideTheTreeAndInsideARepositoryAndAcceptsOneOutsideBothThe,                        \
       "X2 the sandbox fence refuses a box inside the tree and inside a repository, and accepts one outside both (the control)") \
     X(X1TheSelfTestSTempTreesWereRemoved, "X1 the self-test's temp trees were removed")

@@ -1,1 +1,1 @@
-            qualifiers.insert((*it)[1].str());
+            declared.emplace_back((*it)[1].str(), lastComponent((*it)[2].str()));

@@ -1642,22 +1642,29 @@ def _empty_is_none(text):
 
 def build_parser():
     p = _Parser(prog="benchmark_speedtest1.py", add_help=False, allow_abbrev=False)
-    for flag in ("--sqlite-dir", "--dss-src", "--dss", "--out", "--target"):
-        p.add_argument(flag, type=_nonempty(flag))
+    paths = C.owning_tree_module()      # its path types: what each refuses is said there and nowhere else
+    p.add_argument("--sqlite-dir", type=paths.read_path_arg("--sqlite-dir"))
+    p.add_argument("--dss-src", type=paths.read_path_arg("--dss-src"))
+    p.add_argument("--dss", type=paths.read_path_arg("--dss"))
+    p.add_argument("--out", type=paths.written_path_arg("--out"))
+    p.add_argument("--target", type=paths.path_part_arg("--target"))
     # ★ `--plan`, `--cc` and `--testset` are the `benchmark-speedtest1` step's inputs (2026-09-30): a step
     # hands every input over, its default included, so an EMPTY value is the default -- the plan written
-    # here, the pinned reference compiler, speedtest1's own test set.
-    for flag in ("--plan", "--cc", "--testset"):
-        p.add_argument(flag, type=_empty_is_none)
-    p.add_argument("--size", type=_int_at_least(1, "--size"))
-    p.add_argument("--build-repeats", type=_int_at_least(1, "--build-repeats"))
-    p.add_argument("--run-repeats", type=_int_at_least(1, "--run-repeats"))
-    p.add_argument("--jobs-arms", type=_jobs_arms)
-    p.add_argument("--recipe-transform", type=_nonempty("--recipe-transform"))
-    p.add_argument("--stack-reserve", type=_int_at_least(0, "--stack-reserve"))
+    # here, the pinned reference compiler, speedtest1's own test set. `--plan` and `--cc` name a path, so
+    # their type keeps '' as '' (absent) and every reading of them asks whether it is given AND non-empty.
+    p.add_argument("--plan", type=paths.written_path_arg("--plan", empty_means_absent=True))
+    p.add_argument("--cc", type=paths.read_path_arg("--cc", empty_means_absent=True))
+    p.add_argument("--testset", type=paths.text_arg("--testset", then=_empty_is_none))
+    p.add_argument("--size", type=paths.text_arg("--size", then=_int_at_least(1, "--size")))
+    p.add_argument("--build-repeats", type=paths.text_arg("--build-repeats", then=_int_at_least(1, "--build-repeats")))
+    p.add_argument("--run-repeats", type=paths.text_arg("--run-repeats", then=_int_at_least(1, "--run-repeats")))
+    p.add_argument("--jobs-arms", type=paths.text_arg("--jobs-arms", then=_jobs_arms))
+    p.add_argument("--recipe-transform",
+                   type=paths.text_arg("--recipe-transform", then=_nonempty("--recipe-transform")))
+    p.add_argument("--stack-reserve", type=paths.text_arg("--stack-reserve", then=_int_at_least(0, "--stack-reserve")))
     p.add_argument("--derive-only", action="store_true")
     p.add_argument("--path-style", choices=("posix", "windows"))
-    p.add_argument("--step", choices=BENCH_STEPS)
+    p.add_argument("--step", choices=BENCH_STEPS, type=paths.text_arg("--step"))
     p.add_argument("--self-test", "--selftest", dest="self_test", action="store_true")
     p.add_argument("-h", "--help", dest="help", action="store_true")
     return p
@@ -1694,7 +1701,7 @@ def validate_mode(args, host):
         if not args.derive_only:
             raise UsageError("--path-style windows makes this process the DERIVE HALF of a Windows "
                              "measuring host, which never measures: it needs --derive-only")
-        given = [flag for attr, flag in MEASURING_HOST_FLAGS if getattr(args, attr) is not None]
+        given = [flag for attr, flag in MEASURING_HOST_FLAGS if getattr(args, attr) not in (None, "")]
         if given:
             raise UsageError("%s belong%s to the MEASURING host, not to the derive half "
                              "(--path-style windows): the Windows host resolves the compilers and "
@@ -3194,14 +3201,18 @@ def _st_cli(A, fx):
            "win-default": mode([], "windows"),
            "half-no-derive": mode(["--path-style", "windows"], "linux"),
            "half-with-cc": mode(half + ["--cc", "gcc"], "linux"),
+           "half-with-cc-path": mode(half + ["--cc", "/x"], "linux"),
+           "half-empty-cc-plan": mode(half + ["--cc", "", "--plan", ""], "linux"),
            "half-no-target": mode(half[:-2], "linux"),
            "half-ok": mode(half, "linux"),
            "posix-default": mode([], "linux")}
     A.arm("n74 the path style is decided once per host: posix on Windows is refused; the derive half "
-          "needs --derive-only and its three inputs, and refuses the measuring host's flags",
+          "needs --derive-only and its three inputs, and refuses the measuring host's flags given non-empty "
+          "(`--cc gcc`, `--cc /x`) -- an EMPTY one is absent, as a step's default hands it (`--cc ''`, `--plan ''`)",
           lambda: (res["win-posix"].startswith("USAGE") and res["win-default"] == "windows"
                    and "needs --derive-only" in res["half-no-derive"] and "--cc belongs to the MEASURING host"
-                   in res["half-with-cc"] and "needs --target" in res["half-no-target"]
+                   in res["half-with-cc"] and "--cc belongs to the MEASURING host" in res["half-with-cc-path"]
+                   and res["half-empty-cc-plan"] == "windows" and "needs --target" in res["half-no-target"]
                    and res["half-ok"] == "windows" and res["posix-default"] == "posix", res))
     if fx.host == "windows" and fx.wsl_ok:
         def loads():

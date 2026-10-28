@@ -1,1 +1,1 @@
-        if (!entry.is_regular_file()) continue;
+            if (entry.reaches == core::EntryKind::File || entry.kind == core::EntryKind::Link) out.push_back(entry.path);

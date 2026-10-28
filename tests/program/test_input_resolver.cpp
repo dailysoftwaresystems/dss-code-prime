@@ -112,12 +112,12 @@ TEST(InputResolver, RecursiveScanNeverDescendsALinkAndTakesALinkByWhatItReaches)
     writeFile(elsewhere.path() / "beyond.c");
     writeFile(elsewhere.path() / "named.c");
     using dss::test_support::LinkTo;
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(elsewhere.path(), scratch.path() / "linked-dir",
-                                                     LinkTo::Directory));
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", scratch.path() / "via-link.c",
-                                                     LinkTo::File));
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(scratch.path() / "gone.c", scratch.path() / "dangling.c",
-                                                     LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path(), scratch.path() / "linked-dir",
+                                                             LinkTo::Directory));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", scratch.path() / "via-link.c",
+                                                             LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "gone.c", scratch.path() / "dangling.c",
+                                                             LinkTo::File));
 
     std::vector<std::string> exts{".c"};
     std::vector<std::string> out;

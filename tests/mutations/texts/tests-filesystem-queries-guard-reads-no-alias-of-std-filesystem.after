@@ -1,1 +1,1 @@
-            static_cast<void>((*it)[1].str());
+            static_cast<void>(lastComponent((*it)[2].str()));

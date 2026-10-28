@@ -542,9 +542,8 @@ void expectADanglingLinkIsNoHeader(HeaderNameMatching matching, char const* scra
     fs::path const later = scratch.path() / "later";
     fs::create_directories(first);
     writeFile(later / "x.h", "#define FROM_LATER 1\n");
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(first / "no-such.h", first / "x.h",
-                                                     dss::test_support::LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(first / "no-such.h", first / "x.h",
+                                                             dss::test_support::LinkTo::File));
 
     HeaderSearchCache cache;   // one compile's view of the tree
     std::vector<fs::path> const dirs{first, later};

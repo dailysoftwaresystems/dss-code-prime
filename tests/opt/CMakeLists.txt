@@ -24,6 +24,9 @@ dss_add_test(NAME opt/test_licm            SOURCES test_licm.cpp)
 dss_add_test(NAME opt/test_inlining        SOURCES test_inlining.cpp)
 dss_add_test(NAME opt/test_inline_growth_budget
              SOURCES test_inline_growth_budget.cpp)
+# Only the LAST optimization stage a module receives reports a truncated fixpoint, and every production route
+# lowers a module only after its Program stage (the stage topology's seam).
+dss_add_test(NAME opt/test_fixpoint_report_stage SOURCES test_fixpoint_report_stage.cpp)
 dss_add_test(NAME opt/test_compile_options SOURCES test_compile_options.cpp)
 dss_add_test(NAME opt/test_mir_alias       SOURCES test_mir_alias.cpp)
 dss_add_test(NAME opt/test_mir_memory_clobbers SOURCES test_mir_memory_clobbers.cpp)

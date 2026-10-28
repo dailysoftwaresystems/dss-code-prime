@@ -34,9 +34,10 @@
 #
 # ★ THE SELF-TEST (`-DDSS_PYTHON_MODE=selftest`, ctest `build/python_interpreter`). Run with `cmake -P`,
 #   this file configures fixture PROJECTS that include it -- with the build's own generator, in throwaway
-#   directories -- and proves what it chooses: on a clean configure, on a floor no interpreter meets, and,
-#   on a Windows host, on a cache that already names an App Execution Alias (the cache a build configured
-#   before this rule holds) and on an alias named by hand. Each proof is an ARM and prints one verdict line;
+#   directories -- and proves what it chooses: on a clean configure (and that the search there was told to
+#   ask the PATH before the registry and the frameworks), on a floor no interpreter meets, and, on a Windows
+#   host, on a cache that already names an App Execution Alias (the cache a build configured before this rule
+#   holds), on an alias named by hand, and on one named in another case. Each proof is an ARM and prints one verdict line;
 #   the test binary reads each into a case of its own (tests/program/test_python_interpreter.cpp).
 
 # The floor `config` states (tools -> python3 -> minVersion) -> `out_var`; a FATAL_ERROR naming what is
@@ -80,6 +81,41 @@ function(_dss_python_alias_directory out_var)
     set(${out_var} "${_dss_python_dir}" PARENT_SCOPE)
 endfunction()
 
+# Whether `path` names the App Execution Alias directory `aliases` or lies inside it -> `out_var`, compared AS THE
+# OS COMPARES: through the long name of the directory that holds it (`file(REAL_PATH)` asks the OS, which hands
+# back the long name for an 8.3 short one and resolves a link) and, on Windows, without regard to case -- a cache
+# or a PATH entry spelling `WindowsApps` in another case or in its short form names the same directory.
+function(_dss_python_in_aliases aliases path out_var)
+    set(_in FALSE)
+    if(aliases AND NOT "${path}" STREQUAL "")
+        file(TO_CMAKE_PATH "${path}" _p)
+        if(IS_DIRECTORY "${_p}")
+            set(_dir "${_p}")
+            set(_leaf "")
+        else()
+            cmake_path(GET _p PARENT_PATH _dir)
+            cmake_path(GET _p FILENAME _leaf)
+        endif()
+        if(IS_DIRECTORY "${_dir}")
+            file(REAL_PATH "${_dir}" _dir)
+        endif()
+        set(_a "${aliases}")
+        if(IS_DIRECTORY "${_a}")
+            file(REAL_PATH "${_a}" _a)
+        endif()
+        set(_whole "${_dir}")
+        if(NOT _leaf STREQUAL "")
+            set(_whole "${_dir}/${_leaf}")
+        endif()
+        if(CMAKE_HOST_WIN32)
+            string(TOLOWER "${_whole}" _whole)
+            string(TOLOWER "${_a}" _a)
+        endif()
+        cmake_path(IS_PREFIX _a "${_whole}" NORMALIZE _in)
+    endif()
+    set(${out_var} ${_in} PARENT_SCOPE)
+endfunction()
+
 if(DEFINED DSS_PYTHON_MODE)
     # ═══ THE SELF-TEST ═══
     if(NOT DSS_PYTHON_MODE STREQUAL "selftest")
@@ -94,10 +130,10 @@ if(DEFINED DSS_PYTHON_MODE)
     _dss_python_read_floor("${DSS_PYTHON_SOURCE_DIR}/.harness-config/config.json" _dss_py_t_floor)
     file(READ "${DSS_PYTHON_SOURCE_DIR}/.harness-config/config.json" _dss_py_t_config)
     _dss_python_alias_directory(_dss_py_t_aliases)
-    # The ratchet: two arms on every host, two more where App Execution Aliases exist.
-    set(_DSS_PY_SELFTEST_ARMS 2)
+    # The ratchet: three arms on every host, three more where App Execution Aliases exist.
+    set(_DSS_PY_SELFTEST_ARMS 3)
     if(_dss_py_t_aliases)
-        set(_DSS_PY_SELFTEST_ARMS 4)
+        set(_DSS_PY_SELFTEST_ARMS 6)
     endif()
     set(_dss_py_t_ran 0)
     set(_dss_py_t_failed 0)
@@ -125,7 +161,8 @@ if(DEFINED DSS_PYTHON_MODE)
         file(WRITE "${_root}/tree/CMakeLists.txt"
              "cmake_minimum_required(VERSION 4.0)\nproject(pythonfixture NONE)\n"
              "include(\"${_dss_py_t_module}\")\n"
-             "file(WRITE \"\${CMAKE_BINARY_DIR}/chosen.txt\" \"\${Python3_EXECUTABLE}\\n\${Python3_VERSION}\\n\")\n")
+             "file(WRITE \"\${CMAKE_BINARY_DIR}/chosen.txt\" \"\${Python3_EXECUTABLE}\\n\${Python3_VERSION}\\n\")\n"
+             "file(WRITE \"\${CMAKE_BINARY_DIR}/order.txt\" \"\${Python3_FIND_REGISTRY}\\n\${Python3_FIND_FRAMEWORK}\\n\")\n")
         set(_gen -G "${DSS_PYTHON_GENERATOR}")
         if(DSS_PYTHON_MAKE_PROGRAM)
             list(APPEND _gen "-DCMAKE_MAKE_PROGRAM=${DSS_PYTHON_MAKE_PROGRAM}")
@@ -145,11 +182,7 @@ if(DEFINED DSS_PYTHON_MODE)
 
     # Whether `path` lies inside the App Execution Alias directory -> `out_var`.
     function(_dss_py_t_in_aliases path out_var)
-        set(_in FALSE)
-        if(_dss_py_t_aliases AND NOT "${path}" STREQUAL "")
-            file(TO_CMAKE_PATH "${path}" _p)
-            cmake_path(IS_PREFIX _dss_py_t_aliases "${_p}" NORMALIZE _in)
-        endif()
+        _dss_python_in_aliases("${_dss_py_t_aliases}" "${path}" _in)
         set(${out_var} ${_in} PARENT_SCOPE)
     endfunction()
 
@@ -167,6 +200,23 @@ if(DEFINED DSS_PYTHON_MODE)
     endif()
     _dss_py_t_arm("configure: a clean configure chooses an interpreter at or above the floor config.json states"
                   ${_ok} "rc ${_rc}, chose [${_chosen}] under the floor ${_dss_py_t_floor}: ${_o}")
+
+    # (1b) THE LEG'S PATH IS ASKED FIRST: the search is told to ask the Windows registry and the macOS frameworks
+    #      only after the PATH -- FindPython3 asks both FIRST by default, and ✔MEASURED 2026-10-16 a registry entry
+    #      answered ahead of the interpreter the host's PATH names. What the module told the search is read back
+    #      from the clean configure above, on every host (a registry this test may not write is no fixture).
+    set(_order "")
+    if(EXISTS "${DSS_PYTHON_SCRATCH}/clean/build/order.txt")
+        file(READ "${DSS_PYTHON_SCRATCH}/clean/build/order.txt" _order)
+        string(STRIP "${_order}" _order)
+        string(REPLACE "\n" ";" _order "${_order}")
+    endif()
+    set(_ok FALSE)
+    if(_order STREQUAL "LAST;LAST")
+        set(_ok TRUE)
+    endif()
+    _dss_py_t_arm("configure: the search asks the leg's PATH before the Windows registry and the macOS frameworks"
+                  ${_ok} "the clean configure told FindPython3 registry;framework [${_order}], not [LAST;LAST]")
 
     # (2) A floor no interpreter meets is refused at configure, by the floor it names. A Python 3 floor: one of
     #     another major version is refused by FindPython3 for its major alone, without naming the floor
@@ -207,6 +257,17 @@ if(DEFINED DSS_PYTHON_MODE)
         endif()
         _dss_py_t_arm("configure: an interpreter named by hand inside the App Execution Alias directory is refused by name"
                       ${_ok} "rc ${_rc}: ${_o}")
+
+        # (5) The same, spelled in another CASE: the OS compares names without regard to case, so the module does.
+        string(TOUPPER "${_dss_py_t_aliases}" _dss_py_t_upper)
+        _dss_py_t_configure(named-alias-case "${_dss_py_t_config}" _rc _o _chosen
+                            "-DPython3_EXECUTABLE=${_dss_py_t_upper}/python3.exe")
+        set(_ok FALSE)
+        if(NOT _rc EQUAL 0 AND _o MATCHES "Python3_EXECUTABLE names .* an App Execution Alias")
+            set(_ok TRUE)
+        endif()
+        _dss_py_t_arm("configure: an interpreter named inside the App Execution Alias directory in another case is refused by name"
+                      ${_ok} "rc ${_rc}, chose [${_chosen}]: ${_o}")
     endif()
 
     file(REMOVE_RECURSE "${DSS_PYTHON_SCRATCH}")
@@ -239,7 +300,7 @@ if(_dss_python_aliases)
     foreach(_dss_python_var _Python3_EXECUTABLE Python3_EXECUTABLE)
         if(DEFINED ${_dss_python_var} AND NOT "${${_dss_python_var}}" STREQUAL "")
             file(TO_CMAKE_PATH "${${_dss_python_var}}" _dss_python_named)
-            cmake_path(IS_PREFIX _dss_python_aliases "${_dss_python_named}" NORMALIZE _dss_python_in_aliases)
+            _dss_python_in_aliases("${_dss_python_aliases}" "${_dss_python_named}" _dss_python_in_aliases)
             if(_dss_python_in_aliases AND _dss_python_var STREQUAL "_Python3_EXECUTABLE")
                 unset(_Python3_EXECUTABLE CACHE)
             elseif(_dss_python_in_aliases)
@@ -249,15 +310,30 @@ if(_dss_python_aliases)
             endif()
         endif()
     endforeach()
-    list(APPEND CMAKE_IGNORE_PATH "${_dss_python_aliases}")
+    # The search leaves the alias directory out under EVERY spelling the leg's PATH gives it: CMAKE_IGNORE_PATH
+    # compares spellings, and a PATH entry naming the directory in another case or its short form would pass.
+    # (Aliases exist on Windows alone, whose PATH is `;`-separated: a CMake list as it stands.)
+    set(_dss_python_ignored "${_dss_python_aliases}")
+    set(_dss_python_path "$ENV{PATH}")
+    foreach(_dss_python_entry IN LISTS _dss_python_path)
+        if(NOT _dss_python_entry STREQUAL "")
+            _dss_python_in_aliases("${_dss_python_aliases}" "${_dss_python_entry}" _dss_python_in_aliases)
+            if(_dss_python_in_aliases)
+                file(TO_CMAKE_PATH "${_dss_python_entry}" _dss_python_entry)
+                list(APPEND _dss_python_ignored "${_dss_python_entry}")
+            endif()
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _dss_python_ignored)
+    list(APPEND CMAKE_IGNORE_PATH ${_dss_python_ignored})
 endif()
 set(Python3_FIND_REGISTRY LAST)
 set(Python3_FIND_FRAMEWORK LAST)
 find_package(Python3 ${DSS_PYTHON_FLOOR} COMPONENTS Interpreter REQUIRED)
 if(_dss_python_aliases)
-    list(REMOVE_ITEM CMAKE_IGNORE_PATH "${_dss_python_aliases}")
+    list(REMOVE_ITEM CMAKE_IGNORE_PATH ${_dss_python_ignored})
     file(TO_CMAKE_PATH "${Python3_EXECUTABLE}" _dss_python_named)
-    cmake_path(IS_PREFIX _dss_python_aliases "${_dss_python_named}" NORMALIZE _dss_python_in_aliases)
+    _dss_python_in_aliases("${_dss_python_aliases}" "${_dss_python_named}" _dss_python_in_aliases)
     if(_dss_python_in_aliases)
         message(FATAL_ERROR "DssPython: FindPython3 chose ${_dss_python_named}, inside the App Execution Alias "
                             "directory this module left out of its search; no interpreter is used from there")

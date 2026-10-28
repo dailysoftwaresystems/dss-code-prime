@@ -5,10 +5,12 @@
 // never an App Execution Alias (on Windows, `%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe`: a reparse
 // point the process loader resolves and a spawner that asks the file system finds no program at). Run with
 // `-DDSS_PYTHON_MODE=selftest` it configures fixture projects that include it and proves that choice: on a
-// clean configure, on a floor no interpreter meets, and -- on a host that has an alias directory -- on a cache
+// clean configure (and the order it was told to search in: the PATH first), on a floor no interpreter meets, and
+// -- on a host that has an alias directory -- on a cache
 // that ALREADY names an alias (✔MEASURED 2026-10-20: a build configured before the rule held
 // `_Python3_EXECUTABLE` = the alias, and seven self-test entries went red on windows-x86_64-release, each "was
-// not found as an executable") and on an alias named by hand. Each proof is an ARM, and the script prints one
+// not found as an executable"), on an alias named by hand, and on one named in another case. Each proof is an ARM,
+// and the script prints one
 // verdict line per arm.
 //
 // This binary RUNS that self-test -- once, by the command line the top-level CMakeLists composed at configure
@@ -37,6 +39,8 @@ namespace {
 #define DSS_PYTHON_SELFTEST_EVERY_HOST_ARMS(X)                                                              \
     X(ACleanConfigureChoosesAnInterpreterAtOrAboveTheFloor,                                                 \
       "configure: a clean configure chooses an interpreter at or above the floor config.json states")      \
+    X(TheSearchAsksThePathBeforeTheRegistryAndTheFrameworks,                                                \
+      "configure: the search asks the leg's PATH before the Windows registry and the macOS frameworks")    \
     X(AFloorNoInterpreterMeetsIsRefusedByTheFloorItNames,                                                   \
       "configure: a floor no interpreter meets is refused at configure, by the floor it names")
 #ifdef _WIN32
@@ -45,7 +49,10 @@ namespace {
       "configure: a cache naming an App Execution Alias is searched again, and the interpreter chosen lies " \
       "outside the alias directory")                                                                        \
     X(AnInterpreterNamedByHandInsideTheAliasDirectoryIsRefusedByName,                                       \
-      "configure: an interpreter named by hand inside the App Execution Alias directory is refused by name")
+      "configure: an interpreter named by hand inside the App Execution Alias directory is refused by name") \
+    X(AnInterpreterNamedInsideTheAliasDirectoryInAnotherCaseIsRefusedByName,                                \
+      "configure: an interpreter named inside the App Execution Alias directory in another case is refused " \
+      "by name")
 #else
 #define DSS_PYTHON_SELFTEST_ALIAS_ARMS(X)
 #endif

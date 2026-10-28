@@ -1,1 +1,1 @@
-            if (entry.kind == EntryKind::Directory) {
+        int const opened = ::openat(top.dir.get(), name.c_str(), kOpenDirectoryOnly);

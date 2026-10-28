@@ -921,15 +921,17 @@ bool writeImage(LinkedImage const&             image,
     // WARNING (the artifact is valid — it just needs a manual chmod), NOT a
     // write failure. `executable` is the CALLER's config-driven decision
     // (`ObjectFormatSchema::isImageFlavor()`); this code never inspects the
-    // format itself, staying format-blind.
+    // format itself, staying format-blind. Asked of the substrate
+    // (`core::addReachedPermissions`): the bits go to the file the path
+    // reaches on every build, never to a link's own attribute.
     if (executable) {
         std::error_code ec;
-        std::filesystem::permissions(
+        core::addReachedPermissions(
             path,
             std::filesystem::perms::owner_exec
                 | std::filesystem::perms::group_exec
                 | std::filesystem::perms::others_exec,
-            std::filesystem::perm_options::add, ec);
+            ec);
         if (ec) {
             dss::report(reporter, DiagnosticCode::K_ImageExecBitFailed,
                         DiagnosticSeverity::Warning,

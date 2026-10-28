@@ -145,7 +145,7 @@ STEER_DECOY = "zz-owning-tree-steer-decoy.txt"
 STEER_PLANS_DECOY = ".plans/zz-owning-tree-steer-decoy.md"
 
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 91
+EXPECTED_ARMS = 97
 
 # A `gitdir:` value that is a Windows drive path (`C:/...` or `C:\...`).
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -158,7 +158,8 @@ class Refusal(Exception):
 class UsageRefusal(Refusal):
     """A call that names NOTHING -- an empty path, an empty argv, no identity -- refused
     before it can answer for whatever the caller happens to stand in; and a command line
-    that names an OPTION where a path to write belongs (`written_path`)."""
+    that names an OPTION where a path or a text belongs (`read_path`, `written_path`,
+    `path_part`, `text`)."""
 
 
 def _require_path(path, what):
@@ -170,41 +171,155 @@ def _require_path(path, what):
     return os.fspath(path)
 
 
-# ── A PATH A COMMAND LINE NAMES FOR A PROGRAM TO WRITE ──────────────────────────────────────────────
+# ── A PATH A COMMAND LINE NAMES ─────────────────────────────────────────────────────────────────────
 # ★ NEVER ONE THAT BEGINS WITH `-`. A value flag reads the word after it as its value, so `--out --help`
 # hands a program `--help` as the place to write -- a request for help become a file or a directory in
 # the caller's working directory, or in the tree a program resolves its paths from. (2026-10-15: a file
-# named `--help` appeared at the root of a checkout that way.) No path a program is asked to write
-# begins with `-`: one that does is an option taken for a value, and it is refused naming the flag, in
-# either spelling (`--out x`, `--out=x`). A file truly so named is still reachable as `./-x`. An empty
-# value names no place and is refused too.
-# ★ WHO ASKS: a program that reads its command line BY HAND asks `written_path` for each such value; one
-# that reads it with argparse gives every path-to-write argument `type=written_path_arg(<its flag>)`, and
-# `check-scripts-index` refuses a path-to-write argument without it. ARGPARSE ALONE IS NO GUARD: it refuses
-# `--out --help` (a value it reads as an option) and takes `--out=--help` and `--out -` verbatim.
-def written_path(value, flag):
-    """`value` as the path `flag` names for writing, or `UsageRefusal` when it is empty or begins with `-`."""
+# named `--help` appeared at the root of a checkout that way.) No path a command line names begins with
+# `-`: one that does is an option taken for a value, and it is refused naming the flag, in either
+# spelling (`--out x`, `--out=x`). A file truly so named is still reachable as `./-x`. An empty value
+# names no place and is refused too.
+# ★ THREE KINDS, ONE RULE: a path a program WRITES (`written_path`); a path it READS -- a file, a
+# directory, the program a child starts (`read_path`); and a PART of one -- a name or a relative path it
+# joins under a place it names itself (`path_part`), refused as well when it would name ANOTHER place:
+# absolute, on a drive (`C:x`, on every host), or holding a `..` component.
+# ★ WHO ASKS: a program that reads its command line BY HAND asks the kind's function for each such value;
+# one that reads it with argparse gives EVERY argument that takes a value its kind -- one of these three,
+# or one of the three below (A VALUE A COMMAND LINE NAMES THAT IS NO PATH) -- as `type=<kind>_arg(<its
+# flag>)`, and `check-scripts-index` (its clause 14) refuses an argument without one. ARGPARSE ALONE IS NO
+# GUARD: it refuses `--out --help` (a value it reads as an option) and takes `--out=--help` and `--out -`
+# verbatim.
+# ★ AN EMPTY VALUE THAT MEANS "NOT GIVEN" IS SAID SO: `empty_means_absent=True` keeps '' as '' and still
+# refuses `-x`. argparse runs `type=` over a string DEFAULT too, and a step hands an empty input on as
+# `--flag ''`: an argument whose '' means absent would otherwise be refused on every run that omits it.
+def _named_path(value, flag, what):
+    """`value` as `what` (a phrase: "the path to write") `flag` names, or `UsageRefusal` when it is empty or
+    begins with `-`."""
     if value is None or not str(value).strip():
-        raise UsageRefusal("%s names no path to write" % flag)
+        raise UsageRefusal("%s names no %s" % (flag, what.split(" ", 1)[1]))
     value = str(value)
     if value.startswith("-"):
-        raise UsageRefusal("%s takes '%s' as the path to write, and it begins with `-`: an option taken for a "
-                           "value. Name the path (`./%s` if that is truly its name)" % (flag, value, value))
+        raise UsageRefusal("%s takes '%s' as %s, and it begins with `-`: an option taken for a value. Name it "
+                           "(`./%s` if that is truly its name)" % (flag, value, what, value))
     return value
 
 
-def written_path_arg(flag):
-    """argparse's `type=` for a path a program writes: `written_path(value, flag)`, its refusal raised as
-    `argparse.ArgumentTypeError`, which argparse prints as its usage error, naming the option, and exits 2."""
+def written_path(value, flag):
+    """`value` as the path `flag` names for writing, or `UsageRefusal` when it is empty or begins with `-`."""
+    return _named_path(value, flag, "the path to write")
+
+
+def read_path(value, flag):
+    """`value` as the path `flag` names for reading -- a file, a directory, a program to start -- or
+    `UsageRefusal` when it is empty or begins with `-`."""
+    return _named_path(value, flag, "the path to read")
+
+
+_DRIVE_SPELLING = re.compile(r"^[A-Za-z]:")
+
+
+def path_part(value, flag):
+    """`value` as a part of a path -- a name, or a relative path, the program joins under a place it names --
+    or `UsageRefusal` when it is empty, begins with `-`, or names another place: absolute, on a drive (on every
+    host: a part is joined the same way wherever it runs), or holding a `..` component."""
+    value = _named_path(value, flag, "a part of a path")
+    if value[0] in "/\\" or _DRIVE_SPELLING.match(value) or os.path.isabs(value):
+        raise UsageRefusal("%s takes '%s' as a part of a path, and it is absolute: a part is joined under the "
+                           "place the program names, and this one would replace it" % (flag, value))
+    if ".." in re.split(r"[\\/]", value):
+        raise UsageRefusal("%s takes '%s' as a part of a path, and it holds `..`: it would leave the place it "
+                           "is joined under" % (flag, value))
+    return value
+
+
+def _path_arg(kind, flag, name, empty_means_absent):
+    """argparse's `type=` asking `kind(value, flag)`, its refusal raised as `argparse.ArgumentTypeError`, which
+    argparse prints as its usage error, naming the option, and exits 2."""
     import argparse
 
-    def path_to_write(value):
+    def path_type(value):
+        if empty_means_absent and value == "":
+            return value
         try:
-            return written_path(value, flag)
+            return kind(value, flag)
         except UsageRefusal as exc:
             raise argparse.ArgumentTypeError(str(exc))
-    path_to_write.__name__ = "path to write"   # argparse names a type by it in an error it makes itself
-    return path_to_write
+    path_type.__name__ = name   # argparse names a type by it in an error it makes itself
+    return path_type
+
+
+def written_path_arg(flag, empty_means_absent=False):
+    """argparse's `type=` for a path a program writes (`written_path`)."""
+    return _path_arg(written_path, flag, "path to write", empty_means_absent)
+
+
+def read_path_arg(flag, empty_means_absent=False):
+    """argparse's `type=` for a path a program reads (`read_path`)."""
+    return _path_arg(read_path, flag, "path to read", empty_means_absent)
+
+
+def path_part_arg(flag, empty_means_absent=False):
+    """argparse's `type=` for a part of a path a program joins under a place it names (`path_part`)."""
+    return _path_arg(path_part, flag, "part of a path", empty_means_absent)
+
+
+# ── A VALUE A COMMAND LINE NAMES THAT IS NO PATH ────────────────────────────────────────────────────
+# ★ EVERY VALUE HAS A KIND. An argument that takes a value names a path (the three kinds above), a number
+# (`type=int` / `float`) or one word of a closed `choices` set -- both of which argparse already holds to
+# values no option can be -- or one of these three, and it SAYS which (clause 14 of check-scripts-index
+# refuses one that says none, and cross-checks what it says against where the value goes).
+# ★ TEXT (`text`): a value that names no path -- a label, a leg, a key, a hash, a list of names. It never
+# begins with `-` either: `--label=--help` is the same option taken for a value. An EMPTY one passes -- it
+# is no option, and argparse runs `type=` over a string default. A program's own conversion (a number at
+# least 1, a list of bands) is handed as `then`, and asked only AFTER the refusal.
+# ★ OPTION TEXT (`option_text`): a text value that may BEGIN with `-` by its nature -- a pattern looked for in a
+# log (`--match=-O2`), URL-safe base64 (its alphabet holds `-`). And COMMAND WORDS (`command_words`): a word
+# of a CHILD'S command line or of its options (`--launcher=qemu-s390x`, `--flags=-std=c2x`), which the child
+# judges.
+# Both take a leading `-` on purpose, and both are safe for one reason: a value beginning with `-` handed
+# as a SEPARATE word is refused LOUD by argparse (`--match -O2`: "expected one argument"), so it reaches
+# the program only in the `--flag=value` form, which a caller writes on purpose. They are escapes from the
+# refusal all the same, so clause 14 pins how many arguments take each.
+def text(value, flag):
+    """`value` as the text `flag` names, or `UsageRefusal` when it begins with `-`. An empty value passes."""
+    value = "" if value is None else str(value)
+    if value.startswith("-"):
+        raise UsageRefusal("%s takes '%s', and it begins with `-`: an option taken for a value -- a value that "
+                           "may truly begin with one is declared so (`option_text_arg`, `command_words_arg`)"
+                           % (flag, value))
+    return value
+
+
+def _value_arg(kind, flag, name, then):
+    """argparse's `type=` asking `kind(value, flag)` -- its refusal raised as `argparse.ArgumentTypeError` --
+    then handing what it kept to `then`, the program's own conversion, when there is one."""
+    import argparse
+
+    def value_type(value):
+        try:
+            value = kind(value, flag)
+        except UsageRefusal as exc:
+            raise argparse.ArgumentTypeError(str(exc))
+        return value if then is None else then(value)
+    value_type.__name__ = name   # argparse names a type by it in an error it makes itself
+    return value_type
+
+
+def text_arg(flag, then=None):
+    """argparse's `type=` for a value that names no path (`text`), converted by `then` when one is given."""
+    return _value_arg(text, flag, "text", then)
+
+
+def option_text_arg(flag):
+    """argparse's `type=` for a text value that may begin with `-` by its nature (`--match=-O2`, URL-safe
+    base64): kept as given."""
+    return _value_arg(lambda value, _flag: str(value), flag, "option text", None)
+
+
+def command_words_arg(flag):
+    """argparse's `type=` for a word of a child's command line or options (`--launcher=qemu-s390x`): kept as
+    given -- the child judges it."""
+    return _value_arg(lambda value, _flag: str(value), flag, "command word", None)
 
 
 def same_path(a, b):
@@ -2535,6 +2650,129 @@ def self_test():
             return got == ["build/x-y", "./-x"], "got %s" % ", ".join(got)
         pin("D5 written_path_arg: a path holding a dash, or spelling a leading one as `./-x`, passes the type as given "
             "(the control)", p5)
+
+        def p6():
+            asked = (("--help", "--tree"), ("-", "--manifest"), ("", "--dss"), (None, "--kit"))
+            said = [(lambda v=v, f=f: _raises(lambda: read_path(v, f), UsageRefusal))() for v, f in asked]
+            wrong = ["%r (%s)" % (v, m[:60]) for (v, f), (ok, m) in zip(asked, said) if not ok or f not in m]
+            kept = [read_path(v, "--tree") for v in ("build/x-y", "./-x", "cc")]
+            return not wrong and kept == ["build/x-y", "./-x", "cc"], "not refused naming the flag: %s; kept %r" % (
+                "; ".join(wrong), kept)
+        pin("D6 read_path: a path to read that begins with `-` or is empty is refused naming the flag; a dashed one, "
+            "`./-x` and a bare program name are kept (the control)", p6)
+
+        def p7():
+            refused = ("-x", "", "/abs", "\\x", "C:\\x", "c:rel", "a/../b", "..", "a\\..\\b")
+            said = [(v, _raises(lambda v=v: path_part(v, "--part"), UsageRefusal)) for v in refused]
+            wrong = ["%r (%s)" % (v, m[:60]) for v, (ok, m) in said if not ok or "--part" not in m]
+            kept_in = ("x86_64:pe64-x86_64-windows-exec", "a/b.c", "./-x", "8.6", "a..b")
+            kept = [path_part(v, "--part") for v in kept_in]
+            return not wrong and kept == list(kept_in), "not refused naming the flag: %s; kept %r" % (
+                "; ".join(wrong), kept)
+        pin("D7 path_part: a part that begins with `-`, is empty, is absolute or on a drive, or holds a `..` component "
+            "is refused naming the flag; a name with `:` or `..` inside it, a relative path and `./-x` are kept (the "
+            "control)", p7)
+
+        def parsed_with(kind, argv, **options):
+            import argparse
+            import contextlib
+            import io
+            parser = argparse.ArgumentParser(prog="d8")
+            parser.add_argument(fixture_flag, type=kind(fixture_flag, **options))
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    return parser.parse_args(argv).out, 0, ""
+            except SystemExit as exc:
+                return None, exc.code, err.getvalue()
+
+        def p8():
+            wrong = []
+            for kind, phrase in ((read_path_arg, "path to read"), (path_part_arg, "part of a path")):
+                for argv in (["--out=--help"], ["--out", "-"], ["--out="]):
+                    got = parsed_with(kind, argv)
+                    if got[1] != 2 or "--out" not in got[2] or phrase not in got[2]:
+                        wrong.append("%s %s exit %s" % (kind.__name__, " ".join(argv), got[1]))
+                got = parsed_with(kind, ["--out", "name-x"])
+                if got[0] != "name-x":
+                    wrong.append("%s refused the control: %r" % (kind.__name__, got))
+            return not wrong, "; ".join(wrong)
+        pin("D8 read_path_arg / path_part_arg: argparse refuses a value that begins with `-`, in either spelling, "
+            "and an empty one, by its usage error naming the flag; a plain name passes (the control)", p8)
+
+        def p9():
+            import argparse
+            import contextlib
+            import io
+            wrong = []
+            for kind in (read_path_arg, written_path_arg, path_part_arg):
+                parser = argparse.ArgumentParser(prog="d9")
+                parser.add_argument(fixture_flag, type=kind(fixture_flag, empty_means_absent=True), default="")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        omitted, given = parser.parse_args([]).out, parser.parse_args(["--out", ""]).out
+                    except SystemExit as exc:
+                        omitted = given = "refused, exit %s" % exc.code
+                    try:
+                        parser.parse_args(["--out=-x"])
+                        dashed = "kept"
+                    except SystemExit:
+                        dashed = "refused"
+                if (omitted, given, dashed) != ("", "", "refused"):
+                    wrong.append("%s: omitted %r, given '' %r, `-x` %s" % (kind.__name__, omitted, given, dashed))
+                strict = argparse.ArgumentParser(prog="d9")
+                strict.add_argument(fixture_flag, type=kind(fixture_flag), default="")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        strict.parse_args([])
+                        wrong.append("%s without empty_means_absent kept an empty default" % kind.__name__)
+                    except SystemExit:
+                        pass
+            return not wrong, "; ".join(wrong)
+        pin("D9 empty_means_absent: an empty value -- the default argparse runs the type over, or one given -- passes "
+            "as '', `-x` is still refused, and without it the same empty default is refused (the pair)", p9)
+
+        def p10():
+            wrong = []
+            for argv in (["--out=--help"], ["--out", "-"], ["--out=-1"]):
+                got = parsed_with(text_arg, argv)
+                if got[1] != 2 or "--out" not in got[2] or "begins with `-`" not in got[2]:
+                    wrong.append("%s exit %s" % (" ".join(argv), got[1]))
+            kept = [parsed_with(text_arg, argv)[0] for argv in (["--out", "leg-x"], ["--out="], ["--out", "a b"])]
+            if kept != ["leg-x", "", "a b"]:
+                wrong.append("kept %r" % (kept,))
+            converted = parsed_with(text_arg, ["--out=7"], then=int)
+            refused_first = parsed_with(text_arg, ["--out=-7"], then=int)
+            if converted[0] != 7 or refused_first[1] != 2 or "begins with `-`" not in refused_first[2]:
+                wrong.append("then: %r / %r" % (converted, refused_first))
+            return not wrong, "; ".join(wrong)
+        pin("D10 text_arg: a text that begins with `-` is refused naming the flag, in either spelling, BEFORE the "
+            "program's own conversion (`then`) sees it; a word with a dash inside, an empty one and one with a space "
+            "are kept, and `then` converts what passed (the control)", p10)
+
+        def p11():
+            import argparse
+            import contextlib
+            import io
+            wrong = []
+            match_flag = "--" + "match"     # spelled so: clause 14 reads a literal flag as a program's own argument
+            for kind in (option_text_arg, command_words_arg):
+                parser = argparse.ArgumentParser(prog="d11")
+                parser.add_argument(match_flag, type=kind(match_flag))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    try:
+                        parser.parse_args(["--match", "-O2"])
+                        separate = "kept"
+                    except SystemExit as exc:
+                        separate = "exit %s" % exc.code
+                    joined = parser.parse_args(["--match=-O2"]).match
+                if separate != "exit 2" or "expected one argument" not in err.getvalue() or joined != "-O2":
+                    wrong.append("%s: `--match -O2` %s, `--match=-O2` -> %r" % (kind.__name__, separate, joined))
+            return not wrong, "; ".join(wrong)
+        pin("D11 option_text_arg / command_words_arg: a value beginning with `-` handed as a SEPARATE word is refused "
+            "by argparse itself (`--match -O2`: expected one argument), and the `=` form keeps it as written "
+            "(`--match=-O2`) -- the one spelling a caller writes on purpose", p11)
 
         # ── X: the fence and the cleanup ──────────────────────────────────────
         def x2():

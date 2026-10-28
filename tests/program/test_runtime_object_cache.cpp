@@ -1115,9 +1115,8 @@ TEST(RuntimeObjectCacheStore, ADanglingLinkAtTheShippedArtifactIsPassedOver) {
     std::error_code ec;
     fs::create_directories(key->shippedArtifactPath.parent_path(), ec);
     ASSERT_FALSE(ec) << ec.message();
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(key->shippedArtifactPath.parent_path() / "no-such.o",
-                                                     key->shippedArtifactPath, dss::test_support::LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(key->shippedArtifactPath.parent_path() / "no-such.o",
+                                                             key->shippedArtifactPath, dss::test_support::LinkTo::File));
 
     auto const        found = lookupRuntimeObject(*key);
     std::string const answered =
@@ -1144,9 +1143,8 @@ TEST(RuntimeObjectCacheStore, ADanglingLinkAtTheArtifactPathIsNoLandedArtifact) 
     std::error_code ec;
     fs::create_directories(key->userArtifactPath.parent_path(), ec);
     ASSERT_FALSE(ec) << ec.message();
-    ASSERT_FALSE(dss::test_support::makeSymbolicLink(key->userArtifactPath.parent_path() / "no-such.o",
-                                                     key->userArtifactPath, dss::test_support::LinkTo::File))
-        << "the OS made no link here, so this case cannot ask its question";
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(key->userArtifactPath.parent_path() / "no-such.o",
+                                                             key->userArtifactPath, dss::test_support::LinkTo::File));
 
     auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(stored.has_value()) << stored.error();

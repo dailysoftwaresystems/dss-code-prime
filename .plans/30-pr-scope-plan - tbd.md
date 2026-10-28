@@ -11,16 +11,16 @@
 > The decisions in §4 are the orchestrator's, under the operator's order of 2026-09-21 (*"you do everything"*),
 > and each one is veto-able.
 
-## 0. Where we are (MEASURED 2026-10-22, main `b5efdbb3` = checkpoint 32, plus four row closures not yet committed)
+## 0. Where we are (MEASURED 2026-10-28, main `c5be892d` = checkpoint 33, plus fold H4b = checkpoint 34)
 
-**666 open rows.**
+**679 open rows.**
 
 | band | OPEN | DISCLOSED | GATED | total |
 |---|---|---|---|---|
-| P0 | 2 | 19 | — | 21 |
-| P1 | 44 | 38 | 1 | 83 |
-| P2 | 140 | 55 | 22 | 217 |
-| P3 | 221 | 6 | 103 | 330 |
+| P0 | 2 | 22 | — | 24 |
+| P1 | 44 | 48 | 1 | 93 |
+| P2 | 140 | 54 | 22 | 216 |
+| P3 | 221 | 7 | 103 | 331 |
 | P4 | 8 | — | 3 | 11 |
 | P5 | 4 | — | — | 4 |
 
@@ -28,20 +28,20 @@
 
 | PR | rows | what |
 |---|---|---|
-| **PR #59** (current) | 81 | the four lanes' rows, every remaining P0, three rows ruled into fold 3d/3e, two fixed rows awaiting their arms |
+| **PR #59** (current) | 93 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b and H5, two fixed rows awaiting their arms |
 | **the next PR** | 469 | every remaining actionable row, in three rounds; plus full debug information (§3) |
 | **the capability PR** | 21 | plan 28's boot half, plan 09.5's tier skeleton with its C harmlessness proof, plan 16's codesign |
 | **the wasm32 PR** | 1 | plan 18, the first ILP32 target |
 | **the C++ PR** | 2 | the second source language and the second embedding language |
-| **opened by a trigger** | 92 | plan 24 (50), plan 28's driver half (19), plan 09.5's lattices (10) and services (3), plan 17 GPU (9), plan 27's gui profile (1) |
+| **opened by a trigger** | 93 | plan 24 (50), plan 28's driver half (19), plan 09.5's lattices (10) and services (3), plan 17 GPU (10), plan 27's gui profile (1) |
 
 **Throughput, MEASURED:**
-- Rows closed per ISO week, from the done registry's close dates:
+- Rows closed per ISO week, from the done registry's close dates (read 2026-10-22):
   - weeks 33–36: 161, 147, 197, 127;
   - weeks 37–41: 40, 44, 163, 54, 32;
   - week 43 so far: 13.
-- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 74 opened**. The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
-- **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
+- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 87 opened (3 created, 84 disclosed): counted −25, REAL net +59** (2026-10-28, at checkpoint 34's tree). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
+- (read 2026-10-22) **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
 
 ## 1. PR #59 — the exit scope
 
@@ -56,14 +56,14 @@ The merge is the operator's.
 
 ### 1.1 Folds, in order
 
-`L2a → f26b → H4b → H5 → 3d → f26c → L2b → 3e`, then the added work of §1.2 on the lanes that free first.
+`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b → L2a2 → H5 → 3d → f26c → L2b → 3e`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
 
 | lane | rows (§8 A.1) | what it is |
 |---|---|---|
-| `lm` | 21 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement; then the try/except P0 pair and the `#if` truth P0 |
+| `lm` | 34 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement; then the try/except P0 pair and the `#if` truth P0; L2a's new rows, open until main's sweep of their arms (L2a2), and arithmetic on a pointer to a VLA (L2b) |
 | `cs` | 24 | attributes, weak/select-any, declarations and type rules, visibility |
-| `xa` | 21 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS |
-| `hm` | 11 | DssHarness migration, filesystem substrate, the PE platform runtime |
+| `xa` | 25 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; the all-object link's order and its client object's imports (3d), a library datum, data symbols and a shared library's initializers (3e) |
+| `hm` | 6 | the PE platform runtime (H5: the stack probe and the /GS family), the census row it opened, P68's two audit rows; the filesystem substrate's row until main's sweep of its arms (H4b folded) |
 | first lane to free | 2 | the shipped-constants P0, and the SysV memory-class ABI P0 |
 | round-close sweep | 2 | fixed rows whose arms have not been read |
 
@@ -210,7 +210,7 @@ Each fold is a pushed checkpoint. Each round ends with the 8-run gate, the arm s
 
 ## 8. Every open row, placed
 
-Generated from the production registry at plan 30's measurement: 666 rows, each placed once.
+Generated from the production registry at plan 30's measurement: 679 rows, each placed once.
 A row closed since then still resolves (the done registry), and the next refresh drops it.
 
 ### A.1 PR #59 (current)
@@ -246,24 +246,21 @@ A row closed since then still resolves (the done registry), and the next refresh
 
 - [[D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET]] (P0)
 
-#### hm (H4b, H5) — 11
+#### hm (H5) — 6
 
 - [[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]] (P1)
-- [[D-CSUBSET-EXTERN-LIBRARY-SYNTAX-IS-NOT-VALID-C]] (P1)
-- [[D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN]] (P2)
+- [[D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED]] (P1)
+- [[D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED]] (P1)
 - [[D-HARNESS-PROTOTYPE-CENSUS-DEFAULT-REFERENCE-IS-ABSENT-ON-ITS-WINDOWS-LEGS]] (P2)
 - [[D-AUDIT-P68-ROUND-12-MINOR-FINDINGS]] (P3)
 - [[D-AUDIT-P68-ROUND-13-MINOR-FINDINGS]] (P3)
-- [[D-GPU-MIR-SIDECAR-SIDETABLE-ROUNDTRIP]] (P3)
-- [[D-LIR-ALLOCA-LOWERING-EXTRACTION]] (P3)
-- [[D-PLAN12-MIRSHADERATTRIBUTE-SIDE-TABLE-FOR-SPIR-DECORATIONS-SHADER-DECORATIONS]] (P3)
-- [[D-PLAN12-SUB-INTERVAL-LIRLIVERANGE-LIST-DEFERRED-FROM-ML6-CYCLE]] (P3)
-- [[D-PLAN12-TARGETOPCODEINFO-PAYLOADKIND-DISCRIMINATOR-PAYLOAD-FIELD-CARRIES-SPILL-SLOT]] (P3)
 
-#### lm (L2a, L2b) — 21
+#### lm (L2a2, L2b) — 34
 
 - [[D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT]] (P0)
+- [[D-C-A-DECLARATORS-NAME-IS-BOUND-AT-THE-END-OF-ITS-DECLARATION]] (P0)
 - [[D-C-AN-EXPRESSIONS-VALUE-KEEPS-THE-TYPE-OF-THE-OBJECT-IT-WAS-READ-FROM]] (P0)
+- [[D-C-AN-ORDINARY-IDENTIFIER-DOES-NOT-HIDE-A-TYPEDEF-IN-A-TYPE-NAME]] (P0)
 - [[D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR]] (P0)
 - [[D-C-CONSTANT-BIT-FIELD-MEMBER-IS-READ-AT-ITS-DECLARED-TYPE-NOT-ITS-WIDTH]] (P0)
 - [[D-C-GENERIC-SELECTION-BEFORE-THE-EXPRESSION-PASS-SELECTS-DEFAULT]] (P0)
@@ -273,16 +270,27 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER]] (P0)
 - [[D-MIR-TRY-HANDLER-SHARED-FILTER-VALUE-ABORTS-IN-RELEASE]] (P0)
 - [[D-PP-IF-TRUTH-RESULT-IS-AN-INT-NOT-INTMAX]] (P0)
+- [[D-C-A-CONSTANT-EXPRESSION-POSITION-ACCEPTS-A-BARE-COMMA-AND-REFUSES-A-PARENTHESISED-ONE]] (P1)
+- [[D-C-A-DUPLICATE-CASE-VALUE-IS-ACCEPTED]] (P1)
+- [[D-C-A-PARAMETERS-ARRAY-SIZE-EXPRESSION-IS-NOT-EVALUATED-ON-ENTRY]] (P1)
+- [[D-C-A-SWITCH-BODY-THAT-IS-NOT-A-COMPOUND-STATEMENT-IS-REFUSED]] (P1)
+- [[D-C-A-TAG-OR-A-MEMBER-ANSWERS-THE-TYPE-NAME-TRIAGE-AS-AN-ORDINARY-NAME]] (P1)
+- [[D-C-A-TYPEOF-OF-A-VARIABLE-LENGTH-ARRAY-TYPE-IS-NOT-LOWERED]] (P1)
 - [[D-C-FLOAT-H-AND-FLOAT-PREDEFINES-MISSING]] (P1)
+- [[D-C-GNU-CASE-RANGES-AND-RANGE-DESIGNATORS-ARE-NOT-PARSED]] (P1)
 - [[D-C-GNU-STATEMENT-EXPRESSION]] (P1)
 - [[D-C-NEITHER-CONSTANT-EVALUATOR-HOLDS-A-COMPLEX-VALUE]] (P1)
+- [[D-C-SIZEOF-OF-A-VLA-TYPED-OPERAND-SKIPS-THE-OPERANDS-SIDE-EFFECTS]] (P1)
 - [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]] (P1)
+- [[D-CORE-A-LEFT-RECURSIVE-SHAPE-LOADS-THOUGH-THE-SPEC-DOCUMENTS-ITS-REFUSAL]] (P1)
 - [[D-HIR-BRACE-PEEL-TAKES-AN-OPERATORS-OPERAND-FOR-THE-ELEMENT]] (P1)
 - [[D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL]] (P1)
 - [[D-HIR-WHOLE-STRUCTURE-BRACE-ELEMENT-IS-PLACED-BY-TYPE-STAMPS]] (P1)
 - [[D-MIR-TRY-FILTER-WITH-A-BRANCH-REFUSED]] (P1)
 - [[D-MIR-VERIFIER-PASSES-A-PHI-MISSING-A-PREDECESSORS-INPUT]] (P1)
+- [[D-PARSE-A-PARENTHESISED-CHAIN-COSTS-PARSE-WORK-EXPONENTIAL-IN-ITS-DEPTH]] (P1)
 - [[D-C-A-SCALAR-INITIALIZER-IN-MORE-BRACES-OR-WITH-MORE-ELEMENTS-IS-REFUSED]] (P2)
+- [[D-C-ARITHMETIC-ON-A-POINTER-TO-A-VLA-IS-REFUSED]] (P2)
 
 #### the dss-config holder — 1
 
@@ -293,10 +301,11 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY]] (P2)
 - [[D-PLAN00-D14-FC4-DECLARATOR-SUBSTRATE-SCOPE-DESIGN-CHOSEN]] (P3)
 
-#### xa (3d, 3e) — 21
+#### xa (3d, 3e) — 25
 
 - [[D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE]] (P0)
 - [[D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN]] (P0)
+- [[D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT]] (P0)
 - [[D-LK-OBJECT-READERS-GAVE-RECORD-ZERO-THE-INVALID-SYMBOL-ID]] (P0)
 - [[D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM]] (P1)
 - [[D-LK-COFF-READER-REFUSES-A-CUSTOM-NAMED-SECTION]] (P1)
@@ -304,22 +313,25 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LK-FOREIGN-OBJECT-THREAD-LOCAL-RELOCATIONS-REFUSED-AT-READ]] (P1)
 - [[D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ]] (P1)
 - [[D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ]] (P1)
+- [[D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT]] (P1)
 - [[D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE]] (P1)
-- [[D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED]] (P1)
-- [[D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED]] (P1)
 - [[D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER]] (P1)
 - [[D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS]] (P1)
 - [[D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED]] (P2)
+- [[D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] (P2)
+- [[D-LINK-MACHO-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] (P2)
 - [[D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION]] (P2)
 - [[D-LK-PE-DLL-EXPORTS-AN-OVERRIDABLE-WEAK-NAME]] (P2)
 - [[D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE]] (P2)
+- [[D-LK-SHARED-LIBRARY-RUNS-NO-STATIC-INITIALIZERS]] (P2)
 - [[D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED]] (P2)
 - [[D-PROGRAM-MERGED-ROUTE-DROPS-THE-ASSEMBLY-FORMAT-KIND]] (P2)
+- [[D-WIN64-HUGE-FRAME-ALLOC]] (P2)
 - [[D-LK11-FORMAT-WEAK-SEMANTICS]] (P3)
 
 ### A.2 The next PR
 
-#### R1, lane A — 30
+#### R1, lane A — 31
 
 - [[D-C-FENV-ACCESS-PRAGMA-NOT-HONOURED]] (P1)
 - [[D-C-FENV-H-NOT-SHIPPED]] (P1)
@@ -333,6 +345,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-CSUBSET-CONSTEXPR-EXACT-REPRESENTABILITY]] (P1)
 - [[D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES]] (P1)
 - [[D-CSUBSET-ENUM-UNDERLYING-BASE-DRIFT]] (P1)
+- [[D-CSUBSET-EXTERN-LIBRARY-SYNTAX-IS-NOT-VALID-C]] (P1)
 - [[D-CSUBSET-IMAGINARY-LITERAL-SUFFIX]] (P1)
 - [[D-CSUBSET-INT128-VA-ARG]] (P1)
 - [[D-CSUBSET-LINKAGE-SPECIFIER-VOCABULARY-INCOMPLETE-VS-REAL-HEADERS]] (P1)
@@ -352,7 +365,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-PARSE-INJECTED-BUILTIN-TYPE-NAME-SKETCH-GAP]] (P1)
 - [[D-PP-EMBED-STREAMING]] (P1)
 
-#### R1, lane B — 11
+#### R1, lane B — 10
 
 - [[D-ASM-ARM64-GAS-SURFACE-INCOMPLETE]] (P1)
 - [[D-ASM-ATT-GCC-OUTPUT-SURFACE-REFUSED]] (P1)
@@ -360,13 +373,12 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-ASM-SYSTEM-REGISTER-AS-ENCODED-DATA-UNMODELLED]] (P1)
 - [[D-LK-DLL-TLS-MODEL]] (P1)
 - [[D-LK-DYN-TLS-MODEL]] (P1)
-- [[D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT]] (P1)
 - [[D-LK-RELOCATABLE-TBSS-UNSUPPORTED]] (P1)
 - [[D-LK7-CODESIGN-PAGESIZE-OVERFLOW-HARDENING]] (P1)
 - [[D-WIN64-XMM-UNWIND-RESTORE]] (P1)
 - [[D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN]] (P2)
 
-#### R1, lane C — 9
+#### R1, lane C — 10
 
 - [[D-CONFIG-ASM-TEMPLATE-CAPABILITY-NO-LONGER-OPTIONAL-FOR-A-SHARED-SURFACE-IMPORTER]] (P1)
 - [[D-CONFIG-NON-ALPHABETIC-MODIFIER-LETTER-WOULD-SPLIT-THE-TWO-TIERS]] (P1)
@@ -377,8 +389,9 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FFI-SHIPPED-ROW-KIND-NOT-CROSSCHECKED-AGAINST-DECLARATOR]] (P1)
 - [[D-MIR-SEH-FILTER-CLONER-HAS-NO-INLINE-ASM-ARM]] (P1)
 - [[D-MIR-TRY-FILTER-SHARED-PURE-VALUE-REFUSED-IN-RELEASE]] (P1)
+- [[D-HARNESS-SCRIPTS-INDEX-CENSUS-CANNOT-RESOLVE-A-CALL-IT-HANDS-A-PATH-VALUE]] (P3)
 
-#### R2, lane A — 79
+#### R2, lane A — 78
 
 - [[D-C-A-COMPUTED-GOTO-IN-A-VLA-SCOPE-IS-REFUSED]] (P2)
 - [[D-C-A-CONST-POINTEE-REACHED-THROUGH-A-CALL-RESULT-IS-WRITABLE]] (P2)
@@ -389,7 +402,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-C-A-QUALIFIER-AMONG-THE-TYPE-SPECIFIERS-IS-A-PARSE-ERROR]] (P2)
 - [[D-C-A-REDECLARATION-DIFFERING-ONLY-IN-SIGNEDNESS-IS-REFUSED-WHERE-MSVC-WARNS]] (P2)
 - [[D-C-ADDRESS-OF-AN-RVALUE-REPORTED-AS-AN-UNSUPPORTED-LOWERING]] (P2)
-- [[D-C-ARITHMETIC-ON-A-POINTER-TO-A-VLA-IS-REFUSED]] (P2)
 - [[D-C-C23-TAG-COMPATIBILITY-UNIMPLEMENTED]] (P2)
 - [[D-C-FLOAT128-AND-FLOAT80-TYPES-UNSUPPORTED]] (P2)
 - [[D-C-GLOBAL-REGISTER-VARIABLE-UNSUPPORTED]] (P2)
@@ -460,7 +472,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-SEMANTIC-MAYBE-UNINITIALIZED-WARN]] (P2)
 - [[D-TOKENIZER-FORMFEED-SCHEMA-CURSOR-DESYNC]] (P2)
 
-#### R2, lane B — 57
+#### R2, lane B — 53
 
 - [[D-AS-REWRITE-CALL-HOISTED-ABOVE-ARG-CAPTURE]] (P2)
 - [[D-AS4-ARM64-INDEXED-LEA-SCALE]] (P2)
@@ -489,8 +501,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FF2-UNSUPP-FULL-SWEEP]] (P2)
 - [[D-FF5-EXTERNDECLREF-VALIDATE]] (P2)
 - [[D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE]] (P2)
-- [[D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] (P2)
-- [[D-LINK-MACHO-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] (P2)
 - [[D-LINK-MACHO-STATIC-EXEC-SYMTAB-UNALIGNED]] (P2)
 - [[D-LK-ARM64-DEFINED-GLOBAL-ADDR-PIE-GOT]] (P2)
 - [[D-LK-DEDUP-INTERNAL-BREACH-MISFILED-AS-SYMBOL-UNDEFINED]] (P2)
@@ -501,7 +511,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LK-MACHO-MULTI-ITEM-SECTION-PADDING]] (P2)
 - [[D-LK-MACHO-STACK-RESERVE-LC-MAIN]] (P2)
 - [[D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC]] (P2)
-- [[D-LK-SHARED-LIBRARY-RUNS-NO-STATIC-INITIALIZERS]] (P2)
 - [[D-LK-STATIC-LINK-PCREL-MULTIATOM-DATA]] (P2)
 - [[D-LK1-MACHO-RODATA-DATAITEM-RELOC]] (P2)
 - [[D-LK2-DLL-DLLMAIN-ENTRY]] (P2)
@@ -517,7 +526,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-MERGE-UNREACHABLE-BLOCK]] (P2)
 - [[D-UNWIND-STATIC-ET-EXEC-NO-EH-FRAME]] (P2)
 - [[D-WIN64-CHKSTK-LARGE-PROLOGUE]] (P2)
-- [[D-WIN64-HUGE-FRAME-ALLOC]] (P2)
 - [[D-WIN64-SEH-SCOPE]] (P2)
 
 #### R2, lane C — 59
@@ -544,6 +552,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-DIAG-SURFACE-CLAIM-MASKS-THE-DESCRIPTOR-ROOT-CAUSE]] (P2)
 - [[D-DRIVER-MIXED-LANGUAGE-CU-UNREACHABLE]] (P2)
 - [[D-FFI-ANGLE-INCLUDE-LINE-SCOPED-HEADER]] (P2)
+- [[D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN]] (P2)
 - [[D-FFI-DARWIN-FLOCK-PROVENANCE]] (P2)
 - [[D-FFI-DARWIN-LOCK-CONSTANT-PROVENANCE]] (P2)
 - [[D-FFI-DARWIN-MALLOC-ZONE-FN-PROVENANCE]] (P2)
@@ -572,7 +581,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-MIR-SYNTH-THREADS-SHIM-VOID-PTR-SIGNATURE-LOSES-CHECKABILITY]] (P2)
 - [[D-OPT-CONSTANT-FOLD-SKIPS-FLOAT-CONVERSIONS]] (P2)
 - [[D-OPT-RELEASE-PIPELINE-GAPS-SURFACED-BY-BYTE-IDENTITY-TRIAGE]] (P2)
-- [[D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES]] (P2)
 - [[D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES]] (P2)
 - [[D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28]] (P2)
 - [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]] (P2)
@@ -682,7 +690,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-MERGE-CONTEXT-PREFIX-SIDE-TABLE]] (P4)
 - [[D-MERGE-SCRATCH-FRESH]] (P4)
 
-#### R3, lane C — 130
+#### R3, lane C — 134
 
 - [[D-BUILD-AR-READER-FREE-NONHEAP-WARNING-ON-AARCH64-GCC13]] (P3)
 - [[D-COMPILE-ONE-TARGET-NO-LEAK]] (P3)
@@ -696,6 +704,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-GATE-CONFIG-PATH-CWD-RELATIVE]] (P3)
 - [[D-GATE-MACOS-DEBUG-LEG-COSTS-SEVEN-TIMES-ITS-OWN-BASELINE]] (P3)
 - [[D-GLOB-BASE-DIR-HOST-CASE-SENSITIVITY]] (P3)
+- [[D-LIR-ALLOCA-LOWERING-EXTRACTION]] (P3)
 - [[D-LIR-CALL-EXTERN-VARIANT-UNIFY]] (P3)
 - [[D-LSP-UNLISTED-HEADER-CHECKED-UNDER-EVERY-MANIFEST-NOT-ITS-INCLUDERS]] (P3)
 - [[D-OPT-CARVE-OUT-COUNT-REPORTING]] (P3)
@@ -778,6 +787,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-PLAN12-LIRVERIFIER-PRE-EMIT-INVOCATION-POLICY]] (P3)
 - [[D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT]] (P3)
 - [[D-PLAN12-MIR-DIRECTCALLSYMBOL-MIRINSTID-CALL-STD-OPTIONAL-SYMBOLID-SUBSTRATE]] (P3)
+- [[D-PLAN12-MIRSHADERATTRIBUTE-SIDE-TABLE-FOR-SPIR-DECORATIONS-SHADER-DECORATIONS]] (P3)
 - [[D-PLAN12-MIRSOURCEMAP-INJECTION-SLOT-MIRVERIFIER-CYCLE-STASHES-NODE-ACTUAL]] (P3)
 - [[D-PLAN12-MULTI-SPILLED-OPERAND-REG-ROTATION-CURRENT-IMPLEMENTATION-POOLS]] (P3)
 - [[D-PLAN12-NAMEDREGISTERREF-COLLAPSE-STACKPOINTERREF-LINKREGISTERREF-WERE-EXACT-COPY-STRUCTS]] (P3)
@@ -793,6 +803,8 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-PLAN12-SHARED-LIR-PASS-UTIL-HPP-FOR-EMITTERMINATOR-REPORT]] (P3)
 - [[D-PLAN12-SHARED-TEXT-FORMAT-SUBSTRATE-SPANNING-MIR-LIR-HIR]] (P3)
 - [[D-PLAN12-SPLIT-AWARE-SUB-INTERVAL-LIRLIVERANGE-LIST-CURRENTLY-FLAT]] (P3)
+- [[D-PLAN12-SUB-INTERVAL-LIRLIVERANGE-LIST-DEFERRED-FROM-ML6-CYCLE]] (P3)
+- [[D-PLAN12-TARGETOPCODEINFO-PAYLOADKIND-DISCRIMINATOR-PAYLOAD-FIELD-CARRIES-SPILL-SLOT]] (P3)
 - [[D-PLAN12-TARGETOPCODEINFO-PAYLOADKIND-VERIFIER-RULE-CLOSES-THE-PAYLOAD-CHANNEL]] (P3)
 - [[D-PLAN12-TARGETOPCODEINFO-TERMINATORKIND-ENUM-SCHEMA-DRIVEN-DISPATCH]] (P3)
 - [[D-PLAN12-TARGETSCHEMA-MULTI-SHAPE-DISCRIMINATOR-WIRING-TARGETABIMODEL-ENUM-REGISTERMACHINE]] (P3)
@@ -881,7 +893,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-DSSHIR-SERVICE-OWNERSHIP-SPLIT]] (P3)
 - [[D-DSSHIR-WORKERS-NO-THREAD-FALLBACK]] (P3)
 
-#### plan 17 GPU — 9
+#### plan 17 GPU — 10
 
 - [[D-GPU-ARTIFACT-RUNTIME-CODESIGN]] (P3)
 - [[D-GPU-CPU-SIBLING-MANDATORY]] (P3)
@@ -890,6 +902,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-GPU-ISA-ABIMODEL-DIVERGENCE]] (P3)
 - [[D-GPU-ISA-DRIVER-VERSION-DRIFT]] (P3)
 - [[D-GPU-MIR-SIDECAR-FORMAT-STABILITY]] (P3)
+- [[D-GPU-MIR-SIDECAR-SIDETABLE-ROUNDTRIP]] (P3)
 - [[D-GPU-RUNTIME-COMPILER-MINIMAL-LIB]] (P3)
 - [[D-GPU-TARGET-CONFIG-SUBDIR-RESOLUTION]] (P3)
 

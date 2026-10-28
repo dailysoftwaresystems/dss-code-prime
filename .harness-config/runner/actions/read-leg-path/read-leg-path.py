@@ -298,32 +298,34 @@ def selftest():
 
 def build_parser():
     ap = argparse.ArgumentParser(description="Read one path inside a leg's tree, redacted.", allow_abbrev=False)
-    ap.add_argument("--tree", required=True)
-    ap.add_argument("--path", required=True)
+    ap.add_argument("--tree", required=True, type=_path_types().read_path_arg("--tree"))
+    ap.add_argument("--path", required=True, type=_path_types().path_part_arg("--path"))
     ap.add_argument("--lines", type=int, default=200)
-    ap.add_argument("--match", default=".")
-    ap.add_argument("--out", required=True, type=_written_path_arg("--out"))
+    ap.add_argument("--match", default=".", type=_path_types().option_text_arg("--match"))
+    ap.add_argument("--out", required=True, type=_path_types().written_path_arg("--out"))
     return ap
 
 
-_WRITTEN_PATH_OWNER = []
+_PATH_TYPES_OWNER = []
 
 
-def _written_path_arg(flag):
-    """argparse's `type=` for a path this program writes: owning-tree's `written_path_arg`, loaded ONCE by path from
-    the actions directory (a hyphen is no module name). A path to write never begins with `-`, and that is said there
-    once; check-scripts-index's clause 14 asks it of every such argument. It FAILS LOUD when owning-tree is absent."""
-    if not _WRITTEN_PATH_OWNER:
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
         import importlib.util
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
         if not os.path.isfile(path):
-            raise SystemExit("read-leg-path: cannot find %s -- what a path to write may be is said there and nowhere else"
-                             % path)
+            raise SystemExit("read-leg-path: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
         spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        _WRITTEN_PATH_OWNER.append(mod)
-    return _WRITTEN_PATH_OWNER[0].written_path_arg(flag)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
 
 
 def main(argv):

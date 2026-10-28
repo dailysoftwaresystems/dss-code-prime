@@ -3476,10 +3476,22 @@ void runErrorTarget(fs::path const&        exampleDir,
     // this arm walks: it never descends a link on any build (libstdc++ on Windows
     // cannot tell one from what it reaches -- the substrate's header), and a file
     // reached through a link is still a file the build left.
-    static_cast<void>(dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
-        if (entry.reaches == dss::core::EntryKind::File) leftovers.push_back(entry.path.generic_string());
-        return dss::core::WalkStep::Continue;
-    }));
+    // A walk that could not read the whole directory did not look for leftovers
+    // there: it FAILS the case, naming where it stopped. An output directory the
+    // refused build never made holds nothing, and is no walk to fail.
+    std::error_code    outKindEc;
+    bool const         outDirMade = dss::core::entryKind(outDir, outKindEc) != dss::core::EntryKind::Absent
+                                 || outKindEc;
+    dss::core::TreeWalk walk;
+    if (outDirMade) {
+        walk = dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
+            if (entry.reaches == dss::core::EntryKind::File) leftovers.push_back(entry.path.generic_string());
+            return dss::core::WalkStep::Continue;
+        });
+    }
+    EXPECT_FALSE(walk.error) << "expect-error example " << exampleDir.generic_string() << ": the walk of "
+                             << outDir.generic_string() << " stopped at " << walk.where.generic_string() << ": "
+                             << walk.error.message() << " -- no leftover artifact was ruled out there";
     EXPECT_TRUE(leftovers.empty())
         << "expect-error example " << exampleDir.generic_string()
         << " REPORTED FAILURE AND STILL WROTE AN ARTIFACT ("
