@@ -3,6 +3,7 @@
 #include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the referenced-document ledger's digest
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/substrate/fixpoint_passes.hpp"       // a monotone fixpoint's bound is its lattice (P69 L2)
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
@@ -1328,18 +1329,24 @@ void computeFirstAndNullable(GrammarSchemaData& data, json const& shapesJson) {
     // Initialise every rule's FIRST = {} and nullable = false. Iterate
     // until a full pass leaves every rule's values unchanged. FIRST sets
     // only grow (via insertSorted's dedup) and nullable only flips
-    // false→true, so the loop is monotone over a finite lattice. The
-    // iteration cap is a safety net — if a future refactor breaks
-    // monotonicity, we abort rather than hanging silently.
+    // false→true, so the loop is monotone over a finite lattice: every pass
+    // but the last adds a bit, and the lattice (each rule's FIRST set over the
+    // token vocabulary, plus its nullable flag) bounds the passes. A pass past
+    // that height is a pass that took a bit back, and the process stops loud
+    // (`substrate::FixpointPasses`; P69 L2, lane `lm`). It was a fixed 10000
+    // passes that ended the loop in SILENCE and kept the sets of that pass —
+    // found by the census pin of cycle P69 L2 (an increment between the counter
+    // and its comparison hid it from the census's first instrument).
     for (auto const& [shapeName, _] : shapesJson.items()) {
         const auto rid = data.rules->find(shapeName);
         data.compiledRules[rid.v] = detail::CompiledRule{};
     }
 
-    constexpr int kMaxIters = 10000;
     bool changed = true;
-    int iters = 0;
-    while (changed && iters++ < kMaxIters) {
+    for (substrate::FixpointPasses passes{shapesJson.size() * (data.schemaTokens->size() + 1),
+                                          "the FIRST-set and nullable fixpoint"};
+         changed;) {
+        passes.pass();
         changed = false;
         for (auto const& [shapeName, body] : shapesJson.items()) {
             const auto rid = data.rules->find(shapeName);
@@ -2154,19 +2161,125 @@ void detectAmbiguousAlternatives(GrammarSchemaData& data, Collector& coll,
     }
 }
 
+// ── A SHAPE THAT REACHES ITSELF BEFORE CONSUMING A TOKEN (C_CircularShape) ──
+//
+// cycle P69 L2, lane `lm`. The parser enters a rule and walks its compiled positions; a
+// rule whose body can reach a reference to ITSELF before any token is consumed — first
+// in its sequence, after elements that can all match nothing, in any `alt` branch or
+// inside an `optional` / `repeat` body standing there — re-enters itself with no
+// progress (a left recursion, direct or through other shapes). The language-config spec
+// has always documented this refusal; the loader never made it.
+//
+// THE RULE, from the compiled positions (FIRST sets and `nullable` are known by now): a
+// rule's LEFT CORNERS are the rules referenced at a position its entry reaches without
+// consuming — a rule reference is a corner, and the walk goes past it only when that rule
+// can match nothing; an alternative goes into every branch; a token or the body's end
+// stops it. A cycle among left corners is a left recursion, and each cycle is reported
+// once, at the shape it returns to, naming its path.
+//
+// Both walks are iterative (a work stack of positions, a path stack of rules): a grammar
+// as deep as its document may be is walked on the heap.
+void detectLeftRecursion(GrammarSchemaData const& data, Collector& coll) {
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> corners;
+    std::vector<std::uint32_t> ruleIds;
+    for (auto const& [rid, rule] : data.compiledRules) {
+        if (rule.entryPos == 0) continue;   // a walker-managed rule: no body to enter
+        ruleIds.push_back(rid);
+        std::vector<std::uint32_t>& out = corners[rid];
+        std::vector<bool> seen(rule.positions.size(), false);
+        std::vector<std::uint32_t> work{rule.entryPos};
+        while (!work.empty()) {
+            std::uint32_t const pos = work.back();
+            work.pop_back();
+            if (pos == 0 || pos >= rule.positions.size() || seen[pos]) continue;
+            seen[pos] = true;
+            auto const& p = rule.positions[pos];
+            switch (p.slotKind()) {
+            case SlotKind::RuleLeaf: {
+                out.push_back(p.ruleId().v);
+                auto const callee = data.compiledRules.find(p.ruleId().v);
+                if (callee != data.compiledRules.end() && callee->second.nullable) {
+                    work.push_back(p.nextPos());
+                }
+                break;
+            }
+            case SlotKind::AltChoice:
+                for (auto const b : p.branches()) work.push_back(b);
+                break;
+            case SlotKind::TokenLeaf:
+            case SlotKind::End:
+                break;
+            }
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+    std::sort(ruleIds.begin(), ruleIds.end());   // a report in one order on every host
+
+    enum class Mark : std::uint8_t { New, OnPath, Done };
+    std::unordered_map<std::uint32_t, Mark> mark;
+    std::unordered_set<std::uint32_t> reported;
+    struct Frame {
+        std::uint32_t rule;
+        std::size_t   next = 0;
+    };
+    for (std::uint32_t const root : ruleIds) {
+        if (mark[root] != Mark::New) continue;
+        mark[root] = Mark::OnPath;
+        std::vector<Frame> path{{root, 0}};
+        while (!path.empty()) {
+            std::uint32_t const at = path.back().rule;
+            std::vector<std::uint32_t> const& edges = corners[at];
+            if (path.back().next == edges.size()) {
+                mark[at] = Mark::Done;
+                path.pop_back();
+                continue;
+            }
+            std::uint32_t const to = edges[path.back().next++];
+            if (!corners.contains(to)) continue;
+            Mark& m = mark[to];
+            if (m == Mark::New) {
+                m = Mark::OnPath;
+                path.push_back({to, 0});
+                continue;
+            }
+            if (m != Mark::OnPath || reported.contains(to)) continue;
+            // `to` is on the path: the path from it back to it is the cycle.
+            std::size_t from = path.size();
+            while (from > 0 && path[from - 1].rule != to) --from;
+            std::string cycle;
+            for (std::size_t i = from - 1; i < path.size(); ++i) {
+                cycle += data.rules->name(RuleId{path[i].rule});
+                cycle += " → ";
+                reported.insert(path[i].rule);
+            }
+            std::string const name{data.rules->name(RuleId{to})};
+            cycle += name;
+            coll.emit(DiagnosticCode::C_CircularShape, shapePointer(data, name),
+                      std::format("the shape '{}' can reach itself before consuming any token ({}): "
+                                  "a left recursion the parser can make no progress through. Put a "
+                                  "token before the recursive reference, or say the repetition with "
+                                  "\"repeat\"",
+                                  name, cycle));
+        }
+    }
+}
+
 void computeNullableTails(GrammarSchemaData& data) {
-    // Fixed point over a finite lattice (false ⇒ true is monotone). Cap
-    // iterations as a safety net — if a future refactor accidentally
-    // flips a flag back, we'd otherwise hang silently.
-    constexpr int kMaxIters = 10000;
+    // Fixed point over a finite lattice (false ⇒ true is monotone): one flag
+    // per position, so a rule's positions bound its passes, and a pass past
+    // them flipped a flag back — the process stops loud
+    // (`substrate::FixpointPasses`; P69 L2). A fixed 10000 passes ended it in
+    // silence before.
     for (auto& [_, rule] : data.compiledRules) {
         auto& positions = rule.positions;
         for (auto& p : positions) {
             p.setNullableTail(p.slotKind() == SlotKind::End);
         }
         bool changed = true;
-        int iters = 0;
-        while (changed && iters++ < kMaxIters) {
+        for (substrate::FixpointPasses passes{positions.size(), "the nullable-tail fixpoint"};
+             changed;) {
+            passes.pass();
             changed = false;
             for (auto& p : positions) {
                 bool newVal = p.nullableTail();
@@ -2219,13 +2332,19 @@ void computeNullableTails(GrammarSchemaData& data) {
 // AltChoice) expectedSet back into the positions that point at it. Runs AFTER
 // detectAmbiguousAlternatives (so the more-complete sets can't manufacture a
 // false FIRST/FIRST overlap) and BEFORE computeFollowSets (which reads these).
+//
+// The passes are bounded by the lattice (every position's set over the token
+// vocabulary); a pass past it took a token back, and the process stops loud
+// (`substrate::FixpointPasses`; P69 L2). A fixed 10000 passes ended it in
+// silence before.
 void recomputeAltExpectedSets(GrammarSchemaData& data) {
-    constexpr int kMaxIters = 10000;
     for (auto& [_, rule] : data.compiledRules) {
         auto& positions = rule.positions;
         bool changed = true;
-        int iters = 0;
-        while (changed && iters++ < kMaxIters) {
+        for (substrate::FixpointPasses passes{positions.size() * data.schemaTokens->size(),
+                                              "the alternatives' expected-set fixpoint"};
+             changed;) {
+            passes.pass();
             changed = false;
             for (auto& p : positions) {
                 if (p.slotKind() != SlotKind::AltChoice) continue;
@@ -2429,13 +2548,12 @@ void computePredictivePrefixes(GrammarSchemaData& data) {
 //
 // Root rule's FOLLOW stays empty — nothing in the grammar references
 // it. EOF is handled separately by the parser's `canEndSource` check.
-void computeFollowSets(GrammarSchemaData& data, Collector& coll) {
-    // Bound is far above the O(rules × positions) convergence the
-    // monotone lattice guarantees — functions as a runaway guard
-    // against a future refactor that breaks monotonicity. If we hit
-    // it with `changed == true` we emit a loader diagnostic rather
-    // than silently shipping a truncated FOLLOW set.
-    constexpr int kMaxIters = 10000;
+void computeFollowSets(GrammarSchemaData& data) {
+    // FOLLOW sets only grow (`addToFollow`), so every pass but the last adds a
+    // token, and the lattice (each rule's set over the token vocabulary) bounds
+    // the passes. A pass past it is a refactor that broke monotonicity: the
+    // process stops loud (`substrate::FixpointPasses`; P69 L2). A fixed 10000
+    // passes said C_CircularShape and went on with truncated sets before.
     auto addToFollow = [](std::vector<SchemaTokenId>& follow,
                           SchemaTokenId tok) -> bool {
         auto it = std::lower_bound(follow.begin(), follow.end(), tok,
@@ -2446,8 +2564,10 @@ void computeFollowSets(GrammarSchemaData& data, Collector& coll) {
     };
 
     bool changed = true;
-    int iters = 0;
-    while (changed && iters++ < kMaxIters) {
+    for (substrate::FixpointPasses passes{data.compiledRules.size() * data.schemaTokens->size(),
+                                          "the FOLLOW-set fixpoint"};
+         changed;) {
+        passes.pass();
         changed = false;
         for (auto& [parentIdV, parentRule] : data.compiledRules) {
             auto const& positions = parentRule.positions;
@@ -2474,15 +2594,6 @@ void computeFollowSets(GrammarSchemaData& data, Collector& coll) {
                 }
             }
         }
-    }
-    if (changed) {
-        coll.emit(DiagnosticCode::C_CircularShape,
-                  "/shapes",
-                  std::format("FOLLOW-set fixed-point did not converge in "
-                              "{} iterations — the grammar likely violates "
-                              "monotonicity (a loader bug); FOLLOW data is "
-                              "truncated and recovery quality degraded",
-                              kMaxIters));
     }
 }
 
@@ -6939,12 +7050,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
                 computeFirstAndNullable    (data, shapes);
                 buildPositionTables        (data, shapes, coll);
+                detectLeftRecursion        (data, coll);   // P69 L2: C_CircularShape
                 detectAmbiguousAlternatives(data, coll, shapes);
                 computeNullableTails       (data);
                 recomputeAltExpectedSets   (data);
                 computePredictivePrefixes  (data);
                 computeContextualKinds     (data);
-                computeFollowSets          (data, coll);
+                computeFollowSets          (data);
                 validateNotFollowedBy      (data, coll);   // P69: needs positions + FIRST sets
                 validateBodyDefaultKindsOffGrammar(data, coll);
                 validateOperatorBodyRules  (data, coll);
@@ -9233,7 +9345,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // of `compoundLiterals`.
             // ⓘ 65 → 66 (P69, lane `cs`): `libraryBuiltins` — GCC's `__builtin_<libfn>`
             // spellings (`LibraryBuiltins`); a sibling of `builtinFunctions`.
-            static constexpr std::array<std::string_view, 66> kSemanticsKeys{
+            // ⓘ 66 → 67 (P69 L2, lane `lm`): `integerConstantExpressions` — the 6.6p10 forms
+            // admitted per integer-constant position (`IntegerConstantForms`); a sibling of
+            // `staticInitializers`.
+            static constexpr std::array<std::string_view, 67> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -9252,8 +9367,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // remaining expression / declaration facets
                 "variadic", "staticAssertRule", "inlineAsm",
                 "inlineAsmTemplateLexemes", "generic",
-                "compoundLiterals", "staticInitializers", "builtinFunctions",
-                "libraryBuiltins",
+                "compoundLiterals", "staticInitializers", "integerConstantExpressions",
+                "builtinFunctions", "libraryBuiltins",
                 // P31: the compile-time OPERATORS (not functions — see above)
                 "builtinOffsetof", "builtinTypesCompatible", "builtinChooseExpr",
                 // statement surface
@@ -13945,6 +14060,105 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                     }
                     if (ok) cfg.staticInitializers = rule;
+                }
+            }
+
+            // ── P69 L2 (lane `lm`): `integerConstantExpressions` (C 6.6p3, p6, p10) ──
+            // An object whose one optional key, `otherConstantForms`, maps a constant form's
+            // name to the integer-constant POSITIONS that admit it (`IntegerConstantPosition`,
+            // `constant_form.hpp`: the references take 6.6p10's latitude per position). Refused
+            // loud: a non-object, an unknown key, a form or a position that is no name of its
+            // closed vocabulary, a form the integer-constant evaluator does not read
+            // (`readAtIntegerConstantPositions` — listing it would change nothing), a non-array
+            // or empty position list, a position named twice for one form. Undeclared ⇒ the
+            // standard's forms everywhere.
+            if (sem.contains("integerConstantExpressions")) {
+                json const& obj = sem.at("integerConstantExpressions");
+                std::string const base = "/semantics/integerConstantExpressions";
+                static constexpr std::array<std::string_view, 1> kIntegerConstantKeys{
+                    "otherConstantForms"};
+                DSS_CHECK_KEY_VOCABULARY(kIntegerConstantKeys);
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                              "'integerConstantExpressions' must be an object");
+                } else if (checkKeysAgainst(obj, kIntegerConstantKeys, base,
+                                            "the 'integerConstantExpressions' block",
+                                            DiagnosticCode::C_InvalidSemantics, coll,
+                                            "each key names one part of the rule")) {
+                    IntegerConstantForms rule;
+                    bool ok = true;
+                    if (obj.contains("otherConstantForms")) {
+                        std::string const path = base + "/otherConstantForms";
+                        json const& forms = obj.at("otherConstantForms");
+                        if (!forms.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      "'otherConstantForms' must be an object mapping a "
+                                      "constant form's name to the positions that admit it");
+                            ok = false;
+                        } else {
+                            for (auto const& [formName, positions] : forms.items()) {
+                                if (isDocumentationKey(formName)) continue;
+                                std::string const formPath = path + "/" + formName;
+                                auto const form = constantFormFromName(formName);
+                                if (!form.has_value()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, formPath,
+                                              std::format("unknown constant form '{}' (expected "
+                                                          "one of {})", formName,
+                                                          renderAllowedList(
+                                                              allNames(kConstantFormTable))));
+                                    ok = false;
+                                    continue;
+                                }
+                                if (!readAtIntegerConstantPositions(*form)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, formPath,
+                                              std::format("constant form '{}' is not read at an "
+                                                          "integer-constant position (the "
+                                                          "evaluator reads 'commaOperator' "
+                                                          "there); listing it would change "
+                                                          "nothing", formName));
+                                    ok = false;
+                                    continue;
+                                }
+                                if (!positions.is_array() || positions.empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, formPath,
+                                              std::format("the positions admitting '{}' must be "
+                                                          "a non-empty array of position names "
+                                                          "({})", formName,
+                                                          renderAllowedList(allNames(
+                                                              kIntegerConstantPositionTable))));
+                                    ok = false;
+                                    continue;
+                                }
+                                for (auto const& p : positions) {
+                                    auto const pos = p.is_string()
+                                        ? integerConstantPositionFromName(p.get<std::string>())
+                                        : std::nullopt;
+                                    if (!pos.has_value()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, formPath,
+                                                  std::format("unknown integer-constant position "
+                                                              "'{}' (expected one of {})",
+                                                              p.is_string() ? p.get<std::string>()
+                                                                            : p.dump(),
+                                                              renderAllowedList(allNames(
+                                                                  kIntegerConstantPositionTable))));
+                                        ok = false;
+                                        continue;
+                                    }
+                                    if (rule.at(*pos).admits(*form)) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, formPath,
+                                                  std::format("position '{}' is listed twice "
+                                                              "for '{}'",
+                                                              integerConstantPositionName(*pos),
+                                                              formName));
+                                        ok = false;
+                                        continue;
+                                    }
+                                    rule.admit(*pos, *form);
+                                }
+                            }
+                        }
+                    }
+                    if (ok) cfg.integerConstantExpressions = rule;
                 }
             }
 

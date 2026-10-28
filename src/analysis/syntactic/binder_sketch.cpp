@@ -48,6 +48,9 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
         // this (the analyzer's evaluation is the template).
         row.isType    = decl.kind == DeclarationKind::Type;
         row.nameMatch = decl.nameMatch;
+        // P69 L2 (lane `lm`): a composite's row (it carries `fieldChildren`) names a
+        // TAG — the analyzer's own gate for `SymbolNamespace::Tag`.
+        row.namesATag = decl.fieldChildren.has_value();
         if (decl.specifierPrefixRule.has_value()) {
             row.specifierPrefixRule = *decl.specifierPrefixRule;
         }
@@ -59,13 +62,26 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
     // republishes them rather than inside the composite body, where they would
     // die with it and read as Unknown — which `sizeof(E)` then committed as a
     // TYPE. The row is found through the SAME config link the analyzer follows.
+    // P69 L2 (lane `lm`): a field row whose composite does NOT republish its names
+    // declares MEMBERS — the structure's own name space (C 6.2.3), which the sketch
+    // never records. Found through the same config link.
     for (auto const& decl : sem.declarations) {
-        if (!decl.fieldChildren.has_value()
-            || !decl.fieldChildren->liftToEnclosingScope
-            || !decl.fieldChildren->rule.valid())
+        if (!decl.fieldChildren.has_value() || !decl.fieldChildren->rule.valid())
             continue;
-        if (auto it = byRule_.find(decl.fieldChildren->rule.v); it != byRule_.end()) {
+        auto it = byRule_.find(decl.fieldChildren->rule.v);
+        if (it == byRule_.end()) continue;
+        if (decl.fieldChildren->liftToEnclosingScope) {
             it->second.liftToEnclosingScope = true;
+        } else {
+            it->second.namesAMember = true;
+        }
+    }
+    for (auto const& [rule, row] : byRule_) {
+        if (row.liftToEnclosingScope && row.namesAMember) {
+            // One field row shared by a composite that lifts its names and one that
+            // does not would make its names both ordinary and members: a config the
+            // sketch cannot mirror, stopped rather than guessed at.
+            bsFatal("a field row is both lifted and a member row");
         }
     }
     for (auto const& sc : sem.scopes) {
@@ -135,6 +151,7 @@ void BinderSketch::closeScope() {
     liveScopes_.pop_back();
     liveScopeIsDominator_.pop_back();
     liveScopeIsComposite_.pop_back();
+    version_ = ++versionSource_;   // the bindings it held are hidden now
 }
 
 void BinderSketch::record(std::string name, bool isType, SourceSpan span,
@@ -160,6 +177,7 @@ void BinderSketch::record(std::string name, bool isType, SourceSpan span,
             .isType = isType,
             .span   = span,
         });
+        version_ = ++versionSource_;
         return;
     }
     // A composite/typedef TYPE tag (C11 6.2.1) belongs to the nearest enclosing
@@ -178,17 +196,63 @@ void BinderSketch::record(std::string name, bool isType, SourceSpan span,
         }
     }
     bindings_.push_back(Binding{
+        .name      = std::move(name),
+        .scope     = scope,
+        .isType    = isType,
+        .span      = span,
+    });
+    version_ = ++versionSource_;
+}
+
+void BinderSketch::recordAtDeclaratorEnd(std::string name, bool isType, SourceSpan span,
+                                         bool rowOwnsInnermostScope) {
+    if (name.empty()) return;   // abstract / malformed — nothing to bind
+    // The row's own scope is the innermost live one while its declarators close;
+    // its close-time record runs after that scope closed, so this one starts one
+    // scope further out. The global scope (slot 0) is never a row's own.
+    std::size_t from = liveScopes_.size() - 1;
+    if (rowOwnsInnermostScope) {
+        if (from == 0) bsFatal("recordAtDeclaratorEnd: the row owns no live scope");
+        --from;
+    }
+    // Then as `record` places a name: a TYPE floats past declarator-dominator
+    // scopes, a VALUE stays where it is.
+    std::uint32_t scope = liveScopes_[from];
+    if (isType) {
+        for (std::size_t i = from + 1; i-- > 0;) {
+            if (!liveScopeIsDominator_[i]) { scope = liveScopes_[i]; break; }
+        }
+    }
+    bindings_.push_back(Binding{
         .name   = std::move(name),
         .scope  = scope,
         .isType = isType,
         .span   = span,
     });
+    version_ = ++versionSource_;
+}
+
+void BinderSketch::recordUnlessBoundAtItsDeclarator(std::string name, bool isType,
+                                                    SourceSpan span) {
+    // Everything recorded after a name's declarator-end binding comes from tokens
+    // after that declarator (the rest of the declaration and whatever it holds), so
+    // the backward scan stops at the first binding that starts before this name:
+    // it reads only this declaration's own bindings.
+    for (auto it = bindings_.rbegin();
+         it != bindings_.rend() && it->span.start() >= span.start(); ++it) {
+        if (it->span == span && it->name == name) {
+            return;   // bound at the end of its declarator already
+        }
+    }
+    record(std::move(name), isType, span);
 }
 
 BinderSketch::NameKind BinderSketch::lookup(std::string_view name) const noexcept {
     // Newest-first: the most recent binding in a LIVE scope wins —
     // that's lexical shadowing (an inner `int T;` recorded after a
-    // file-scope `typedef ... T` is found first).
+    // file-scope `typedef ... T` is found first). Only ordinary identifiers are
+    // recorded (C 6.2.3), so a tag of the same spelling, however new, is never the
+    // answer: `int g(int); struct g {…}; (g)(2)` stays a call.
     for (auto it = bindings_.rbegin(); it != bindings_.rend(); ++it) {
         if (it->name != name) continue;
         if (std::ranges::find(liveScopes_, it->scope) == liveScopes_.end()) {
@@ -206,12 +270,15 @@ void BinderSketch::seedGlobalType(std::string name) {
         .scope  = 0,
         .isType = true,
     });
+    version_ = ++versionSource_;
 }
 
 std::vector<std::string> BinderSketch::globalTypeNames() const {
     std::vector<std::string> out;
     for (auto const& b : bindings_) {
-        if (b.scope == 0 && b.isType) out.push_back(b.name);
+        if (b.scope == 0 && b.isType) {
+            out.push_back(b.name);
+        }
     }
     return out;
 }
@@ -220,7 +287,9 @@ std::vector<std::pair<std::string, SourceSpan>>
 BinderSketch::globalTypeBindings() const {
     std::vector<std::pair<std::string, SourceSpan>> out;
     for (auto const& b : bindings_) {
-        if (b.scope == 0 && b.isType) out.emplace_back(b.name, b.span);
+        if (b.scope == 0 && b.isType) {
+            out.emplace_back(b.name, b.span);
+        }
     }
     return out;
 }
@@ -241,6 +310,7 @@ BinderSketch::Snapshot BinderSketch::snapshot() const {
         .liveScopeDominator = liveScopeIsDominator_,
         .liveScopeComposite = liveScopeIsComposite_,
         .nextScopeId        = nextScopeId_,
+        .version            = version_,
     };
 }
 
@@ -262,6 +332,7 @@ void BinderSketch::restore(Snapshot&& s) {
     liveScopeIsDominator_ = std::move(s.liveScopeDominator);
     liveScopeIsComposite_ = std::move(s.liveScopeComposite);
     nextScopeId_          = s.nextScopeId;
+    version_              = s.version;   // `versionSource_` stays: a number is never given twice
 }
 
 } // namespace dss

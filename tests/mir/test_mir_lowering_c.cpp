@@ -13393,6 +13393,82 @@ TEST(MirLoweringC, VlaTypedefWithOwnVlaSuffixComposesOwnDimOverFrozenAlias) {
            "slot — re-lowering `n` here would break freeze-once (C99 6.7.7p2)";
 }
 
+// (b2) ★ P69 L2 (lane `lm`): a TYPEDEF with a variable-length dimension of its own over a
+// VLA typedef (`typedef int R[n]; typedef R S[m];`) composes at ITS declaration exactly as
+// an object does at its (`R a[m];`, above): R's frozen row size is copied down, S's own
+// `[m]` multiplies it, and S's whole-object size is frozen there — so `S b;` copies S's
+// slot, and `n = 99;` between them resizes nothing (C 6.7.8p3). ✔MEASURED gcc 13.3.0 and
+// clang 18.1.3 (-std=gnu2x, -std=c2x -pedantic-errors): built and run, the bound evaluated
+// once; DSS refused it at the TypeDecl freeze, the arity guard ("… array level(s) …
+// bound(s) captured") — the gap the CLOSED chained-typedef work named and left.
+// RED-ON-DISABLE: the TypeDecl freeze composing nothing on the typedef's origin → that
+// refusal, and `L.mir.ok` is false.
+TEST(MirLoweringC, ATypedefsOwnVlaSuffixComposesOverAVlaTypedefAtTheTypedef) {
+    auto L = lowerC(
+        "int main(void) {\n"
+        "  int n; int m;\n"
+        "  n = 3; m = 2;\n"
+        "  typedef int R[n];\n"
+        "  typedef R S[m];\n"
+        "  n = 99;\n"
+        "  S b;\n"
+        "  return (int)sizeof b;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "`typedef int R[n]; typedef R S[m];` must lower — gcc and clang both compile and "
+           "run it: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // `S b;`'s runtime Alloca (the one operand-bearing Alloca whose pointee is a vlaArray)
+    // is sized by a LOAD: the copy of the whole-object size S froze at its typedef.
+    MirInstId objAlloca{};
+    int objCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        if (m.instOperands(id).empty()) continue;
+        TypeId const t = m.instType(id);
+        if (in.kind(t) != TypeKind::Ptr) continue;
+        auto const po = in.operands(t);
+        if (po.size() == 1u && in.isVlaArray(po[0])) { objAlloca = id; ++objCount; }
+    }
+    ASSERT_EQ(objCount, 1) << "exactly one VLA object alloca (ptr<vlaArray>)";
+    auto const aOps = m.instOperands(objAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(aOps[0]), MirOpcode::Load)
+        << "`S b;` must copy the size S froze at its typedef — a Mul here would mean the "
+           "object composed S's levels again";
+
+    // S's composition: a Mul one of whose operands is a LOAD of a hidden 8-byte size slot
+    // (no-operand Alloca, payload 8) — R's frozen row size, never `n` re-read. The body
+    // indexes nothing, so no index stride competes for this signature.
+    bool composedOnTheFrozenRow = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry) && !composedOnTheFrozenRow; ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Mul) continue;
+        for (MirInstId const op : m.instOperands(id)) {
+            if (m.instOpcode(op) != MirOpcode::Load) continue;
+            auto const lops = m.instOperands(op);
+            if (lops.size() == 1 && m.instOpcode(lops[0]) == MirOpcode::Alloca
+                && m.instOperands(lops[0]).empty() && m.instPayload(lops[0]) == 8u)
+                composedOnTheFrozenRow = true;
+        }
+    }
+    EXPECT_TRUE(composedOnTheFrozenRow)
+        << "S's size must be its own `m` times R's FROZEN row size (a Load of R's slot) — "
+           "re-lowering `n` at S would break freeze-once (C 6.7.8p3)";
+}
+
 // (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the alias freezes ONE quantity at
 // its own declaration, the POINTEE ROW STRIDE, and the object copies it. `p` itself is
 // an ordinary 8-byte pointer: it must NOT acquire a runtime-operand alloca.
@@ -18542,4 +18618,41 @@ TEST(MirLoweringC, AnOverflowPredicateIsCheckedArithmeticWithoutAStore) {
         "int k(void) { return __builtin_add_overflow_p(2147483647, 1, (int)0); }\n");
     ASSERT_TRUE(builtinLowered(L, why)) << why;
     EXPECT_GE(countOp(L.mir.mir, MirOpcode::ICmpNe), 3u) << "f, g and h compare at run time";
+}
+
+// ── P69 L2a (lane `lm`): THREE VARIABLE-LENGTH FORMS THE LOWERING REFUSES, AND KEEPS REFUSING
+//    BY NAME (D-C-SIZEOF-OF-A-VLA-TYPED-OPERAND-SKIPS-THE-OPERANDS-SIDE-EFFECTS). Evaluating what
+//    C evaluates in a variable-length operand must never turn a refusal into a wrong value: a
+//    pointer to a variable-length array reached through an assignment (`*(p += 1)`), and a
+//    subscript or a size THROUGH a cast to one (an rvalue pointer carries no stride). gcc 13.3.0
+//    and clang 18.1.3 (gnu2x, c2x -pedantic-errors) run each (41, 43, 43); the positive answer is
+//    owed by L2b, with D-C-ARITHMETIC-ON-A-POINTER-TO-A-VLA-IS-REFUSED's class. ✔MEASURED at
+//    937a3b15 (macos-arm64-debug, x86_64:pe64): each refused with H_UnsupportedLoweringForKind,
+//    the sentence each case names — the two `sizeof` forms by the HIR lowering now, at the
+//    expression that reaches the array (they fell to the MIR's unnamed "un-sizeable" before).
+TEST(MirLoweringC, AVariableLengthOperandTheLoweringCannotSizeStaysRefusedByName) {
+    struct Case {
+        char const* src;
+        char const* says;
+    };
+    for (Case const c : {
+             Case{"int f(int n, int m) { int v[n][m]; int (*p)[m] = v; "
+                  "return (int)sizeof *(p += 1); }\n",
+                  "a variable-length array reached through this expression"},
+             Case{"int f(int n) { int x[8] = {0}; return ((int (*)[n])x)[1][0]; }\n",
+                  "subscript base is not a single"},
+             Case{"int f(int n) { int x[8] = {0}; return (int)sizeof *(int (*)[n])x; }\n",
+                  "a variable-length array reached through this expression"},
+         }) {
+        auto L = lowerC(c.src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.src;
+        bool named = false;
+        for (DiagnosticReporter const* r : {&L.hirReporter, &L.mirReporter})
+            for (auto const& d : r->all())
+                if (d.code == DiagnosticCode::H_UnsupportedLoweringForKind
+                    && d.actual.find(c.says) != std::string::npos)
+                    named = true;
+        EXPECT_TRUE(named) << "still refused, by name ('" << c.says << "'): " << c.src;
+        EXPECT_FALSE(L.hir->ok && L.mir.ok) << "never a lowered program: " << c.src;
+    }
 }

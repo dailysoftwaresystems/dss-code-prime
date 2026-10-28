@@ -209,6 +209,53 @@ TEST(ConstantConditionalIsBalanced, TheTypersTypeAndTheArmsBalanceAgree) {
     });
 }
 
+// AN ARM THAT HOLDS FLOATING ARITHMETIC, OR A FOLDED BUILTIN (P69 L2, lane `lm`, the review of
+// checkpoint 29, BLOCKER 1). The balance reads the arms' folded values, so each value must
+// state its C type: the float fold handed `2.0f * 3.0f` on as a binary64 (core F64) and the
+// folded-constant rules every value as a 64-bit unsigned, so the balance said `double` / an
+// unsigned 64-bit integer where the typer said `float` / `int`, and the process STOPPED.
+// ✔MEASURED 2026-10-20 on checkpoint 29's bytes (pe64 and ELF, both pipelines): every
+// conditional below stopped the compiler (exit -6, "the typer's F32 and the arms' balance
+// F64"; "I32 … U64" for the builtin), where clang 18.1.3 and gcc 13.3.0 build and run each
+// (clang has no C23 `constexpr`). Each assertion holds; each `if` is true in C, so the
+// position after it is marked never reached.
+TEST(ConstantConditionalIsBalanced, AnArmOfFloatingArithmeticOrAFoldedBuiltinHasItsType) {
+    inAChildProcess([] {
+        std::string found = analysisErrors(inF(
+            "    constexpr float cf = 1 ? 2.0f * 3.0f : 1.0f;\n"
+            "    _Static_assert((1 ? 2.0f * 3.0f : 1.0f) > 0, \"float times float: float\");\n"
+            "    _Static_assert((1 ? 0.5f * 2 : 0.0f) == 1.0f, \"float times int: float\");\n"
+            "    _Static_assert((1 ? 5 : (0 ? 2.0f * 3 : 1.0f)) == 5, \"the unselected arm\");\n"
+            "    _Static_assert((1 ? 2.0f * 3.0f : 1.0) == 6.0, \"float and double: double\");\n"
+            "    _Static_assert((1 ? __builtin_types_compatible_p(int, int) : 0) == 1, \"an int\");\n"
+            "    _Static_assert((1 ? __builtin_types_compatible_p(int, int) : 0u) - 2 > 0,\n"
+            "                   \"an int and an unsigned int: unsigned int\");\n"
+            "    (void)cf;\n    return y;"));
+        found += analysisErrors(std::string{kObjects} +
+            "int a1[(1 ? 2.0f * 3.0f : 1.0f) > 0 ? 1 : -1];\n"
+            "int a2[(1 ? __builtin_types_compatible_p(int, int) : 0) == 1 ? 1 : -1];\n"
+            "static int s = (1 ? 2.0f * 3.0f : 1.0f) > 0 ? 42 : 7;\n"
+            "_Static_assert((1 ? 2.0f * 3.0f : 1.0f) > 0, \"at file scope\");\n"
+            "int main(void) { return s; }\n");
+        struct Fold { char const* body; std::size_t marks; };
+        for (Fold const& f : {
+                 Fold{"    if ((1 ? 2.0f * 3.0f : 1.0f) > 0) return 7;\n    return 42;", 1},
+                 Fold{"    if ((1 ? 2.0f * 3.0f : 1.0f) < 0) return 7;\n    return 42;", 0},
+                 Fold{"    if ((1 ? 5 : (0 ? 2.0f * 3 : 1.0f)) == 5) return 7;\n    return 42;", 1},
+                 Fold{"    static const float fc = 3.0f;\n    if ((1 ? fc * 2 : 0.0f) > 0) return 7;\n"
+                      "    return 42;", 1},
+                 Fold{"    if ((1 ? __builtin_types_compatible_p(int, int) : 0) == 1) return 7;\n"
+                      "    return 42;", 1},
+             }) {
+            std::size_t const marks = positionsMarkedNeverReached(inF(f.body));
+            if (marks != f.marks)
+                found += "\n    " + std::to_string(marks) + " position(s) marked never reached, not " +
+                         std::to_string(f.marks) + ", in:\n" + f.body;
+        }
+        return found;
+    });
+}
+
 // THE CONTROL: arms of ONE type keep it — the conversion of the selected arm is the identity,
 // so this case stands whatever either statement of the conditional's type says, and it is the
 // neighbour that stays green while a case above reds.

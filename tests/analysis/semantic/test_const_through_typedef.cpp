@@ -449,3 +449,66 @@ TEST(ConstThroughTypedef, AWriteThroughACastAsksTheCastsTypeName) {
          "static void g(char *q, const char *cq) { *(typeof_unqual(*cq) *)q = 'x'; }\n", false},
     }, DiagnosticCode::S_ConstViolation);
 }
+
+// ── P69 L2 (lane `lm`): A CLAIM READ THROUGH NESTED `typeof` LAYERS ─────────
+// Layers that are nothing but `typeof(typeof(…))` are resolved in one loop (the analyzer's
+// typeof peel, so a deep nest costs no host frame per layer); each layer's claim is still
+// read back innermost-first: the operand's `const` carried up through every `typeof`, its
+// top level dropped by a `typeof_unqual` WHEREVER that layer sits, a pointer's pointee
+// claim kept below it, and an innermost EXPRESSION operand's object claim read like a type's.
+// ✔MEASURED (WSL gcc 13.3.0 and clang 18.1.3, -std=gnu2x and -std=c2x -pedantic-errors,
+// each shape built and run at 2, 3 and 100 layers; probes tc_* and tcd2_* / tcd100_*): both
+// refuse every REFUSED row and run every accepted one, at every depth.
+// RED-ON-DISABLE: a PEELED `typeof_unqual` layer that strips nothing → the
+// `typeof_unqual`-innermost rows red at every depth (the outermost layer is its own arm's,
+// not the peel's); the operand's claim never read → every refusal accepted.
+TEST(ConstThroughTypedef, AClaimIsReadBackThroughEveryNestedTypeofLayer) {
+    // `depth` layers: the outermost spelled `outer`, every other one `typeof`.
+    auto const nest = [](int depth, std::string const& inner, std::string const& outer) {
+        std::string s = inner;
+        for (int i = 0; i < depth; ++i)
+            s = (i == depth - 1 ? outer : std::string{"typeof"}) + "(" + s + ")";
+        return s;
+    };
+    auto const innerUnqual = [](int depth, std::string const& inner) {
+        std::string s = "typeof_unqual(" + inner + ")";
+        for (int i = 1; i < depth; ++i) s = "typeof(" + s + ")";
+        return s;
+    };
+    for (int const depth : {2, 3, 100}) {
+        std::string const d = " at " + std::to_string(depth) + " layers";
+        std::string const keep = "void g(void) { " + nest(depth, "const int", "typeof") +
+                                 " x = 1; x = 2; }\n";
+        std::string const outerUnqual = "void g(void) { " +
+                                        nest(depth, "const int", "typeof_unqual") +
+                                        " x = 1; x = 2; (void)x; }\n";
+        std::string const innerUnq = "void g(void) { " + innerUnqual(depth, "const int") +
+                                     " x = 1; x = 2; (void)x; }\n";
+        std::string const ptrKeep = "void g(void) { int v = 0; " +
+                                    nest(depth, "const int *", "typeof") + " p = &v; *p = 2; }\n";
+        std::string const ptrOuterQ = "void g(void) { int v = 0; " +
+                                      nest(depth, "const int *const", "typeof_unqual") +
+                                      " q = &v; q = 0; (void)q; }\n";
+        std::string const ptrOuterStar = "void g(void) { int v = 0; " +
+                                         nest(depth, "const int *const", "typeof_unqual") +
+                                         " q = &v; *q = 2; }\n";
+        std::string const exprKeep = "const int c = 1;\nvoid g(void) { " +
+                                     nest(depth, "c", "typeof") + " y = 1; y = 2; }\n";
+        std::string const w1 = "every layer a `typeof` of `const int`" + d;
+        std::string const w2 = "a `typeof_unqual` outermost" + d;
+        std::string const w3 = "a `typeof_unqual` innermost" + d;
+        std::string const w4 = "a pointer to const through every layer" + d;
+        std::string const w5 = "`typeof_unqual` drops the pointer's own const" + d;
+        std::string const w6 = "... and keeps its pointee's" + d;
+        std::string const w7 = "an EXPRESSION innermost, `typeof(c)` of a const object" + d;
+        expectVerdicts({
+            {w1.c_str(), keep.c_str(), true},
+            {w2.c_str(), outerUnqual.c_str(), false},
+            {w3.c_str(), innerUnq.c_str(), false},
+            {w4.c_str(), ptrKeep.c_str(), true},
+            {w5.c_str(), ptrOuterQ.c_str(), false},
+            {w6.c_str(), ptrOuterStar.c_str(), true},
+            {w7.c_str(), exprKeep.c_str(), true},
+        }, DiagnosticCode::S_ConstViolation);
+    }
+}

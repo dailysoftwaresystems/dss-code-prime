@@ -802,7 +802,11 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // ⓘ EXTENT 200 → 202 (2026-10-15, P69 round 1): lane `cs`'s `S_SymbolAliasTargetInvalid` and lane
 // `lm`'s `H_SehRegionInsideAFilter` join — the latter under `kWhyHirStructural`, a `__try` inside a
 // filter expression, which the filter's own function has no handler table for.
-constexpr std::array<UnsuppressableEntry, 202> kUnsuppressableCodes{{
+// ⓘ EXTENT 202 → 203 (2026-10-20, P69 round 1, L2, lane `lm`): `I_PhiIncomingsNotOnePerPredecessor`
+// joins under `kWhyMirVerifier`, a member like every I_* verifier invariant (a Phi that does not
+// take its value from every way into its block). Written from main's 202; a fold landing another
+// member first reconciles the count.
+constexpr std::array<UnsuppressableEntry, 203> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1242,6 +1246,7 @@ constexpr std::array<UnsuppressableEntry, 202> kUnsuppressableCodes{{
     {DiagnosticCode::I_EntryBlockNotFirst, kWhyMirVerifier},
     {DiagnosticCode::I_BlockNotTerminated, kWhyMirVerifier},
     {DiagnosticCode::I_PhiPredNotInCfg, kWhyMirVerifier},
+    {DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor, kWhyMirVerifier},
     {DiagnosticCode::I_NotDominated, kWhyMirVerifier},
     {DiagnosticCode::I_TerminatorTypeMismatch, kWhyMirVerifier},
     {DiagnosticCode::I_ArgIndexOutOfRange, kWhyMirVerifier},

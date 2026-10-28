@@ -82,6 +82,16 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ THE PR SCOPE (2026-10-22): [`30-pr-scope-plan`](./30-pr-scope-plan%20-%20tbd.md) places every open row and every plan
+
+✔MEASURED at `b5efdbb3`: 666 open rows. Where they go:
+- **PR #59's exit: 81.** The four lanes' rows, every remaining P0, and the foreign debug-info carry the operator ordered into this PR on 2026-10-22.
+- **The next PR: 469.** Three rounds by band, plus the compiler's own FULL debug information as a fourth lane (plan 15 §8).
+- **The capability, wasm32 and C++ PRs: 24.**
+- **Opened by a trigger: 92.** Plans 24, 28's driver half, 09.5's lattices and services, 17, and 27's profile.
+
+The seven decision rows are decided in plan 30 §4, each veto-able. Every plan carries a `Scheduled` stamp naming where its rest lands.
+
 ### ⏳ CYCLE P69, ROUND 1 IS IN FLIGHT — THE NEWEST COMMITS ARE CHECKPOINTS, NOT A ROUND CLOSE (2026-10-08)
 
 Operator ruling 2026-10-08, verbatim: *"please commit + push between waves, It's totally wrong 600+ files without
@@ -620,6 +630,25 @@ round's close; each checkpoint's commit message says what was and was not run on
   orchestrator: the tool's by-arm merge reported a conflict on an arm both sides held byte-equal (a section header
   that had moved off it), so the lane's copy was proved to be main's registry plus only the lane's own deltas
   (1024 arms, 0 out of order) before it was taken.
+- **Checkpoint 33 (2026-10-28) = the library lane's fold L2a**: a declarator's name is bound at the end of its own
+  declaration and an ordinary identifier hides a typedef only where C says it does, so a parenthesised name an inner
+  object hides no longer reads as a cast (`(T) - 2` runs 42 as the references do — P0); a tag or member answers the
+  type-name triage as no ordinary name; `sizeof` of a variable-length-array operand, and a cast's or compound
+  literal's variably modified type name, run what C evaluates (subscripts that name something, `++`/`--`) and refuse
+  BY NAME what cannot be sized without running it; `typeof` of a VLA lowers through any number of layers; `nullptr`
+  compares with a null pointer constant (born closed); a comma in a constant-expression position is refused by name
+  (`case 0, 42:` — 0xE09B) and a non-constant case label too (0xE09C); a Phi missing a predecessor's input is refused
+  by the MIR verifier (0xA01B); the constant evaluator, the lowering's statement-expression values and the type
+  resolver's typeof chains walk on heap frames, every walk bounded by what it walks (`substrate::WalkSteps`,
+  `FixpointPasses`, `retryUpTo`), the config tree's nesting limit a configure-time number; a parenthesised call chain
+  parses in work linear in its depth, a probe refuted by a speculation ceiling remembered with the room it had (P1);
+  the grammar loader refuses a left-recursive shape as the spec documents. 13 rows NEW (12 DISCLOSED — 7 fixed here
+  and closing on their arms, 1 half-done, 4 owed by the lane's L2b — and 1 born CLOSED). ✔MEASURED by the lane on its
+  final bytes, one invocation (run 20261022-051913-e29e9814, no filter): macos-arm64-debug and linux-x86_64-debug
+  2877 of 2877, windows-x86_64-debug and windows-x86_64-release 2897 of 2899 (the two reds the anchor guards naming
+  two of the ids this commit applies); its 89 arms `passed` on macos-arm64-debug in the lane. Three registry
+  cross-refs that cited two rows of the retired harness registry (no row holds either id) now state the rule they
+  cited instead.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -672,18 +701,17 @@ round's close; each checkpoint's commit message says what was and was not run on
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the
-  foreign object that bound no library import (P0), every foreign PE object's unwind information dropped. STILL IN THE
+  foreign object that bound no library import (P0), every foreign PE object's unwind information dropped. IN MAIN
+  SINCE CHECKPOINT 33 (the library lane's L2a): the `sizeof` of a VLA operand's side effects, the parenthesised name
+  read as a cast, `case 0, 42:` / `case y:`, the exponential parenthesised call chain, `typeof` of a VLA. STILL IN THE
   LANES — SILENT miscompiles: a name used in a block BEFORE the block declares its own binds to the LATER declaration
   (`int r = y; int y = 2;` under a file-scope `y = 40` runs 2, not 42, at checkpoint 31 — P0, the C front end lane's
-  fold f26c, on the order-aware test the library lane's L2a adds for type names); `sizeof` of an operand of
-  variable-length-array type skips the operand's side effects (`sizeof v[k++]` over a 2-D VLA leaves k alone: 10 forms
-  wrong at checkpoint 31 — the library lane's L2a); a parenthesised name that an inner tag or a later declarator
-  hides read as a CAST through an outer typedef (`(T) - 2` runs −2 where the references run 42); `case 0, 42:` and
-  `case y:` compiled without a diagnostic (the comma's right operand; a run-time compare); a tentative
-  `__declspec(dllimport) int x;` made a DEFINITION where the references import. P0 — a parenthesised call chain
-  parsed in time exponential in its depth, and past a binding speculation-depth ceiling ANY such chain is (the
-  library lane's L2a). LOUD — the PE platform runtime has no `__chkstk` and no `/GS` family (H5); `typeof` of a
-  variable-length array not lowered; no attribute may lead a block-scope `extern`; a shared library holding only data
+  fold f26c); DSS takes "the first copy" and a weak tie by CREATION order — every compiled unit before every named
+  object — never the command line's order every reference uses (a select-any or weak value from the wrong input; P0,
+  the link lane's 3d); `-r` writes a PE weak alias as a second external inside its COMDAT, so link.exe reads the
+  discarded copy (P0, 3d); a tentative `__declspec(dllimport) int x;` made a DEFINITION where the references import
+  (f26b). LOUD — the PE platform runtime has no `__chkstk` and no `/GS` family (H5); no attribute may lead a
+  block-scope `extern`; a shared library holding only data
   (DLL, `.so`, `.dylib`) refused as "an exec with no instructions" on all three formats (the link lane's 3d); a call
   to an undeclared function (C89's implicit declaration, which every reference still compiles) — f26c.
 - **Arm sweeps from the main checkout so far:** the registry held 502 arms at checkpoint 17 (606 at checkpoint 22).

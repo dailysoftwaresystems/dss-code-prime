@@ -222,7 +222,8 @@ additions seldom meet, and its own header states the same rules:
   cites it"*).
 - **A text holds exactly the text**: no line before or after it, one line ending at its end, UTF-8, LF. The
   before-text must stand in its site EXACTLY once — take enough of the surrounding lines to make it so, and no
-  more. The registry itself is ASCII. `.gitattributes` pins the whole directory (`tests/mutations/** text
+  more. The registry itself is UTF-8 with LF line endings, as its texts are; no check enforces a narrower
+  character set, so none is claimed. `.gitattributes` pins the whole directory (`tests/mutations/** text
   eol=lf`), so no checkout rewrites a text; the tool reads a text by its site's line endings either way.
 
 ### The validation — after every edit of the registry, before anything else reads it

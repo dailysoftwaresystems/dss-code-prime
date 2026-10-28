@@ -203,7 +203,11 @@ TEST(EveryDescentReadsTheOneStatement, OverflowPredicateThirdOperandIsABitFieldB
         auto const& in = m.lattice().interner();
         EXPECT_EQ(static_cast<int>(in.kind(targets[0])), static_cast<int>(c.kind))
             << c.form << ": the type the result is cast to";
-        if (c.kind == TypeKind::BitInt) {
+        // The width is read only of a type that HAS one: a wrong kind is this case's red already,
+        // and asking a non-BitInt for its width stops the whole binary (the lattice's loud fatal),
+        // which would read as a crash rather than as this case (MEASURED, check-mutations run
+        // 20261020-090118-4c132d4b: the arm exited 134 and wrote no report).
+        if (c.kind == TypeKind::BitInt && in.kind(targets[0]) == TypeKind::BitInt) {
             EXPECT_EQ(in.bitIntWidth(targets[0]), c.bits) << c.form;
             EXPECT_FALSE(in.bitIntIsSigned(targets[0])) << c.form;
         }
@@ -264,7 +268,10 @@ TEST(EveryDescentReadsTheOneStatement, TheLoweringTakesTheValueTheStatementNames
         for (HirNodeId c : hir.children(id)) stack.push_back(c);
         if (hir.kind(id) == HirKind::SeqExpr) sequences.push_back(id);
     }
-    ASSERT_EQ(sequences.size(), 1u) << "the one statement expression is one sequence";
+    ASSERT_EQ(sequences.size(), 1u)
+        << "the one statement expression is one sequence - the value is the LAST item's expression, "
+           "the literal 7, so no other item is lowered as a value (an assignment's value is a sequence "
+           "of its own)";
     auto const items = hir.children(sequences[0]);
     ASSERT_EQ(items.size(), 2u) << "the assignment run as a statement, then the value";
     EXPECT_EQ(hir.kind(items[1]), HirKind::Literal)
@@ -291,7 +298,7 @@ TEST(EveryDescentReadsTheOneStatement, ALabeledLastItemIsTheValue) {
     ASSERT_EQ(errorsOf(m), 0u) << "the labeled last item: refused by the semantic tier" << described(m);
     DiagnosticReporter reporter{};
     auto const lowered = lowerToHir(m, reporter);
-    ASSERT_NE(lowered, nullptr);
+    ASSERT_NE(lowered, nullptr) << "the labeled last item: the lowering gave no HIR";
     std::string words;
     for (auto const& d : reporter.all()) words += "\n    " + d.actual;
     ASSERT_EQ(reporter.errorCount(), 0u) << "the labeled last item: refused by the lowering" << words;
@@ -305,11 +312,13 @@ TEST(EveryDescentReadsTheOneStatement, ALabeledLastItemIsTheValue) {
         for (HirNodeId c : hir.children(id)) stack.push_back(c);
         if (hir.kind(id) == HirKind::SeqExpr) sequences.push_back(id);
     }
-    ASSERT_EQ(sequences.size(), 2u) << "one statement expression in each function";
+    ASSERT_EQ(sequences.size(), 2u)
+        << "the labeled last item: one statement expression in each function";
     std::size_t withTwoLabels = 0, withOneLabel = 0;
     for (HirNodeId const seq : sequences) {
         auto const items = hir.children(seq);
-        ASSERT_GE(items.size(), 2u);
+        ASSERT_GE(items.size(), 2u)
+            << "the labeled last item: each sequence holds its label before the value";
         std::size_t labels = 0;
         for (HirNodeId const c : items)
             if (hir.kind(c) == HirKind::LabelStmt) ++labels;

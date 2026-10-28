@@ -1,0 +1,2 @@
+                f.phase  = 2;
+                enter(selected, scope);              // may invalidate `f`

@@ -389,7 +389,7 @@ struct DSS_EXPORT HirLoweringConfig {
     std::vector<std::string> foldedConstantRuleNames;
 
     // P31: `__builtin_choose_expr` — the compile-time `?:`. Routed to the SAME
-    // lowering body `genericRule` is (`lowerRecordedSelection`), because the two
+    // lowering `genericRule` is (the recorded-selection frame), because the two
     // differ ONLY in how the semantic tier picked the winner and not at all in
     // what the lowering does with it: read the recorded NodeId out of
     // `nodeToSelectedExpr`, lower that sub-expression, discard the rest.
@@ -408,7 +408,7 @@ struct DSS_EXPORT HirLoweringConfig {
     // (`stmtExpr`). A dedicated operand alt (the `sizeof` / `_Generic`
     // precedent) whose children are STATEMENTS, not expressions — so it must
     // never reach the generic operand descent, which would try to lower a
-    // declaration as a value. The lowering (`lowerStatementExpr`) runs the
+    // declaration as a value. The lowering (`stmtExprValuePrologue`) runs the
     // statements through the ordinary statement machinery and yields the last
     // one's expression, building the ALREADY-EXISTING `HirKind::SeqExpr`
     // ([stmts…, result]) — no new HIR kind, and no MIR change, because MIR's

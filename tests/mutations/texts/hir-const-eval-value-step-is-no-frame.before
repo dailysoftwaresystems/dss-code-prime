@@ -1,1 +1,0 @@
-            if (NodeId const value = valueStepChild(tree, cfg, n, kids); value.valid()) {

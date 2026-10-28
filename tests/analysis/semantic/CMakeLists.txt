@@ -200,6 +200,22 @@ dss_add_test(NAME analysis/semantic/test_constant_conditional_is_balanced
 target_include_directories(dss_analysis_semantic_test_constant_conditional_is_balanced
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 L2 (lane `lm`, the review of checkpoint 29, BLOCKER 1 and MAJOR 3): a folded constant's
+# core states its C type — a float operation rounds to its type, an integer operand converts to
+# it once, a folded builtin has its rule's type. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_folded_constant_states_its_type
+             SOURCES test_folded_constant_states_its_type.cpp)
+target_include_directories(dss_analysis_semantic_test_folded_constant_states_its_type
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 L2 (lane `lm`): an ordinary identifier declared before a type-name position hides a
+# typedef of its spelling there (C 6.2.1p4, p7); a member or a later declaration does not.
+# Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_ordinary_identifier_hides_a_typedef
+             SOURCES test_ordinary_identifier_hides_a_typedef.cpp)
+target_include_directories(dss_analysis_semantic_test_ordinary_identifier_hides_a_typedef
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P69 (lane `lm`, a review's finding B): every descent takes its steps by the ONE statement
 # of what a wrapper is (`nodeSaysSomethingItself`) — the constant evaluator's statement
 # expression and braced scalar, the builtins' operand value through a selection and a

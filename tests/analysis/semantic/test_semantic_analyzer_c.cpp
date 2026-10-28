@@ -1806,6 +1806,43 @@ TEST(SemanticAnalyzerC, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
         << "sizeof(int)==99 must FOLD false — the assertion fails loud";
 }
 
+// P69 L2 (lane `lm`): a `sizeof` of an array TYPE whose bound is itself a `sizeof` is an
+// integer constant expression at every depth, in every constant position. ✔MEASURED by
+// the orchestrator at eb6f22a3 (compile-and-keep run 20261020-114530-c5341e5b): depth 2
+// in a static assertion compiles and runs; ✔MEASURED 2026-10-20 on this lane's L2 tree
+// (run 20261020-112924-a77ebf9b): "not an integer constant expression" at depths 2-16 — a
+// regression of the L2 tree, pinned here. ✔MEASURED, clang 18.1.3 and gcc 13.3.0
+// (`-std=gnu2x`, `-std=c2x -pedantic-errors`): every line below builds and runs.
+TEST(SemanticAnalyzerC, ASizeofOfAnArrayTypeBoundedByASizeofIsAConstant) {
+    for (char const* src : {
+             "_Static_assert(sizeof(char[1]) == 1, \"d1\");\n",
+             "_Static_assert(sizeof(char[sizeof(char[1])]) == 1, \"d2\");\n",
+             "_Static_assert(sizeof(char[sizeof(char[sizeof(char[1])])]) == 1, \"d3\");\n",
+             "int a1[sizeof(char[1])];\n_Static_assert(sizeof a1 == sizeof(int), \"a1\");\n",
+             "int a2[sizeof(char[sizeof(char[1])])];\n_Static_assert(sizeof a2 == sizeof(int), \"a2\");\n",
+             "int a3[sizeof(char[sizeof(char[sizeof(char[1])])])];\n"
+             "_Static_assert(sizeof a3 == sizeof(int), \"a3\");\n",
+             "_Static_assert(_Alignof(char[sizeof(int)]) == 1, \"alignof\");\n",
+             "enum { E = sizeof(char[sizeof(char[2])]) };\n_Static_assert(E == 2, \"enum\");\n",
+             "int f(int x) { switch (x) { case sizeof(char[sizeof(char[3])]): return 1; } return 0; }\n",
+             // neighbours that tell the type name's bound from the declaration's
+             "_Static_assert(sizeof(char[1 + 0]) == 1, \"sum\");\n",
+             "_Static_assert(sizeof(char[(1)]) == 1, \"paren\");\n",
+             "typedef char T1[sizeof(char[1])];\n_Static_assert(sizeof(T1) == 1, \"typedef\");\n",
+         }) {
+        SCOPED_TRACE(src);
+        auto cu = buildShippedUnit("c", {std::string{src} + "int main(void){ return 0; }\n"});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+        std::string errors;
+        for (auto const& d : model.diagnostics().all())
+            if (d.severity == DiagnosticSeverity::Error)
+                errors += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+        EXPECT_EQ(errors, "") << "a sizeof of a VLA-free array type folds at every depth";
+    }
+}
+
 // VLA C2 (D-CSUBSET-VLA) — THE INVARIANT: `sizeof <vla>` is a RUNTIME value, NOT a
 // constant expression (C 6.6). It must therefore DECLINE the const-eval fold in a
 // constant-required context, so `_Static_assert(sizeof a == K)` fails loud (the
@@ -11013,6 +11050,26 @@ TEST(SemanticAnalyzerC, NullptrInitsAndComparesPointer) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
+    // ★ P69 L2a (lane `lm`): and with a NULL POINTER CONSTANT (C23 6.5.9p2: "one operand has type
+    // nullptr_t and the other is a null pointer constant") — `0` on either side, `!=`, a folded
+    // `1 - 1`, and the control `(void *)0`, a null pointer constant of pointer type. ✔MEASURED
+    // 2026-10-22 (probes np_*, gcc 13.3.0 and clang 18.1.3 at -std=gnu2x and -std=c2x
+    // -pedantic-errors): each builds and runs; the gate refused the integer forms.
+    for (char const* const src : {
+             "int f(void){ return nullptr == 0; }\n",
+             "int f(void){ return 0 == nullptr; }\n",
+             "int f(void){ return nullptr != 0; }\n",
+             "int f(void){ return nullptr == 1 - 1; }\n",
+             "int f(void){ return nullptr == (void *)0; }\n",
+         }) {
+        SCOPED_TRACE(src);
+        auto pc = buildShippedUnit("c", { src });
+        assertNoBuilderErrors(*pc);
+        auto pcModel = analyze(pc, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(pcModel.diagnostics(), DiagnosticCode::S_NullptrInvalidOperand), 0u)
+            << "a null pointer constant is a valid peer of nullptr (C23 6.5.9p2)";
+        EXPECT_FALSE(pcModel.hasErrors());
+    }
 }
 
 // `int x = nullptr;` is a constraint violation — nullptr converts only to pointers.
@@ -11148,6 +11205,14 @@ TEST(SemanticAnalyzerC, NullptrRelationalFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
+    // P69 L2a (lane `lm`): a null pointer constant beside it changes nothing — `nullptr < 0` is
+    // refused (C23 6.5.8p2). ✔MEASURED 2026-10-22: gcc 13.3.0 and clang 18.1.3 refuse it at
+    // -std=gnu2x and -std=c2x -pedantic-errors.
+    auto zero = buildShippedUnit("c", { "int f(void){ return nullptr < 0; }\n" });
+    assertNoBuilderErrors(*zero);
+    auto zeroModel = analyze(zero, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(zeroModel.diagnostics(), DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "a relational operator takes no nullptr_t operand, a null pointer constant beside it or not";
 }
 
 // `==` against a NON-pointer, NON-nullptr peer (`nullptr == 5`) is rejected.
@@ -11157,6 +11222,18 @@ TEST(SemanticAnalyzerC, NullptrEqualsIntFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
+    // P69 L2a (lane `lm`): the one integer peer is a NULL POINTER CONSTANT (C23 6.5.9p2) — never
+    // another constant or a non-constant `int`. ✔MEASURED 2026-10-22: gcc 13.3.0 and clang 18.1.3
+    // refuse both at -std=gnu2x and -std=c2x -pedantic-errors.
+    for (char const* const src : {"int f(void){ return nullptr == 1; }\n",
+                                  "int f(int i){ return nullptr == i; }\n"}) {
+        SCOPED_TRACE(src);
+        auto other = buildShippedUnit("c", { src });
+        assertNoBuilderErrors(*other);
+        auto otherModel = analyze(other, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(otherModel.diagnostics(), DiagnosticCode::S_NullptrInvalidOperand), 1u)
+            << "an integer that is no null pointer constant is no peer of nullptr";
+    }
 }
 
 // The gate must NOT fire on a plain assignment `p = nullptr` (handled by isAssignable)
@@ -11188,6 +11265,43 @@ TEST(SemanticAnalyzerC, NullptrUnaryNegFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// P69 L2 (lane `lm`): an OPERATOR applied to `nullptr` is not `nullptr` — the operand
+// question stops at a unary operator and the typer answers for it, and a refused `-`, `+`
+// or `~` of a `nullptr_t` has no type. `- -nullptr` and `~ ~nullptr` are refused ONCE, at
+// the inner operator; `+nullptr` is refused (C 6.5.3.3p1: an arithmetic operand); `!nullptr`
+// (a scalar operand, an `int` result) compares with `0` as the `int` it is. ✔MEASURED
+// 2026-10-20, clang 18.1.3 and gcc 13.3.0 (`-std=gnu2x` and `-std=c2x -pedantic-errors`):
+// one error each for the first three, at the inner operator; the last builds and runs. The `+`
+// row is written with nothing above it (`(void)+nullptr;`, ✔MEASURED refused by both, 2026-10-22):
+// under an `==` the binary gate refuses the `+` expression at the same count, so a `+` admitted by
+// the predicate went unseen (the lane's sweep of 2026-10-22 read that arm survive).
+TEST(SemanticAnalyzerC, AnOperatorAppliedToNullptrIsNotNullptr) {
+    auto neg = buildShippedUnit("c", { "void *f(void){ return - -nullptr; }\n" });
+    assertNoBuilderErrors(*neg);
+    auto negModel = analyze(neg, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(negModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "the outer `-` applies to `-nullptr`, which is no `nullptr`";
+    auto tilde = buildShippedUnit("c", { "int f(void){ return ~ ~nullptr; }\n" });
+    assertNoBuilderErrors(*tilde);
+    auto tildeModel = analyze(tilde, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(tildeModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "the outer `~` applies to `~nullptr`, which has no type";
+    auto pos = buildShippedUnit("c", { "int f(void){ (void)+nullptr; return 0; }\n" });
+    assertNoBuilderErrors(*pos);
+    auto posModel = analyze(pos, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(posModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "unary `+` takes an arithmetic operand";
+    auto bang = buildShippedUnit("c", { "int g(void){ return (!nullptr) == 0; }\n" });
+    assertNoBuilderErrors(*bang);
+    auto bangModel = analyze(bang, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(bangModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(bangModel.hasErrors());
 }
 
 // `nullptr` passed as a VARIADIC argument is rejected (no default arg promotion).

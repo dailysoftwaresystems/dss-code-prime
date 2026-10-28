@@ -308,6 +308,72 @@ TEST(MirVerifier, PhiPredNotInCfgEmitsDiag) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_PhiPredNotInCfg), 1u);
 }
 
+// ── P69 L2 (lane `lm`, D-MIR-VERIFIER-PASSES-A-PHI-MISSING-A-PREDECESSORS-INPUT) ──
+// EVERY WAY INTO THE BLOCK BRINGS THE PHI ITS VALUE. The predecessor check above asked only that
+// a NAMED block be a predecessor; a Phi with NO input from one verified clean, and so did the
+// module a pass had dropped one from. The diamond: `entry` branches to `t` and `e`, both to
+// `join`; the Phi in `join` takes its inputs as each case says.
+namespace {
+// `incomings(ct, ce, tBB, eBB)` builds the Phi's inputs from the two arms' constants and blocks.
+template <typename MakeIncomings>
+[[nodiscard]] Mir phiDiamond(MakeIncomings const& incomings) {
+    MirBuilder b;
+    MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
+    (void)f;
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tBB   = b.createBlock(StructCfMarker::IfThen);
+    MirBlockId const eBB   = b.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join  = b.createBlock(StructCfMarker::IfJoin);
+    b.beginBlock(entry);
+    MirInstId const c1 = b.addConst(intLit(1), kBool);
+    b.addCondBr(c1, tBB, eBB);
+    b.beginBlock(tBB);
+    MirInstId const ct = b.addConst(intLit(10), kI32);
+    b.addBr(join);
+    b.beginBlock(eBB);
+    MirInstId const ce = b.addConst(intLit(20), kI32);
+    b.addBr(join);
+    b.beginBlock(join);
+    std::vector<MirPhiIncoming> const incs = incomings(ct, ce, tBB, eBB);
+    MirInstId const phi = b.addPhi(kI32, incs);
+    b.addReturn(phi);
+    return std::move(b).finish();
+}
+}  // namespace
+
+TEST(MirVerifier, APhiWithoutAnInputFromAPredecessorIsRefused) {
+    Mir const m = phiDiamond([](MirInstId ct, MirInstId, MirBlockId tBB, MirBlockId) {
+        return std::vector<MirPhiIncoming>{MirPhiIncoming{ct, tBB}};   // nothing from `e`
+    });
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor), 1u)
+        << "the Phi takes nothing from the else arm, a way into its block";
+}
+
+TEST(MirVerifier, APhiTakingTwoValuesFromOnePredecessorIsRefused) {
+    Mir const m = phiDiamond([](MirInstId ct, MirInstId ce, MirBlockId tBB, MirBlockId eBB) {
+        return std::vector<MirPhiIncoming>{MirPhiIncoming{ct, tBB}, MirPhiIncoming{ce, tBB},
+                                           MirPhiIncoming{ce, eBB}};
+    });
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor), 1u)
+        << "one edge from the then arm, two different values from it";
+}
+
+TEST(MirVerifier, APhiWithOneInputPerWayInVerifies) {
+    Mir const m = phiDiamond([](MirInstId ct, MirInstId ce, MirBlockId tBB, MirBlockId eBB) {
+        return std::vector<MirPhiIncoming>{MirPhiIncoming{ct, tBB}, MirPhiIncoming{ce, eBB}};
+    });
+    DiagnosticReporter r;
+    MirVerifier v{m};
+    EXPECT_TRUE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor), 0u);
+}
+
 // ── negative: dominance (use of a value defined in a non-dominator block) ───
 
 // A simple cross-block use-without-dominance: define a value in the

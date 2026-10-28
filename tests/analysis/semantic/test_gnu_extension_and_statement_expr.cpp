@@ -134,6 +134,21 @@ loweringCodeCount(std::string const& src, DiagnosticCode code) {
     return countCode(reporter, code) + countCode(model.diagnostics(), code);
 }
 
+// Every error the front end says about `src` — the analysis's and the lowering's.
+[[nodiscard]] std::size_t frontEndErrorCount(std::string const& src) {
+    auto cu = buildShippedUnit("c", {src});
+    SemanticModel model =
+        analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    DiagnosticReporter reporter{};
+    auto lowered = lowerToHir(model, reporter);
+    (void)lowered;
+    std::size_t errors = reporter.errorCount();
+    for (auto const& d : model.diagnostics().all())
+        if (d.severity == DiagnosticSeverity::Error) ++errors;
+    return errors;
+}
+
 // Does ANY symbol carry this name? The discriminator for "did the declaration
 // survive the wrapper" — a prefix rule that parsed and then dropped its
 // declaration is silent everywhere else.
@@ -457,6 +472,11 @@ TEST(GnuStatementExpression, DoesNotStealTheOtherParenLedOperandForms) {
 // clang refuses `&&L` of a label inside one taken outside it and gcc builds it — no
 // reference makes that work. DSS accepted all of them, and the labeled last item landed
 // the goto on the computation of the value. Refused by the construct, in the lowering.
+// ★ P69 L2 (the review of checkpoint 29, NIT 10): a computed goto OUTSIDE a statement
+// expression whose label's address is taken INSIDE it enters it too — refused at the `goto *`.
+// ✔MEASURED 2026-10-20 (probes l2n): clang 18.1.3 refuses both forms below ("cannot jump from
+// this indirect goto statement to one of its possible targets"); gcc 13.3.0 builds them, a
+// program the GNU manual (6.1) calls undefined.
 TEST(GnuStatementExpression, AJumpIntoAStatementExpressionIsRefusedByTheConstruct) {
     constexpr char const* kInto[] = {
         "int f(int c) { int a = 1; if (c) goto L; return a + ({ L: 5; }); }\n",
@@ -468,6 +488,8 @@ TEST(GnuStatementExpression, AJumpIntoAStatementExpressionIsRefusedByTheConstruc
         "int f(int x) { switch (x) { case 1: return ({ default: 5; }); } return 0; }\n",
         "int f(int x) { switch (x) { case 1: ({ case 2: ; }); } return 0; }\n",
         "int f(int c) { void *p = &&L; if (c) goto *p; return ({ L: 5; }); }\n",
+        "int f(int c) { void *p; int v = ({ p = &&L; L: 5; }); if (c) goto *p; return v; }\n",
+        "int f(int c) { void *p; int v = ({ p = &&L; L: 5; }); ({ if (c) goto *p; 0; }); return v; }\n",
     };
     for (char const* fn : kInto) {
         std::string const src = std::string{fn} + "int main(void) { return f(0); }\n";
@@ -477,7 +499,10 @@ TEST(GnuStatementExpression, AJumpIntoAStatementExpressionIsRefusedByTheConstruc
 }
 
 // THE CONTROLS: a jump inside a statement expression, a `switch` inside one, a jump out of
-// one, and `&&L` taken and used inside the one around `L` — both references build each.
+// one, and `&&L` taken and used inside the one around `L` — both references build each; and
+// (NIT 10's controls, ✔MEASURED 2026-10-20 on both) a computed goto out of one, one in a
+// statement expression nested in the one around `L`, and `&&L` taken inside with no computed
+// goto outside.
 TEST(GnuStatementExpression, AJumpInsideOrOutOfAStatementExpressionStands) {
     constexpr char const* kStands[] = {
         "int f(int c) { return ({ int r = 1; if (c) goto L; r = 2; L: r; }); }\n",
@@ -485,10 +510,33 @@ TEST(GnuStatementExpression, AJumpInsideOrOutOfAStatementExpressionStands) {
         "int f(int c) { int r = ({ if (c) goto L; 5; }); return r; L: return 7; }\n",
         "int f(int c) { return ({ void *p = &&L; if (c) goto *p; L: 5; }); }\n",
         "int f(int c) { return ({ int r = ({ if (c) goto L; 1; }); L: r; }); }\n",
+        "int f(int c) { void *p = &&L; int v = ({ if (c) goto *p; 5; }); return v; L: return 7; }\n",
+        "int f(int c) { return ({ void *p = &&L; int r = ({ if (c) goto *p; 0; }); L: 5 + r; }); }\n",
+        "int f(int c) { void *p; int v = ({ p = &&L; L: 5; }); (void)p; (void)c; return v; }\n",
     };
     for (char const* fn : kStands) {
         std::string const src = std::string{fn} + "int main(void) { return f(0); }\n";
         EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_JumpIntoStatementExpression), 0u)
             << src;
     }
+}
+
+// A `case` OR `default` LABEL ON THE VALUE IS STEPPED THROUGH (P69 L2, lane `lm`): such a
+// label's `switch` is outside the statement expression — inside, the `switch` would be the last
+// item — so the program is refused ONCE, for the jump into it. ✔MEASURED 2026-10-16 on the
+// base: the lowering said a second, false thing — "its last statement is not an expression
+// statement" (S_StatementExprHasNoValue) — because the reading of the value stepped through a
+// named label only. With no `switch` around, the label is the stray one it is.
+TEST(GnuStatementExpression, ACaseOrDefaultLabelOnTheValueIsSteppedThrough) {
+    for (char const* label : {"case 2: 5;", "default: 5;"}) {
+        std::string const src = std::string{"int f(int x) { switch (x) { case 1: return ({ "} +
+                                label + " }); } return 0; }\nint main(void) { return f(0); }\n";
+        EXPECT_EQ(loweringCodeCount(src, DiagnosticCode::S_StatementExprHasNoValue), 0u) << src;
+        EXPECT_EQ(frontEndErrorCount(src), 1u) << "the jump into it, said once:\n" << src;
+    }
+    std::string const stray =
+        "int f(void) { return ({ case 2: 5; }); }\nint main(void) { return f(); }\n";
+    EXPECT_EQ(loweringCodeCount(stray, DiagnosticCode::S_StatementExprHasNoValue), 0u);
+    EXPECT_EQ(loweringCodeCount(stray, DiagnosticCode::S_CaseLabelNotInSwitch), 1u)
+        << "a `case` with no `switch` around it is a stray label";
 }

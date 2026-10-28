@@ -115,6 +115,22 @@ target_compile_definitions(core PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
 # a compiler that silently never reports a foreign tree, which is the defect.
 target_compile_definitions(core PRIVATE DSS_BUILD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+# THE CONFIG DOCUMENTS' NESTING LIMIT (cycle P69 L2, lane `lm`). Every reader of a config
+# document takes it (`parseConfigDocument`, core/types/config_document_parse.hpp), so it
+# cannot live in a document the compiler reads at run time: it is the config tree's
+# configure-time document, read HERE by cmake/DssConfigNestingLimit.cmake — which refuses
+# the configure, by name, on a missing or malformed one — and compiled in. Undefined =>
+# config_document_parse.cpp's `#error`; no default stands in for it. The second define
+# names the document in the refusal's sentence. The document is never installed
+# (cmake/DssInstall.cmake), and the install smoke test proves nothing reads it at run time.
+include("${CMAKE_SOURCE_DIR}/cmake/DssConfigNestingLimit.cmake")
+dss_read_config_nesting_limit(
+    "${CMAKE_SOURCE_DIR}/src/dss-config/configure-time/config-documents.json"
+    DSS_CONFIG_MAX_NESTING)
+target_compile_definitions(core PRIVATE
+    DSS_CONFIG_MAX_NESTING=${DSS_CONFIG_MAX_NESTING}
+    DSS_CONFIG_MAX_NESTING_DOCUMENT="configure-time/config-documents.json")
+
 # nlohmann/json is PRIVATE: the include path is a build requirement of `core`'s
 # own sources, NOT a usage requirement re-exported to consumers.
 #

@@ -195,6 +195,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_BracesAroundScalarInitializer";
         case DiagnosticCode::S_ExcessElementsInScalarInitializer:
             return "S_ExcessElementsInScalarInitializer";
+        case DiagnosticCode::S_ConstantExpressionUsesTheCommaOperator:
+            return "S_ConstantExpressionUsesTheCommaOperator";
+        case DiagnosticCode::S_CaseLabelNotConstant:
+            return "S_CaseLabelNotConstant";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:
@@ -444,6 +448,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_AtomicAccessNotLowered:   return "I_AtomicAccessNotLowered";
         case DiagnosticCode::I_CallSignatureMismatch:    return "I_CallSignatureMismatch";
         case DiagnosticCode::I_StoreValueTypeMismatch:   return "I_StoreValueTypeMismatch";
+        case DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor:
+            return "I_PhiIncomingsNotOnePerPredecessor";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";

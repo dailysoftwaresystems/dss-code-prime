@@ -5,6 +5,7 @@
 #include "core/types/call_payload.hpp"
 #include "core/types/grammar_schema.hpp"   // languageMirLoweringConfig's input
 #include "core/types/parse_diagnostic.hpp"
+#include "core/substrate/walk_steps.hpp"   // P69 L2: a walk's bound is what it walks
 #include "core/types/semantic_config.hpp"  // c103: BuiltinLowering (BuiltinCall payload)
 #include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
@@ -7334,8 +7335,10 @@ struct Lowerer {
     [[nodiscard]] TypeId peelArrayLevels(TypeId arrayTy, HirNodeId anchor,
                                          std::vector<TypeId>& levelTypes) {
         TypeId walk = arrayTy;
-        for (int guard = 0; guard < 4096 && walk.valid()
-                            && interner.kind(walk) == TypeKind::Array; ++guard) {
+        // P69 L2 (lane `lm`): bounded by the interner it walks (`WalkSteps`) — a fixed 4096
+        // levels left the levels past it unpeeled, with no stride slot, in silence.
+        for (substrate::WalkSteps steps{interner.size(), "peelArrayLevels' spine"};
+             walk.valid() && interner.kind(walk) == TypeKind::Array; steps.step()) {
             levelTypes.push_back(walk);
             auto const ops = interner.operands(walk);
             if (ops.empty()) {
@@ -7636,17 +7639,40 @@ struct Lowerer {
     // ordering that keeps this copy-down reading R's already-Stored (live) frozen slots.
     [[nodiscard]] MirInstId vlaAllocaFromTypedef(SymbolId a, SymbolId origin, TypeId ty,
                                                  TypeId ptrTy, HirNodeId anchor) {
+        auto const sz = composeOnTypedefOrigin(a, origin, ty, anchor);
+        if (!sz.has_value()) return InvalidMirInst;
+        // Effective alignment from the BASE element (the innermost non-array element)
+        // + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
+        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
+        std::uint32_t const effectiveAlign = vlaEffectiveAlign(sz->baseElemTy, anchor);
+        std::array<MirInstId, 1> aops{sz->totalBytes};
+        MirInstId const av =
+            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
+        addressableLocal[a.v] = av;
+        return av;
+    }
+
+    // ★ P69 L2 (lane `lm`): THE COMPOSITION ON A VLA TYPEDEF'S ORIGIN, shared by an
+    // object (`R a[m];`, `vlaAllocaFromTypedef`, at its declaration) and a TYPEDEF with
+    // dimensions of its own (`typedef R S[m];`, the TypeDecl freeze, at its declaration):
+    // the levels the origin froze are copied down into `a`'s own slots and `a`'s own
+    // dimensions folded above them, so `a`'s size reaches the origin's bound evaluated
+    // ONCE, when the origin was reached, never re-derived. nullopt on a belt fail-loud
+    // (reported).
+    [[nodiscard]] std::optional<VlaByteSize>
+    composeOnTypedefOrigin(SymbolId a, SymbolId origin, TypeId ty, HirNodeId anchor) {
         // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
         // each next via ops[0]) down to the non-array base — the SAME walk
         // `computeVlaByteSize` used when it froze R's slots (so the level SHAPES, hence
         // the slot keys, are identical; the TypeIds too unless the use is qualified).
         std::vector<TypeId> levelTypes;
         TypeId const baseElemTy = peelArrayLevels(ty, anchor, levelTypes);
-        if (!baseElemTy.valid()) return InvalidMirInst;   // belt already reported
+        if (!baseElemTy.valid()) return std::nullopt;   // belt already reported
         if (levelTypes.empty()) {
             unsupported(anchor, "variable-length array typedef object has a non-array "
                                 "top type (internal side-table desync)");
-            return InvalidMirInst;
+            return std::nullopt;
         }
         // ★ WHERE THE OBJECT ENDS AND THE ALIAS BEGINS. `R a;` is the whole object;
         // `R a[m];` puts the object's OWN `[m]` above the alias's spine. The seam is at
@@ -7664,7 +7690,7 @@ struct Lowerer {
                 "own but its type has only {} array level(s), leaving none for the "
                 "typedef it aliases (internal side-table desync)",
                 ownDims, levelTypes.size()));
-            return InvalidMirInst;
+            return std::nullopt;
         }
         // Copy each level R froze down into a's own slot, keyed IDENTICALLY so `a[i]` /
         // `sizeof a[0]` Load them (I3 — copy ONLY the HITS; a fixed intermediate level R
@@ -7676,7 +7702,7 @@ struct Lowerer {
             MirInstId const src = frozenVlaLevelSlot(origin, levelTypes[L]);
             if (!src.valid()) continue;   // R did not freeze this level
             MirInstId const val = copyFrozenVlaLevel(src, a, levelTypes[L]);
-            if (!val.valid()) return InvalidMirInst;
+            if (!val.valid()) return std::nullopt;
             if (L == ownDims) aliasTotal = val;   // the alias's whole-object size
         }
         if (!aliasTotal.valid()) {
@@ -7686,27 +7712,15 @@ struct Lowerer {
             // stale alloca.
             unsupported(anchor, "variable-length array typedef object's origin froze no "
                                 "whole-object size slot (internal side-table desync)");
-            return InvalidMirInst;
+            return std::nullopt;
         }
         // The object's OWN dimensions multiply the alias's frozen size, bottom-up, and
         // freeze each of a's own runtime-sized levels into a's `(a, levelType)` slots —
         // the same fold, the same predicate and the same keys a DIRECTLY declared VLA
         // gets, which is why `sizeof a` and `a[i]` need no separate composed path.
         // `ownDims == 0` folds nothing and returns `aliasTotal` unchanged.
-        auto const sz = computeVlaByteSize(a, ty, anchor, /*freezeLevelSlots=*/true,
-                                           VlaSeed{aliasTotal, ownDims});
-        if (!sz.has_value()) return InvalidMirInst;
-        MirInstId const total = sz->totalBytes;
-        // Effective alignment from the BASE element (the innermost non-array element)
-        // + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
-        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
-        std::uint32_t const effectiveAlign = vlaEffectiveAlign(baseElemTy, anchor);
-        std::array<MirInstId, 1> aops{total};
-        MirInstId const av =
-            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
-                        MirInstFlags::None, /*payload2=*/effectiveAlign);
-        addressableLocal[a.v] = av;
-        return av;
+        return computeVlaByteSize(a, ty, anchor, /*freezeLevelSlots=*/true,
+                                  VlaSeed{aliasTotal, ownDims});
     }
 
     // FC7 (D-FC7-MEMBER-ACCESS): the cached layout of aggregate `aggTy`, or
@@ -8834,7 +8848,10 @@ struct Lowerer {
     // FAILS LOUD rather than form a bogus stride.
     [[nodiscard]] SymbolId vlaIndexRootSymbol(HirNodeId indexNode) const {
         HirNodeId cur = indexNode;
-        for (int guard = 0; guard < 4096 && cur.valid(); ++guard) {
+        // P69 L2 (lane `lm`): bounded by the HIR it walks (`WalkSteps`) — a fixed 4096
+        // subscripts answered "not a single VLA root object" past them.
+        for (substrate::WalkSteps steps{hir.nodeCount(), "vlaIndexRootSymbol's peel"}; cur.valid();
+             steps.step()) {
             HirKind const k = hir.kind(cur);
             if (k == HirKind::Index) {
                 auto kids = hir.children(cur);
@@ -9754,9 +9771,9 @@ struct Lowerer {
     // function is how they cannot.
     [[nodiscard]] TypeId vlaBaseElementType(TypeId t) const {
         TypeId cur = t;
-        for (int guard = 0;
-             guard < 64 && cur.valid() && interner.kind(cur) == TypeKind::Array;
-             ++guard) {
+        // P69 L2 (lane `lm`): bounded by the interner it walks (`WalkSteps`), never 64 levels.
+        for (substrate::WalkSteps steps{interner.size(), "vlaBaseElementType's spine"};
+             cur.valid() && interner.kind(cur) == TypeKind::Array; steps.step()) {
             auto const ops = interner.operands(cur);
             if (ops.empty() || !ops[0].valid()) break;
             cur = ops[0];
@@ -15513,7 +15530,22 @@ struct Lowerer {
                 if (R.valid() && ty.valid()) {
                     bool ok = true;
                     if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
-                        ok = computeVlaByteSize(R, ty, node, /*freezeLevelSlots=*/true)
+                        // ★ P69 L2 (lane `lm`): a typedef with dimensions of its own over
+                        // a VLA typedef or a `typeof` VLA head (`typedef R S[m];`,
+                        // `typedef typeof(int[n]) R, S[m];`) has an origin
+                        // (CST→HIR records it): its levels below its own are the
+                        // origin's, frozen when the origin was reached — composed here as
+                        // an object's are at its declaration (`composeOnTypedefOrigin`).
+                        SymbolId origin{};
+                        if (typedefVlaOriginMap != nullptr
+                            && interner.kind(ty) == TypeKind::Array)
+                            if (auto it = typedefVlaOriginMap->find(R.v);
+                                it != typedefVlaOriginMap->end())
+                                origin = SymbolId{it->second};
+                        ok = (origin.valid()
+                                  ? composeOnTypedefOrigin(R, origin, ty, node)
+                                  : computeVlaByteSize(R, ty, node,
+                                                       /*freezeLevelSlots=*/true))
                                  .has_value();
                     } else if (interner.kind(ty) == TypeKind::Ptr) {
                         auto const pops = interner.operands(ty);

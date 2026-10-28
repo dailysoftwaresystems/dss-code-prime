@@ -68,6 +68,14 @@ dss_add_test(NAME hir/test_scalar_brace_initializer
              SOURCES test_scalar_brace_initializer.cpp)
 target_link_libraries(dss_hir_test_scalar_brace_initializer
                       PRIVATE nlohmann_json::nlohmann_json)
+# P69 L2 (lane `lm`): the comma operator in an integer constant expression — admitted per
+# position (`semantics.integerConstantExpressions`), warned once per comma, refused by name where
+# no reference folds it; a bare top-level comma is no bound, case or designator. A binary of its
+# own: it reads the shipped C document with that block erased or malformed.
+dss_add_test(NAME hir/test_constant_expression_comma_operator
+             SOURCES test_constant_expression_comma_operator.cpp)
+target_link_libraries(dss_hir_test_constant_expression_comma_operator
+                      PRIVATE nlohmann_json::nlohmann_json)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of
@@ -152,3 +160,8 @@ dss_add_test(NAME hir/test_frontend_deep_nesting_probe
              SOURCES test_frontend_deep_nesting_probe.cpp)
 dss_add_test(NAME hir/test_frontend_deep_nesting_costs_heap
              SOURCES test_frontend_deep_nesting_costs_heap.cpp)
+# A `typeof` of a variable-length array type (P69 L2, lane `lm`): the head's bound is captured
+# once, under the first name it declares; every later name reaches that size.
+dss_add_test(NAME hir/test_typeof_of_a_vla SOURCES test_typeof_of_a_vla.cpp)
+dss_add_test(NAME hir/test_a_variable_length_operand_is_evaluated
+             SOURCES test_a_variable_length_operand_is_evaluated.cpp)

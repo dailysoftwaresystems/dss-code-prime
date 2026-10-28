@@ -1,0 +1,5 @@
+            if (false && scalar.empty) {
+                HirLiteralValue zero;
+                zero.core  = TypeKind::I32;
+                zero.value = std::int64_t{0};
+                return convertToCastTarget(ok(std::move(zero)), *resolved->declaredType,

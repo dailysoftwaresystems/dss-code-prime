@@ -35,6 +35,7 @@
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
+#include "core/substrate/walk_steps.hpp"           // P69 L2: a walk's bound is what it walks
 #include "core/types/string_style.hpp"
 #include "core/types/symbol_attrs.hpp"   // P50: SymbolBinding::Local (the internal-linkage facet)
 // Inline-asm P5: `asmConstraint(letter)` / `declaredAsmConstraintLetters()` /
@@ -267,6 +268,7 @@ struct EngineState {
           nodeToSymbol{cu},
           nodeToType{cu},
           derivedExprType{cu},
+          literalLeavesWalked{cu},
           nodeToSelectedExpr{cu},
           nodeToFoldedConstant{cu},
           nullPointerConstantNodes{cu},
@@ -348,12 +350,11 @@ struct EngineState {
         ScopeId scope;
         TypeId  type;
     };
-    // `mutable` because this is a MEMO behind a logically-const read: the typer's
-    // handle is `EngineState const&` (the same reason the interner handle is taken
-    // by const_cast there). Recording an answer the walk already computed changes
-    // no observable state — the stamp table, the symbols and the diagnostics are
-    // untouched.
-    mutable UnitAttribute<DerivedExprType> derivedExprType;
+    // A MEMO the typer writes through its `EngineState&` (P69 L2, lane `lm`: the typer
+    // took `EngineState const&` and wrote this through `mutable` and a const_cast — a const
+    // handle that mutated). Recording an answer the walk already computed changes no
+    // observable state — the stamp table, the symbols and the diagnostics are untouched.
+    UnitAttribute<DerivedExprType> derivedExprType;
 
     // The two counters THE PIN reads (`SemanticModel::exprType{Queries,NodeVisits}`).
     // ★ TWO, NOT ONE, AND THE SECOND IS NOT A REFINEMENT OF THE FIRST. `queries`
@@ -361,10 +362,18 @@ struct EngineState {
     // nodes the walks actually CLASSIFIED. With only the second, "the record made
     // this free" and "the question is no longer asked at all" are the same number —
     // and the second of those is a correctness regression wearing a performance
-    // win's clothes. Mutable because the typer's handle is `EngineState const&` (it
-    // is a logically-const read); the same reason the interner handle is const_cast.
-    mutable std::uint64_t exprTypeQueries    = 0;
-    mutable std::uint64_t exprTypeNodeVisits = 0;
+    // win's clothes. Counted by the typer through its `EngineState&`.
+    std::uint64_t exprTypeQueries    = 0;
+    std::uint64_t exprTypeNodeVisits = 0;
+
+    // The nodes `preStampLiteralLeaves` has walked (P69 L2, lane `lm`, the recursion row
+    // D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL): a later walk stops at
+    // one, so each node is walked ONCE however many nested expressions ask. The constant
+    // evaluator asks the type of every conditional it balances (`buildConstEvalEnv`'s
+    // `resolveExpressionType`), and each ask walked its whole subtree again — O(n^2) over a
+    // chain of conditionals. A literal's stamp is the same whoever writes it and nothing
+    // removes one, so the record never goes stale.
+    UnitAttribute<bool> literalLeavesWalked;
 
     // Drop every derived-expression-type entry. Called at each PASS boundary — see
     // the record's own note above for why a pass is the right unit.
@@ -755,6 +764,12 @@ struct EngineState {
         auto const* p = nodeToSymbol.tryGet(id);
         return p ? *p : InvalidSymbol;
     }
+
+    // P69 L2 (lane `lm`): the comma operators S_ConstantExpressionUsesTheCommaOperator has been
+    // said for, keyed `arenaTag << 32 | v` (a NodeId's equality reads `.v` alone, and a unit holds
+    // many trees). An integer constant expression is folded again by later passes and by the
+    // callers that re-ask it; the constraint's diagnostic is owed once per comma.
+    std::unordered_set<std::uint64_t> commaOperatorsWarned;
 };
 
 // Visible (non-EmptySpace) children of `parent` — the indexing convention
@@ -794,15 +809,18 @@ visibleChildren(Tree const& tree, NodeId parent) {
 // The token test lives HERE now, once. A node that is neither Internal nor Token
 // is an Error node and is SKIPPED — it carries its own ParseDiagnostic, so the
 // refusal is already reported and a specifier scan has nothing to learn from it.
-// `guardBudget` keeps the caller's existing bound (an input-proportional walk is
-// heap, not host stack — [[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]]).
+// The walk is bounded by the tree it walks (`WalkSteps`; P69 L2, lane `lm`): it took a literal
+// `guardBudget` of 8192 from every caller and stopped there in silence, so a specifier prefix past it
+// read as if it had ended (an input-proportional walk is heap, not host stack —
+// [[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]]).
 // `fn` returns false to STOP the walk early (the callers that answer a yes/no
 // question), true to continue.
 template <typename Fn>
-void forEachTokenLeafUnder(Tree const& tree, NodeId root, int guardBudget, Fn&& fn) {
+void forEachTokenLeafUnder(Tree const& tree, NodeId root, Fn&& fn) {
     if (!root.valid()) return;
     std::vector<NodeId> stack{root};
-    for (int guard = 0; guard < guardBudget && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "forEachTokenLeafUnder's walk"}; !stack.empty();
+         steps.step()) {
         NodeId const c = stack.back(); stack.pop_back();
         if (tree.kind(c) == NodeKind::Internal) {
             for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
@@ -845,7 +863,8 @@ nodeHasVisibleChildOfRule(Tree const& tree, NodeId node, RuleId childRule) {
 // (an empty always-emitted run), which can only mean there was nothing to stamp.
 [[nodiscard]] std::uint32_t leftmostTokenOffset(Tree const& tree, NodeId node) {
     NodeId cur = node;
-    for (int guard = 0; guard < 4096 && cur.valid(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "leftmostTokenOffset's descent"};
+         cur.valid(); steps.step()) {
         if (tree.kind(cur) == NodeKind::Token) {
             return static_cast<std::uint32_t>(tree.span(cur).start());
         }
@@ -943,7 +962,8 @@ paramStarSuffixesOfOwnParamList(Tree const& tree, NodeId fnSuffix,
         auto const kids = visibleChildren(tree, fnSuffix);
         for (std::size_t i = kids.size(); i-- > 0;) stk.push_back(kids[i]);
     }
-    for (int guard = 0; guard < 1'000'000 && !stk.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "paramStarSuffixesOfOwnParamList's walk"};
+         !stk.empty(); steps.step()) {
         NodeId const cur = stk.back();
         stk.pop_back();
         if (tree.kind(cur) != NodeKind::Internal) continue;
@@ -1034,7 +1054,8 @@ headNamesPotentialTypedef(Tree const& tree, NodeId headNode,
                           SchemaTokenId identifierToken) {
     if (!headNode.valid() || !identifierToken.valid()) return false;
     std::vector<NodeId> stk{headNode};
-    for (int guard = 0; guard < 4096 && !stk.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "headNamesPotentialTypedef's walk"};
+         !stk.empty(); steps.step()) {
         NodeId const cur = stk.back();
         stk.pop_back();
         if (tree.kind(cur) == NodeKind::Token) {
@@ -1250,7 +1271,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                  NodeId node, ScopeId scope, ReturnRule const& ret);
 void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
-[[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
+[[nodiscard]] TypeId subtreeType(EngineState& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
 [[nodiscard]] std::optional<std::uint32_t>
 semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const& tree,
@@ -1286,7 +1307,7 @@ struct GenericSelection {
     std::vector<NodeId> typedAssocTypeNodes;   // pass2Post re-resolves (loud) + stamps
 };
 [[nodiscard]] GenericSelection
-selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
+selectGenericAssociation(EngineState& s, SemanticConfig const& cfg,
                          Tree const& tree, NodeId node, ScopeId scope,
                          TypeId controllingType);
 // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the ONE literal-typing chokepoint
@@ -1348,7 +1369,7 @@ struct MemberResolution {
     bool        dereferences   = false;  // arrow form (NotAComposite message disambiguation)
 };
 [[nodiscard]] MemberResolution
-resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
+resolveMemberAccess(EngineState& s, SemanticConfig const& cfg,
                     Tree const& tree, NodeId node, ScopeId scope);
 
 // FC6 (C99 §6.7.2.1p18): does `t` CONTAIN a flexible array member — i.e. is it a
@@ -1406,7 +1427,8 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
         return !ops.empty() && ops[0] == headTy;
     }
     TypeId walk = declTy;
-    for (int guard = 0; guard < 4096 && in.kind(walk) == TypeKind::Array; ++guard) {
+    for (substrate::WalkSteps steps{in.size(), "declaredTypeDerivesFromAliasHead's array spine"};
+         in.kind(walk) == TypeKind::Array; steps.step()) {
         auto const ops = in.operands(walk);
         if (ops.empty()) return false;
         walk = ops[0];
@@ -1658,11 +1680,11 @@ specifierPrefixQualifierTokens(Tree const& tree, NodeId declNode,
     for (auto const& child : tree.children(prefix)) {
         if (isEmptySpace(tree.flags(child))) continue;
         NodeId cur = child;
-        // Bounded: a wrapper chain is one or two levels in every shipped
-        // grammar, and a cap turns a corrupt node graph into a miss instead of
-        // a hang (the `declaratorNameNode` depth-cap posture).
-        for (int step = 0; step < 8 && cur.valid()
-                           && tree.kind(cur) == NodeKind::Internal; ++step) {
+        // Each step goes to the sole visible child, a strict descendant, so the tree it walks
+        // bounds the peel (`substrate::WalkSteps`; P69 L2): a wrapper chain is one or two levels
+        // in every shipped grammar, and a fixed 8 would have read a ninth as a miss in silence.
+        for (substrate::WalkSteps steps{tree.nodeCount(), "specifierPrefixQualifierTokens' peel"};
+             cur.valid() && tree.kind(cur) == NodeKind::Internal; steps.step()) {
             cur = soleVisibleChild(cur);
         }
         if (cur.valid() && tree.kind(cur) == NodeKind::Token) out.push_back(cur);
@@ -1728,10 +1750,10 @@ prefixQualifiersHave(Tree const& tree, std::span<NodeId const> prefixQualifiers,
     for (auto const& child : tree.children(head)) {
         if (isEmptySpace(tree.flags(child))) continue;
         NodeId cur = child;
-        // Bounded, as the prefix walk is: a wrapper chain is a few levels in every
-        // shipped grammar, and a cap turns a corrupt node graph into a miss.
-        for (int step = 0; step < 8 && cur.valid()
-                           && tree.kind(cur) == NodeKind::Internal; ++step) {
+        // Bounded as the prefix walk is, by the tree it walks (`substrate::WalkSteps`): each step
+        // is a strict descendant.
+        for (substrate::WalkSteps steps{tree.nodeCount(), "headTypeNameToken's peel"};
+             cur.valid() && tree.kind(cur) == NodeKind::Internal; steps.step()) {
             cur = soleVisibleChild(cur);
         }
         if (isName(cur)) return cur;
@@ -1863,7 +1885,9 @@ private:
         for (auto const& child : tree.children(head)) {
             if (isEmptySpace(tree.flags(child))) continue;
             NodeId cur = child;
-            for (int step = 0; step < 8 && cur.valid(); ++step) {
+            // Each step is a strict descendant: the tree it walks bounds the peel.
+            for (substrate::WalkSteps steps{tree.nodeCount(), "headTypeofNode's peel"}; cur.valid();
+                 steps.step()) {
                 if (isTypeof(cur)) return cur;
                 if (tree.kind(cur) != NodeKind::Internal) break;
                 cur = soleVisibleChild(cur);
@@ -2101,12 +2125,13 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     // `.data` instead of relocated-read-only relro on EVERY format (correctness-
     // neutral at runtime — a writable const table still links + runs — but it
     // dropped the relro hardening + the object's const-ness). visibleChildren is
-    // source-ordered; the depth cap turns a corrupt/cyclic node graph into a
-    // bounded miss (→ head scan) instead of a hang, mirroring declaratorNameNode.
+    // source-ordered. The walk is bounded by the tree (`WalkSteps`, P69 L2): a fixed 4096-step
+    // cap read a declarator deeper than it as a miss (→ head scan) in silence, and only a
+    // cyclic node graph can take more steps than the tree has nodes.
     NodeId lastLayer{};
     NodeId cur = inner;
-    for (std::size_t step = 0;
-         step < declarator_walk_detail::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "declaratorObjectIsConst's layer walk"};;
+         steps.step()) {
         if (!cur.valid() || tree.kind(cur) != NodeKind::Internal
             || tree.rule(cur) != dc.declaratorRule) {
             break;
@@ -2322,20 +2347,6 @@ readDeclaratorChain(Tree const& tree, NodeId start, DeclaratorConfig const& dc,
         if (!innerD.valid()) return false;
         d = innerD;
     }
-}
-
-// ★ P68 round 13 (lane `cs`): the ONE answer of a walk that has taken more steps than its
-// tree has nodes. Every uncapped walk that calls this moves to a strict descendant (or a
-// strict ancestor) at each step, so on a well-formed tree it can never get here; getting
-// here means the node graph is cyclic — memory corruption or a TreeBuilder bug, never the
-// program's fault — and the process stops loud, as `readDeclaratorChain` does. Never an
-// answer as if the walk had ended: a truncated walk is how the fixed depth caps these walks
-// replace skipped a constraint or admitted what they had not checked.
-[[noreturn]] void
-failOnCyclicTree(char const* walk) {
-    std::fprintf(stderr, "dss::analyze fatal: %s took more steps than its tree has nodes "
-                         "— the node graph is cyclic\n", walk);
-    std::abort();
 }
 
 [[nodiscard]] std::optional<QualifierSpine>
@@ -3378,7 +3389,7 @@ void reportTagDeclaredInParameterList(EngineState& s, Tree const& tree,
 // the array-dimension / alignas / static_assert consumers use.
 [[nodiscard]] std::optional<std::int64_t>
 constIntExpr(EngineState& s, Tree const& tree, NodeId node, ScopeId fromScope,
-             SemanticConfig const* cfg);
+             SemanticConfig const* cfg, std::optional<IntegerConstantPosition> position);
 
 // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the builtin-call
 // helpers, DEFINED with `checkBuiltinVerbCall` beside `checkCall`; declared here because
@@ -3606,6 +3617,76 @@ pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 [[nodiscard]] bool pointeeSpinesDiverge(std::optional<QualifierSpine> const& a,
                                         std::optional<QualifierSpine> const& b);
 
+// ★ P69 L2 (lane `lm`): WHERE AN ORDINARY IDENTIFIER'S SCOPE BEGINS, in its own tree
+// (C 6.2.1p7): "just after the completion of its declarator" — the outermost
+// declarator around its name node (the name climbs through the declarator, its
+// direct declarator and any grouping parentheses; every suffix sits inside them) —
+// or, for a name a declaration binds without a declarator (an enumeration constant,
+// whose scope begins after its enumerator), just after its declaration node.
+// std::nullopt when the record holds no position in `tree` (a symbol of another
+// tree of the unit, a seed, a builtin): the caller keeps its tree-blind answer.
+// The scope tree binds a whole block's declarations up front, so this position is
+// what tells a declaration BEFORE a use from one after it.
+//
+// THE CONTRACT (self-contained: one rule, no state; a caller compares, this decides
+// nothing else):
+//   * it reads only `cfg.declarators` (the declarator, direct-declarator and group
+//     rules), `tree` (parents, rules, spans) and the record's `tree`, `declNode` and
+//     `declRuleNode` - no scope, symbol table or analysis state;
+//   * the record must sit in `tree`, the USE's own tree; otherwise std::nullopt;
+//   * the answer is the END of the completed declarator: climbed from `declNode`
+//     through the declarator, direct-declarator and group rules, the outermost
+//     declarator reached; with no declarator, the end of the declaration-rule node,
+//     else of `declNode` itself;
+//   * a use whose own span starts at byte `u` of `tree` sees the record iff the
+//     answer is present and at or before `u` (the caller's `*begins <= useAt`).
+[[nodiscard]] std::optional<ByteOffset>
+ordinaryScopeBeginsAt(SemanticConfig const& cfg, Tree const& tree,
+                      SymbolRecord const& rec) {
+    if (rec.tree.v != tree.id().v || !rec.declNode.valid()) return std::nullopt;
+    NodeId declarator = InvalidNode;
+    if (cfg.declarators.has_value()) {
+        DeclaratorConfig const& dc = *cfg.declarators;
+        substrate::WalkSteps steps{tree.nodeCount(), "ordinaryScopeBeginsAt"};
+        for (NodeId up = tree.parent(rec.declNode); up.valid(); up = tree.parent(up)) {
+            steps.step();
+            std::optional<RuleId> const r = tree.ruleIfInternal(up);
+            if (!r.has_value()) break;
+            if (*r == dc.declaratorRule) { declarator = up; continue; }
+            if (*r == dc.directRule || *r == dc.groupRule) continue;
+            break;
+        }
+    }
+    NodeId const completed = declarator.valid()            ? declarator
+                             : rec.declRuleNode.valid()    ? rec.declRuleNode
+                                                           : rec.declNode;
+    return tree.span(completed).end();
+}
+
+// ★ P69 L2 (lane `lm`): A STRUCTURE OR UNION MEMBER is no ordinary identifier — each
+// structure or union has its own name space of members (C 6.2.3) — so a member
+// spelled like a typedef hides nothing: `typedef int T; struct S { int T; T x; };`
+// declares x of the typedef's type (✔MEASURED gcc 13.3.0 and clang 18.1.3, gnu2x and
+// c2x -pedantic-errors: builds and runs). The scope tree binds members in their
+// composite's body scope beside ordinary names, so the type-name lookup must tell
+// them apart: a member is a symbol a composite's FIELD row minted, where the
+// composite does not republish its names (an enumeration constant is republished,
+// ordinary, and does hide).
+[[nodiscard]] bool namesAMember(SemanticConfig const& cfg, Tree const& tree,
+                                SymbolRecord const& rec) {
+    if (rec.isEnumerator || rec.tree.v != tree.id().v || !rec.declRuleNode.valid())
+        return false;
+    std::optional<RuleId> const row = tree.ruleIfInternal(rec.declRuleNode);
+    if (!row.has_value()) return false;
+    for (auto const& decl : cfg.declarations) {
+        if (decl.fieldChildren.has_value() && !decl.fieldChildren->liftToEnclosingScope
+            && decl.fieldChildren->rule == *row) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // `inferOuterArrayLength` (P68 round 9, lane `cs`): the ONE type-name position whose
 // OUTERMOST array bound may be absent because the construct completes it — a compound
 // literal's `(T[]){ … }` (C 6.5.2.5p4: the size is determined by its initializer). It
@@ -3779,7 +3860,8 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     specifierDiagnosed = true;
                 };
                 auto const width =
-                    constIntExpr(s, tree, bitKids[cfg.bitIntWidthChild], scope, &cfg);
+                    constIntExpr(s, tree, bitKids[cfg.bitIntWidthChild], scope, &cfg,
+                                 IntegerConstantPosition::BitPreciseIntegerWidth);
                 if (!width.has_value()) {
                     emitWidth(DiagnosticCode::S_BitIntWidthNotConstant,
                               "`_BitInt(N)` requires an integer constant-expression "
@@ -4101,11 +4183,77 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     && tree.tokenKind(tkids[0]) == *cfg.typeofStripQualifiersToken;
                 TypeId raw = InvalidType;
                 if (isTypeofType) {
-                    // TYPE-NAME operand: recurse the SAME type resolver (an
-                    // unknown type-name fails loud S_UnknownType for free).
-                    raw = resolveTypeNodeImpl(s, cfg, tree, operandNode, scope,
-                                              emitOnMiss, emitTypeUse,
-                                              specifierDiagnosed);
+                    // ★ P69 L2 (lane `lm`): A TYPE NAME THAT IS NOTHING BUT ANOTHER
+                    // `typeof` OF A TYPE NAME IS PEELED IN A LOOP — `typeof(typeof(int))`.
+                    // Resolving it by recursion cost this resolver's frame once per
+                    // wrapper of every level (✔MEASURED 2026-10-20, macos-arm64-debug:
+                    // three nested `typeof`s overflowed a 256 KiB stack in the analysis;
+                    // 64 MiB took them). The innermost operand is resolved once, then
+                    // each peeled layer, innermost first, records what its own arm
+                    // records — its type (stripped by `typeof_unqual`) and its operand's
+                    // qualifier claim — exactly as the recursion did. A type name with
+                    // anything else in it (a qualifier, a star, a declarator, an
+                    // attribute) is no peel: it is resolved as before. Between two
+                    // layers stand only WRAPPERS — a node whose one visible child is the
+                    // next — and the generic descent below returns a wrapper's child's
+                    // type unchanged (no qualifier, star, declarator or attribute among
+                    // its children to apply), so passing through one is that descent.
+                    // A node an earlier arm owns (a type shape, a declaration row, an
+                    // attribute run) is never passed through.
+                    auto const soleTypeofOf = [&](NodeId typeName) -> NodeId {
+                        NodeId n = typeName;
+                        for (substrate::WalkSteps steps{tree.nodeCount(), "the nested typeof peel"};
+                             n.valid() && tree.kind(n) == NodeKind::Internal; steps.step()) {
+                            RuleId const r = tree.rule(n);
+                            if (r.v == cfg.typeofTypeRule.v) return n;
+                            if (s.idx().typeShapeByRule.contains(r.v)
+                                || s.idx().declByRule.contains(r.v)
+                                || isAttributeRunNode(tree, n)) {
+                                break;
+                            }
+                            auto const ck = visibleChildren(tree, n);
+                            if (ck.size() != 1 || tree.kind(ck[0]) != NodeKind::Internal) break;
+                            n = ck[0];
+                        }
+                        return NodeId{};
+                    };
+                    struct PeeledTypeof { NodeId node; NodeId operand; bool strip; };
+                    std::vector<PeeledTypeof> peeled;
+                    NodeId innermost = operandNode;
+                    for (substrate::WalkSteps steps{tree.nodeCount(), "the nested typeof layers"};;
+                         steps.step()) {
+                        NodeId const nested = soleTypeofOf(innermost);
+                        if (!nested.valid()) break;
+                        auto const nk = visibleChildren(tree, nested);
+                        if (cfg.typeofOperandChild >= nk.size()) break;   // its own arm says so
+                        bool const nestedStrip =
+                            cfg.typeofStripQualifiersToken.has_value()
+                            && tree.kind(nk[0]) == NodeKind::Token
+                            && tree.tokenKind(nk[0]) == *cfg.typeofStripQualifiersToken;
+                        innermost = nk[cfg.typeofOperandChild];
+                        peeled.push_back({nested, innermost, nestedStrip});
+                    }
+                    // TYPE-NAME operand: the SAME type resolver (an unknown type-name
+                    // fails loud S_UnknownType for free). A peeled layer's operand was
+                    // reached by the wrapper descent, which asks with emitOnMiss off.
+                    raw = resolveTypeNodeImpl(s, cfg, tree, innermost, scope,
+                                              peeled.empty() ? emitOnMiss : false,
+                                              emitTypeUse, specifierDiagnosed);
+                    for (auto layer = peeled.rbegin(); layer != peeled.rend() && raw.valid();
+                         ++layer) {
+                        TypeId const layerResult =
+                            layer->strip ? s.lattice.interner().stripVolatile(raw) : raw;
+                        s.nodeToType.set(layer->node, layerResult);
+                        if (auto layerClaim =
+                                typeNameQualifierSpine(s, cfg, tree, layer->operand)) {
+                            if (layer->strip) {
+                                layerClaim->constBits    &= ~std::uint64_t{1};
+                                layerClaim->restrictBits &= ~std::uint64_t{1};
+                            }
+                            s.typeofClaimByNode.set(layer->node, std::move(*layerClaim));
+                        }
+                        raw = layerResult;
+                    }
                 } else {
                     // EXPRESSION operand (UNEVALUATED, 6.7.2.5p2). C 6.7.2.5
                     // constraint: a bit-field member has no nameable type. The descent
@@ -4129,10 +4277,9 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // and never saw a member access below them, so a bit-field operand
                     // inside 64 or more parentheses escaped the constraint. Each step goes
                     // to a strict descendant, so the tree's node count bounds the walk
-                    // (`failOnCyclicTree` past it).
-                    std::size_t const probeBound = tree.nodeCount() + 1;
-                    for (std::size_t step = 0; probe.valid(); ++step) {
-                        if (step > probeBound) failOnCyclicTree("the typeof bit-field probe");
+                    // (`substrate::failOnCyclicWalk` past it).
+                    for (substrate::WalkSteps steps{tree.nodeCount(), "the typeof bit-field probe"};
+                         probe.valid(); steps.step()) {
                         if (tree.kind(probe) == NodeKind::Internal
                             && s.idx().memberAccessByRule.contains(
                                    tree.rule(probe).v)) {
@@ -4702,12 +4849,36 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // A name with NO usable binding anywhere on the chain still returns
         // InvalidType and the caller's miss arm fails LOUD — this widens WHERE
         // a type may be found, never WHETHER a miss is reported.
+        //
+        // ★ P69 L2 (lane `lm`): AN ORDINARY IDENTIFIER THAT IS NOT A TYPE HIDES THE
+        // TYPEDEF FROM THE END OF ITS DECLARATOR (C 6.2.1p4 + p7). The skip above
+        // was for a binding the use cannot see yet; it skipped EVERY non-type
+        // binding, so an object, a function, a parameter or an enumeration constant
+        // declared BEFORE the use in an inner scope was walked past to the outer
+        // typedef, and a type name it hides resolved silently. ✔MEASURED at
+        // eb6f22a3 (pe64, image run natively): `typedef int T; … int T = 44; {
+        // struct T {…}; return (T) - 2; }` RAN -2 (the cast through the outer
+        // typedef; gcc 13.3.0 and clang 18.1.3: 42), and `_Generic(0, T: …)` /
+        // `va_arg(ap, T)` under such an object are refused by both ("unknown type
+        // name 'T'"). Such a binding is now the answer when it is in the use's tree
+        // and its scope has begun at the use (`ordinaryScopeBeginsAt`): the arm
+        // returns InvalidType and the caller's miss reports it. One declared after
+        // the use, or in another tree, is still skipped as before.
         if (scope.valid()) {
+            ByteOffset const useAt = tree.span(node).start();
             SymbolId const aliasSym =
-                s.scopes.lookupIf(scope, text, [&s](SymbolId cand) {
+                s.scopes.lookupIf(scope, text, [&s, &cfg, &tree, useAt](SymbolId cand) {
                     auto const& r = s.symbols.at(cand);
-                    return r.kind == DeclarationKind::Type && r.type.valid();
+                    if (r.kind == DeclarationKind::Type) return r.type.valid();
+                    if (namesAMember(cfg, tree, r)) return false;   // not ordinary
+                    std::optional<ByteOffset> const begins =
+                        ordinaryScopeBeginsAt(cfg, tree, r);
+                    return begins.has_value() && *begins <= useAt;
                 });
+            if (aliasSym.valid()
+                && s.symbols.at(aliasSym).kind != DeclarationKind::Type) {
+                return InvalidType;   // hidden by an ordinary identifier in scope
+            }
             if (aliasSym.valid()) {
                 // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES) — THE TYPEDEF'S USE
                 // SITE. A TAG use is warned by Pass 2's reference-resolution
@@ -5344,9 +5515,44 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
     return env;
 }
 
+// ── P69 L2 (lane `lm`): AN INTEGER CONSTANT EXPRESSION IS ASKED FOR AT A POSITION ─────────────
+// The 6.6p10 forms the language admits at `position` (`semantics.integerConstantExpressions`;
+// `IntegerConstantPosition` says why per position) go into `options`; without a position — a
+// null pointer constant, an alignment, a `__builtin_choose_expr` condition, every compile-time
+// ANSWER that is no constraint's position — the standard's forms only. The engine tells `env`'s
+// sink each comma it folded in the expression asked for; `sayAdmittedForms` then says the
+// constraint's warning (C 6.6p3) once per comma, and only for a fold that ANSWERED — a refused
+// expression's own error is its one message.
+void admitFormsAt(SemanticConfig const* cfg, std::optional<IntegerConstantPosition> position,
+                  EvalOptions& options, CstEvalEnvironment& env, std::vector<NodeId>& commas) {
+    if (cfg == nullptr || !position.has_value()) return;
+    options.admittedForms = cfg->integerConstantExpressions.at(*position);
+    if (options.admittedForms.empty()) return;
+    env.noteConstantForm = [&commas](ConstantForm form, NodeId at) {
+        if (form == ConstantForm::CommaOperator) commas.push_back(at);
+    };
+}
+
+void sayAdmittedForms(EngineState& s, Tree const& tree, std::vector<NodeId> const& commas) {
+    for (NodeId const at : commas) {
+        std::uint64_t const key = (static_cast<std::uint64_t>(at.arenaTag) << 32) | at.v;
+        if (!s.commaOperatorsWarned.insert(key).second) continue;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ConstantExpressionUsesTheCommaOperator;
+        d.severity = DiagnosticSeverity::Warning;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at);
+        d.actual   = std::format("'{}' uses the comma operator in an integer constant expression "
+                                 "(C 6.6p3 excludes it; the language admits it in this position)",
+                                 tree.text(at));
+        s.reporter.report(std::move(d));
+    }
+}
+
 [[nodiscard]] std::optional<std::int64_t>
 constIntExpr(EngineState& s, Tree const& tree, NodeId node,
-             ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
+             ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr,
+             std::optional<IntegerConstantPosition> position = std::nullopt) {
     if (!node.valid()) return std::nullopt;
     auto intLits = integerLiteralTokenSet(s);
     // FC17 F2: the fixed-value keyword literals (`true`/`false`) fold in EVERY
@@ -5392,10 +5598,14 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's answer for plain
     // `char`, so `int a[('ÿ' < 0) ? 1 : 2]` sizes as the references do.
     options.charIsUnsigned = s.charIsUnsigned;
+    std::vector<NodeId> commas;
+    admitFormsAt(cfg, position, options, env, commas);
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, options,
                                                  fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
-    return asInt64Bridge(*r.value);
+    auto const answer = asInt64Bridge(*r.value);
+    if (answer.has_value()) sayAdmittedForms(s, tree, commas);
+    return answer;
 }
 
 // ── P31: `__builtin_offsetof` + `__builtin_types_compatible_p` (see the
@@ -5724,7 +5934,8 @@ genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 //     so `constexpr int N = M + 1;` resolves M exactly as `int a[M + 1]` does.
 [[nodiscard]] std::optional<HirLiteralValue>
 constExprValue(EngineState& s, Tree const& tree, NodeId node,
-               ScopeId fromScope, SemanticConfig const* cfg) {
+               ScopeId fromScope, SemanticConfig const* cfg,
+               std::optional<IntegerConstantPosition> position = std::nullopt) {
     if (!node.valid()) return std::nullopt;
     auto intLits   = integerLiteralTokenSet(s);
     auto floatLits = floatLiteralTokenSet(s);
@@ -5749,9 +5960,12 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     // both const-expr entry points, so a constexpr initializer and an array
     // dimension cannot read the same `'ÿ'` differently.
     options.charIsUnsigned = s.charIsUnsigned;
+    std::vector<NodeId> commas;
+    admitFormsAt(cfg, position, options, env, commas);
     ConstEvalResult const r =
         evaluateConstantCst(node, ctx, env, options, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
+    sayAdmittedForms(s, tree, commas);
     return r.value;
 }
 
@@ -5768,13 +5982,11 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
 // has no single Internal child to pass through to (a leaf; a node with several operands
 // the statement does not name). Returns `n` itself when nothing is interposed; never
 // leaves the subtree. `what` names the descent for the one failure a strict-descendant
-// walk can have: a cyclic, malformed tree (`failOnCyclicTree`).
+// walk can have: a cyclic, malformed tree (`substrate::failOnCyclicWalk`).
 [[nodiscard]] NodeId
 peelGroupingWrappers(SemanticConfig const& cfg, Tree const& tree, NodeId n, char const* what) {
     auto const& hirCfg = tree.schema().hirLowering();
-    std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
-    for (std::size_t guard = 0; n.valid(); ++guard) {
-        if (guard > bound) failOnCyclicTree(what);
+    for (substrate::WalkSteps steps{tree.nodeCount(), what}; n.valid(); steps.step()) {
         if (tree.kind(n) != NodeKind::Internal
             || nodeSaysSomethingItself(cfg, hirCfg, tree, n)) {
             return n;
@@ -5852,7 +6064,7 @@ cancelledUnaryPair(Tree const& tree, NodeId n, std::string_view outer, std::stri
 // pointer whose null cast sat inside 64 or more parentheses was refused, the cast never
 // seen. Every step moves to a strict descendant, so the walk ends on any tree; a walk
 // longer than the tree has nodes can only mean a cyclic (malformed) tree
-// (`failOnCyclicTree`).
+// (`substrate::failOnCyclicWalk`).
 [[nodiscard]] NodeId
 descendInitWrappers(EngineState const&, Tree const& tree, NodeId node) {
     return peelGroupingWrappers(tree.schema().semantics(), tree, node,
@@ -5895,10 +6107,9 @@ constexprPointerCastFoldsToNull(EngineState& s, SemanticConfig const& cfg,
     // ★ P68 round 13 (lane `cs`): no cap — this stopped after 16 casts and refused a
     // longer chain of pointer casts over a null constant as not constant. Each step goes
     // to the cast's operand, a strict descendant; the tree's node count bounds it
-    // (`failOnCyclicTree` past it).
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t step = 0; cur.valid(); ++step) {
-        if (step > bound) failOnCyclicTree("the constexpr null pointer cast chain");
+    // (`substrate::failOnCyclicWalk` past it).
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the constexpr null pointer cast chain"}; cur.valid();
+         steps.step()) {
         cur = descendInitWrappers(s, tree, cur);
         if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) return false;
         // `&*E` IS `E` (`cancelledUnaryPair`): gcc takes `constexpr int *p = &*(int *)0;`.
@@ -6199,10 +6410,9 @@ void validateConstexprObject(EngineState& s, SemanticConfig const& cfg, Tree con
         // FIRST elements, since the stack pops the last first) never were, so a
         // non-constant element there was ADMITTED. Every item is a strict descendant of
         // `initNode`, so the tree's node count bounds the walk; past it (a cyclic tree
-        // only) the process stops loud (`failOnCyclicTree`) rather than half-check it.
-        std::size_t const bound = tree.nodeCount() + 1;
-        for (std::size_t step = 0; !pending.empty(); ++step) {
-            if (step > bound) failOnCyclicTree("the constexpr aggregate walk");
+        // only) the process stops loud (`substrate::failOnCyclicWalk`) rather than half-check it.
+        for (substrate::WalkSteps steps{tree.nodeCount(), "the constexpr aggregate walk"}; !pending.empty();
+             steps.step()) {
             NodeId const raw = pending.back();
             pending.pop_back();
             NodeId const value = descendInitWrappers(s, tree, raw);
@@ -6286,7 +6496,16 @@ void validateConstexprObject(EngineState& s, SemanticConfig const& cfg, Tree con
         || k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
         || k == TypeKind::F80 || k == TypeKind::F128;
     if (arithmetic) {
-        if (constExprValue(s, tree, initNode, here, &cfg).has_value()) return;
+        // A scalar's whole initializer, read through its braces (P69 L2, lane `lm`, the
+        // review of checkpoint 29, BLOCKER 2 and MINOR 5): the evaluator steps a brace list
+        // only for a reader that knows it reads a scalar, and an empty level is the zero
+        // (C23 6.7.10p11) — `constexpr int k = {};` and `{{}}` are constants, as gcc 13.3.0
+        // -std=c2x folds them (✔MEASURED 2026-10-20).
+        CstScalarInitializer const scalar =
+            scalarInitializerValue(tree, tree.schema(), initNode);
+        if (scalar.empty) return;
+        if (scalar.value.valid()
+            && constExprValue(s, tree, scalar.value, here, &cfg).has_value()) return;
         emit(DiagnosticCode::S_ConstexprNonConstantInitializer, initNode);
         return;
     }
@@ -6322,8 +6541,8 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         && cfg.declarators.has_value()) {
         auto const& dc = *cfg.declarators;
         std::vector<NodeId> stack{dNode};
-        for (int guard = 0; guard < 16384 && !stack.empty() && !variablyModified;
-             ++guard) {
+        for (substrate::WalkSteps steps{tree.nodeCount(), "validateConstexprDeclarator's walk"};
+             !stack.empty() && !variablyModified; steps.step()) {
             NodeId const c = stack.back();
             stack.pop_back();
             if (tree.kind(c) != NodeKind::Internal) continue;
@@ -6331,7 +6550,8 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
                 auto const bound =
                     arraySuffixBoundNode(tree, c, dc.arraySuffixModifierTokens);
                 if (bound.has_value()
-                    && !constIntExpr(s, tree, *bound, here, &cfg).has_value()) {
+                    && !constIntExpr(s, tree, *bound, here, &cfg,
+                                     IntegerConstantPosition::ArrayBound).has_value()) {
                     variablyModified = true;
                 }
                 continue;   // a suffix's own bound is not a nested declarator
@@ -6379,7 +6599,8 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // declarator-suffix rule — so descending into an initializer is harmless.
     NodeId suffix{};
     std::vector<NodeId> stack{declNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "applyArraySuffix's suffix walk"};
+         !stack.empty(); steps.step()) {
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c) == as.rule) { suffix = c; break; }
@@ -6467,7 +6688,8 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         }
         return s.lattice.interner().incompleteArray(base);
     }
-    auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
+    auto len = constIntExpr(s, tree, lenNode, fromScope, cfg,
+                            IntegerConstantPosition::ArrayBound);
     if (!len.has_value()) {
         // VLA C1a (D-CSUBSET-VLA): the legacy-facet twin of the declarator-mode VLA
         // arm — a PRESENT-but-non-constant length on a NON-FAM, NON-param declarator
@@ -6559,7 +6781,8 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     // Bounded descendant search for the suffix rule (mirror applyArraySuffix).
     NodeId suffix{};
     std::vector<NodeId> stack{declNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "resolveBitfieldSuffix's suffix walk"};
+         !stack.empty(); steps.step()) {
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c) == bs.rule) { suffix = c; break; }
@@ -6690,7 +6913,8 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
         auto sufKids = visibleChildren(tree, suffix);
         if (*bs.widthChild < sufKids.size()) widthNode = sufKids[*bs.widthChild];
     }
-    auto w = constIntExpr(s, tree, widthNode, fromScope, cfg);
+    auto w = constIntExpr(s, tree, widthNode, fromScope, cfg,
+                          IntegerConstantPosition::BitFieldWidth);
     // THREE DISTINCT FAULTS, THREE DISTINCT SENTENCES — they shared one wordless
     // diagnostic, so a reader could not tell "the width did not fold" from "the
     // width is 200 and the type holds 32".
@@ -6741,7 +6965,8 @@ firstAlignasSpecInPrefix(EngineState& s, SemanticConfig const& cfg,
     // Bounded descendant search for the specifier rule (mirror
     // resolveBitfieldSuffix's suffix search); the prefix subtree is tiny.
     std::vector<NodeId> stack{prefix};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "firstAlignasSpecInPrefix's walk"};
+         !stack.empty(); steps.step()) {
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c).v == cfg.alignasSpecRule.v) return c;
@@ -6805,7 +7030,7 @@ void scanNoreturnSpelling(SemanticConfig const& cfg, Tree const& tree,
     bool const haveKeyword = cfg.noreturnKeywordToken.has_value()
                           && cfg.noreturnKeywordToken->valid();
     if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return;
-    forEachTokenLeafUnder(tree, root, 8192, [&](NodeId c) {
+    forEachTokenLeafUnder(tree, root, [&](NodeId c) {
         // (a) the `_Noreturn` KEYWORD token.
         if (haveKeyword && tree.tokenKind(c).v == cfg.noreturnKeywordToken->v)
             out.keyword = true;
@@ -7111,7 +7336,7 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
     }
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
     bool found = false;
-    forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
+    forEachTokenLeafUnder(tree, prefix, [&](NodeId c) {
         if (tree.tokenKind(c).v != cfg.constexprKeywordToken->v) return true;
         found = true;
         return false;
@@ -7183,7 +7408,7 @@ specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
     bool sawInline = false;
     bool sawExtern = false;
-    forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
+    forEachTokenLeafUnder(tree, prefix, [&](NodeId c) {
         SchemaTokenId const kind = tree.tokenKind(c);
         if (kind.v == cfg.inlineKeywordToken->v) { sawInline = true; return true; }
         for (SchemaTokenId ex : cfg.inlineExternSpecifierTokens)
@@ -7270,7 +7495,8 @@ scanSpecifierStorage(SemanticConfig const& cfg, Tree const& tree, NodeId prefix,
     };
     std::vector<GroupHit> grouped;
     std::vector<NodeId> stack{prefix};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "scanSpecifierStorage's walk"};
+         !stack.empty(); steps.step()) {
         NodeId c = stack.back(); stack.pop_back();
         if (tree.kind(c) == NodeKind::Internal) {
             bool skip = false;
@@ -7502,7 +7728,7 @@ firstPrefixTokenOfKinds(Tree const& tree, NodeId declNode,
     if (kinds.empty()) return {};
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
     NodeId hit{};
-    forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
+    forEachTokenLeafUnder(tree, prefix, [&](NodeId c) {
         for (SchemaTokenId k : kinds) {
             if (tree.tokenKind(c).v == k.v) { hit = c; return false; }
         }
@@ -7657,7 +7883,7 @@ struct AttributeSemanticsFacts {
     }
     if (!group.valid()) return {};
     NodeId cur = group;
-    for (int guard = 0; guard < 32; ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "attrClauseArgOperand's descent"};; steps.step()) {
         if (cfg.attributeArgExprRule.valid()
             && tree.rule(cur).v == cfg.attributeArgExprRule.v) break;
         NodeId only{};
@@ -7685,7 +7911,8 @@ void collectAttrNodes(SemanticConfig const& cfg, Tree const& tree, NodeId root,
     if (!root.valid()) return;
     if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
     std::vector<NodeId> stack{root};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "collectAttrNodes' walk"};
+         !stack.empty(); steps.step()) {
         NodeId const c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
         RuleId const r = tree.rule(c);
@@ -7830,7 +8057,8 @@ collectAttrClauses(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode,
     std::vector<NodeId> stack;
     for (NodeId c : visibleChildren(tree, attrNode))
         if (tree.kind(c) == NodeKind::Internal) stack.push_back(c);
-    for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "collectAttrClauses' walk"};
+         !stack.empty(); steps.step()) {
         NodeId const cur = stack.back(); stack.pop_back();
         RuleId const cr = tree.rule(cur);
         // ★ never descend into an ARGUMENT group (the phantom-clause exclusion),
@@ -8107,7 +8335,8 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
     for (NodeId c : visibleChildren(tree, clauseNode)) {
         if (tree.kind(c) == NodeKind::Internal) stack.push_back(c);
     }
-    for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "extractOneAttrClause's walk"};
+         !stack.empty(); steps.step()) {
         NodeId const cur = stack.back();
         stack.pop_back();
         if (isStringArg(cur)) {
@@ -9969,7 +10198,8 @@ resolveAlignasOverride(EngineState& s, SemanticConfig const& cfg, Tree const& tr
     std::vector<NodeId> specs;
     {
         std::vector<NodeId> stack{prefix};
-        for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        for (substrate::WalkSteps steps{tree.nodeCount(), "resolveAlignasOverride's walk"};
+             !stack.empty(); steps.step()) {
             NodeId c = stack.back(); stack.pop_back();
             if (tree.kind(c) != NodeKind::Internal) continue;
             if (tree.rule(c).v == cfg.alignasSpecRule.v) { specs.push_back(c); continue; }
@@ -10573,7 +10803,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // silent pointer decay.
         std::optional<std::int64_t> len;
         for (NodeId c : visibleChildren(tree, suffix)) {
-            len = constIntExpr(s, tree, c, scope, &cfg);
+            len = constIntExpr(s, tree, c, scope, &cfg,
+                               IntegerConstantPosition::ArrayBound);
             if (len.has_value()) break;
         }
         if (!len.has_value()) {
@@ -10769,15 +11000,28 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 // `declarator` wrapper node to hand `declaratorDeclaredType`. ONE engine, two
 // entry points — the abstract type-name fold and the declaration-position fold
 // can never drift. `base` already carries the pointer-star depth.
-[[nodiscard]] TypeId
-directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                   NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
-                   bool allowFlexibleArray, bool allowInitInferredArray,
-                   bool paramDecay, bool typeAliasRow) {
-    if (!cfg.declarators.has_value()) return InvalidType;
+//
+// P69 L2 (lane `lm`): the fold of ONE level. A group (`(declarator)`) does not fold
+// its inner declarator here: the step hands it back with the type so far, and the
+// caller goes on there (`declaratorDeclaredType`'s loop) — so a name inside any
+// number of grouping parentheses costs one loop pass per level, never a host
+// frame. ✔MEASURED 2026-10-20 (macos-arm64-debug, a 256 KiB stack): when this
+// function and `declaratorDeclaredType` called each other once per group, a name
+// in 200 grouping parentheses overflowed the analysis; the parser takes 3000.
+struct DirectDeclaratorStep {
+    TypeId type;              // the type folded so far (InvalidType: the fold failed)
+    NodeId innerDeclarator;   // valid: the group's inner declarator, whose base is `type`
+};
+
+[[nodiscard]] DirectDeclaratorStep
+directDeclaratorStep(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                     NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
+                     bool allowFlexibleArray, bool allowInitInferredArray,
+                     bool paramDecay, bool typeAliasRow) {
+    if (!cfg.declarators.has_value()) return {InvalidType, {}};
     DeclaratorConfig const& dc = *cfg.declarators;
-    if (!direct.valid() || !base.valid()) return InvalidType;
-    if (tree.kind(direct) != NodeKind::Internal) return InvalidType;
+    if (!direct.valid() || !base.valid()) return {InvalidType, {}};
+    if (tree.kind(direct) != NodeKind::Internal) return {InvalidType, {}};
     // Accept the concrete `directRule` (declaration position) OR its abstract
     // twin `directAbstractRule` (c26 type-name position) — both expose the SAME
     // group/fnSuffix/arraySuffix child rules, so the fold below is identical. The
@@ -10788,7 +11032,7 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     bool const isDirect = directR == dc.directRule
         || (dc.directAbstractRule.has_value()
             && directR == *dc.directAbstractRule);
-    if (!isDirect) return InvalidType;
+    if (!isDirect) return {InvalidType, {}};
     TypeId t = base;
 
     // The direct's base (name token or group) + suffixes, one scan.
@@ -10831,14 +11075,14 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                   emitOnMiss, allowFlexibleArray, paramDecay,
                                   allowInitInferredArray, typeAliasRow,
                                   innerIsUnspecifiedSize);
-        if (!t.valid()) return InvalidType;
+        if (!t.valid()) return {InvalidType, {}};
     }
 
-    if (nameTok.valid()) return t;   // bound at the name
+    if (nameTok.valid()) return {t, {}};   // bound at the name
     if (group.valid()) {
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, group, dc.declaratorRule);
-        if (!inner.valid()) return InvalidType;   // malformed group
+        if (!inner.valid()) return {InvalidType, {}};   // malformed group
         // GOTCHA (c10 plan-lock): FAM-ness does NOT cross into a grouped/
         // parenthesized inner declarator — a nested fn-ptr param's array
         // (`int (*f)(int x[]))`) is its OWN declarator and keeps the ordinary
@@ -10872,13 +11116,32 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             !groupSpecifiers.empty()) {
             t = typePositionAligned(s, cfg, tree, groupSpecifiers, t, scope);
         }
-        return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
-                                      /*allowFlexibleArray=*/false,
-                                      /*allowInitInferredArray=*/allowInitInferredArray,
-                                      /*paramDecay=*/false,
-                                      /*typeAliasRow=*/typeAliasRow);
+        // The fold goes on at the inner declarator, with `t` as its base and the
+        // two flags above FALSE there — the caller's next pass (see the struct).
+        return {t, inner};
     }
-    return t;   // abstract direct — the type itself
+    return {t, {}};   // abstract direct — the type itself
+}
+
+// ONE `directRule` node folded to the end: its step, then — when the step ends at a
+// group — the inner declarator's fold, which iterates over every further level. The
+// entry of the abstract type-name resolver; the declarator fold below takes the step.
+[[nodiscard]] TypeId
+directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
+                   bool allowFlexibleArray, bool allowInitInferredArray,
+                   bool paramDecay, bool typeAliasRow) {
+    DirectDeclaratorStep const step =
+        directDeclaratorStep(s, cfg, tree, direct, base, scope, emitOnMiss,
+                             allowFlexibleArray, allowInitInferredArray, paramDecay,
+                             typeAliasRow);
+    if (!step.innerDeclarator.valid()) return step.type;
+    return declaratorDeclaredType(s, cfg, tree, step.innerDeclarator, step.type, scope,
+                                  emitOnMiss,
+                                  /*allowFlexibleArray=*/false,
+                                  /*allowInitInferredArray=*/allowInitInferredArray,
+                                  /*paramDecay=*/false,
+                                  /*typeAliasRow=*/typeAliasRow);
 }
 
 TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
@@ -10888,94 +11151,107 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               bool paramDecay, bool typeAliasRow) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
-    if (!node.valid() || !base.valid()) return InvalidType;
-    if (tree.kind(node) != NodeKind::Internal) return InvalidType;
-    RuleId const r = tree.rule(node);
-    // EVERY per-slot wrapper is TRANSPARENT here: descend to the inner
-    // declaratorRule and recurse. WITHOUT this arm a slot node falls through to
-    // the `r != dc.declaratorRule` reject below → InvalidType for EVERY slot of
-    // that shape → the struct never composes (H_TypeUnresolved) / the typedef
-    // list mints no types; the feature is dead rather than diagnosed.
-    // Each slot takes the head `base` TypeId BY VALUE into the append-only
-    // interner, so a per-slot star (`int *a, b;` → Ptr<int> then int) cannot
-    // leak across slots — the crux is correct by construction. An ABSENT inner
-    // declarator (the anonymous bit-field `int : 3;`) yields InvalidType here,
-    // which is fine: the anonymous-field path (~2435) types it from `headTy`,
-    // never from this declTy.
-    // ★ paramDecay rides through UNCHANGED — the decaying-dim signal belongs to
-    // the wrapped declarator, not to the shell.
-    // ★★ P66 (lane `ag`): the three wrapper roles were three arms with one body;
-    // they are one arm over `isDeclaratorSlotWrapper` now, so the THIRD
-    // (c's typedef-list slot, which carries a per-declarator attribute run)
-    // could not be added to some sites and missed at others.
-    if (isDeclaratorSlotWrapper(r, dc)) {
-        NodeId const inner = declarator_walk_detail::firstChildOfRule(
-            TreeDeclaratorView{tree}, node, dc.declaratorRule);
-        if (!inner.valid()) return InvalidType;
-        return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
-                                      emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray, paramDecay,
-                                      typeAliasRow);
-    }
-    if (r != dc.declaratorRule) return InvalidType;
-
-    // Pointer layers bind FIRST (innermost): T1 = Ptr^k(base).
-    TypeId t = base;
-    NodeId direct{};
-    for (NodeId c : visibleChildren(tree, node)) {
-        if (tree.kind(c) != NodeKind::Internal) continue;
-        RuleId const cr = tree.rule(c);
-        if (cr == dc.pointerLayerRule) {
-            t = s.lattice.interner().pointer(t);
-            // c27 (D-CSUBSET-VOLATILE-POINTEE): EAST volatile — a `volatile`
-            // qualifier INSIDE this pointer layer (the `*volatile` / `* volatile`
-            // ptrQualifier, AFTER the star) makes THIS pointer OBJECT volatile
-            // (C 6.7.3): wrap the just-formed pointer in VolatileQual so the
-            // symbol's type is `VolatileQual(Ptr<...>)`. This is what makes the
-            // symbol object-volatile uniformly through the TYPE (the c21
-            // isVolatile is now derived from the type's top-level VolatileQual-
-            // ness — see the binding sites). `const`/`restrict` in the layer stay
-            // ignored. Config-driven on `cfg.volatileMarker`; a layer with no
-            // volatile is byte-identical to before.
-            if (cfg.volatileMarker.has_value()
-                && subtreeContainsToken(tree, c, *cfg.volatileMarker,
-                                        &s.idx().declByRule)) {
-                t = s.lattice.interner().volatileQualified(t);
-            }
-            // D-CSUBSET-ATOMIC (FC17.9(d) 1b): the EAST `_Atomic` — an `atomicMarker`
-            // ptrQualifier INSIDE this pointer layer (after the star, `int * _Atomic p`)
-            // makes THIS pointer OBJECT atomic ⇒ atomicQualified(Ptr<...>), the exact
-            // mirror of the east-volatile wrap above. Composes with a co-present east
-            // volatile in the one shared skin (cycle 1a bit-merge).
-            if (cfg.atomicMarker.has_value()
-                && subtreeContainsToken(tree, c, *cfg.atomicMarker,
-                                        &s.idx().declByRule)) {
-                t = s.lattice.interner().atomicQualified(t);
-            }
-            // ★ P69 round 4 (lane `cs`): `aligned` written IN this layer is THIS
-            // pointer's own alignment, exactly as an east qualifier is this
-            // pointer's own qualifier — at an inner level as much as beside the
-            // name (`struct { char c; int * __attribute__((aligned(16))) m, n; }`
-            // puts `m` at 16 and the `int` `n` at 24 on every reference; `int *
-            // __attribute__((aligned(16))) *pp` is an 8-aligned pointer to a
-            // 16-aligned pointer on gcc). See `typePositionAligned`.
-            if (auto const layerSpecifiers = directAttributeSpecifiers(tree, c);
-                !layerSpecifiers.empty()) {
-                t = typePositionAligned(s, cfg, tree, layerSpecifiers, t, scope);
-            }
+    // P69 L2 (lane `lm`): ONE LOOP over the declarator's levels — a slot wrapper's
+    // inner declarator, then each group's — where each level used to be a host
+    // frame (this function and `directDeclaredType` called each other once per
+    // group; see `DirectDeclaratorStep`). Each pass moves to a descendant, so the
+    // tree's size bounds the passes; one more is a cycle, and stops loud.
+    for (substrate::WalkSteps steps{tree.nodeCount(), "declaratorDeclaredType's descent"};;
+         steps.step()) {
+        if (!node.valid() || !base.valid()) return InvalidType;
+        if (tree.kind(node) != NodeKind::Internal) return InvalidType;
+        RuleId const r = tree.rule(node);
+        // EVERY per-slot wrapper is TRANSPARENT here: descend to the inner
+        // declaratorRule and fold it on the next pass. WITHOUT this arm a slot node falls through to
+        // the `r != dc.declaratorRule` reject below → InvalidType for EVERY slot of
+        // that shape → the struct never composes (H_TypeUnresolved) / the typedef
+        // list mints no types; the feature is dead rather than diagnosed.
+        // Each slot takes the head `base` TypeId BY VALUE into the append-only
+        // interner, so a per-slot star (`int *a, b;` → Ptr<int> then int) cannot
+        // leak across slots — the crux is correct by construction. An ABSENT inner
+        // declarator (the anonymous bit-field `int : 3;`) yields InvalidType here,
+        // which is fine: the anonymous-field path (~2435) types it from `headTy`,
+        // never from this declTy.
+        // ★ paramDecay rides through UNCHANGED — the decaying-dim signal belongs to
+        // the wrapped declarator, not to the shell.
+        // ★★ P66 (lane `ag`): the three wrapper roles were three arms with one body;
+        // they are one arm over `isDeclaratorSlotWrapper` now, so the THIRD
+        // (c's typedef-list slot, which carries a per-declarator attribute run)
+        // could not be added to some sites and missed at others.
+        if (isDeclaratorSlotWrapper(r, dc)) {
+            NodeId const inner = declarator_walk_detail::firstChildOfRule(
+                TreeDeclaratorView{tree}, node, dc.declaratorRule);
+            if (!inner.valid()) return InvalidType;
+            node = inner;
             continue;
         }
-        if (cr == dc.directRule && !direct.valid()) direct = c;
-    }
-    if (!direct.valid()) return t;   // star-only abstract declarator
+        if (r != dc.declaratorRule) return InvalidType;
 
-    // The direct's base (name token or group) + suffixes — folded by the
-    // SHARED `directDeclaredType` engine (the same one the abstract type-name
-    // resolver uses; see its comment). `t` already carries the pointer-star
-    // depth from the loop above.
-    return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
-                              allowFlexibleArray, allowInitInferredArray,
-                              paramDecay, typeAliasRow);
+        // Pointer layers bind FIRST (innermost): T1 = Ptr^k(base).
+        TypeId t = base;
+        NodeId direct{};
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            RuleId const cr = tree.rule(c);
+            if (cr == dc.pointerLayerRule) {
+                t = s.lattice.interner().pointer(t);
+                // c27 (D-CSUBSET-VOLATILE-POINTEE): EAST volatile — a `volatile`
+                // qualifier INSIDE this pointer layer (the `*volatile` / `* volatile`
+                // ptrQualifier, AFTER the star) makes THIS pointer OBJECT volatile
+                // (C 6.7.3): wrap the just-formed pointer in VolatileQual so the
+                // symbol's type is `VolatileQual(Ptr<...>)`. This is what makes the
+                // symbol object-volatile uniformly through the TYPE (the c21
+                // isVolatile is now derived from the type's top-level VolatileQual-
+                // ness — see the binding sites). `const`/`restrict` in the layer stay
+                // ignored. Config-driven on `cfg.volatileMarker`; a layer with no
+                // volatile is byte-identical to before.
+                if (cfg.volatileMarker.has_value()
+                    && subtreeContainsToken(tree, c, *cfg.volatileMarker,
+                                            &s.idx().declByRule)) {
+                    t = s.lattice.interner().volatileQualified(t);
+                }
+                // D-CSUBSET-ATOMIC (FC17.9(d) 1b): the EAST `_Atomic` — an `atomicMarker`
+                // ptrQualifier INSIDE this pointer layer (after the star, `int * _Atomic p`)
+                // makes THIS pointer OBJECT atomic ⇒ atomicQualified(Ptr<...>), the exact
+                // mirror of the east-volatile wrap above. Composes with a co-present east
+                // volatile in the one shared skin (cycle 1a bit-merge).
+                if (cfg.atomicMarker.has_value()
+                    && subtreeContainsToken(tree, c, *cfg.atomicMarker,
+                                            &s.idx().declByRule)) {
+                    t = s.lattice.interner().atomicQualified(t);
+                }
+                // ★ P69 round 4 (lane `cs`): `aligned` written IN this layer is THIS
+                // pointer's own alignment, exactly as an east qualifier is this
+                // pointer's own qualifier — at an inner level as much as beside the
+                // name (`struct { char c; int * __attribute__((aligned(16))) m, n; }`
+                // puts `m` at 16 and the `int` `n` at 24 on every reference; `int *
+                // __attribute__((aligned(16))) *pp` is an 8-aligned pointer to a
+                // 16-aligned pointer on gcc). See `typePositionAligned`.
+                if (auto const layerSpecifiers = directAttributeSpecifiers(tree, c);
+                    !layerSpecifiers.empty()) {
+                    t = typePositionAligned(s, cfg, tree, layerSpecifiers, t, scope);
+                }
+                continue;
+            }
+            if (cr == dc.directRule && !direct.valid()) direct = c;
+        }
+        if (!direct.valid()) return t;   // star-only abstract declarator
+
+        // The direct's base (name token or group) + suffixes — folded by the
+        // SHARED `directDeclaratorStep` engine (the one the abstract type-name
+        // resolver's `directDeclaredType` takes; see its comment). `t` already
+        // carries the pointer-star depth from the loop above. A group hands back
+        // its inner declarator: the next pass folds it, with `t` as its base.
+        DirectDeclaratorStep const step =
+            directDeclaratorStep(s, cfg, tree, direct, t, scope, emitOnMiss,
+                                 allowFlexibleArray, allowInitInferredArray, paramDecay,
+                                 typeAliasRow);
+        if (!step.innerDeclarator.valid()) return step.type;
+        node               = step.innerDeclarator;
+        base               = step.type;
+        allowFlexibleArray = false;   // FAM-ness does not cross into a group
+        paramDecay         = false;   // only the outermost dimension decays
+    }
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
@@ -11514,7 +11790,7 @@ vlaLengthNodes(Tree const& tree, NodeId declaratorNode, DeclaratorConfig const& 
     // children in REVERSE so they pop left-to-right. An array-suffix node is
     // recorded (its middle child) and NOT descended into.
     std::vector<NodeId> stack{declaratorNode};
-    for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "vlaLengthNodes' walk"}; !stack.empty(); steps.step()) {
         NodeId const c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
         if (tree.rule(c).v == dc.arraySuffixRule.v) { out.push_back(middleOf(c)); continue; }
@@ -11702,7 +11978,6 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
     // (`nodeSaysSomethingItself`) and this check takes its steps through it like every
     // other descent. (Its entry for the string literal went with the move: a string
     // literal's node has no Internal child, so the walk below stops at it either way.)
-    std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
     auto const peel = [&](NodeId n) {
         return peelGroupingWrappers(cfg, tree, n, "the static initializer check's wrapper peel");
     };
@@ -11788,8 +12063,8 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
         NodeId         narrowedBy{};
     };
     std::vector<Item> work{{element, StaticInitUse::Value}};
-    for (std::size_t guard = 0; !work.empty() && !out.notConstant.valid(); ++guard) {
-        if (guard > bound) failOnCyclicTree("the static initializer check");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the static initializer check"};
+         !work.empty() && !out.notConstant.valid(); steps.step()) {
         Item const it = work.back();
         work.pop_back();
         NodeId const cur = peel(it.node);
@@ -12625,7 +12900,8 @@ void checkVariadicMarkerTerminatesParamList(EngineState& s,
     // The marker inside ONE list element, never inside a nested list.
     auto const markerIn = [&](NodeId elem) -> NodeId {
         std::vector<NodeId> stack{elem};
-        for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        for (substrate::WalkSteps steps{tree.nodeCount(), "checkVariadicMarkerTerminatesParamList's walk"};
+             !stack.empty(); steps.step()) {
             NodeId const cur = stack.back();
             stack.pop_back();
             if (tree.kind(cur) == NodeKind::Token
@@ -14040,7 +14316,8 @@ initializerBraceElementCount(Tree const& tree, SchemaIndexes const& idx,
     if (!idx.braceInitListRule.valid() || !idx.initElementRule.valid())
         return std::nullopt;
     std::vector<NodeId> stack{initNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "initializerBraceElementCount's walk"};
+         !stack.empty(); steps.step()) {
         NodeId const c = stack.back();
         stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
@@ -14203,10 +14480,9 @@ private:
     if (!rule.valid()) return {};
     SemanticConfig const& cfg = tree.schema().semantics();
     auto const& hirCfg = tree.schema().hirLowering();
-    std::size_t const bound = tree.nodeCount() + 1;
     NodeId cur = n;
-    for (std::size_t guard = 0; cur.valid() && tree.kind(cur) == NodeKind::Internal; ++guard) {
-        if (guard > bound) failOnCyclicTree("the brace walks' wrapper peel");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the brace walks' wrapper peel"};
+         cur.valid() && tree.kind(cur) == NodeKind::Internal; steps.step()) {
         if (tree.rule(cur).v == rule.v) return cur;
         if (nodeSaysSomethingItself(cfg, hirCfg, tree, cur)) return {};
         auto const inner = internalChildrenOf(tree, cur);
@@ -14369,7 +14645,8 @@ resolveBraceElement(EngineState& s, Tree const& tree, NodeId element, TypeId obj
                 out.resolved = false;
                 return out;
             }
-            auto const kv = constIntExpr(s, tree, indexKids.front(), scope, &sem);
+            auto const kv = constIntExpr(s, tree, indexKids.front(), scope, &sem,
+                                         IntegerConstantPosition::IndexDesignator);
             if (!kv.has_value() || *kv < 0) { out.resolved = false; return out; }
             out.designator.push_back(static_cast<std::uint64_t>(*kv));   // non-negative: lossless
             cur = interner.operands(cur)[0];
@@ -14493,10 +14770,9 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
     // to a strict descendant: the tree's node count bounds it, LOUD past it.
     SemanticConfig const& semCfg = tree.schema().semantics();
     auto const& hirCfg = tree.schema().hirLowering();
-    std::size_t const searchBound = tree.nodeCount() + 1;
     NodeId c = initNode;
-    for (std::size_t step = 0; c.valid() && tree.kind(c) == NodeKind::Internal; ++step) {
-        if (step > searchBound) failOnCyclicTree("the initializer search of an array of unknown size");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the initializer search of an array of unknown size"};
+         c.valid() && tree.kind(c) == NodeKind::Internal; steps.step()) {
         RuleId const r = tree.rule(c);
         if (idx.stringLiteralExprRule.valid()
             && idx.stringLiteralBodyToken.valid()
@@ -14691,7 +14967,6 @@ void forEachPlacedBraceValue(EngineState& s, Tree const& tree, NodeId braceList,
         initializer_cursor::Cursor cursor;
     };
     std::vector<Level> stack;
-    std::size_t const bound = tree.nodeCount() + 1;   // each level is a strict descendant
     // Open one brace list against the type it initializes: a scalar's is walked to its value
     // at once; a character array's list led by the string literal that initializes it IS that
     // string; any other aggregate's list opens a level.
@@ -14699,8 +14974,8 @@ void forEachPlacedBraceValue(EngineState& s, Tree const& tree, NodeId braceList,
         if (!t.valid()) return;
         std::vector<NodeId> elements = elementsOf(list);
         if (view.shape(t) == initializer_cursor::Shape::Scalar) {
-            for (std::size_t guard = 0; !elements.empty(); ++guard) {
-                if (guard > bound) failOnCyclicTree("the scalar brace levels");
+            for (substrate::WalkSteps steps{tree.nodeCount(), "the scalar brace levels"}; !elements.empty();
+                 steps.step()) {
                 auto const parts = internalChildrenOf(tree, elements.front());
                 if (parts.size() > 1) {   // a designation and its value
                     onScalarDesignator(elements.front());
@@ -14987,9 +15262,8 @@ judgeCompoundLiteral(EngineState& s, SemanticConfig const& cfg, Tree const& tree
         std::vector<NodeId> toks;
         {
             std::vector<NodeId> stack{specs};
-            std::size_t const bound = tree.nodeCount() + 1;
-            for (std::size_t guard = 0; !stack.empty(); ++guard) {
-                if (guard > bound) failOnCyclicTree("the compound literal specifier walk");
+            for (substrate::WalkSteps steps{tree.nodeCount(), "the compound literal specifier walk"};
+                 !stack.empty(); steps.step()) {
                 NodeId const c = stack.back();
                 stack.pop_back();
                 if (tree.kind(c) == NodeKind::Token) { toks.push_back(c); continue; }
@@ -15110,7 +15384,6 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
     TypeInterner& in = s.lattice.interner();
     auto const& hirCfg = tree.schema().hirLowering();
     SchemaIndexes const& idx = s.idx();
-    std::size_t const bound = tree.nodeCount() + 1;
     auto const isRule = [&](NodeId n, RuleId r) {
         return r.valid() && n.valid() && tree.kind(n) == NodeKind::Internal
             && tree.rule(n).v == r.v;
@@ -15159,8 +15432,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
     // fold them (✔MEASURED 2026-10-12; gcc refuses each as no constant). Stopped at the
     // construct, the three were refused here.
     auto const peel = [&](NodeId n) {
-        for (std::size_t guard = 0;; ++guard) {
-            if (guard > bound) failOnCyclicTree("the constant subobject peel");
+        for (substrate::WalkSteps steps{tree.nodeCount(), "the constant subobject peel"};; steps.step()) {
             n = peelGroupingWrappers(cfg, tree, n, "the constant subobject peel");
             if (NodeId const designated = cancelledUnaryPair(tree, n, "Deref", "AddressOf");
                 designated.valid()) {
@@ -15220,8 +15492,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
     // 1. The member names, OUTERMOST access last: `r.a.b` is (r, [a, b]).
     std::vector<NodeId> names;
     NodeId cur = peel(node);
-    for (std::size_t guard = 0;; ++guard) {
-        if (guard > bound) failOnCyclicTree("the constant member chain");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the constant member chain"};; steps.step()) {
         auto const m = memberAccess(cur);
         if (!m.has_value()) break;
         names.push_back(m->second);
@@ -15266,8 +15537,7 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
     ScopeId  at     = root->scope;
     std::size_t done = 0;   // `target[0..done)` is consumed: `object` is that subobject
     std::unordered_set<std::uint32_t> visited;
-    for (std::size_t guard = 0;; ++guard) {
-        if (guard > bound) failOnCyclicTree("the constant subobject walk");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the constant subobject walk"};; steps.step()) {
         NodeId const value = descendInitWrappers(s, tree, init);
         if (!value.valid() || !visited.insert(value.v).second) return std::nullopt;
         bool const isList = isRule(value, idx.braceInitListRule);
@@ -15429,7 +15699,7 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         bool found = false;
         NodeId const prefix = specifierPrefixChild(tree, node, decl);
         if (prefix.valid()) {
-            forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
+            forEachTokenLeafUnder(tree, prefix, [&](NodeId c) {
                 if (tree.tokenKind(c).v == decl.requiredSpecifierToken->v) {
                     found = true;
                     return false;
@@ -16423,10 +16693,10 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 NodeId aliasTok{};
                                 if (cfg.identifierToken.valid()) {
                                     std::vector<NodeId> stk{kids[*decl.headChild]};
-                                    for (int guard = 0;
-                                         guard < 4096 && !stk.empty()
-                                             && !aliasTok.valid();
-                                         ++guard) {
+                                    for (substrate::WalkSteps steps{tree.nodeCount(),
+                                                         "the typedef alias token walk"};
+                                         !stk.empty() && !aliasTok.valid();
+                                         steps.step()) {
                                         NodeId const cur = stk.back();
                                         stk.pop_back();
                                         if (tree.kind(cur) == NodeKind::Token) {
@@ -19690,7 +19960,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             if (valueExpr.has_value()) {
                                                 hadExplicit = true;
                                                 if (auto iv = constIntExpr(
-                                                        s, tree, *valueExpr, erec.scope, &cfg);
+                                                        s, tree, *valueExpr, erec.scope, &cfg,
+                                                        IntegerConstantPosition::EnumeratorValue);
                                                     iv.has_value()) {
                                                     value = *iv;
                                                 } else {
@@ -20721,9 +20992,6 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
 // re-stamping recomputes the same TypeId, so a Pass-1.5 pre-stamp followed by the
 // Pass-2 blanket walk is a no-op the second time.
 //
-// A subtree deeper than the guard leaves some leaves unstamped — the caller then
-// fails LOUD on an unresolvable type, never silently-wrong.
-//
 // ★★ WHY THIS IS A SHARED HELPER AND NOT TWO COPIES. It began (FC17.5) inline in
 // `resolveAutoInferredDeclaration` ★C3, whose own comment recorded the reason —
 // and named, as its probe, the very shape that was BROKEN: *"the typeof-of-literal
@@ -20736,12 +21004,24 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
 // (`typeof(1) x = 3.9;` was a `double`, with no diagnostic). ⇒ the preparation a
 // Pass-1.5 `subtreeType` call needs belongs to the CALL, in one place both callers
 // reach, not to whichever arm happened to be written first.
+// ★ P69 L2 (lane `lm`, the recursion row
+// D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL):
+// EVERY NODE ONCE, AND THE WHOLE SUBTREE. A node already walked
+// (`literalLeavesWalked`) is not walked again, so the nested expressions that each ask for
+// their own subtree cost the tree once between them; and the walk reads all of it — it STOPPED
+// IN SILENCE after 65536 nodes, leaving every literal past them unstamped (typed as nothing,
+// so whatever asked got no type). A tree is finite and acyclic: the node count bounds the walk,
+// and a walk past it is a cyclic node graph — never the program's fault — that stops the
+// process.
 void preStampLiteralLeaves(EngineState& s, SemanticConfig const& cfg,
                            Tree const& tree, NodeId root) {
     if (!root.valid()) return;
     std::vector<NodeId> stack{root};
-    for (int guard = 0; guard < 65536 && !stack.empty(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the literal pre-stamp walk"}; !stack.empty();
+         steps.step()) {
         NodeId c = stack.back(); stack.pop_back();
+        if (s.literalLeavesWalked.has(c)) continue;   // walked, its subtree with it
+        s.literalLeavesWalked.set(c, true);
         if (s.typeAt(c).valid()) continue;   // already stamped
         typeLiteralIfAny(s, cfg, tree, c);
         if (tree.kind(c) != NodeKind::Internal) continue;
@@ -20868,7 +21148,7 @@ foldedConditionOperands(EngineState& s, SemanticConfig const& cfg,
     // Bounded transparent descent to the binary node (assignmentExpr wrapper,
     // parenthesized operand, …). Stops at the first non-transparent layer.
     NodeId bin = condNode;
-    for (int guard = 0; guard < 64; ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "foldedConditionOperands' descent"};; steps.step()) {
         if (tree.kind(bin) != NodeKind::Internal) return {};
         if (tree.rule(bin).v == hirCfg.binaryExprRule.v) break;
         NodeId only{};
@@ -21004,7 +21284,8 @@ stampedOperandMayBePointer(EngineState const& s, Tree const& tree, NodeId n) {
     auto const& in  = s.lattice.interner();
     auto const& unaryOps = tree.schema().hirLowering().unaryOps;
     NodeId      cur = n;
-    for (int guard = 0; guard < 16 && cur.valid(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "stampedOperandMayBePointer's peel"};
+         cur.valid(); steps.step()) {
         if (TypeId t = s.typeAt(cur); t.valid()) {
             auto const k = in.kind(t);
             return k == TypeKind::Ptr || k == TypeKind::Array
@@ -21251,7 +21532,8 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
                               unsigned startLevels) -> ConstLvalueVerdict {
     NodeId   cur    = start;
     unsigned levels = startLevels;
-    for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "constQualifiedLvalue's path"};
+         cur.valid(); steps.step()) {
         if (tree.kind(cur) == NodeKind::Token) {
             if (!cfg.identifierToken.valid()
                 || tree.tokenKind(cur) != cfg.identifierToken) {
@@ -21723,18 +22005,20 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (!cfg.pointerConversions.nullPointerConstantFromNullptrT)
                     return false;
                 NodeId const root = n;
-                for (int guard = 0; n.valid() && guard < 64; ++guard) {
+                for (substrate::WalkSteps steps{tree.nodeCount(), "isNullptrOperand's descent"}; n.valid();
+                     steps.step()) {
                     if (TypeId t = s.typeAt(n); t.valid()) {
                         if (interner.kind(t) == TypeKind::NullptrT) return true;
                         // ⚠ A NEGATIVE STAMP IS AUTHORITATIVE ONLY AT THE ROOT.
-                        // `internals == 1` cannot tell a PAREN from a real unary
-                        // operator, so the descent walks THROUGH `*p` and reads the
+                        // `internals == 1` could not tell a PAREN from a real unary
+                        // operator, so the descent walked THROUGH `*p` and read the
                         // stamp on `p` — `Ptr<NullptrT>`, correctly not NullptrT,
-                        // and the WRONG question. ✔MEASURED: with the descent
+                        // and the WRONG question (it stops at an operator now, below;
+                        // the rule stands for any other layer). ✔MEASURED: with the descent
                         // trusted here, `typeof(nullptr) *p; *p + 1;` stayed
                         // `H0009` while the sibling `a[1] + 1` was already fixed —
                         // one repair passing over its own second case.
-                        if (guard == 0) return false;
+                        if (steps.taken() == 0) return false;
                         break;
                     }
                     if (tree.kind(n) == NodeKind::Token) {
@@ -21744,6 +22028,23 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             return true;
                         }
                         break;   // a non-literal leaf (an identifier) — ask the typer
+                    }
+                    // ★ P69 L2 (lane `lm`): AN OPERATOR IS NOT A TRANSPARENT LAYER — the rule
+                    // `stampedOperandMayBePointer` states, on the same config-declared set
+                    // (`hirLowering.unaryOps`). A node carrying a unary operator token ends the
+                    // descent and the typer answers: `!nullptr` and `-nullptr` are not `nullptr`.
+                    // ✔MEASURED 2026-10-20 (macos-arm64-debug): walking THROUGH each operator,
+                    // every operand of a chain of d unary operators descended to the chain's
+                    // leaf — d²/2 steps (500500 at 1000 `!`), the analysis 7 s at 2000 `!`; the
+                    // fixed 64-step bound this walk had before kept it linear by stopping early.
+                    {
+                        bool operatorNode = false;
+                        for (NodeId c : visibleChildren(tree, n)) {
+                            if (tree.kind(c) != NodeKind::Token) continue;
+                            for (auto const& e : tree.schema().hirLowering().unaryOps)
+                                if (e.token.v == tree.tokenKind(c).v) operatorNode = true;
+                        }
+                        if (operatorNode) break;   // an operator — ask the typer
                     }
                     // Descend one transparent layer: the single meaningful child is
                     // an Internal child (a paren / thin wrapper) if present, else a
@@ -21959,9 +22260,25 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             TypeId const pt = subtreeType(s, tree, peer, here);
                             TypeKind const pk =
                                 pt.valid() ? interner.kind(pt) : TypeKind::Void;
+                            // ★ P69 L2a (lane `lm`): OR A NULL POINTER CONSTANT (C23 6.5.9p2: "one
+                            // operand has type nullptr_t and the other is a null pointer constant") —
+                            // `nullptr == 0`, `0 != nullptr`, a folded `1 - 1` — and never another
+                            // integer (`nullptr == 1`, `nullptr == i`). ✔MEASURED 2026-10-22 (gcc
+                            // 13.3.0, clang 18.1.3, -std=gnu2x and -std=c2x -pedantic-errors): the
+                            // first three build and run, the other two are refused; this arm refused
+                            // all five (S_NullptrInvalidOperand). The question is the one a pointer's
+                            // integer peer is asked (`admitsNullPointerConstant`, which marks a folded
+                            // `1 - 1` for the lowering), asked against `void *`: `nullptr` lowers to
+                            // that null constant, so the comparison is the null pointer against itself.
                             ok = (pk == TypeKind::Ptr || pk == TypeKind::FnSig
                                   || pk == TypeKind::Array
-                                  || pk == TypeKind::NullptrT);
+                                  || pk == TypeKind::NullptrT)
+                                 || admitsNullPointerConstant(
+                                        s, tree,
+                                        s.lattice.interner().pointer(
+                                            s.lattice.interner().primitive(TypeKind::Void)),
+                                        peer, tree.schema().semantics().pointerConversions,
+                                        here, cfg);
                         }
                     } else {
                         // A core arithmetic / relational / bitwise / shift op —
@@ -21978,13 +22295,12 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 }
                 if (operandN.valid() && isNullptrOperand(operandN)) {
                     HirOperatorEntry const* e = opEntry(hirCfg.unaryOps);
-                    std::optional<HirOpKind> const op =
-                        e ? coreOpFromNameSem(e->target) : std::nullopt;
-                    // Reject `-nullptr` (Neg) and `~nullptr` (BitNot). `!nullptr`
-                    // (Not) is VALID (nullptr→false→true); `&nullptr` is caught by
-                    // the existing lvalue check (nullptr is a non-lvalue like 0/true).
-                    if (op.has_value()
-                        && (*op == HirOpKind::Neg || *op == HirOpKind::BitNot)) {
+                    // Reject `-nullptr` (Neg), `+nullptr` (Pos) and `~nullptr` (BitNot)
+                    // — `unaryRefusesNullptrOperand`, the predicate the typer asks too
+                    // (P69 L2: `+nullptr` was admitted; gcc and clang refuse it).
+                    // `!nullptr` (Not) is VALID (nullptr→false→true); `&nullptr` is
+                    // caught by the existing lvalue check (a non-lvalue like 0/true).
+                    if (e != nullptr && unaryRefusesNullptrOperand(e->target)) {
                         emitInvalid(operandN);
                     }
                 }
@@ -23804,7 +24120,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // operand would pass a positive-only pin and lose this.
         std::optional<bool> truth;
         if (condNode.valid()) {
-            if (auto const v = constExprValue(s, tree, condNode, here, &cfg)) {
+            if (auto const v = constExprValue(s, tree, condNode, here, &cfg,
+                                          IntegerConstantPosition::StaticAssertion)) {
                 truth = asBoolBridge(*v, /*allowFloat=*/true);
             }
         }
@@ -23830,6 +24147,45 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
             d.actual += foldedConditionOperands(s, cfg, tree, condNode, here);
             s.reporter.report(std::move(d));
+        }
+    }
+
+    // ★ P69 L2 (lane `lm`): A CASE LABEL'S VALUE IS AN INTEGER CONSTANT EXPRESSION (C 6.8.4.2p3's
+    // constraint). Nothing asked it (READ: no producer of a case-label diagnostic but the
+    // not-in-a-switch one; the lowering lowers the value as an expression).
+    // ✔MEASURED 2026-10-20 (gcc 13.3.0, clang 18.1.3, every mode): both refuse it ("case label
+    // does not reduce to an integer constant" / "expression is not an integer constant
+    // expression"). The value folds at the case-label position (its admitted forms — the comma,
+    // with its warning — `IntegerConstantPosition::CaseLabel`) and must fold to an INTEGER: a
+    // float or an address is refused as both refuse it, and every integer arm of the folded value
+    // is one — a literal past INT64_MAX (`case 0xFFFFFFFFFFFFFFFFULL:`) folds through the signed
+    // arm's bit pattern, a `sizeof` and a cast to an unsigned type (`case sizeof(int):`, `case
+    // (unsigned long long)-1:`) through the unsigned one, which is why this reads the value's
+    // arms, never the int64 bridge alone. A value whose type did not resolve was diagnosed where
+    // it failed, and is skipped.
+    if (k == NodeKind::Internal) {
+        RuleId const caseLabel = tree.schema().hirLowering().caseLabelRule;
+        if (caseLabel.valid() && tree.rule(node).v == caseLabel.v) {
+            for (NodeId const value : visibleChildren(tree, node)) {
+                if (tree.kind(value) != NodeKind::Internal) continue;   // `case` / `:` tokens
+                if (!subtreeType(s, tree, value, here).valid()) continue;
+                auto const folded = constExprValue(s, tree, value, here, &cfg,
+                                                   IntegerConstantPosition::CaseLabel);
+                bool const integer = folded.has_value()
+                    && (std::holds_alternative<std::int64_t>(folded->value)
+                        || std::holds_alternative<std::uint64_t>(folded->value)
+                        || std::holds_alternative<bool>(folded->value)
+                        || std::holds_alternative<BitIntValue>(folded->value));
+                if (integer) continue;
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_CaseLabelNotConstant;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(value);
+                d.actual   = std::format("case label '{}' is not an integer constant expression "
+                                         "(C 6.8.4.2p3)", tree.text(value));
+                s.reporter.report(std::move(d));
+            }
         }
     }
 
@@ -23965,8 +24321,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // ── (3) THE RESIDUAL REFUSAL — the capture could not complete ──
         // ★ 0xE062 IS NO LONGER A BLANKET GATE, and what replaced it is narrower
         // in exactly one way that matters: it now fires on a property of THIS
-        // BUILD (the walk did not finish, or an operand did not decompose into a
-        // constraint and a value expression), never on a property of the SOURCE.
+        // BUILD (an operand did not decompose into a constraint and a value
+        // expression), never on a property of the SOURCE.
         // A statement that captures cleanly is carried, whatever it contains.
         // ⚠ It stays UNSUPPRESSABLE and it stays a REFUSAL: an operand this tier
         // could not read is an operand the descriptor cannot carry, and building
@@ -23992,17 +24348,11 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             if (!detail.empty()) detail += ")";
             std::string why;
             NodeId      at = node;
-            if (f.scanTruncated) {
-                why = "the structural scan of this statement did not finish (node "
-                      "budget exhausted), so it has NOT been shown to carry only "
-                      "what was captured";
-            } else {
-                for (auto const& op : f.operands) {
-                    if (!op.malformed) continue;
-                    why = op.malformedDetail;
-                    if (op.operandNode.valid()) at = op.operandNode;
-                    break;
-                }
+            for (auto const& op : f.operands) {
+                if (!op.malformed) continue;
+                why = op.malformedDetail;
+                if (op.operandNode.valid()) at = op.operandNode;
+                break;
             }
             report(DiagnosticCode::S_InlineAsmExtendedUnsupported, at,
                    "this inline-asm statement's payload could not be read" + detail
@@ -24913,13 +25263,11 @@ semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const
 // size), a statement expression (its item, then the item's expression). And it stopped in
 // silence past its bound, handing back the node it had reached as if the walk had ended;
 // every step is to a strict descendant, so a walk past the node count is a cyclic node
-// graph, and that stops the process (`failOnCyclicTree`) — a stop no program can reach.
+// graph, and that stops the process (`substrate::failOnCyclicWalk`) — a stop no program can reach.
 [[nodiscard]] NodeId peelBuiltinOperand(Tree const& tree, NodeId n) {
     SemanticConfig const& sem = tree.schema().semantics();
     auto const& hc = tree.schema().hirLowering();
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t step = 0; n.valid(); ++step) {
-        if (step > bound) failOnCyclicTree("the builtin operand peel");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the builtin operand peel"}; n.valid(); steps.step()) {
         if (tree.kind(n) != NodeKind::Internal) return n;
         if (nodeSaysSomethingItself(sem, hc, tree, n)) return n;
         NodeId only{};
@@ -24959,9 +25307,7 @@ semanticBitFieldValueWidth(EngineState& s, SemanticConfig const& sem, Tree const
 [[nodiscard]] NodeId builtinOperandValueCore(EngineState& s, SemanticConfig const& cfg,
                                              Tree const& tree, NodeId n, ScopeId scope) {
     auto const& hc = tree.schema().hirLowering();
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t step = 0;; ++step) {
-        if (step > bound) failOnCyclicTree("the builtin operand's value peel");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the builtin operand's value peel"};; steps.step()) {
         n = peelBuiltinOperand(tree, n);
         if (!n.valid() || tree.kind(n) != NodeKind::Internal) return n;
         if (nodeIsASelection(cfg, tree, n)) {
@@ -24996,11 +25342,9 @@ builtinOperandOperator(Tree const& tree, NodeId node, std::vector<HirOperatorEnt
 [[nodiscard]] bool builtinOperandHasSideEffects(Tree const& tree, NodeId node) {
     auto const& hc = tree.schema().hirLowering();
     std::vector<NodeId> stack{node};
-    std::size_t visited = 0;
-    std::size_t const bound = tree.nodeCount() + 1;
-    while (!stack.empty()) {
-        // Every node is visited once (a tree): past the node count the graph is cyclic.
-        if (++visited > bound) failOnCyclicTree("the builtin operand's side-effect walk");
+    // Every node is visited once (a tree): past the node count the graph is cyclic.
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the builtin operand's side-effect walk"};
+         !stack.empty(); steps.step()) {
         NodeId const n = stack.back();
         stack.pop_back();
         if (!n.valid() || tree.kind(n) != NodeKind::Internal) continue;
@@ -25079,12 +25423,11 @@ designateBuiltinOperand(EngineState& s, SemanticConfig const& cfg, Tree const& t
     std::vector<Adjust> adjusts;
     NodeId n = start;
     bool lvalue = startIsLvalue;
-    std::size_t const bound = tree.nodeCount() + 1;
     std::optional<DesignatedBytes> base;
-    for (std::size_t step = 0;; ++step) {
-        // Every step is to a strict descendant: past the node count the graph is cyclic
-        // (P69, lane `lm`: this ended in silence and answered "no object").
-        if (step > bound) failOnCyclicTree("the builtin operand's designation");
+    // Every step is to a strict descendant: past the node count the graph is cyclic
+    // (P69, lane `lm`: this ended in silence and answered "no object").
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the builtin operand's designation"};;
+         steps.step()) {
         n = builtinOperandValueCore(s, cfg, tree, n, here);
         if (!n.valid()) return std::nullopt;
         TypeId const t = subtreeType(s, tree, n, here);
@@ -25498,7 +25841,8 @@ builtinCallPlan(EngineState& s, SemanticConfig const& cfg, Tree const& tree, Nod
             plan.answer = *v;
         } else {
             if (args.size() != 2) return std::nullopt;
-            auto const type = constIntExpr(s, tree, args[1], fromScope, &cfg);
+            auto const type = constIntExpr(s, tree, args[1], fromScope, &cfg,
+                                           IntegerConstantPosition::ObjectSizeQueryType);
             if (!type.has_value() || *type < 0 || *type > 3) return std::nullopt;
             plan.answer = objectSizeAnswer(s, cfg, tree, args[0], fromScope, *type);
         }
@@ -25547,7 +25891,8 @@ void checkBuiltinVerbCall(EngineState& s, SemanticConfig const& cfg, Tree const&
             // ✔MEASURED (lane `cs`'s probe r5s s33): gcc 13.3.0 and clang 18.1.3 both refuse
             // a `type` that is not an integer constant expression 0..3.
             if (args.size() != 2) return;   // the arity check already spoke
-            auto const type = constIntExpr(s, tree, args[1], scope, &cfg);
+            auto const type = constIntExpr(s, tree, args[1], scope, &cfg,
+                                           IntegerConstantPosition::ObjectSizeQueryType);
             if (!type.has_value() || *type < 0 || *type > 3) {
                 report(DiagnosticCode::S_BuiltinArgumentNotConstant, args[1],
                        std::format("'{}': its second operand must be an integer constant "
@@ -25788,11 +26133,10 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         auto const& opTable = tree.schema().operatorTable();
         NodeId cur = calleeNode;
         bool coveredByRefRule = false;
-        // Guard exhaustion (>128-deep wrapper nest) leaves `cur` at an
-        // intermediate node → subtreeType → conservative silent return.
-        // Degrade-to-silent is deliberate: no miscompile is possible
-        // (deeper tiers keep their own fail-loud walls).
-        for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
+        // P69 L2 (lane `lm`): the peel is bounded by the tree it walks (`WalkSteps`) — it stopped
+        // at 128 wrappers and read the callee from an intermediate node, in silence.
+        for (substrate::WalkSteps steps{tree.nodeCount(), "checkCall's callee peel"}; cur.valid();
+             steps.step()) {
             if (tree.kind(cur) != NodeKind::Internal) break;  // landed
             if (s.idx().refByRule.contains(tree.rule(cur).v)) {
                 // A `references` rule covers the walked subtree — its
@@ -26072,10 +26416,8 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // ★ P68 round 13 (lane `cs`): no cap. This stopped after 64 ancestors, so a
         // call discarded inside 64 or more transparent wrappers (parentheses) drew no
         // warning. Each step goes to a strict ancestor, so the walk ends at the root;
-        // the tree's node count bounds it (`failOnCyclicTree` past it).
-        std::size_t const upBound = tree.nodeCount() + 1;
-        for (std::size_t step = 0;; ++step) {
-            if (step > upBound) failOnCyclicTree("the nodiscard discard walk");
+        // the tree's node count bounds it (`substrate::failOnCyclicWalk` past it).
+        for (substrate::WalkSteps steps{tree.nodeCount(), "the nodiscard discard walk"};; steps.step()) {
             NodeId const p = tree.parent(cur);
             if (!p.valid() || tree.kind(p) != NodeKind::Internal) break;
             std::uint32_t const pv = tree.rule(p).v;
@@ -26326,16 +26668,18 @@ admitsNullPointerConstant(EngineState& s, Tree const& tree,
 // hardcoded); a language without a `hirLowering` block has empty op tables, so
 // every dispatch falls through to the leaf path.
 //
-// Const note: the signature is `EngineState const& s` (every caller's
-// EngineState is itself non-const — Pass 1.5 `resolveSizeof`, Pass 2,
-// checkCall/Return — so the mutable interner obtained below never writes
-// through a genuinely-const object). The read accessors (`kind`/`operands`/
-// `fnResult`) are const; the INTERNING ops the derivations need (`primitive`
-// for Bool, `pointer` for AddressOf, the common-type engine) mutate (they
-// memoize into the interner's arena), so a mutable interner reference is taken
-// once here — the same handle the lowering tier uses.
+// The state is taken MUTABLE (`EngineState& s`), and that is what this walk does to it:
+// the INTERNING ops the derivations need (`primitive` for Bool, `pointer` for
+// AddressOf, the common-type engine) memoize into the interner's arena, the selectors
+// it asks (`chooseExprSelectedArm`, `selectGenericAssociation`) memoize and may mint a
+// forward tag, the probe resolves (`resolveTypeNode`, `compoundLiteralType`) snapshot
+// and roll back the reporter, and the walk records its own answers
+// (`derivedExprType`). ★ P69 L2 (lane `lm`, a review's finding): the signature said
+// `EngineState const&` and six const_casts here and one in `selectGenericAssociation`
+// took the mutation back — a const handle that mutated, each cast with a note
+// explaining the workaround. Every caller owns a non-const state; the handle says so.
 [[nodiscard]] TypeId
-subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
+subtreeType(EngineState& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
     // D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 1): this typer is an
     // EXPLICIT HEAP WORK-STACK driver — NOT host recursion — so a deeply-nested
     // expression carries flat O(N) host-stack cost. The five recursive arms
@@ -26365,11 +26709,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return m->type;
     }
 
-    // The interning derivations memoize into the interner's arena, so they need
-    // a mutable handle. Sound because every caller owns a non-const EngineState
-    // (see the const note above); the const-cast never mutates a const object.
-    TypeInterner& interner =
-        const_cast<TypeLattice&>(s.lattice).interner();   // NOLINT — see const note
+    // The interning derivations memoize into the interner's arena.
+    TypeInterner& interner = s.lattice.interner();
     auto const boolType = [&]() -> TypeId {
         return interner.primitive(TypeKind::Bool);
     };
@@ -26446,7 +26787,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // the walk is asked only of a type a bit-field's promotion can change.
         if (bitFieldPromotedType(interner, t, 1, *arith).v == t.v) return t;
         auto const width = semanticBitFieldValueWidth(
-            const_cast<EngineState&>(s), sem, tree, operandN, scope);   // NOLINT — const note above
+            s, sem, tree, operandN, scope);
         if (!width.has_value()) return t;
         return bitFieldPromotedType(interner, t, *width, *arith);
     };
@@ -26676,6 +27017,13 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // pass2Post's SE4e through this same predicate, and a refused operation has
         // no type (see `combineBinary`) — `long r = -p;` drew a second diagnostic.
         if (pointerOperandRefusedByUnary(interner, e->target, ot)) return InvalidType;
+        // ★ P69 L2 (lane `lm`): and of a `nullptr_t` — pass2Post's nullptr gate refuses it
+        // (`unaryRefusesNullptrOperand`, the one predicate); typed as `nullptr_t`, the
+        // operator above it refused it again (`- -nullptr` said twice, ✔MEASURED).
+        if (ot.valid() && interner.kind(ot) == TypeKind::NullptrT
+            && unaryRefusesNullptrOperand(e->target)) {
+            return InvalidType;
+        }
         // c12 (C 6.5.3.3p2) + D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT: unary
         // `+` yields the INTEGER-PROMOTED operand type (the value already lives
         // promoted in a 32-bit reg — the lazy-consumer model), so `sizeof(+c)`
@@ -26937,10 +27285,9 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // arms' spines ("A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES
             // NOT"); the HIR `combineTernary` realizes the stamp, SE4b reports it.
             if (pointeesCanDivergeInAQualifier(interner, thenT, elseT)) {
-                EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT — const note above
                 if (pointeeSpinesDiverge(
-                        pointerValueSpine(mutS, sem, tree, thenN, thenT, scope),
-                        pointerValueSpine(mutS, sem, tree, elseN, elseT, scope)))
+                        pointerValueSpine(s, sem, tree, thenN, thenT, scope),
+                        pointerValueSpine(s, sem, tree, elseN, elseT, scope)))
                     return interner.pointer(interner.primitive(TypeKind::Void));
             }
         }
@@ -27035,12 +27382,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // Pass 2 cannot disagree about which arm survives.
         if (sem.builtinChooseExprRule.valid()
             && r.v == sem.builtinChooseExprRule.v) {
-            // The const_cast is `selectGenericAssociation`'s exact discipline,
-            // for the same reason and with the same guarantee: the selector
-            // memoizes in the interner and (silently) folds a constant, and no
-            // caller of `subtreeType` holds a genuinely const EngineState.
-            EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
-            NodeId const arm = chooseExprSelectedArm(mutS, sem, tree, node, scope,
+            // The selector memoizes in the interner and (silently) folds a constant.
+            NodeId const arm = chooseExprSelectedArm(s, sem, tree, node, scope,
                                                      /*loud=*/false);
             if (!arm.valid()) { result = InvalidType; return; }
             std::vector<NodeId> only{arm};
@@ -27062,16 +27405,15 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // interner/nodeToType side effects persist; the Pass-2 cast arm is the
             // SOLE emitter (it re-resolves loud, and a FAILED resolve returns
             // InvalidType WITHOUT stamping the cast node, so the re-resolve runs).
-            auto& mut = const_cast<EngineState&>(s);
-            auto const snap = mut.reporter.snapshotForRollback();
-            result = resolveTypeNode(mut, sem, tree, kids[cr.typeChild], scope,
+            auto const snap = s.reporter.snapshotForRollback();
+            result = resolveTypeNode(s, sem, tree, kids[cr.typeChild], scope,
                                      /*emitOnMiss=*/false,
                                      /*emitTypeUse=*/false);
-            mut.reporter.truncateTo(snap);
+            s.reporter.truncateTo(snap);
             // A cast's value is no lvalue (C 6.5.4p5): its type is the NAMED one
             // without the qualifiers of its own level — "THE VALUE LAW", where the
             // frames end; this arm builds no frame, so it says it here.
-            result = valueConversion(mut.lattice.interner(), result);
+            result = valueConversion(s.lattice.interner(), result);
             return;
         }
         if (auto const it = s.idx().compoundLiteralByRule.find(r.v);
@@ -27083,11 +27425,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // Pass-2 compound-literal arm re-resolves loud as the sole emitter).
             // P68 round 9: the SAME typer the loud arm uses, so an inferred
             // `(T[]){ … }` bound is the same length in a constant expression.
-            auto& mut = const_cast<EngineState&>(s);
-            auto const snap = mut.reporter.snapshotForRollback();
-            result = compoundLiteralType(mut, sem, tree, node, cl.typeChild, scope,
+            auto const snap = s.reporter.snapshotForRollback();
+            result = compoundLiteralType(s, sem, tree, node, cl.typeChild, scope,
                                          /*emitOnMiss=*/false);
-            mut.reporter.truncateTo(snap);
+            s.reporter.truncateTo(snap);
             return;
         }
         // ── P32 [[D-C-SUBTREE-TYPE-WALKS-INTO-A-STATEMENT-EXPRESSION-BODY]] ──
@@ -27132,7 +27473,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // mingw-w64 gcc 13.2 all say 8 — a silent wrong constant — and an array
         // "initialized" by `({ "abc"; })` passed this tier for the lowering to refuse
         // by an internal sentence.
-        // ⚠ THIS MOVES WITH `lowerStatementExpr` (`cst_to_hir.cpp`), AND NEITHER
+        // ⚠ THIS MOVES WITH `stmtExprValueEpilogue` (`cst_to_hir.cpp`), AND NEITHER
         // ALONE — the comma's two halves (`combineBinary` here, `combineComma` there)
         // say the same of themselves, and for the same reason: `lowerSizeof` reads
         // THIS tier's stamp.
@@ -27453,7 +27794,7 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
 [[nodiscard]] std::optional<std::uint8_t>
 typeDerivationLevels(TypeInterner const& in, TypeId t) {
     std::uint32_t levels = 1;
-    for (int guard = 0; guard < 64 && t.valid(); ++guard) {
+    for (substrate::WalkSteps steps{in.size(), "typeDerivationLevels' spine"}; t.valid(); steps.step()) {
         TypeKind const k = in.kind(t);   // transparent through a qualifier skin
         if (k == TypeKind::FnSig) {
             t = in.fnResult(t);
@@ -27914,7 +28255,8 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
             out.values.push_back(
                 ValueAt{out.steps.size(), t.valid() && in.kind(t) == TypeKind::FnSig});
         };
-        for (int guard = 0; guard < 512 && cur.valid(); ++guard) {
+        for (substrate::WalkSteps steps{tree.nodeCount(), "expressionQualifierSpine's steps"};
+             cur.valid(); steps.step()) {
             if (tree.kind(cur) == NodeKind::Token) {
                 if (isIdentifier(cur)) {
                     out.base = symbolSpine(s.scopes.lookup(here, tree.text(cur)));
@@ -28245,16 +28587,13 @@ pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // and is FULLY SILENT (its association resolves are rolled back — pass2Post's
 // stamp-loop is the sole emitter).
 GenericSelection
-selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
+selectGenericAssociation(EngineState& s, SemanticConfig const& cfg,
                          Tree const& tree, NodeId node, ScopeId scope,
                          TypeId controllingType) {
     GenericSelection sel;
-    // The const_cast is subtreeType's exact discipline — the interner memoizes,
-    // resolveTypeNode(emitOnMiss=false) may mint a forward tag, and the reporter
-    // snapshot/rollback below runs on this handle; none mutates a const object
-    // (every caller owns a non-const EngineState).
-    EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
-    TypeInterner& in = mutS.lattice.interner();
+    // The state is taken mutable: the interner memoizes, resolveTypeNode(emitOnMiss=
+    // false) may mint a forward tag, and the reporter snapshot/rollback below runs on it.
+    TypeInterner& in = s.lattice.interner();
     auto kids = visibleChildren(tree, node);
 
     // (1) The controlling type is supplied by the caller (typed on its OWN
@@ -28292,7 +28631,7 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
     // S_GenericSelectionAmbiguous and selected the wrong association in 6.
     std::optional<QualifierSpine> ctrlSpine;
     if (ctrlConv.valid() && cfg.genericControlChild < kids.size()) {
-        ctrlSpine = expressionQualifierSpine(mutS, cfg, tree, kids[cfg.genericControlChild],
+        ctrlSpine = expressionQualifierSpine(s, cfg, tree, kids[cfg.genericControlChild],
                                              scope);
         if (ctrlSpine.has_value()) {
             // A function designator's decay puts a pointer level ABOVE its type (an
@@ -28338,7 +28677,7 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
     // the reporter back afterwards: the resolved TypeIds (for matching) and the
     // benign interner/nodeToType side effects persist; every diagnostic is
     // dropped. pass2Post re-resolves LOUD (its stamp-loop) as the SOLE emitter.
-    auto const diagSnapshot = mutS.reporter.snapshotForRollback();
+    auto const diagSnapshot = s.reporter.snapshotForRollback();
 
     for (NodeId assocChild : kids) {
         if (tree.kind(assocChild) != NodeKind::Internal) continue;
@@ -28374,7 +28713,7 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
         // position leaves the type Invalid → anyBadType (no-match cascade guard).
         TypeId assocTy = InvalidType;
         if (typeNode.valid()) {
-            assocTy = resolveTypeNode(mutS, cfg, tree, typeNode, scope,
+            assocTy = resolveTypeNode(s, cfg, tree, typeNode, scope,
                                       /*emitOnMiss=*/false,
                                       /*emitTypeUse=*/false);
             sel.typedAssocTypeNodes.push_back(typeNode);
@@ -28399,10 +28738,10 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
         bool matches = assocTy.valid() && ctrlConv.valid()
             && sameOrEnumCompatible(in, in.stripVolatile(assocTy), ctrlConv)
             && in.qualifierBits(assocTy) == 0
-            && !typeNameOutermostLayerIsVolatileOrAtomic(mutS, cfg, tree, typeNode);
+            && !typeNameOutermostLayerIsVolatileOrAtomic(s, cfg, tree, typeNode);
         if (matches) {
             std::optional<QualifierSpine> assocSpine =
-                typeNameQualifierSpine(mutS, cfg, tree, typeNode);
+                typeNameQualifierSpine(s, cfg, tree, typeNode);
             if (assocSpine.has_value() && !spineFitsType(in, *assocSpine, assocTy))
                 assocSpine.reset();
             if (assocSpine.has_value()) {
@@ -28425,7 +28764,7 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
         }
     }
 
-    mutS.reporter.truncateTo(diagSnapshot);   // drop every resolve diagnostic
+    s.reporter.truncateTo(diagSnapshot);   // drop every resolve diagnostic
 
     // (3) Resolve the selection: exactly-one typed match wins, else the
     // `default:`; >1 typed match is ambiguous (InvalidNode — pass2Post reports).
@@ -28465,7 +28804,7 @@ findPromotedField(EngineState const& s, ScopeId fieldScope,
 // it exposes (`nameChildNode` for the pre-extraction failures, `nameNode` for the
 // undeclared-field case) preserve the exact diagnostic positions the corpus pins.
 [[nodiscard]] MemberResolution
-resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
+resolveMemberAccess(EngineState& s, SemanticConfig const& cfg,
                     Tree const& tree, NodeId node, ScopeId scope) {
     MemberResolution out;
     // Locate the matching MemberAccessRule for this node's rule, distinguished by
@@ -31984,7 +32323,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 for (NodeId const use : useIt->second) {
                     bool reached = false;
                     NodeId at = use;
-                    for (int guard = 0; guard < 256 && at.valid(); ++guard) {
+                    for (substrate::WalkSteps steps{tree.nodeCount(), "the asm register operand's climb"};
+                         at.valid(); steps.step()) {
                         NodeId const up = tree.parent(at);
                         if (!up.valid() || visibleChildren(tree, up).size() != 1) {
                             break;

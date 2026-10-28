@@ -1,2 +1,2 @@
-        element = c;   // the first element; any after it is excess
-        break;
+                element = c;   // the first element; any after it is excess
+                break;

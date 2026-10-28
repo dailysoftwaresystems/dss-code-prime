@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/substrate/walk_steps.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
@@ -474,20 +475,6 @@ arraySuffixHasModifier(Tree const& tree, NodeId suffix,
 // `_Alignof` forms, `_Generic`, the casts and the compound literals from `semantics` — and
 // both tiers hand in the same two blocks of the same schema.
 
-// THE ONE ANSWER OF A DESCENT THAT HAS TAKEN MORE STEPS THAN ITS TREE HAS NODES. Every
-// descent bounded by it moves to a strict descendant at each step, so on a well-formed
-// tree it can never get here: getting here means the node graph is cyclic — memory
-// corruption or a tree-builder bug, never the program's fault — and the process stops
-// LOUD. Never an answer as if the walk had ended: a truncated walk is how a fixed depth
-// cap skipped what it had not looked at. (The semantic tier's `failOnCyclicTree` says the
-// same for its own walks.)
-[[noreturn]] inline void
-failOnCyclicNodeGraph(char const* walk) {
-    std::fprintf(stderr, "dss fatal: %s took more steps than its tree has nodes — the node "
-                         "graph is cyclic\n", walk);
-    std::abort();
-}
-
 // `sizeof` / `_Alignof` in any of their forms: the operand below is not evaluated
 // (C 6.5.3.4p2).
 [[nodiscard]] inline bool
@@ -557,7 +544,12 @@ nodeSaysSomethingItself(SemanticConfig const& cfg, HirLoweringConfig const& hirC
 // gcc 13.3 (x86_64 and arm64) and clang 18 — DSS refused the construct. The labels stepped
 // through are handed back (`labels`, outermost first): the lowering places each one, on
 // an empty statement, where it stood — before the value is computed — so a `goto` in the
-// body reaches it.
+// body reaches it. A `case` or `default` label is stepped through ALIKE (P69 L2, lane `lm`):
+// its `switch` is always outside the statement expression — inside it, the `switch` would
+// be the last item — so the program is refused for the jump into it
+// (S_JumpIntoStatementExpression, the lowering's switch prescan), and reading no value
+// there said a second, false thing about it ("its last statement is not an expression
+// statement"; ✔MEASURED 2026-10-16 on `return ({ case 2: 5; });` and `({ default: 5; })`).
 //
 // ★ ONE ITEM, AND IT IS SAID IN ONE PLACE. `soleExpressionOfStatementExpression` is the
 // step, and it steps only through a body of exactly one item. A body of several
@@ -575,7 +567,7 @@ inline constexpr std::string_view kStatementExprOutsideAFunctionBody =
 struct StatementExpressionBody {
     NodeId              value{};     // the last item's expression; invalid when the body has no value
     std::size_t         items = 0;   // how many items the body holds
-    std::vector<NodeId> labels;      // the labeled statements the value stands under, outermost first
+    std::vector<NodeId> labels;      // the labeled statements (`case` and `default` ones too) the value stands under, outermost first
 };
 
 [[nodiscard]] inline StatementExpressionBody
@@ -604,17 +596,23 @@ statementExpressionBody(HirLoweringConfig const& hirCfg, Tree const& tree, NodeI
     // tree's node count bounds the walk; a walk past it is a cyclic node graph, never the
     // program's fault, and stops the process.
     NodeId core = last;
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t guard = 0; core.valid() && tree.kind(core) == NodeKind::Internal; ++guard) {
-        if (guard > bound) failOnCyclicNodeGraph("the statement expression's item peel");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the statement expression's item peel"};
+         core.valid() && tree.kind(core) == NodeKind::Internal; steps.step()) {
         std::uint32_t const r = tree.rule(core).v;
         if (HirRuleMapping const* const lm = mappingOf(core);
-            lm != nullptr && lm->hirKind == "LabelStmt") {
+            lm != nullptr && (lm->hirKind == "LabelStmt" || lm->hirKind == "CaseStmt")) {
+            // A named label's statement is its first child that is not a token; a `case` or
+            // `default` label's is its LAST (`caseLabel statement`).
             NodeId stmt{};
             for (NodeId c : decl_prefix_detail::visibleChildren(tree, core)) {
                 if (tree.kind(c) == NodeKind::Token) continue;
                 stmt = c;
-                break;
+                if (lm->hirKind == "LabelStmt") break;
+            }
+            if (lm->hirKind == "CaseStmt" && stmt.valid()
+                && tree.kind(stmt) == NodeKind::Internal && hirCfg.caseLabelRule.valid()
+                && tree.rule(stmt).v == hirCfg.caseLabelRule.v) {
+                stmt = NodeId{};   // the label alone: no statement
             }
             if (!stmt.valid()) return out;   // a label on nothing: no value
             out.labels.push_back(core);
@@ -712,9 +710,8 @@ bitFieldValueWidth(SemanticConfig const& cfg, HirLoweringConfig const& hirCfg, T
         }
         return NodeId{};
     };
-    std::size_t const bound = tree.nodeCount() + 1;
-    for (std::size_t guard = 0; n.valid() && tree.kind(n) == NodeKind::Internal; ++guard) {
-        if (guard > bound) failOnCyclicNodeGraph("the bit-field value walk");
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the bit-field value walk"};
+         n.valid() && tree.kind(n) == NodeKind::Internal; steps.step()) {
         std::uint32_t const r = tree.rule(n).v;
         auto const is = [r](RuleId rule) { return rule.valid() && rule.v == r; };
         if (is(hirCfg.postfixExprRule)) {

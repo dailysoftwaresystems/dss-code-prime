@@ -1,0 +1,1 @@
+                return RecordedFailure{it->second.candidate, it->second.hit};

@@ -2754,6 +2754,23 @@ enum class DiagnosticCode : std::uint16_t {
     // the language (`hirLowering.scalarBraceInitializer.excessElements`); a language that
     // declares none refuses the shape (S_InvalidScalarInitializer).
     S_ExcessElementsInScalarInitializer   = 0xE09A,
+    // P69 L2 (lane `lm`): an integer constant expression uses the COMMA operator, which C
+    // 6.6p3 excludes from a constant expression outside an unevaluated subexpression — a
+    // constraint, so a diagnostic is owed. ✔MEASURED 2026-10-20 (clang 18.1.3, gcc 13.3.0,
+    // every build RUN): clang folds `(0, 42)` as a static assertion, an array bound, an
+    // enumerator, a case label, a bit-field width, an index designator and a `_BitInt` width,
+    // refusing it only at -pedantic-errors; gcc folds it as `__builtin_object_size`'s type.
+    // So the language admits it where its position is named
+    // (`semantics.integerConstantExpressions.otherConstantForms`), and this is the warning.
+    // Said once per comma, of the expression asked for (one in an unselected `?:` arm or in
+    // another object's initializer is not). A WARNING, suppressible; `--warnings-as-errors`
+    // restores the refusal. `.actual` is the comma expression.
+    S_ConstantExpressionUsesTheCommaOperator = 0xE09B,
+    // P69 L2 (lane `lm`): a case label's value is not an integer constant expression — C
+    // 6.8.4.2p3's constraint. ✔MEASURED 2026-10-20 (gcc 13.3.0, clang 18.1.3, every mode): both
+    // refuse `case y:` for a variable `y`, and DSS asked nothing of a case label's value (READ).
+    // An ERROR at the value; a float or an address value is refused too (both refuse it).
+    S_CaseLabelNotConstant                = 0xE09C,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -4327,6 +4344,13 @@ enum class DiagnosticCode : std::uint16_t {
     // spelling for "an address whose pointee is unknown"), so a store through one
     // is not judged. Interner-gated.
     I_StoreValueTypeMismatch       = 0xA01A,
+    // P69 L2 (lane `lm`, D-MIR-VERIFIER-PASSES-A-PHI-MISSING-A-PREDECESSORS-INPUT): a Phi in a
+    // reachable block does not take its value from every predecessor that can run — none from
+    // one, two different values from one, or a count that is neither one nor one per edge.
+    // `I_PhiPredNotInCfg` asks the converse (a named block that is no predecessor); together
+    // they say the Phi's inputs ARE its block's ways in. A pass that drops an input is caught
+    // at the pass (verify runs after every pass), not where the LIR lowering emits the edge.
+    I_PhiIncomingsNotOnePerPredecessor = 0xA01B,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

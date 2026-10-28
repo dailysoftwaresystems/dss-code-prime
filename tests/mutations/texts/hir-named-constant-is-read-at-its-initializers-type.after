@@ -1,1 +1,3 @@
-            if (false && resolved->declaredType.has_value() && inner.value.has_value()) {
+                ConstEvalResult atType = done.kind == CstFoldFrame::Kind::Ref
+                                             ? inner
+                                             : convertToCastTarget(inner, *done.target, options, node);

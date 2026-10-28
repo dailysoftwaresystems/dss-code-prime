@@ -15,7 +15,10 @@
     // (Windows: commit charge over commit limit), re-read after a settle while another leg holds a slot. A wait names
     // each holder; past the wait the leg is `not-admitted` (exit 7), never `failed`. Each lane and the orchestrator
     // run their heavy jobs through it: no slot directory and no memory script by hand.
-    "admission": { "heavyLegs": 2, "maxMemoryPercent": 76 }
+    // The wait is 480 minutes, not the tool's 60: four lanes' whole-suite runs each hold a slot for hours, so a
+    // 60-minute wait ended a queued leg `not-admitted` and its relaunch went to the back of the queue again
+    // (MEASURED, cycle P69 round 1: a lane's run sat seven legs back and an earlier one ended not-admitted).
+    "admission": { "heavyLegs": 2, "maxMemoryPercent": 76, "maxWaitMinutes": 480 }
   },
   "toolchains": {
     // EVERY toolchain NAMES its compiler (`env` CC/CXX) and HOLDS the build to it (`compilerId`,

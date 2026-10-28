@@ -1,1 +1,2 @@
-    return NodeId{};
+            return {};
+            cur = value;

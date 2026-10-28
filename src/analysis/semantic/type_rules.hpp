@@ -7,6 +7,7 @@
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_compatibility.hpp"   // sameOrEnumCompatible
+#include "core/substrate/walk_steps.hpp"                         // P69 L2: a walk's bound is what it walks
 
 #include <cstdint>
 #include <optional>
@@ -154,12 +155,13 @@ namespace detail::type_rules {
 // bound, so in every other language no type reaches this predicate with a sentinel
 // level and it answers exactly what `sameType` already answered.
 //
-// Terminates: each step takes `operands[0]` of an Array and the interned operand DAG
-// is acyclic; the guard is belt-and-braces, matching `declaredTypeDerivesFromAliasHead`.
+// Terminates: each step takes `operands[0]` of an Array and the interned operand DAG is
+// acyclic, so the walk is bounded by the interner it walks (`WalkSteps`; P69 L2, lane `lm`):
+// a fixed 4096 levels answered "incompatible" past them in silence.
 [[nodiscard]] inline bool vlaCompatibleArrayTypes(TypeInterner const& interner,
                                                   TypeId a, TypeId b) {
     if (!a.valid() || !b.valid()) return false;
-    for (int guard = 0; guard < 4096; ++guard) {
+    for (substrate::WalkSteps steps{interner.size(), "vlaCompatibleArrayTypes' spine"};; steps.step()) {
         if (a == b) return true;
         if (interner.kind(a) != TypeKind::Array
             || interner.kind(b) != TypeKind::Array) {
@@ -1165,6 +1167,18 @@ pointerOperandRefusedByUnary(TypeInterner const& interner, std::string_view targ
                              TypeId operand) noexcept {
     return (target == "Neg" || target == "Pos" || target == "BitNot")
         && contributedPointee(interner, operand).valid();
+}
+
+// The `nullptr_t` half (C23 6.5.3.3p1): the same three operators take an arithmetic
+// (`~`: an integer) operand, and `nullptr_t` is neither. ONE predicate, two askers:
+// pass2Post's nullptr gate refuses the operation, and the expression typer gives the
+// refused operation no type — so the operator above it is not told it holds a
+// `nullptr_t` and says nothing more. ✔MEASURED 2026-10-20, gcc 13.3.0 and clang 18.1.3
+// (`-std=gnu2x`, `-std=c2x -pedantic-errors`): `+nullptr` is refused, and `- -nullptr` /
+// `~ ~nullptr` draw ONE error, at the inner operator.
+[[nodiscard]] inline bool
+unaryRefusesNullptrOperand(std::string_view target) noexcept {
+    return target == "Neg" || target == "Pos" || target == "BitNot";
 }
 
 // Which class a pair the ordinary rules DECLINED belongs to. `target` is the type

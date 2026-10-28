@@ -27,6 +27,7 @@
 #include "core/types/number_decode.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
+#include "core/substrate/walk_steps.hpp"              // P69 L2: a walk's bound is what it walks
 #include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
 #include "core/types/wide_float_value.hpp"     // P69: a long double NaN's payload (`quietNan`)
 // Inline-asm P5: the SHARED capture (`gatherInlineAsmFacts`) the semantic
@@ -350,6 +351,17 @@ struct Lowerer {
     // site when its `SymbolRecord.vlaTypedefOrigin` is set; moved onto the result's
     // `typedefVlaOriginBySymbol` AFTER finish(). Sparse: only VLA-typedef objects.
     std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOriginAcc;
+    // ★ P69 L2 (lane `lm`): (typedef SymbolId.v → the SymbolId.v of the earlier name
+    // of the SAME typedef declaration that froze its size) for a declaration whose
+    // head is a `typeof ( type-name )` carrying a variable-length bound — `typedef
+    // typeof(int[n]) R, S;` evaluates `n` once, at R, and S is R's alias. Written by
+    // `lowerTypeDeclInto` before any use of S lowers (a declaration precedes its
+    // uses); read through `vlaOriginOf` wherever an origin is recorded.
+    std::unordered_map<std::uint32_t, std::uint32_t> headVlaTypedefAnchor_;
+    [[nodiscard]] SymbolId vlaOriginOf(SymbolId origin) const {
+        auto const it = headVlaTypedefAnchor_.find(origin.v);
+        return it == headVlaTypedefAnchor_.end() ? origin : SymbolId{it->second};
+    }
     // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): shared accumulator of (shim SymbolId.v
     // → `synthesize` recipe id) pairs — the SAME vector the shipped-descriptor
     // injection loop in `lowerCstToHir` fills, moved onto
@@ -559,7 +571,7 @@ struct Lowerer {
     // the per-function label namespace above — those three ARE the function-body
     // lowering sites, and keeping the two facts adjacent is what stops a fourth
     // one from acquiring a label scope and not a body depth.
-    // Read by `lowerStatementExpr`: a GNU statement expression needs an enclosing
+    // Read by `stmtExprValuePrologue`: a GNU statement expression needs an enclosing
     // function (both references say so — see S_StatementExprAtFileScope), and a
     // global initializer is lowered through the SAME `lowerExpr` a body is, so the
     // expression tier cannot tell the two apart without this.
@@ -1817,7 +1829,8 @@ struct Lowerer {
         if (sem.packedAttributeNames.empty() || !sem.identifierToken.valid())
             return false;
         std::vector<NodeId> stack{n};
-        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        for (substrate::WalkSteps steps{tree().nodeCount(), "subtreeNamesPacked's walk"}; !stack.empty();
+             steps.step()) {
             NodeId const cur = stack.back();
             stack.pop_back();
             if (isToken(cur)) {
@@ -3312,6 +3325,16 @@ struct Lowerer {
         auto const ops = interner.operands(t);
         return !ops.empty() && interner.typeContainsVla(ops[0]);
     }
+    // The type `n` array levels below `t` — the levels a declarator's own suffixes add
+    // above the type its head names — or InvalidType when a level on the way is no array.
+    [[nodiscard]] TypeId typeBelowOwnLevels(TypeId t, std::size_t n) const {
+        for (std::size_t i = 0; i < n && t.valid(); ++i) {
+            if (interner.kind(t) != TypeKind::Array) return InvalidType;
+            auto const ops = interner.operands(t);
+            t = ops.empty() ? InvalidType : ops[0];
+        }
+        return t;
+    }
     // VLA C4b (D-CSUBSET-VLA): does this declarator carry its OWN array suffix
     // (`[...]`)? The HIR-tier discriminator that separates the ORIGINAL VLA typedef
     // (`typedef int R[n];` — has the `[n]` suffix, so its runtime bound is
@@ -3324,7 +3347,8 @@ struct Lowerer {
         if (!sem.declarators.has_value()) return false;
         DeclaratorConfig const& dc = *sem.declarators;
         std::vector<NodeId> stack{declaratorNode};
-        for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+        for (substrate::WalkSteps steps{tree().nodeCount(), "declaratorHasArraySuffix's walk"};
+             !stack.empty(); steps.step()) {
             NodeId const c = stack.back();
             stack.pop_back();
             if (tree().kind(c) != NodeKind::Internal) continue;
@@ -3333,6 +3357,82 @@ struct Lowerer {
             for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
         }
         return false;
+    }
+    // The `typeof` node of `rule` (the type-name form or the expression form) a
+    // declaration's head IS, or reaches through single-visible-child wrappers from one
+    // of its visible children — the descent the analyzer's head readers make, so a
+    // typeof inside a parameter list or a member never counts. Invalid when there is
+    // none. Each step is a strict descendant: the tree it walks bounds the peel.
+    [[nodiscard]] NodeId headTypeofOf_(NodeId declNode, DeclarationRule const& decl,
+                                       RuleId rule) {
+        if (!rule.valid() || !decl.headChild.has_value()) return {};
+        auto const vis = declRoleChildren(tree(), declNode, decl);
+        if (*decl.headChild >= vis.size()) return {};
+        auto const isTypeof = [this, rule](NodeId n) {
+            return n.valid() && tree().kind(n) == NodeKind::Internal
+                && tree().rule(n).v == rule.v;
+        };
+        NodeId const head = vis[*decl.headChild];
+        if (isTypeof(head)) return head;
+        if (tree().kind(head) != NodeKind::Internal) return {};
+        for (NodeId const child : visible(head)) {
+            NodeId cur = child;
+            for (substrate::WalkSteps steps{tree().nodeCount(), "the head typeof peel"};
+                 cur.valid(); steps.step()) {
+                if (isTypeof(cur)) return cur;
+                if (tree().kind(cur) != NodeKind::Internal) break;
+                auto const kids = visible(cur);
+                cur = kids.size() == 1 ? kids[0] : NodeId{};
+            }
+        }
+        return {};
+    }
+    // ★ P69 L2 (lane `lm`): THE `typeof ( type-name )` OF A DECLARATION'S HEAD WHOSE TYPE
+    // CARRIES A VARIABLE-LENGTH BOUND — the `typeofType` node (`sem.typeofTypeRule`) the
+    // head is, or reaches through single-visible-child wrappers from one of its visible
+    // children (the descent the analyzer's head readers make, so a typeof inside a
+    // parameter list or a member never counts), and only when the type stamped on it
+    // carries such a bound (`typeCarriesVlaBound`). Invalid otherwise — among them a
+    // `typeof ( expression )`, whose size is no bound written in a type name. Nested
+    // layers (`typeof(typeof(int[n]))`) are ONE node here: the outermost, whose subtree
+    // holds the innermost type name's suffixes. Invalid too for a type name that
+    // reaches a variable-length typedef (`typeof(R)`): an alias head, not a bound.
+    [[nodiscard]] NodeId headTypeofTypeName(NodeId declNode, DeclarationRule const& decl) {
+        NodeId const found = headTypeofOf_(declNode, decl, sem.typeofTypeRule);
+        if (!found.valid() || !typeCarriesVlaBound(typeAtOr(found, InvalidType))) return {};
+        // A type name that reaches a variable-length TYPEDEF (`typeof(R)`, `typeof(R *)`)
+        // writes no bound of its own: R's was evaluated once, at R, and the name is an
+        // alias head — the semantic tier stamps its origin (`vlaTypedefOrigin`), and
+        // capturing here would look for a suffix the head does not carry.
+        // ✔MEASURED gcc 13.3.0 and clang 18.1.3: `typedef int R[n + k++]; typedef
+        // typeof(R) S; n = 99; S b;` leaves k == 1 and b of the first n ints.
+        if (vlaTypedefOwnerOfTypeName(found).valid()) return {};
+        return found;
+    }
+    // ★ P69 L2a (lane `lm`): THE VARIABLE-LENGTH ARRAY OBJECT a declaration's head
+    // `typeof ( expression )` reads WHOLE — `typeof(v)`, `typeof((v))`, `typeof(*&v)` —
+    // found by the runtime `sizeof`'s own descent (`vlaObjectOperandSymbol`), and only
+    // when that object's declared type IS the type stamped on the typeof. Its size was
+    // frozen when it was declared (C 6.7.6.2p2), so every name the head declares takes
+    // it as its size origin and copies its slots down, as an object of a variable-length
+    // typedef does; reading it whole evaluates nothing. Invalid for any other operand —
+    // the row of a 2-D object (`v[0]`), a pointer's pointee (`*p`), a conditional, a
+    // comma: such an operand is EVALUATED (C23 6.7.2.5p4) and its size is no one
+    // declaration's whole object, so its declaration keeps the loud refusal.
+    // ✔MEASURED gcc 13.3.0 and clang 18.1.3 (-std=gnu2x, -std=c2x -pedantic-errors):
+    // `int v[n]; n = 99; typeof(v) a, b; typeof(v) c[m]; typeof(v) *p = &v; typedef
+    // typeof(v) T; T d; typedef typeof(v) S[m]; S e;` — every one of v's frozen size.
+    [[nodiscard]] SymbolId headTypeofVlaObject(NodeId declNode, DeclarationRule const& decl) {
+        NodeId const found = headTypeofOf_(declNode, decl, sem.typeofValueRule);
+        if (!found.valid()) return {};
+        TypeId const t = typeAtOr(found, InvalidType);
+        if (!t.valid() || !(interner.isVlaArray(t) || interner.typeContainsVla(t))) return {};
+        auto const kids = visible(found);
+        if (sem.typeofOperandChild >= kids.size()) return {};
+        SymbolId const object = vlaObjectOperandSymbol(kids[sem.typeofOperandChild]);
+        SymbolRecord const* rec = object.valid() ? model.recordFor(object) : nullptr;
+        if (rec == nullptr || reprOf(rec->type) != reprOf(t)) return {};
+        return object;
     }
     // VLA C1a (D-CSUBSET-VLA): lower a block-scope variable-length array local's
     // SIZE expression and record it in the out-of-band side-table keyed by the
@@ -3343,8 +3443,18 @@ struct Lowerer {
     // scope gate guarantees that shape). `declaratorNode` is the declarator CST
     // node; `sym` its declared symbol. The lowered size node is FLOATING (valid in
     // the arena, reachable only via the side-table — no statement parents it).
-    void captureVlaSize(NodeId declaratorNode, SymbolId sym) {
-        if (!sem.declarators.has_value() || !sym.valid()) return;
+    //
+    // ★ P69 L2 (lane `lm`): `headTypeName` — a `typeof ( type-name )` in the
+    // declaration's head whose type carries a variable-length bound
+    // (`headTypeofTypeName`). Its suffixes are the INNER levels of every declarator's
+    // type (`typeof(int[n]) a[m]` is `m` arrays of `int[n]`), so they are collected
+    // after the declarator's own, in the same source order. Before this, the head's
+    // bound was found nowhere and every such declaration was refused below ("carries
+    // no array suffix"): `typeof(int[n + k++]) a;` — gcc 13.3.0 and clang 18.1.3
+    // build it and evaluate the bound once (✔MEASURED, exit 41, one layer and three).
+    // Returns how many bounds it captured under `sym` (0 when it captured none).
+    std::size_t captureVlaSize(NodeId declaratorNode, SymbolId sym, NodeId headTypeName = {}) {
+        if (!sem.declarators.has_value() || !sym.valid()) return 0;
         DeclaratorConfig const& dc = *sem.declarators;
         // VLA C3: collect EVERY array suffix in SOURCE order (outer→inner) — a multi-
         // dimensional VLA (`int a[n][m]`) has one suffix per dimension, and the order
@@ -3354,9 +3464,11 @@ struct Lowerer {
         // left-to-right; an array-suffix node is recorded, NOT descended into (its
         // only children are `[`, the bound expr, `]`).
         std::vector<NodeId> suffixes;
-        {
-            std::vector<NodeId> stack{declaratorNode};
-            for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+        for (NodeId const root : {declaratorNode, headTypeName}) {
+            if (!root.valid()) continue;
+            std::vector<NodeId> stack{root};
+            for (substrate::WalkSteps steps{tree().nodeCount(), "captureVlaSize's suffix walk"};
+                 !stack.empty(); steps.step()) {
                 NodeId const c = stack.back(); stack.pop_back();
                 if (tree().kind(c) != NodeKind::Internal) continue;
                 if (tree().rule(c).v == dc.arraySuffixRule.v) {
@@ -3374,7 +3486,7 @@ struct Lowerer {
             (void)reportedError(declaratorNode,
                 "internal: variable-length array declarator carries no array "
                 "suffix to lower its runtime size from");
-            return;
+            return 0;
         }
         // VLA C4a-param (D-CSUBSET-VLA, FIX-3): a ptr-to-VLA PARAMETER's declarator
         // carries DECAYED leading array suffix(es) that are NOT part of the pointee's
@@ -3439,9 +3551,10 @@ struct Lowerer {
                 (void)reportedError(declaratorNode,
                     "internal: variable-length array declarator's runtime size "
                     "expression could not be lowered");
-                return;
+                return 0;
             }
         }
+        return suffixes.size();
     }
     // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
     // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
@@ -3725,13 +3838,12 @@ struct Lowerer {
     // `isBraceInitList` beside the role, so nothing was lowered wrong by it). And no
     // depth cap: past 128 steps this returned the node it had reached as if the walk
     // had ended; every step is to a strict descendant, so the tree's node count bounds
-    // it and a walk past it is a cyclic node graph (`failOnCyclicNodeGraph`) — a stop no
+    // it and a walk past it is a cyclic node graph (`substrate::failOnCyclicWalk`) — a stop no
     // program can reach.
     [[nodiscard]] NodeId peelToCore(NodeId n) const {
         NodeId cur = n;
-        std::size_t const bound = tree().nodeCount() + 1;
-        for (std::size_t step = 0; cur.valid(); ++step) {
-            if (step > bound) failOnCyclicNodeGraph("the lowering's role peel (`peelToCore`)");
+        for (substrate::WalkSteps steps{tree().nodeCount(), "the lowering's role peel (`peelToCore`)"};
+             cur.valid(); steps.step()) {
             if (tree().kind(cur) != NodeKind::Internal) return cur;  // token
             std::uint32_t const rv = tree().rule(cur).v;
             if (isExprNode(cur)) return cur;
@@ -3865,7 +3977,9 @@ struct Lowerer {
     // `f` and advances `f.phase` BEFORE calling `enter` (the Stage-1/2 idiom).
     struct ExprFrame {
         enum class Kind : std::uint8_t { PassThrough, Binary, Unary, Cast, Postfix,
-                                         Ternary, Comma, Call, Assign } kind;
+                                         Ternary, Comma, Call, Assign, StmtExpr,
+                                         Selection, Collect, SizeofOperand,
+                                         VlaTypeNameSize, CompoundLiteral } kind;
         NodeId                  node;    // the source node (provenance / combine anchor)
         std::uint8_t            phase;
         NodeId                  n0;      // PassThrough inner / binary+comma lhs / unary+cast operand / postfix+call base / ternary cond
@@ -3875,7 +3989,9 @@ struct Lowerer {
         E                       c0;      // first child result (binary rhs / postfix base / ternary coerced cond / comma ExprStmt effect in .id)
         E                       c1;      // second child result (ternary then)
         TypeId                  target;  // cast target type
-        std::uint32_t           aux;     // Call: index into the local `callCtxs` stack
+        std::uint32_t           aux;     // Call: index into the local `callCtxs` stack; StmtExpr: into `stmtExprStmts`;
+                                         // Collect / SizeofOperand / VlaTypeNameSize / CompoundLiteral: into
+                                         // `collectCtxs`; Cast: 1 + its index there (0: the cast collects nothing)
     };
 
     // The per-call accumulating state for a flattened postfix Call. Lives in a
@@ -3918,6 +4034,32 @@ struct Lowerer {
         HirNodeId    compoundLhsRead{}; // compound only: the lvRead emitted BEFORE the rhs
     };
 
+    // ★ P69 L2a (lane `lm`): WHAT A FRAME COLLECTS BEFORE IT CAN FINISH — the expressions C
+    // evaluates there, each lowered by THIS driver (one `Collect` frame per node, never a
+    // re-entry of `lowerExpr`, so a chain of them nested in one another costs heap, not host
+    // stack), and their values in the same order. The consumers: a `sizeof` whose operand of
+    // variable-length array type is evaluated (`SizeofOperand`), the bounds of a variable-length
+    // array type name a `sizeof` multiplies (`VlaTypeNameSize`), and the size expressions of a
+    // variably modified type name a cast or a compound literal evaluates (`Cast`,
+    // `CompoundLiteral`). A LIFO stack local to `lowerExpr`, like `callCtxs`: a consumer nested
+    // in another one's collection finishes first.
+    struct CollectCtx {
+        std::vector<NodeId> nodes;      // the expressions, in evaluation order
+        std::vector<E>      values;     // VlaTypeNameSize: their values, one per node, in order
+        // The other consumers run them for what they DO, their values unread: each as a
+        // statement, in order (`stmts`) — a `++` / `--` as the statement `x++;` is, so no
+        // temporary holds a value nobody reads (a stepped pointer to a variable-length array
+        // would need a row stride for it that nothing froze) — and the first that failed to
+        // lower is the consumer's answer (`failed`, its diagnostic already emitted).
+        bool                   statements = false;
+        std::vector<HirNodeId> stmts;
+        E                      failed{};
+        HirNodeId           carried{};  // SizeofOperand: the SizeOf the operand runs before
+        TypeId              type{};     // SizeofOperand / VlaTypeNameSize: the size's type
+        TypeId              elem{};     // VlaTypeNameSize: the element the bounds multiply
+        NodeId              scan{};     // VlaTypeNameSize: the type name (a typedef element's slot)
+    };
+
     // The public expression-lowering entry: a driver over an explicit work-stack.
     // `enter` classifies a node (TERMINAL → set `result`; DEEP arm → push a
     // phase-0 frame and return WITHOUT recursing); the loop runs each frame's
@@ -3933,6 +4075,26 @@ struct Lowerer {
         // Separate from `callCtxs` (a frame is Call XOR Assign, but each space is
         // independent); a right-assoc `a=b=c=…` chain pushes one per `=`.
         std::vector<AssignCtx> assignCtxs;
+        // ★ P69 L2 (lane `lm`, D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL): the
+        // statements a statement expression in VALUE position runs before its value, one entry per
+        // StmtExpr frame (LIFO, like `callCtxs`: nested ones finish inner-first). The value is a
+        // frame of THIS driver; the `lowerStatementExpr` it replaced re-entered `lowerExpr`, a fresh
+        // driver and its host frames per nested `({ ({ … }); })` level.
+        std::vector<std::vector<HirNodeId>> stmtExprStmts;
+        // P69 L2a (lane `lm`): the collections of the frames that evaluate expressions before
+        // they finish (`CollectCtx`), and the push that queues one: the consumer first (its
+        // `aux` names the collection), then one `Collect` frame per node, the FIRST node's on
+        // top — the driver runs them in order, and reaches the consumer once the last delivered.
+        std::vector<CollectCtx> collectCtxs;
+        auto const pushCollected = [&work, &collectCtxs](ExprFrame consumer,
+                                                         std::uint32_t ctxIdx) {
+            work.push_back(consumer);
+            collectCtxs[ctxIdx].statements = consumer.kind != ExprFrame::Kind::VlaTypeNameSize;
+            std::vector<NodeId> const& nodes = collectCtxs[ctxIdx].nodes;
+            for (std::size_t i = nodes.size(); i-- > 0;)
+                work.push_back({.kind = ExprFrame::Kind::Collect, .node = nodes[i],
+                                .n0 = nodes[i], .aux = ctxIdx});
+        };
         // Default-init (no node emitted): `enter` ALWAYS assigns `result` for a
         // terminal, and every pushed frame eventually delivers into `result`
         // before it is read, so this never leaks an Error node.
@@ -3951,8 +4113,78 @@ struct Lowerer {
                     // resolve here; the plain `( expression )` wrapper and the
                     // explicit cast `(T)expr` return nullopt → flatten their operand
                     // recursion via the work-stack (a PassThrough or Cast frame).
-                    NodeId inner{}, castN{};
-                    if (auto term = lowerOperandTerminal(n, inner, castN)) { result = *term; return; }
+                    NodeId inner{}, castN{}, stmtExprN{}, selectionN{}, sizeofN{}, literalN{};
+                    if (auto term = lowerOperandTerminal(n, inner, castN, stmtExprN, selectionN,
+                                                         sizeofN, literalN)) {
+                        result = *term;
+                        return;
+                    }
+                    if (sizeofN.valid()) {
+                        // P69 L2a (lane `lm`): a `sizeof` — its size now, unless C evaluates
+                        // something in it first: an operand of variable-length array type (the
+                        // size its root froze is read after the operand ran) or the bounds of a
+                        // variable-length array type name (multiplied), collected as frames.
+                        SizeofDeferral deferred;
+                        E const sized = lowerSizeof(sizeofN, deferred);
+                        if (deferred.kind == SizeofDeferral::Kind::None) {
+                            result = sized;
+                            return;
+                        }
+                        auto const ctxIdx = static_cast<std::uint32_t>(collectCtxs.size());
+                        CollectCtx ctx;
+                        ctx.nodes   = std::move(deferred.nodes);
+                        ctx.carried = sized.id;
+                        ctx.type    = sized.type;
+                        ctx.elem    = deferred.elem;
+                        ctx.scan    = deferred.scan;
+                        collectCtxs.push_back(std::move(ctx));
+                        pushCollected({.kind = deferred.kind == SizeofDeferral::Kind::Operand
+                                                   ? ExprFrame::Kind::SizeofOperand
+                                                   : ExprFrame::Kind::VlaTypeNameSize,
+                                       .node = sizeofN, .aux = ctxIdx},
+                                      ctxIdx);
+                        return;
+                    }
+                    if (literalN.valid()) {
+                        // P69 L2a (lane `lm`): a compound literal whose variably modified type
+                        // name C evaluates: its size expressions as frames, then the literal.
+                        auto const ctxIdx = static_cast<std::uint32_t>(collectCtxs.size());
+                        CollectCtx ctx;
+                        ctx.nodes = compoundLiteralTypeNameEffects(literalN);
+                        collectCtxs.push_back(std::move(ctx));
+                        pushCollected({.kind = ExprFrame::Kind::CompoundLiteral,
+                                       .node = literalN, .aux = ctxIdx},
+                                      ctxIdx);
+                        return;
+                    }
+                    if (selectionN.valid()) {
+                        // A recorded selection: its winner as a frame (phase 0 enters it), the
+                        // re-anchored result at phase 1.
+                        NodeId selected{};
+                        if (auto refused = recordedSelectionPrologue(selectionN, selected)) {
+                            result = *refused;
+                            return;
+                        }
+                        work.push_back({.kind = ExprFrame::Kind::Selection, .node = selectionN,
+                                        .n0 = selected});
+                        return;
+                    }
+                    if (stmtExprN.valid()) {
+                        // A statement expression in value position: its statements now, its
+                        // value as a frame (phase 0 enters it), the SeqExpr at phase 1.
+                        std::vector<HirNodeId> stmts;
+                        NodeId valueN{};
+                        if (auto refused = stmtExprValuePrologue(stmtExprN, stmts, valueN)) {
+                            result = *refused;
+                            return;
+                        }
+                        std::uint32_t const ctxIdx =
+                            static_cast<std::uint32_t>(stmtExprStmts.size());
+                        stmtExprStmts.push_back(std::move(stmts));
+                        work.push_back({.kind = ExprFrame::Kind::StmtExpr, .node = stmtExprN,
+                                        .n0 = valueN, .aux = ctxIdx});
+                        return;
+                    }
                     if (castN.valid()) {
                         // Resolve the cast target (a pure read of the semantic
                         // stamps) BEFORE entering the operand — matching the
@@ -3962,8 +4194,23 @@ struct Lowerer {
                         if (auto err = castPrologue(castN, castOperandN, castTarget)) {
                             result = *err; return;
                         }
-                        work.push_back({.kind = ExprFrame::Kind::Cast, .node = castN,
-                                        .n0 = castOperandN, .target = castTarget});
+                        // P69 L2a (lane `lm`): a variably modified target's type name is
+                        // EVALUATED (its size expressions) before the operand — collected as
+                        // frames above the cast, which runs them before its value.
+                        std::vector<NodeId> effects = castTypeNameEffects(castN, castTarget);
+                        if (effects.empty()) {
+                            work.push_back({.kind = ExprFrame::Kind::Cast, .node = castN,
+                                            .n0 = castOperandN, .target = castTarget});
+                            return;
+                        }
+                        auto const ctxIdx = static_cast<std::uint32_t>(collectCtxs.size());
+                        CollectCtx ctx;
+                        ctx.nodes = std::move(effects);
+                        collectCtxs.push_back(std::move(ctx));
+                        pushCollected({.kind = ExprFrame::Kind::Cast, .node = castN,
+                                       .n0 = castOperandN, .target = castTarget,
+                                       .aux = ctxIdx + 1},
+                                      ctxIdx);
                         return;
                     }
                     work.push_back({.kind = ExprFrame::Kind::PassThrough, .node = n,
@@ -4224,8 +4471,15 @@ struct Lowerer {
                 } else {
                     NodeId const node2 = f.node;
                     TypeId const target = f.target;
+                    std::uint32_t const effectsAt = f.aux;   // 0: none; else 1 + its collection
                     work.pop_back();
                     result = combineCast(node2, target, result);
+                    if (effectsAt != 0) {
+                        // P69 L2a (lane `lm`): the type name's size expressions ran first.
+                        CollectCtx const ctx = std::move(collectCtxs[effectsAt - 1]);
+                        collectCtxs.pop_back();   // LIFO: this cast's collection is the back
+                        result = effectsThen(node2, ctx, result);
+                    }
                 }
                 break;
             case ExprFrame::Kind::Postfix:
@@ -4402,6 +4656,86 @@ struct Lowerer {
                     finishAssign(work, assignCtxs, ctxIdx, result);
                 }
                 break;
+            case ExprFrame::Kind::StmtExpr:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const valueN = f.n0;
+                    enter(valueN);          // lower the value — may invalidate `f`
+                } else {
+                    NodeId const        node2  = f.node;
+                    std::uint32_t const ctxIdx = f.aux;
+                    E const value = result;
+                    work.pop_back();
+                    std::vector<HirNodeId> stmts = std::move(stmtExprStmts[ctxIdx]);
+                    stmtExprStmts.pop_back();   // LIFO: this frame's entry is the back
+                    result = stmtExprValueEpilogue(node2, std::move(stmts), value);
+                }
+                break;
+            case ExprFrame::Kind::Selection:
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const selected = f.n0;
+                    enter(selected);        // lower the winner — may invalidate `f`
+                } else {
+                    NodeId const node2  = f.node;
+                    E const      chosen = result;
+                    work.pop_back();
+                    result = recordedSelectionEpilogue(node2, chosen);
+                }
+                break;
+            case ExprFrame::Kind::Collect:
+                // P69 L2a (lane `lm`): one expression a consumer below collects — entered at
+                // phase 0, its value (or, for a consumer that runs it for what it does, its
+                // statement) appended to the consumer's collection at phase 1.
+                if (f.phase == 0) {
+                    NodeId const        collected = f.n0;
+                    std::uint32_t const ctxIdx    = f.aux;
+                    if (collectCtxs[ctxIdx].statements) {
+                        if (std::optional<bool> const inc = incDecOf(collected)) {
+                            work.pop_back();   // `f` is gone: the statement needs no frame
+                            HirNodeId const st = lowerIncDecStmt(collected, *inc);
+                            CollectCtx& ctx = collectCtxs[ctxIdx];
+                            if (builder.kind(st) == HirKind::Error) {
+                                if (!ctx.failed.id.valid()) ctx.failed = E{st, InvalidType};
+                            } else {
+                                ctx.stmts.push_back(st);
+                            }
+                            break;
+                        }
+                    }
+                    f.phase = 1;
+                    enter(collected);       // lower it — may invalidate `f`
+                } else {
+                    std::uint32_t const ctxIdx = f.aux;
+                    work.pop_back();
+                    CollectCtx& ctx = collectCtxs[ctxIdx];
+                    if (!ctx.statements) {
+                        ctx.values.push_back(result);
+                    } else if (!result.type.valid()) {
+                        if (!ctx.failed.id.valid()) ctx.failed = result;
+                    } else {
+                        // an array decays to a pointer, so nothing of an array is loaded
+                        ctx.stmts.push_back(builder.makeExprStmt(convertedToItsValue(result).id));
+                    }
+                }
+                break;
+            case ExprFrame::Kind::SizeofOperand:
+            case ExprFrame::Kind::VlaTypeNameSize:
+            case ExprFrame::Kind::CompoundLiteral: {
+                // P69 L2a (lane `lm`): every collection above this frame has delivered.
+                NodeId const              node2  = f.node;
+                ExprFrame::Kind const     kind   = f.kind;
+                work.pop_back();
+                CollectCtx const ctx = std::move(collectCtxs.back());
+                collectCtxs.pop_back();   // LIFO: this frame's collection is the back
+                if (kind == ExprFrame::Kind::SizeofOperand)
+                    result = effectsThen(node2, ctx, E{ctx.carried, ctx.type});
+                else if (kind == ExprFrame::Kind::VlaTypeNameSize)
+                    result = vlaTypeNameSizeEpilogue(node2, ctx);
+                else
+                    result = lowerCompoundLiteral(node2, &ctx);
+                break;
+            }
             }
         }
         return result;
@@ -4561,10 +4895,21 @@ struct Lowerer {
     // the `lowerExpr` driver flattens their operand recursion via the work-stack:
     //   • the plain `( expression )` wrapper → sets `descendInto` to the inner node
     //   • the explicit cast `(T)expr`        → sets `castNode` to the cast node
-    // (exactly one of the two out-params is set when nullopt is returned). The
+    //   • a GNU statement expression `({ … })` → sets `stmtExprNode` to it (P69 L2: its
+    //     value is a frame of the driver, `ExprFrame::Kind::StmtExpr`)
+    //   • a recorded selection (`_Generic`, `__builtin_choose_expr`) → sets
+    //     `selectionNode` to it (P69 L2: its winner is a frame, `ExprFrame::Kind::Selection`)
+    //   • a `sizeof` → sets `sizeofNode` to it (P69 L2a: what C evaluates in it is collected
+    //     as frames, `ExprFrame::Kind::SizeofOperand` / `VlaTypeNameSize`)
+    //   • a compound literal whose variably modified type name C evaluates → sets
+    //     `compoundLiteralNode` to it (P69 L2a: its size expressions are frames,
+    //     `ExprFrame::Kind::CompoundLiteral`)
+    // (exactly one of the six out-params is set when nullopt is returned). The
     // dispatch ORDER is byte-identical to the prior recursive `lowerOperand`.
     [[nodiscard]] std::optional<E> lowerOperandTerminal(NodeId node, NodeId& descendInto,
-                                                        NodeId& castNode) {
+                                                        NodeId& castNode, NodeId& stmtExprNode,
+                                                        NodeId& selectionNode, NodeId& sizeofNode,
+                                                        NodeId& compoundLiteralNode) {
         // operand = Identifier | <literal token> | <char/string literal>
         //         | ( expression ) | compoundLiteralExpr | castExpr | ...
         if (auto lit = tryLowerLeafLiteral(node)) return *lit;
@@ -4582,6 +4927,10 @@ struct Lowerer {
             // D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR); the
             // hirLowering block no longer repeats it.
             if (compoundLiteralRowFor(c) != nullptr) {
+                if (!compoundLiteralTypeNameEffects(c).empty()) {
+                    compoundLiteralNode = c;
+                    return std::nullopt;   // the driver evaluates its type name first
+                }
                 return lowerCompoundLiteral(c);
             }
             if (cfg.castRule.valid()
@@ -4591,7 +4940,8 @@ struct Lowerer {
             }
             if (cfg.sizeofRule.valid()
              && tree().rule(c).v == cfg.sizeofRule.v) {
-                return lowerSizeof(c);
+                sizeofNode = c;
+                return std::nullopt;   // the driver lowers it (what C evaluates in it, as frames)
             }
             // C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` — like sizeof, its
             // castTypeRef child must NOT be lowered as an expression; route it to
@@ -4637,7 +4987,8 @@ struct Lowerer {
             // `_Generic` surface leaves this invalid and skips it.
             if (cfg.genericRule.valid()
              && tree().rule(c).v == cfg.genericRule.v) {
-                return lowerRecordedSelection(c, "_Generic");
+                selectionNode = c;
+                return std::nullopt;   // the driver lowers the winner as a frame
             }
             // P31: `__builtin_choose_expr` takes the SAME recorded-selection
             // lowering, because the two constructs differ ONLY in how the
@@ -4646,7 +4997,8 @@ struct Lowerer {
             // sub-expression survives".
             if (cfg.chooseExprRule.valid()
              && tree().rule(c).v == cfg.chooseExprRule.v) {
-                return lowerRecordedSelection(c, "__builtin_choose_expr");
+                selectionNode = c;
+                return std::nullopt;   // the driver lowers the winner as a frame
             }
             // P31 (D-C-GNU-STATEMENT-EXPRESSION): `({ … })` — its children are
             // STATEMENTS, so it routes to a dedicated lowering for the same
@@ -4654,7 +5006,8 @@ struct Lowerer {
             // operand descent would try to lower a declaration as a value.
             if (cfg.stmtExprRule.valid()
              && tree().rule(c).v == cfg.stmtExprRule.v) {
-                return lowerStatementExpr(c);
+                stmtExprNode = c;
+                return std::nullopt;   // the driver lowers its value as a frame
             }
             // P31: the compile-time-answer operators. Their ENTIRE meaning is a
             // number the semantic tier computed, so there is no subtree to lower
@@ -5611,7 +5964,8 @@ struct Lowerer {
     [[nodiscard]] NameHit firstNameToken(NodeId subtree) const {
         NameHit hit;
         std::vector<NodeId> stack{subtree};
-        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+        for (substrate::WalkSteps steps{tree().nodeCount(), "firstNameToken's walk"}; !stack.empty();
+             steps.step()) {
             NodeId n = stack.back(); stack.pop_back();
             if (isNameToken(n)) {
                 if (!hit.node.valid()) hit.node = n;            // rightmost name (for the span)
@@ -7240,6 +7594,55 @@ struct Lowerer {
         return PostfixFlatten::Delegate;  // Call / PostInc / PostDec / unknown
     }
 
+    // P69 L2a (lane `lm`): whether `node` is a `++` / `--` — postfix (the first token after its
+    // operand) or prefix (its first token) — and which (true: an increment). The lookups the
+    // statement lowering makes to route `x++;` / `++x;` to `lowerIncDecStmt` (`postOp_`, `unOp_`).
+    [[nodiscard]] std::optional<bool> incDecOf(NodeId node) {
+        if (!node.valid() || tree().kind(node) != NodeKind::Internal) return std::nullopt;
+        std::uint32_t const r = tree().rule(node).v;
+        bool const postfix = r == cfg.postfixExprRule.v;
+        if (!postfix && r != cfg.unaryExprRule.v) return std::nullopt;
+        for (NodeId c : visible(node)) {
+            if (!isToken(c)) continue;
+            if (postfix) {
+                auto const it = postOp_.find(tree().tokenKind(c).v);
+                if (it == postOp_.end()) return std::nullopt;
+                std::string const& t = cfg.postfixOps[it->second].target;
+                if (t == "PostInc") return true;
+                if (t == "PostDec") return false;
+                return std::nullopt;
+            }
+            auto const it = unOp_.find(tree().tokenKind(c).v);
+            if (it == unOp_.end()) return std::nullopt;
+            std::string const& t = cfg.unaryOps[it->second].target;
+            if (t == "PreInc") return true;
+            if (t == "PreDec") return false;
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    // P69 L2a (lane `lm`): whether running `expr` can do anything at all — false when it names
+    // nothing (no identifier: `0`, `1 + 2`), so an index like that runs as nothing and the
+    // common `sizeof v[0]` keeps the bare SizeOf. A walk bounded by the tree it walks.
+    [[nodiscard]] bool namesAnything(NodeId expr) {
+        std::vector<NodeId> stack{expr};
+        for (substrate::WalkSteps steps{tree().nodeCount(), "namesAnything's walk"};
+             !stack.empty(); steps.step()) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (!c.valid()) continue;
+            if (isToken(c)) {
+                if (sem.identifierToken.valid()
+                    && tree().tokenKind(c).v == sem.identifierToken.v)
+                    return true;
+                continue;
+            }
+            for (NodeId const k : visible(c)) stack.push_back(k);
+        }
+        return false;
+    }
+
     // True iff `node` is a well-formed postfix CALL — the form the driver flattens
     // through a Call frame. On success sets `baseN` to the callee CST node and
     // `argNodes` to its argument expression nodes (left→right, via
@@ -7913,14 +8316,6 @@ struct Lowerer {
                                                     sem.inlineAsmTemplateLexemes,
                                                     sem.identifierToken,
                                                     cfg.stringBodyToken);
-                if (f.scanTruncated) {
-                    stmtResult = reportedError(n,
-                        "inline-asm payload scan did not finish (node budget "
-                        "exhausted), so this statement has NOT been shown to carry "
-                        "only what was captured — refusing rather than building a "
-                        "descriptor on an unverified assumption");
-                    return;
-                }
                 // The BARE BARRIER: no sections at all AND an empty template.
                 // `payload` stays `kNoInlineAsmDescriptor`, so every existing
                 // consumer (MIR's CompilerBarrier arm, `hir_text`'s bare
@@ -8545,11 +8940,26 @@ struct Lowerer {
         // clang refuses `&&L` of a label inside one taken outside it and gcc builds it —
         // a construct no reference makes work, so refused too. A jump inside one and a
         // jump out of one stand. The case and default labels are the switch's prescan's.
+        // ★ P69 L2 (lane `lm`, the review of checkpoint 29, NIT 10): A COMPUTED GOTO
+        // OUTSIDE A STATEMENT EXPRESSION MAY NOT REACH A LABEL INSIDE IT, wherever its
+        // address was taken — `({ p = &&L; L: 5; }); goto *p;` enters the statement
+        // expression as surely as `&&L` taken outside it does. Every `goto *` is checked
+        // against every label whose address the function takes: each statement
+        // expression around such a label must be around the `goto *` too. ✔MEASURED
+        // 2026-10-20 (probes l2n): clang 18.1.3 refuses the `goto *` ("cannot jump from
+        // this indirect goto statement to one of its possible targets") after the
+        // statement expression and from a sibling one, and builds a `goto *` inside it,
+        // inside a nested one, out of one, and an address taken with no `goto *` outside;
+        // gcc 13.3.0 builds all six — the GNU manual (6.1) calls a jump into a statement
+        // expression with a computed goto undefined behavior, so gcc's build is of an
+        // undefined program, which the reference disjunction does not require.
         struct PrescanEntry { NodeId node; NodeId stmtExpr; };
         struct LabelJump    { NodeId nameTok; NodeId stmtExpr; bool address; };
+        struct ComputedGoto { NodeId node; NodeId stmtExpr; };
         std::unordered_map<std::uint32_t, NodeId> stmtExprAround;   // a statement expression -> the one around it
         std::unordered_map<std::string, NodeId>   labelStmtExpr;    // a label -> the innermost one around it
         std::vector<LabelJump>                    jumps;
+        std::vector<ComputedGoto>                 computedGotos;
         std::vector<PrescanEntry> stack;
         if (root.valid()) stack.push_back({root, NodeId{}});
         while (!stack.empty()) {
@@ -8575,6 +8985,8 @@ struct Lowerer {
             } else if (m != nullptr && m->hirKind == "GotoStmt") {
                 if (NodeId const nameTok = firstIdentifierToken(node); nameTok.valid())
                     jumps.push_back({nameTok, entry.stmtExpr, /*address=*/false});
+            } else if (m != nullptr && m->hirKind == "IndirectGotoStmt") {
+                computedGotos.push_back({node, entry.stmtExpr});
             } else if (cfg.labelAddressRule.valid() && tree().kind(node) == NodeKind::Internal
                        && tree().rule(node).v == cfg.labelAddressRule.v) {
                 if (NodeId const nameTok = firstIdentifierToken(node); nameTok.valid())
@@ -8593,6 +9005,7 @@ struct Lowerer {
                 if (!isToken(c)) stack.push_back({c, around});
             std::reverse(stack.begin() + static_cast<std::ptrdiff_t>(mark), stack.end());
         }
+        std::unordered_set<std::string_view> refusedAddress;   // `&&L` taken outside: said once
         for (LabelJump const& j : jumps) {
             auto const target = labelStmtExpr.find(std::string{tree().text(j.nameTok)});
             if (target == labelStmtExpr.end() || !target->second.valid()) continue;
@@ -8611,7 +9024,38 @@ struct Lowerer {
                           : std::format("goto '{}' jumps into a statement expression it is "
                                         "not inside (GNU C 6.1)",
                                         tree().text(j.nameTok)));
+                if (j.address) refusedAddress.insert(tree().text(j.nameTok));
                 break;
+            }
+        }
+        // The labels whose address the function takes, each by the innermost statement
+        // expression around it (none: no `goto *` can enter one through it), once each — a
+        // label whose `&&` was refused above is refused once, there.
+        std::vector<std::pair<std::string_view, NodeId>> addressTaken;
+        std::unordered_set<std::string_view> seenAddress;
+        for (LabelJump const& j : jumps) {
+            if (!j.address) continue;
+            std::string_view const name = tree().text(j.nameTok);
+            if (refusedAddress.contains(name)) continue;
+            auto const target = labelStmtExpr.find(std::string{name});
+            if (target == labelStmtExpr.end() || !target->second.valid()) continue;
+            if (seenAddress.insert(name).second) addressTaken.emplace_back(name, target->second);
+        }
+        for (ComputedGoto const& g : computedGotos) {
+            std::unordered_set<std::uint32_t> aroundGoto;
+            for (NodeId se = g.stmtExpr; se.valid(); se = stmtExprAround.at(se.v))
+                aroundGoto.insert(se.v);
+            for (auto const& [name, innermost] : addressTaken) {
+                bool enters = false;
+                for (NodeId se = innermost; se.valid() && !enters; se = stmtExprAround.at(se.v))
+                    enters = !aroundGoto.contains(se.v);
+                if (!enters) continue;
+                emitH(DiagnosticCode::S_JumpIntoStatementExpression, g.node,
+                      std::format("this computed goto may jump to '&&{}', a label inside a "
+                                  "statement expression the goto is not inside — a jump into "
+                                  "a statement expression (GNU C 6.1)",
+                                  name));
+                break;   // once per computed goto
             }
         }
     }
@@ -9448,14 +9892,13 @@ struct Lowerer {
     // under one, so an element's VALUE is not walked into looking for one (no answer
     // changes: the value's own node is returned either way, and the caller's rule test
     // finds no designator there) — and is bounded by its tree's node count, LOUD past it
-    // (`failOnCyclicNodeGraph`: every step is to a strict descendant, so no program
+    // (`substrate::failOnCyclicWalk`: every step is to a strict descendant, so no program
     // reaches the stop).
     [[nodiscard]] std::pair<NodeId, std::uint32_t>
     peelToDesignatorLeaf(NodeId n) const {
         NodeId cur = n;
-        std::size_t const bound = tree().nodeCount() + 1;
-        for (std::size_t step = 0; tree().kind(cur) == NodeKind::Internal; ++step) {
-            if (step > bound) failOnCyclicNodeGraph("the lowering's designator peel");
+        for (substrate::WalkSteps steps{tree().nodeCount(), "the lowering's designator peel"};
+             tree().kind(cur) == NodeKind::Internal; steps.step()) {
             std::uint32_t const rr = tree().rule(cur).v;
             if (cfg.designatedFieldRule.valid() && rr == cfg.designatedFieldRule.v) break;
             if (cfg.designatedIndexRule.valid() && rr == cfg.designatedIndexRule.v) break;
@@ -9691,6 +10134,35 @@ struct Lowerer {
         }
         return delivered;
     }
+    // ★ P69 L2a (lane `lm`): what the descent below found — the root whose frozen slot
+    // sizes the operand, the indirections it consumed on the way (a subscript, a unary `*`),
+    // and what EVALUATING the operand runs (`effects`, outer → inner): every subscript's index
+    // and every `++` / `--` it passed over the root pointer. That is the whole of it — the rest
+    // designates an array, an lvalue nothing loads, so its address is not computed: computing
+    // it does nothing a program can observe, and through a stepped pointer it would need the
+    // row stride of a temporary nothing froze (✔MEASURED 2026-10-21, run 20261021-233331-52914fa9
+    // and compile-and-keep l2a-exsplit: `sizeof *(p++)`, `sizeof *p++` and `sizeof p++[0]` were
+    // refused at MIR when the operand was run whole). `vlaObjectOperandSymbol` is the root alone.
+    //
+    // ★ THE RULE IS TOTAL — nothing that can do something is dropped. What the descent passes
+    // through is closed over what an expression can do: a subscript (its index runs), a `++` /
+    // `--` (it runs), a parenthesis, a unary `*` or `&` (they do nothing), and the root — an
+    // array object (designated, never read) or a pointer to one (read: a VOLATILE pointer's
+    // read runs, C 5.1.2.3p2, unless a `++` / `--` of it already reads it). Anything else that
+    // reaches the array — a comma, a conditional, an assignment, a call, a cast, a pointer to a
+    // pointer, a selection — stops the descent (`stoppedAt`), and the `sizeof` is REFUSED BY
+    // NAME there (`lowerSizeof`): the declaration that froze the size is not known through it.
+    // So a descent that one day passes through more (sizing a composite operand) must say, for
+    // each node it newly passes, what that node runs — the totality is this list's.
+    struct VlaOperandRoot {
+        SymbolId            symbol{};
+        int                 indirections = 0;
+        std::vector<NodeId> effects;
+        NodeId              stoppedAt{};   // no root: the sub-expression the descent stopped at
+    };
+    [[nodiscard]] SymbolId vlaObjectOperandSymbol(NodeId operand) {
+        return vlaObjectOperandRoot(operand).symbol;
+    }
     // VLA C2 (D-CSUBSET-VLA): the SymbolId of a `sizeof <operand>` when the operand is a
     // DIRECT reference to a VLA object (`a`, `(a)`, `((a))`). Mirrors `simpleLvalue`'s
     // core (side-effect-free): `peelToCore` peels transparent paren/wrapper nodes, and
@@ -9709,14 +10181,28 @@ struct Lowerer {
     // BASE to the root VLA object; the MIR SizeOf case then Loads the SAME
     // (sym, sized-row-type) stride slot the index path uses. Non-const so it can call
     // the postfix classifier `postfixFlattenPlan`.
-    [[nodiscard]] SymbolId vlaObjectOperandSymbol(NodeId operand) {
+    [[nodiscard]] VlaOperandRoot vlaObjectOperandRoot(NodeId operand) {
         NodeId cur = operand;
+        std::vector<NodeId> effects;   // what evaluating the operand runs (see `VlaOperandRoot`)
+        bool stepped = false;          // a `++` / `--` of the root pointer is among them
+        auto const stopAt = [](NodeId at) {
+            VlaOperandRoot r;
+            r.stoppedAt = at;
+            return r;
+        };
         // P68 round 12 (lane `cs`): the indirections (subscripts and unary `*`) consumed
         // on the way to the root — a POINTER to a variable-length array answers after
         // exactly one of them (`sizeof *p`, `sizeof p[i]`: the pointee), see below.
         int indirections = 0;
-        for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
-            if (isToken(cur)) return SymbolId{};   // a bare non-identifier token operand
+        for (substrate::WalkSteps steps{tree().nodeCount(), "vlaObjectOperandSymbol's descent"}; cur.valid();
+             steps.step()) {
+            if (isToken(cur)) return stopAt(cur);   // a bare non-identifier token operand
+            // A `++` / `--` on the way (`*p++`, `*++p`, `p++[0]`): the operand's run steps the
+            // pointer.
+            if (incDecOf(cur).has_value()) {
+                effects.push_back(cur);
+                stepped = true;
+            }
             // VLA C3: a postfix subscript (`a[0]`, `a[i][j]`) — descend the BASE
             // (skipping the subscript index), reaching the root VLA object. A
             // subscript keeps the row's array type under sizeof (no array→pointer
@@ -9728,6 +10214,8 @@ struct Lowerer {
                         == PostfixFlatten::Index
                     && baseN.valid()) {
                     ++indirections;
+                    if (subscriptN.valid() && namesAnything(subscriptN))
+                        effects.push_back(subscriptN);   // the index runs
                     cur = baseN;
                     continue;
                 }
@@ -9770,20 +10258,26 @@ struct Lowerer {
             // lane `cs`'s `.temp/probe/vtp`). Deeper indirections through a pointer stay
             // unrecorded, and so stay refused loudly by that fold.
             if (subCount == 0) {
-                if (!identTok.valid()) return SymbolId{};
+                if (!identTok.valid()) return stopAt(cur);
                 SymbolId const sym = model.symbolAt(identTok);
                 SymbolRecord const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
-                if (rec == nullptr) return SymbolId{};
+                if (rec == nullptr) return stopAt(cur);
                 if (interner.isVlaArray(rec->type) || interner.typeContainsVla(rec->type))
-                    return sym;
+                    return VlaOperandRoot{sym, indirections, std::move(effects)};
                 if (indirections == 1 && interner.kind(rec->type) == TypeKind::Ptr) {
                     auto const pointee = interner.operands(rec->type);
                     if (!pointee.empty()
                         && (interner.isVlaArray(pointee[0])
-                            || interner.typeContainsVla(pointee[0])))
-                        return sym;
+                            || interner.typeContainsVla(pointee[0]))) {
+                        // P69 L2a (lane `lm`): evaluating the operand READS the pointer — an
+                        // access only a volatile one makes observable (C 5.1.2.3p2); it runs,
+                        // unless a `++` / `--` of it (which reads it) already does.
+                        if (!stepped && interner.isVolatileQualified(rec->type))
+                            effects.push_back(cur);
+                        return VlaOperandRoot{sym, indirections, std::move(effects)};
+                    }
                 }
-                return SymbolId{};
+                return stopAt(cur);
             }
             // Transparent grouping wrapper (parens / operand / postfix / a unary `*` over
             // a sub-expression): exactly ONE sub-expression and no stray identifier —
@@ -9794,11 +10288,12 @@ struct Lowerer {
             // rather than silently loading a VLA's frozen size — C decays a composite
             // operand to a pointer).
             if (subCount == 1 && !identTok.valid()) { cur = sub; continue; }
-            return SymbolId{};
+            return stopAt(cur);
         }
-        return SymbolId{};
+        return {};
     }
-    [[nodiscard]] E lowerCompoundLiteral(NodeId clNode) {
+    [[nodiscard]] E lowerCompoundLiteral(NodeId clNode,
+                                         CollectCtx const* typeNameEffects = nullptr) {
         // ★★ THE DECLARED INDEX for the TYPE (
         // D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK, second tier): the
         // `compoundLiterals` row's `typeChild`, the same field Pass 2 resolves and
@@ -9834,8 +10329,16 @@ struct Lowerer {
             return exprError(clNode,
                 "compound literal type-ref did not resolve to a type");
         }
-        HirNodeId const init = lowerBraceInit(braceN, type);
+        // P69 L2a (lane `lm`): a variably modified type name's size expressions, evaluated
+        // by the driver (`ExprFrame::Kind::CompoundLiteral`), run before the initializer — the
+        // object's initialization is the sequence, so its type agrees and the object stays the
+        // object an `&` takes.
+        if (typeNameEffects != nullptr && typeNameEffects->failed.id.valid())
+            return typeNameEffects->failed;   // its diagnostic is already emitted
+        HirNodeId init = lowerBraceInit(braceN, type);
         if (!init.valid() || builder.kind(init) == HirKind::Error) return {init, type};
+        if (typeNameEffects != nullptr)
+            init = effectsThen(clNode, *typeNameEffects, E{init, builder.typeId(init)}).id;
         // ★★ P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): a
         // compound literal is an unnamed OBJECT initialized by its brace list (C
         // 6.5.2.5p4), not that list's value. Lowered as the value alone it had no storage
@@ -9932,30 +10435,50 @@ struct Lowerer {
     // spine, e.g. `int (*[n])[3]`) is an internal desync and FAILS LOUD; it fails
     // loud today too, so nothing becomes silently wrong.
     //
-    // Returns an INVALID id when the shape is not this one (no declarator config,
+    // Leaves `deferred` None when the shape is not this one (no declarator config,
     // or a VLA type-name carrying no suffix of its own — `typedef int R[n];
     // sizeof(R)`, whose size is frozen at the TYPEDEF, C 6.7.7p2). The caller then
     // falls through to the static path, which keeps refusing loudly at MIR.
-    [[nodiscard]] E lowerVlaTypeNameSizeof(NodeId node, NodeId scan, TypeId sized,
-                                           TypeId sizeType) {
-        if (!sem.declarators.has_value()) return {HirNodeId{}, InvalidType};
+    //
+    // ★ P69 L2a (lane `lm`): THE BOUNDS ARE FRAMES OF THE `lowerExpr` DRIVER. This prologue
+    // finds them and the element; the driver lowers each (`ExprFrame::Kind::VlaTypeNameSize`,
+    // one `Collect` frame per bound) and `vlaTypeNameSizeEpilogue` multiplies. It lowered each
+    // bound by re-entering `lowerExpr`, a fresh driver and its host frames per level of a
+    // `sizeof(int[sizeof(int[…])])` chain — host stack in proportion to the input.
+    //
+    // `SizeofDeferral`: what a `sizeof` leaves for the `lowerExpr` driver to evaluate as frames
+    // (`CollectCtx`) before its value is known — nothing (the size is complete), the operand of
+    // variable-length array type C evaluates (`Operand`: the SizeOf reads the size its root
+    // froze once the operand ran), or the bounds of a variable-length array type name it
+    // multiplies (`TypeNameBounds`, this prologue's).
+    struct SizeofDeferral {
+        enum class Kind : std::uint8_t { None, Operand, TypeNameBounds } kind = Kind::None;
+        std::vector<NodeId> nodes;   // Operand: the operand; TypeNameBounds: the bounds, outer → inner
+        TypeId              elem{};  // TypeNameBounds: the element the bounds multiply
+        NodeId              scan{};  // TypeNameBounds: the type name (a typedef element's slot)
+    };
+    [[nodiscard]] std::optional<E> vlaTypeNameSizeofPrologue(NodeId node, NodeId scan,
+                                                             TypeId sized,
+                                                             SizeofDeferral& deferred) {
+        if (!sem.declarators.has_value()) return std::nullopt;
         DeclaratorConfig const& dc = *sem.declarators;
         // Ordered pre-order work-stack (children pushed REVERSED so they pop
         // left-to-right); an array-suffix node is RECORDED, not descended into —
         // its only children are `[`, the bound expression and `]`. Identical to
         // `captureVlaSize`'s collector, so a shape capturable there is capturable
         // here.
-        // ⚠ THE BUDGET IS CHECKED, not merely applied. A truncated walk would
-        // find FEWER suffixes than the type has dimensions, and the element
-        // descent below would then succeed at a shallower level and return a
-        // SMALLER product — a wrong number with no diagnostic. So exhausting the
-        // budget is reported, never absorbed.
+        // ⚠ THE WALK IS NEVER TRUNCATED. A truncated walk would find FEWER suffixes
+        // than the type has dimensions, and the element descent below would then
+        // succeed at a shallower level and return a SMALLER product — a wrong number
+        // with no diagnostic. It stopped at a fixed 16384 steps and REFUSED a valid
+        // type-name past them ("exceeded the traversal budget"); it is bounded by the
+        // tree it walks now (`WalkSteps`; P69 L2, lane `lm`), which only a cyclic node
+        // graph exceeds.
         std::vector<NodeId> suffixes;
-        bool walkComplete = false;
         {
             std::vector<NodeId> stack{scan};
-            for (int guard = 0; guard < 16384; ++guard) {
-                if (stack.empty()) { walkComplete = true; break; }
+            for (substrate::WalkSteps steps{tree().nodeCount(), "lowerVlaTypeNameSizeof's suffix walk"};
+                 !stack.empty(); steps.step()) {
                 NodeId const c = stack.back(); stack.pop_back();
                 if (tree().kind(c) != NodeKind::Internal) continue;
                 if (tree().rule(c).v == dc.arraySuffixRule.v) {
@@ -9966,13 +10489,7 @@ struct Lowerer {
                 for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
             }
         }
-        if (!walkComplete) {
-            return exprError(node,
-                "internal: a variable-length array type-name exceeded the "
-                "traversal budget for locating its array suffixes, so its "
-                "dimensions cannot be enumerated");
-        }
-        if (suffixes.empty()) return {HirNodeId{}, InvalidType};
+        if (suffixes.empty()) return std::nullopt;
         // Descend ONE array level per suffix; whatever is left is the element.
         TypeId elem = sized;
         for (std::size_t i = 0; i < suffixes.size(); ++i) {
@@ -9988,13 +10505,15 @@ struct Lowerer {
                     "bounds cannot be paired with its dimensions");
             }
         }
-        // Lower each bound to a FRESH evaluation, widen it to size_t, and multiply
-        // outer→inner. `lowerExpr` handles every expression form (a fixed bound
-        // `[5]` lowers to a Const, a runtime one `[n]` to its expression, and a
-        // side-effecting one `[n++]` to the increment C 6.5.3.4p2 requires to
-        // happen). EVERY suffix must yield a bound — a suffix with no lowerable
-        // bound is an internal desync, never a silently dropped dimension.
-        HirNodeId product{};
+        // Each suffix's bound, outer→inner, for the driver to lower as frames — a FRESH
+        // evaluation each (`ExprFrame::Kind::VlaTypeNameSize`, then
+        // `vlaTypeNameSizeEpilogue`): `lowerExpr` handles every expression form (a fixed bound
+        // `[5]` lowers to a Const, a runtime one `[n]` to its expression, and a side-effecting
+        // one `[n++]` to the increment C 6.5.3.4p2 requires to happen). EVERY suffix must yield
+        // a bound — a suffix with none is an internal desync, never a silently dropped
+        // dimension.
+        std::vector<NodeId> bounds;
+        bounds.reserve(suffixes.size());
         for (NodeId const suffix : suffixes) {
             // VLA C4c: the bound sits BEHIND any array-parameter decoration
             // (`[static n]`) — located through the shared skipper so a leading
@@ -10002,8 +10521,29 @@ struct Lowerer {
             NodeId const boundNode =
                 arraySuffixBoundNode(tree(), suffix, dc.arraySuffixModifierTokens)
                     .value_or(NodeId{});
-            E const bound = boundNode.valid() ? lowerExpr(boundNode)
-                                              : E{HirNodeId{}, InvalidType};
+            if (!boundNode.valid()) {
+                return exprError(node,
+                    "internal: a dimension of a variable-length array type-name "
+                    "carries no lowerable bound expression");
+            }
+            bounds.push_back(boundNode);
+        }
+        deferred.kind  = SizeofDeferral::Kind::TypeNameBounds;
+        deferred.nodes = std::move(bounds);
+        deferred.elem  = elem;
+        deferred.scan  = scan;
+        return std::nullopt;
+    }
+
+    // The size of a variable-length array type name once the driver lowered its bounds
+    // (`ctx.values`, outer→inner; `ctx.nodes` the bound nodes): each widened to size_t and
+    // multiplied outer→inner, then × the element's size.
+    [[nodiscard]] E vlaTypeNameSizeEpilogue(NodeId node, CollectCtx const& ctx) {
+        TypeId const sizeType = ctx.type;
+        HirNodeId product{};
+        for (std::size_t i = 0; i < ctx.values.size(); ++i) {
+            E const bound = ctx.values[i];
+            NodeId const boundNode = ctx.nodes[i];
             if (!bound.id.valid()) {
                 return exprError(node,
                     "internal: a dimension of a variable-length array type-name "
@@ -10052,7 +10592,7 @@ struct Lowerer {
         // takes, so an un-sizeable element still refuses loudly there rather than
         // being guessed at here.
         HirNodeId const elemSize = track(
-            builder.makeSizeOf(track(builder.makeTypeRef(elem), node), sizeType,
+            builder.makeSizeOf(track(builder.makeTypeRef(ctx.elem), node), sizeType,
                                HirFlags::Synthetic),
             node);
         // P68 round 12 (lane `cs`): an element that is STILL variable-length after
@@ -10061,8 +10601,8 @@ struct Lowerer {
         // so the element's SizeOf reads that slot at MIR, exactly as `sizeof v`
         // of a `V v;` object does. No typedef found is left to the static fold,
         // which keeps refusing loudly.
-        if (interner.isVlaArray(elem) || interner.typeContainsVla(elem))
-            if (SymbolId const owner = vlaTypedefOwnerOfTypeName(scan); owner.valid())
+        if (interner.isVlaArray(ctx.elem) || interner.typeContainsVla(ctx.elem))
+            if (SymbolId const owner = vlaTypedefOwnerOfTypeName(ctx.scan); owner.valid())
                 sizeofVlaSymAcc.emplace_back(elemSize.v, owner.v);
         HirNodeId const total =
             product.valid()
@@ -10080,9 +10620,11 @@ struct Lowerer {
     // semantic-stamped TYPE being sized, which `resolveStampedTypeBelow` recovers
     // by descending past the (unstamped) sizeof wrappers. The operand is
     // UNEVALUATED (C 6.5.3.4) — only its type reaches the node; the SizeOf folds to
-    // that type's byte size via the `type_layout` engine at MIR lowering. The ONE
-    // documented exception is a VLA TYPE-NAME operand (C 6.5.3.4p2), which
-    // `lowerVlaTypeNameSizeof` takes instead — see [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]].
+    // that type's byte size via the `type_layout` engine at MIR lowering. The exception
+    // is an operand of VARIABLE-LENGTH ARRAY type (C 6.5.3.4p2): a TYPE-NAME one, whose
+    // bounds `vlaTypeNameSizeofPrologue` hands the driver to multiply — see
+    // [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] — and a VALUE one reached through an
+    // indirection, which the driver runs before the size its root froze is read.
     // WHAT a `sizeof` / `_Alignof` node asks about: its operand's TYPE, which of the
     // two forms the node is, and the node the form's children hang under. ONE
     // derivation, read by the lowering of the node (`lowerSizeof`, `lowerAlignof`)
@@ -10172,7 +10714,8 @@ struct Lowerer {
         return alignment ? layout->align.bytes() : layout->size;
     }
 
-    [[nodiscard]] E lowerSizeof(NodeId node) {
+    // (`SizeofDeferral` is declared above `vlaTypeNameSizeofPrologue`, whose parameter it is.)
+    [[nodiscard]] E lowerSizeof(NodeId node, SizeofDeferral& deferred) {
         LayoutQueryOperand const operand = layoutQueryOperand(node, sem.sizeofValueRule);
         NodeId const scan = operand.scan;
         bool const valueForm = operand.valueForm;
@@ -10210,9 +10753,11 @@ struct Lowerer {
         // keeps refusing loudly.
         if (!valueForm
             && (interner.isVlaArray(sized) || interner.typeContainsVla(sized))) {
-            if (E const vlaSize = lowerVlaTypeNameSizeof(node, scan, sized, u64);
-                vlaSize.id.valid())
-                return vlaSize;
+            if (std::optional<E> refused =
+                    vlaTypeNameSizeofPrologue(node, scan, sized, deferred))
+                return *refused;
+            if (deferred.kind == SizeofDeferral::Kind::TypeNameBounds)
+                return {HirNodeId{}, u64};   // the driver lowers the bounds and multiplies
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         HirNodeId const so = track(builder.makeSizeOf(tref, u64), node);
@@ -10234,12 +10779,53 @@ struct Lowerer {
             for (NodeId c : visible(scan))
                 if (tree().kind(c) == NodeKind::Internal) { operandN = c; break; }
             SymbolId recorded{};
-            if (operandN.valid())
-                if (SymbolId const opSym = vlaObjectOperandSymbol(operandN);
-                    opSym.valid()) {
-                    sizeofVlaSymAcc.emplace_back(so.v, opSym.v);
-                    recorded = opSym;
+            VlaOperandRoot const root =
+                operandN.valid() ? vlaObjectOperandRoot(operandN) : VlaOperandRoot{};
+            if (root.symbol.valid()) {
+                sizeofVlaSymAcc.emplace_back(so.v, root.symbol.v);
+                recorded = root.symbol;
+                // ★ P69 L2a (lane `lm`, D-C-SIZEOF-OF-A-VLA-TYPED-OPERAND-SKIPS-THE-OPERANDS-SIDE-EFFECTS):
+                // AN OPERAND OF VARIABLE-LENGTH ARRAY TYPE IS EVALUATED (C 6.5.3.4p2) — and its
+                // size is still the one its root FROZE (the slot recorded above); the evaluation
+                // is for what the operand DOES. Reached through an indirection (a subscript, a
+                // unary `*`) the operand computes something: an index with a side effect
+                // (`v[k++]`, `v[f()]`), a pointer stepped on the way (`*p++`, `p++[0]`). It was
+                // never lowered — the descent skips every index and peels the operators to reach
+                // the root — so every such effect was DROPPED, silently: ✔MEASURED at 937a3b15
+                // (macos-arm64-debug, x86_64:pe64, images run natively, baseline and release
+                // alike) `int v[n][m]; sizeof v[k++]` left k == 0, as did the call, assignment,
+                // three-dimensional, fixed-outer, pointer and `sizeof(typeof(v[k++]))` forms,
+                // where gcc 13.3.0 and clang 18.1.3 (gnu2x and c2x -pedantic-errors) run each
+                // once. The bare object (no indirection: `sizeof v`, `sizeof (v)`) computes
+                // nothing. What evaluating the operand runs — each index, each `++` / `--` of the
+                // pointer (`VlaOperandRoot::effects`) — the driver runs as frames
+                // (`ExprFrame::Kind::SizeofOperand`), never by re-entering itself.
+                if (root.indirections > 0 && !root.effects.empty()) {
+                    deferred.kind  = SizeofDeferral::Kind::Operand;
+                    deferred.nodes = root.effects;
                 }
+            }
+            // ★ P69 L2a (lane `lm`): THE RULE IS TOTAL (see `VlaOperandRoot`). An operand of
+            // variable-length array type the descent cannot root reaches its array through an
+            // expression that can do something — a comma, a conditional, an assignment, a call,
+            // a cast, a pointer to a pointer — and the size its declaration froze is not known
+            // through it: REFUSED BY NAME at that expression, never sized without running it.
+            // ✔MEASURED 2026-10-21: `sizeof *(k++, p)`, `sizeof *(c++ ? p : q)`, `sizeof *(p =
+            // q)`, `sizeof *fp()`, `sizeof *(p += 1)` and `sizeof (*pp)[k++]` — gcc 13.3.0 and
+            // clang 18.1.3 (gnu2x and c2x -pedantic-errors) run each, side effect and all (41);
+            // each fell to the MIR's "sizeof of an incomplete or un-sizeable type", loud but
+            // naming nothing. Owed: sizing them (the composite operand's resolver, cycle P69 L2b).
+            if (!root.symbol.valid() && valueForm) {
+                emitH(DiagnosticCode::H_UnsupportedLoweringForKind,
+                      root.stoppedAt.valid() ? root.stoppedAt
+                                             : (operandN.valid() ? operandN : node),
+                      "sizeof of a variable-length array reached through this expression is not "
+                      "supported: the size its declaration froze is found only through the array "
+                      "object, a pointer to it, a subscript of either or a ++/-- of that pointer "
+                      "(not through a comma, a conditional, an assignment, a call, a cast or a "
+                      "pointer to a pointer); refused rather than sized without evaluating it");
+                return {errorNode(node), InvalidType};
+            }
             // P68 round 12 (lane `cs`): the TYPE form with no suffix of its own
             // (`lowerVlaTypeNameSizeof` declined) — `sizeof(V)`, `sizeof(volatile V)`
             // of a variable-length typedef. Its size was FROZEN when the typedef was
@@ -10268,7 +10854,8 @@ struct Lowerer {
             return SymbolId{};
         DeclaratorConfig const& dc = *sem.declarators;
         std::vector<NodeId> stack{typeName};
-        for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+        for (substrate::WalkSteps steps{tree().nodeCount(), "vlaTypedefOwnerOfTypeName's walk"};
+             !stack.empty(); steps.step()) {
             NodeId const c = stack.back();
             stack.pop_back();
             if (isToken(c)) {
@@ -10277,8 +10864,8 @@ struct Lowerer {
                 if (!named.valid()) continue;
                 SymbolRecord const* rec = model.recordFor(named);
                 if (rec == nullptr) continue;
-                SymbolId const owner =
-                    rec->vlaTypedefOrigin.valid() ? rec->vlaTypedefOrigin : named;
+                SymbolId const owner = vlaOriginOf(
+                    rec->vlaTypedefOrigin.valid() ? rec->vlaTypedefOrigin : named);
                 SymbolRecord const* ownerRec = model.recordFor(owner);
                 if (ownerRec != nullptr && ownerRec->type.valid()
                     && (interner.isVlaArray(ownerRec->type)
@@ -10529,8 +11116,17 @@ struct Lowerer {
     // of a type match, routes here unchanged. `what` names the construct so the
     // refusal message stays specific; that string is the ONLY thing that differs
     // between the two callers, which is the measure of how much of this is shared.
-    [[nodiscard]] E lowerRecordedSelection(NodeId node, char const* what) {
-        NodeId const selected = model.selectedGenericExpr(node);
+    // ★ P69 L2 (lane `lm`, D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL): THE
+    // WINNER IS A FRAME OF THE `lowerExpr` DRIVER (`ExprFrame::Kind::Selection`). This was one
+    // function that lowered the winner by calling `lowerExpr` — a fresh driver and its host frames
+    // per nested level, so 2000 nested `_Generic` / `__builtin_choose_expr` died on a 256 KiB stack
+    // (✔MEASURED 2026-10-20, macos-arm64-debug, signal 10). Its two halves: the PROLOGUE finds the
+    // recorded winner (or refuses, loud) and the EPILOGUE re-anchors what the winner lowered to.
+    [[nodiscard]] std::optional<E> recordedSelectionPrologue(NodeId node, NodeId& selected) {
+        char const* const what =
+            (cfg.genericRule.valid() && tree().rule(node).v == cfg.genericRule.v)
+                ? "_Generic" : "__builtin_choose_expr";
+        selected = model.selectedGenericExpr(node);
         if (!selected.valid()) {
             // The analyzer recorded no winner — a constraint violation it already
             // reported (S_GenericSelectionNoMatch / Ambiguous /
@@ -10542,10 +11138,13 @@ struct Lowerer {
                 "default, an ambiguous match, a non-constant condition, or an "
                 "un-typeable operand)", what));
         }
-        // Lower ONLY the selected association's assignment-expression; its result
-        // (id + type) IS the generic selection's result. `track` re-anchors the
-        // lowered node to the `_Generic` CST node for provenance/diagnostics.
-        E const chosen = lowerExpr(selected);
+        return std::nullopt;
+    }
+
+    // Lower ONLY the selected association's assignment-expression (the frame did); its result
+    // (id + type) IS the selection's result. `track` re-anchors the lowered node to the
+    // selection's CST node for provenance/diagnostics.
+    [[nodiscard]] E recordedSelectionEpilogue(NodeId node, E chosen) {
         if (!chosen.type.valid()) return chosen;   // diagnostic already emitted
         return {track(chosen.id, node), chosen.type};
     }
@@ -10590,6 +11189,106 @@ struct Lowerer {
         lit.value = *v;
         return {track(builder.makeLiteral(type, literals.add(std::move(lit))), node),
                 type};
+    }
+
+    // ── ★ P69 L2a (lane `lm`): WHAT C EVALUATES IN A VARIABLY MODIFIED TYPE NAME ───────────
+    // (D-C-SIZEOF-OF-A-VLA-TYPED-OPERAND-SKIPS-THE-OPERANDS-SIDE-EFFECTS.) A type name whose type
+    // is variably modified — an array of run-time length at some level, or a pointer to one —
+    // is EVALUATED where a cast or a compound literal writes it: each size expression it
+    // carries runs, side effects and all (C 6.7.6.2p5, "each time it is evaluated"; C23
+    // 6.7.2.5p4 for a `typeof` whose operand is variably modified). The lowering dropped them:
+    // ✔MEASURED at 937a3b15 (macos-arm64-debug, x86_64:pe64, images run natively, baseline and
+    // release alike) `(void)(int (*)[k++ + 1])x;`, `(void)(typeof(v[k++]) *)x;` and
+    // `(void)(int (*)[k++ + 1]){ (void *)x };` left k == 0, where gcc 13.3.0 and clang 18.1.3
+    // (gnu2x and c2x -pedantic-errors) leave k == 1.
+    //
+    // `typeIsVariablyModified`: some level of `t`, through pointers and arrays, has a run-time
+    // length (a pointer to a function returning one is not followed).
+    [[nodiscard]] bool typeIsVariablyModified(TypeId t) const {
+        while (t.valid()) {
+            if (interner.isVlaArray(t)) return true;
+            TypeKind const k = interner.kind(t);
+            if (k != TypeKind::Ptr && k != TypeKind::Array) return false;
+            auto const ops = interner.operands(t);
+            if (ops.empty()) return false;
+            t = ops[0];
+        }
+        return false;
+    }
+    // The expressions a variably modified type name evaluates, in source order: the bound of
+    // every array suffix it writes (a fixed one lowers to a constant and runs as nothing) and
+    // the operand of every `typeof ( expression )` whose type is variably modified — what
+    // evaluating it runs: its indices and its pointer's steps when it designates an array the
+    // descent roots (`VlaOperandRoot::effects`), else the whole operand — never a function
+    // declarator's parameters (they are not evaluated where its type is named). Empty when
+    // `type` is not variably modified. Iterative: a work stack bounded by the tree it walks.
+    [[nodiscard]] std::vector<NodeId> variablyModifiedTypeNameEffects(NodeId typeName,
+                                                                      TypeId type) {
+        std::vector<NodeId> out;
+        if (!typeName.valid() || !typeIsVariablyModified(type) || !sem.declarators.has_value())
+            return out;
+        DeclaratorConfig const& dc = *sem.declarators;
+        std::vector<NodeId> stack{typeName};
+        for (substrate::WalkSteps steps{tree().nodeCount(), "variablyModifiedTypeNameEffects' walk"};
+             !stack.empty(); steps.step()) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            std::uint32_t const r = tree().rule(c).v;
+            if (dc.fnSuffixRule.valid() && r == dc.fnSuffixRule.v) continue;
+            if (r == dc.arraySuffixRule.v) {
+                NodeId const bound =
+                    arraySuffixBoundNode(tree(), c, dc.arraySuffixModifierTokens)
+                        .value_or(NodeId{});
+                if (bound.valid()) out.push_back(bound);
+                continue;
+            }
+            if (sem.typeofValueRule.valid() && r == sem.typeofValueRule.v) {
+                auto const kids = visible(c);
+                if (sem.typeofOperandChild < kids.size()
+                    && typeIsVariablyModified(typeAtOr(c, InvalidType))) {
+                    NodeId const operand = kids[sem.typeofOperandChild];
+                    VlaOperandRoot const root = vlaObjectOperandRoot(operand);
+                    if (root.symbol.valid())
+                        out.insert(out.end(), root.effects.begin(), root.effects.end());
+                    else
+                        out.push_back(operand);
+                }
+                continue;
+            }
+            auto const kids = visible(c);
+            for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+        }
+        return out;
+    }
+    // The cast's type name's (its `casts` row's type child), for its resolved target.
+    [[nodiscard]] std::vector<NodeId> castTypeNameEffects(NodeId castNode, TypeId target) {
+        auto const* crow = castRowFor(castNode);
+        if (crow == nullptr) return {};
+        auto const ckids = visible(castNode);
+        if (crow->typeChild >= ckids.size()) return {};
+        return variablyModifiedTypeNameEffects(ckids[crow->typeChild], target);
+    }
+    // The compound literal's type name's (its `compoundLiterals` row's type child).
+    [[nodiscard]] std::vector<NodeId> compoundLiteralTypeNameEffects(NodeId clNode) {
+        auto const* clrow = compoundLiteralRowFor(clNode);
+        if (clrow == nullptr) return {};
+        auto const clkids = visible(clNode);
+        if (clrow->typeChild >= clkids.size()) return {};
+        NodeId const typeRefN = clkids[clrow->typeChild];
+        if (!typeRefN.valid()) return {};
+        return variablyModifiedTypeNameEffects(typeRefN, resolveStampedTypeBelow(typeRefN));
+    }
+    // `then`, after the statements a collection ran for what its expressions do (the `Collect`
+    // frames build them: a value converted as a value is and run as an expression statement, a
+    // `++` / `--` as its statement). The first that failed to lower is the answer (its
+    // diagnostic is already emitted).
+    [[nodiscard]] E effectsThen(NodeId node, CollectCtx const& effects, E then) {
+        if (effects.failed.id.valid()) return effects.failed;
+        if (!then.type.valid() || effects.stmts.empty()) return then;
+        return {track(builder.makeSeqExpr(effects.stmts, then.id, then.type, HirFlags::None),
+                      node),
+                then.type};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar
@@ -10797,7 +11496,7 @@ struct Lowerer {
             if (tree().kind(c) == NodeKind::Internal) { exprChild = c; break; }
         }
         if (!exprChild.valid()) return std::nullopt;
-        return evalCstConstInt(exprChild);
+        return evalCstConstInt(exprChild, IntegerConstantPosition::IndexDesignator);
     }
 
     // Fold a CST expression to a compile-time `int64` through the shared
@@ -10809,7 +11508,15 @@ struct Lowerer {
     // integer at this lowering tier" — shared by the index-designator
     // resolver and the provably-infinite-loop condition test, so the
     // two can never drift on what folds.
-    [[nodiscard]] std::optional<std::int64_t> evalCstConstInt(NodeId exprNode) {
+    // P69 L2 (lane `lm`): `position` is the integer-constant position the value is asked for
+    // AS (`IntegerConstantPosition`): the forms the language admits there fold
+    // (`sem.integerConstantExpressions`) — an index designator's comma, which the semantic tier
+    // folded at the same position and warned for (its S_ConstantExpressionUsesTheCommaOperator
+    // is the one message). Without one — a null pointer constant, a loop's or an `if`'s
+    // truth — the standard's forms only.
+    [[nodiscard]] std::optional<std::int64_t>
+    evalCstConstInt(NodeId exprNode,
+                    std::optional<IntegerConstantPosition> position = std::nullopt) {
         std::unordered_set<std::uint32_t> intLits;
         std::unordered_set<std::uint32_t> floatLits;
         for (auto const& [tok, kind] : litCore_) {
@@ -11035,7 +11742,7 @@ struct Lowerer {
         };
         // The other recorded answer: WHICH arm a `_Generic` / a
         // `__builtin_choose_expr` selected. The semantic tier chose it once
-        // (`selectedGenericExpr` — the record `lowerRecordedSelection` lowers the
+        // (`selectedGenericExpr` — the record `recordedSelectionPrologue` lowers the
         // node from), and the engine then folds that arm like any other
         // expression, so the selection is a constant exactly when its winner is.
         env.resolveSelectedArm = [this](NodeId n) -> std::optional<NodeId> {
@@ -11068,6 +11775,8 @@ struct Lowerer {
         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the same answer the semantic
         // tier folded with — one fact, both tiers.
         options.charIsUnsigned = charIsUnsigned_;
+        if (position.has_value())
+            options.admittedForms = sem.integerConstantExpressions.at(*position);
         ConstEvalResult const r = evaluateConstantCst(exprNode, ctx, env, options);
         if (!r.value.has_value()) return std::nullopt;
         return asInt64Bridge(*r.value);
@@ -11378,9 +12087,9 @@ struct Lowerer {
             return out;
         };
         NodeId list = braceInitListNode;
-        std::size_t const bound = tree().nodeCount() + 1;   // each level is a strict descendant
-        for (std::size_t level = 0;; ++level) {
-            if (level > bound) failOnCyclicNodeGraph("the lowering's scalar brace levels");
+        // Each level is a strict descendant, so the tree's node count bounds them.
+        substrate::WalkSteps levels{tree().nodeCount(), "the lowering's scalar brace levels"};
+        for (std::size_t level = 0;; ++level, levels.step()) {
             if (level > 0 || subobject) {
                 if (admits.nestedBraces != DiagnosticCode::None) {
                     emitHAt(admits.nestedBraces, DiagnosticSeverity::Warning, list,
@@ -13305,10 +14014,19 @@ struct Lowerer {
         return true;
     }
 
-    [[nodiscard]] E lowerStatementExpr(NodeId node) {
+    // ★ P69 L2 (lane `lm`, D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL): THE
+    // VALUE IS A FRAME OF THE `lowerExpr` DRIVER (`ExprFrame::Kind::StmtExpr`). This was one
+    // function that lowered the value by calling `lowerExpr` — a fresh driver and its host frames
+    // per nested level, so `({ ({ … ({ 5; }) … }); })` in value position died on a 256 KiB stack
+    // at 1000 levels (✔MEASURED 2026-10-20, the row). Its two halves: the PROLOGUE — the refusals,
+    // every item before the value lowered as a statement, the labels the value stands under —
+    // returns the refusal's E, or nullopt with `stmts` and `valueNode` set; the driver then lowers
+    // the value and runs the EPILOGUE, which builds the SeqExpr. The order is the one function's.
+    [[nodiscard]] std::optional<E> stmtExprValuePrologue(NodeId node,
+                                                         std::vector<HirNodeId>& stmts,
+                                                         NodeId& valueNode) {
         if (statementExprOutsideAFunctionBody(node)) return E{errorNode(node), InvalidType};
         std::vector<NodeId> items;
-        NodeId valueNode{};
         std::vector<NodeId> labels;
         stmtExprItems(node, items, valueNode, labels);
         if (!valueNode.valid()) {
@@ -13319,7 +14037,6 @@ struct Lowerer {
                   "where a value is required");
             return E{errorNode(node), InvalidType};
         }
-        std::vector<HirNodeId> stmts;
         stmts.reserve(items.size() - 1 + labels.size());
         for (std::size_t i = 0; i + 1 < items.size(); ++i)
             stmts.push_back(lowerStmt(items[i]));
@@ -13327,20 +14044,37 @@ struct Lowerer {
         // every GNU reference — ✔MEASURED 2026-10-15, see `statementExpressionBody`): each
         // label stands where it stood, on an empty statement, before the value is computed,
         // so a `goto` of the body reaches the computation of the value.
+        // A `case` or `default` label there (P69 L2) is its switch's marker, by the ordinal the
+        // switch's prescan gave it (that prescan has refused the jump into the statement
+        // expression already); with no switch around, it is the stray label it is.
         for (NodeId const labelNode : labels) {
             std::uint32_t ord{};
-            NodeId        labeled{};
-            if (!labelPrologue(labelNode, ord, labeled)) return E{errorNode(node), InvalidType};
+            if (HirRuleMapping const* const lm = mappingFor(labelNode);
+                lm != nullptr && lm->hirKind == "CaseStmt") {
+                NodeId const caseLabel = switchCaseLabelOf(labelNode);
+                if (switchBodyDepth_ == 0 || !caseLabel.valid()
+                    || !switchCaseOrdinal(caseLabel, ord)) {
+                    emitH(DiagnosticCode::S_CaseLabelNotInSwitch, labelNode,
+                          "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
+                    return E{errorNode(node), InvalidType};
+                }
+            } else {
+                NodeId labeled{};
+                if (!labelPrologue(labelNode, ord, labeled)) return E{errorNode(node), InvalidType};
+            }
             HirNodeId const empty = track(builder.makeBlock({}), labelNode);
             stmts.push_back(track(builder.makeLabelStmt(ord, empty), labelNode));
         }
-        // ★ P69 (lane `lm`): THE CONSTRUCT YIELDS A VALUE (`convertedToItsValue`) —
-        // the last expression's type was handed on as it stood, an array as an array.
-        // ⚠ The semantic tier's statement-expression arm (`subtreeType`) is the mirror
-        // of this, moved with it, and neither moves alone.
-        E const yield = convertedToItsValue(lowerExpr(valueNode));
-        return E{track(builder.makeSeqExpr(stmts, yield.id, yield.type), node),
-                 yield.type};
+        return std::nullopt;
+    }
+
+    // ★ P69 (lane `lm`): THE CONSTRUCT YIELDS A VALUE (`convertedToItsValue`) — the last
+    // expression's type was handed on as it stood, an array as an array.
+    // ⚠ The semantic tier's statement-expression arm (`subtreeType`) is the mirror of this,
+    // moved with it, and neither moves alone.
+    [[nodiscard]] E stmtExprValueEpilogue(NodeId node, std::vector<HirNodeId> stmts, E value) {
+        E const yield = convertedToItsValue(value);
+        return E{track(builder.makeSeqExpr(stmts, yield.id, yield.type), node), yield.type};
     }
 
     // `({ … })` in a DISCARD position → a plain `Block`. See the call site in
@@ -13430,7 +14164,8 @@ struct Lowerer {
         // Find the arm: descend through single-child wrappers, checking rule
         // identity at each level first.
         NodeId arm = handlerChild;
-        for (int guard = 0; guard < 8 && arm.valid(); ++guard) {
+        for (substrate::WalkSteps steps{tree().nodeCount(), "sehPrologue's handler peel"}; arm.valid();
+             steps.step()) {
             if (switchIsRuleNode(arm, cfg.sehExceptArmRule)
                 || switchIsRuleNode(arm, cfg.sehFinallyArmRule)) break;
             NodeId only{}; int meaningful = 0;
@@ -14209,6 +14944,19 @@ struct Lowerer {
             }
             return;
         }
+        // ★ P69 L2 (lane `lm`): a `typeof ( type-name )` head whose type carries a
+        // variable-length bound (`headTypeofTypeName`) is evaluated ONCE, when the
+        // declaration is reached, however many declarators share it — the first one
+        // that carries it captures the head's bound under its own symbol, and every
+        // later one copies the slots that one froze (`headVlaAnchor`). ✔MEASURED
+        // gcc 13.3.0 and clang 18.1.3: `typeof(int[n + k++]) a, b;` leaves k == 1 and
+        // both objects of n ints.
+        NodeId const headVla = asGlobal ? NodeId{} : headTypeofTypeName(node, *decl);
+        // ... and a `typeof ( expression )` head that reads a variable-length array
+        // object whole (`headTypeofVlaObject`): every name takes that object's size.
+        SymbolId const headVlaObject =
+            asGlobal ? SymbolId{} : headTypeofVlaObject(node, *decl);
+        SymbolId headVlaAnchor{};
         for (NodeId d : declarators) {
             NodeId const nameNode = declaratorNameNode(tree(), d, dc);
             if (!nameNode.valid()) {
@@ -14539,7 +15287,7 @@ struct Lowerer {
             SymbolId const vlaOrigin =
                 symRec != nullptr ? symRec->vlaTypedefOrigin : SymbolId{};
             if (!asGlobal && vlaOrigin.valid()) {
-                typedefOriginAcc.emplace_back(sym.v, vlaOrigin.v);
+                typedefOriginAcc.emplace_back(sym.v, vlaOriginOf(vlaOrigin).v);
                 if (declaratorHasArraySuffix(d)) captureVlaSize(d, sym);
             } else if (type.valid()) {
                 // ★★ D-HIR-VLA-PROBE-ABORTS-ON-AN-UNRESOLVED-DECLARED-TYPE — the
@@ -14578,7 +15326,37 @@ struct Lowerer {
                 // an alias. It carries the same `!t.valid()` guard this comment is
                 // about, so the crash fix is preserved by construction rather than by
                 // repetition.
-                if (!asGlobal && typeCarriesVlaBound(type)) captureVlaSize(d, sym);
+                if (!asGlobal && typeCarriesVlaBound(type)) {
+                    if (headVlaObject.valid()) {
+                        // `typeof(v) b;`, `typeof(v) c[m];`, `typeof(v) *p;`: the size v
+                        // froze at its own declaration, copied down, with the name's own
+                        // dimensions folded above it — v's bound is never evaluated
+                        // again. Recorded only when the levels below its own are v's
+                        // whole object (or, with none of its own, a pointer to it): an
+                        // array of pointers to it (`typeof(v) *q[m];`) is sized by its
+                        // own bound alone, as `R *q[m];` is.
+                        std::size_t const ownDims =
+                            declaratorHasArraySuffix(d) ? captureVlaSize(d, sym) : 0;
+                        TypeId const below = typeBelowOwnLevels(type, ownDims);
+                        if (below.valid()
+                            && ((interner.kind(below) == TypeKind::Array
+                                 && typeCarriesVlaBound(below))
+                                || (ownDims == 0 && interner.kind(below) == TypeKind::Ptr)))
+                            typedefOriginAcc.emplace_back(sym.v, headVlaObject.v);
+                    } else if (!headVla.valid()) {
+                        captureVlaSize(d, sym);
+                    } else if (!headVlaAnchor.valid()) {
+                        // The first declarator carrying the head's bound evaluates it.
+                        headVlaAnchor = sym;
+                        captureVlaSize(d, sym, headVla);
+                    } else {
+                        // A later one takes the size that first one froze — the
+                        // VLA-typedef object's copy-down, with the anchor as origin —
+                        // and captures only its own suffixes, as `R a[m];` does.
+                        typedefOriginAcc.emplace_back(sym.v, headVlaAnchor.v);
+                        if (declaratorHasArraySuffix(d)) captureVlaSize(d, sym);
+                    }
+                }
             }
             pushOut(lowered, d);
         }
@@ -14705,6 +15483,17 @@ struct Lowerer {
                 std::vector<NodeId> declarators;
                 collectDeclarators(tree(), vis[*carrier], *sem.declarators,
                                    declarators);
+                // ★ P69 L2 (lane `lm`): a `typeof ( type-name )` head whose type
+                // carries a variable-length bound is evaluated ONCE, at this
+                // declaration — the first name captures it, and every later name of
+                // the same declaration is an alias of that one, emitting nothing and
+                // reaching its slots through `headVlaTypedefAnchor_` (a chained
+                // alias's shape). ✔MEASURED gcc 13.3.0 and clang 18.1.3: `typedef
+                // typeof(int[n + k++]) R, S;` leaves k == 1, R and S of n ints, and
+                // `n = 99;` after it resizes neither.
+                NodeId const headVla = headTypeofTypeName(node, *decl);
+                SymbolId const headVlaObject = headTypeofVlaObject(node, *decl);
+                SymbolId headVlaAnchor{};
                 for (NodeId d : declarators) {
                     NodeId const nameNode =
                         declaratorNameNode(tree(), d, *sem.declarators);
@@ -14767,9 +15556,49 @@ struct Lowerer {
                         auto const* aliasRec = sym.valid() ? model.recordFor(sym) : nullptr;
                         chainedVlaAlias =
                             aliasRec != nullptr && aliasRec->vlaTypedefOrigin.valid();
-                        if (declaratorHasArraySuffix(d))
-                            captureVlaSize(d, sym);
-                        else if (!chainedVlaAlias)
+                        if (headVla.valid() && !headVlaAnchor.valid()) {
+                            // The first name evaluates the head's bound (with its own
+                            // suffixes above it).
+                            headVlaAnchor = sym;
+                            captureVlaSize(d, sym, headVla);
+                        } else if (headVla.valid() && !declaratorHasArraySuffix(d)) {
+                            // A later name with nothing of its own: an alias of the
+                            // first, frozen there once.
+                            headVlaTypedefAnchor_[sym.v] = headVlaAnchor.v;
+                            chainedVlaAlias = true;
+                        } else if (headVlaObject.valid() && !declaratorHasArraySuffix(d)) {
+                            // `typedef typeof(v) T;`: an alias of the object, whose size
+                            // was frozen when it was declared; T evaluates nothing and its
+                            // objects reach v's slots through `headVlaTypedefAnchor_`.
+                            headVlaTypedefAnchor_[sym.v] = headVlaObject.v;
+                            chainedVlaAlias = true;
+                        } else if (declaratorHasArraySuffix(d)) {
+                            std::size_t const ownDims = captureVlaSize(d, sym);
+                            // ★ P69 L2 (lane `lm`): a typedef with dimensions of its
+                            // own over a variable-length head — the head's first name
+                            // (`typedef typeof(int[n]) R, S[m];`) or a VLA typedef the
+                            // head names (`typedef R S[m];`, `typedef typeof(R) S[m];`)
+                            // — or the VLA object a `typeof` head reads whole
+                            // (`typedef typeof(v) S[m];`)
+                            // — captures only its own dimensions; the levels below
+                            // them are that origin's, frozen when it was reached (C
+                            // 6.7.8p3), and HIR→MIR composes them at this typedef as
+                            // it does an object's (`R a[m];`). Recorded only when the
+                            // type below the own levels IS an array with a bound (the
+                            // origin's spine): `typedef R *P[m];` is m pointers, sized
+                            // by its own bound alone. ✔MEASURED gcc 13.3.0 and clang
+                            // 18.1.3: all three shapes build and run, the head's bound
+                            // evaluated once; DSS refused them (the arity guard).
+                            SymbolId origin = headVla.valid() ? headVlaAnchor : headVlaObject;
+                            if (!origin.valid() && decl->headChild.has_value()
+                                && *decl->headChild < vis.size())
+                                origin = vlaTypedefOwnerOfTypeName(vis[*decl->headChild]);
+                            TypeId const below = typeBelowOwnLevels(type, ownDims);
+                            if (origin.valid() && ownDims > 0 && below.valid()
+                                && interner.kind(below) == TypeKind::Array
+                                && typeCarriesVlaBound(below))
+                                typedefOriginAcc.emplace_back(sym.v, vlaOriginOf(origin).v);
+                        } else if (!chainedVlaAlias)
                             (void)reportedError(
                                 d,
                                 "a typedef that aliases a variable-length-array "

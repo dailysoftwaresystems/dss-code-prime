@@ -56,6 +56,7 @@
 
 #include "core/types/enum_name_table.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -105,6 +106,78 @@ private:
         return std::uint32_t{1} << static_cast<std::uint32_t>(f);
     }
     std::uint32_t bits_ = 0;
+};
+
+// ── WHERE AN INTEGER CONSTANT EXPRESSION IS ASKED FOR (cycle P69 L2, lane `lm`) ────────────
+//
+// A language requires an integer constant expression in each of these positions, and 6.6p10's
+// latitude is taken per POSITION by the reference toolchains, not per program. ✔MEASURED
+// 2026-10-20 (lane `lm`, WSL clang 18.1.3 and gcc 13.3.0 at the default mode, -pedantic,
+// -pedantic-errors and -std=c2x -pedantic-errors, every build RUN): clang folds `(0, 42)` — a
+// warning, refused only at -pedantic-errors — as a static assertion, an array bound, an
+// enumerator's value, a case label, a bit-field's width, an index designator and a bit-precise
+// integer's width, and refuses it as an alignment (`_Alignas`, `aligned`), a
+// `__builtin_choose_expr` condition, an object-size query's type and a null pointer constant;
+// gcc folds it as the object-size query's type alone. So a language names, per form, the
+// positions that admit it (`semantics.integerConstantExpressions.otherConstantForms`), and a
+// position it does not name takes the standard's forms only. A position is listed here only
+// when a consumer asks for its constant AS that position — a name no consumer reads would be
+// a configuration that silently does nothing.
+enum class IntegerConstantPosition : std::uint8_t {
+    StaticAssertion        = 0,
+    ArrayBound             = 1,
+    EnumeratorValue        = 2,
+    CaseLabel              = 3,
+    BitFieldWidth          = 4,
+    IndexDesignator        = 5,
+    BitPreciseIntegerWidth = 6,
+    ObjectSizeQueryType    = 7,
+};
+inline constexpr std::size_t kIntegerConstantPositionCount = 8;
+inline constexpr EnumNameTable<IntegerConstantPosition, kIntegerConstantPositionCount>
+    kIntegerConstantPositionTable{{{
+        { IntegerConstantPosition::StaticAssertion,        "staticAssertion"        },
+        { IntegerConstantPosition::ArrayBound,             "arrayBound"             },
+        { IntegerConstantPosition::EnumeratorValue,        "enumeratorValue"        },
+        { IntegerConstantPosition::CaseLabel,              "caseLabel"              },
+        { IntegerConstantPosition::BitFieldWidth,          "bitFieldWidth"          },
+        { IntegerConstantPosition::IndexDesignator,        "indexDesignator"        },
+        { IntegerConstantPosition::BitPreciseIntegerWidth, "bitPreciseIntegerWidth" },
+        { IntegerConstantPosition::ObjectSizeQueryType,    "objectSizeQueryType"    },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kIntegerConstantPositionTable);
+
+[[nodiscard]] constexpr std::string_view
+integerConstantPositionName(IntegerConstantPosition p) noexcept {
+    return kIntegerConstantPositionTable.name(p);
+}
+[[nodiscard]] constexpr std::optional<IntegerConstantPosition>
+integerConstantPositionFromName(std::string_view s) noexcept {
+    return kIntegerConstantPositionTable.fromName(s);
+}
+
+// The forms the integer-constant evaluator READS from a position's admitted set. Only the comma
+// today: the other forms are address forms (an address is never an integer constant
+// expression's value) and `constObjectRead`, which the evaluator folds at every position
+// regardless (a separate, older rule). The loader refuses any other name, loud, rather than
+// load a list that would change nothing.
+[[nodiscard]] constexpr bool readAtIntegerConstantPositions(ConstantForm f) noexcept {
+    return f == ConstantForm::CommaOperator;
+}
+
+// The language's admitted forms per position (`IntegerConstantExpressionRule` holds one).
+// EMPTY everywhere ⇒ the standard's forms at every position.
+class IntegerConstantForms {
+public:
+    constexpr void admit(IntegerConstantPosition p, ConstantForm f) noexcept {
+        at_[static_cast<std::size_t>(p)].admit(f);
+    }
+    [[nodiscard]] constexpr ConstantForms at(IntegerConstantPosition p) const noexcept {
+        return at_[static_cast<std::size_t>(p)];
+    }
+
+private:
+    ConstantForms at_[kIntegerConstantPositionCount]{};
 };
 
 } // namespace dss

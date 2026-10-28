@@ -1,0 +1,1 @@
+                enter(argN, scope);                  // may invalidate `f` (and `bc`)

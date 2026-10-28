@@ -263,9 +263,12 @@ classifyCstCastTarget(TypeInterner const& interner, TypeId ty,
 // symbol (the semantic tier's `resolveConstSymbolInit` and the lowering's). An object's
 // value is its initializer CONVERTED to its type (C 6.7.9p11), so:
 //   * a type the conversion classifies (`classifyCstCastTarget`) — read through it;
-//   * a structure, a union or an array — handed on as its initializer folded, with NO
-//     conversion: its value is its members' and elements', each read at its own type
-//     where it is read (the constant-subobject path);
+//   * a structure, a union or an array — handed on with NO conversion (`declaredType`
+//     nullopt): its value is its members' and elements', each read at its own type where
+//     it is read (the constant-subobject path), and the engine's IDENTIFIER read of it —
+//     the aggregate read WHOLE — is no constant (an array read as a value is its address,
+//     C 6.3.2.1p3; P69 L2, the review of checkpoint 29, BLOCKER 2: the engine folded `!z`
+//     over `static const int z[2] = {0, 7}` to `!0`, see `scalarInitializerValue`);
 //   * ANY OTHER TYPE — NO CONSTANT. An arithmetic type the engine has no value for
 //     (`_Complex`: a fold holds one real number) cannot be read at its own type, and
 //     reading it at the initializer's is a different number: ✔MEASURED 2026-10-15 (pe64,
@@ -279,6 +282,34 @@ classifyCstCastTarget(TypeInterner const& interner, TypeId ty,
 [[nodiscard]] DSS_EXPORT std::optional<CstResolvedSymbol>
 namedConstantRead(TypeInterner const& interner, NodeId initExpr, std::uint32_t initScopeOpaque,
                   TypeId declaredType, std::optional<bool> charIsUnsigned);
+
+// ★ P69 L2 (lane `lm`, the review of checkpoint 29, BLOCKER 2 and MINOR 5): THE VALUE OF A
+// SCALAR'S INITIALIZER. C 6.7.9p11 gives a scalar "a single expression, optionally enclosed in
+// braces"; an element after the first is EXCESS (6.7.9p2's constraint — the lowering warns and
+// drops it unevaluated, so the scalar holds the first); an EMPTY list initializes it as an
+// object of static storage duration, to zero (C23 6.7.10p11) — at any level. So the value of
+// `init` READ AS A SCALAR'S INITIALIZER is `value`: its brace levels stepped, each to its
+// first undesignated element (transparent wrappers between them peeled, the evaluator's own
+// `wrapperChild` step); `empty` when a level is the empty list — the scalar's zero; neither
+// when a level's first element is designated (no value: no constant). Not a brace list:
+// `init` itself, its wrappers peeled.
+//
+// THE STEP IS THE SCALAR'S, AND ONLY A READER THAT KNOWS IT READS A SCALAR TAKES IT: the
+// engine's named-constant read when the declared type is a scalar's, its constant-subobject
+// read (a subobject's type is a scalar's), and a caller handing a scalar's whole initializer
+// (`validateConstexprObject`). The evaluator itself took it at ANY brace list, so an ARRAY
+// named constant read whole folded to its first element: ✔MEASURED 2026-10-20 on checkpoint
+// 29's bytes (pe64 and ELF, both pipelines, images run), `if (!z) return 1; return 2;` over
+// `static const int z[2] = {0, 7}` — and `z[1] = {0}`, `z == 0`, a structure array, an array
+// of `const char *const` — died of an illegal instruction (the fold marked `return 2` never
+// reached), and `_Static_assert(!z, "")` was accepted, where clang 18.1.3 and gcc 13.3.0 run 2
+// and refuse it. A brace list the evaluator meets itself is no constant.
+struct CstScalarInitializer {
+    NodeId value{};        // the expression initializing the scalar, its braces stepped
+    bool   empty = false;  // a level is the empty list `{}`: the scalar's zero
+};
+[[nodiscard]] DSS_EXPORT CstScalarInitializer
+scalarInitializerValue(Tree const& tree, GrammarSchema const& schema, NodeId init);
 
 // c43: field-offset resolver — given a struct/union CONTAINER TypeId + a field-name
 // token, return the field's {byteOffset, fieldType}, or nullopt (unknown field /
@@ -306,7 +337,7 @@ using CstFoldedConstantResolver =
 // TWO rules reach it, and they are ONE arm here on purpose — the two constructs
 // differ ONLY in HOW the semantic tier picks the winner, never in what a
 // consumer then does with it, which is the same reason the CST→HIR tier routes
-// both through one `lowerRecordedSelection` body:
+// both through one recorded-selection frame (`recordedSelectionPrologue`):
 //   * `chooseExprRule` (`__builtin_choose_expr`) — winner picked by an INTEGER
 //     CONSTANT condition. Makes `__builtin_choose_expr(1, 4, 1/0)` fold to 4
 //     instead of tripping the divide-by-zero wall, exactly as gcc does.
@@ -408,6 +439,14 @@ struct CstBuiltinCall {
 };
 using CstBuiltinCallResolver = std::function<std::optional<CstBuiltinCall>(NodeId)>;
 
+// P69 L2 (lane `lm`): told each 6.6p10 form the engine folded because `EvalOptions::admittedForms`
+// admits it — today the comma operator, at the comma's node — so the CALLER can say what the
+// constraint asks (C 6.6p3: S_ConstantExpressionUsesTheCommaOperator). Only a form of the
+// expression ASKED FOR, in an evaluated position: not one in a conditional's unselected arm
+// (folded for its type only), not one in another object's initializer (a `Ref` — its own
+// expression, diagnosed by its own rule). The engine stays diagnostics-free; unset ⇒ unheard.
+using CstConstantFormSink = std::function<void(ConstantForm, NodeId)>;
+
 struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
     CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
@@ -422,6 +461,7 @@ struct CstEvalEnvironment {
     CstBuiltinCallResolver       resolveBuiltinCall{};         // P69 — a constant builtin call
     CstBitFieldValueTypeResolver resolveBitFieldValueType{};   // P69 — a bit-field operand's type
     CstExpressionTypeResolver    resolveExpressionType{};      // P69 — a conditional's type
+    CstConstantFormSink          noteConstantForm{};           // P69 L2 — an admitted form used
 };
 
 // Static recognition context. All fields are non-owning references

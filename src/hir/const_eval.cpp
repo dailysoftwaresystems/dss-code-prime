@@ -649,21 +649,14 @@ combineBinary(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
         ConstEvalFailure why = ConstEvalFailure::None;
-        if (auto folded = applyBinaryFloat(op, *a.value, *b.value, why);
+        if (auto folded = applyBinaryFloat(op, *a.value, *b.value, options.charIsUnsigned, why);
             folded.has_value()) {
-            // Result core: comparisons → Bool (set by applyBinaryFloat);
-            // arithmetic → the C99-UAC common type from the HIR node's
-            // typeId so wider-of-two-floats wins (commonType on float
-            // pairs promotes to the wider). Re-tag with the same
-            // discipline as the int path.
-            if (!isComparison(op)) {
-                TypeId const aTy = hir.typeId(kids[0]);
-                TypeId const bTy = hir.typeId(kids[1]);
-                if (TypeId const common = interner.commonType(aTy, bTy);
-                    common.valid()) {
-                    folded->core = interner.kind(common);
-                }
-            }
+            // The kernel states the result's kind and rounds the value to it (comparisons a
+            // Bool). ★ P69 L2 (lane `lm`): this walker used to re-tag the core with the HIR
+            // node's common type and keep the kernel's binary64 VALUE — an F32 core over a
+            // value no float holds (`static float g = 16777216.0f + 1.0f - 16777216.0f;`
+            // laid down 1, ✔MEASURED 2026-10-20 on pe64 and ELF, where C gives 0). A re-tag
+            // can only relabel; the rounding is the kernel's, so the kind is too.
             return ok(std::move(*folded));
         }
         // `why` distinguishes "op valid, type wrong" (e.g. `1.5 % 2.0` —
@@ -918,9 +911,16 @@ combineCast(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
                 : (std::isfinite(narrowed) && narrowed == widened);
             if (!lossless) return fail(ConstEvalFailure::LossyFloatConversion, expr);
         }
+        // ★ ROUNDED ONCE, to the target's own precision (P69 L2, lane `lm`): rounding
+        // `widened` — itself a binary64 rounding above 2^53 — a second time turned
+        // `(float)0x1000001000000001ULL` into 2^60 where C gives 2^60 + 2^37
+        // (`integerConstantAsFloatKind` says why; the CST walker's float-target arm
+        // calls the same verb).
+        auto const once = detail::integerConstantAsFloatKind(*inner.value, toK, options.charIsUnsigned);
+        if (!once.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         HirLiteralValue folded;
         folded.core  = toK;
-        folded.value = narrowToFloatWidth(widened, info->bits);
+        folded.value = *once;
         return ok(std::move(folded));
     }
 

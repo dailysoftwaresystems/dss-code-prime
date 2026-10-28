@@ -587,8 +587,17 @@ TEST(GrammarSchema, FollowSetOfExpressionIncludesStatementEnders) {
         << "FOLLOW(expression) must include `;` — expression can end a statement";
     EXPECT_TRUE(containsName("ParenClose"))
         << "FOLLOW(expression) must include `)` — expression in `(expr)`";
-    EXPECT_TRUE(containsName("Colon"))
-        << "FOLLOW(expression) must include `:` — `case expr:` label";
+
+    // A case label's value is a CONSTANT-expression (C 6.8.1p1; P69 L2: c's `caseLabel` names
+    // `constantExpr`, never the comma-carrying `expression`), so `:` follows THAT rule.
+    const auto constantExpr = schema.rules().find("constantExpr");
+    ASSERT_TRUE(constantExpr.valid());
+    const auto caseFollow = schema.followSetOf(constantExpr);
+    const auto colon = schema.schemaTokens().find("Colon");
+    ASSERT_TRUE(colon.valid());
+    EXPECT_NE(std::ranges::find_if(caseFollow, [colon](SchemaTokenId s) { return s.v == colon.v; }),
+              caseFollow.end())
+        << "FOLLOW(constantExpr) must include `:` — `case expr:` label";
 }
 
 // FOLLOW propagation across nullable-tail positions: when a RuleLeaf

@@ -66,7 +66,7 @@ The loader's error catalogue (returned in `ConfigDiagnostic.code`):
 | `C_MissingField` | Required field absent. |
 | `C_UnknownToken` | A `shapes` entry references a token kind that isn't declared in `tokens`, `keywords`, or built-ins. |
 | `C_UnknownShape` | A `shapes` entry references a shape name that isn't declared. |
-| `C_CircularShape` | A shape reaches itself with no progress (e.g., `a: {sequence: [a]}`). |
+| `C_CircularShape` | A shape can reach itself before consuming any token (a left recursion, direct or through other shapes), e.g. `a: {sequence: [a, "End"]}`. |
 | `C_AmbiguousAlternatives` | An `alt` has two alternatives with overlapping FIRST sets. |
 | `C_UnclosableScope` | A scope is opened by some token but no token closes it. |
 
@@ -198,7 +198,7 @@ Each element inside `sequence`/`alt`/`repeat` is a **name** (token kind, keyword
 
 **Constraints the loader checks:**
 
-- `C_CircularShape` — a shape's `sequence` starts by referencing itself with no progress (e.g., `a: { sequence: [a, "End"] }`).
+- `C_CircularShape` — a shape can reach a reference to itself before any token is consumed: first in its `sequence`, after elements that can all match nothing (an `optional`, a `repeat`, a shape that can match nothing), in any `alt` branch, or inside an `optional`/`repeat` body standing there — directly (`a: { sequence: [a, "End"] }`) or through other shapes (`c: { alt: [ { sequence: [d, "End"] }, "X" ] }`, `d: { sequence: [c] }`). The diagnostic names the cycle (`c → d → c`). A reference after a token (`r: { alt: [ { sequence: ["X", r] }, "End" ] }`) and a `repeat` are not left recursions.
 - `C_AmbiguousAlternatives` — two `alt` arms have overlapping FIRST sets. The loader catches this at config-load time so you fix it before deploying, not as a parse-time silent first-match.
 - `C_UnclosableScope` — a token has `opensScope: "X"` but no token has `closesScope: true` reachable from inside X.
 
@@ -272,7 +272,7 @@ To verify, run any unit test that calls `GrammarSchema::loadShipped("calc")` and
 | `C_VersionMismatch` | `"dssSchemaVersion": 1` — must be an integer inside `1..4`, not a string. |
 | `C_UnknownToken: "X"` referenced from `shapes.Y` | `X` isn't declared in `tokens` or `keywords` and isn't a built-in. Check spelling; built-ins are `Identifier`, `IntLiteral`, `FloatLiteral`, `StringLiteral`, `Eof`, `Error`, `Whitespace`, `Newline`. Paradigm-specific kinds (`CharLiteral`, `BoolLiteral`, `NullLiteral`, …) are no longer pre-interned — a language that uses them must declare them in `tokens`/`keywords` or via a `defaultToken` body mode. |
 | `C_UnknownShape: "X"` referenced from `shapes.Y` | `Y` references a shape name that isn't a key in `shapes`. |
-| `C_CircularShape: "X"` | Your shape references itself as the first element of its sequence. Insert a literal token before the recursive reference, or split into two shapes. |
+| `C_CircularShape: "X"` | Your shape can reach itself before consuming a token (the message names the cycle). Put a token before the recursive reference, or say the repetition with `repeat`. |
 | `C_AmbiguousAlternatives` | Two `alt` arms can start with the same token. Pull the common prefix into a parent sequence or pick distinct sentinels. |
 | `C_UnclosableScope: "X"` | Some token has `"opensScope": "X"` but nothing reachable inside X has `"closesScope": true`. |
 

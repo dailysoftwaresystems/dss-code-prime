@@ -732,6 +732,31 @@ TEST(ConstEval, FloatAddFoldsWithAllowFloat) {
     EXPECT_EQ(res.value->core, TypeKind::F64);
 }
 
+// ★ P69 L2 (lane `lm`, the review of checkpoint 29, BLOCKER 1): A FLOAT OPERATION IS FOLDED
+// AT ITS TYPE. The kernel computed every host-backed float operation in binary64 and handed
+// the result on as an F64, so `16777216.0f + 1.0f` kept 2^24 + 1 — no float — and the chain
+// below folded to 1 where the run time computes 0. ✔MEASURED 2026-10-20 on checkpoint 29's
+// bytes (pe64 and ELF, both pipelines): `static int s = (int)(16777216.0f + 1.0f -
+// 16777216.0f) == 0 ? 42 : 7;` — a global initializer, this engine — RAN 7, where clang
+// 18.1.3 and gcc 13.3.0 run 42 and DSS's own run time over `volatile float`s computes 0. The
+// result is the operands' kind (C 6.3.1.8) and its value is rounded to it.
+TEST(ConstEval, AFloatOperationIsFoldedAtItsType) {
+    Rig r;
+    HirNodeId const big = r.litFloat(16777216.0, r.f32T());
+    HirNodeId const one = r.litFloat(1.0, r.f32T());
+    HirNodeId const sum = r.binary(HirOpKind::Add, big, one, r.f32T());
+    HirNodeId const big2 = r.litFloat(16777216.0, r.f32T());
+    HirNodeId const diff = r.binary(HirOpKind::Sub, sum, big2, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(diff);
+    auto res = evaluateConstant(hir, r.interner, r.literals, diff, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F32);
+    EXPECT_EQ(std::get<double>(res.value->value), 0.0)
+        << "2^24 + 1 is no float: the sum rounds to 2^24 before the subtraction";
+}
+
 // IEEE 754 div-by-zero is well-defined (±inf), unlike integer div-by-zero.
 TEST(ConstEval, FloatDivByZeroProducesInfNotFailure) {
     Rig r;

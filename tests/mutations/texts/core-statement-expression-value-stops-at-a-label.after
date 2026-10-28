@@ -1,1 +1,1 @@
-            false && lm != nullptr && lm->hirKind == "LabelStmt") {
+            false && lm != nullptr && (lm->hirKind == "LabelStmt" || lm->hirKind == "CaseStmt")) {

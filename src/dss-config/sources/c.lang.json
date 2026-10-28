@@ -1524,11 +1524,11 @@
     "initValue": { "$comment": "FC5: assignmentExpr (NOT expression) — the comma-gate. Covers ALL three initializer consumers (initDeclarator, structField, braceInitList initElement), so `int a = b, c;` stays 2 declarators (not `a = (b,c)`).", "alt": [ "braceInitList", "assignmentExpr" ] },
 
     "arrayDeclSuffix": {
-      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl, externDecl). It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`). P68 round 10 (lane `cs`): `_Atomic` joins the qualifier run — C 6.7.6.2p1's type-qualifier-list names every type qualifier, and gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 all accept `int p[_Atomic]`, `int p[static _Atomic 2]` and `int p[_Atomic (2)]` (the parenthesized bound is a bound: no expression begins with `_Atomic`, so the run stays FIRST-disjoint from it).",
+      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl, externDecl). It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`). P68 round 10 (lane `cs`): `_Atomic` joins the qualifier run — C 6.7.6.2p1's type-qualifier-list names every type qualifier, and gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 all accept `int p[_Atomic]`, `int p[static _Atomic 2]` and `int p[_Atomic (2)]` (the parenthesized bound is a bound: no expression begins with `_Atomic`, so the run stays FIRST-disjoint from it). ★ P69 L2 (lane `lm`): the BOUND is an ASSIGNMENT-expression (C 6.7.6.2p1's array declarator), never the comma-carrying `expression`. ✔MEASURED 2026-10-20 (clang 18.1.3, gcc 13.3.0; the default mode, -pedantic, -pedantic-errors and -std=c2x -pedantic-errors): `int a[0, 2];` at file and at block scope is a SYNTAX error on both (\"expected ']'\"), while `int a[(0, 2)]` builds on both. The bound was `expression`, so DSS parsed the bare comma and refused it only as a non-constant; once an array bound admits the comma operator (`semantics.integerConstantExpressions`), it would have folded a syntax error.",
       "sequence": [
         "BracketOpen",
         { "repeat": { "alt": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword", "AtomicKeyword" ] } },
-        { "optional": "expression" },
+        { "optional": "assignmentExpr" },
         "BracketClose"
       ]
     },
@@ -1856,8 +1856,9 @@
     "switchBodyItem": { "alt": [ "caseLabel", "statement" ], "speculative": true, "lookahead": 256 },
 
     "caseLabel": {
+      "$comment": "P69 L2 (lane `lm`): the value is a CONSTANT-expression (C 6.8.1p1: `case constant-expression :`), never the comma-carrying `expression`. ✔MEASURED 2026-10-20 (clang 18.1.3, gcc 13.3.0, every mode): `case 0, 42:` is a SYNTAX error on both (\"expected ':' after 'case'\" / \"expected ':' or '...' before ','\"), while `case (0, 42):` builds on clang (a warning).",
       "alt": [
-        { "sequence": [ "CaseKeyword", "expression", "Colon" ] },
+        { "sequence": [ "CaseKeyword", "constantExpr", "Colon" ] },
         { "sequence": [ "DefaultKeyword", "Colon" ] }
       ]
     },
@@ -1903,6 +1904,20 @@
     "expression": {
       "expr": {
         "atom": "operand",
+        "wrapperRules": {
+          "binary":  "binaryExpr",
+          "unary":   "unaryExpr",
+          "postfix": "postfixExpr",
+          "ternary": "ternaryExpr"
+        }
+      }
+    },
+
+    "constantExpr": {
+      "$comment": "P69 L2 (lane `lm`): a C `constant-expression` (6.6p1: a conditional-expression) — the operators from the conditional `?:` (precedence 16) up, so neither an assignment (15) nor the comma operator (10) is part of it: the level of `attrArgConstExpr`, over the language's own atoms. The positions C's grammar states as a constant-expression that DSS parses here: a case label and an index designator.",
+      "expr": {
+        "atom": "operand",
+        "minPrecedence": 16,
         "wrapperRules": {
           "binary":  "binaryExpr",
           "unary":   "unaryExpr",
@@ -2231,7 +2246,10 @@
 
     "designator": { "alt": [ "designatedField", "designatedIndex" ] },
     "designatedField": { "sequence": [ "DotOp", "Identifier" ] },
-    "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
+    "designatedIndex": {
+      "$comment": "P69 L2 (lane `lm`): the index is a CONSTANT-expression (C 6.7.9p1's designator `[ constant-expression ]`), never the comma-carrying `expression`. ✔MEASURED 2026-10-20 (clang 18.1.3, gcc 13.3.0, every mode): `{ [0, 1] = 5 }` is a SYNTAX error on both (\"expected ']'\"), while `{ [(0, 1)] = 5 }` builds on clang (a warning).",
+      "sequence": [ "BracketOpen", "constantExpr", "BracketClose" ]
+    },
 
     "charLiteralExpr":   {
       "$comment": "C11/C23 6.4.4.4: a character constant is opener + coalesced body + closer. The opener is an INLINE token alt (`'`|`L'`|`u'`|`U'`|`u8'`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the stringLiteralExpr precedent), so the opener token stays a DIRECT child of this node and charLiteralNodeOf / the semantic char-typing override find it AND recover its SPECIFIC kind (the C23 element-type discriminator). D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the trailing `CharEnd` is the closing `'`, now a real token (charBody's `defaultToken.closeToken` — see $closingDelimiterTokenComment); it is a DISTINCT kind from the `CharLiteral` body precisely so a kind-filtering body reader can never mistake the delimiter for a second body segment. Children go 2 → 3; every consumer locates the body by KIND (hirLowering.charLiteral.bodyToken=CharLiteral), not by index, so nothing shifts.",
@@ -2836,6 +2854,12 @@
     "staticInitializers": {
       "otherConstantForms": ["constObjectRead", "commaOperator", "addressAsInteger", "addressTruthValue", "addressComparison", "addressDifference", "addressIntegerAlgebra"]
     },
+    "$integerConstantExpressionsComment": "P69 L2 (lane `lm`): C 6.6p3 keeps the comma operator out of a constant expression (outside an unevaluated subexpression — a constraint, so a diagnostic is owed), and 6.6p10 lets an implementation accept other forms; the references take that latitude PER POSITION. ✔MEASURED 2026-10-20 (lane `lm`'s probes/comma, WSL clang 18.1.3 and gcc 13.3.0 at the default mode, -pedantic, -pedantic-errors and -std=c2x -pedantic-errors, every build RUN): clang folds `(0, 42)` with a warning, and refuses it only at -pedantic-errors, as a static assertion, an array bound (file scope: 'variable length array folded to constant array as an extension'), an enumerator's value, a case label, a bit-field's width, an index designator and a `_BitInt` width; gcc refuses every one of those, and folds it as `__builtin_object_size`'s type operand, where clang refuses. NEITHER folds it in `_Alignas` / `aligned(...)`, a `__builtin_choose_expr` condition, or as a null pointer constant (`int *p = (0, 0);` is an integer-to-pointer conversion on both) — those positions are not named, so they take the standard's forms. Both refuse `(y, 1)` for a non-constant `y`: the discarded operand must fold too. One working reference makes a form REQUIRED, so each named position admits the comma, with S_ConstantExpressionUsesTheCommaOperator (a warning, once per comma) for the constraint.",
+    "integerConstantExpressions": {
+      "otherConstantForms": {
+        "commaOperator": ["staticAssertion", "arrayBound", "enumeratorValue", "caseLabel", "bitFieldWidth", "indexDesignator", "bitPreciseIntegerWidth", "objectSizeQueryType"]
+      }
+    },
     "compoundLiterals": [
       { "rule": "compoundLiteralExpr", "typeChild": 1 },
       { "rule": "storageCompoundLiteralExpr", "typeChild": 2, "storageChild": 1,
@@ -3198,9 +3222,9 @@
     "castRule":            "castExpr",
     "$foldedConstantRulesComment": "P31: the rules whose ENTIRE meaning is a number the SEMANTIC tier already computed. CST→HIR emits the recorded value as a Literal and NEVER lowers the subtree — there is no subtree to lower, because the operands are type-names and member designators rather than expressions. A LIST and not one field per construct, because `read the folded constant` is ONE lowering verb and a second construct must not need a second dispatch arm. A rule named here whose node carries NO recorded constant is a hard REFUSAL, never a zero.",
     "foldedConstantRules": [ "builtinOffsetofExpr", "builtinTypesCompatibleExpr" ],
-    "$chooseExprRuleComment": "P31: `__builtin_choose_expr` — routed to the SAME `lowerRecordedSelection` body `genericRule` uses, because the two constructs differ ONLY in how the semantic tier picked the winner and never in what the lowering then does with it.",
+    "$chooseExprRuleComment": "P31: `__builtin_choose_expr` — routed to the SAME recorded-selection frame (`recordedSelectionPrologue` / `recordedSelectionEpilogue`) `genericRule` uses, because the two constructs differ ONLY in how the semantic tier picked the winner and never in what the lowering then does with it.",
     "chooseExprRule":      "builtinChooseExpr",
-    "$stmtExprRuleComment": "P31 (D-C-GNU-STATEMENT-EXPRESSION): the GNU `({ … })` operand rule. It routes to `lowerStatementExpr`, which builds the ALREADY-EXISTING `HirKind::SeqExpr` ([stmts…, result]) — the node whose own header comment names GCC statement expressions as what it models, and which MIR already lowers by running each statement child through `lowerStmt` and yielding the last child's value. Invalid (key absent) ⇒ the language has no statement-expression surface and the operand dispatch never matches it.",
+    "$stmtExprRuleComment": "P31 (D-C-GNU-STATEMENT-EXPRESSION): the GNU `({ … })` operand rule. It routes to the `lowerExpr` driver's statement-expression frame (`stmtExprValuePrologue` / `stmtExprValueEpilogue`, P69 L2: its value costs no host frame per nested level), which builds the ALREADY-EXISTING `HirKind::SeqExpr` ([stmts…, result]) — the node whose own header comment names GCC statement expressions as what it models, and which MIR already lowers by running each statement child through `lowerStmt` and yielding the last child's value. Invalid (key absent) ⇒ the language has no statement-expression surface and the operand dispatch never matches it.",
     "stmtExprRule":        "stmtExpr",
     "sizeofRule":          "sizeofExpr",
     "alignofRule":         "alignofExpr",

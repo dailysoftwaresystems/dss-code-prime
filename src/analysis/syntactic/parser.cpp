@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -310,6 +311,64 @@ struct Parser::Impl {
     // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
     std::size_t speculationDepth = 0;
 
+    // ── THE FAILED-PROBE MEMO (cycle P69 L2, lane `lm`) ──────────────
+    //
+    // A candidate rule probed at a token and FAILED fails there again, whoever
+    // asks, when nothing outside the token stream decided it differently. Two
+    // things can: the binder sketch (the one question a probe asks it is the
+    // type-name triage's lookup) and the parser's ceilings (depth, token budget,
+    // expression depth — what remains of each depends on where the probe was
+    // opened). So a failure that latched no ceiling is RECORDED by (rule, token,
+    // whether the walker was already desynced — the one probe-start state its
+    // refutation reads) and, when it asked the sketch, the sketch's `version()`
+    // at the probe's start (equal versions answer every lookup alike); a later
+    // probe of the same key is answered from the record: the candidate fails at
+    // once, the type-name candidate that failure handed out is recorded again,
+    // and the site moves on exactly as after an abandoned probe.
+    //
+    // ✔MEASURED 2026-10-20 (macos-arm64-debug, the shipped ceilings): without
+    // it a parenthesised chain of calls, `return (g(g(…g(0)…)));`, parsed in
+    // 2 / 5 / 29 / 193 / 1335 / 9245 ms at depths 4 / 8 / 12 / 16 / 20 / 24 —
+    // x1.62 per level. Inside the cast reading's type name every `(` of the
+    // abstract declarator is probed as a group (`parenDeclarator`) and as a
+    // parameter list (`fnSuffix`), and each probe re-parsed the whole inner
+    // region with both readings again (464 probes of each at depth 12). Each
+    // (rule, token) fails once now. gcc 13.3.0 and clang 18.1.3 build and run a
+    // 30-deep chain.
+    std::uint64_t sketchLookups_  = 0;   // the triage's sketch questions, ever
+    std::uint64_t ceilingLatches_ = 0;   // ceilings met (each one, latched or not)
+    // The version a failure that asked the sketch nothing is recorded under: it
+    // fails whatever the sketch holds.
+    static constexpr std::uint64_t kAnySketchVersion = ~std::uint64_t{0};
+    struct FailedProbeKey {
+        std::uint32_t rule = 0;
+        std::size_t   pos  = 0;
+        bool          desyncedBefore = false;
+        std::uint64_t sketchVersion  = kAnySketchVersion;
+        bool operator==(FailedProbeKey const&) const = default;
+    };
+    struct FailedProbeKeyHash {
+        std::size_t operator()(FailedProbeKey const& k) const noexcept {
+            return (static_cast<std::size_t>(k.rule) * 0x9E3779B97F4A7C15ull)
+                 ^ (k.pos << 1) ^ static_cast<std::size_t>(k.desyncedBefore)
+                 ^ (static_cast<std::size_t>(k.sketchVersion) * 0xC2B2AE3D27D4EB4Full);
+        }
+    };
+    // The value: the type-name candidate the failure's triage handed out, if any — and, P69
+    // L2a (lane `lm`), WHAT OF THE THREE CEILINGS THE FAILURE USED: the deepest speculation
+    // nesting and the deepest expression nesting it ATTEMPTED, each relative to its start, and
+    // the largest token charge its budget was asked about. A probe that met no ceiling where it
+    // ran can meet one where less room is left — a deeper start, a smaller budget — and fail
+    // THERE by that ceiling, latching it; so the record answers only where all three fit
+    // (`recordedFailure_`), and elsewhere the probe runs again.
+    struct FailedProbe {
+        std::optional<AmbiguousTypeNameCandidate> candidate;
+        std::size_t relSpeculationPeak = 0;   // deepest open attempted, minus the start depth
+        std::size_t relExpressionPeak  = 0;   // deepest expression push attempted, minus the start
+        std::size_t peakCharge         = 0;   // the largest charge its budget was asked about
+    };
+    std::unordered_map<FailedProbeKey, FailedProbe, FailedProbeKeyHash> failedProbes_;
+
     // Declared here so `innermostProbe_` can name it; defined below.
     class SpeculationProbe;
 
@@ -367,6 +426,56 @@ struct Parser::Impl {
     };
     std::optional<SpeculationCapHit> speculationCapHit_;
 
+    // ── ★ P69 L2a (lane `lm`): A PROBE REFUTED BY A CEILING IS REMEMBERED TOO ──────────
+    // (D-PARSE-A-PARENTHESISED-CHAIN-COSTS-PARSE-WORK-EXPONENTIAL-IN-ITS-DEPTH.) A probe that
+    // met a ceiling was never remembered, so past a BINDING ceiling every enclosing level's retry
+    // ran it again: ✔MEASURED 2026-10-21 (macos-arm64-debug, the parser alone under a 15 s
+    // watchdog) a parenthesised `__builtin_expect(` chain under `maxSpeculationDepth` 64 parsed
+    // 64 levels in 20836 token accesses, 65 in 29661, and did not finish 96 — exponential past the
+    // ceiling, linear below it (16383: 45476 at 128).
+    // ★ WHY THIS KEY IS SOUND. A probe's outcome — fail or not, the type-name candidate its
+    // triage hands out, and the first ceiling it meets — is a function of: the tokens from its
+    // start (the position), its rule, whether the walker had desynced before it, the binder
+    // sketch's answers when it asked them (its version), and the room the three ceilings left it
+    // at its start — the speculation depth (`maxSpeculationDepth` is met by an open attempted at
+    // depth >= the limit), the expression depth (`maxExpressionDepth`, by a push attempted at depth
+    // >= the limit) and its token budget (its site's lookahead times `speculationBudgetFactor`,
+    // charged net of what its nested probes consumed — a function of the same nested outcomes).
+    // Every other parser state a probe touches it snapshots and restores and does not read to
+    // decide (READ: the builder, the token stream, the walker, the diagnostic count, the recovery
+    // flags, the watchdog tuple and the sketch are restored by the probe's destructor; the cascade
+    // shield is read only at depth 0; the ceiling latch is written inside a probe and read only at
+    // depth 0). So a refutation is remembered under the failed-probe key PLUS the exact room
+    // (`CeilingRefutedKey`), and a record answers exactly the probes that would repeat it.
+    struct CeilingRefutedKey {
+        FailedProbeKey probe;
+        std::size_t    speculationDepth = 0;   // live probes at its start
+        std::size_t    expressionDepth  = 0;   // expression nesting at its start
+        std::size_t    budget           = 0;   // its token budget
+        bool operator==(CeilingRefutedKey const&) const = default;
+    };
+    struct CeilingRefutedKeyHash {
+        std::size_t operator()(CeilingRefutedKey const& k) const noexcept {
+            return FailedProbeKeyHash{}(k.probe)
+                 ^ (k.speculationDepth * 0xD6E8FEB86659FD93ull)
+                 ^ (k.expressionDepth * 0xA0761D6478BD642Full)
+                 ^ (k.budget * 0xE7037ED1A0B428DBull);
+        }
+    };
+    // The value: the candidate (as for `failedProbes_`) and the FIRST ceiling hit the probe met —
+    // replayed on a hit, so the latch and the enclosing probe's first hit are what the run made.
+    struct CeilingRefutation {
+        std::optional<AmbiguousTypeNameCandidate> candidate;
+        SpeculationCapHit                         hit;
+    };
+    std::unordered_map<CeilingRefutedKey, CeilingRefutation, CeilingRefutedKeyHash>
+        ceilingRefuted_;
+    // The deepest speculation open and expression push ATTEMPTED since the innermost live probe
+    // started (each probe resets them to its start and, on destruction, folds its own back into
+    // its parent's): what a failure records as the room it used.
+    std::size_t peakSpeculationAttempt_ = 0;
+    std::size_t peakExpressionAttempt_  = 0;
+
     // ── the cascade shield ───────────────────────────────────────────
     //
     // Set when a speculation ceiling has been reported and the construct
@@ -395,12 +504,70 @@ struct Parser::Impl {
     // Latch one ceiling hit at `peek`. FIRST hit wins: the deepest /
     // earliest refusal is the one that describes where the parse actually
     // ran out, and a later outer refusal is its consequence.
+    // P69 L2a (lane `lm`): and the innermost live probe keeps its FIRST hit (a probe's first hit
+    // is its own or its earliest child's, handed up on destruction) — what a ceiling-refuted
+    // record replays.
     void latchSpeculationCeiling_(SpeculationCeiling which,
                                   std::size_t        limit) {
-        if (speculationCapHit_) return;
-        Token const& peek  = tokens.peek();
-        speculationCapHit_ = SpeculationCapHit{peek.span, renderActual(peek),
-                                               limit, which};
+        ++ceilingLatches_;   // every ceiling met: such a probe is remembered by its exact room
+        bool const probeWantsIt =
+            innermostProbe_ != nullptr && !innermostProbe_->hasFirstCeilingHit();
+        if (!probeWantsIt && speculationCapHit_) return;
+        Token const& peek = tokens.peek();
+        SpeculationCapHit hit{peek.span, renderActual(peek), limit, which};
+        if (probeWantsIt) innermostProbe_->noteFirstCeilingHit(hit);
+        if (!speculationCapHit_) speculationCapHit_ = std::move(hit);
+    }
+
+    // P69 L2a (lane `lm`): a ceiling-refuted record answering a probe — the ceiling is met as the
+    // run met it: counted (so every enclosing probe is ceiling-met), the innermost live probe's
+    // first hit if it has none, and the latch if it is empty (first hit wins, as in the run).
+    void replayCeilingHit_(SpeculationCapHit const& hit) {
+        ++ceilingLatches_;
+        if (innermostProbe_ != nullptr && !innermostProbe_->hasFirstCeilingHit())
+            innermostProbe_->noteFirstCeilingHit(hit);
+        if (!speculationCapHit_) speculationCapHit_ = hit;
+    }
+
+    // The token budget a probe opened NOW would get: its site's declared lookahead times
+    // `speculationBudgetFactor` (4x the factor for a site that declares none) — the one formula,
+    // read by the probe's constructor and by the memo's key.
+    [[nodiscard]] std::size_t probeBudgetNow_() {
+        return walker.lookahead() > 0
+                   ? static_cast<std::size_t>(walker.lookahead()) * config.speculationBudgetFactor
+                   : 4u * config.speculationBudgetFactor;
+    }
+
+    // P69 L2a (lane `lm`): the remembered failure of `branch` at the current token, if a record
+    // answers it here — a failure that met no ceiling where the room it used is left (its
+    // attempted peaks folded into the enclosing probe's, as the run would have reached them), or a
+    // ceiling refutation under this exact room. Under any sketch first, then the current version.
+    struct RecordedFailure {
+        std::optional<AmbiguousTypeNameCandidate> candidate;
+        std::optional<SpeculationCapHit>          hit;
+    };
+    [[nodiscard]] std::optional<RecordedFailure> recordedFailure_(RuleId branch) {
+        std::size_t const budget = probeBudgetNow_();
+        for (std::uint64_t const version : {kAnySketchVersion, sketch.version()}) {
+            FailedProbeKey const key{branch.v, tokens.position(), walker.isDesynced(), version};
+            if (auto const it = failedProbes_.find(key); it != failedProbes_.end()) {
+                FailedProbe const& f = it->second;
+                if (speculationDepth + f.relSpeculationPeak < config.maxSpeculationDepth
+                    && expressionDepth + f.relExpressionPeak < config.maxExpressionDepth
+                    && f.peakCharge <= budget) {
+                    peakSpeculationAttempt_ = std::max(peakSpeculationAttempt_,
+                                                       speculationDepth + f.relSpeculationPeak);
+                    peakExpressionAttempt_  = std::max(peakExpressionAttempt_,
+                                                       expressionDepth + f.relExpressionPeak);
+                    return RecordedFailure{f.candidate, std::nullopt};
+                }
+            }
+            if (auto const it = ceilingRefuted_.find(
+                    CeilingRefutedKey{key, speculationDepth, expressionDepth, budget});
+                it != ceilingRefuted_.end())
+                return RecordedFailure{it->second.candidate, it->second.hit};
+        }
+        return std::nullopt;
     }
 
     // Pratt-walker expression-nesting depth. Incremented on every PUSH
@@ -909,10 +1076,20 @@ struct Parser::Impl {
         // P68 round 9 (lane `cs`): a lifted field row (an enumeration constant)
         // binds in the enclosing namespace scope — see `BinderSketch::record`.
         bool liftToEnclosingScope = false;
+        // A declarator-mode row bound each name at the end of its declarator
+        // (`recordAtDeclaratorEnd_`); its close records only what that missed.
+        bool declaratorMode = false;
         if (sketch.enabled()) {
             if (auto const* decl = sketch.binderFor(rule)) {
-                binderNames = extractBinderNames_(*decl);
+                // P69 L2 (lane `lm`): a composite's row names a TAG and a struct or
+                // union field row a MEMBER — no ordinary identifier either (C 6.2.3),
+                // so the sketch, which answers for ordinary identifiers only, records
+                // neither.
+                if (!decl->namesATag && !decl->namesAMember) {
+                    binderNames = extractBinderNames_(*decl);
+                }
                 liftToEnclosingScope = decl->liftToEnclosingScope;
+                declaratorMode = decl->declaratorMode;
             }
         }
         walker.leaveRule(SourceSpan::empty(0), rule);
@@ -920,12 +1097,67 @@ struct Parser::Impl {
         frames.pop_back();
         if (!frameRules.empty()) frameRules.pop_back();
         if (sketch.enabled()) {
+            recordAtDeclaratorEnd_(rule);
             if (sketch.isScopeRule(rule)) sketch.closeScope();
             for (auto& bn : binderNames) {
+                if (declaratorMode && !liftToEnclosingScope) {
+                    sketch.recordUnlessBoundAtItsDeclarator(std::move(bn.name),
+                                                            bn.isType, bn.span);
+                    continue;
+                }
                 sketch.record(std::move(bn.name), bn.isType, bn.span,
                               liftToEnclosingScope);
             }
         }
+    }
+
+    // ★ P69 L2 (lane `lm`): A DECLARATOR-MODE ROW'S NAME IS IN SCOPE FROM THE END OF
+    // ITS DECLARATOR — C 6.2.1p7, "just after the completion of its declarator" —
+    // not from the end of the declaration, where the row's close records it. So when
+    // a SLOT declarator closes (an init-declarator's, a member or plain-list slot's,
+    // a list's bare declarator, or a single-declarator row's own: the slots the
+    // shared `collectDeclarators` walk hands the row's close), its name is recorded
+    // at once, where that close would record it; the close then finds it bound and
+    // adds nothing. ✔MEASURED at eb6f22a3 (pe64, images run natively): `typedef int
+    // T; … int T = 44, y = (T) - 2;` RAN -2 and `typedef char T; … int T =
+    // sizeof(T);` RAN 1, where gcc 13.3.0 and clang 18.1.3 run both to 42 — the
+    // triage read T as the typedef inside the very declaration that had hidden it.
+    // The row is found by structure, never by distance: up through the slot
+    // wrappers and lists, the next frame must be a declarator-mode row.
+    void recordAtDeclaratorEnd_(RuleId closed) {
+        auto const& dcOpt = schema->semantics().declarators;
+        if (!dcOpt.has_value() || closed != dcOpt->declaratorRule || frameRules.empty())
+            return;
+        DeclaratorConfig const& dc = *dcOpt;
+        auto const slotStructure = [&dc](RuleId r) noexcept {
+            return isDeclaratorSlotWrapper(r, dc) || r == dc.listRule
+                || (dc.plainListRule.has_value() && r == *dc.plainListRule)
+                || (dc.memberListRule.has_value() && r == *dc.memberListRule);
+        };
+        auto it = frameRules.rbegin();
+        while (it != frameRules.rend() && slotStructure(*it)) ++it;
+        if (it == frameRules.rend()) return;
+        BinderSketch::BinderDecl const* const row = sketch.binderFor(*it);
+        if (row == nullptr || !row->declaratorMode) return;   // a nested declarator
+        // A MEMBER is no ordinary identifier: never recorded.
+        if (row->namesAMember) return;
+        RuleId const rowRule = *it;
+        // The declarator that just closed: the newest visible child staged in the
+        // frame it closed into.
+        NodeId closedNode{};
+        for (NodeId c : builder->currentFramePendingChildren()) {
+            if (!isEmptySpace(builder->nodeFlags(c))) closedNode = c;
+        }
+        if (!closedNode.valid() || builder->nodeKind(closedNode) != NodeKind::Internal
+            || builder->nodeRule(closedNode).v != closed.v) {
+            return;
+        }
+        BuilderDeclaratorView const view{*builder};
+        NodeId const nameNode = declaratorNameNode(view, closedNode, dc);
+        if (!nameNode.valid()) return;   // abstract — no binding
+        SourceSpan const nameSpan = builder->nodeSpan(nameNode);
+        sketch.recordAtDeclaratorEnd(std::string{src->slice(nameSpan)}, row->isType,
+                                     nameSpan, sketch.isScopeRule(rowRule));
     }
 
     // ── FC2 binder-sketch name extraction ───────────────────────────────
@@ -994,6 +1226,8 @@ struct Parser::Impl {
         [[nodiscard]] std::span<NodeId const> children(NodeId n) const {
             return b.nodeChildren(n);
         }
+        // What the shared walks are bounded by (`substrate::WalkSteps`).
+        [[nodiscard]] std::size_t nodeCount() const noexcept { return b.nodeCount(); }
     };
 
     // Extract every (name, isType) binding from the ABOUT-TO-CLOSE top
@@ -1067,49 +1301,6 @@ struct Parser::Impl {
         out.emplace_back(std::string{src->slice(nameSpan)}, decl.isType,
                          nameSpan);
         return out;
-    }
-
-    // ── D-CSUBSET-SELF-REFERENTIAL-STRUCT: mid-frame composite-tag record ──
-    //
-    // P0009 fix. A composite SPECIFIER body (`struct N { … }`) binds its tag only
-    // at frame CLOSE today (closeFrameOnce → extractBinderNames_). But a SELF-
-    // REFERENTIAL member inside the body (`struct sqlite3 { … sqlite3 *m; … }`)
-    // hits the decl-vs-expr triage MID-body, where `sketch.lookup("sqlite3")` is
-    // still Unknown → `sqlite3 *m` mis-triages as a value (a multiply) → P0009.
-    // FIX: the instant the body's TAG identifier is consumed (BEFORE the member
-    // list), record it as a TYPE so the mid-body lookup sees it. The tag is the
-    // ONLY identifier token that is a DIRECT child of the composite-specifier frame
-    // (the member-field identifiers are nested in the `structBody`/`structField`
-    // subframes — c25 added the `structBody` wrapper level, but it is still a
-    // nested frame, so `currentRule()` is no longer the specifier while the body
-    // parses), so a single "consumed an identifier directly under a composite
-    // specifier rule" test fires exactly once, on the tag. `record(name,
-    // /*isType=*/true)` floats it to the innermost non-dominator scope (the spec's
-    // own scope — non-dominator since it is an isType binder), giving body
-    // visibility; the close-time record then also binds it in the enclosing scope
-    // (the inner-scope binding dies with the spec — a benign duplicate). Anonymous
-    // `struct { … }` has no tag identifier ⇒ no-op.
-    // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a composite specifier is now a
-    // binder row that is BOTH isType AND a scope rule — the unified
-    // structSpec/unionSpec/enumSpec (which REPLACED the *SpecifierBody rules).
-    // A body-ABSENT use (`struct S v;` — a tag reference) ALSO trips this and
-    // records its tag as a Type: harmless (the name DOES denote a type) and a
-    // struct-keyword-led form is already unambiguously a declaration, so it
-    // changes no decl-vs-expr triage outcome. Nothing here hardcodes a keyword.
-    void recordCompositeTagIfApplicable_(SchemaTokenId consumedKind) {
-        if (!sketch.enabled()) return;
-        if (consumedKind.v != identifierKind.v) return;
-        const RuleId rule = builder->currentRule();
-        auto const* decl = sketch.binderFor(rule);
-        if (decl == nullptr || !decl->isType || !sketch.isScopeRule(rule)) return;
-        // The tag is at the row's positional nameChild (e.g. index 1, after the
-        // struct/union/enum keyword). Extract via the SAME positional logic
-        // extractBinderNames_ uses; at this point the only staged visible children
-        // are [keyword, tag], so nameChild resolves to the just-consumed tag.
-        auto names = extractBinderNames_(*decl);
-        for (auto& bn : names) {
-            sketch.record(std::move(bn.name), bn.isType, bn.span);
-        }
     }
 
     // ── FC2 type-name commit triage ─────────────────────────────────────
@@ -1248,6 +1439,28 @@ struct Parser::Impl {
             return false;
         }
 
+        // The follower rule 4 reads: the operand's first leaf.
+        SchemaTokenId followerKind{};
+        if (operandSibling.valid()) {
+            std::vector<NodeId> fl;
+            collectLeavesBelow_(operandSibling, fl, /*cap=*/0);
+            if (!fl.empty()
+                && builder->nodeKind(fl[0]) == NodeKind::Token) {
+                followerKind = builder->nodeTokenKind(fl[0]);
+            }
+        }
+        return triageApprovesTypeChild_(typeChild, followerKind, polarity,
+                                        outCandidate);
+    }
+
+    // Rules 1-4 (above) on a BUILT type child whose operand begins with
+    // `followerKind` (invalid: no operand leaf) — asked at the branch's close
+    // (`typeNameCommitApproved_`) and when its operand opens
+    // (`askTriageAtTheOperand_`). True: commit.
+    [[nodiscard]] bool triageApprovesTypeChild_(
+        NodeId typeChild, SchemaTokenId followerKind,
+        TypeNameCommitPolarity polarity,
+        std::optional<AmbiguousTypeNameCandidate>& outCandidate) {
         // Rule 1 — the type-name's BASE cannot be an expression (a keyword
         // base, struct/union/enum tag, const, …) → COMMIT: no value reading
         // competes. The discriminator is the BASE (leftmost) leaf, NOT the
@@ -1276,6 +1489,7 @@ struct Parser::Impl {
         // Rules 2 + 3 — the sketch knows the name.
         const SourceSpan nameSpan = builder->nodeSpan(typeLeaves[0]);
         const std::string_view name = src->slice(nameSpan);
+        ++sketchLookups_;   // a probe that asked this is not memoised (`failedProbes_`)
         switch (sketch.lookup(name)) {
         case BinderSketch::NameKind::Type:    return true;
         case BinderSketch::NameKind::Value:   return false;
@@ -1295,15 +1509,6 @@ struct Parser::Impl {
         }
 
         // PreferType — follower-operator test.
-        SchemaTokenId followerKind{};
-        if (operandSibling.valid()) {
-            std::vector<NodeId> fl;
-            collectLeavesBelow_(operandSibling, fl, /*cap=*/0);
-            if (!fl.empty()
-                && builder->nodeKind(fl[0]) == NodeKind::Token) {
-                followerKind = builder->nodeTokenKind(fl[0]);
-            }
-        }
         auto const& ops = schema->operatorTable();
         const bool followerIsOperator = followerKind.valid()
             && (ops.lookup(followerKind, OperatorArity::Infix).has_value()
@@ -1317,6 +1522,118 @@ struct Parser::Impl {
             .span = nameSpan,
         };
         return false;
+    }
+
+    // ★★ P69 L2 (lane `lm`): THE TRIAGE'S BASE IS ASKED WHEN THE TYPE CHILD OPENS.
+    // Rule 3 above reads nothing but the type child's BASE leaf and the sketch, so a
+    // base the sketch knows as a VALUE refutes the branch as soon as that leaf is known
+    // — and the driver's refuted-hypothesis test abandons the probe there, instead of
+    // the probe parsing the rest of its branch (a cast's whole operand) for a rollback
+    // that was already certain. ✔MEASURED 2026-10-20 (macos-arm64-debug, the parse's
+    // token-access count, the failed-probe memo in place): `(T)(g((T)(g(…))))` with
+    // `typedef int T;` and a function `g` cost 25319 / 95111 / 369863 / 1460039 /
+    // 5803079 accesses at 16 / 32 / 64 / 128 / 256 levels — ×4 per doubling, 9 s at 256
+    // — because at every level the cast probe of `(g(…))` parsed the rest of the chain
+    // (as its type name's declarator, then as its operand) before rule 3 refused it.
+    //
+    // The base is the next significant token when the type child's frame opens, on
+    // three conditions the schema answers: the frame is the branch's own child (the
+    // triage reads the branch's FIRST type child, and this is its first frame), the
+    // type rule cannot derive nothing (the token would then be the next element's),
+    // and no attribute specifier can start with an identifier (the base is the first
+    // leaf outside one). Only rule 3 is answered here. A TYPE (rule 2) is left to the
+    // close, and an unknown name (rule 4, its follower test and its candidate) to the
+    // operand's opening (`askTriageAtTheOperand_`) and the close.
+    //
+    // The close would answer the same. A VALUE binding of the name visible now is
+    // still the newest one at the close unless the branch itself binds the name: in
+    // a scope that closes inside it (a statement expression's block, a prototype's
+    // parameters), which the close no longer sees; or as a value (an enumeration
+    // constant), which changes nothing. A tag of the name is never recorded (C 6.2.3:
+    // tags are no ordinary identifiers).
+    void askTriageBaseEarly_(RuleId opened) {
+        if (innermostProbe_ == nullptr || specStack.empty()) return;
+        SpeculationSite& site = specStack.back();
+        if (site.probe.get() != innermostProbe_ || site.exprBranch) return;
+        SpeculationProbe& probe = *site.probe;
+        if (probe.baseAsked() || frames.size() != probe.targetDepth() + 2) return;
+        const RuleId typeRule = schema->typeNameCommitRule(site.branch);
+        if (!typeRule.valid() || typeRule.v != opened.v) return;
+        probe.markBaseAsked();
+        if (schema->isNullable(typeRule)) return;
+        auto const& sem = schema->semantics();
+        for (RuleId const attr : {sem.attrSpecRule, sem.stdAttrRule}) {
+            if (attr.valid() && schema->firstSetContains(attr, identifierKind)) return;
+        }
+        for (std::size_t raw = 0;; ++raw) {
+            Token const& t = tokens.peek(raw);
+            if (t.coreKind == CoreTokenKind::Eof) return;
+            if (isTriviaToken(t, *schema)) continue;
+            if (effectiveKind(t, identifierKind, errorKind).v != identifierKind.v) return;
+            ++sketchLookups_;   // the failed-probe memo keys this probe by the sketch
+            if (sketch.lookup(src->slice(t.span)) == BinderSketch::NameKind::Value) {
+                probe.refuteByTheTriage();
+            }
+            return;
+        }
+    }
+
+    // ★★ P69 L2 (lane `lm`): THE TRIAGE IS ASKED AGAIN WHEN THE OPERAND OPENS. Rule 4
+    // (an identifier base the sketch does not know) reads the built type child and the
+    // FIRST token of the operand that follows it — both known the moment the branch
+    // dispatches that operand, before a token of it is parsed. ✔MEASURED 2026-10-21
+    // (macos-arm64-debug, the parse's token-access count, the failed-probe memo and the
+    // early base ask in place): `(u)((u)(…))` with `u` declared nowhere cost 2908 / 8852
+    // / 30340 / 111716 / 428068 / 1675172 accesses at 8 … 256 levels — x3.9 per doubling
+    // — because at every level the cast probe parsed the rest of the chain as its operand
+    // before its close rolled it back. Here the four rules run on the built type child
+    // through the one function the close runs (`triageApprovesTypeChild_`); a ROLLBACK
+    // refutes the probe and hands the site its candidate, as the close does; a COMMIT is
+    // left to the close. The operand is dispatched as a rule of the branch's own frame,
+    // its first token in that rule's FIRST — so it is the operand's first leaf, the token
+    // the close reads — and it is the branch's first child frame after the type child
+    // (anything else is left to the close).
+    //
+    // The close would answer the same but for a binding the OPERAND makes that is still
+    // visible at the close: an enumeration constant of the base's spelling declared in it
+    // (`(u)(sizeof(enum { u = 1 }))`) — the close reads a VALUE (rule 3: rollback, no
+    // candidate), this ask an unknown name (rule 4: rollback and a candidate). And an
+    // operand that would not have parsed (`(u)()`) never reached the close, which handed
+    // out no candidate. In both the parse is the same — the identity corpus pins the
+    // trees — and the compilation unit's oracle is handed one more candidate.
+    void askTriageAtTheOperand_(RuleId operandRule, SchemaTokenId followerKind) {
+        if (innermostProbe_ == nullptr || specStack.empty()) return;
+        SpeculationSite& site = specStack.back();
+        if (site.probe.get() != innermostProbe_ || site.exprBranch) return;
+        SpeculationProbe& probe = *site.probe;
+        if (!probe.baseAsked() || probe.operandAsked()
+            || frames.size() != probe.targetDepth() + 1) {
+            return;
+        }
+        const RuleId typeRule = schema->typeNameCommitRule(site.branch);
+        if (!typeRule.valid() || typeRule.v == operandRule.v) return;
+        // The branch's children so far: the type child, then only tokens (its closer).
+        NodeId typeChild{};
+        for (NodeId c : builder->currentFramePendingChildren()) {
+            if (isEmptySpace(builder->nodeFlags(c))) continue;
+            if (!typeChild.valid()) {
+                if (builder->nodeKind(c) == NodeKind::Internal
+                    && builder->nodeRule(c).v == typeRule.v) {
+                    typeChild = c;
+                }
+                continue;
+            }
+            if (builder->nodeKind(c) == NodeKind::Internal) return;   // not the operand
+        }
+        if (!typeChild.valid()) return;
+        probe.markOperandAsked();
+        std::optional<AmbiguousTypeNameCandidate> candidate;
+        if (!triageApprovesTypeChild_(typeChild, followerKind,
+                                      schema->typeNameCommitPolarity(site.branch),
+                                      candidate)) {
+            site.rolledBackCandidate = std::move(candidate);
+            probe.refuteByTheTriage();
+        }
     }
 
     [[nodiscard]] bool isAtSourceEnd() const noexcept {
@@ -1591,10 +1908,7 @@ struct Parser::Impl {
             // inside this one consumed. A depth-proportional ALLOWANCE was
             // tried and ✔MEASURED WRONG in both directions; the record is
             // in `exceededBudget`.
-            , budget_(impl.walker.lookahead() > 0
-                          ? static_cast<std::size_t>(impl.walker.lookahead())
-                                * impl.config.speculationBudgetFactor
-                          : 4u * impl.config.speculationBudgetFactor)
+            , budget_(impl.probeBudgetNow_())
             // The enclosing live probe, captured BEFORE the ctor body
             // publishes this one as the innermost. Null at the outermost.
             , parent_(impl.innermostProbe_)
@@ -1617,7 +1931,17 @@ struct Parser::Impl {
             // record bindings; the type-name triage records
             // candidates). A rolled-back probe must leak neither —
             // same discipline as diagsEmitted / stepRecovered_.
-            , sketchSnap_(impl.sketch.snapshot()) {
+            , sketchSnap_(impl.sketch.snapshot())
+            // P69 L2: what the failed-probe memo asks of this probe when it fails.
+            , sketchLookupsBefore_(impl.sketchLookups_)
+            , ceilingLatchesBefore_(impl.ceilingLatches_)
+            , sketchVersionBefore_(impl.sketch.version())
+            // P69 L2a (lane `lm`): the room it starts with and the peaks it measures against.
+            , speculationDepthBefore_(impl.speculationDepth)
+            , peakSpeculationBefore_(impl.peakSpeculationAttempt_)
+            , peakExpressionBefore_(impl.peakExpressionAttempt_) {
+            impl_.peakSpeculationAttempt_ = impl_.speculationDepth;
+            impl_.peakExpressionAttempt_  = impl_.expressionDepth;
             ++impl_.speculationDepth;
             impl_.innermostProbe_ = this;
         }
@@ -1695,6 +2019,15 @@ struct Parser::Impl {
                 parent_->nestedAdvance_ +=
                     impl_.tokens.position() - probeStartPos_;
             }
+            // P69 L2a (lane `lm`): the parent's first ceiling hit is its own or, when it has none,
+            // this probe's; and what this probe attempted is what its parent attempted too.
+            if (parent_ != nullptr && !parent_->firstCeilingHit_.has_value()
+                && firstCeilingHit_.has_value())
+                parent_->firstCeilingHit_ = std::move(firstCeilingHit_);
+            impl_.peakSpeculationAttempt_ =
+                std::max(peakSpeculationBefore_, impl_.peakSpeculationAttempt_);
+            impl_.peakExpressionAttempt_ =
+                std::max(peakExpressionBefore_, impl_.peakExpressionAttempt_);
             --impl_.speculationDepth;
         }
 
@@ -1712,6 +2045,44 @@ struct Parser::Impl {
 
         [[nodiscard]] bool isDesynced() const noexcept {
             return impl_.walker.isDesynced() && !desyncedBefore_;
+        }
+
+        // P69 L2 (`failedProbes_`): this probe, failing now, met no ceiling (nor did
+        // any probe nested in it), so its failure is the tokens' and the sketch's;
+        // and whether it asked the sketch at all — if not, the tokens' alone.
+        [[nodiscard]] bool metNoCeiling() const noexcept {
+            return impl_.ceilingLatches_ == ceilingLatchesBefore_;
+        }
+        [[nodiscard]] bool askedTheSketch() const noexcept {
+            return impl_.sketchLookups_ != sketchLookupsBefore_;
+        }
+        [[nodiscard]] bool desyncedBefore() const noexcept { return desyncedBefore_; }
+        // P69 L2a (lane `lm`): what a failure records — its first ceiling hit, the room it
+        // started with and the room it used.
+        [[nodiscard]] bool hasFirstCeilingHit() const noexcept {
+            return firstCeilingHit_.has_value();
+        }
+        void noteFirstCeilingHit(SpeculationCapHit hit) { firstCeilingHit_ = std::move(hit); }
+        [[nodiscard]] std::optional<SpeculationCapHit> const& firstCeilingHit() const noexcept {
+            return firstCeilingHit_;
+        }
+        [[nodiscard]] std::size_t speculationDepthBefore() const noexcept {
+            return speculationDepthBefore_;
+        }
+        [[nodiscard]] std::size_t expressionDepthBefore() const noexcept {
+            return expressionDepthBefore_;
+        }
+        [[nodiscard]] std::size_t relSpeculationPeak() const noexcept {
+            return impl_.peakSpeculationAttempt_ - speculationDepthBefore_;
+        }
+        [[nodiscard]] std::size_t relExpressionPeak() const noexcept {
+            return impl_.peakExpressionAttempt_ > expressionDepthBefore_
+                       ? impl_.peakExpressionAttempt_ - expressionDepthBefore_
+                       : 0;
+        }
+        [[nodiscard]] std::size_t peakCharge() const noexcept { return peakCharge_; }
+        [[nodiscard]] std::uint64_t sketchVersionBefore() const noexcept {
+            return sketchVersionBefore_;
         }
 
         // ★★★ THE BUDGET IS CHARGED AT THIS PROBE'S OWN NESTING LEVEL — AND
@@ -1790,7 +2161,9 @@ struct Parser::Impl {
                       "more nested token advance than it spans — a nested "
                       "probe reported an advance outside its parent's span");
             }
-            return span - nestedAdvance_ > budget_;
+            const std::size_t charge = span - nestedAdvance_;
+            if (charge > peakCharge_) peakCharge_ = charge;   // P69 L2a: the room it used
+            return charge > budget_;
         }
 
         // The token budget this probe was given, for the fail-loud
@@ -1817,9 +2190,21 @@ struct Parser::Impl {
         // and a refuted branch went on parsing — recovering, panic-scanning
         // and re-scanning — to the end of its rule, with every token of it
         // discarded by the rollback that was already certain. See the driver.
+        // ★ P69 L2: and a branch the type-name triage has already refused — at its
+        // base (`askTriageBaseEarly_`) or when its operand opens
+        // (`askTriageAtTheOperand_`); its close would refuse it the same way.
         [[nodiscard]] bool isRefuted() const noexcept {
-            return emittedDiag() || isDesynced();
+            return emittedDiag() || isDesynced() || refutedByTheTriage_;
         }
+
+        // P69 L2: the triage's base is asked once per probe, at its type child's
+        // first frame (`askTriageBaseEarly_`), and the triage once more when the
+        // operand after it opens (`askTriageAtTheOperand_`); a rollback refutes.
+        [[nodiscard]] bool baseAsked() const noexcept { return baseAsked_; }
+        void markBaseAsked() noexcept { baseAsked_ = true; }
+        [[nodiscard]] bool operandAsked() const noexcept { return operandAsked_; }
+        void markOperandAsked() noexcept { operandAsked_ = true; }
+        void refuteByTheTriage() noexcept { refutedByTheTriage_ = true; }
 
         // Commit the probe. After this the dtor is a no-op (beyond
         // the speculation-depth decrement) and the four-machine
@@ -1879,6 +2264,18 @@ struct Parser::Impl {
         std::size_t                            lastDepthBefore_;
         bool                                   firstIterationBefore_;
         BinderSketch::Snapshot                 sketchSnap_;
+        std::uint64_t                          sketchLookupsBefore_;
+        std::uint64_t                          ceilingLatchesBefore_;
+        std::uint64_t                          sketchVersionBefore_;
+        // P69 L2a (lane `lm`): see `recordedFailure_` / `CeilingRefutedKey`.
+        std::size_t                            speculationDepthBefore_;
+        std::size_t                            peakSpeculationBefore_;
+        std::size_t                            peakExpressionBefore_;
+        mutable std::size_t                    peakCharge_ = 0;
+        std::optional<SpeculationCapHit>       firstCeilingHit_;
+        bool                                   baseAsked_          = false;
+        bool                                   operandAsked_       = false;
+        bool                                   refutedByTheTriage_ = false;
         bool                                   committed_ = false;
     };
 
@@ -1888,6 +2285,7 @@ struct Parser::Impl {
     // stack so recovery code can walk the rule chain.
     void openExprFrame(RuleId rule) {
         pushFrameBookkeeping_(builder->open(rule), rule);
+        askTriageBaseEarly_(rule);
     }
 
     // Left-recursive wrap: open `rule` as a new frame that adopts the
@@ -2016,6 +2414,7 @@ struct Parser::Impl {
     [[nodiscard]] bool startNextCandidate_(SpeculationSite& site) {
         while (site.next < site.candidates.size()) {
             const RuleId branch = site.candidates[site.next++];
+            if (speculationDepth > peakSpeculationAttempt_) peakSpeculationAttempt_ = speculationDepth;
             if (speculationDepth >= config.maxSpeculationDepth) {
                 // LATCH, do not emit. Emitting here would land the
                 // diagnostic inside the ENCLOSING probe, which erases it on
@@ -2028,6 +2427,20 @@ struct Parser::Impl {
                 // that describes where the nesting actually ran out.
                 latchSpeculationCeiling_(SpeculationCeiling::Depth,
                                          config.maxSpeculationDepth);
+                continue;
+            }
+            // P69 L2 (`failedProbes_`): this rule failed at this token, by the tokens
+            // alone or under the sketch as it is now — it fails again: its handed-out
+            // type-name candidate is recorded again, and the site moves on exactly as
+            // after an abandoned probe (`abandonAndAdvance_`): the final candidate's
+            // direct descent, else the next candidate.
+            // P69 L2a (lane `lm`): or met a ceiling under exactly this room — it is refuted by it
+            // again (the hit replayed); and a failure that met none answers only where the room it
+            // used is left (`recordedFailure_`).
+            if (std::optional<RecordedFailure> const rec = recordedFailure_(branch)) {
+                if (rec->hit.has_value()) replayCeilingHit_(*rec->hit);
+                if (rec->candidate.has_value()) sketch.recordCandidate(*rec->candidate);
+                if (finalCandidateDirectDescent_()) return true;
                 continue;
             }
             site.branch      = branch;
@@ -2061,6 +2474,30 @@ struct Parser::Impl {
     // is recorded into the RESTORED sketch — the order the recursive form
     // kept by recording after its probe went out of scope.
     void abandonCandidate_(SpeculationSite& site) {
+        // P69 L2: a failure that met no ceiling is recorded (`failedProbes_`) — under
+        // any sketch when it asked the sketch nothing, else under its sketch version.
+        // P69 L2a (lane `lm`): with the room it used; and a failure that met a ceiling is recorded
+        // under the exact room it started with, with the first ceiling hit it met.
+        if (site.probe) {
+            FailedProbeKey const key{site.branch.v, site.probe->startPos(),
+                                     site.probe->desyncedBefore(),
+                                     site.probe->askedTheSketch()
+                                         ? site.probe->sketchVersionBefore()
+                                         : kAnySketchVersion};
+            if (site.probe->metNoCeiling()) {
+                failedProbes_.insert_or_assign(
+                    key, FailedProbe{site.rolledBackCandidate, site.probe->relSpeculationPeak(),
+                                     site.probe->relExpressionPeak(),
+                                     site.probe->peakCharge()});
+            } else if (site.probe->firstCeilingHit().has_value()) {
+                ceilingRefuted_.insert_or_assign(
+                    CeilingRefutedKey{key, site.probe->speculationDepthBefore(),
+                                      site.probe->expressionDepthBefore(),
+                                      site.probe->budget()},
+                    CeilingRefutation{site.rolledBackCandidate,
+                                      *site.probe->firstCeilingHit()});
+            }
+        }
         site.probe.reset();
         if (site.rolledBackCandidate.has_value()) {
             sketch.recordCandidate(std::move(*site.rolledBackCandidate));
@@ -2586,10 +3023,6 @@ struct Parser::Impl {
                 builder->pushToken(tok);
                 walker.advance(advanceKind, tok.span,
                                std::optional<RuleId>{builder->currentRule()});
-                // D-CSUBSET-SELF-REFERENTIAL-STRUCT (P0009): if this token was the
-                // TAG of a composite specifier body, bind it as a TYPE NOW so a
-                // self-referential member later in the body triages as a decl.
-                recordCompositeTagIfApplicable_(advanceKind);
                 return StepOutcome::Continue;
             }
 
@@ -2612,6 +3045,9 @@ struct Parser::Impl {
             const bool tokInFirst = schema->firstSetContains(nextRule, tokKind);
 
             if (tokInFirst) {
+                // P69 L2: a speculated branch's operand opening — the type-name
+                // triage may refute the branch now (`askTriageAtTheOperand_`).
+                askTriageAtTheOperand_(nextRule, tokKind);
                 // `expr`-shape rules hand off to the Pratt walker
                 // instead of the schema-driven RuleLeaf descent. The
                 // walker opens its own `exprRule` frame plus any
@@ -3114,6 +3550,7 @@ void pumpTrivia(Parser::Impl& I) {
 // guarded callee returned immediately and the caller ran `closeFrameOnce`).
 [[nodiscard]] bool pushExprFrame(Parser::Impl& I, PrattRules const& rules,
                                  std::int32_t minPrec) {
+    if (I.expressionDepth > I.peakExpressionAttempt_) I.peakExpressionAttempt_ = I.expressionDepth;
     if (I.expressionDepth >= I.config.maxExpressionDepth) {
         I.recoverExpressionTooDeep_(I.tokens.peek());
         return false;

@@ -1,0 +1,1 @@
+        return evalCstConstInt(exprChild, std::nullopt);

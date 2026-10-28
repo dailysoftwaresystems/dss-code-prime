@@ -1,0 +1,1 @@
+                    enter(valueN);          // lower the value — may invalidate `f`

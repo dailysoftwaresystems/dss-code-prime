@@ -15,12 +15,15 @@
 // Three tiers read the same levels to the same value — the lowering
 // (`lowerScalarBraceInit`), the semantic tier's element walks (`forEachPlacedBraceValue`: the
 // element judge and the static-initializer check) and the constant evaluator
-// (`valueStepChild`) — and each has its cases here.
+// (`scalarInitializerValue`, taken only where a SCALAR is read — an aggregate read whole is no
+// constant, and an empty list is the zero) — and each has its cases here.
 //
 // THE MUTATIONS are arms of `dssharness check-mutations` (tests/mutations/arms.registry),
 // written, not read: the lowering's step through a level, its excess rule, the semantic
-// walk's step through a level, its excess skip, its designator refusal, and the evaluator's
-// first element. The runnable half is examples/c/scalar_brace_initializer_takes_its_first_value.
+// walk's step through a level, its excess skip, its designator refusal, the evaluator's first
+// element, its empty level and its refusal of an aggregate read whole. The runnable halves are
+// examples/c/scalar_brace_initializer_takes_its_first_value and
+// examples/c/constant_condition_has_its_c_type.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
@@ -248,6 +251,75 @@ TEST(ScalarBraceInitializer, TheConstantIsTheFirstValueInEveryTier) {
             if (d.code == DiagnosticCode::S_StaticAssertFailed) ++failed;
         EXPECT_EQ(failed, 1u) << init << ": the assertion must be folded, and fail"
                               << dump(no.diagnostics());
+    }
+}
+
+// THE EMPTY LIST OF A SCALAR IS ITS ZERO, at any level (C23 6.7.10p11: an empty initializer
+// initializes a scalar as an object of static storage — to zero), in the constant as in the
+// lowering (P69 L2, lane `lm`, the review of checkpoint 29, MINOR 5). ✔MEASURED 2026-10-20 on
+// checkpoint 29's bytes: `constexpr int k = {}; _Static_assert(k == 0, "")` was "not an
+// integer constant expression", `{{}}` S_ConstexprNonConstantInitializer, and `static const
+// int c = {}; int a[c + 1];` S_NonConstantArrayLength — gcc 13.3.0 -std=c2x folds `k` (and
+// `{{}}` with a braces warning), clang 18.1.3 folds `c` in the bound and the assertion.
+TEST(ScalarBraceInitializer, TheEmptyListOfAScalarIsItsZeroInEveryTier) {
+    for (char const* init : {"{}", "{{}}"}) {
+        std::string const decl = std::string{"static const int c = "} + init + ";\n";
+        // The bound folds: a file-scope array whose bound is no constant is refused
+        // (S_NonConstantArrayLength, checkpoint 29's reading of `{}` here).
+        SemanticModel const ok = analyzeUnder(
+            shippedC(), decl + "_Static_assert(c == 0, \"zero\");\nint a[c + 1];\n"
+                               "int main(void) { return c; }\n");
+        EXPECT_FALSE(ok.hasErrors()) << init << ": the empty list is the scalar's zero"
+                                     << dump(ok.diagnostics());
+        SemanticModel const cx = analyzeUnder(
+            shippedC(), std::string{"int main(void) {\n    constexpr int k = "} + init +
+                            ";\n    _Static_assert(k == 0, \"zero\");\n    return k;\n}\n");
+        EXPECT_FALSE(cx.hasErrors()) << "constexpr " << init << ": the empty list is the scalar's zero"
+                                     << dump(cx.diagnostics());
+        SemanticModel const no = analyzeUnder(
+            shippedC(), decl + "_Static_assert(c != 0, \"not zero\");\nint main(void) { return 0; }\n");
+        std::size_t failed = 0;
+        for (auto const& d : no.diagnostics().all())
+            if (d.code == DiagnosticCode::S_StaticAssertFailed) ++failed;
+        EXPECT_EQ(failed, 1u) << init << ": the assertion must be folded, and fail"
+                              << dump(no.diagnostics());
+    }
+}
+
+// AN AGGREGATE READ WHOLE IS NO SCALAR CONSTANT (P69 L2, lane `lm`, the review of checkpoint
+// 29, BLOCKER 2). The step through a brace list is the SCALAR's (C 6.7.9p11) — taken where a
+// scalar is read, never at an array or a structure: an array named constant read as a value
+// is its address (C 6.3.2.1p3), no integer constant, and `!z` is 0. The evaluator stepped
+// through ANY brace list, so a `const` array read whole folded to its first element:
+// ✔MEASURED 2026-10-20 on checkpoint 29's bytes (pe64 and ELF, both pipelines, images run):
+// `if (!z) return 1; return 2;` over `static const int z[2] = {0, 7}` (and `z[1] = {0}`, `z
+// == 0`, a structure array, an array of `const char *const`) DIED of an illegal instruction —
+// the fold marked `return 2` never reached — and `_Static_assert(!z, "")` was ACCEPTED, where
+// clang 18.1.3 and gcc 13.3.0 run 2 and refuse the assertion.
+TEST(ScalarBraceInitializer, AnAggregateReadWholeIsNoScalarConstant) {
+    char const* const decls[] = {
+        "static const int z[2] = {0, 7};\n",
+        "static const int z[1] = {0};\n",
+        "struct P { int x, y; };\nstatic const struct P z[2] = {{0, 1}, {2, 3}};\n",
+        "static const char *const z[] = {0, \"a\"};\n",
+    };
+    for (char const* decl : decls) {
+        for (char const* cond : {"!z", "z == 0"}) {
+            auto const l = lowerUnder(shippedC(), std::string{decl} + "int f(void) {\n    if (" + cond +
+                                                      ") return 1;\n    return 2;\n}\n");
+            ASSERT_NE(l->result, nullptr) << decl << cond;
+            EXPECT_TRUE(l->result->ok) << decl << cond << dump(l->reporter);
+            EXPECT_EQ(countKind(l->result->hir, HirKind::Unreachable), 0u)
+                << decl << cond << ": the condition is no constant; nothing may be marked never reached";
+        }
+        SemanticModel const sa = analyzeUnder(
+            shippedC(), std::string{decl} + "int main(void) {\n    _Static_assert(!z, \"z\");\n"
+                                            "    return 0;\n}\n");
+        std::size_t refused = 0;
+        for (auto const& d : sa.diagnostics().all())
+            if (d.severity == DiagnosticSeverity::Error) ++refused;
+        EXPECT_EQ(refused, 1u) << decl << ": `!z` is no integer constant expression"
+                               << dump(sa.diagnostics());
     }
 }
 

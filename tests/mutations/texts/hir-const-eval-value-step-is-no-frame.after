@@ -1,1 +1,0 @@
-            if (NodeId const value = NodeId{}; value.valid()) {

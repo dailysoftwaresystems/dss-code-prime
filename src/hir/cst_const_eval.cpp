@@ -1,5 +1,6 @@
 #include "hir/cst_const_eval.hpp"
 
+#include "core/substrate/walk_steps.hpp"
 #include "core/types/char_decode.hpp"         // FC17 F2: shared narrow char-literal decode
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren (shared specifier-prefix strip)
 #include "core/types/declarator_walk.hpp"     // FC4: collectDeclarators / declaratorNameNode
@@ -96,18 +97,57 @@ visibleChildren(Tree const& tree, NodeId parent) {
 // `hir/const_eval_operators.hpp` (see opFromName note above). Reachable here as
 // `dss::opEntryFor` (unqualified).
 
-// Forward decl: the public entry `evaluateConstantCst` drives an explicit heap
-// work-stack (plan 24 Stage 6 — D-PARSE-DEEP-NEST-RECURSION-MEMORY). The per-
-// node body (`evalNode` below) re-enters it for the children of every DELEGATED
-// arm, so a deeply-nested sub-expression inside a shallow complex arm still
-// flattens.
-[[nodiscard]] ConstEvalResult
-evalImpl(NodeId                              expr,
-         CstEvalContext const&               ctx,
-         CstEvalEnvironment const&           env,
-         EvalOptions const&                  options,
-         std::uint32_t                       currentScopeOpaque,
-         std::unordered_set<std::uint32_t> & visitedInitNodes);
+// ── THE ONE DRIVER, AND WHAT AN ARM ASKS IT FOR ──────────────────────────────────────
+// The public entry `evaluateConstantCst` drives an explicit heap work-stack (plan 24 Stage 6 —
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY): `evalImpl` below, entered ONCE per evaluation. An arm of
+// the per-node body (`evalNode`) that needs a child's value does not fold it: it fills a FRAME —
+// which child, in which scope, and what its value becomes — which the driver pushes, folding
+// the child as a frame of its own and then running the frame's epilogue. So the nesting of ANY
+// arm costs heap, never a host frame.
+// ★ P69 L2 (lane `lm`, D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL): the
+// conditional and the logical operators, a cast, a compile-time selection, a builtin call's
+// operands, a member access's base, `&`, a named constant's initializer and a constant
+// subobject's were DELEGATED arms that folded their children by RE-ENTERING the driver — a
+// fresh driver and two host frames per level (the row holds the measurement).
+//
+// A frame's fields, by kind (`phase` counts the children already asked for; the last phase pops
+// and delivers into the driver's `result`; `scope` is the scope the node folds in):
+//   PassThrough  `node` IS the child to fold (a wrapper's, a value step's, a selection's arm);
+//   Unary        `child` the operand, `entry` the operator;
+//   Binary       `child` and `second` the operands, `entry` the operator;
+//   Conditional  `child` the condition, then the SELECTED arm; `second` the then-arm, then the
+//                UNSELECTED one; `third` the else-arm; `c0` the selected arm's value; `target`
+//                the tier's type of the conditional (`balanceConditionalArm`, C 6.5.15p5);
+//   Logical      `child` and `second` the operands, `isAnd`;
+//   Convert      `child` a cast's operand, `target` the cast's type;
+//   Ref          `child` a named constant's initializer value, folded in `childScope`;
+//                `initKey` its entry in the cycle set; `target` the declared type;
+//   Subobject    as Ref, and `bitField` a bit-field member read at its width;
+//   Member       `child` the base, `second` the member's name token;
+//   AddressOf    `child` the operand;
+//   Builtin      `call` the call, its operands folded one by one into `values` and `cores`.
+struct CstFoldFrame {
+    enum class Kind : std::uint8_t {
+        PassThrough, Unary, Binary, Conditional, Logical, Convert, Ref, Subobject, Member,
+        AddressOf, Builtin
+    } kind;
+    NodeId                         node;
+    std::uint32_t                  phase = 0;
+    HirOperatorEntry const*        entry = nullptr;   // loaded config: stable for the call
+    ConstEvalResult                c0{};
+    std::uint32_t                  scope = 0;
+    NodeId                         child{};
+    NodeId                         second{};
+    NodeId                         third{};
+    std::uint32_t                  childScope = 0;
+    std::uint32_t                  initKey = 0;
+    bool                           isAnd = false;
+    std::optional<CstCastTarget>   target{};
+    std::optional<CstBitFieldRead> bitField{};
+    std::optional<CstBuiltinCall>  call{};
+    std::vector<HirLiteralValue>   values{};
+    std::vector<TypeKind>          cores{};
+};
 
 // ── Plan 24 Stage 6 — straight-line CST const-fold epilogues ───────────────
 // Each `combine*` is the BYTE-IDENTICAL slice of a flattened arm AFTER its
@@ -153,8 +193,10 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
         if (!options.allowFloat) {
             return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         }
+        // The kernel states the result's C type and rounds the value to it — the core the
+        // balance of a conditional reads (`balanceConditionalArm`).
         ConstEvalFailure why = ConstEvalFailure::None;
-        if (auto folded = applyBinaryFloat(*opK, *a.value, *b.value, why);
+        if (auto folded = applyBinaryFloat(*opK, *a.value, *b.value, options.charIsUnsigned, why);
             folded.has_value()) {
             return ok(std::move(*folded));
         }
@@ -392,52 +434,24 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
     return NodeId{};
 }
 
-// THE VALUE STEPS A DESCENT THAT ASKS A VALUE TAKES BY NAME (P69, lane `lm`):
-//   * a statement expression of ONE item that is an expression statement has that
-//     expression's value (`soleExpressionOfStatementExpression`, the one place that says
-//     so); a body ending in anything else has no value, and is no constant;
-//   * a brace list led by an UNDESIGNATED element has that element's value — the
-//     initializer of a scalar, "optionally enclosed in braces" (C 6.7.9p11): the form a
-//     named constant's initializer `constexpr int c = { 5 };` is read in. An element after
-//     the first is EXCESS (C 6.7.9p2's constraint): the lowering warns and drops it
-//     unevaluated, and the scalar holds the first — so the constant is the first too
-//     (P69, lane `lm`, the scalar brace closure: ✔MEASURED 2026-10-16, clang 18.1.3 folds
-//     `static const int c = {5, 7};` and `{{5}, 7}` to 5 in `_Static_assert` and an array
-//     bound, gcc 13.3.0 `constexpr int c = {5, 7};`). An empty list or one led by a
-//     designator takes no step: no constant.
+// THE VALUE STEP A DESCENT THAT ASKS A VALUE TAKES BY NAME (P69, lane `lm`): a statement
+// expression of ONE item that is an expression statement has that expression's value
+// (`soleExpressionOfStatementExpression`, the one place that says so); a body ending in
+// anything else has no value, and is no constant.
+// ★ A BRACE LIST IS NO STEP OF THIS ONE (P69 L2, the review of checkpoint 29, BLOCKER 2):
+// its first element is a SCALAR's value only where a scalar is read — a reader that knows it
+// takes that step (`scalarInitializerValue`) — and stepped here, at ANY brace list, it made
+// an array named constant read whole its first element. A brace list the evaluator meets on
+// its own is no constant (`evalNode`'s tail).
 // The node to step to, or an invalid node. ★ THE DRIVER TAKES THE STEP AS A FRAME (the
-// review's E): the fold that named these steps took them in `evalNode`'s tail, one fresh
-// driver and two host frames per level, so `({ ({ … ({ 0; }) … }); })` or
-// `{{ … { 5 } … }}` nested as deep as the parser admits recursed on the host stack where
-// the peel by count it replaced had been a frame. Shared by the driver and `evalNode`'s
-// tail, so the two never take different steps.
+// review's E): the fold that named this step took it in `evalNode`'s tail, one fresh driver
+// and two host frames per level, so `({ ({ … ({ 0; }) … }); })` nested as deep as the parser
+// admits recursed on the host stack where the peel by count it replaced had been a frame.
+// Shared by the driver and `evalNode`'s tail, so the two never take different steps.
 [[nodiscard]] NodeId
-valueStepChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
-               std::vector<NodeId> const& kids) {
+valueStepChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr) {
     if (!expr.valid() || tree.kind(expr) != NodeKind::Internal) return NodeId{};
-    if (NodeId const value = soleExpressionOfStatementExpression(cfg, tree, expr);
-        value.valid()) {
-        return value;
-    }
-    if (!cfg.braceInitListRule.valid() || tree.rule(expr).v != cfg.braceInitListRule.v) {
-        return NodeId{};
-    }
-    NodeId element{};
-    for (NodeId c : kids) {
-        if (tree.kind(c) != NodeKind::Internal) continue;
-        element = c;   // the first element; any after it is excess
-        break;
-    }
-    if (!element.valid()) return NodeId{};
-    NodeId value{};
-    std::size_t parts = 0;
-    for (NodeId c : visibleChildren(tree, element)) {
-        if (tree.kind(c) != NodeKind::Internal) continue;
-        ++parts;
-        value = c;
-    }
-    // A designated element has two parts: the designation and the value.
-    return parts == 1 ? value : NodeId{};
+    return soleExpressionOfStatementExpression(cfg, tree, expr);
 }
 
 // ── A BIT-FIELD MEMBER IS READ AT ITS WIDTH ───────────────────────────────────────────
@@ -588,13 +602,15 @@ convertToCastTarget(ConstEvalResult const& inner, CstCastTarget const& target,
         } else if (isFloatValue(*inner.value)) {
             src = *detail::asDouble(*inner.value);
         } else {
-            // Int → Float, through the SHARED widening verb, which reads the
-            // source's signedness off its CORE. Neither obvious bridge works
-            // here: `asIntBits` is an int64 REINTERPRETATION and would fold
-            // `(double)18446744073709551615ULL` to -1.0, while `asInt64`
-            // refuses the value outright — and all four references fold it to
-            // 2^64 (✔MEASURED).
-            auto const iv = detail::integerConstantAsDouble(*inner.value, options.charIsUnsigned);
+            // Int → Float, through the SHARED verb, which reads the source's
+            // signedness off its CORE and rounds ONCE, to the target's own
+            // precision. Neither obvious bridge works here: `asIntBits` is an
+            // int64 REINTERPRETATION and would fold `(double)18446744073709551615ULL`
+            // to -1.0, while `asInt64` refuses the value outright — and all four
+            // references fold it to 2^64 (✔MEASURED). Nor a `double` first: that is
+            // two roundings (`integerConstantAsFloatKind` says what they cost).
+            auto const iv = detail::integerConstantAsFloatKind(*inner.value, toK,
+                                                               options.charIsUnsigned);
             if (!iv.has_value()) {
                 return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
             }
@@ -1041,25 +1057,22 @@ failOnDivergentConditionalType(Tree const& tree, NodeId conditional,
 }
 
 // The selected arm `arm` (folded, a bit-field's value already promoted) of the conditional
-// `conditional`, converted to the conditional's type; `other` is the unselected arm.
+// `conditional`, converted to the conditional's type. `tierType` is the tier's type of the
+// conditional, asked before the unselected arm folds (a pointer conditional's — handed on as it
+// is — folds no other arm); `other` is the unselected arm and `otherValue` its fold, a
+// bit-field's value promoted. The DRIVER folds that arm, as a frame of its own (P69 L2: this
+// function folded it by re-entering the driver, a host frame per nested level).
 [[nodiscard]] ConstEvalResult
-balanceConditionalArm(NodeId conditional, NodeId other, ConstEvalResult arm,
+balanceConditionalArm(NodeId conditional, NodeId other, ConstEvalResult const& otherValue,
+                      ConstEvalResult arm, std::optional<CstCastTarget> const& tierType,
                       CstEvalContext const& ctx, CstEvalEnvironment const& env,
-                      EvalOptions const& options, std::uint32_t scopeOpaque,
-                      std::unordered_set<std::uint32_t>& visitedInitNodes) {
-    std::optional<CstCastTarget> const tierType =
-        env.resolveExpressionType ? env.resolveExpressionType(conditional, scopeOpaque)
-                                  : std::nullopt;
-    if (tierType.has_value() && tierType->isPointer) return arm;   // a pointer conditional
+                      EvalOptions const& options, std::uint32_t scopeOpaque) {
     bool const armIsAddress = asAddress(*arm.value) != nullptr;
     // nullopt for an address, and for a `char` of unknown sign (then no balance: refused)
     std::optional<CstArithmeticType> const armType = arithmeticTypeOfValue(*arm.value, options);
     // The unselected arm's type: its folded value's, else the tier's type of it.
     std::optional<CstArithmeticType> otherType;
     bool otherIsAddress = false;
-    ConstEvalResult const otherValue = asBitFieldOperand(
-        other, evalImpl(other, ctx, env, options, scopeOpaque, visitedInitNodes), env, options,
-        scopeOpaque);
     if (otherValue.value.has_value()) {
         otherIsAddress = asAddress(*otherValue.value) != nullptr;
         if (!otherIsAddress) otherType = arithmeticTypeOfValue(*otherValue.value, options);
@@ -1084,6 +1097,41 @@ balanceConditionalArm(NodeId conditional, NodeId other, ConstEvalResult arm,
     return convertToCastTarget(arm, *balanced, options, conditional);
 }
 
+// What `evalNode` returns when it fills a frame instead of folding: the driver reads the frame
+// (`request.node` valid) and never this value.
+[[nodiscard]] ConstEvalResult suspended(NodeId expr) {
+    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+}
+
+// The core a builtin call's operand or result is folded at, by the type the call converts it to.
+[[nodiscard]] TypeKind builtinOperandCore(CstCastTarget const& t) {
+    if (t.isBool) return TypeKind::Bool;
+    if (t.isInteger && t.intBits >= 8)
+        return detail::intKindFromWidth(static_cast<std::uint32_t>(t.intBits), t.intSigned);
+    if (t.isPointer) return TypeKind::Ptr;
+    if (t.floatKind.has_value()) return *t.floatKind;
+    return TypeKind::Void;
+}
+
+// The epilogue of a member access in an address fold (`((T*)0)->M`): the base, folded, is an
+// address; the field's byte offset (`resolveFieldOffset`) is added — the ADDRESS of the member.
+[[nodiscard]] ConstEvalResult
+memberAddressCst(NodeId expr, NodeId fieldTok, ConstEvalResult base,
+                 CstEvalEnvironment const& env) {
+    if (!base.value.has_value()) return base;
+    auto const* a = asAddress(*base.value);
+    if (a == nullptr) {
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    }
+    auto const fr = env.resolveFieldOffset(a->pointeeType, fieldTok);
+    if (!fr.has_value()) {
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    }
+    return ok(makeAddress(HirAddressValue{
+        a->base, a->byteOffset + static_cast<std::int64_t>(fr->offset),
+        fr->fieldType}));
+}
+
 // Internal per-node fold body. `visitedInitNodes` carries the per-call
 // cycle-detection set, keyed on the RESOLVED init-expression NodeId
 // (NOT on identifier text — text-keyed detection produces
@@ -1094,21 +1142,20 @@ balanceConditionalArm(NodeId conditional, NodeId other, ConstEvalResult arm,
 // declaration has its own init NodeId.).
 //
 // Plan 24 Stage 6: the deep STRAIGHT-LINE arms (plain BinaryOp, unary, and the
-// transparent WRAPPER/paren descent) are flattened onto the `evalImpl` work-
-// stack driver and reach their epilogue THERE; this handler keeps them as the
-// dead-via-driver recursive fallback (calling the SAME epilogues / peel helper).
-// DELEGATED here (re-entering the driver for their children): the token leaves
-// (integer / direct-value / init-resolver — the cycle-set Ref analog), sizeof,
-// LogicalAnd/Or short-circuit, and ternary. Output-identity holds because the
-// delegated arms keep their subtle evaluation-order / cycle-set / short-circuit
-// semantics verbatim; only their CHILDREN re-enter the driver.
+// transparent WRAPPER/paren descent) are taken by the driver's own plans first; reached here
+// anyway they ask for the same frames. EVERY arm with a child to fold asks the driver for it
+// through `request` (P69 L2: the frame kinds above) and returns `suspended`; an arm with no
+// child to fold (a leaf, sizeof, a folded constant, a builtin's compile-time answer) returns
+// its value and leaves `request.node` invalid. Output-identity holds because each arm's
+// evaluation order, cycle-set bracket, short-circuit and epilogue are the frame's, verbatim.
 [[nodiscard]] ConstEvalResult
 evalNode(NodeId                              expr,
          CstEvalContext const&               ctx,
          CstEvalEnvironment const&           env,
          EvalOptions const&                  options,
          std::uint32_t                       currentScopeOpaque,
-         std::unordered_set<std::uint32_t> & visitedInitNodes) {
+         std::unordered_set<std::uint32_t> & visitedInitNodes,
+         CstFoldFrame&                       request) {
     if (!expr.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     Tree const& tree = ctx.tree;
     HirLoweringConfig const& cfg = ctx.schema.hirLowering();
@@ -1298,14 +1345,32 @@ evalNode(NodeId                              expr,
             if (visitedInitNodes.contains(resolved->initExpr.v)) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
+            // ★ AN AGGREGATE READ WHOLE IS NO SCALAR CONSTANT, and a SCALAR's initializer is
+            // read through its braces (`scalarInitializerValue`; P69 L2, the review of
+            // checkpoint 29, BLOCKER 2 and MINOR 5). An array named constant read as a value
+            // is its address (C 6.3.2.1p3) — no integer constant — and a structure or a union
+            // has no value an operator takes; the declared type the resolver classified says
+            // which (`namedConstantRead`: nullopt for the three).
+            if (!resolved->declaredType.has_value()) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            CstScalarInitializer const scalar =
+                scalarInitializerValue(tree, ctx.schema, resolved->initExpr);
+            if (scalar.empty) {
+                HirLiteralValue zero;
+                zero.core  = TypeKind::I32;
+                zero.value = std::int64_t{0};
+                return convertToCastTarget(ok(std::move(zero)), *resolved->declaredType,
+                                           options, expr);
+            }
+            if (!scalar.value.valid()) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
             visitedInitNodes.insert(resolved->initExpr.v);
-            // Recurse with the SYMBOL's scope (resolved->initScopeOpaque),
-            // not the original use-site scope — closes D7 cross-scope
-            // shadowing.
-            ConstEvalResult inner = evalImpl(resolved->initExpr, ctx, env, options,
-                                             resolved->initScopeOpaque, visitedInitNodes);
-            visitedInitNodes.erase(resolved->initExpr.v);
-            if (!inner.value.has_value()) inner.blamedNode = HirNodeId{expr.v};
+            // The initializer folds in the SYMBOL's scope (resolved->initScopeOpaque), not
+            // the original use-site scope — closes D7 cross-scope shadowing — as a frame of
+            // the driver (`Kind::Ref`: it erases the cycle-set entry, blames this name for a
+            // failure, and converts the value to the declared type).
             // ★ P69 (lane `lm`, [[D-CSUBSET-CONST-REF-DECLARED-NARROWING]]): A NAMED
             // CONSTANT'S VALUE IS ITS INITIALIZER CONVERTED TO ITS DECLARED TYPE (C
             // 6.7.9p11) — by the ONE conversion the cast uses, as a constant's member
@@ -1316,10 +1381,12 @@ evalNode(NodeId                              expr,
             // `CstResolvedSymbol::declaredType` for the measurement). A wrong value
             // here was a wrong static assertion, and — since a condition this folds
             // can mark what follows a statement as never reached — deleted code.
-            if (resolved->declaredType.has_value() && inner.value.has_value()) {
-                return convertToCastTarget(inner, *resolved->declaredType, options, expr);
-            }
-            return inner;
+            request = CstFoldFrame{.kind = CstFoldFrame::Kind::Ref, .node = expr,
+                                   .child = scalar.value,
+                                   .childScope = resolved->initScopeOpaque,
+                                   .initKey = resolved->initExpr.v,
+                                   .target = resolved->declaredType};
+            return suspended(expr);
         }
         return fail(ConstEvalFailure::NotAConstantExpression, expr);
     }
@@ -1392,10 +1459,29 @@ evalNode(NodeId                              expr,
         if (!v.has_value()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
+        // ★ THE VALUE HAS ITS RULE'S TYPE, AS THE TYPER TYPES THE NODE (P69 L2, lane
+        // `lm`, the review of checkpoint 29, BLOCKER 1 and MAJOR 3): `__builtin_types_
+        // compatible_p` is an `int` (c.lang.json `typesCompatible`), `__builtin_offsetof` a
+        // `size_t`. Every such value was a 64-bit unsigned here, so `__builtin_types_
+        // compatible_p(int, long) - 1` was 2^64 - 1 and `1 ? __builtin_types_compatible_p(int,
+        // int) : 0` balanced to an unsigned 64-bit integer where the typer says `int` — which
+        // stopped the compiler. ✔MEASURED 2026-10-20 on checkpoint 29's bytes (pe64 and ELF,
+        // both pipelines): `if (__builtin_types_compatible_p(int, long) - 1 >= 0) return 1;
+        // return 2;` died of an illegal instruction (the fold marked `return 2` never
+        // reached) and `_Static_assert(... - 1 < 0, "")` failed, where clang 18.1.3 and gcc
+        // 13.3.0 run 2 and hold it. The resolver hands the bits; the TIER's type of the node
+        // states what they are. A tier that gives the node no type has no constant here —
+        // never a guessed width.
+        std::optional<CstCastTarget> const type =
+            env.resolveExpressionType ? env.resolveExpressionType(expr, currentScopeOpaque)
+                                      : std::nullopt;
+        if (!type.has_value() || !type->isInteger || type->intSignednessUnknown) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
         HirLiteralValue lit;
         lit.core  = TypeKind::U64;
         lit.value = *v;
-        return ok(std::move(lit));
+        return convertToCastTarget(ok(std::move(lit)), *type, options, expr);
     }
 
     // P31 / P49: a COMPILE-TIME SELECTION in a const-expr context —
@@ -1403,7 +1489,7 @@ evalNode(NodeId                              expr,
     // and C11/C23 6.5.1.1 `_Generic` (winner picked by the controlling
     // expression's TYPE). ONE arm for both, because what this engine does with a
     // selection does not depend on how the winner was chosen — the same reason
-    // the CST→HIR tier lowers both through one `lowerRecordedSelection`.
+    // the CST→HIR tier lowers both through one recorded-selection frame.
     //
     // The closure hands back the SELECTED arm and this engine then evaluates ONLY
     // that node, so the discarded arms are never visited at all. For
@@ -1429,8 +1515,8 @@ evalNode(NodeId                              expr,
         if (!arm.has_value() || !arm->valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        return evalImpl(*arm, ctx, env, options, currentScopeOpaque,
-                        visitedInitNodes);
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::PassThrough, .node = *arm};
+        return suspended(expr);
     }
 
     // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): a CAST in a const-expr.
@@ -1455,10 +1541,9 @@ evalNode(NodeId                              expr,
         if (!operandN.valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        ConstEvalResult inner =
-            evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        if (!inner.value.has_value()) return inner;
-        return convertToCastTarget(inner, *tgt, options, expr);
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::Convert, .node = expr,
+                               .child = operandN, .target = *tgt};
+        return suspended(expr);
     }
 
     // ★ P69 (lane `cs`, C23 6.6p6-p7): a CONSTANT SUBOBJECT — a compound literal constant
@@ -1505,15 +1590,25 @@ evalNode(NodeId                              expr,
             if (!init.valid() || visitedInitNodes.contains(init.v)) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
-            visitedInitNodes.insert(init.v);
-            ConstEvalResult inner = evalImpl(init, ctx, env, options,
-                                             sub->init.initScopeOpaque, visitedInitNodes);
-            visitedInitNodes.erase(init.v);
-            if (!inner.value.has_value()) {
-                inner.blamedNode = HirNodeId{expr.v};
-                return inner;
+            // A subobject read here is a SCALAR (its `type` a conversion): its initializer is
+            // read through its braces, an empty level its zero (`scalarInitializerValue`).
+            CstScalarInitializer const scalar = scalarInitializerValue(tree, ctx.schema, init);
+            if (scalar.empty) {
+                HirLiteralValue zero;
+                zero.core  = TypeKind::I32;
+                zero.value = std::int64_t{0};
+                return asRead(convertToCastTarget(ok(std::move(zero)), sub->type, options, expr));
             }
-            return asRead(convertToCastTarget(inner, sub->type, options, expr));
+            if (!scalar.value.valid()) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            visitedInitNodes.insert(init.v);
+            request = CstFoldFrame{.kind = CstFoldFrame::Kind::Subobject, .node = expr,
+                                   .child = scalar.value,
+                                   .childScope = sub->init.initScopeOpaque,
+                                   .initKey = init.v, .target = sub->type,
+                                   .bitField = sub->bitField};
+            return suspended(expr);
         }
         if (isCompoundLiteral) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     }
@@ -1532,16 +1627,7 @@ evalNode(NodeId                              expr,
     if (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v
         && env.resolveBuiltinCall) {
         if (std::optional<CstBuiltinCall> const bc = env.resolveBuiltinCall(expr)) {
-            auto const coreOf = [](CstCastTarget const& t) -> TypeKind {
-                if (t.isBool) return TypeKind::Bool;
-                if (t.isInteger && t.intBits >= 8)
-                    return detail::intKindFromWidth(static_cast<std::uint32_t>(t.intBits),
-                                                    t.intSigned);
-                if (t.isPointer) return TypeKind::Ptr;
-                if (t.floatKind.has_value()) return *t.floatKind;
-                return TypeKind::Void;
-            };
-            TypeKind const resultCore = coreOf(bc->resultType);
+            TypeKind const resultCore = builtinOperandCore(bc->resultType);
             if (bc->answer.has_value()) {
                 // A compile-time answer the tier computed (its operands are unevaluated):
                 // an integer, or a `_Bool` (the `_p` overflow predicates' result) — held in
@@ -1559,26 +1645,10 @@ evalNode(NodeId                              expr,
                     lit.value = *bc->answer;
                 return convertToCastTarget(ok(std::move(lit)), bc->resultType, options, expr);
             }
-            std::vector<HirLiteralValue> values;
-            std::vector<TypeKind>        cores;
-            values.reserve(bc->args.size());
-            cores.reserve(bc->args.size());
-            for (std::size_t i = 0; i < bc->args.size(); ++i) {
-                ConstEvalResult inner = evalImpl(bc->args[i], ctx, env, options,
-                                                 currentScopeOpaque, visitedInitNodes);
-                if (!inner.value.has_value()) return inner;
-                if (i < bc->argTypes.size() && bc->argTypes[i].has_value()) {
-                    inner = convertToCastTarget(inner, *bc->argTypes[i], options, bc->args[i]);
-                    if (!inner.value.has_value()) return inner;
-                    cores.push_back(coreOf(*bc->argTypes[i]));
-                } else {
-                    cores.push_back(inner.value->core);
-                }
-                values.push_back(std::move(*inner.value));
-            }
-            auto folded = foldBuiltinVerb(bc->verb, values, cores, resultCore);
-            if (!folded.has_value()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-            return convertToCastTarget(ok(std::move(*folded)), bc->resultType, options, expr);
+            // Its operands fold one by one, as frames of the driver (`Kind::Builtin`), each
+            // converted as the call converts it; `foldBuiltinVerb` computes the value.
+            request = CstFoldFrame{.kind = CstFoldFrame::Kind::Builtin, .node = expr, .call = *bc};
+            return suspended(expr);
         }
     }
 
@@ -1625,20 +1695,9 @@ evalNode(NodeId                              expr,
         if (!fieldTok.valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        ConstEvalResult base =
-            evalImpl(baseN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        if (!base.value.has_value()) return base;
-        auto const* a = asAddress(*base.value);
-        if (a == nullptr) {
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        }
-        auto const fr = env.resolveFieldOffset(a->pointeeType, fieldTok);
-        if (!fr.has_value()) {
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
-        }
-        return ok(makeAddress(HirAddressValue{
-            a->base, a->byteOffset + static_cast<std::int64_t>(fr->offset),
-            fr->fieldType}));
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::Member, .node = expr,
+                               .child = baseN, .second = fieldTok};
+        return suspended(expr);
     }
 
     // Binary expression: [lhs (internal), OP-token, rhs (internal)].
@@ -1662,37 +1721,20 @@ evalNode(NodeId                              expr,
         if (e->target == "Assign" || !e->compoundBase.empty()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        // LogicalAnd / LogicalOr: short-circuit; do NOT recurse into
-        // rhs until lhs's truthiness is known. Matches the HIR walker's
-        // C99 semantics exactly.
+        // LogicalAnd / LogicalOr: short-circuit — the right operand is not folded until the
+        // left one's truth is known (a frame of the driver, `Kind::Logical`). Matches the HIR
+        // walker's C99 semantics exactly.
         if (e->target == "LogicalAnd" || e->target == "LogicalOr") {
-            ConstEvalResult a = evalImpl(lhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-            if (!a.value.has_value()) return a;
-            auto aIsTrueOpt = asBool(*a.value, options.allowFloat);
-            if (!aIsTrueOpt.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            bool const aIsTrue = *aIsTrueOpt;
-            bool const isAnd = (e->target == "LogicalAnd");
-            bool const shortCircuits = isAnd ? !aIsTrue : aIsTrue;
-            if (shortCircuits) return ok(makeBoolLiteral(aIsTrue ? 1 : 0));
-            ConstEvalResult b = evalImpl(rhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-            if (!b.value.has_value()) return b;
-            auto bIsTrueOpt = asBool(*b.value, options.allowFloat);
-            if (!bIsTrueOpt.has_value()) {
-                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-            }
-            return ok(makeBoolLiteral(*bIsTrueOpt ? 1 : 0));
+            request = CstFoldFrame{.kind = CstFoldFrame::Kind::Logical, .node = expr,
+                                   .child = lhsN, .second = rhsN,
+                                   .isAnd = (e->target == "LogicalAnd")};
+            return suspended(expr);
         }
-        // Plain arithmetic / bitwise / comparison. DEAD-VIA-DRIVER fallback
-        // (the driver flattens this case): fold LHS then RHS (left-to-right)
-        // then route through the SHARED epilogue.
-        ConstEvalResult a = evalImpl(lhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        ConstEvalResult b = evalImpl(rhsN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        return combineBinaryCst(
-            expr, *e, options,
-            asBitFieldOperand(lhsN, std::move(a), env, options, currentScopeOpaque),
-            asBitFieldOperand(rhsN, std::move(b), env, options, currentScopeOpaque));
+        // Plain arithmetic / bitwise / comparison — DEAD-VIA-DRIVER (the driver's own plan
+        // takes the case first): the same frame.
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::Binary, .node = expr, .entry = e,
+                               .child = lhsN, .second = rhsN};
+        return suspended(expr);
     }
 
     // Unary expression: [OP-token, operand (internal)].
@@ -1717,22 +1759,18 @@ evalNode(NodeId                              expr,
         // offset). Pass the address through. A non-address operand (taking the
         // address of a plain value) is not const-foldable.
         if (e->target == "AddressOf") {
-            ConstEvalResult inner = evalImpl(operandN, ctx, env, options,
-                                             currentScopeOpaque, visitedInitNodes);
-            if (!inner.value.has_value()) return inner;
-            if (asAddress(*inner.value) != nullptr) return inner;
-            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            request = CstFoldFrame{.kind = CstFoldFrame::Kind::AddressOf, .node = expr,
+                                   .child = operandN};
+            return suspended(expr);
         }
         // Deref is not const-foldable.
         if (e->target == "Deref") {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        // DEAD-VIA-DRIVER fallback: fold the operand then route through the
-        // SHARED epilogue.
-        ConstEvalResult inner = evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        return combineUnaryCst(
-            expr, *e, options,
-            asBitFieldOperand(operandN, std::move(inner), env, options, currentScopeOpaque));
+        // DEAD-VIA-DRIVER (the driver's own plan takes the case first): the same frame.
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::Unary, .node = expr, .entry = e,
+                               .child = operandN};
+        return suspended(expr);
     }
 
     // Ternary expression: visible children [cond, '?', then, ':', else].
@@ -1747,22 +1785,13 @@ evalNode(NodeId                              expr,
         if (!condN.valid() || !thenN.valid() || !elseN.valid()) {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
-        ConstEvalResult cond = evalImpl(condN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
-        if (!cond.value.has_value()) return cond;
-        auto condTrueOpt = asBool(*cond.value, options.allowFloat);
-        if (!condTrueOpt.has_value()) {
-            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        }
-        // The selected arm, a bit-field's value promoted, at the conditional's type
+        // The condition, then the selected arm (a bit-field's value promoted), then — unless the
+        // conditional is a pointer's — the unselected one, each a frame of the driver
+        // (`Kind::Conditional`); the selected arm at the conditional's type
         // (`balanceConditionalArm`, C 6.5.15p5).
-        NodeId const selected = *condTrueOpt ? thenN : elseN;
-        NodeId const other    = *condTrueOpt ? elseN : thenN;
-        ConstEvalResult arm = asBitFieldOperand(
-            selected, evalImpl(selected, ctx, env, options, currentScopeOpaque, visitedInitNodes),
-            env, options, currentScopeOpaque);
-        if (!arm.value.has_value()) return arm;
-        return balanceConditionalArm(expr, other, std::move(arm), ctx, env, options,
-                                     currentScopeOpaque, visitedInitNodes);
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::Conditional, .node = expr,
+                               .child = condN, .second = thenN, .third = elseN};
+        return suspended(expr);
     }
 
     // FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert('a'==97)`
@@ -1881,14 +1910,16 @@ evalNode(NodeId                              expr,
         }
     }
 
-    // THE VALUE STEPS THE STATEMENT LEAVES TO A DESCENT THAT ASKS A VALUE, each by name
+    // THE VALUE STEP THE STATEMENT LEAVES TO A DESCENT THAT ASKS A VALUE, by name
     // (`valueStepChild`), before the wrapper rule below — which takes its steps by the
     // statement (`wrapperChild`). DEAD-VIA-DRIVER: the driver takes both as frames. Every
     // other node that says something itself and reached this tail has no arm above (a label
-    // address, a statement expression of anything else, a brace list that is empty or led by
-    // a designator): no constant.
-    if (NodeId const value = valueStepChild(tree, cfg, expr, kids); value.valid()) {
-        return evalImpl(value, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+    // address, a statement expression of anything else, a BRACE LIST — whose first element is
+    // a scalar's value only to a reader that knows it reads a scalar,
+    // `scalarInitializerValue`): no constant.
+    if (NodeId const value = valueStepChild(tree, cfg, expr); value.valid()) {
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::PassThrough, .node = value};
+        return suspended(expr);
     }
     if (tree.kind(expr) == NodeKind::Internal && cfg.braceInitListRule.valid()
         && tree.rule(expr).v == cfg.braceInitListRule.v) {
@@ -1900,156 +1931,361 @@ evalNode(NodeId                              expr,
     // integer-literal token or an identifier-Ref token: the Token-leaf branch above
     // dispatches it). The SAME decision the driver takes (`wrapperChild`).
     if (NodeId const child = wrapperChild(tree, cfg, expr, kids); child.valid()) {
-        return evalImpl(child, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::PassThrough, .node = child};
+        return suspended(expr);
     }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
 
 // ── Plan 24 Stage 6 — the iterative CST const-fold driver ──────────────────
-// A POD work-stack frame for ONE flattened straight-line arm. `phase`
-// 0 = enter the (last/only) child; Binary phase 1 = enter the second child
-// (after stashing the first folded result in `c0`); the final phase pops and
-// combines into `result`. PassThrough (wrapper/paren descent) and Unary are
-// single-child (phase 0 enters, phase 1 combines/forwards). `entry` points into
-// the loaded config (stable for the whole call) — safe to stash. Mirrors the
-// Stage-4 hir_to_mir `ValueFrame` idiom + realloc-safe rule (copy frame fields
-// to locals and advance `phase` BEFORE any `enter`; copy `result` out before
-// `pop_back`).
-struct CstFoldFrame {
-    enum class Kind : std::uint8_t { PassThrough, Unary, Binary } kind;
-    NodeId                  node;
-    std::uint8_t            phase;
-    HirOperatorEntry const* entry;  // Unary/Binary: resolved operator entry
-    ConstEvalResult         c0;     // Binary: the folded LHS (between phase 1 and 2)
-};
-
+// `enter` classifies a node: a plain binary, a unary, a value step or a wrapper is pushed as its
+// frame (the plan helpers gate on the exact conditions `evalNode`'s arms would); every other node
+// goes to `evalNode`, which folds it (a leaf, or an arm with no child to fold) or fills a frame
+// for the child it needs, pushed here (the frame kinds: `CstFoldFrame`). The loop runs each
+// frame's phase machine. The realloc-safe rule (the Stage-4 hir_to_mir `ValueFrame` idiom): copy
+// a frame's fields to locals and advance `phase` BEFORE any `enter`, which may grow `work` and
+// dangle `f`; copy `result` out before `pop_back`.
 [[nodiscard]] ConstEvalResult
 evalImpl(NodeId                              expr,
          CstEvalContext const&               ctx,
          CstEvalEnvironment const&           env,
          EvalOptions const&                  options,
-         std::uint32_t                       currentScopeOpaque,
+         std::uint32_t                       initialScopeOpaque,
          std::unordered_set<std::uint32_t> & visitedInitNodes) {
     Tree const&              tree = ctx.tree;
     HirLoweringConfig const& cfg  = ctx.schema.hirLowering();
 
     std::vector<CstFoldFrame> work;
-    // `enter` ALWAYS assigns `result` for a delegated node, and every pushed
-    // frame delivers into `result` before it is read (then popped), so this
-    // sentinel never leaks.
+    // `enter` ALWAYS assigns `result` for a node it folds, and every pushed frame delivers into
+    // `result` before it is read (then popped), so this sentinel never leaks.
     ConstEvalResult result = fail(ConstEvalFailure::NotAConstantExpression, expr);
+    // P69 L2 (lane `lm`): how many open frames fold something that is NOT the expression asked
+    // for as evaluated — a conditional's unselected arm (folded for its type alone) and another
+    // object's initializer (a `Ref` / `Subobject`, its own expression). An admitted form folded
+    // under one is not told to `env.noteConstantForm` (C 6.6p3 exempts an unevaluated
+    // subexpression; the initializer is diagnosed by its own rule). Frames finish LIFO, so the
+    // count is exact at every fold.
+    std::uint32_t notTheAskedExpression = 0;
 
-    // Classify `n`: push a frame for a flattenable straight-line arm (plain
-    // BinaryOp / unary / transparent wrapper), else fold it here via `evalNode`
-    // (delegating; its children re-enter this driver). The plan helpers gate on
-    // the EXACT same conditions `evalNode`'s arms would, so a malformed /
-    // logical / assign / non-foldable shape delegates and is handled there
-    // byte-identically. NOTE: `enter` (push) MUST be the LAST action of any
-    // caller path that copied out its frame fields — `work.back()` may dangle.
-    auto const enter = [&](NodeId n) {
+    auto const enter = [&](NodeId n, std::uint32_t scope) {
         if (n.valid() && tree.kind(n) == NodeKind::Internal) {
             auto kids = visibleChildren(tree, n);
             if (auto bp = plainBinaryPlan(tree, cfg, n, kids)) {
-                // Operands (lhsN/rhsN) are re-derived from `node` in the loop via
-                // the SAME deterministic plan helper (realloc-safe: no dangling
-                // child NodeId stored across a `work` realloc).
-                work.push_back({.kind = CstFoldFrame::Kind::Binary,
-                                .node = n, .phase = 0, .entry = bp->entry});
+                work.push_back({.kind = CstFoldFrame::Kind::Binary, .node = n,
+                                .entry = bp->entry, .scope = scope, .child = bp->lhsN,
+                                .second = bp->rhsN});
                 return;
             }
             if (auto up = unaryPlan(tree, cfg, n, kids)) {
-                work.push_back({.kind = CstFoldFrame::Kind::Unary,
-                                .node = n, .phase = 0, .entry = up->entry});
+                work.push_back({.kind = CstFoldFrame::Kind::Unary, .node = n,
+                                .entry = up->entry, .scope = scope, .child = up->operandN});
                 return;
             }
-            // A value step (`valueStepChild`: a statement expression's sole expression, a
-            // braced scalar's element) is a frame too, so its nesting costs heap.
-            if (NodeId const value = valueStepChild(tree, cfg, n, kids); value.valid()) {
-                work.push_back({.kind = CstFoldFrame::Kind::PassThrough,
-                                .node = value, .phase = 0, .entry = nullptr});
+            // A value step (`valueStepChild`: a statement expression's sole expression) is a
+            // frame too, so its nesting costs heap.
+            if (NodeId const value = valueStepChild(tree, cfg, n); value.valid()) {
+                work.push_back({.kind = CstFoldFrame::Kind::PassThrough, .node = value,
+                                .scope = scope});
                 return;
             }
             if (NodeId const child = wrapperChild(tree, cfg, n, kids); child.valid()) {
-                work.push_back({.kind = CstFoldFrame::Kind::PassThrough,
-                                .node = child, .phase = 0, .entry = nullptr});
+                work.push_back({.kind = CstFoldFrame::Kind::PassThrough, .node = child,
+                                .scope = scope});
                 return;
             }
         }
-        // Delegate (token leaf / sizeof / logical short-circuit / ternary /
-        // malformed straight-line arm → fail loud, byte-identical to recursive).
-        result = evalNode(n, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+        CstFoldFrame request{.kind = CstFoldFrame::Kind::PassThrough, .node = NodeId{}};
+        ConstEvalResult folded =
+            evalNode(n, ctx, env, options, scope, visitedInitNodes, request);
+        if (!request.node.valid()) {
+            result = std::move(folded);
+            return;
+        }
+        request.scope = scope;
+        work.push_back(std::move(request));
     };
 
-    enter(expr);
+    enter(expr, initialScopeOpaque);
     while (!work.empty()) {
         CstFoldFrame& f = work.back();
+        std::uint32_t const scope = f.scope;
+        NodeId const        node  = f.node;
         switch (f.kind) {
         case CstFoldFrame::Kind::PassThrough:
-            // The wrapper's single child IS `f.node` (stored at push). Enter it
-            // and pop in one step — its folded `result` is the wrapper's result.
-            {
-                NodeId const childN = f.node;
-                work.pop_back();
-                enter(childN);   // may push a deeper frame or set `result`
-            }
+            // `node` IS the child: its folded `result` is this frame's.
+            work.pop_back();
+            enter(node, scope);
             break;
         case CstFoldFrame::Kind::Unary:
             if (f.phase == 0) {
                 f.phase = 1;
-                // Re-derive the operand from the node (realloc-safe: kids is a
-                // fresh local; the plan helper is deterministic).
-                auto kids = visibleChildren(tree, f.node);
-                NodeId const operandN = unaryPlan(tree, cfg, f.node, kids)->operandN;
-                enter(operandN);            // build operand — may invalidate `f`
+                NodeId const operandN = f.child;
+                enter(operandN, scope);              // may invalidate `f`
             } else {
-                NodeId const          node2 = f.node;
-                HirOperatorEntry const* e   = f.entry;
+                NodeId const            operandN = f.child;
+                HirOperatorEntry const* e        = f.entry;
                 ConstEvalResult operand = std::move(result);
                 work.pop_back();
                 // The operand, a bit-field's value promoted (`asBitFieldOperand`).
-                if (operandMayBePromoted(operand, env)) {
-                    auto kids = visibleChildren(tree, node2);
-                    NodeId const operandN = unaryPlan(tree, cfg, node2, kids)->operandN;
-                    operand = asBitFieldOperand(operandN, std::move(operand), env, options,
-                                                currentScopeOpaque);
-                }
-                result = combineUnaryCst(node2, *e, options, std::move(operand));
+                operand = asBitFieldOperand(operandN, std::move(operand), env, options, scope);
+                result = combineUnaryCst(node, *e, options, std::move(operand));
             }
             break;
         case CstFoldFrame::Kind::Binary:
-            // LHS first (phase 0→1), then RHS (phase 1→2) — matching the
-            // recursive `a = evalImpl(lhsN); b = evalImpl(rhsN);` (two
-            // SEQUENTIAL statements → left-to-right, platform-independent).
+            // LHS first (phase 0→1), then RHS (phase 1→2) — left-to-right, platform-independent.
             if (f.phase == 0) {
                 f.phase = 1;
-                auto kids = visibleChildren(tree, f.node);
-                NodeId const lhsN = plainBinaryPlan(tree, cfg, f.node, kids)->lhsN;
-                enter(lhsN);                // build LHS — may invalidate `f`
+                NodeId const lhsN = f.child;
+                enter(lhsN, scope);                  // may invalidate `f`
             } else if (f.phase == 1) {
-                f.c0 = std::move(result);   // LHS result
+                f.c0 = std::move(result);
                 f.phase = 2;
-                auto kids = visibleChildren(tree, f.node);
-                NodeId const rhsN = plainBinaryPlan(tree, cfg, f.node, kids)->rhsN;
-                enter(rhsN);                // build RHS — may invalidate `f`
+                NodeId const rhsN = f.second;
+                enter(rhsN, scope);                  // may invalidate `f`
             } else {
-                NodeId const          node2 = f.node;
-                HirOperatorEntry const* e   = f.entry;
+                NodeId const            lhsN = f.child;
+                NodeId const            rhsN = f.second;
+                HirOperatorEntry const* e    = f.entry;
                 ConstEvalResult lhs = std::move(f.c0);
                 ConstEvalResult rhs = std::move(result);
                 work.pop_back();
                 // Each operand, a bit-field's value promoted (`asBitFieldOperand`).
-                if (operandMayBePromoted(lhs, env) || operandMayBePromoted(rhs, env)) {
-                    auto kids = visibleChildren(tree, node2);
-                    auto const plan = plainBinaryPlan(tree, cfg, node2, kids);
-                    lhs = asBitFieldOperand(plan->lhsN, std::move(lhs), env, options,
-                                            currentScopeOpaque);
-                    rhs = asBitFieldOperand(plan->rhsN, std::move(rhs), env, options,
-                                            currentScopeOpaque);
+                lhs = asBitFieldOperand(lhsN, std::move(lhs), env, options, scope);
+                rhs = asBitFieldOperand(rhsN, std::move(rhs), env, options, scope);
+                // ★ P69 L2 (lane `lm`): THE COMMA OPERATOR. C 6.6p3 keeps it out of a constant
+                // expression; the language admits it where the position asked for admits the
+                // `commaOperator` form (`EvalOptions::admittedForms` — the caller's position,
+                // `IntegerConstantPosition`). The discarded LEFT operand must fold too (both
+                // references refuse `(y, 1)` for a non-constant `y`, ✔MEASURED); the value is
+                // the RIGHT operand's, a bit-field's promoted as above — clang's comma hands its
+                // right operand's bit-field on. Not admitted: refused AT the comma.
+                if (e->target == "Comma") {
+                    if (!options.admittedForms.admits(ConstantForm::CommaOperator)) {
+                        result = fail(ConstEvalFailure::NotAConstantExpression, node);
+                    } else if (!lhs.value.has_value()) {
+                        result = std::move(lhs);
+                    } else {
+                        if (rhs.value.has_value() && notTheAskedExpression == 0
+                            && env.noteConstantForm) {
+                            env.noteConstantForm(ConstantForm::CommaOperator, node);
+                        }
+                        result = std::move(rhs);
+                    }
+                    break;
                 }
-                result = combineBinaryCst(node2, *e, options,
-                                          std::move(lhs), std::move(rhs));
+                result = combineBinaryCst(node, *e, options, std::move(lhs), std::move(rhs));
             }
             break;
+        case CstFoldFrame::Kind::Conditional:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const condN = f.child;
+                enter(condN, scope);                 // may invalidate `f`
+            } else if (f.phase == 1) {
+                ConstEvalResult cond = std::move(result);
+                if (!cond.value.has_value()) {
+                    work.pop_back();
+                    result = std::move(cond);
+                    break;
+                }
+                auto const condTrue = asBool(*cond.value, options.allowFloat);
+                if (!condTrue.has_value()) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::UnsupportedTypeKind, node);
+                    break;
+                }
+                NodeId const selected = *condTrue ? f.second : f.third;
+                NodeId const other    = *condTrue ? f.third : f.second;
+                f.child  = selected;
+                f.second = other;
+                f.phase  = 2;
+                enter(selected, scope);              // may invalidate `f`
+            } else if (f.phase == 2) {
+                ConstEvalResult arm =
+                    asBitFieldOperand(f.child, std::move(result), env, options, scope);
+                if (!arm.value.has_value()) {
+                    work.pop_back();
+                    result = std::move(arm);
+                    break;
+                }
+                std::optional<CstCastTarget> const tierType =
+                    env.resolveExpressionType ? env.resolveExpressionType(node, scope)
+                                              : std::nullopt;
+                if (tierType.has_value() && tierType->isPointer) {   // a pointer conditional
+                    work.pop_back();
+                    result = std::move(arm);
+                    break;
+                }
+                f.c0     = std::move(arm);
+                f.target = tierType;
+                f.phase  = 3;
+                NodeId const other = f.second;
+                ++notTheAskedExpression;             // the unselected arm: its type only
+                enter(other, scope);                 // may invalidate `f`
+            } else {
+                --notTheAskedExpression;
+                NodeId const                       other    = f.second;
+                ConstEvalResult                    arm      = std::move(f.c0);
+                std::optional<CstCastTarget> const tierType = f.target;
+                work.pop_back();
+                ConstEvalResult const otherValue =
+                    asBitFieldOperand(other, std::move(result), env, options, scope);
+                result = balanceConditionalArm(node, other, otherValue, std::move(arm), tierType,
+                                               ctx, env, options, scope);
+            }
+            break;
+        case CstFoldFrame::Kind::Logical:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const lhsN = f.child;
+                enter(lhsN, scope);                  // may invalidate `f`
+            } else if (f.phase == 1) {
+                ConstEvalResult a = std::move(result);
+                if (!a.value.has_value()) {
+                    work.pop_back();
+                    result = std::move(a);
+                    break;
+                }
+                auto const aTrue = asBool(*a.value, options.allowFloat);
+                if (!aTrue.has_value()) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::UnsupportedTypeKind, node);
+                    break;
+                }
+                if (f.isAnd ? !*aTrue : *aTrue) {    // short-circuits: the RHS is never folded
+                    work.pop_back();
+                    result = ok(makeBoolLiteral(*aTrue ? 1 : 0));
+                    break;
+                }
+                f.phase = 2;
+                NodeId const rhsN = f.second;
+                enter(rhsN, scope);                  // may invalidate `f`
+            } else {
+                ConstEvalResult b = std::move(result);
+                work.pop_back();
+                if (!b.value.has_value()) {
+                    result = std::move(b);
+                    break;
+                }
+                auto const bTrue = asBool(*b.value, options.allowFloat);
+                if (!bTrue.has_value()) {
+                    result = fail(ConstEvalFailure::UnsupportedTypeKind, node);
+                    break;
+                }
+                result = ok(makeBoolLiteral(*bTrue ? 1 : 0));
+            }
+            break;
+        case CstFoldFrame::Kind::Convert:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const operandN = f.child;
+                enter(operandN, scope);              // may invalidate `f`
+            } else {
+                CstCastTarget const target = *f.target;
+                ConstEvalResult inner = std::move(result);
+                work.pop_back();
+                if (inner.value.has_value()) {
+                    result = convertToCastTarget(inner, target, options, node);
+                } else {
+                    result = std::move(inner);
+                }
+            }
+            break;
+        case CstFoldFrame::Kind::Ref:
+        case CstFoldFrame::Kind::Subobject:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const        initN     = f.child;
+                std::uint32_t const initScope = f.childScope;
+                ++notTheAskedExpression;             // another object's initializer
+                enter(initN, initScope);             // may invalidate `f`
+            } else {
+                --notTheAskedExpression;
+                CstFoldFrame const done = std::move(f);
+                work.pop_back();
+                visitedInitNodes.erase(done.initKey);
+                ConstEvalResult inner = std::move(result);
+                if (!inner.value.has_value()) {
+                    inner.blamedNode = HirNodeId{node.v};
+                    result = std::move(inner);
+                    break;
+                }
+                ConstEvalResult atType = convertToCastTarget(inner, *done.target, options, node);
+                // A BIT-FIELD member is read at its width, at its declared type
+                // (`readThroughBitField`).
+                if (done.kind == CstFoldFrame::Kind::Subobject && done.bitField.has_value()
+                    && atType.value.has_value()) {
+                    atType = readThroughBitField(atType, *done.target, *done.bitField, node);
+                }
+                result = std::move(atType);
+            }
+            break;
+        case CstFoldFrame::Kind::Member:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const baseN = f.child;
+                enter(baseN, scope);                 // may invalidate `f`
+            } else {
+                NodeId const fieldTok = f.second;
+                work.pop_back();
+                result = memberAddressCst(node, fieldTok, std::move(result), env);
+            }
+            break;
+        case CstFoldFrame::Kind::AddressOf:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const operandN = f.child;
+                enter(operandN, scope);              // may invalidate `f`
+            } else {
+                ConstEvalResult inner = std::move(result);
+                work.pop_back();
+                // The address OF an lvalue at a known offset is that address; the address of a
+                // plain value is no constant.
+                if (inner.value.has_value() && asAddress(*inner.value) == nullptr) {
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node);
+                } else {
+                    result = std::move(inner);
+                }
+            }
+            break;
+        case CstFoldFrame::Kind::Builtin: {
+            // `phase` counts the operands asked for; the one before it has just folded.
+            CstBuiltinCall const& bc = *f.call;
+            if (f.phase > 0) {
+                std::size_t const i = f.phase - 1;
+                ConstEvalResult inner = std::move(result);
+                if (inner.value.has_value() && i < bc.argTypes.size()
+                    && bc.argTypes[i].has_value()) {
+                    inner = convertToCastTarget(inner, *bc.argTypes[i], options, bc.args[i]);
+                    if (inner.value.has_value())
+                        f.cores.push_back(builtinOperandCore(*bc.argTypes[i]));
+                } else if (inner.value.has_value()) {
+                    f.cores.push_back(inner.value->core);
+                }
+                if (!inner.value.has_value()) {
+                    work.pop_back();
+                    result = std::move(inner);
+                    break;
+                }
+                f.values.push_back(std::move(*inner.value));
+            }
+            if (f.phase < bc.args.size()) {
+                NodeId const argN = bc.args[f.phase];
+                ++f.phase;
+                enter(argN, scope);                  // may invalidate `f` (and `bc`)
+                break;
+            }
+            CstCastTarget const resultType = bc.resultType;
+            auto folded = foldBuiltinVerb(bc.verb, f.values, f.cores,
+                                          builtinOperandCore(resultType));
+            work.pop_back();
+            if (!folded.has_value()) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node);
+            } else {
+                result = convertToCastTarget(ok(std::move(*folded)), resultType, options, node);
+            }
+            break;
+        }
         }
     }
     return result;
@@ -2196,9 +2432,49 @@ namedConstantRead(TypeInterner const& in, NodeId initExpr, std::uint32_t initSco
     switch (in.kind(declaredType)) {
         case TypeKind::Struct: case TypeKind::Union: case TypeKind::Tuple:
         case TypeKind::Array:  case TypeKind::Slice:
-            return out;   // read member by member, each at its own type
+            return out;   // read member by member, each at its own type; whole, no constant
         default:
             return std::nullopt;   // a type with no constant value at its own type
+    }
+}
+
+// The header says what this is. Each step is to a strict descendant (an element's value, or
+// a wrapper's one child), so the tree's node count bounds the walk; past it the node graph
+// is cyclic — never the program's fault — and the process stops. No recursion: a scalar in
+// as many braces as the parser admits costs one loop.
+CstScalarInitializer
+scalarInitializerValue(Tree const& tree, GrammarSchema const& schema, NodeId init) {
+    HirLoweringConfig const& cfg = schema.hirLowering();
+    NodeId cur = init;
+    for (substrate::WalkSteps steps{tree.nodeCount(), "the scalar initializer's brace steps"};;
+         steps.step()) {
+        if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) return {cur, false};
+        auto const kids = visibleChildren(tree, cur);
+        if (cfg.braceInitListRule.valid() && tree.rule(cur).v == cfg.braceInitListRule.v) {
+            NodeId element{};
+            for (NodeId c : kids) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                element = c;   // the first element; any after it is excess
+                break;
+            }
+            if (!element.valid()) return {NodeId{}, true};   // `{}`: the scalar's zero
+            NodeId value{};
+            std::size_t parts = 0;
+            for (NodeId c : visibleChildren(tree, element)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                ++parts;
+                value = c;
+            }
+            // A designated element has two parts, the designation and the value: no value.
+            if (parts != 1) return {};
+            cur = value;
+            continue;
+        }
+        // A transparent wrapper between two levels (the evaluator's own step): peeled, so a
+        // brace list under it is a level too; anything else is the value.
+        NodeId const child = wrapperChild(tree, cfg, cur, kids);
+        if (!child.valid()) return {cur, false};
+        cur = child;
     }
 }
 

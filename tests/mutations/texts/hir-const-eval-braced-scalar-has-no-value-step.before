@@ -1,1 +1,2 @@
-    return parts == 1 ? value : NodeId{};
+            if (parts != 1) return {};
+            cur = value;

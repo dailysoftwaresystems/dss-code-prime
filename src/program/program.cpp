@@ -1,6 +1,7 @@
 #include "program/program.hpp"
 
 #include "core/crypto/sha256.hpp"  // the ONE content digest — the artifact cache's input closure
+#include "core/substrate/bounded_retry.hpp"  // retryUpTo: a fresh staging directory
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
@@ -3557,32 +3558,47 @@ class RuntimeArchiveStaging {
 public:
     // EMPTY until first use. A build that hits in the cache for every unit —
     // the steady state — never creates a directory at all.
+    // P69 L2 (lane `lm`): the 64 attempts are the substrate's bounded retry — running out
+    // keeps the sentence saying why (`failure()`), which the caller's report carries.
     [[nodiscard]] fs::path const& dir() {
         if (!dir_.empty()) return dir_;
         std::error_code    ec;
         fs::path const     base = fs::temp_directory_path(ec);
-        if (ec) return dir_;   // still empty ⇒ the caller reports the failure
-        static std::atomic<unsigned> counter{0u};
-        for (unsigned attempt = 0; attempt < 64u; ++attempt) {
-            fs::path candidate =
-                base / std::format("dsscp-runtime-{:016x}-{}",
-                                   static_cast<std::uint64_t>(
-                                       std::chrono::steady_clock::now()
-                                           .time_since_epoch().count()),
-                                   counter.fetch_add(1u));
-            std::error_code mkEc;
-            // `create_directory` (not `create_directories`) returns FALSE for a
-            // path that already existed, which is exactly the uniqueness probe
-            // this loop needs — `create_directories` would happily adopt
-            // somebody else's directory and two builds would share a staging
-            // area.
-            if (fs::create_directory(candidate, mkEc) && !mkEc) {
-                dir_ = std::move(candidate);
-                return dir_;
-            }
+        if (ec) {   // still empty ⇒ the caller reports the failure
+            failure_ = "the system temporary directory is unknown (" + ec.message() + ")";
+            return dir_;
         }
-        return dir_;   // empty
+        static std::atomic<unsigned> counter{0u};
+        auto made = substrate::retryUpTo(
+            64, "making a fresh runtime staging directory",
+            [&](std::size_t, std::string& whyNot) -> std::optional<fs::path> {
+                fs::path candidate =
+                    base / std::format("dsscp-runtime-{:016x}-{}",
+                                       static_cast<std::uint64_t>(
+                                           std::chrono::steady_clock::now()
+                                               .time_since_epoch().count()),
+                                       counter.fetch_add(1u));
+                std::error_code mkEc;
+                // `create_directory` (not `create_directories`) returns FALSE for a
+                // path that already existed, which is exactly the uniqueness probe
+                // this needs — `create_directories` would happily adopt somebody
+                // else's directory and two builds would share a staging area.
+                if (fs::create_directory(candidate, mkEc) && !mkEc) return candidate;
+                whyNot = "'" + core::genericSpelling(candidate) + "' "
+                       + (mkEc ? "could not be created (" + mkEc.message() + ")"
+                               : std::string{"already exists"});
+                return std::nullopt;
+            });
+        if (!made.succeeded()) {
+            failure_ = made.failure();
+            return dir_;   // empty
+        }
+        dir_ = std::move(made.value());
+        return dir_;
     }
+
+    // Why `dir()` answered nothing (empty while it has answered nothing yet, or a directory).
+    [[nodiscard]] std::string const& failure() const noexcept { return failure_; }
 
     ~RuntimeArchiveStaging() {
         if (dir_.empty()) return;
@@ -3599,7 +3615,8 @@ public:
     RuntimeArchiveStaging& operator=(RuntimeArchiveStaging const&) = delete;
 
 private:
-    fs::path dir_;
+    fs::path    dir_;
+    std::string failure_;   // why `dir()` last answered nothing
 };
 
 // Append the documents a loaded schema is a function of: the document itself,
@@ -4197,7 +4214,8 @@ buildDependencyArtifactKey(
         if (stagingRoot.empty()) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: no staging directory could "
-                       "be created under the system temporary directory, so "
+                       "be created under the system temporary directory ("
+                       + staging.failure() + "), so "
                        "the shipped runtime unit '" + claim.source
                        + "' cannot be compiled for target '" + siblingSpec
                        + "'. The build stops here rather than continuing "

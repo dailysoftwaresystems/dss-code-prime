@@ -270,6 +270,9 @@ public:
     [[nodiscard]] SchemaTokenId nodeTokenKind(NodeId id) const;
     [[nodiscard]] SourceSpan    nodeSpan(NodeId id)      const;
     [[nodiscard]] std::span<NodeId const> nodeChildren(NodeId id) const;
+    // The nodes emitted so far (the arena's size). A walk over the nodes below a closed
+    // frame is bounded by it (`substrate::WalkSteps`): it takes no more steps than that.
+    [[nodiscard]] std::size_t   nodeCount() const noexcept { return arena_.size(); }
 
     // The pending (not-yet-flushed) children of the CURRENT top open
     // frame, in attach order. Empty when no frame is open. The back

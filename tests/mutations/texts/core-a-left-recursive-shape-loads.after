@@ -1,0 +1,1 @@
+                if ((false)) detectLeftRecursion(data, coll);   // P69 L2: C_CircularShape

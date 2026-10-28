@@ -1,0 +1,1 @@
+        if (!value_.has_value() && !read_) failOnUnreadRetryExhaustion(operation_, attempts_);

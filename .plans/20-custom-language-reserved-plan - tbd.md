@@ -11,6 +11,7 @@
 | | |
 |---|---|
 | Status        | 🔒 **reserved.** Triggered once v1 ships and C++ / C# / TSQL / SQLite validation is mature. |
+| Scheduled | per [`30`](./30-pr-scope-plan%20-%20tbd.md) (2026-10-22): opened by its trigger, after v1 ships and the C++ PR's validation is mature. |
 | Predecessors  | ⏳ v1 ship per [`07-production-readiness-plan`](./07-production-readiness-plan%20-%20tbd.md). ⏳ Schema v3 (per [`06-artifact-profile-plan`](./06-artifact-profile-plan%20-%20tbd.md) + lattice extension support). ⏳ Mature C++/C# language configs (post-v1 work). |
 | Successors    | First-class user of [`17-shader-gpu-plan`](./17-shader-gpu-plan%20-%20tbd.md) (the same-source CPU+GPU goal). |
 | Scope         | **Unspecified.** Design lands when triggered. |

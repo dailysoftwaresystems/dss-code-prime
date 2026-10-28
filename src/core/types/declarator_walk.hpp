@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/substrate/walk_steps.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
@@ -41,10 +42,12 @@ namespace dss {
 
 namespace declarator_walk_detail {
 
-// Hard cap on descent steps. A well-formed declarator chain is depth ~N for
-// N grouping parens; 4096 is unreachable by real input and turns a cyclic /
-// corrupted node graph into a bounded miss instead of a hang.
-inline constexpr std::size_t kMaxDeclaratorDepth = 4096;
+// Every walk here is bounded by the tree it walks (`substrate::WalkSteps` over the View's
+// `nodeCount()`; P69 L2, lane `lm`). A descent moves to a strict descendant and a climb to
+// a strict ancestor, so only a cyclic node graph takes more steps than the tree has nodes,
+// and that stops the process loud. It was a fixed 4096 steps that answered a miss (no
+// name, no derivation, a partial specifier list) past them, and a declarator with ~2048
+// grouping parentheses takes that many.
 
 // First visible child of `node` that is an Internal node of `rule`, or
 // InvalidNode. The role-targeted descent step every arm of the walk uses.
@@ -99,7 +102,8 @@ template <class View>
                                         DeclaratorConfig const& dc) {
     namespace det = declarator_walk_detail;
     NodeId cur = node;
-    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{v.nodeCount(), "declaratorNameNode's descent"};;
+         steps.step()) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return {};
         RuleId const r = v.rule(cur);
         // EVERY per-slot wrapper descends to its inner declaratorRule, and the
@@ -140,7 +144,6 @@ template <class View>
         }
         return {};   // not a declarator-role shape
     }
-    return {};   // depth cap — corrupted/cyclic input, bounded miss
 }
 
 // Collect the declarator-carrying nodes below a declaration's
@@ -283,7 +286,8 @@ template <class View>
     // Walk the carrier shapes down to the DIRECT declarator, the same arms
     // `declaratorNameNode` takes, and stop there — the outermost derivation is
     // the one the trailing run sits beside.
-    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{v.nodeCount(), "declaratorDerivesType's descent"};;
+         steps.step()) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return false;
         RuleId const r = v.rule(cur);
         if (isDeclaratorSlotWrapper(r, dc)) {
@@ -336,6 +340,8 @@ struct TreeDeclaratorView {
         return !isEmptySpace(tree.flags(n));
     }
     [[nodiscard]] auto children(NodeId n) const { return tree.children(n); }
+    // What the walks are bounded by (`substrate::WalkSteps`).
+    [[nodiscard]] std::size_t nodeCount() const noexcept { return tree.nodeCount(); }
 };
 
 [[nodiscard]] inline NodeId
@@ -409,8 +415,7 @@ runAppertainmentFor(Tree const& tree, DeclaratorConfig const& dc,
 //
 // Roles only (`pointerLayerRule`, `groupRule`, `directRule` and its abstract twin,
 // the suffix roles, the attribute-specifier predicate) — no rule name, no spelling.
-// An iterative descent with the walk's own depth cap: a corrupted or cyclic node
-// graph is a bounded miss.
+// An iterative descent bounded by the tree it walks: a cyclic node graph stops loud.
 [[nodiscard]] inline std::vector<NodeId>
 nameAdjacentAttributeSpecifiers(Tree const& tree, SemanticConfig const& cfg,
                                 NodeId carrier) {
@@ -430,7 +435,8 @@ nameAdjacentAttributeSpecifiers(Tree const& tree, SemanticConfig const& cfg,
     // dropped when a pointer layer does.
     std::vector<NodeId> pending;
     NodeId cur = carrier;
-    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "nameAdjacentAttributeSpecifiers' descent"};;
+         steps.step()) {
         if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) break;
         RuleId const r = tree.rule(cur);
         if (isDeclaratorSlotWrapper(r, dc)) {
@@ -646,8 +652,8 @@ innermostNameDerivation(Tree const& tree, NodeId nameNode,
     // level, the parenthesis group at every level above it. It is the BASE of the
     // direct declarator, never one of its suffixes.
     NodeId base = nameNode;
-    for (std::size_t step = 0;
-         step < declarator_walk_detail::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "innermostNameDerivation's climb"};;
+         steps.step()) {
         // (1) A SUFFIX on this direct declarator; leftmost = innermost. Declarator
         //     DECORATIONS (attribute runs, asm labels) annotate a declarator, they
         //     never derive a type from it, so they are skipped through the shared
@@ -689,7 +695,6 @@ innermostNameDerivation(Tree const& tree, NodeId nameNode,
         base   = group;
         direct = outer;
     }
-    return {};   // depth cap — corrupted/cyclic node graph, a bounded miss
 }
 
 // The FUNCTION SUFFIX that declares `nameNode` a function — i.e. its innermost

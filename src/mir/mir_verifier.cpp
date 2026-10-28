@@ -669,6 +669,17 @@ void MirVerifier::checkBlockTermination(DiagnosticReporter& reporter) const {
 
 void MirVerifier::checkPhiIncomings(DiagnosticReporter& reporter) const {
     auto preds = mirBuildPredecessors(mir_);
+    // The blocks reachable from their function's entry. A Phi owes an input only
+    // to a predecessor that can run; an unreachable block is `I_UnreachableBlock`'s
+    // (checkDomination), said once there.
+    std::vector<bool> reachable(mir_.blockCount(), false);
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir_.funcAt(fi);
+        if (mir_.funcBlockCount(f) == 0) continue;
+        for (MirBlockId const b : mirReversePostOrder(mir_, mir_.funcEntry(f))) {
+            if (b.v < reachable.size()) reachable[b.v] = true;
+        }
+    }
     forEachInst(mir_, [&](MirInstId id) {
         if (mir_.instOpcode(id) != MirOpcode::Phi) return;
         MirBlockId const phiBlock = mir_.instBlock(id);
@@ -681,12 +692,54 @@ void MirVerifier::checkPhiIncomings(DiagnosticReporter& reporter) const {
         auto const& blockPreds = preds[phiBlock.v];
         std::unordered_set<std::uint32_t> predSet;
         for (auto p : blockPreds) predSet.insert(p.v);
-        for (MirPhiIncoming const& inc : mir_.phiIncomings(id)) {
+        auto const incomings = mir_.phiIncomings(id);
+        for (MirPhiIncoming const& inc : incomings) {
             if (!predSet.contains(inc.pred.v)) {
                 reportInst(reporter, DiagnosticCode::I_PhiPredNotInCfg, id,
                     std::format("(phi in block #{}) names predecessor #{} but "
                                 "that block is not a CFG-predecessor",
                         phiBlock.v, inc.pred.v));
+            }
+        }
+        if (!reachable[phiBlock.v]) return;
+        // ★ P69 L2 (lane `lm`, D-MIR-VERIFIER-PASSES-A-PHI-MISSING-A-PREDECESSORS-INPUT): EVERY
+        // WAY INTO THE BLOCK BRINGS THE PHI ITS VALUE — from each distinct predecessor that can
+        // run, at least one input, all of one value, and either one input or one per edge
+        // (`mirBuildPredecessors` lists a predecessor once per edge; both spellings are the
+        // module's). The check above asked only that a NAMED block be a predecessor, so a Phi
+        // with no input at all verified, and a pass that dropped one was caught by no
+        // verification after it (✔MEASURED 2026-10-15, the funclet pass's arm: the module it
+        // broke verified clean); the LIR lowering refused it late, where its edge was emitted.
+        // ✔MEASURED 2026-10-15 with this check in place, the whole suite on macos-arm64-debug:
+        // no producer in the tree leaves a Phi incomplete.
+        std::vector<std::uint32_t> seen;
+        for (MirBlockId const p : blockPreds) {
+            if (std::find(seen.begin(), seen.end(), p.v) != seen.end()) continue;
+            seen.push_back(p.v);
+            if (p.v >= reachable.size() || !reachable[p.v]) continue;
+            std::uint32_t const edges = static_cast<std::uint32_t>(
+                std::count(blockPreds.begin(), blockPreds.end(), p));
+            std::uint32_t named = 0;
+            bool          differ = false;
+            MirValueId    first{};
+            for (MirPhiIncoming const& inc : incomings) {
+                if (inc.pred.v != p.v) continue;
+                if (named == 0) first = inc.value;
+                else if (inc.value.v != first.v) differ = true;
+                ++named;
+            }
+            if (named == 0) {
+                reportInst(reporter, DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor, id,
+                    std::format("(phi in block #{}) has no input from its predecessor #{}",
+                        phiBlock.v, p.v));
+            } else if (differ) {
+                reportInst(reporter, DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor, id,
+                    std::format("(phi in block #{}) takes two different values from its "
+                                "predecessor #{}", phiBlock.v, p.v));
+            } else if (named != 1 && named != edges) {
+                reportInst(reporter, DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor, id,
+                    std::format("(phi in block #{}) names its predecessor #{} {} times over "
+                                "{} edge(s)", phiBlock.v, p.v, named, edges));
             }
         }
     });

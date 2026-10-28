@@ -3740,6 +3740,11 @@ struct DSS_EXPORT SemanticConfig {
     // the language's 6.6p10 constant forms — see `StaticInitializerRule`. nullopt ⇒ the
     // constraint is not checked.
     std::optional<StaticInitializerRule> staticInitializers;
+    // Cycle P69 L2 (lane `lm`): the 6.6p10 forms the language admits in an integer constant
+    // expression, PER POSITION (`semantics.integerConstantExpressions.otherConstantForms`;
+    // `IntegerConstantPosition`, `constant_form.hpp`, says why per position). Undeclared ⇒
+    // empty ⇒ the standard's forms at every position.
+    IntegerConstantForms integerConstantExpressions;
 
     // ── P31: the three GNU compile-time OPERATORS ────────────────────────────
     // All three are OPERATORS, not builtin FUNCTIONS, and the distinction is

@@ -1,0 +1,1 @@
+        return evalImpl(*arm, ctx, env, options, currentScopeOpaque, visitedInitNodes);
