@@ -1,0 +1,16 @@
+{
+  "$comment": "LANE-O (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR, the PE witness of roadmap C2): `unsigned char **p = &_mbcasemap + 1;` -- the address of a REAL ucrtbase.dll DATA export PLUS AN OFFSET in a file-scope initializer -- on the pe64 image arm. ** THIS WAS THE ARM'S FAIL-LOUD WITNESS AND IT RUNS SINCE P69: until then the shape was REJECTED (K_RelocationKindMismatch, no artifact), because PE has no symbol-based image relocation and the only value a writer could bake was the IAT slot's own address plus the offset, one indirection off. P69 bound it in two steps: design c2 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) makes `&_mbcasemap` alone the FirstThunk of an import descriptor of its own, which the Windows loader fills; and `&_mbcasemap + 1`, which the loader cannot write, is written by the image's RESIDUE RUNNER (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE): one synthesized function, the image's first TLS callback, run on DLL_PROCESS_ATTACH after the loader has bound the IAT and before `main`, which reads the import's bound address from its IAT entry and stores it plus the offset. It was `extern_data_addr_reject_pe` until P69 round 3, when it was renamed for what it witnesses (it refuses nothing). THE REFERENCES (MEASURED 2026-10-01 on this source's shape): MinGW gcc 13.2.0 + GNU ld 2.42 run it to 42 at -O0 and -O2 through their runtime pseudo-relocations, `p - 1` being the address GetProcAddress gives `_mbcasemap` -- one working reference makes it required; cl 19.51 and clang-cl (/O2 /MD) link a plain `extern` of it but bind the name to the import library's THUNK (exit 106 under main.c's check), and cl refuses a `__declspec(dllimport)` declaration of it (C2099). main.c compares `p`, the code's own `&_mbcasemap + 1` and GetProcAddress's answer: exit 42, or 100 + a bitset (see main.c). RED-ON-DISABLE: make the runner skip DLL_PROCESS_ATTACH -> `p` keeps the file's zero -> exit 103. WHY `_mbcasemap` AND NOT `_fmode`: `_fmode` is not a ucrtbase export at all -- MEASURED 2026-08-10 on two concurring instruments (GNU objdump 2.42 `-p`, MSVC dumpbin 14.44.35207 `-exports`) over all 2,484 exports of the live ucrtbase.dll 10.0.26100.8875; UCRT publishes it only via `__p__fmode` -- so a bare `extern int _fmode;` is unbound and fails K_SymbolUndefined. `_mbcasemap` IS a ucrtbase DATA export (ordinal 527, READ-WRITE `.data`) and ships from ctype.json as a pe-gated `kind: object` row.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

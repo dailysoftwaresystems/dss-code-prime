@@ -3,6 +3,7 @@
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/section_relative_target.hpp"
 #include "link/format/object_atom_coverage.hpp"
+#include "link/format/record_symbol_ids.hpp"
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 
@@ -48,11 +49,14 @@ constexpr std::uint16_t kEtRel      = 1;   // ET_REL
 
 constexpr std::uint16_t kShnUndef      = 0;
 constexpr std::uint16_t kShnLoReserve  = 0xff00;  // >= here: reserved (ABS/COMMON/...)
+constexpr std::uint16_t kShnCommon     = 0xfff2;  // SHN_COMMON: a common (tentative) definition
 
 constexpr std::uint32_t kShtSymtab = 2;
 constexpr std::uint32_t kShtStrtab = 3;
 constexpr std::uint32_t kShtRela   = 4;
 constexpr std::uint32_t kShtNobits = 8;
+constexpr std::uint32_t kShtGroup  = 17;   // SHT_GROUP: a flag word, then its member sections' indices
+constexpr std::uint32_t kGrpComdat = 0x1;  // GRP_COMDAT: one of several groups of a signature is kept
 
 // Elf64 sh_flags bits (gABI 4.8) -- the FALLBACK section-kind signal for a
 // section NAME the format schema does not declare (the -ffunction-sections /
@@ -63,6 +67,7 @@ constexpr std::uint64_t kShfAlloc     = 0x2;
 constexpr std::uint64_t kShfExecInstr = 0x4;
 constexpr std::uint64_t kShfTls       = 0x400;
 
+constexpr std::uint8_t kStbLocal  = 0;
 constexpr std::uint8_t kStbGlobal = 1;
 constexpr std::uint8_t kStbWeak   = 2;
 constexpr std::uint8_t kSttNoType  = 0;
@@ -70,6 +75,7 @@ constexpr std::uint8_t kSttObject  = 1;
 constexpr std::uint8_t kSttFunc    = 2;
 constexpr std::uint8_t kSttSection = 3;
 constexpr std::uint8_t kSttFile    = 4;
+constexpr std::uint8_t kSttTls     = 6;   // P69 round 4: a thread-local common is refused by name
 
 // ── THE LINKER-DEFINED GOT BASE SYMBOL ────────────────────────────────────
 //    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
@@ -140,13 +146,34 @@ constexpr std::string_view kGotBaseSymbolName = "_GLOBAL_OFFSET_TABLE_";
         default: return SymbolVisibility::Default;    // STV_DEFAULT
     }
 }
-// STB_* -> SymbolBinding.
-[[nodiscard]] constexpr SymbolBinding stbToBinding(std::uint8_t b) noexcept {
+// THE BINDING A SYMBOL IS READ AS (P69 fold 3c). The three bindings every
+// format shares, by the gABI's values; the one the FORMAT DOCUMENT states for a
+// definition of which a process holds one instance (`elf.uniqueBinding`), as
+// the binding the document says it is read as, with the property carried
+// (`ModuleSymbol::oneInstancePerProcess`) — whatever OS ABI the object's header
+// states, as GNU ld 2.42 and ld.lld 18.1.3 both read it (✔MEASURED 2026-10-20,
+// headers patched to NONE and FreeBSD); and NOTHING ELSE: nullopt, and the
+// caller refuses the object by name, as ld.lld refuses it ("has invalid
+// binding"). GNU ld links such a symbol, by falling through to no meaning at all
+// (✔MEASURED, bindings 3, 11 and 13); no producer writes one.
+// Until fold 3c every other value read as LOCAL, so g++'s STB_GNU_UNIQUE inline
+// variable of two units linked to two objects (✔MEASURED 2026-10-20: the
+// program 5 where GNU ld's and ld.lld's is 41).
+struct ReadBinding {
+    SymbolBinding binding               = SymbolBinding::Local;
+    bool          oneInstancePerProcess = false;
+};
+[[nodiscard]] std::optional<ReadBinding> readBinding(std::uint8_t b, ElfIdentity const& id) noexcept {
     switch (b) {
-        case kStbGlobal: return SymbolBinding::Global;
-        case kStbWeak:   return SymbolBinding::Weak;
-        default:         return SymbolBinding::Local;
+        case kStbLocal:  return ReadBinding{SymbolBinding::Local, false};
+        case kStbGlobal: return ReadBinding{SymbolBinding::Global, false};
+        case kStbWeak:   return ReadBinding{SymbolBinding::Weak, false};
+        default:         break;
     }
+    if (id.uniqueBinding.has_value() && b == id.uniqueBinding->value) {
+        return ReadBinding{id.uniqueBinding->readAs, true};
+    }
+    return std::nullopt;
 }
 
 // ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
@@ -159,13 +186,13 @@ constexpr std::string_view kGotBaseSymbolName = "_GLOBAL_OFFSET_TABLE_";
 // instruction encoding, so its formula happens to be branch-specific. It
 // carries no role wherever the branch shares its arithmetic with a data
 // reference, which on x86_64 is `S + A - P` for both. The role now comes from
-// the FORMAT row: `isCall` where the wire type is branch-only (aarch64's
-// R_AARCH64_CALL26), and `pltNativeId` where the format instead spells an
-// extern call with a distinct PLT-variant wire type (x86_64's R_X86_64_PLT32,
-// emitted INSTEAD of PC32 against an undefined extern). Both are collected
-// into `callSignalNativeIds` below; ELF x86_64 needs the second because its
-// R_X86_64_PC32 genuinely serves data references too and therefore must NOT
-// be declared `isCall`.
+// the FORMAT row: `isCall` where the wire type is a call — aarch64's
+// R_AARCH64_CALL26 and, since P69, x86_64's R_X86_64_PLT32, which is the
+// `rel32` row now that x86_64's `rel32` is call-only
+// (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). R_X86_64_PC32 serves
+// addresses and memory operands and is therefore NOT `isCall`. (Until P69 the
+// x86_64 call signal hid in a second wire id on the PC32 row, `pltNativeId`,
+// now retired.) The signals are collected into `callSignalNativeIds` below.
 
 // Overflow-safe [off, off+size) within [0, total) -- the c159-c161
 // `rangeExceedsBuffer` shape (subtraction, never `off + size` which
@@ -196,8 +223,9 @@ rangeExceedsBuffer(std::uint64_t off, std::uint64_t size, std::uint64_t total) n
 // the declared section alignment; the POLICY that turns a declared alignment
 // into an `Alignment` is shared with the Mach-O and COFF readers and lives in
 // `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
-// fact that ELF spells it as a raw BYTE COUNT.
-[[nodiscard]] Alignment alignFromSection(std::uint64_t shAddrAlign) noexcept {
+// fact that ELF spells it as a raw BYTE COUNT. nullopt: the field is no
+// alignment (the header walk refuses the object by name).
+[[nodiscard]] std::optional<Alignment> alignFromSection(std::uint64_t shAddrAlign) noexcept {
     return link::format::foreignSectionAlignmentFromByteCount(shAddrAlign);
 }
 
@@ -226,6 +254,9 @@ struct Shdr {
     std::uint32_t link      = 0;
     std::uint32_t info      = 0;
     std::uint64_t addrAlign = 0;
+    // `addrAlign` as the alignment every item cut from this section has (the
+    // header walk carries it, or refuses the object).
+    Alignment     alignment{};
     std::uint64_t entSize   = 0;
     std::string   name;
     std::optional<SectionKind> kind;  // resolved from `name` via the format schema
@@ -372,6 +403,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         s.info      = rdU32(bytes, base + 44);
         s.addrAlign = rdU64(bytes, base + 48);
         s.entSize   = rdU64(bytes, base + 56);
+        // The declared alignment is a CORRECTNESS input (the policy's note):
+        // carried as declared, or -- a field that is no alignment -- the
+        // object refused here, by name, before any item is cut from it.
+        std::optional<Alignment> const declared = alignFromSection(s.addrAlign);
+        if (!declared.has_value()) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "elf::readRelocatableObject: section #" + std::to_string(i)
+                + " declares sh_addralign " + std::to_string(s.addrAlign)
+                + ", which is not a power of two no greater than 2^31: no "
+                  "alignment its bytes can be placed at.");
+        }
+        s.alignment = *declared;
         // Every non-NOBITS section's body must lie within the file.
         if (s.type != kShtNobits
             && rangeExceedsBuffer(s.offset, s.size, bytes.size())) {
@@ -439,8 +482,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::uint64_t const strOff = secs[symtab.link].offset;
     std::uint64_t const strEnd = strOff + secs[symtab.link].size;  // in-bounds (checked)
 
-    // -- (4) Decode every symbol; assign SymbolId = symtab index -----
+    // -- (4) Decode every symbol ------------------------------------
+    // A record's id is `symbolIds.of(its index)` — THE ONE RULE every object
+    // reader states its ids by (`record_symbol_ids.hpp`). An ELF table's record 0
+    // is the null symbol and names nothing, so every id here is its record's
+    // index, as it always was; the rule is asked all the same, so that no reader
+    // keeps one of its own.
     std::size_t const numSyms = static_cast<std::size_t>(symtab.size / kSymSz);
+    link::format::RecordSymbolIds symbolIds{static_cast<std::uint32_t>(numSyms)};
     std::vector<Sym> syms(numSyms);
     for (std::size_t i = 0; i < numSyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(symtab.offset) + i * kSymSz;
@@ -453,18 +502,49 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         sy.size    = rdU64(bytes, so + 16);
         sy.name    = rdName(bytes, strOff, strEnd, sy.nameIdx);
     }
+    // Every symbol's binding, read ONCE through the document (`readBinding`). A
+    // value the document states no meaning for refuses the object here, naming
+    // the symbol, before any row is built from it.
+    std::vector<ReadBinding> bindingOf(numSyms);
+    for (std::size_t i = 0; i < numSyms; ++i) {
+        std::uint8_t const b  = stBind(syms[i].info);
+        auto const         rb = readBinding(b, objectFormatSchema.elf());
+        if (!rb.has_value()) {
+            auto const& stated = objectFormatSchema.elf().uniqueBinding;
+            return fail(DiagnosticCode::K_SymbolBindingNotModelled,
+                "elf::readRelocatableObject: symbol #" + std::to_string(i) + " ('" + syms[i].name
+                + "') has binding " + std::to_string(b) + ", which format '"
+                + std::string{objectFormatSchema.name()} + "' states no meaning for: it is none of local (0), "
+                  "global (1) and weak (2), and "
+                + (stated.has_value()
+                       ? "not the binding " + std::to_string(stated->value)
+                             + " the document states for a definition of which a process holds one instance"
+                       : std::string{"the document states no binding for a definition of which a process holds "
+                                     "one instance ('elf.uniqueBinding')"})
+                + ". Refused rather than read as a binding nobody stated: read as local, two units' "
+                  "definitions of one name were two objects.");
+        }
+        bindingOf[i] = *rb;
+    }
+    // A DEFINED symbol's row: its id and name, and the binding, visibility and
+    // one-instance property record `rec` states.
+    auto definitionRow = [&](std::size_t rec, SymbolId id, std::string name) {
+        ModuleSymbol row{id, std::move(name), bindingOf[rec].binding,
+                         stvToVisibility(stVis(syms[rec].other))};
+        row.oneInstancePerProcess = bindingOf[rec].oneInstancePerProcess;
+        return row;
+    };
 
     // -- (5) Reverse reloc maps (nativeId -> RelocationKind), from the
     //         FORMAT SCHEMA -- no hardcoded R_X86_64 numbers here -----
     //
     // `callSignalNativeIds` collects the native ids that mark an extern as a
-    // FUNCTION -- the UNION of the format's two declared call signals: the
-    // x86_64 PLT (call-through-stub) variant (`pltNativeId`) AND the native id
-    // of any row the format declares `"isCall": true` on (aarch64 CALL26,
-    // which has NO pltNativeId). Both are DECLARATIONS read from the schema,
-    // never inferred from the target's arithmetic (see the note above the byte
-    // helpers). The plain PC32 a DATA reference uses is deliberately in
-    // neither, which is exactly why elf64-x86_64 must not declare `isCall`.
+    // FUNCTION: the native id of every row the format declares
+    // `"isCall": true` on (aarch64 CALL26; x86_64 PLT32 since P69). They are
+    // DECLARATIONS read from the schema, never inferred from the target's
+    // arithmetic (see the note above the byte helpers). The plain PC32 a DATA reference uses is in neither: it is
+    // the `riprel32` row, which states no call. (Before P69 one x86_64 row served both a call and an address, so
+    // elf64-x86_64 could not declare `isCall` on it; the call is R_X86_64_PLT32's row of its own now.)
     //
     // Built by `ObjectFormatSchema::relocationDecodeTable()` — the SCHEMA's
     // own answer to "which rows decode, and which wire ids are call signals",
@@ -608,11 +688,15 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return link::format::AtomStartCandidate{
             /*sectionKey=*/sy.shndx, /*offset=*/sy.value,
             /*declaredExtent=*/sy.size, /*symbolId=*/static_cast<std::uint32_t>(i),
-            /*binding=*/stbToBinding(stBind(sy.info)),
+            /*binding=*/bindingOf[i].binding,
             /*visibility=*/stvToVisibility(stVis(sy.other)),
             /*name=*/sy.name, /*sectionName=*/sec.name};
     };
     std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    // The names a relocation KEEPS instead of the atom this pass gives it: THE
+    // WEAK-NAME RULE (`object_atom_coverage.hpp`), decided on the alias sets
+    // here and read by the relocation pass.
+    link::format::WeakNameReferences weakNames;
     {
         std::vector<link::format::AtomStartCandidate> candidates;
         for (std::size_t i = 0; i < numSyms; ++i) {
@@ -630,6 +714,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
             }
         }
+        weakNames.decideFrom(candidates, owner, symbolIds);
     }
     // The atom identity a symbol resolves to: itself unless it aliases another.
     // Consulted at BOTH sites that need it -- the walk (does this symbol slice a
@@ -664,18 +749,32 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // measurement is at `kGotBaseSymbolName`.
             if (sy.name == kGotBaseSymbolName) continue;
             ExternImport ext;
-            ext.symbol      = SymbolId{static_cast<std::uint32_t>(i)};
+            ext.symbol      = symbolIds.of(static_cast<std::uint32_t>(i));
             ext.mangledName = sy.name;
-            // isData seed from the symtab type: STT_FUNC -> false; STT_OBJECT
-            // -> true; STT_NOTYPE (DSS + gcc emit externs as NOTYPE) -> DATA by
-            // default, overridden to false (function) ONLY when a CALL/BRANCH
-            // -class reloc targets it (the reloc pass below). This is the fix
-            // for the old "any non-PLT reloc => data" rule, which misclassified
-            // an address-taken extern function and EVERY aarch64 extern call
-            // (aarch64 declares no pltNativeId).
-            ext.isData      = (stType(sy.info) != kSttFunc);
+            // THE KIND IS WHAT THE OBJECT STATES, AND NOTHING ELSE
+            // (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA, P69). STT_FUNC states
+            // code and every other type a datum. STT_NOTYPE, which gcc, clang
+            // and DSS's own writer give EVERY undefined symbol, states nothing,
+            // and neither does a GOT load or a plain PC32 or ABS64, because each
+            // names a function and a datum alike. Such a row is `Pending`
+            // (`ExternKindOrigin`), and its kind comes from the DEFINITION, as
+            // ld takes it: a sibling unit's, or the library the archive-member
+            // binder matches (`decideKindFromTheDefinition`). A CALL states
+            // code, and the reloc pass below states it on the row (the format's
+            // `isCall` rows: x86_64 PLT32, aarch64 CALL26). Until P69 an untyped
+            // symbol was seeded DATA. A member that reached a library FUNCTION
+            // only through the GOT (a `-fno-plt` call, `&fputs`) therefore
+            // minted a DATA import, and a program declaring the function was
+            // refused: ✔MEASURED 2026-09-24, gcc 13.3 `-O2 -fno-plt` members,
+            // all 12 arms, K_ExternImportAttributeConflict.
+            if (type == kSttNoType) {
+                ext.kindOrigin = ExternKindOrigin::Pending;
+                ext.isData     = false;   // meaningless while Pending
+            } else {
+                ext.isData     = (type != kSttFunc);
+            }
             // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
-            // binding, through the SAME `stbToBinding` every DEFINED symbol in
+            // binding, through the SAME `readBinding` every DEFINED symbol in
             // this reader uses -- ELF spells a weak reference and a weak
             // definition in the one `st_info` field, so there is nothing extra
             // to decode. Reading it as Global (what this arm did until the
@@ -685,25 +784,84 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // and DSS's own writer now does too, so the round trip closes.
             // ⚠ A STB_LOCAL undefined symbol is not a shape any producer emits
             // (an undefined LOCAL names nothing any linker could resolve);
-            // `stbToBinding` maps it to `SymbolBinding::Local`, which the
+            // `readBinding` reads it as `SymbolBinding::Local`, which the
             // link-tier fold `strongerReferenceBinding` treats as contributing
             // nothing rather than as a third kind of reference.
-            ext.binding     = stbToBinding(stBind(sy.info));
+            ext.binding     = bindingOf[i].binding;
             externBySym.emplace(static_cast<std::uint32_t>(i), mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;
         }
+        if (sy.shndx == kShnCommon) {
+            // A COMMON symbol: a tentative DEFINITION whose storage the link
+            // allocates once per name -- `st_size` bytes aligned to `st_value`
+            // (gABI, "Symbol Values": for SHN_COMMON, st_value holds alignment
+            // constraints). Read as the row that says so
+            // (`ExternImport::commonSize`, P69,
+            // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS). This arm used to
+            // record it as a BODILESS definition -- a name with no storage
+            // behind it, which a reference then reached as nothing at all.
+            // gcc and clang write one for every tentative definition under
+            // -fcommon (gcc's default before GCC 10, clang's before 11).
+            // A common is a GLOBAL definition by the gABI's own terms, of a
+            // size and a power-of-two alignment; any other shape names no
+            // storage a link could allocate, and is refused rather than read.
+            std::uint8_t const bind = stBind(sy.info);
+            bool const pow2 = sy.value != 0u && (sy.value & (sy.value - 1u)) == 0u
+                           && sy.value <= Alignment::kMaxBytes;
+            if (sy.name.empty() || bind != kStbGlobal || sy.size == 0u || !pow2) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: COMMON symbol #" + std::to_string(i)
+                    + " ('" + sy.name + "', binding " + std::to_string(bind)
+                    + ", size " + std::to_string(sy.size) + ", alignment "
+                    + std::to_string(sy.value)
+                    + ") is not a named GLOBAL common of a non-zero size and a "
+                      "power-of-two alignment -- no storage a link could allocate "
+                      "is described by it.");
+            }
+            // P69 round 4: a THREAD-LOCAL common (`STT_TLS`; gas writes one for
+            // `.tls_common` and GNU ld places it in the image's `.tbss`) is
+            // storage every thread owns a copy of, and no DSS link allocates a
+            // thread-local common: read as an ordinary one it would be ONE `.bss`
+            // object all threads share. gcc 13.3 and clang 18.1 -fcommon never
+            // write one -- a thread-local tentative definition goes to `.tbss` --
+            // (✔MEASURED 2026-10-07), so refusing it costs no reference
+            // compiler's output (D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
+            if (type == kSttTls) {
+                return fail(DiagnosticCode::K_CommonSymbolUnallocatable,
+                    "elf::readRelocatableObject: COMMON symbol #" + std::to_string(i)
+                    + " ('" + sy.name + "') is THREAD-LOCAL (STT_TLS, as an "
+                      "assembler's `.tls_common` writes it). Every thread owns a "
+                      "copy of such storage, and no DSS link allocates a "
+                      "thread-local common, so it is refused rather than placed "
+                      "once in .bss for all threads to share. Define the variable "
+                      "in a section of its own (a compiler puts `_Thread_local` "
+                      "tentative definitions in .tbss), or link with GNU ld.");
+            }
+            ExternImport common;
+            common.symbol           = symbolIds.of(static_cast<std::uint32_t>(i));
+            common.mangledName      = sy.name;
+            common.isData           = true;
+            common.binding          = SymbolBinding::Global;
+            common.commonSize       = sy.size;
+            common.commonAlignment  = sy.value;
+            common.commonAlignmentStated = sy.value;   // ELF states it in `st_value`
+            common.commonVisibility = stvToVisibility(stVis(sy.other));
+            // An ELF symbol's TYPE states its storage duration -- this one is not
+            // `STT_TLS` (refused above) -- and GNU ld and ld.lld compare it with
+            // the definition's whether or not the unit reads the name
+            // (`ExternImport::recordStatesStorageDuration`).
+            common.recordStatesStorageDuration = true;
+            externBySym.emplace(static_cast<std::uint32_t>(i), mod.externImports.size());
+            mod.externImports.push_back(std::move(common));
+            continue;
+        }
         if (sy.shndx >= kShnLoReserve) {
-            // A reserved section index (SHN_ABS absolute value, SHN_COMMON
-            // tentative definition, ...): not a section-backed body. Recorded
-            // as a ModuleSymbol so a reloc target still resolves by identity.
-            // (SHN_COMMON allocation -- pick-max-size across CUs into `.bss` --
-            // is a linker/merge concern, deliberately left to the c165
-            // static-link rather than fabricated as a fixed `.bss` item here.)
+            // A reserved section index (SHN_ABS absolute value, ...): not a
+            // section-backed body. Recorded as a ModuleSymbol so a reloc
+            // target still resolves by identity.
             if (!sy.name.empty() && type != kSttSection) {
-                mod.symbols.push_back(ModuleSymbol{SymbolId{static_cast<std::uint32_t>(i)},
-                                                   sy.name, stbToBinding(stBind(sy.info)),
-                                                   stvToVisibility(stVis(sy.other))});
+                mod.symbols.push_back(definitionRow(i, symbolIds.of(static_cast<std::uint32_t>(i)), sy.name));
             }
             continue;
         }
@@ -725,7 +883,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // named LOCAL identity (the merge's handling of section-relative
             // references is c165's static-link concern).
             std::string const nm = sy.name.empty() ? sec.name : sy.name;
-            mod.symbols.push_back(ModuleSymbol{SymbolId{static_cast<std::uint32_t>(i)},
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(static_cast<std::uint32_t>(i)),
                                                nm, SymbolBinding::Local,
                                                stvToVisibility(stVis(sy.other))});
             continue;
@@ -735,9 +893,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // (`rk` -- exact name, then `.text.`/`.data.`-style prefix, then flags).
         auto pushModuleSym = [&] {
             if (!sy.name.empty())
-                mod.symbols.push_back(ModuleSymbol{SymbolId{static_cast<std::uint32_t>(i)},
-                                                   sy.name, stbToBinding(stBind(sy.info)),
-                                                   stvToVisibility(stVis(sy.other))});
+                mod.symbols.push_back(definitionRow(i, symbolIds.of(static_cast<std::uint32_t>(i)), sy.name));
         };
         // Stage a BODILESS defined symbol for the shared coverage guard
         // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM) --
@@ -786,9 +942,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (std::uint32_t const owner = ownerOf(static_cast<std::uint32_t>(i));
             owner != static_cast<std::uint32_t>(i)) {
             if (!sy.name.empty()) {
-                aliasRows.push_back(ModuleSymbol{SymbolId{owner}, sy.name,
-                                                 stbToBinding(stBind(sy.info)),
-                                                 stvToVisibility(stVis(sy.other))});
+                aliasRows.push_back(definitionRow(i, symbolIds.of(owner), sy.name));
             }
             aliasOwners.push_back(owner);
             continue;
@@ -811,7 +965,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 std::size_t const bodyOff =
                     static_cast<std::size_t>(sec.offset + sy.value);
                 AssembledFunction fn;
-                fn.symbol = SymbolId{static_cast<std::uint32_t>(i)};
+                fn.symbol = symbolIds.of(static_cast<std::uint32_t>(i));
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + sy.size);
                 funcIntervalsBySec[sy.shndx].push_back(
@@ -846,9 +1000,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // slice their bytes; zero-fill (.bss / .tbss) reserve the size
             // with empty bytes (the `reservedSize` invariant).
             AssembledData di;
-            di.symbol    = SymbolId{static_cast<std::uint32_t>(i)};
+            di.symbol    = symbolIds.of(static_cast<std::uint32_t>(i));
             di.section   = *dk;
-            di.alignment = alignFromSection(sec.addrAlign);  // section-granular (see header)
+            di.alignment = sec.alignment;  // section-granular (see header)
             if (isZeroFill(*dk)) {
                 di.reservedSize = sy.size;
             } else {
@@ -885,14 +1039,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             allocated && sy.size > 0
             && (type == kSttObject || type == kSttNoType);
         if (isRuntimeBody) {
-            return fail(DiagnosticCode::F_CorruptedBinary,
+            // Under a code of its own (P69): the object is not corrupt, DSS
+            // does not model the section.
+            return fail(DiagnosticCode::K_ObjectSectionNotModelled,
                 "elf::readRelocatableObject: defined symbol '" + sy.name
                 + "' (an allocated " + std::to_string(sy.size)
                 + "-byte body in section '" + sec.name + "', sh_flags="
                 + std::to_string(sec.flags)
-                + ") resolves to no known code/data section kind -- refusing to "
-                  "silently drop a code/data body. Add the section's kind (a "
-                  "format schema row or a resolveSectionKind arm).");
+                + ") resolves to no known code/data section kind: no row of "
+                  "format '" + std::string{objectFormatSchema.name()}
+                + "' names that section. The object is well-formed; DSS does "
+                  "not carry a section its format document has no row for, "
+                  "and refuses rather than drop the body.");
         }
         stageBodiless();   // self-gates on a RESOLVED kind (see above)
         pushModuleSym();
@@ -922,6 +1080,68 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
     for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+    // THE WEAK-NAME RULE, stated on the rows: each weak name this object's
+    // relocations are kept on says so (`ModuleSymbol::referencedByName`), which
+    // is what makes a relocation left on its atom a reference to the BYTES.
+    weakNames.stateOn(mod.symbols);
+
+    // SECTION GROUPS (P69 folds 2 and 3c): the unit states, for every input
+    // section that is a member of a COMDAT group, the group's SIGNATURE
+    // (`AssembledModule::sectionGroupOfInputSection`) — the one statement the
+    // link's discard reads (`linker.cpp`, `discardLaterSectionGroups`): the first
+    // unit that carries a signature keeps its group, and every later unit's goes
+    // with all it holds. `SHT_GROUP` is a flag word followed by the member
+    // sections' indices, and `sh_info` is the signature's symbol-table index;
+    // only a `GRP_COMDAT` group is one of several that a link keeps one of. A
+    // signature that is a section symbol is named by its section; one with no
+    // name at all can match no other group and states nothing.
+    {
+        std::unordered_map<std::uint16_t, std::string> signatureOfSection;
+        for (std::uint16_t g = 0; g < eShnum; ++g) {
+            Shdr const& group = secs[g];
+            if (group.type != kShtGroup) continue;
+            if (group.size < 4u || group.size % 4u != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: section group #" + std::to_string(g)
+                    + " is " + std::to_string(group.size)
+                    + " bytes, which is not a flag word followed by 4-byte section indices.");
+            }
+            std::size_t const at = static_cast<std::size_t>(group.offset);
+            if ((rdU32(bytes, at) & kGrpComdat) == 0u) continue;
+            if (group.info >= numSyms) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: section group #" + std::to_string(g)
+                    + " names symbol #" + std::to_string(group.info)
+                    + " as its signature, and the symbol table has "
+                    + std::to_string(numSyms) + " records.");
+            }
+            Sym const&  signatureSym = syms[group.info];
+            std::string signature    = signatureSym.name;
+            if (signature.empty() && signatureSym.shndx != kShnUndef
+                && signatureSym.shndx < eShnum) {
+                signature = secs[signatureSym.shndx].name;
+            }
+            for (std::uint64_t k = 4; k < group.size; k += 4) {
+                std::uint32_t const member = rdU32(bytes, at + static_cast<std::size_t>(k));
+                if (member == 0u || member >= eShnum) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "elf::readRelocatableObject: section group #" + std::to_string(g)
+                        + " lists section #" + std::to_string(member)
+                        + " as a member, and the object has "
+                        + std::to_string(eShnum) + " sections.");
+                }
+                if (!signature.empty()) {
+                    signatureOfSection.emplace(static_cast<std::uint16_t>(member), signature);
+                }
+            }
+        }
+        // A member section is named by its index, the key every atom cut from it
+        // carries (`InputSectionSlice::section`, set from that index when the
+        // atoms are tied to their sections below).
+        for (auto const& [section, signature] : signatureOfSection) {
+            mod.sectionGroupOfInputSection.emplace(section, signature);
+        }
+    }
 
     // MEDIUM guard: overlapping STT_FUNC (st_value,st_size) ranges within one
     // section -- a relocation site inside the overlap would mis-route to
@@ -1033,7 +1253,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             std::size_t const bodyOff =
                 static_cast<std::size_t>(psec.offset + c.sectionOffset);
             AssembledFunction fn;
-            fn.symbol = SymbolId{symIdx};
+            fn.symbol = symbolIds.of(symIdx);
             fn.bytes.assign(bytes.begin() + bodyOff,
                             bytes.begin() + bodyOff + static_cast<std::size_t>(size));
             funcIntervalsBySec[static_cast<std::uint16_t>(c.sectionKey)].push_back(
@@ -1085,7 +1305,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         return k.has_value() ? dataSectionKindOf(*k) : std::nullopt;
     };
-    std::uint32_t nextSyntheticId = static_cast<std::uint32_t>(numSyms);
     for (std::uint16_t si = 0; si < eShnum; ++si) {
         Shdr const& sec = secs[si];
         if ((sec.flags & kShfAlloc) == 0u || sec.size == 0u
@@ -1109,9 +1328,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         auto emitGap = [&](std::uint64_t gapStart, std::uint64_t gapEnd) {
             if (gapEnd <= gapStart) return;
             AssembledData di;
-            di.symbol    = SymbolId{nextSyntheticId++};
+            di.symbol    = symbolIds.fresh();
             di.section   = *dk;
-            di.alignment = alignFromSection(sec.addrAlign);
+            di.alignment = sec.alignment;
             std::size_t const b0 = static_cast<std::size_t>(sec.offset + gapStart);
             di.bytes.assign(bytes.begin() + b0,
                             bytes.begin() + b0 + static_cast<std::size_t>(gapEnd - gapStart));
@@ -1286,7 +1505,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                       "relocation's addend lives is unstated.");
             }
             auto const recovered = link::format::recoverRelocationAddend(
-                *storage, *tri, rAddend, std::span<std::uint8_t const>{});
+                *storage, *tri, rAddend, std::span<std::uint8_t const>{},
+                decode->addendLoweringOf(rType));
             if (!recovered.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "elf::readRelocatableObject: relocation at offset "
@@ -1327,7 +1547,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // number -- doing it by identity says what is meant and keeps the
             // three readers' handling of one shape identical.)
             std::uint32_t const targetSym = ownerOf(symIdx);
-            SymbolId     relTarget = SymbolId{targetSym};
+            SymbolId     relTarget = symbolIds.of(targetSym);
             std::int64_t relAddend = nativeAddend;
             if (!atomSymIdx.contains(targetSym)) {
                 Sym const& tsym = syms[targetSym];
@@ -1354,33 +1574,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     // nativeAddend + addendBias. Getting L right picks the correct
                     // atom when a section holds several (multi-function `.text`); the
                     // residual above stays bindBase - atom.start regardless.
-                    std::int64_t searchOff = bindBase;
-                    if (tri->pcRelative && patchesData) {
-                        std::int64_t const relInAtom =
-                            static_cast<std::int64_t>(rOffset)
-                            - static_cast<std::int64_t>(iv->start);
-                        searchOff = bindBase
-                                  + static_cast<std::int64_t>(tri->addendBias)
-                                  - relInAtom;
-                    }
+                    std::int64_t const searchOff = link::format::sectionRelativeSearchOffset(
+                        bindBase, tri->pcRelative, /*referenceIsInData=*/patchesData,
+                        static_cast<std::int64_t>(tri->addendBias),
+                        static_cast<std::int64_t>(rOffset)
+                            - static_cast<std::int64_t>(iv->start));
                     // WHICH atom, and why any atom of the section is exact
                     // once the section is a unit, is the shared rule's
-                    // (`section_relative_target.hpp`) — COFF binds through
-                    // the same one.
-                    auto spansOf = [](auto const& bySec, std::uint16_t key) {
-                        std::vector<link::format::SectionAtomSpan> spans;
-                        if (auto it = bySec.find(key); it != bySec.end()) {
-                            for (auto const& v : it->second) {
-                                spans.push_back(link::format::SectionAtomSpan{
-                                    v.start, v.len, v.outIdx});
-                            }
-                        }
-                        return spans;
-                    };
+                    // (`section_relative_target.hpp`) — COFF and Mach-O bind
+                    // through the same one.
                     auto const bound = link::format::bindSectionRelativeReference(
-                        spansOf(funcIntervalsBySec, tsym.shndx),
-                        spansOf(dataIntervalsBySec, tsym.shndx), bindBase,
-                        searchOff, sectionsAreUnits);
+                        link::format::sectionAtomSpans(funcIntervalsBySec, tsym.shndx),
+                        link::format::sectionAtomSpans(dataIntervalsBySec, tsym.shndx),
+                        bindBase, searchOff, sectionsAreUnits);
                     if (!bound.has_value()) {
                         return fail(DiagnosticCode::F_CorruptedBinary,
                             "elf::readRelocatableObject: section-relative relocation "
@@ -1396,6 +1602,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     relAddend = bound->residual;
                 }
             }
+            // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
+            // written through a WEAK name keeps the NAME, whatever else names
+            // the body -- a plain reference row the link resolves by name, to an
+            // override where one is linked and to this very body otherwise --
+            // instead of the atom (6.44) chose for it. What this pass leaves on
+            // an atom is then a reference to its BYTES: one written through a
+            // static name of the body, or through its section. The addend is
+            // the name's own: the name sits at the atom's start.
+            if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
+                if (weakName->fresh) {
+                    mod.externImports.push_back(
+                        link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
+                }
+                relTarget = weakName->id;
+            }
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(rOffset - iv->start);
             rel.target = relTarget;
@@ -1404,25 +1625,28 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 
-            // isData inference: an extern reached through one of the format's
-            // DECLARED call signals -- x86_64 PLT32 (`pltNativeId`), aarch64
-            // CALL26 (`"isCall": true`) -- is a FUNCTION, so force
-            // isData=false. A plain data-address reloc (PC32/abs64/GOT) leaves
-            // the symtab-type seed intact (NOTYPE defaults to data). This is
-            // the fix for the old "any non-PLT reloc => data" rule that
-            // misclassified an address-taken extern function and all aarch64
-            // extern calls.
+            // The kind a CALL states: an extern reached through one of the
+            // format's DECLARED call signals -- the `"isCall": true` rows,
+            // x86_64 PLT32 and aarch64 CALL26 -- is a FUNCTION, stated by the
+            // object. A plain address reloc (PC32/abs64/GOT) states nothing and
+            // leaves the symtab type's answer as it is: a typed symbol's own
+            // statement, or `Pending` for STT_NOTYPE (see the undefined-symbol
+            // arm). This is also the fix for the old "any non-PLT reloc =>
+            // data" rule, which misclassified an address-taken extern function
+            // and all aarch64 extern calls.
             //
             // ⓘ NO EMPTY-SET REFUSAL HERE, and the asymmetry with the Mach-O
             // reader is a real difference rather than an oversight: ELF's
             // st_info carries an INDEPENDENT class hint (STT_FUNC/STT_OBJECT),
             // so an ELF format with no declared call signal still classifies
-            // every typed extern correctly and only leaves STT_NOTYPE on its
-            // DATA seed. Mach-O's nlist_64 has no such field, which is why
-            // there the missing declaration is unrecoverable.
+            // every typed extern correctly and only leaves STT_NOTYPE `Pending`
+            // for its definition to decide. Mach-O's nlist_64 has no such
+            // field, so there a format without the declaration could not read
+            // the statement a call makes at all.
             if (auto ex = externBySym.find(symIdx); ex != externBySym.end()) {
                 if (callSignalNativeIds.contains(rType)) {
-                    mod.externImports[ex->second].isData = false;
+                    mod.externImports[ex->second].isData     = false;
+                    mod.externImports[ex->second].kindOrigin = ExternKindOrigin::Stated;
                 }
             }
         }
@@ -1740,12 +1964,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // already correct -- which is why the two tests above pass again.
     {
         std::vector<std::pair<std::size_t, AssembledFunction>> padAtoms;
-        std::uint32_t nextPadId = static_cast<std::uint32_t>(numSyms);
-        for (auto const& f : mod.functions)
-            nextPadId = std::max(nextPadId, f.symbol.v + 1u);
-        for (auto const& d : mod.dataItems)
-            nextPadId = std::max(nextPadId, d.symbol.v + 1u);
-
         for (auto& [secIdx, ivs] : funcIntervalsBySec) {
             if (ivs.size() < 2) continue;
             if (secIdx >= secs.size()) continue;
@@ -1806,10 +2024,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 std::size_t const off =
                     static_cast<std::size_t>(psec.offset + gapStart);
                 AssembledFunction pad;
-                // A fresh id above every real symbol, with NO ModuleSymbol --
-                // the module-private, never-cross-CU-folded discipline the
-                // (6.5) data gap atoms already use.
-                pad.symbol = SymbolId{nextPadId++};
+                // A fresh id no record holds, with NO ModuleSymbol -- the
+                // module-private, never-cross-CU-folded discipline the (6.5)
+                // data gap atoms already use. From the object's ONE counter
+                // (`symbolIds`): the gap atoms and a weak name's reference row
+                // draw from it too, and a second counter seeded from the
+                // functions and data items alone gave such a row and the first
+                // padding atom one id.
+                pad.symbol = symbolIds.fresh();
                 pad.bytes.assign(bytes.begin() + off,
                                  bytes.begin() + off
                                      + static_cast<std::size_t>(gapLen));

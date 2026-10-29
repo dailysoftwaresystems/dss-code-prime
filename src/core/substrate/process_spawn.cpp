@@ -282,7 +282,8 @@ bool hasDirectoryComponent(std::string const& command) {
 #endif
 }
 
-// A candidate must be a real regular file — and on POSIX, one this user may
+// A candidate must be a program the OS will start: a real regular file (on
+// Windows, also an App Execution Alias, below) — and on POSIX, one this user may
 // actually exec.
 //
 // ★ "NOT EXECUTABLE" IS ITS OWN ANSWER, NOT A FLAVOUR OF "NOT FOUND". This
@@ -302,17 +303,57 @@ enum class CandidateVerdict : std::uint8_t {
     Executable,
 };
 
+// ★ ON WINDOWS THE QUESTION IS THE PROCESS LOADER'S, ASKED OF THE OS. An App Execution Alias
+// (`%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe` and its kind) is a zero-byte reparse point
+// with the tag IO_REPARSE_TAG_APPEXECLINK, which CreateProcessW resolves and runs -- and which
+// `fs::is_regular_file` cannot follow on MS-STL, so the alias a CMake cache named was refused as
+// "not found as an executable" while the very same path ran from any shell (✔MEASURED 2026-10-16:
+// attributes 0x420, tag 0x8000001B; two self-test entries red on a Windows leg). So the OS is asked
+// what the name is (`FindFirstFileW`, whose record carries a reparse point's tag): a directory is no
+// program, an execution alias is one, and anything else -- a file, or a symbolic link, which
+// CreateProcessW follows -- is one exactly when what it reaches is a regular file. A name holding a
+// wildcard is no file a Windows directory can hold (and would make `FindFirstFileW` a search): the
+// OS reads `<`, `>` and `"` as wildcards too (DOS_STAR, DOS_QM, DOS_DOT), not only `*` and `?` --
+// ✔MEASURED 2026-10-21, both Windows libraries, one probe: "python.ex>" and "python\"exe" each found
+// python.exe, "a<" found abc -- so a candidate holding any of the five is no program.
+// Windows keeps no execute bit, so there is no near-miss to report there.
+#if defined(_WIN32)
+constexpr DWORD kAppExecutionAliasTag = 0x8000001BUL;  // IO_REPARSE_TAG_APPEXECLINK (winnt.h)
+#endif
+
 CandidateVerdict classifyCandidate(fs::path const& candidate) {
     std::error_code ec;
-    if (!fs::is_regular_file(candidate, ec) || ec) {
+#if defined(_WIN32)
+    std::wstring const wide = candidate.wstring();
+    if (wide.find_first_of(L"*?<>\"") != std::wstring::npos) {
         return CandidateVerdict::NotAFile;
     }
-#if !defined(_WIN32)
+    WIN32_FIND_DATAW found{};
+    HANDLE const     search = ::FindFirstFileW(wide.c_str(), &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        return CandidateVerdict::NotAFile;
+    }
+    ::FindClose(search);
+    if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return CandidateVerdict::NotAFile;
+    }
+    if ((found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        && found.dwReserved0 == kAppExecutionAliasTag) {
+        return CandidateVerdict::Executable;
+    }
+    // What the candidate REACHES (a dangling link reaches nothing): the substrate's answer, which the
+    // MinGW build's library does not give -- it calls a dangling link a regular file.
+    return core::reachedKind(candidate, ec) == core::EntryKind::File && !ec ? CandidateVerdict::Executable
+                                                     : CandidateVerdict::NotAFile;
+#else
+    if (core::reachedKind(candidate, ec) != core::EntryKind::File || ec) {
+        return CandidateVerdict::NotAFile;
+    }
     if (::access(candidate.c_str(), X_OK) != 0) {
         return CandidateVerdict::NotExecutable;
     }
-#endif
     return CandidateVerdict::Executable;
+#endif
 }
 
 // Build an `fs::path` out of UTF-8 bytes. `nullopt` = the bytes are not UTF-8.
@@ -1000,7 +1041,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // failure (Windows) or as a child that dies after fork (POSIX).
     if (!cwd.empty()) {
         std::error_code ec;
-        if (!fs::is_directory(cwd, ec) || ec) {
+        if (core::reachedKind(cwd, ec) != core::EntryKind::Directory || ec) {
             out.diagnostic = self + "working directory '" + cwd.string()
                            + "' is not a directory"
                            + (ec ? ": " + ec.message() : std::string{});

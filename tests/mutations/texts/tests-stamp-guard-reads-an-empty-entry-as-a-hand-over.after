@@ -1,0 +1,3 @@
+            get_property(_dss_type CACHE "${_dss_entry}" PROPERTY TYPE)
+            if(_dss_abs STREQUAL "" AND NOT _dss_type STREQUAL "UNINITIALIZED")
+                continue()                     # nothing handed: the dependency is fetched

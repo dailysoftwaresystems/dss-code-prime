@@ -26,6 +26,7 @@
 // reports the child's received argv back to the parent — so it is the one place
 // the harness's quoting can be judged by what the CHILD actually got, rather
 // than by re-reading the string the parent produced.
+#include "os_link.hpp"     // links made by the OS: MinGW's library makes none
 #include "run_binary.hpp"
 
 #include "scoped_env.hpp"  // the environment arm's pins set what the child must NOT get
@@ -1095,6 +1096,82 @@ TEST(ResolveExecutableOnPath, FindsANameOnPathAndNotOtherwise) {
                : std::string{});
 }
 
+// A DANGLING LINK IS NO PROGRAM, on every build: a PATH entry holding a dangling link named like the program is
+// passed over, and the search goes on to the entry that holds it -- what the MSVC and POSIX builds always did.
+// libstdc++ on Windows reads a dangling link's own attributes and calls it a regular file, so the MinGW build
+// stopped the search at the link ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]).
+TEST(ResolveExecutableOnPath, ADanglingLinkOnAnEarlierPathEntryIsPassedOver) {
+    fs::path const    ownDir = selfPath().parent_path();
+    std::string const stem   = selfPath().stem().string();
+    dss::test_support::ScratchDir earlier{dss::test_support::Location::Temp, "process-spawn-dangling-path"};
+    // The name the search tries first in that entry: the stem itself on POSIX, the stem with `.exe` on Windows.
+#if defined(_WIN32)
+    fs::path const link = earlier.path() / (stem + ".exe");
+#else
+    fs::path const link = earlier.path() / stem;
+#endif
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(earlier.path() / "no-such-program", link,
+                                                             dss::test_support::LinkTo::File));
+
+    PathVarGuard guard;
+    setPathVar(earlier.path().string() + std::string(1, kPathListSeparator) + ownDir.string());
+    auto const        hit  = resolveExecutableOnPath(stem);
+    std::string const took = !hit.has_value()                                 ? "nothing"
+                           : hit->parent_path() == earlier.path()             ? "the dangling link"
+                           : hit->parent_path().lexically_normal() == ownDir.lexically_normal() ? "the program"
+                                                                              : "another file";
+    EXPECT_EQ(took, "the program") << "the search took " << took;
+}
+
+// A NAME HOLDING A WINDOWS WILDCARD IS NO PROGRAM. On Windows the candidate is classified by the record
+// `FindFirstFileW` returns, and the OS reads `<`, `>` and `"` as wildcards as well as `*` and `?` (DOS_STAR,
+// DOS_QM, DOS_DOT): ✔MEASURED 2026-10-21, `tool.ex>` and `tool"exe` each find `tool.exe`. An App Execution Alias
+// record is taken for a program from that record alone, so a wildcard spelling of one resolved to it. The record
+// here is made in a scratch directory (✔MEASURED 2026-10-21: any process may set the alias reparse tag on a file
+// it creates), so the case needs none of the host's own aliases; the name itself resolving is its control.
+// POSIX holds no wildcard in a file name: `<`, `>` and `"` are ordinary characters there.
+TEST(ResolveExecutableOnPath, ANameHoldingAWindowsWildcardIsNoProgram) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX file name holds no wildcard; the Windows legs ask this";
+#else
+    dss::test_support::ScratchDir dir{dss::test_support::Location::Temp, "process-spawn-wildcard"};
+    fs::path const record = dir.path() / "tool.exe";
+    {
+        HANDLE const file = ::CreateFileW(record.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        ASSERT_NE(file, INVALID_HANDLE_VALUE) << "cannot create " << record.string() << ": " << ::GetLastError();
+        // The alias layout: version 3, then four NUL-ended strings (package, app id, target, app type).
+        std::wstring const strings = std::wstring(L"Dss.Probe_0") + L'\0' + L"Dss.Probe_0!App" + L'\0'
+                                   + L"C:\\Windows\\System32\\cmd.exe" + L'\0' + L"0" + L'\0';
+        std::vector<unsigned char> buffer(12 + strings.size() * sizeof(wchar_t), 0);
+        ULONG const  tag     = 0x8000001BUL;   // IO_REPARSE_TAG_APPEXECLINK
+        USHORT const length  = static_cast<USHORT>(buffer.size() - 8);
+        ULONG const  version = 3;
+        std::memcpy(buffer.data(), &tag, sizeof tag);
+        std::memcpy(buffer.data() + 4, &length, sizeof length);
+        std::memcpy(buffer.data() + 8, &version, sizeof version);
+        std::memcpy(buffer.data() + 12, strings.data(), strings.size() * sizeof(wchar_t));
+        DWORD      returned = 0;
+        BOOL const set      = ::DeviceIoControl(file, FSCTL_SET_REPARSE_POINT, buffer.data(),
+                                                static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr);
+        DWORD const error = set ? ERROR_SUCCESS : ::GetLastError();
+        ::CloseHandle(file);
+        ASSERT_TRUE(set) << "the OS set no alias reparse point on " << record.string() << " (error " << error << ")";
+    }
+    PathVarGuard guard;
+    setPathVar(dir.path().string());
+    EXPECT_TRUE(resolveExecutableOnPath("tool.exe").has_value()) << "the alias record itself is no program: the "
+                                                                   "case cannot tell a wildcard from a miss";
+    // Each spelled with an extension, so the search tries it as given (a name without one is tried with PATHEXT
+    // appended, a spelling no record matches).
+    for (char const* spelled : {"tool.ex>", "tool.ex?", "tool.e*"}) {
+        auto const hit = resolveExecutableOnPath(spelled);
+        EXPECT_FALSE(hit.has_value()) << "`" << spelled << "` resolved to " << (hit ? hit->string() : std::string{})
+                                      << ": a wildcard found a program it does not name";
+    }
+#endif
+}
+
 // A command that already carries a directory component is NOT a PATH lookup —
 // it is taken as given. Pinned with a PATH that contains only a known-empty
 // directory, so a resolver that (wrongly) routed this through the search would
@@ -1110,6 +1187,46 @@ TEST(ResolveExecutableOnPath, APathIsTakenAsGivenWithoutSearching) {
     std::error_code ec;
     EXPECT_TRUE(fs::equivalent(*hit, selfPath(), ec)) << hit->string();
 }
+
+#if defined(_WIN32)
+// ★ AN APP EXECUTION ALIAS IS A PROGRAM, AS CreateProcessW RUNS IT. The aliases Windows keeps in
+// `%LOCALAPPDATA%\Microsoft\WindowsApps` (`python3.exe`, `winget.exe`, ...) are zero-byte reparse
+// points tagged IO_REPARSE_TAG_APPEXECLINK; the process loader resolves them, and MS-STL's
+// `fs::is_regular_file` cannot follow them -- so a CMake cache naming the `python3.exe` alias had
+// every script self-test refused as "not found as an executable" while the same path ran from any
+// shell. The resolver asks the OS instead. The case takes the first alias the host holds and hands
+// its path over as given (no PATH search); a host that holds none says so, and nothing passes.
+TEST(ResolveExecutableOnPath, AnAppExecutionAliasIsAProgramAsCreateProcessRunsIt) {
+    wchar_t const* local = _wgetenv(L"LOCALAPPDATA");
+    if (local == nullptr || *local == L'\0') {
+        GTEST_SKIP() << "LOCALAPPDATA is unset: there is no App Execution Alias directory to look in";
+    }
+    fs::path const          dir = fs::path(local) / L"Microsoft" / L"WindowsApps";
+    std::optional<fs::path> alias;
+    WIN32_FIND_DATAW        found{};
+    HANDLE const            search = ::FindFirstFileW((dir / L"*.exe").wstring().c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if ((found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                && found.dwReserved0 == 0x8000001BUL /* IO_REPARSE_TAG_APPEXECLINK */) {
+                alias = dir / found.cFileName;
+                break;
+            }
+        } while (::FindNextFileW(search, &found));
+        ::FindClose(search);
+    }
+    if (!alias.has_value()) {
+        GTEST_SKIP() << "this host holds no App Execution Alias in its WindowsApps directory: the case did "
+                        "not run";
+    }
+    std::u8string const spelled = alias->u8string();
+    std::string const   utf8(spelled.begin(), spelled.end());
+    auto const          hit = resolveExecutableOnPath(utf8);
+    ASSERT_TRUE(hit.has_value()) << "the App Execution Alias " << utf8
+                                 << " was refused as no program, though CreateProcessW runs it";
+    EXPECT_EQ(*hit, *alias);
+}
+#endif
 
 // ★ THE CURRENT DIRECTORY IS NEVER SEARCHED — including through the back door
 // POSIX leaves open, where an EMPTY PATH entry means "the current directory"

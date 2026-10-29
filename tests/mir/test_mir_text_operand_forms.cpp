@@ -19,8 +19,11 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_literal_pool.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (the reader verifies)
 #include "mir/mir_text.hpp"
+#include "mir/mir_verifier.hpp"   // the one-definition rule, held of a hand-built module
 
 #include <gtest/gtest.h>
 
@@ -29,6 +32,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -121,7 +125,7 @@ TEST(MirTextOperandForms, IndirectBrRoundTripsThroughTheReader) {
 // input reaches it directly.
 TEST(MirTextOperandForms, HandWrittenIndirectBrIsReadBack) {
     std::string const text =
-        "dssir 3\n"
+        "dssir 7\n"
         "symbols {\n"
         "  %1 \"cg\"\n"
         "}\n"
@@ -389,7 +393,7 @@ TEST(MirTextOperandForms, TheUndecodableTypeMarkerIsRefusedByNameAndWarnsOnce) {
 TEST(MirTextOperandForms, UnknownOpcodeRefusalNamesTheAcceptedSet) {
     DiagnosticReporter r;
     auto parsed = parseMir(
-        "dssir 3\nsymbols { %1 \"f\" }\nmodule {\n"
+        "dssir 7\nsymbols { %1 \"f\" }\nmodule {\n"
         "  function %1 : fn() -> void {\n    block %b1 [entry] {\n"
         "      nosuchopcode\n      return\n    }\n  }\n}\n",
         CompilationUnitId{1}, r);
@@ -430,11 +434,11 @@ TEST(MirTextOperandForms, AnUnknownTypeNameIsRefusedRatherThanAborting) {
         EXPECT_FALSE(parsed->ok);
         EXPECT_TRUE(named) << "the refusal must name the offending spelling";
     };
-    probe("dssir 3\nsymbols { %1 \"f\" %2 \"g\" }\nmodule {\n"
+    probe("dssir 7\nsymbols { %1 \"f\" %2 \"g\" }\nmodule {\n"
           "  global %2 : bogus = zero\n"
           "  function %1 : fn() -> void {\n    block %b1 [entry] {\n"
           "      return\n    }\n  }\n}\n");
-    probe("dssir 3\nsymbols { %1 \"f\" }\nmodule {\n"
+    probe("dssir 7\nsymbols { %1 \"f\" }\nmodule {\n"
           "  function %1 : bogus {\n    block %b1 [entry] {\n"
           "      return\n    }\n  }\n}\n");
 }
@@ -446,7 +450,7 @@ TEST(MirTextOperandForms, ARefusedFunctionHeaderDoesNotCascadeOverItsBody) {
     // is re-offered to the MODULE loop and refused in turn.
     DiagnosticReporter r;
     auto parsed = parseMir(
-        "dssir 3\nsymbols { %1 \"f\" }\nmodule {\n"
+        "dssir 7\nsymbols { %1 \"f\" }\nmodule {\n"
         "  function %1 : bogus {\n"
         "    block %b1 [entry] {\n      return\n    }\n"
         "    block %b2 {\n      return\n    }\n"
@@ -477,7 +481,7 @@ TEST(MirTextOperandForms, ARefusedFunctionHeaderDoesNotCascadeOverItsBody) {
 // (a well-formed instruction plus an unconsumed remainder) without needing one.
 TEST(MirTextOperandForms, UnconsumedOperandTailIsRefusedByName) {
     std::string const text =
-        "dssir 3\n"
+        "dssir 7\n"
         "symbols {\n"
         "  %1 \"f\"\n"
         "}\n"
@@ -528,7 +532,7 @@ Mir symbolAddressGlobal(TypeInterner& ti, std::int64_t addend) {
 }
 
 std::string symaddrDoc(std::string const& symbols, std::string const& value) {
-    return "dssir 3\nsymbols {\n" + symbols + "}\nmodule {\n  global %1 : ptr<i32> = lit " + value +
+    return "dssir 7\nsymbols {\n" + symbols + "}\nmodule {\n  global %1 : ptr<i32> = lit " + value +
            " : ptr\n}\n";
 }
 
@@ -586,7 +590,8 @@ TEST(MirTextOperandForms, ASymbolAddressNamingNoDeclaredSymbolIsRefused) {
     auto const undeclared = readDiagnostics(symaddrDoc("  %1 \"p\"\n", "symaddr %9"), &ok);
     EXPECT_FALSE(ok);
     EXPECT_TRUE(mentions(undeclared,
-                         "symaddr names symbol %9, which the `symbols` preamble does not declare"))
+                         "symaddr names symbol %9, which this text neither declares in its "
+                         "`symbols` preamble nor defines"))
         << listed(undeclared);
     auto const sentinel = readDiagnostics(symaddrDoc("  %1 \"p\"\n", "symaddr %0"), &ok);
     EXPECT_FALSE(ok);
@@ -597,4 +602,295 @@ TEST(MirTextOperandForms, ASymbolAddressNamingNoDeclaredSymbolIsRefused) {
     EXPECT_FALSE(ok);
     EXPECT_TRUE(mentions(addend, "expected an integer addend after `symaddr %7 +`, got 'x'"))
         << listed(addend);
+}
+
+// ── (e) EVERY SYMBOL ID A TEXT NAMES IS ONE THE TEXT INTRODUCES ──────────────
+// (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, P69)
+//
+// A text is the name table its module is made from: the reader STATES the module's
+// symbol-id end from the slots the text declares and the symbols it defines, and the
+// next synthesized symbol is minted there. An id the text merely NAMES was outside
+// that statement, and one arm of three asked: `symaddr` refused an undeclared id (the
+// case above), `globaladdr` read it in silence — READ, P69:
+// `globaladdr (%5)` in a text that defines `%1` alone read back stated at 2 — and a
+// `blockaddress_export`'s symbol was a raw payload the WRITER never declared at all.
+// One rule now, for every construct that names an id, over the one list the writer,
+// the reader and the verifier read (mir/mir_symbols_named.hpp).
+//
+// ★ THE NEGATIVE IS MADE FROM THE WRITER'S OWN TEXT, by cutting the one line that
+// declares the id — so each arm fails for that line's absence and for nothing a
+// hand-written text could get wrong beside it.
+//
+// ★ A `blockaddress_export` DEFINES the id it names (P69 fold f26b, the re-review of
+// fold A2, finding 1): the object writes that symbol as a local at the block. So its
+// text needs no declaration of the id, as a global's does not — and a global of the
+// module under the SAME id is a second definition of it, refused by name.
+//
+// THE MUTATIONS THIS CASE WAS WRITTEN AGAINST are arms of `dssharness check-mutations`
+// (tests/mutations/arms.registry), each alone; their verdicts are the registry's:
+//   mir-the-reader-refuses-no-id-its-text-never-introduced   (the reader's rule asks
+//                                                              nothing of a text)
+//   mir-a-blockaddress-export-names-no-symbol_mir-text-operand-forms
+//                                                            (one of the places left
+//                                                              out of the one list)
+//   mir-a-blockaddress-export-defines-no-symbol               (the export is no
+//                                                              definition)
+//   mir-an-id-two-places-define-is-read-in-silence           (the one-definition rule
+//                                                              asks nothing)
+namespace {
+
+enum class NamedBy { GlobalAddr, BlockAddressExport, ConstLiteral };
+
+constexpr std::array kNamedBy{NamedBy::GlobalAddr, NamedBy::BlockAddressExport,
+                              NamedBy::ConstLiteral};
+
+std::string_view spelledAs(NamedBy how) {
+    switch (how) {
+        case NamedBy::GlobalAddr:         return "globaladdr";
+        case NamedBy::BlockAddressExport: return "blockaddress_export";
+        case NamedBy::ConstLiteral:       return "symaddr";
+    }
+    return "?";
+}
+
+// `i32 f(void)` under %1 naming the symbol `named` in ONE place of its body — and,
+// when `definesIt`, a global of the module under that very id.
+Mir functionNaming(TypeInterner& ti, NamedBy how, std::uint32_t named, bool definesIt) {
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const pi32  = ti.pointer(i32);
+    TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
+    TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    if (definesIt) {
+        (void)b.addGlobal(i32, SymbolId{named}, UINT32_MAX, MirFuncId{}, SymbolBinding::Global,
+                          SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    }
+    b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    if (how == NamedBy::BlockAddressExport) {
+        MirBlockId const tgt = b.createBlock(StructCfMarker::Linear);
+        b.beginBlock(entry);
+        MirInstId const addr = b.addBlockAddress(tgt, vptr);
+        b.addBlockAddressExport(addr, SymbolId{named});
+        std::array<MirBlockId, 1> succs{tgt};
+        b.addIndirectBr(addr, succs);
+        b.beginBlock(tgt);
+    } else {
+        b.beginBlock(entry);
+        if (how == NamedBy::GlobalAddr) {
+            (void)b.addGlobalAddr(SymbolId{named}, pi32);
+        } else {
+            MirLiteralValue lit;
+            lit.value = MirSymbolAddrValue{named, 0};
+            lit.core  = TypeKind::Ptr;
+            (void)b.addConst(std::move(lit), pi32);
+        }
+    }
+    b.addReturn(b.addConst(i32Lit(0), i32));
+    Mir m = std::move(b).finish();
+    rederiveStructCfMarkers(m);   // the reader's verifier checks stored == derived
+    return m;
+}
+
+// `text` with `line` — which must stand in it exactly once — replaced by `with`.
+std::string withLineReplaced(std::string text, std::string const& line, std::string const& with) {
+    std::size_t const at = text.find(line);
+    if (at == std::string::npos || text.find(line, at + 1) != std::string::npos) {
+        ADD_FAILURE() << "expected exactly one `" << line << "` in:\n" << text;
+        return text;
+    }
+    text.replace(at, line.size(), with);
+    return text;
+}
+
+struct TextRead {
+    bool                     ok = false;
+    std::uint32_t            end = 0;
+    bool                     endStated = false;
+    std::vector<std::string> diagnostics;
+};
+
+TextRead readBack(std::string const& text) {
+    DiagnosticReporter r;
+    auto const res = parseMir(text, CompilationUnitId{1}, r);
+    TextRead out;
+    out.ok        = res->ok;
+    out.end       = res->mir.symbolIdEnd();
+    out.endStated = res->mir.symbolIdEndIsStated();
+    for (auto const& d : r.all()) out.diagnostics.push_back(d.actual);
+    return out;
+}
+
+} // namespace
+
+TEST(MirTextOperandForms, EverySymbolIdATextNamesIsDeclaredOrDefinedOrRefusedByName) {
+    constexpr std::uint32_t kNamed = 9;
+    std::vector<std::string> names(kNamed + 1);
+    names[1]      = "f";
+    names[kNamed] = "ext";
+    std::string const declaration = "  %9 \"ext\"\n";
+    for (NamedBy const how : kNamedBy) {
+        std::string const construct{spelledAs(how)};
+        SCOPED_TRACE(construct);
+        std::string const refusal = construct + " names symbol %9, which this text neither "
+                                                "declares in its `symbols` preamble nor defines";
+
+        // THE WRITER DECLARES IT, the text reads back and re-emits byte for byte, and
+        // the end the reader states is past it.
+        TypeInterner ti{CompilationUnitId{1}};
+        Mir const m = functionNaming(ti, how, kNamed, /*definesIt=*/false);
+        RoundTrip const rt = roundTrip(m, ti, names);
+        ASSERT_NE(rt.firstEmit.find(declaration), std::string::npos)
+            << "the writer names %9 and does not declare it:\n" << rt.firstEmit;
+        EXPECT_TRUE(rt.parseOk) << rt.firstEmit;
+        EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+        TextRead const declared = readBack(rt.firstEmit);
+        ASSERT_TRUE(declared.ok) << listed(declared.diagnostics);
+        EXPECT_TRUE(declared.endStated);
+        EXPECT_EQ(declared.end, kNamed + 1) << "the stated end is past the declared slot";
+
+        // A `blockaddress_export` DEFINES the id it names; `globaladdr` and `symaddr`
+        // only name one.
+        bool const constructDefines = how == NamedBy::BlockAddressExport;
+
+        // NAMED, NEVER INTRODUCED: the same text less the one line that declares it.
+        TextRead const undeclared = readBack(withLineReplaced(rt.firstEmit, declaration, ""));
+        if (constructDefines) {
+            EXPECT_TRUE(undeclared.ok)
+                << "a text whose block export DEFINES %9 was refused for not declaring it:"
+                << listed(undeclared.diagnostics);
+            EXPECT_EQ(undeclared.end, kNamed + 1)
+                << "the end the reader states is past the id the export defines";
+        } else {
+            EXPECT_FALSE(undeclared.ok) << "a text naming %9, which nothing introduces, was read";
+            EXPECT_TRUE(mentions(undeclared.diagnostics, refusal)) << listed(undeclared.diagnostics);
+            EXPECT_EQ(undeclared.diagnostics.size(), 1u)
+                << "one refusal, by name, and nothing after it:" << listed(undeclared.diagnostics);
+
+            // … AND STILL NEVER INTRODUCED WHEN A HIGHER SLOT IS: %9 is then INSIDE the
+            // end the text states (13), where "an id the module names is below its stated
+            // end" holds of it — and it is nobody's all the same.
+            TextRead const belowAnother =
+                readBack(withLineReplaced(rt.firstEmit, declaration, "  %12 \"other\"\n"));
+            EXPECT_FALSE(belowAnother.ok)
+                << "an id no line introduces was read because a higher slot was declared";
+            EXPECT_TRUE(mentions(belowAnother.diagnostics, refusal))
+                << listed(belowAnother.diagnostics);
+        }
+
+        // DEFINED IS INTRODUCED: a global of the module under %9, and no declaration —
+        // and where the construct DEFINES %9 too, that is two definitions of one id,
+        // refused by name in the reader (it verifies what it reads) and in the verifier.
+        TypeInterner ti2{CompilationUnitId{1}};
+        Mir const defining = functionNaming(ti2, how, kNamed, /*definesIt=*/true);
+        RoundTrip const rt2 = roundTrip(defining, ti2, names);
+        ASSERT_NE(rt2.firstEmit.find("  global %9 : "), std::string::npos) << rt2.firstEmit;
+        TextRead const defined = readBack(withLineReplaced(rt2.firstEmit, declaration, ""));
+        DiagnosticReporter vr;
+        bool const verified = MirVerifier{defining, &ti2}.verify(vr);
+        if (constructDefines) {
+            std::string const twice = "symbol %9 is defined twice in this module, as its global and "
+                                      "as its blockaddress_export";
+            EXPECT_FALSE(defined.ok) << "a text defining %9 twice was read";
+            EXPECT_TRUE(mentions(defined.diagnostics, twice)) << listed(defined.diagnostics);
+            EXPECT_FALSE(verified) << "a module defining %9 twice verified";
+            std::vector<std::string> said;
+            for (auto const& d : vr.all()) said.push_back(d.actual);
+            EXPECT_TRUE(mentions(said, twice)) << listed(said);
+        } else {
+            EXPECT_TRUE(defined.ok) << "a text that DEFINES %9 was refused for not declaring it:"
+                                    << listed(defined.diagnostics);
+            EXPECT_EQ(defined.end, kNamed + 1);
+            EXPECT_TRUE(verified) << "CONTROL: one definition of %9 verifies";
+        }
+    }
+}
+
+// ONE ID, ONE DEFINITION, for every pair of the four definitions a module can give an
+// id (P69 fold f26b, the re-review of fold A2, finding 1): a function's, a global's, an
+// alias's name and a block export's. Each pair is built by hand and VERIFIED — the rule
+// every module is held to, the `.dssir` reader's included (it verifies what it reads;
+// the case above reads one pair through it). Before the fold only an alias's name was
+// held to it, and only beside a function or a global.
+TEST(MirTextOperandForms, AnIdTwoDefinitionsGiveIsRefusedByName) {
+    enum class Def { Function, Global, Alias, Export };
+    struct Case {
+        char const* what;
+        Def         a;
+        Def         b;
+        char const* says;
+    };
+    for (Case const c : {
+             Case{"a function and a global", Def::Function, Def::Global,
+                  "as its function and as its global"},
+             Case{"a global and a block export", Def::Global, Def::Export,
+                  "as its global and as its blockaddress_export"},
+             Case{"a function and a block export", Def::Function, Def::Export,
+                  "as its function and as its blockaddress_export"},
+             Case{"two block exports", Def::Export, Def::Export,
+                  "as its blockaddress_export and as its blockaddress_export"},
+             Case{"a block export and an alias's name", Def::Export, Def::Alias,
+                  "as its blockaddress_export and as its alias"},
+         }) {
+        SCOPED_TRACE(c.what);
+        // f is %1, a global %2 for an alias to name; %9 is the id the pair shares, or —
+        // for the CONTROL below — two different ids.
+        for (bool const shared : {true, false}) {
+            TypeInterner ti{CompilationUnitId{1}};
+            TypeId const i32   = ti.primitive(TypeKind::I32);
+            TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
+            TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+            std::uint32_t const idA = 9;
+            std::uint32_t const idB = shared ? 9 : 10;
+            std::vector<std::pair<Def, std::uint32_t>> const defs{{c.a, idA}, {c.b, idB}};
+            MirBuilder b;
+            (void)b.addGlobal(i32, SymbolId{2}, UINT32_MAX, MirFuncId{}, SymbolBinding::Global,
+                              SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+            for (auto const& [d, id] : defs) {
+                if (d == Def::Global) {
+                    (void)b.addGlobal(i32, SymbolId{id}, UINT32_MAX, MirFuncId{}, SymbolBinding::Global,
+                                      SymbolVisibility::Default, /*isConst=*/false,
+                                      MirThreadStorage::Shared);
+                }
+            }
+            for (auto const& [d, id] : defs) {
+                if (d != Def::Function) continue;
+                b.addFunction(fnSig, SymbolId{id});
+                MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
+                b.beginBlock(e);
+                b.addReturn(b.addConst(i32Lit(0), i32));
+            }
+            b.addFunction(fnSig, SymbolId{1});
+            MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+            MirBlockId const tgt   = b.createBlock(StructCfMarker::Linear);
+            b.beginBlock(entry);
+            MirInstId const addr = b.addBlockAddress(tgt, vptr);
+            for (auto const& [d, id] : defs) {
+                if (d == Def::Export) b.addBlockAddressExport(addr, SymbolId{id});
+            }
+            std::array<MirBlockId, 1> succs{tgt};
+            b.addIndirectBr(addr, succs);
+            b.beginBlock(tgt);
+            b.addReturn(b.addConst(i32Lit(0), i32));
+            for (auto const& [d, id] : defs) {
+                if (d == Def::Alias) {
+                    b.addAlias(SymbolId{id}, SymbolId{2},
+                               MirLinkage{SymbolBinding::Global, SymbolVisibility::Default});
+                }
+            }
+            Mir m = std::move(b).finish();
+            rederiveStructCfMarkers(m);
+            DiagnosticReporter rep;
+            bool const ok = MirVerifier{m, &ti}.verify(rep);
+            std::vector<std::string> said;
+            for (auto const& d : rep.all()) said.push_back(d.actual);
+            if (shared) {
+                EXPECT_FALSE(ok) << "one id, two definitions, verified";
+                EXPECT_TRUE(mentions(said, std::string{"symbol %9 is defined twice in this module, "} + c.says))
+                    << listed(said);
+            } else {
+                EXPECT_TRUE(ok) << "CONTROL: the same two definitions under two ids" << listed(said);
+            }
+        }
+    }
 }

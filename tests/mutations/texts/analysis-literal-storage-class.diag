@@ -1,0 +1,1 @@
+int main(void) { static int *p = &(static int){ 42 }; return *p; }

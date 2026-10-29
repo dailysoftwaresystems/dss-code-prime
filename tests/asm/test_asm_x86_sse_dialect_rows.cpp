@@ -191,7 +191,7 @@ runOn(std::shared_ptr<GrammarSchema> dialect,
     }
 
     run->ok = lowerAsmTemplateToLirRun(*tree, *run->dialect, *run->target,
-                                       bindings, builder, run->reporter);
+                                       bindings, builder, run->reporter, nullptr);
 
     auto const retOp = run->target->opcodeByMnemonic("ret");
     if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};
@@ -252,7 +252,7 @@ runGprToXmm(std::string_view templateText, std::string const& gpr,
     bind("%0", "xmm0", LirRegClass::FPR, dstWidth);
     bind("%1", gpr, LirRegClass::GPR, srcWidth);
     run->ok = lowerAsmTemplateToLirRun(*tree, *run->dialect, *run->target,
-                                       bindings, builder, run->reporter);
+                                       bindings, builder, run->reporter, nullptr);
     auto const retOp = run->target->opcodeByMnemonic("ret");
     if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};
     builder.addReturn(*retOp, {});

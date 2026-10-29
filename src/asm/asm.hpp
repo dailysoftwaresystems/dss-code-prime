@@ -12,6 +12,7 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/unit_linker_requests.hpp"
 #include "lir/lir.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -161,12 +162,55 @@ struct DSS_EXPORT SyntheticBlockSymbol {
 // `[beginByteOffset, endByteOffset)`; a fault in it dispatches to the filter
 // funclet (`filterFuncletSymbol`), and on EXECUTE_HANDLER the OS resumes at
 // `jumpTargetByteOffset` (the `__except` body, in the parent frame).
+//
+// AN ENTRY IS ONE RECORD, NOT ONE `__try`. A guarded region is a set of
+// contiguous byte runs — the blocks its body's statements became, and each run
+// of blocks the lowering created for them and laid out elsewhere in the
+// function — and it has one entry per run, all with the region's filter and
+// handler. The entries of a function are in TABLE ORDER (the dispatcher takes
+// the first record whose range holds the faulting PC): a region's records
+// together, an inner region's before those of a region around it.
 struct DSS_EXPORT SehScopeEntry {
     std::uint32_t beginByteOffset      = 0;  // start of the guarded body (within parent bytes)
     std::uint32_t endByteOffset        = 0;  // one-past the guarded body (half-open range)
     std::uint32_t jumpTargetByteOffset = 0;  // the __except handler block (within parent bytes)
     SymbolId      filterFuncletSymbol{};     // the synthesized filter-funclet function symbol
     SymbolId      personalitySymbol{};       // __C_specific_handler extern (its thunk RVA = the UNWIND handler field)
+};
+
+// P69 fold 3c: THE ROUTINE AN EXCEPTION DISPATCHER CALLS FOR A FUNCTION'S FRAME,
+// AND THE DATA THAT ROUTINE READS, as a FOREIGN object states them — carried
+// with the function, never re-typed.
+//
+// A compiler that guards a frame names a handler routine (a "personality") and
+// hands it a block of data whose layout is the routine's own: cl's
+// `__C_specific_handler` reads a scope table, its `__GSHandlerCheck` a stack
+// cookie's frame offset, and gcc's `__gcc_personality_seh0` an exception table.
+// ✔MEASURED P69 fold 3c in 31 objects from cl 19.44, clang-cl 19.1.5 and mingw-w64
+// gcc 13.2.0: those three routines and `__GSHandlerCheck_SEH`, each with data of
+// its own shape. DSS states what it must to place the function in an image —
+// which routine, in which phases, and where the data holds an address — and
+// carries the rest as bytes, so a routine it has never seen still reads what its
+// compiler wrote. That is why a foreign `__try` is NOT re-read into `sehScopes`:
+// a scope table read into DSS's own model and written back would be the
+// routine's data interpreted by a reader that is not the routine.
+//
+// Engaged only on a function a relocatable-object reader brought, and then
+// always beside `cfi` (the handler is reached through the frame description).
+// A DSS-compiled function's `__try` scopes are `sehScopes`; a function never
+// carries both.
+struct DSS_EXPORT LanguageHandler {
+    // The routine: an import, or a function a unit of the link defines.
+    SymbolId personality{};
+    // Which dispatch phases call it: while a handler is searched for, and while
+    // frames are unwound. At least one.
+    bool exceptionPhase = false;
+    bool unwindPhase    = false;
+    // The routine's data, exactly as the object wrote it.
+    std::vector<std::uint8_t> data;
+    // Each address the data holds, as a relocation whose `offset` is a byte
+    // offset into `data`.
+    std::vector<Relocation> relocations;
 };
 
 // ★★★ THE PRODUCER'S INPUT SECTION AN ATOM WAS CUT FROM, when that section is
@@ -237,8 +281,9 @@ struct DSS_EXPORT AssembledFunction {
     // quoted verbatim -- as "AssembledFunction::unwind is nullopt on the object
     // path by construction" -- inside the `$sehPersonalityOmittedComment` of
     // BOTH `pe64-x86_64-windows.format.json` and
-    // `pe64-x86_64-windows-staticlib.format.json`, where it is the stated
-    // reason those two formats decline `sehPersonality`, and again in
+    // `pe64-x86_64-windows-staticlib.format.json`, where it WAS the stated
+    // reason those two formats declined `sehPersonality` (both state it since
+    // P69 fold 3c, and that comment is gone with its premise), and again in
     // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO's evidence chain. A reader who
     // believes it concludes the unwind data does not EXIST on the object path
     // and looks upstream for a producer to fix. It does exist.
@@ -279,6 +324,9 @@ struct DSS_EXPORT AssembledFunction {
     // is a source-language construct (`__try`), not a statement about where a
     // register was spilled, and no other format's unwind encoder wants it.
     std::vector<SehScopeEntry> sehScopes;
+    // P69 fold 3c: the handler a FOREIGN object named for this function, and its
+    // data (`LanguageHandler` above). nullopt for every function DSS compiled.
+    std::optional<LanguageHandler> languageHandler;
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols this
     // function's block-address `lea`s reference, each paired with the
     // target block's byte offset within `bytes`. The encoder records a
@@ -526,6 +574,66 @@ struct DSS_EXPORT ModuleSymbol {
     // the COMDAT Selection byte. See `core/types/symbol_attrs.hpp` for why this
     // is a second axis rather than two more `SymbolBinding` enumerators.
     DuplicateMatch   duplicateMatch = DuplicateMatch::Any;
+    // P69 (the weak-definition KIND, `core/types/symbol_attrs.hpp`): which of the
+    // two things a WEAK definition is, where its producer's form states one.
+    // Read only when `binding == Weak`. The COFF object reader states both: a
+    // WEAK EXTERNAL whose default is a body of its object is `Overridable`
+    // (MinGW gcc's and clang's `__attribute__((weak))`), a weak COMDAT symbol
+    // `SelectAny`. A unit DSS COMPILES states the kind its front end gave the
+    // definition (`MirLinkage::statedWeakKind`, written by the pipeline's
+    // `appendSym`) on EVERY format — `__attribute__((weak))` is `Overridable`
+    // on ELF and Mach-O too. EMPTY on a row an object READER read from a format
+    // with one spelling for both (ELF's `STB_WEAK`, Mach-O's `N_WEAK_DEF`) and
+    // on a row nobody stated a kind for: an absent kind is neither, and nothing
+    // reads it as one. (P69 fold 3b, the review of fold 3a, F11: this said EMPTY
+    // on ELF and Mach-O, which compiled rows stopped being in fold 3a.)
+    //
+    // What a kind MEANS beside a common of the name and beside the other weak
+    // definitions of it is the LINK document's fact (`commonYieldsTo`), asked
+    // through `link/common_yield.hpp` — never decided where the kind is read.
+    // (It replaces round 4's `yieldsToACommon`, a bool that said one
+    // consequence of one kind on one format: ✔MEASURED 2026-10-08, the same
+    // kind also loses to a select-any definition of its name, and that had no
+    // home — D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER.)
+    std::optional<WeakDefinitionKind> weakKind;
+    // P69 (THE WEAK-NAME RULE, `link/format/object_atom_coverage.hpp`): HOW THE
+    // UNIT THAT CARRIES THIS ROW REFERS TO THE NAME. True when every reference
+    // the unit makes through this NAME is a reference row of the name
+    // (`ExternImport`), never a relocation against the definition — which makes
+    // a relocation of the unit that DOES target the definition a reference to
+    // its BYTES (one written through a `static` name of the body, or through
+    // its section). An object reader states it for every weak name it keeps a
+    // reference on. False — the default — where the unit targets the
+    // definition for a reference through the name too: a unit DSS compiles,
+    // whose every reference to its own weak definition means the name.
+    //
+    // Read only when `binding == Weak`, and it is what tells the two meanings
+    // of one relocation apart. What the second meaning DOES is the format's
+    // (`supersededDefinition`, the link's document): where a superseded
+    // definition keeps its bytes the merge keeps such a relocation on them
+    // (`linker.cpp`, `keptBytesId`) and a relocatable artifact gives them a
+    // record of their own (`ObjectSymbolNames`, `object_symbol_names.hpp`);
+    // where it is replaced whole the relocation goes to the winner as the name
+    // does.
+    bool             referencedByName = false;
+    // P69 fold 3c: THE ONE INSTANCE OF ITS NAME IN THE PROCESS. True when the
+    // unit states that every image a process loads binds this name to ONE
+    // definition — images that would each keep a copy of an ordinary global (a
+    // library loaded `RTLD_LOCAL`) included. g++ states it for a C++ inline
+    // variable and a template's static data member (ELF's STB_GNU_UNIQUE,
+    // ✔MEASURED 2026-10-20, g++ 13.3). A static link reads such a definition as
+    // its `binding` says — the binding the format document says it is read AS
+    // (`elf.uniqueBinding`) — so two of one name are one definition or a
+    // duplicate exactly as two of that binding are; the property is CARRIED, and a
+    // writer spells it back with the binding its document states and refuses it
+    // under a document that states none (`requireOneInstancePerProcessSpelling`).
+    // An object READER states it, through its document; nothing else does.
+    bool             oneInstancePerProcess = false;
+    // ⓘ A definition's SECTION GROUP is not stated here: membership is a fact
+    // of the definition's input SECTION, stated once for the unit
+    // (`AssembledModule::sectionGroupOfInputSection`). Until P69 fold 3c a
+    // second copy of it lived on the row (`sectionGroup`); it was removed with
+    // the merge refusal that was its one reader of its own.
 };
 
 struct DSS_EXPORT AssembledModule {
@@ -573,6 +681,44 @@ struct DSS_EXPORT AssembledModule {
     // `dataItems` populate) is anchored as a follow-up cycle.
     std::vector<AssembledData>     dataItems;
 
+    // ── WHICH INPUT SECTIONS OF THIS UNIT ARE MEMBERS OF WHICH SECTION GROUP ──
+    //    (P69 fold 3; D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE)
+    //
+    // Key: an input section of the unit, as its items name it
+    // (`InputSectionSlice::section`). Value: the signature of the COMDAT group
+    // that section is a member of — a symbol's name. Stated by an object reader
+    // whose form has such groups (ELF's `SHT_GROUP` marked `GRP_COMDAT`); empty
+    // everywhere else, a unit DSS compiles included.
+    //
+    // ★ THE ONE STATEMENT OF MEMBERSHIP, AND WHY IT IS A SECTION'S. A group is
+    // kept or discarded WHOLE by its format's linkers — the first unit that
+    // carries a signature keeps its group, every later unit's goes, bytes and all
+    // — and a member section need hold no named definition at all: the jump
+    // table gcc writes for a function of a group is `.rodata.<f>`, whose only
+    // symbol is the section's own, and it reaches the link as an item with no
+    // row. Until P69 fold 3c a definition's row carried a second copy
+    // (`ModuleSymbol::sectionGroup`); two statements of one fact can disagree,
+    // and the row's could not speak for the table. Read by the link's discard
+    // (`linker.cpp`, `discardLaterSectionGroups`), which drops every later
+    // unit's member sections before any name is resolved; a merged module
+    // carries the statement of each group it keeps, for the relocatable writer,
+    // which writes the group back.
+    std::unordered_map<std::uint32_t, std::string> sectionGroupOfInputSection;
+
+    // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ──
+    //
+    // Symbols whose ADDRESS IS 0: a weak symbol the link resolved to NOTHING,
+    // as the PC-relative and branch fields that name it directly see it (a
+    // reference through a slot reads the symbol's own null slot instead, and an
+    // absolute field is written by the link itself). Minted only by
+    // `linker::link`'s reference gate, and only where the image document
+    // answers `zero` for such a field (`weakResolvedToNothing`) — which the
+    // loader allows only on a writer that places the image at its link address
+    // (`ObjectFormatBackend::writesNullAddressReferences`); that writer gives
+    // each the address 0. Never carried by a module a compiler or an object
+    // reader produced.
+    std::vector<SymbolId>          nullAddressSymbols;
+
     // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
     //
     // The module's STATIC-INITIALIZER SCHEDULE, copied verbatim from
@@ -592,6 +738,16 @@ struct DSS_EXPORT AssembledModule {
     // first, then a deterministic tie-break across every module), so it happens
     // once, in the one place that can see every translation unit.
     std::vector<LirStaticInitEntry> staticInitSchedule;
+
+    // ── D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4) ──
+    //
+    // What this unit asks of the LINK beyond its own symbols: the image requests,
+    // the exports and the hides its linker directives state (a foreign COFF
+    // object's `.drectve`), and the tokens a relocatable artifact holding it
+    // hands on verbatim. Empty for every unit but a foreign COFF object's; the
+    // cross-unit merge folds each unit's in unit order
+    // (`appendUnitLinkerRequests`), and `linker::link` decides them.
+    UnitLinkerRequests             linkerRequests;
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): override of the image
     // entry-point function index. When set, the format walker

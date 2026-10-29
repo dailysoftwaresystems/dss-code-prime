@@ -1,0 +1,2 @@
+                        found = blockFunctionDeclarationBefore(
+                            s, tree.id(), resolved.name, tree.span(resolved.node).start());

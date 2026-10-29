@@ -25,6 +25,10 @@ dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
 # Cycle 24 — the pure cross-CU DEFINITION resolver tripwire (shared by the linker
 # today + a future whole-program MIR merge). Direct value-in/value-out policy pins.
 dss_add_test(NAME link/test_cross_cu_resolve     SOURCES test_cross_cu_resolve.cpp)
+# P69 (cs-28) — the election that settles a definition's own name before the
+# other names it carries run (`resolveSettlingCarriedNames`, link/common_yield.hpp),
+# over synthetic elections: withdrawal, the settled order, a cycle left live.
+dss_add_test(NAME link/test_settled_election     SOURCES test_settled_election.cpp)
 dss_add_test(NAME link/test_crosscu_link_formats SOURCES test_crosscu_link_formats.cpp)
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
@@ -122,18 +126,16 @@ target_link_libraries(dss_link_test_link_veneer_vocabulary
     PRIVATE nlohmann_json::nlohmann_json)
 # ... and its REAL-SCALE end-to-end: the subject row's own shape at 144 MiB
 # through the real linker (entry trampoline, stub layout, veneer pass, writer)
-# for ELF exec, PIE and Mach-O, and RUN where an arm64 runner exists. OPT-IN,
-# because each arm holds ~600 MB and hashes the image for its build-id; the
-# default gate pins the same decisions through the planner's size-only model.
-# Enable with -DDSS_REAL_SCALE_TESTS=ON; the entry carries the `real-scale`
-# label so a gate that does enable it can still select or exclude it by name.
-option(DSS_REAL_SCALE_TESTS "Register the opt-in real-scale link tests" OFF)
-if(DSS_REAL_SCALE_TESTS)
-    dss_add_test(NAME link/test_branch_veneers_real_scale
-                 SOURCES test_branch_veneers_real_scale.cpp)
-    set_tests_properties(link/test_branch_veneers_real_scale
-                         PROPERTIES LABELS real-scale)
-endif()
+# for ELF exec, PIE and Mach-O, and RUN where an arm64 runner exists. It runs
+# on EVERY leg: an opt-in test nothing turns on is code no gate compiles. Each
+# arm holds ~600 MB at its peak and hashes the image for its build-id, one arm
+# after another in one process (✔MEASURED 2026-10-15 on macos-arm64-debug: the
+# entry passed in 26.22 s). The `real-scale` label names it, so a run that must
+# leave it out can say so by name.
+dss_add_test(NAME link/test_branch_veneers_real_scale
+             SOURCES test_branch_veneers_real_scale.cpp)
+set_tests_properties(link/test_branch_veneers_real_scale
+                     PROPERTIES LABELS real-scale)
 
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
@@ -271,6 +273,29 @@ target_link_libraries(dss_link_test_macho_object_reader
 dss_add_test(NAME link/test_pe_object_data_import_slot
              SOURCES test_pe_object_data_import_slot.cpp)
 
+# P69 (lane `cs`, fold f26b) — a `__declspec(dllimport)` declaration with no `extern`, at file scope and inside a
+# body, names another image's object: a DSS-built DLL exports the datum, and DSS, mingw-w64 gcc and cl each build
+# an image that reads it through such a declaration and RUN it (42). Windows-only; each reference arm skips naming
+# the absent toolchain. Compiles through the production driver, hence the `program` surface.
+dss_add_test(NAME link/test_pe_dllimport_declaration_link
+             SOURCES test_pe_dllimport_declaration_link.cpp)
+
+# P69 (lane `cs`, fold f26b) — a weak alias READ from a foreign COFF object is written back as its compiler wrote it:
+# clang-cl's overridable `m` of the select-any `w` (`tests/link/data/coff_carried_alias_b_clangcl_O2.obj`), read by
+# DSS and relocatably linked alone, is still a weak external whose default is `w`'s own record. In process on every
+# leg: the fixture is read, never compiled.
+dss_add_test(NAME link/test_pe_foreign_weak_alias_rewrite
+             SOURCES test_pe_foreign_weak_alias_rewrite.cpp)
+
+# P69 (lane `cs`, fold f26b) — one program, two routes, one answer: the same C units built by the MERGED route (one
+# compile of every unit) and by the UNIT route (each unit to an object alone, the objects linked), on PE and ELF, both
+# unit orders — a weak alias of a copy that loses, and two different weak definitions of one name on PE. Every cell is
+# built both ways on every host; a linked cell is run where its image runs.
+dss_add_test(NAME link/test_weak_definitions_through_both_routes
+             SOURCES test_weak_definitions_through_both_routes.cpp)
+target_link_libraries(dss_link_test_weak_definitions_through_both_routes
+                      PRIVATE nlohmann_json::nlohmann_json)
+
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 # The emission-alias pin splices ONE extra `relocations[]` row into a shipped
 # `.format.json`, deriving the aliased wire id and a free `kind` FROM the
@@ -403,6 +428,13 @@ dss_add_test(NAME link/test_macho_eh_frame       SOURCES test_macho_eh_frame.cpp
 # the name.
 dss_add_test(NAME link/test_cross_cu_alias_merge
              SOURCES test_cross_cu_alias_merge.cpp)
+
+# D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE — the COMPILED shape of a symbol alias (a body, a second name on its id,
+# the unit's own uses through a reference row of the name) through the link on ELF, PE and Mach-O, as an image and as a
+# relocatable object read back by the format's own reader: the call lands on the aliased body; a weak alias yields its
+# name to another unit's strong definition and the unit's call follows the name; a strong one beside it is refused.
+dss_add_test(NAME link/test_compiled_symbol_alias
+             SOURCES test_compiled_symbol_alias.cpp)
 
 # D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the linker tier's
 # one site of the class: `linker::link`'s exec-flavored refusal
@@ -790,3 +822,223 @@ dss_add_test(NAME link/test_page_offset_relocations
              SOURCES test_page_offset_relocations.cpp)
 target_link_libraries(dss_link_test_page_offset_relocations
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-PE-OBJ-PDATA-FIELDS-COUNT-THE-FUNCTION-OFFSET-TWICE — a DSS pe64 object's
+# RUNTIME_FUNCTIONs as the REFERENCE LINKERS resolve them. Tier 1 resolves every
+# `.pdata` field as S + A on every leg; tier 2 hands the same object to link.exe
+# and to MinGW's linker and RUNS it, the image asking the OS for each of its own
+# functions' entries. Compiles through the production driver (`program` surface),
+# as `test_pe_object_data_import_slot` does.
+dss_add_test(NAME link/test_pe_object_unwind_reference_link
+             SOURCES test_pe_object_unwind_reference_link.cpp)
+
+# D-LK-COFF-FOREIGN-UNWIND-DROP -- a reference compiler's COFF object read with its `.pdata`/`.xdata`: each
+# RUNTIME_FUNCTION's UNWIND_INFO decoded into its function's frame rules and a handler carried with its data, both
+# written back by the shipped PE writer byte for byte, on the committed objects of cl, clang-cl and mingw-w64 gcc
+# (`tests/link/data/win64_unwind_*`). Every leg reads and links them; on Windows x86_64 a `__try` object linked by
+# DSS beside a C `main` runs and catches its fault.
+dss_add_test(NAME link/test_coff_foreign_unwind
+             SOURCES test_coff_foreign_unwind.cpp)
+
+# P69 fold 3c (lane `xa`) — [[D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND]],
+# [[D-ASM-DATA-WORD-RELOCATION-KIND-PICKED-BY-DECLARATION-ORDER]] and
+# [[D-LK-RELOCATION-TYPES-REFERENCE-COMPILERS-EMIT-FOR-C-UNDECLARED]]: each narrow Linear field's declared range, the
+# address slot's row picked by range, and the references' JUMP26 / R_X86_64_32S objects read, linked and run.
+dss_add_test(NAME link/test_linear_field_range
+             SOURCES test_linear_field_range.cpp)
+
+# P69 fold 3c (lane `xa`) — [[D-LK-COFF-READER-IGNORES-THE-RELOCATION-COUNT-OVERFLOW]] and [[D-LK2-3]]: a COFF
+# section past the u16 NumberOfRelocations, written and read through IMAGE_SCN_LNK_NRELOC_OVFL's count record.
+dss_add_test(NAME link/test_coff_relocation_count_overflow
+             SOURCES test_coff_relocation_count_overflow.cpp)
+
+# P69 fold 3c (lane `xa`) — [[D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT]],
+# [[D-LK-COFF-READER-TAKES-AN-UNTYPED-UNDEFINED-SYMBOL-AS-DATA]] and
+# [[D-FF1-AR-READER-REFUSES-THE-COFF-LONGNAMES-MEMBER]]: a foreign object that calls the C library, named to the link
+# or archived by lib.exe under a long name, bound to the library's image as the archive-pulled member is
+# (`tests/link/data/foreign_object_library_binding.*`). Every leg links them; on Windows x86_64 each image runs.
+dss_add_test(NAME link/test_foreign_object_library_binding
+             SOURCES test_foreign_object_library_binding.cpp)
+
+# P69 (lane `cs`) — a GLOBAL alias of a `static` body (`alias("target")`) in a DSS pe64 relocatable object, as
+# link.exe and MinGW's linker take it: a second DSS object calls the alias by its global name and the image RUNS,
+# the objects compiled at the baseline and at release. Windows-only; each arm skips naming the absent toolchain.
+dss_add_test(NAME link/test_pe_object_alias_reference_link
+             SOURCES test_pe_object_alias_reference_link.cpp)
+
+# D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB — the structure that gives a library function ONE address across
+# the process, read off images the production driver builds from C source: an address-taken import is STT_FUNC with
+# its stub as st_value in every ELF executable and PIE, the stub's own slot a JUMP_SLOT (never a GLOB_DAT, which
+# would bind the stub to itself); a call-only import is untouched; a shared object states no canonical stub.
+dss_add_test(NAME link/test_library_function_address
+             SOURCES test_library_function_address.cpp)
+
+# D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED + the PE half of D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB with
+# FOREIGN code in the image. Tier 1 (every host): `__imp_X` folded into import X's address slot, on hand-built
+# modules. Tier 2 (Windows with cl/lib and MinGW gcc/ar): an MSVC /MD member, a MinGW member and DSS code in ONE DSS
+# image, every `&puts` each takes compared with GetProcAddress, and a call through `__imp_puts`.
+dss_add_test(NAME link/test_pe_foreign_import_address
+             SOURCES test_pe_foreign_import_address.cpp)
+# P69 fold 3c: its no-address-slot pin builds its synthetic target with `mutate_target_schema.hpp`, an nlohmann
+# consumer.
+target_link_libraries(dss_link_test_pe_foreign_import_address
+    PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE (P69 review M1, MINOR 8) — what an image makes of a unit's PC-relative, non-branch
+# reference to an import (`pcRelativeImportAddress`: the unit binds every address of it to the call entry on PE, and
+# is refused by name on an ELF shared object and a Mach-O image), the target-declared branch decoder it reads the
+# instruction with, and the load-time fix-up runner a PE image synthesizes for the slots its loader cannot bind.
+dss_add_test(NAME link/test_pc_relative_import_address
+             SOURCES test_pc_relative_import_address.cpp)
+
+# P69 review M4 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) — DSS's RELOCATABLE GOT-load encoding as the
+# REFERENCE linkers consume it. Tier 1 (every host): the four relocatable formats' objects read back, every address of
+# an import a GOT load. Tier 2 (Linux x86_64 / aarch64 with gcc, macOS with Apple's ld): the host's own linker links the
+# DSS object into a harness, `-no-pie` and `-pie` / both Mach-O ISAs, and every value is compared with dlsym.
+dss_add_test(NAME link/test_relocatable_got_load_reference_link
+             SOURCES test_relocatable_got_load_reference_link.cpp)
+# Its Rosetta arm runs through the cross-arch gate, whose table is JSON (host_translations.hpp); an arm the gate skips
+# for want of the translator is a red under strict arm verdicts, as a corpus arm's is.
+target_link_libraries(dss_link_test_relocatable_got_load_reference_link
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_relocatable_got_load_reference_link)
+
+# P69 (the PE half of D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS) — a COFF object's LINKER DIRECTIVES: the
+# hide directive DSS writes for a hidden definition, every directive the COFF reader reads (an undeclared one refused
+# by name), a DSS DLL that links such a member exporting the entry alone, and GNU ld doing the same (Windows).
+dss_add_test(NAME link/test_coff_linker_directives
+             SOURCES test_coff_linker_directives.cpp)
+target_link_libraries(dss_link_test_coff_linker_directives
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 round 4 (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE) — what a COFF object's linker directives ask of the
+# IMAGE: each request parsed as link.exe reads it, decided across units with link.exe's precedence, and landed in the
+# PE header, section table, export table, checksum and entry; refused by name by an image that cannot carry it and
+# handed on verbatim by a relocatable artifact.
+dss_add_test(NAME link/test_coff_directive_image_requests
+             SOURCES test_coff_directive_image_requests.cpp)
+
+# D-LK-MACHO-X86-64-OBJECT-WROTE-RIP-RELATIVE-OPERANDS-AS-BRANCHES (P69 review MINOR 9) — a DSS x86_64 Mach-O object
+# states each RIP-relative field by what its instruction does (BRANCH for a call, SIGNED for an operand); tier 2 on
+# the Mac links the object with Apple's ld and runs it under Rosetta.
+dss_add_test(NAME link/test_macho_x86_64_rip_relative_roles
+             SOURCES test_macho_x86_64_rip_relative_roles.cpp)
+# Tier 2's run goes through the cross-arch gate, whose table is JSON (host_translations.hpp).
+target_link_libraries(dss_link_test_macho_x86_64_rip_relative_roles
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_macho_x86_64_rip_relative_roles)
+
+# D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY (P69) — every block a format BACKEND reads (`pe`, `optionalHeader`,
+# `elf`, `macho`, `image` and its nested objects) refuses a misspelled key at the key's own pointer.
+dss_add_test(NAME link/test_format_identity_block_keys
+             SOURCES test_format_identity_block_keys.cpp)
+target_link_libraries(dss_link_test_format_identity_block_keys
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69 re-review MAJOR 2) — a DSS pe64 relocatable object's `&puts` in
+# code and in its own statics, as the REFERENCE PE linkers bind it. Tier 1 (every host): every relocation the object
+# writes against the function is the one absolute pointer relocation, and none names `__imp_puts`. Tier 2 (Windows):
+# the same objects linked by link.exe, GNU ld, lld-link where present, and DSS (the member archived by lib.exe), each
+# image run: one address under every linker — the thunk under a foreign one, GetProcAddress's under DSS's.
+dss_add_test(NAME link/test_pe_object_function_address_reference_link
+             SOURCES test_pe_object_function_address_reference_link.cpp)
+
+# D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS (P69) — a COMMON (tentative) definition through the link (one object
+# per name: the larger, the wider-aligned; a strong definition wins; a weak one is the link document's
+# `commonYieldsTo`: the common outranks it on ELF, it replaces the common on Mach-O and PE; a relocatable hands it on)
+# and through every writer and its reader; natively, cl's and mingw gcc's tentative definitions link under DSS; the
+# archive search beside a member that defines a common's name, as each format's linkers answer it (ELF and Mach-O
+# fetch the first member whose datum the common yields to, PE keeps the common); and, on every host, the reference
+# compiler's common beside a weak definition and beside archive members, under its own linker and under DSS.
+# The image-tier pins find the datum through the patched displacement: an ELF image's `.symtab` lists no datum.
+dss_add_test(NAME link/test_common_symbols
+             SOURCES test_common_symbols.cpp)
+# The archive-search key's refusals load a shipped member document plus one key (round 3,
+# D-LK-ARCHIVE-SEARCH-FETCHED-A-DEFINITION-FOR-A-COMMON), so the fixture cannot drift from the file; the native arms'
+# x86_64 Mac cells run through the cross-arch gate, whose table is JSON (host_translations.hpp).
+target_link_libraries(dss_link_test_common_symbols
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_common_symbols)
+
+# D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3b) — a unit DSS compiles writes each tentative
+# definition the link may fold as a COMMON where its document states commons (`ObjectFormatSchema::statesCommons`):
+# every shipped document's answer, the rows a unit states per document (and the definition a document without the keys
+# keeps, read off a document, never a format's name), each relocatable writer with its reader, DSS's links of two DSS
+# objects and of DSS archives of commons cell by cell, and the host's reference linkers with a DSS object beside the
+# reference's own (the table's answer asserted, the reference's own objects its control). The documents are read as
+# JSON to remove the keys, and the native arms are strict-arm verdicts.
+dss_add_test(NAME link/test_tentative_definitions_as_commons
+             SOURCES test_tentative_definitions_as_commons.cpp)
+target_link_libraries(dss_link_test_tentative_definitions_as_commons
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_tentative_definitions_as_commons)
+
+# P69 fold 3b — the two ownership shapes fold 3a's atom-identity ranking changed (a module-private name beside an
+# external hidden one; a visible weak name beside a hidden strong one), on the references' ELF and Mach-O objects
+# (`tests/link/data/owner_*`): the owner each reader ranks, and DSS's links of the shapes, both orders and after its
+# relocatable link of the shape's object, against the table its header states. Foreign-arch images run through the
+# cross-arch gate, whose verdicts are strict-arm verdicts.
+dss_add_test(NAME link/test_atom_ownership_shapes
+             SOURCES test_atom_ownership_shapes.cpp)
+target_link_libraries(dss_link_test_atom_ownership_shapes
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_atom_ownership_shapes)
+
+# D-LK-THREAD-STORAGE-DISAGREEMENT-REFUSED-ONLY-BY-THE-WRITER-BACKSTOP (P69 round 4) — a linked reference and the
+# definition it binds to agree on storage duration, or the link is refused by name before the merge, on every shipped
+# exec format that carries thread-locals; agreeing pairs link clean, and a reference nothing reads is not judged.
+dss_add_test(NAME link/test_thread_storage_agreement
+             SOURCES test_thread_storage_agreement.cpp)
+
+# D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA (P69) — an archive member built by the host's reference compiler that names
+# a library function only through the GOT (`-fno-plt`) or by its address states no kind, and links under a DSS main
+# that calls the function: Linux exec and PIE (gcc), macOS arm64 and x86_64 (Apple clang; x86_64 through the cross-arch
+# gate, whose table is JSON — host_translations.hpp).
+dss_add_test(NAME link/test_member_untyped_extern_kind
+             SOURCES test_member_untyped_extern_kind.cpp)
+target_link_libraries(dss_link_test_member_untyped_extern_kind
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_member_untyped_extern_kind)
+
+# D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69, lane `lm`) — what a reference naming a weak
+# symbol the image resolves to nothing computes, per field class and per image (`weakResolvedToNothing`): read back
+# off the emitted ELF, PE and Mach-O images, each zero beside a control the same reader sees differently.
+dss_add_test(NAME link/test_weak_resolved_to_nothing
+             SOURCES test_weak_resolved_to_nothing.cpp)
+
+# D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE (P69 round 4, lane `lm`) — whether a static link's archive
+# search fetches a member for a name it holds only as a WEAK reference, as each format's reference linkers answer it
+# (`archiveWeakReferenceSearch`: ELF and PE no, Mach-O yes; a COFF weak external that states SEARCH_LIBRARY asks the
+# search itself). The key's refusals load a shipped member document plus one key, so the fixture cannot drift.
+dss_add_test(NAME link/test_archive_weak_reference_search
+             SOURCES test_archive_weak_reference_search.cpp)
+target_link_libraries(dss_link_test_archive_weak_reference_search
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE (P69 fold 3, the review of fold 2, F1) — a relocation
+# that stands INSIDE a section group and names a member of it (a function's jump table, as gcc writes one) is no
+# reference to discarded bytes: a tracked pair of ELF objects, each carrying group `f` of two sections, links in both
+# orders with both callers on the first unit's body and each table on its own body's cases; the reader states the
+# group of every member SECTION; and a relocation from OUTSIDE a discarded group is still refused by name.
+dss_add_test(NAME link/test_group_member_relocations
+             SOURCES test_group_member_relocations.cpp)
+
+# D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER +
+# D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3) — ONE TABLE OF PAIRS, FOUR DOORS: every
+# ordered pair of {strong, tentative, overridable, select-any} definitions of one name, for ELF, PE and Mach-O, each
+# cell the answer its format's reference linkers gave, held against the fold itself, the unit linker (a relocatable
+# artifact read back), the cross-unit MIR merge and the summary index; the refusal's code and sentence through
+# every door that reports; and the key that decides a weak definition beside a strong one — refused on an archive
+# document and outside its values, and a document that does not say refused by the key's name where it is asked.
+dss_add_test(NAME link/test_cross_unit_fold_doors
+             SOURCES test_cross_unit_fold_doors.cpp)
+target_link_libraries(dss_link_test_cross_unit_fold_doors
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3 — the DEFAULT RECORD of a COFF weak definition: read back hidden (its role AND its name asked) on the
+# compilers' own objects and on DSS's, so no image exports it; and still the record that owns the body, through
+# every round of write and read — which record owns a body several records name is ranked by linkage, then
+# strength, and by visibility only among what is left. Fold 3b: the `.pdata` records DSS writes for an OVERRIDABLE
+# function's body name its default record, never its weak name (the review of fold 3a, F1).
+dss_add_test(NAME link/test_weak_default_record
+             SOURCES test_weak_default_record.cpp)

@@ -1,0 +1,35 @@
+{
+  "$comment": "A FUNCTION TYPE CARRIES AN ARRAY OF UNKNOWN SIZE (P69 fold f26b, lane cs; D-C-A-POINTER-TO-AN-ARRAY-OF-UNKNOWN-SIZE-IS-WARNED-INCOMPATIBLE). Two function types are compatible when their results and each parameter are (C 6.7.6.3p15), and an array of unknown or variable size is compatible with one of any size of a compatible element (C 6.7.6.2p6), so a function designator returning `int (*)[]` decays into a pointer to a function returning `int (*)[3]` or `int (*)[m]` and the reverse, a parameter the same, one function further down the same, through an initialization, an assignment, a call argument and a return statement; `==` pairs such a pointer with such a designator, `_Generic` selects the compatible association, and a function may be declared one way and defined the other. Before this fold DSS warned every designator conversion here an incompatible pointer conversion (the decay asked for the IDENTICAL signature) and `forbidDiagnostics` pins that it no longer does. Each check returns its own number on failure; 42 means every one held. The `release` arm runs the same through the shipped optimizer.",
+  "$measuredComment": "MEASURED 2026-10-22 (lane cs probe ftx) through `dssharness run probe-reference-cc`, on THIS source byte for byte (main.c, md5 f8a62fadf81943fe4828802138e93479): gcc 13.3.0 and clang 18.1.3 on x86_64 Linux at -pedantic-errors -Wall, -O0 and -O2 (run 20261022-013556-c06095ba), and mingw-w64 gcc 13.2.0 the same (run 20261022-013602-cf7c24f0): every image built in silence and exited 42. cl 19.51 is not a reference for this source: it has no run-time array bound (C2057) and refuses the result declared one way and defined the other (C2369) — probe ft cells 3, 4, 7 and 13 (run 20261022-012508-b142c317).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "forbidDiagnostics": ["S_IncompatiblePointerConversion"],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

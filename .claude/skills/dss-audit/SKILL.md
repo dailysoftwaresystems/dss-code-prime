@@ -61,7 +61,8 @@ If an item could not be verified, say **"unverified"** explicitly. Never round i
 5. **Strict-assertion tests** — a test that still passes when the implementation is silently broken
    is not strict enough.
 6. **The full gate held** — build · full ctest · anchor-registry guard · agnosticism scan · review
-   folded · **and all CI legs, not just local**.
+   folded · **and every leg, not just local**: the eight-run gate (`dssharness test --legs gate`) read from
+   its run records, and CI's verdicts read with `dssharness check-ci-legs`.
 7. **No un-anchored issue** — everything the cycle came across is anchored AND handled; a workaround
    that hides an issue, or a row for work the cycle could have done, breaks it.
 
@@ -132,7 +133,7 @@ the next audit will run. Note any WIP already on top.
 - **Rubber-stamping green.** Any item not independently re-run is unverified, not clean.
 - **Auditing your own work.** If this skill built it, the independence that gives the verdict value
   is gone.
-- **Rounding unverified up to clean** — CI legs that cannot run locally stay unverified, with the
-  command to confirm them.
+- **Rounding unverified up to clean** — a leg whose gate run and CI verdict it could not read stays
+  unverified, with the command to confirm it (`dssharness check-ci-legs`).
 - **Reporting a verdict on a dirty tree.** Work in flight gets "in flight", not a judgement.
 - **Closing a claimed fix that the suite would not have caught breaking.** Asserted is not proven.

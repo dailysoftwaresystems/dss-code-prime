@@ -1,0 +1,1 @@
+        body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);

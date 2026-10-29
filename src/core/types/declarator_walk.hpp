@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/substrate/walk_steps.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
@@ -41,10 +42,12 @@ namespace dss {
 
 namespace declarator_walk_detail {
 
-// Hard cap on descent steps. A well-formed declarator chain is depth ~N for
-// N grouping parens; 4096 is unreachable by real input and turns a cyclic /
-// corrupted node graph into a bounded miss instead of a hang.
-inline constexpr std::size_t kMaxDeclaratorDepth = 4096;
+// Every walk here is bounded by the tree it walks (`substrate::WalkSteps` over the View's
+// `nodeCount()`; P69 L2, lane `lm`). A descent moves to a strict descendant and a climb to
+// a strict ancestor, so only a cyclic node graph takes more steps than the tree has nodes,
+// and that stops the process loud. It was a fixed 4096 steps that answered a miss (no
+// name, no derivation, a partial specifier list) past them, and a declarator with ~2048
+// grouping parentheses takes that many.
 
 // First visible child of `node` that is an Internal node of `rule`, or
 // InvalidNode. The role-targeted descent step every arm of the walk uses.
@@ -99,7 +102,8 @@ template <class View>
                                         DeclaratorConfig const& dc) {
     namespace det = declarator_walk_detail;
     NodeId cur = node;
-    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{v.nodeCount(), "declaratorNameNode's descent"};;
+         steps.step()) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return {};
         RuleId const r = v.rule(cur);
         // EVERY per-slot wrapper descends to its inner declaratorRule, and the
@@ -140,7 +144,6 @@ template <class View>
         }
         return {};   // not a declarator-role shape
     }
-    return {};   // depth cap — corrupted/cyclic input, bounded miss
 }
 
 // Collect the declarator-carrying nodes below a declaration's
@@ -283,7 +286,8 @@ template <class View>
     // Walk the carrier shapes down to the DIRECT declarator, the same arms
     // `declaratorNameNode` takes, and stop there — the outermost derivation is
     // the one the trailing run sits beside.
-    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{v.nodeCount(), "declaratorDerivesType's descent"};;
+         steps.step()) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return false;
         RuleId const r = v.rule(cur);
         if (isDeclaratorSlotWrapper(r, dc)) {
@@ -336,6 +340,8 @@ struct TreeDeclaratorView {
         return !isEmptySpace(tree.flags(n));
     }
     [[nodiscard]] auto children(NodeId n) const { return tree.children(n); }
+    // What the walks are bounded by (`substrate::WalkSteps`).
+    [[nodiscard]] std::size_t nodeCount() const noexcept { return tree.nodeCount(); }
 };
 
 [[nodiscard]] inline NodeId
@@ -370,6 +376,138 @@ runAppertainmentFor(Tree const& tree, DeclaratorConfig const& dc,
     return resolveAppertainment(run.appertainsTo,
                                 declaratorDerivesType(tree, declaratorCarrier,
                                                       dc));
+}
+
+// ★★ P69 round 4 (lane `cs`) — THE ATTRIBUTE SPECIFIERS WRITTEN INSIDE A DECLARATOR
+// THAT STAND BESIDE WHAT IT DECLARES, in source order. `carrier` is a node from
+// `collectDeclarators` (a per-slot wrapper or the declarator itself).
+//
+// An attribute specifier inside a declarator sits in a pointer layer (`int *
+// __attribute__((X)) p`) or at the start of a parenthesized declarator (`int
+// (__attribute__((X)) arr)[2]`). What it decorates is decided by what FOLLOWS it,
+// reading inwards towards the name:
+//   * a POINTER layer follows  ⇒ it decorates the type formed so far (`int *
+//     __attribute__((X)) *pp`, `int (__attribute__((X)) *pf)(int)`), and it is not
+//     in this list;
+//   * the declared NAME follows, or the place a name would stand in an abstract
+//     declarator, or a FUNCTION or ARRAY declarator (`int * __attribute__((X))
+//     f(void)`, `int * __attribute__((X)) (*pf)(int)`) ⇒ it stands beside the
+//     declared entity, and it is in this list. Parentheses that derive nothing
+//     (`int * __attribute__((X)) (p)`) are looked through.
+//
+// That is gcc's own rule, the one its manual states — "an attribute that only
+// applies to declarations, applied to the type of a declaration, is treated as
+// applying to that declaration" — and its declarator walk implements with exactly
+// these three cases (a name, a function declarator or an array declarator next).
+// clang gives every attribute in a declarator to the declaration. ✔MEASURED, lane
+// `cs`'s probes ta7 and ta8 (gcc 13.3.0, clang 18.1.3, Apple clang): `int *
+// __attribute__((weak)) p3 = 0, q3 = 0;` is `V p3` / `B q3`; `int * *
+// __attribute__((weak)) p6` and `int (__attribute__((weak)) p7) = 0;` are weak on
+// all three; after the INNER star and before the star in a parenthesized declarator
+// gcc says "does not apply to types" and leaves the symbol strong, clang makes it
+// weak — and there this compiler reads as gcc does and says so, as gcc does.
+//
+// WHAT a consumer does with a specifier of this list is its own business (the
+// attribute fold gives it to the declared entity unless the name's row keeps it on
+// the type; the linkage and noreturn folds read it as they read the run after the
+// declarator). This function only answers WHICH specifiers, once, so the three
+// folds cannot come to disagree about the position.
+//
+// Roles only (`pointerLayerRule`, `groupRule`, `directRule` and its abstract twin,
+// the suffix roles, the attribute-specifier predicate) — no rule name, no spelling.
+// An iterative descent bounded by the tree it walks: a cyclic node graph stops loud.
+[[nodiscard]] inline std::vector<NodeId>
+nameAdjacentAttributeSpecifiers(Tree const& tree, SemanticConfig const& cfg,
+                                NodeId carrier) {
+    namespace det = declarator_walk_detail;
+    std::vector<NodeId> out;
+    if (!cfg.declarators.has_value()) return out;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    TreeDeclaratorView const v{tree};
+    auto const specifiersOf = [&](NodeId shape, std::vector<NodeId>& into) {
+        for (NodeId c : tree.children(shape)) {
+            if (!v.isVisible(c) || tree.kind(c) != NodeKind::Internal) continue;
+            if (isAttributeSpecifierRule(cfg, tree.rule(c))) into.push_back(c);
+        }
+    };
+    // The specifiers whose follower has not been seen yet: they join `out` when a
+    // name, a function suffix or an array suffix turns out to follow, and are
+    // dropped when a pointer layer does.
+    std::vector<NodeId> pending;
+    NodeId cur = carrier;
+    for (substrate::WalkSteps steps{tree.nodeCount(), "nameAdjacentAttributeSpecifiers' descent"};;
+         steps.step()) {
+        if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) break;
+        RuleId const r = tree.rule(cur);
+        if (isDeclaratorSlotWrapper(r, dc)) {
+            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
+            continue;
+        }
+        NodeId direct{};
+        if (r == dc.declaratorRule) {
+            NodeId lastLayer{};
+            for (NodeId c : tree.children(cur)) {
+                if (!v.isVisible(c) || tree.kind(c) != NodeKind::Internal) continue;
+                RuleId const cr = tree.rule(c);
+                if (cr == dc.pointerLayerRule) lastLayer = c;
+                else if (cr == dc.directRule
+                         || (dc.directAbstractRule.has_value()
+                             && cr == *dc.directAbstractRule)) {
+                    if (!direct.valid()) direct = c;
+                }
+            }
+            if (lastLayer.valid()) {
+                pending.clear();   // a pointer followed them: they are a type's
+                specifiersOf(lastLayer, pending);
+            }
+        } else if (r == dc.directRule
+                   || (dc.directAbstractRule.has_value()
+                       && r == *dc.directAbstractRule)) {
+            direct = cur;
+        } else {
+            break;   // not a declarator-role shape
+        }
+        if (!direct.valid()) {
+            // A star-only abstract declarator: the place of the name follows.
+            out.insert(out.end(), pending.begin(), pending.end());
+            break;
+        }
+        bool   hasName   = false;
+        bool   hasSuffix = false;
+        NodeId group{};
+        for (NodeId c : tree.children(direct)) {
+            if (!v.isVisible(c)) continue;
+            if (tree.kind(c) == NodeKind::Token) {
+                if (tree.tokenKind(c) == dc.nameToken) hasName = true;
+                continue;
+            }
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            RuleId const cr = tree.rule(c);
+            if (cr == dc.groupRule) {
+                if (!group.valid()) group = c;
+            } else if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule
+                       || (dc.fnSuffixTailRule.has_value()
+                           && cr == *dc.fnSuffixTailRule)
+                       || (dc.arrayStarSuffixRule.has_value()
+                           && cr == *dc.arrayStarSuffixRule)) {
+                hasSuffix = true;
+            }
+        }
+        if (hasName || !group.valid()) {
+            // The name, or an abstract direct declarator (a suffix with no name).
+            out.insert(out.end(), pending.begin(), pending.end());
+            break;
+        }
+        if (hasSuffix) {
+            // A function or array declarator follows what is pending; the
+            // parenthesized declarator inside it starts a new stretch.
+            out.insert(out.end(), pending.begin(), pending.end());
+            pending.clear();
+        }
+        specifiersOf(group, pending);
+        cur = det::firstChildOfRule(v, group, dc.declaratorRule);
+    }
+    return out;
 }
 
 // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME) — THE shared "this child is a
@@ -514,8 +652,8 @@ innermostNameDerivation(Tree const& tree, NodeId nameNode,
     // level, the parenthesis group at every level above it. It is the BASE of the
     // direct declarator, never one of its suffixes.
     NodeId base = nameNode;
-    for (std::size_t step = 0;
-         step < declarator_walk_detail::kMaxDeclaratorDepth; ++step) {
+    for (substrate::WalkSteps steps{tree.nodeCount(), "innermostNameDerivation's climb"};;
+         steps.step()) {
         // (1) A SUFFIX on this direct declarator; leftmost = innermost. Declarator
         //     DECORATIONS (attribute runs, asm labels) annotate a declarator, they
         //     never derive a type from it, so they are skipped through the shared
@@ -557,7 +695,6 @@ innermostNameDerivation(Tree const& tree, NodeId nameNode,
         base   = group;
         direct = outer;
     }
-    return {};   // depth cap — corrupted/cyclic node graph, a bounded miss
 }
 
 // The FUNCTION SUFFIX that declares `nameNode` a function — i.e. its innermost

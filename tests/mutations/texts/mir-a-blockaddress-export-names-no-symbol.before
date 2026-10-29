@@ -1,0 +1,1 @@
+                named(mir.blockAddressExportSymbol(id), MirSymbolMention::BlockAddressExport, id);

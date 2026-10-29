@@ -1,0 +1,36 @@
+{
+  "$comment": "P69 (lane `cs`, D-LIR-THREAD-LOCAL-IMPORT-STAMPED-READ-THROUGH-A-SLOT): a DSS unit that only DECLARES two thread-locals, defined by a reference compiler's archive member (quoted in main.c). MIR->LIR registered every data import as read through an address slot, a thread-local one included, so the import row left stamped `readThroughSlot`, the link minted an address slot for the definition and retargeted the thread-pointer access into it, and the ELF writer refused the image (K_RelocationKindMismatch) on both ELF execs, at HEAD 71648598 as in this round's tree. The references on THIS main.c and these archives (2026-10-07, WSL): gcc 13.3.0 + GNU ld 2.42, clang 18.1.3 + GNU ld and + ld.lld 18.1.3 at -O0 and -O2, and aarch64-linux-gnu-gcc 13.3.0 under qemu-aarch64 at -O0 and -O2: 42, 8 of 8. Two threads each see their OWN copies (the exit-code ladder is in main.c). The Mach-O and pe64 arms are absent because there the reference object's DEFINITION is refused at read (`__DATA,__thread_vars` / `.tls$` resolve to no section kind), a separate row; this example gains those arms when it closes.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13.3.0 `-O2 -c` of the member quoted in main.c + GNU ar `rcsD`: `foreign_tls_shared` (4 bytes, .tdata) and `foreign_tls_tally` (8 bytes, .tbss), both STT_TLS GLOBAL. The witness is the member's own definition.",
+          "path": "tests/link/data/libforeign_thread_local_definitions_x86_64_elf.a",
+          "containerWitness": "foreign_tls_shared"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "prebuiltLibraries": [
+        {
+          "$comment": "aarch64-linux-gnu-gcc 13.3.0 `-O2 -c` of the same member + aarch64-linux-gnu-ar `rcsD`: the same two STT_TLS GLOBAL definitions. The witness is the member's own definition.",
+          "path": "tests/link/data/libforeign_thread_local_definitions_aarch64_elf.a",
+          "containerWitness": "foreign_tls_shared"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

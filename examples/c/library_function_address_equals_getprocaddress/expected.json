@@ -1,0 +1,24 @@
+{
+  "$comment": "D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB, THE PE HALF (P69, design c2) — the twin of `library_function_address_equals_dlsym`. One address per function and per datum across the process: every form of `&puts` a C program can spell — in code, a static, a const static, a struct member, an array element — in the EXECUTABLE and in the DSS-built DLL it loads (`dsssubject.c`, built for pe64-x86_64-windows-dll and linked with --resolve-library, the `dynlib_resolve_roundtrip` shape) must equal what GetProcAddress answers for `puts`; the addresses of that DLL's function `g` and datum `v`, taken in the executable in code and in static initializers, must equal what GetProcAddress answers for them, and so must a static `&_mbcasemap` (a C-library DATUM, ucrtbase.dll); and a call through a static slot must reach `puts`, `g` and `v`. Exit 42, or 1000 + a bitset naming what failed (main.c's header). WHAT DSS WROTE BEFORE (✔MEASURED 2026-09-30 on HEAD's dsscp): every one of those forms was the image's own `FF 25` import thunk — callable, so every call worked, but `&puts != GetProcAddress(ucrtbase, \"puts\")` (a probe of the same shapes exited 4), and a static initializer naming a DLL datum (`&v`) was refused outright (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR). WHAT IT WRITES NOW: code loads the address from a slot the link mints (`externAddrBinding: got`), and every pointer-sized slot holding an import's address — that GOT slot and each static initializer — is the FirstThunk of an import descriptor of its own, so the Windows loader writes the real address into it before any code of the image runs; a read-only slot (the const static, the GOT slot) lies under the IAT directory in a read-only `.idata`. The references: MSVC cl 19.51 /MD answers the IAT value in code but its C static initializers keep the thunk, and MinGW gcc 13.2 keeps the thunk everywhere — DSS gives one value everywhere. The structure itself (one descriptor per slot, its lookup entry as the slot's file-time word, no DIR64 row, the IAT directory's cover) is pinned in tests/link/test_pe_dll_writer.cpp, on hand-built modules; this is the run. P69 review M1 (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE) — THE SLOTS NO LOADER CAN BIND, which round 1 refused for a datum and left on the THUNK for a function: an import's address PLUS an offset (`&arr[3]` of the DLL's array in writable data, `&arr[1]` in a CONST static, and the DLL's own `(char *)&_mbcasemap + 3`) — the Windows loader writes an import's address and nothing else — and an import's address in a THREAD-LOCAL initializer (`_Thread_local put_fn tl_puts = puts`, `&v`, `&arr[2]`) — the loader copies the main thread's block from the template BEFORE it binds any import (research variant T1, run 20260930-180123-e3ee3909). Each image now carries a RESIDUE RUNNER, a synthesized function its TLS directory names as the FIRST callback (`linker::synthesizeLoadTimeFixupRunner`): on DLL_PROCESS_ATTACH, after the loader has bound the IAT and before any other code of the image, it reads each import's bound address from its IAT entry, adds the offset, and writes the slot — the template and the running thread's copy for a thread-local; a read-only item holding one is laid out in writable `.data`. main.c checks every such value on the main thread AND on a thread started later (which copies the written template), and the DLL's slot through `dll_mbcasemap_plus_three` (the DLL's runner — a DLL's `.tls` section carries only the directory). Exit 1000 + a bitset otherwise (see main.c).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "one address\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsssubject.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsssubject.dll"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -1,0 +1,1 @@
+    return parseConfigDocument(jsonText, configNestingLimit());

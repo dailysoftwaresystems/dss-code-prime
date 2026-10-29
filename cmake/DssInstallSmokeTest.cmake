@@ -159,6 +159,11 @@ foreach(_rel IN LISTS _src_config_files)
     if(_rel MATCHES "^runtime/platform/dist/")
         continue()
     endif()
+    # The configure-time documents are read by the BUILD, never installed (the
+    # second anchored exclusion in DssInstall.cmake).
+    if(_rel MATCHES "^configure-time/")
+        continue()
+    endif()
     if(NOT EXISTS "${_installed_config}/${_rel}")
         list(APPEND _missing "${_rel}")
     endif()
@@ -181,6 +186,13 @@ if(EXISTS "${_installed_config}/runtime/platform/dist")
     message(FATAL_ERROR
         "install smoke: the generated cache 'runtime/platform/dist' was "
         "installed. It is a build artifact, not a shipped input.")
+endif()
+# Nor the configure-time documents: the hello-world below then compiles from an
+# installed tree WITHOUT them, which is what shows nothing reads them at run time.
+if(EXISTS "${_installed_config}/configure-time")
+    message(FATAL_ERROR
+        "install smoke: 'configure-time' was installed. Its documents are read "
+        "when the build is configured, never by the installed compiler.")
 endif()
 
 # ── Compile a hello-world from the installed tree ─────────────────────────────

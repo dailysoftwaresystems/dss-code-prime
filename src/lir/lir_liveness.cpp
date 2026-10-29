@@ -1,5 +1,6 @@
 #include "lir/lir_liveness.hpp"
 
+#include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_asm_region.hpp"
 #include "lir/lir_node.hpp"
 
@@ -8,6 +9,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
+#include <iterator>
+#include <map>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -63,6 +68,69 @@ void forEachDef(Lir const& lir, LirInstId id, OnDef&& onDef) {
     });
 }
 
+// A function's blocks, addressed by their position in the function's block
+// list — `lir.funcBlockAt(fn, i)` for `i in [0, blockCount)` — rather than by
+// arena-index arithmetic. The mapping `LirBlockId.v → index` is built once;
+// this keeps every walk below robust against an arena layout that does not
+// place a function's blocks at contiguous indices.
+class FuncBlockIndex {
+public:
+    FuncBlockIndex(Lir const& lir, LirFuncId fn) {
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        if (blockCount == 0) return;
+        minV_ = maxV_ = lir.funcBlockAt(fn, 0).v;
+        for (std::uint32_t i = 0; i < blockCount; ++i) {
+            std::uint32_t const v = lir.funcBlockAt(fn, i).v;
+            minV_ = std::min(minV_, v);
+            maxV_ = std::max(maxV_, v);
+        }
+        indexOfBlockV_.assign(maxV_ - minV_ + 1u, UINT32_MAX);
+        for (std::uint32_t i = 0; i < blockCount; ++i) {
+            indexOfBlockV_[lir.funcBlockAt(fn, i).v - minV_] = i;
+        }
+    }
+
+    // UINT32_MAX when `v` is not a block of the function.
+    [[nodiscard]] std::uint32_t of(std::uint32_t v) const noexcept {
+        if (indexOfBlockV_.empty() || v < minV_ || v > maxV_) return UINT32_MAX;
+        return indexOfBlockV_[v - minV_];
+    }
+
+private:
+    std::vector<std::uint32_t> indexOfBlockV_;
+    std::uint32_t              minV_ = 0;
+    std::uint32_t              maxV_ = 0;
+};
+
+// One guarded run (`LirGuardedRegion`), resolved against its function's block
+// list and already judged well-formed: `firstIndex <= lastIndex`, and the
+// landing block is a block of the function outside `[firstIndex, lastIndex]`.
+struct ResolvedRun {
+    std::uint32_t firstIndex   = 0;
+    std::uint32_t lastIndex    = 0;
+    std::uint32_t landingIndex = 0;
+};
+
+// The EXCEPTIONAL successors of every block of a function, indexed by the
+// block's position in the function's block list: the landing block (as a
+// position in that list) of every run that holds the block. A block of a nested
+// run has one per level. Empty for a function without runs.
+[[nodiscard]] std::vector<std::vector<std::uint32_t>>
+exceptionalSuccessors(std::uint32_t blockCount, std::span<ResolvedRun const> runs) {
+    std::vector<std::vector<std::uint32_t>> out;
+    if (runs.empty()) return out;
+    out.resize(blockCount);
+    for (auto const& run : runs) {
+        for (std::uint32_t k = run.firstIndex; k <= run.lastIndex; ++k) {
+            auto& list = out[k];
+            if (std::find(list.begin(), list.end(), run.landingIndex) == list.end()) {
+                list.push_back(run.landingIndex);
+            }
+        }
+    }
+    return out;
+}
+
 // Compute reverse post-order of blocks reachable from `entry`. Any
 // orphan blocks (unreachable from `entry`) are appended in arena
 // order so the analysis is total over the function's block range.
@@ -70,40 +138,25 @@ void forEachDef(Lir const& lir, LirInstId id, OnDef&& onDef) {
 // I_UnreachableBlock rule exists for LIR — that rule is MIR-only);
 // this routine is therefore the sole defense and is intentionally
 // total rather than fail-loud.
-[[nodiscard]] std::vector<LirBlockId> computeRpo(Lir const& lir, LirFuncId fn) {
+//
+// ★ `exSuccs` (see `exceptionalSuccessors`) is walked AFTER a block's own
+// successors, so a landing block is REACHED — from every block of its run — and
+// takes its place in the order after the blocks that can transfer to it. Before
+// the exceptional edge existed a landing block was an orphan, appended last in
+// ARENA order together with everything only it reaches; a flat range is sound
+// only when a definition precedes its uses in this order, which reverse
+// post-order gives and arena order does not.
+[[nodiscard]] std::vector<LirBlockId>
+computeRpo(Lir const& lir, LirFuncId fn, FuncBlockIndex const& indexOf,
+           std::vector<std::vector<std::uint32_t>> const& exSuccs) {
     std::uint32_t const blockCount = lir.funcBlockCount(fn);
     std::vector<LirBlockId> rpo;
     rpo.reserve(blockCount);
     if (blockCount == 0) return rpo;
 
-    // Address each block of `fn` by its position in the function's
-    // block range — `lir.funcBlockAt(fn, i)` for `i in [0, blockCount)`
-    // — rather than by arena-index arithmetic. The mapping
-    // `LirBlockId.v → index` is rebuilt up-front; this keeps the RPO
-    // computation robust against future arena layouts that don't
-    // place a function's blocks at contiguous indices.
-    std::vector<std::uint32_t> indexOfBlockV;
     LirBlockId const firstBlock = lir.funcBlockAt(fn, 0);
-    indexOfBlockV.reserve(blockCount);
-    std::uint32_t minV = firstBlock.v;
-    std::uint32_t maxV = firstBlock.v;
-    for (std::uint32_t i = 0; i < blockCount; ++i) {
-        std::uint32_t const v = lir.funcBlockAt(fn, i).v;
-        minV = std::min(minV, v);
-        maxV = std::max(maxV, v);
-    }
-    std::uint32_t const span = maxV - minV + 1u;
-    indexOfBlockV.assign(span, UINT32_MAX);
-    for (std::uint32_t i = 0; i < blockCount; ++i) {
-        indexOfBlockV[lir.funcBlockAt(fn, i).v - minV] = i;
-    }
-    auto idxOf = [&](LirBlockId b) -> std::uint32_t {
-        if (b.v < minV || b.v > maxV) return UINT32_MAX;
-        return indexOfBlockV[b.v - minV];
-    };
-
     std::vector<std::uint8_t> visited(blockCount, 0);
-    visited[idxOf(firstBlock)] = 1;
+    visited[indexOf.of(firstBlock.v)] = 1;
 
     struct Frame {
         LirBlockId block;
@@ -117,12 +170,18 @@ void forEachDef(Lir const& lir, LirInstId id, OnDef&& onDef) {
     while (!stack.empty()) {
         auto& top  = stack.back();
         auto const succs = lir.blockSuccessors(top.block);
-        if (top.nextSucc < succs.size()) {
-            LirBlockId const s = succs[top.nextSucc++];
-            std::uint32_t const si = idxOf(s);
+        std::uint32_t const own = static_cast<std::uint32_t>(succs.size());
+        std::uint32_t const topIndex = indexOf.of(top.block.v);
+        std::uint32_t const extra =
+            exSuccs.empty() || topIndex == UINT32_MAX
+                ? 0u : static_cast<std::uint32_t>(exSuccs[topIndex].size());
+        if (top.nextSucc < own + extra) {
+            std::uint32_t const k = top.nextSucc++;
+            std::uint32_t const si =
+                k < own ? indexOf.of(succs[k].v) : exSuccs[topIndex][k - own];
             if (si != UINT32_MAX && !visited[si]) {
                 visited[si] = 1;
-                stack.push_back({s, 0});
+                stack.push_back({lir.funcBlockAt(fn, si), 0});
             }
             continue;
         }
@@ -226,17 +285,43 @@ LirFuncLiveness const* LirLiveness::forFunc(LirFuncId fn) const noexcept {
     return nullptr;
 }
 
-LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
-    LirFuncLiveness out;
-    out.fn         = fn;
-    out.blockOrder = computeRpo(lir, fn);
+bool lirRangeEntersALanding(LirLiveRange const&            r,
+                            std::span<std::uint32_t const> landingEntryPositions) noexcept {
+    // The first landing entry strictly after the range's start; ascending, so
+    // if that one is not inside the range no later one is.
+    auto const lo = std::upper_bound(landingEntryPositions.begin(),
+                                     landingEntryPositions.end(), r.start);
+    return lo != landingEntryPositions.end() && *lo < r.end;
+}
+
+namespace {
+
+// One function's result together with what only the analysis itself holds: the
+// per-block DEF sets, indexed like `flow.liveIn`. The region check reads them.
+struct FuncAnalysis {
+    LirFuncLiveness         flow;
+    std::vector<VRegBitset> def;
+};
+
+[[nodiscard]] FuncAnalysis
+analyzeFuncWithRuns(Lir const& lir, LirFuncId fn, std::span<ResolvedRun const> runs) {
+    FuncAnalysis result;
+    LirFuncLiveness& out = result.flow;
+    out.fn = fn;
+    FuncBlockIndex const indexOf{lir, fn};
+    // Indexed by a block's position in the FUNCTION's block list.
+    std::vector<std::vector<std::uint32_t>> const exSuccs =
+        exceptionalSuccessors(lir.funcBlockCount(fn), runs);
+    out.blockOrder = computeRpo(lir, fn, indexOf, exSuccs);
     std::uint32_t const blockCount = static_cast<std::uint32_t>(out.blockOrder.size());
     std::uint32_t const numVRegs   = lir.funcNumVRegs(fn);
 
-    if (blockCount == 0) return out;
+    if (blockCount == 0) return result;
 
     // Per-block local USE and DEF sets + parallel sized liveIn/Out.
-    std::vector<VRegBitset> use(blockCount), def(blockCount);
+    std::vector<VRegBitset> use(blockCount);
+    std::vector<VRegBitset>& def = result.def;
+    def.assign(blockCount, VRegBitset{});
     out.liveIn.assign(blockCount,  VRegBitset{});
     out.liveOut.assign(blockCount, VRegBitset{});
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
@@ -302,6 +387,23 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
         return orderOfBlockV[b.v - minV];
     };
 
+    // The exceptional successors again, in THIS walk's vocabulary: for each
+    // block-order index, the block-order indices of the landing blocks of every
+    // guarded run that holds the block.
+    std::vector<std::vector<std::uint32_t>> landingsOf;
+    if (!exSuccs.empty()) {
+        landingsOf.resize(blockCount);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            std::uint32_t const fi = indexOf.of(out.blockOrder[bi].v);
+            if (fi == UINT32_MAX) continue;
+            for (std::uint32_t const landingFi : exSuccs[fi]) {
+                std::uint32_t const li =
+                    orderIdxOf(lir.funcBlockAt(fn, landingFi));
+                if (li != UINT32_MAX) landingsOf[bi].push_back(li);
+            }
+        }
+    }
+
     bool changed = true;
     while (changed) {
         changed = false;
@@ -313,6 +415,14 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
                 std::uint32_t const sIdx = orderIdxOf(s);
                 if (sIdx == UINT32_MAX) continue;
                 if (out.liveOut[bi].unionInPlace(out.liveIn[sIdx])) changed = true;
+            }
+            // … and over the EXCEPTIONAL ones: what a landing block reads is
+            // live at the end of — and, nothing in the run defining it, all
+            // through — every block control can leave for it.
+            if (!landingsOf.empty()) {
+                for (std::uint32_t const li : landingsOf[bi]) {
+                    if (out.liveOut[bi].unionInPlace(out.liveIn[li])) changed = true;
+                }
             }
             // liveIn[B] = use[B] ∪ (liveOut[B] - def[B])
             VRegBitset newIn = out.liveOut[bi];
@@ -443,7 +553,54 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
                   return std::tie(a.start, a.vreg.id)
                        < std::tie(b.start, b.vreg.id);
               });
-    return out;
+
+    // The guarded runs, in this result's vocabulary.
+    out.guardedRuns.reserve(runs.size());
+    for (auto const& run : runs) {
+        LirFuncLiveness::GuardedRun g;
+        g.blockOrderIndices.reserve(run.lastIndex - run.firstIndex + 1u);
+        for (std::uint32_t k = run.firstIndex; k <= run.lastIndex; ++k) {
+            std::uint32_t const bi = orderIdxOf(lir.funcBlockAt(fn, k));
+            if (bi != UINT32_MAX) g.blockOrderIndices.push_back(bi);
+        }
+        g.landingOrderIndex    = orderIdxOf(lir.funcBlockAt(fn, run.landingIndex));
+        g.landingEntryPosition = blockFirstPos[g.landingOrderIndex];
+        out.landingEntryPositions.push_back(g.landingEntryPosition);
+        out.guardedRuns.push_back(std::move(g));
+    }
+    std::sort(out.landingEntryPositions.begin(), out.landingEntryPositions.end());
+    out.landingEntryPositions.erase(
+        std::unique(out.landingEntryPositions.begin(), out.landingEntryPositions.end()),
+        out.landingEntryPositions.end());
+    return result;
+}
+
+void refuseRegion(DiagnosticReporter& reporter, std::string message) {
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::L_SideStructureIndexDangling;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = std::move(message);
+    reporter.report(std::move(d));
+}
+
+// True iff some run that enters the landing block at `landingIndex` holds the
+// block at `blockIndex` (both positions in one function's block list).
+[[nodiscard]] bool aRunEnteringHolds(std::span<ResolvedRun const> runs,
+                                     std::uint32_t landingIndex,
+                                     std::uint32_t blockIndex) noexcept {
+    for (ResolvedRun const& r : runs) {
+        if (r.landingIndex == landingIndex && blockIndex >= r.firstIndex
+            && blockIndex <= r.lastIndex) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
+    return analyzeFuncWithRuns(lir, fn, {}).flow;
 }
 
 LirLiveness analyzeLiveness(Lir const& lir) {
@@ -454,6 +611,171 @@ LirLiveness analyzeLiveness(Lir const& lir) {
         out.perFunc.push_back(
             analyzeFuncLiveness(lir, lir.funcAt(static_cast<std::uint32_t>(i))));
     }
+    return out;
+}
+
+std::optional<LirLiveness>
+analyzeLiveness(Lir const& lir, std::span<LirGuardedRegion const> regions,
+                DiagnosticReporter& reporter) {
+    std::uint32_t const fnCount = static_cast<std::uint32_t>(lir.moduleFuncCount());
+
+    // (1) SHAPE. Every region is resolved against its function's block list
+    // before anything is analyzed with it; one that cannot be is refused by
+    // name. `k` is the region's position in `regions`, which is how every
+    // refusal below names it.
+    std::vector<std::vector<ResolvedRun>>   runsOf(fnCount);
+    std::vector<std::vector<std::uint32_t>> regionOf(fnCount);   // parallel: its `k`
+    bool shapely = true;
+    for (std::uint32_t k = 0; k < regions.size(); ++k) {
+        LirGuardedRegion const& r = regions[k];
+        if (r.funcIndex >= fnCount) {
+            refuseRegion(reporter, std::format(
+                "guarded region #{} names function #{}, and the module has {} function(s)",
+                k, r.funcIndex, fnCount));
+            shapely = false;
+            continue;
+        }
+        FuncBlockIndex const indexOf{lir, lir.funcAt(r.funcIndex)};
+        std::uint32_t const first   = indexOf.of(r.firstBlockV);
+        std::uint32_t const last    = indexOf.of(r.lastBlockV);
+        std::uint32_t const landing = indexOf.of(r.landingBlockV);
+        auto const notABlock = [&](char const* what, std::uint32_t v) {
+            refuseRegion(reporter, std::format(
+                "guarded region #{} of function #{} names block {} as its {} block, "
+                "which is not a block of that function", k, r.funcIndex, v, what));
+            shapely = false;
+        };
+        if (first == UINT32_MAX)   notABlock("first", r.firstBlockV);
+        if (last == UINT32_MAX)    notABlock("last", r.lastBlockV);
+        if (landing == UINT32_MAX) notABlock("landing", r.landingBlockV);
+        if (first == UINT32_MAX || last == UINT32_MAX || landing == UINT32_MAX) continue;
+        if (first > last) {
+            refuseRegion(reporter, std::format(
+                "guarded region #{} of function #{} runs from block {} to block {}, and "
+                "the first is laid out after the last", k, r.funcIndex, r.firstBlockV,
+                r.lastBlockV));
+            shapely = false;
+            continue;
+        }
+        if (landing >= first && landing <= last) {
+            refuseRegion(reporter, std::format(
+                "guarded region #{} of function #{} holds its own landing block {} inside "
+                "the run {}..{}: a fault in the landing block would be delivered to it",
+                k, r.funcIndex, r.landingBlockV, r.firstBlockV, r.lastBlockV));
+            shapely = false;
+            continue;
+        }
+        runsOf[r.funcIndex].push_back(ResolvedRun{first, last, landing});
+        regionOf[r.funcIndex].push_back(k);
+    }
+    if (!shapely) return std::nullopt;
+
+    // (1b) THE ORDER OF THE RECORDS. `regions` is each function's table in the
+    // order it will be written, and the party that reads the table gives a fault
+    // to the FIRST record whose range holds its address. So, of two records of
+    // one function that share a block, the earlier must be the DEEPER region's:
+    //   * its run lies inside the later one's; and
+    //   * when the two runs are the very same blocks — a run that belongs to a
+    //     region and to the region around it — the earlier record's landing
+    //     block, the inner one, lies inside a run of the later record's landing
+    //     block (an outer body holds the inner landing; never the reverse).
+    // A list that breaks either is a table that hands a fault to the wrong
+    // landing, whichever tier ordered it, and is refused.
+    //
+    // The walk keeps, per function, the runs no later run has yet taken in. They
+    // are pairwise apart — a run that arrives takes in every kept run it meets, or
+    // is refused — so keyed by first block they are in order of last block too.
+    bool ordered = true;
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        std::vector<ResolvedRun> const& runs = runsOf[fi];
+        std::map<std::uint32_t, std::size_t> kept;   // a run's first block → its index in `runs`
+        for (std::size_t ri = 0; ri < runs.size(); ++ri) {
+            ResolvedRun const&      later = runs[ri];
+            LirGuardedRegion const& laterRegion = regions[regionOf[fi][ri]];
+            bool refused = false;
+            // Every kept run that shares a block with this one: backwards from
+            // the last that begins at or before this one's last block.
+            auto it = kept.upper_bound(later.lastIndex);
+            while (it != kept.begin()) {
+                auto const prev = std::prev(it);
+                std::size_t const        ei = prev->second;
+                ResolvedRun const&       earlier = runs[ei];
+                LirGuardedRegion const&  earlierRegion = regions[regionOf[fi][ei]];
+                if (earlier.lastIndex < later.firstIndex) break;   // apart; so is every run before it
+                if (earlier.firstIndex < later.firstIndex || earlier.lastIndex > later.lastIndex) {
+                    refuseRegion(reporter, std::format(
+                        "guarded region #{} of function #{} (blocks {}..{}) is listed before "
+                        "guarded region #{} (blocks {}..{}), shares a block with it and does "
+                        "not lie inside it: a fault is given to the first record whose range "
+                        "holds its address, so the record of the deeper region must come first",
+                        regionOf[fi][ei], fi, earlierRegion.firstBlockV, earlierRegion.lastBlockV,
+                        regionOf[fi][ri], laterRegion.firstBlockV, laterRegion.lastBlockV));
+                    refused = true;
+                    break;
+                }
+                bool const sameBlocks = earlier.firstIndex == later.firstIndex
+                                     && earlier.lastIndex == later.lastIndex;
+                if (sameBlocks && earlier.landingIndex != later.landingIndex
+                    && !aRunEnteringHolds(runs, later.landingIndex, earlier.landingIndex)) {
+                    refuseRegion(reporter, std::format(
+                        "guarded regions #{} and #{} of function #{} hold the same blocks "
+                        "{}..{}, and the landing block {} of the first does not lie inside a "
+                        "run that enters the landing block {} of the second: of two records "
+                        "over the same blocks the deeper region's must come first",
+                        regionOf[fi][ei], regionOf[fi][ri], fi, laterRegion.firstBlockV,
+                        laterRegion.lastBlockV, earlierRegion.landingBlockV,
+                        laterRegion.landingBlockV));
+                    refused = true;
+                    break;
+                }
+                it = kept.erase(prev);
+            }
+            if (refused) {
+                ordered = false;
+                continue;
+            }
+            kept.insert_or_assign(later.firstIndex, ri);
+        }
+    }
+    if (!ordered) return std::nullopt;
+
+    // (2) THE ANALYSIS, and (3) NO LANDING READS A VALUE ITS RUN DEFINES.
+    LirLiveness out;
+    out.perFunc.reserve(fnCount);
+    bool deliverable = true;
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        FuncAnalysis analysis = analyzeFuncWithRuns(lir, lir.funcAt(fi), runsOf[fi]);
+        LirFuncLiveness const& flow = analysis.flow;
+        for (std::size_t ri = 0; ri < flow.guardedRuns.size(); ++ri) {
+            auto const& run = flow.guardedRuns[ri];
+            VRegBitset const& read = flow.liveIn[run.landingOrderIndex];
+            // The first register a block of the run defines that the landing
+            // reads; one refusal per region is enough to name the defect.
+            bool refused = false;
+            for (std::uint32_t const bi : run.blockOrderIndices) {
+                VRegBitset const& defined = analysis.def[bi];
+                std::size_t const words = std::min(read.bits.size(), defined.bits.size());
+                for (std::size_t w = 0; w < words && !refused; ++w) {
+                    std::uint64_t const both = read.bits[w] & defined.bits[w];
+                    if (both == 0) continue;
+                    std::uint32_t const id = static_cast<std::uint32_t>(w << 6)
+                        + static_cast<std::uint32_t>(std::countr_zero(both));
+                    refuseRegion(reporter, std::format(
+                        "the landing block {} of guarded region #{} of function #{} reads "
+                        "virtual register {}, which block {} of the run defines: a value "
+                        "defined inside a guarded run cannot be delivered to its landing "
+                        "block, because the transfer may come before the definition",
+                        flow.blockOrder[run.landingOrderIndex].v, regionOf[fi][ri], fi, id,
+                        flow.blockOrder[bi].v));
+                    refused = true;
+                }
+                if (refused) break;
+            }
+            if (refused) deliverable = false;
+        }
+        out.perFunc.push_back(std::move(analysis.flow));
+    }
+    if (!deliverable) return std::nullopt;
     return out;
 }
 

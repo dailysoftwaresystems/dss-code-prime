@@ -1,0 +1,5 @@
+          "selectany": { "binding": "weak", "weakKind": "select-any" },
+          "visibility:hidden": { "visibility": "hidden" },
+          "visibility:default": { "visibility": "default" },
+          "visibility:protected": { "visibility": "protected" },
+          "visibility:internal": { "visibility": "internal" }

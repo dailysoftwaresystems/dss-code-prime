@@ -1,0 +1,2 @@
+            len = constIntExpr(s, tree, c, scope, &cfg,
+                               std::nullopt);

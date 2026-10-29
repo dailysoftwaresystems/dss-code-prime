@@ -1,0 +1,1 @@
+                (ri->hwEncoding & 0x0Fu) | ((scaledFrom / 16) << 4));

@@ -26,6 +26,9 @@ dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
+# The one case table of what a walk of a tree leaves out is JSON (tests/test_support/tree_ignores_cases.json),
+# read by this binary and by owning-tree.py's self-test alike.
+target_link_libraries(dss_core_test_header_name_matching PRIVATE nlohmann_json::nlohmann_json)
 # D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: a header named from a ROOT
 # resolves where it points, in every spelling of that root. Its multi-separator
 # arm SKIPS LOUDLY AND BY NAME where no UNC spelling is reachable -- an
@@ -158,6 +161,14 @@ dss_add_test(NAME core/substrate/test_large_stack_call  SOURCES substrate/test_l
 dss_add_test(NAME core/substrate/test_stack_sized_thread SOURCES substrate/test_stack_sized_thread.cpp)
 dss_add_test(NAME core/substrate/test_relocation_table  SOURCES substrate/test_relocation_table.cpp)
 target_link_libraries(dss_core_substrate_test_relocation_table PRIVATE nlohmann_json::nlohmann_json)
+# A walk's bound is the size of what it walks (`substrate::WalkSteps`, cycle P69 L2): trees of any depth and
+# width finish, a synthesized cycle stops each walk shape loud, naming the walk.
+dss_add_test(NAME core/substrate/test_walk_steps        SOURCES substrate/test_walk_steps.cpp)
+# A monotone fixpoint's bound is its lattice's height (`substrate::FixpointPasses`, cycle P69 L2): far
+# past the old 10000 passes it finishes, the bound is exact, a pass that takes a bit back stops loud.
+dss_add_test(NAME core/substrate/test_fixpoint_passes   SOURCES substrate/test_fixpoint_passes.cpp)
+# One retry, bounded by its caller and loud when it runs out (`substrate::retryUpTo`, cycle P69 L2).
+dss_add_test(NAME core/substrate/test_bounded_retry     SOURCES substrate/test_bounded_retry.cpp)
 # The process-spawn substrate (src/core/substrate/process_spawn.{hpp,cpp}) — the
 # compiler's FIRST process creation, and the home of the "NO SHELL, EVER"
 # contract every `{"run": [...]}` build step and every `git` invocation rides on.
@@ -174,6 +185,22 @@ if(WIN32)
     # shell32 and MinGW's default set is a toolchain detail, so name it.
     target_link_libraries(dss_core_substrate_test_process_spawn PRIVATE shell32)
 endif()
+# The kind of a directory entry, and the walk and the removal that ask it
+# (src/core/substrate/path_identity.{hpp,cpp}): every link these cases read is made by the OS
+# (tests/test_support/os_link.hpp), so they run on the MinGW build -- whose library can neither make
+# a link nor see one -- as on every other.
+dss_add_test(NAME core/substrate/test_directory_tree    SOURCES substrate/test_directory_tree.cpp)
+# THE SOURCE GUARD of the substrate's filesystem questions: no std::filesystem question whose answer depends on
+# how a link is read, in src/ outside src/core/substrate/ or in integrated_tests/ (the guard's header states
+# the class, the forms it refuses and why).
+dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_queries_guard.cpp)
+# ★ `repo-guard`, SET BY HAND, beside its registration: the label scan of the top-level CMakeLists reads the
+# top directory's entries, and this one is registered here. What it judges is the SOURCE TREE, the same
+# bytes on every leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for
+# (stated where the top-level CMakeLists gives the label). The mutation sweep starts the binary itself
+# and asks no label.
+set_property(TEST core/test_filesystem_queries_guard APPEND PROPERTY LABELS "repo-guard")
+message(STATUS "repo-guard label applied to 1 additional test (core/test_filesystem_queries_guard), registered in tests/core")
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -415,6 +442,9 @@ target_link_libraries(dss_core_test_target_register_class_pair_ops
 # *** The target-loader pin READS the shipped arm64 document and mutates the
 #     bytes IN MEMORY (the `test_target_register_class_pair_ops` precedent);
 #     nothing under src/dss-config/ is written.
+# A shape that reaches itself before consuming a token is refused (C_CircularShape), and the
+# loader's fixpoints converge however many passes a grammar asks (cycle P69 L2).
+dss_add_test(NAME core/test_grammar_left_recursion SOURCES test_grammar_left_recursion.cpp)
 dss_add_test(NAME core/test_config_document_parse
              SOURCES test_config_document_parse.cpp)
 target_link_libraries(dss_core_test_config_document_parse
@@ -447,3 +477,20 @@ dss_add_test(NAME core/test_checkpoint_cost
 if(WIN32)
     target_link_libraries(dss_core_test_checkpoint_cost PRIVATE psapi)
 endif()
+
+# P69 (lane lm — M3 of D-C-FLOAT-H-AND-FLOAT-PREDEFINES-MISSING): C's floating
+# characteristics from ONE owner per representation (core/types/float_format.hpp) —
+# every characteristic computed from the table's primary facts and pinned against the
+# standard's values, the host's std::numeric_limits and the hex spellings parsed back;
+# WideFloatValue and floatKindInfo derive from it.
+dss_add_test(NAME core/test_float_format SOURCES test_float_format.cpp)
+
+# P69 L2 (lane `lm`): the configure-time read of the config documents' nesting limit
+# (cmake/DssConfigNestingLimit.cmake) refuses by name a missing document, bytes that are not
+# JSON, a top level that is not an object, no `maxNesting`, and one that is not a positive whole
+# number — each case the reader alone in script mode over a planted document, with two controls.
+add_test(NAME core/config_nesting_limit_configure_refusals
+         COMMAND ${CMAKE_COMMAND}
+                 -D "DSS_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                 -D "DSS_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}/config_nesting_limit_refusals"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test_config_nesting_limit_refusals.cmake")

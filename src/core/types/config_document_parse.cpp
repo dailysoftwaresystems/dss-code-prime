@@ -1,5 +1,11 @@
 #include "core/types/config_document_parse.hpp"
 
+// The config tree's nesting limit, forwarded from its configure-time document by
+// src/core/CMakeLists.txt (cmake/DssConfigNestingLimit.cmake reads it). No default.
+#if !defined(DSS_CONFIG_MAX_NESTING) || !defined(DSS_CONFIG_MAX_NESTING_DOCUMENT)
+#error "the config documents' nesting limit was not forwarded: src/core/CMakeLists.txt reads it from src/dss-config/configure-time/config-documents.json"
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -56,6 +62,15 @@ using json = nlohmann::json;
 // buffer. That is a compiler bug, and a swallowed one would leave the
 // duplicate-key check silently disabled for the document that triggered it —
 // the exact silence this whole file exists to end.
+// A nesting limit a caller got wrong — no levels, or no place declaring it — is no
+// config error: the parse stops naming it rather than read every document as too
+// deep, or name nothing in its refusal.
+[[noreturn]] void nestingLimitMisusedFatal(char const* what) {
+    std::fprintf(stderr, "dss::detail::parseConfigDocument fatal: %s (a caller's misuse, "
+                         "not a config error)\n", what);
+    std::abort();
+}
+
 [[noreturn]] void scannerDisagreedFatal(char const* what) {
     std::fputs("dss::detail::parseConfigDocument fatal: the duplicate-key scan "
                "rejected bytes that json::parse had already accepted; the DOM "
@@ -82,6 +97,9 @@ using json = nlohmann::json;
 // diagnostic about a document that is already refused.
 class DuplicateKeyScanner {
 public:
+    // `maxDepth` is the deepest a container may nest (the top-level one is 1).
+    explicit DuplicateKeyScanner(std::size_t maxDepth) noexcept : maxDepth_{maxDepth} {}
+
     // ── the nlohmann SAX interface (exact signatures of `json_sax`) ──
     bool null() { return finishValue(); }
     bool boolean(bool) { return finishValue(); }
@@ -132,6 +150,8 @@ public:
     }
 
     [[nodiscard]] bool found() const noexcept { return found_; }
+    [[nodiscard]] bool tooDeep() const noexcept { return tooDeep_; }
+    [[nodiscard]] std::string const& tooDeepPointer() const noexcept { return tooDeepPointer_; }
     [[nodiscard]] std::string const& duplicatePointer() const noexcept {
         return duplicatePointer_;
     }
@@ -174,6 +194,16 @@ private:
                              : frames_[depth_ - 1].keyBase + frames_[depth_ - 1].keyCount;
         frame.keyCount = 0;
         ++depth_;
+        // ★ THE NESTING LIMIT (cycle P69 L2, lane `lm`). The first container past it
+        // stops the scan, named by its pointer, before any reader walks the document:
+        // the loaders' walks over a body, and the json library's own deep copy,
+        // recurse once per level, so a deeper document would overflow a host stack
+        // somewhere else instead of being refused here.
+        if (depth_ > maxDepth_) {
+            tooDeepPointer_ = pointerToOpenContainer();
+            tooDeep_        = true;
+            return false;  // ★ THE ABORT
+        }
         return true;
     }
 
@@ -206,6 +236,22 @@ private:
     //     value COMPLETES — so while the child is open it still names the child
     // ⇒ the path is a pure function of the frame stack, reconstructed once, on
     // the refusal path, and never on the path a healthy document takes.
+    // The pointer of the innermost OPEN container: the same reconstruction, without a
+    // key after it (the top-level container is the empty pointer, the whole document).
+    [[nodiscard]] std::string pointerToOpenContainer() const {
+        std::string out;
+        for (std::size_t i = 1; i < depth_; ++i) {
+            Frame const& parent = frames_[i - 1];
+            out += '/';
+            if (parent.isObject) {
+                out += escapeJsonPointerSegment(keys_[parent.keyBase + parent.keyCount - 1]);
+            } else {
+                out += std::to_string(parent.nextIndex);
+            }
+        }
+        return out;
+    }
+
     [[nodiscard]] std::string pointerToDuplicate(std::string_view key) const {
         std::string out;
         for (std::size_t i = 1; i < depth_; ++i) {
@@ -237,6 +283,9 @@ private:
     std::vector<std::string> keys_;
     std::vector<Frame>       frames_;
     std::size_t              depth_ = 0;
+    std::size_t              maxDepth_ = 0;
+    std::string              tooDeepPointer_;
+    bool                     tooDeep_ = false;
     std::string              duplicatePointer_;
     std::string              duplicateKey_;
     bool                     found_ = false;
@@ -262,8 +311,22 @@ std::string escapeJsonPointerSegment(std::string_view raw) {
     return out;
 }
 
+ConfigNestingLimit configNestingLimit() noexcept {
+    return ConfigNestingLimit{static_cast<std::size_t>(DSS_CONFIG_MAX_NESTING),
+                              "maxNesting of " DSS_CONFIG_MAX_NESTING_DOCUMENT
+                              " in the config tree this compiler was built from"};
+}
+
 std::expected<nlohmann::json, ConfigDocumentParseError>
 parseConfigDocument(std::string_view jsonText) {
+    return parseConfigDocument(jsonText, configNestingLimit());
+}
+
+std::expected<nlohmann::json, ConfigDocumentParseError>
+parseConfigDocument(std::string_view jsonText, ConfigNestingLimit limit) {
+    if (limit.levels == 0) nestingLimitMisusedFatal("a nesting limit of no levels was asked for");
+    if (limit.declaredIn.empty())
+        nestingLimitMisusedFatal("a nesting limit naming no place that declares it was asked for");
     // ── 1. THE DOM, EXACTLY AS BEFORE ───────────────────────────────────────
     // Malformed bytes must produce the message they have always produced:
     // every caller wraps `e.what()` into its own diagnostic, and several tests
@@ -281,9 +344,21 @@ parseConfigDocument(std::string_view jsonText) {
     // are known-good JSON, which makes its own `parse_error` callback
     // unreachable and its abort unambiguous — the parse stopped because a key
     // repeated, and for no other reason.
-    DuplicateKeyScanner scanner;
+    DuplicateKeyScanner scanner{limit.levels};
     json::sax_parse(jsonText, &scanner, json::input_format_t::json,
                     /*strict=*/true);
+    if (scanner.tooDeep()) {
+        std::string const at = scanner.tooDeepPointer().empty() ? std::string{"the document itself"}
+                                                                : "'" + scanner.tooDeepPointer() + "'";
+        return std::unexpected(ConfigDocumentParseError{
+            ConfigDocumentParseFailure::TooDeep, scanner.tooDeepPointer(),
+            "the container at " + at + " is nested " + std::to_string(limit.levels + 1)
+                + " levels deep, past the " + std::to_string(limit.levels)
+                + " levels a DSS config document may nest (declared in "
+                + std::string{limit.declaredIn}
+                + "); every reader walks a document once per level, so a deeper one is "
+                  "refused before any of them reads it"});
+    }
     if (scanner.found()) {
         return std::unexpected(ConfigDocumentParseError{
             ConfigDocumentParseFailure::DuplicateKey, scanner.duplicatePointer(),

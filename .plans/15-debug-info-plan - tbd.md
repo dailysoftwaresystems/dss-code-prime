@@ -7,6 +7,7 @@
 | | |
 |---|---|
 | Status        | ⏳ **planned.** v1 acceptance includes "step through line numbers"; locals reserved post-v1. |
+| Scheduled | per [`30`](./30-pr-scope-plan%20-%20tbd.md) (2026-10-22): foreign debug info carried: PR #59; the compiler's own debug information, made FULL (locals and optimized code included): the next PR, lane D, phases D1–D7 (plan 30 §3; §8 below). |
 | Predecessors  | ✅ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (byte-offset stability — AS1–AS6 closed 2026-05-29). ✅ [`14-linker-plan`](./14-linker-plan%20-%20tbd.md) (section placement — LK1–LK10 closed 2026-05-30). |
 | Successors    | [`16-codesign-publish-plan`](./16-codesign-publish-plan%20-%20tbd.md) codesigns include debug sections. |
 | Scope         | **Bounded.** DB1–DB12. v1: line numbers via DWARF + PDB; locals (variable lifetimes) post-v1. CFI / unwind in v1 (required for crash + profilers). |
@@ -228,3 +229,40 @@ Substrate tier for DB1 (source-position contract). Feature tier for writers.
                                             ▼
                                16-codesign-publish (sections covered by signature)
 ```
+
+---
+
+## 8. Refresh and scheduling (2026-10-22, per [`30`](./30-pr-scope-plan%20-%20tbd.md))
+
+> The operator asked for the compiler's **full** debug information to be planned (*"eventually implement the full
+> debug info in our compiler"*). This section supersedes §0's status and §4 Q2 where they disagree, and it is where
+> the next PR's lane D starts.
+
+### 8.1 State
+
+| item | state | label |
+|---|---|---|
+| DB4 `.eh_frame` (ELF) | ships for DSS's own functions | READ (the ELF writers) |
+| DB8 Win64 `.pdata` / `.xdata` | ships, and every PE unwind form a reference writes reaches the image (fold 3c) | READ, and MEASURED in fold 3c |
+| DB9 Mach-O `__unwind_info` | in PR #59, fold 3d | — |
+| DB1–DB3, DB5–DB7, DB10–DB12 | not started | MEASURED: `-g`, `-g3`, `-gdwarf-5`, `--debug` and `/Zi` are refused by name ("unknown flag"), and no output of any configuration holds a debug section or a PDB (lane `xa`, the checkpoint-32 compiler) |
+| foreign debug information | NOT carried: a gcc `-g` object's `.debug_*` sections leave no trace in a DSS image or `-r` object (MEASURED, lane `xa`) | carried by PR #59 (plan 30 §1.2) |
+
+### 8.2 Phases of the next PR's lane D
+
+| phase | DB items | content |
+|---|---|---|
+| D1 | DB1 | the source-position chain (§2.2), `-g` accepted and config-driven, verifiers refusing an instruction with no span unless it is marked synthetic |
+| D2 | DB2 | DWARF 5 line tables, compile-unit and subprogram DIEs, ELF and Mach-O |
+| D3 | DB3, DB10 | types through the ONE universal mapper of §2.1 and a language's `debugInfo` facet |
+| D4 | (was post-v1) | variables: globals, parameters, locals, frame-base locations, `.debug_loclists` for optimized code, lexical blocks |
+| D5 | DB5–DB7 | the PDB, the image's RSDS debug directory, CodeView locals |
+| D6 | DB11, DB12 | oracles (`llvm-dwarfdump --verify`, `llvm-pdbutil`), scripted gdb / lldb / cdb runs on every leg, byte-identical rebuilds |
+| D7 | — | own and foreign debug information merged through `-r` and into images, one engine with PR #59's carry |
+
+### 8.3 Superseded or reopened here
+
+- **§4 Q2 (locals in v1? "No")** is superseded: "full" puts locals and optimized-code locations in scope (D4).
+- **§4 Q3 (Mach-O: embed DWARF inline)** is reopened as a measurement at D2's design audit: the image's `__DWARF`, or ld64's debug map. The criterion is that lldb on the Mac leg debugs both a DSS-only program and a mixed one.
+- **§2.6 and DB10's per-language `<lang>_debug.cpp` glue** contradict §2.1, which removed that tree as bucket-3 identity branching. §2.1 stands: one universal mapper plus a `debugInfo` facet.
+- **The diagnostic namespace (§2.7)** is checked against the current code allocation before D1 mints a code.

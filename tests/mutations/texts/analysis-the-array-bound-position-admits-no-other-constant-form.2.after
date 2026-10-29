@@ -1,0 +1,2 @@
+                    && !constIntExpr(s, tree, *bound, here, &cfg,
+                                     std::nullopt).has_value()) {

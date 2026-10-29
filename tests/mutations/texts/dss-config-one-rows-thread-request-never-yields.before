@@ -1,0 +1,5 @@
+          "__declspec(thread)": { "threadStorage": true, "yieldsOnMismatch": true },
+          "__declspec(dllimport)": { "nonDefining": true, "imported": true },
+          "dllimport": { "nonDefining": true, "imported": true },
+          "weak":   { "binding": "weak", "weakKind": "overridable" },
+          "selectany": { "binding": "weak", "weakKind": "select-any" },

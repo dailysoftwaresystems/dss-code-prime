@@ -1,6 +1,6 @@
 #include "program/input_resolver.hpp"
 
-#include "core/substrate/path_identity.hpp"  // genericSpelling
+#include "core/substrate/path_identity.hpp"  // genericSpelling, walkTree
 #include "core/types/parse_diagnostic.hpp"
 
 #include <algorithm>
@@ -42,62 +42,50 @@ bool InputResolver::resolveDirectory(
         std::vector<std::string>&      out,
         DiagnosticReporter&            reporter) {
     std::error_code ec;
-    if (!fs::exists(directoryPath, ec) || !fs::is_directory(directoryPath, ec)) {
+    if (core::reachedKind(directoryPath, ec) != core::EntryKind::Directory) {
         emit(reporter, DiagnosticCode::D_FileNotFound,
              "InputResolver: '" + core::genericSpelling(directoryPath)
              + "' does not exist or is not a directory.");
         return false;
     }
 
-    // Two iterator shapes — recursive and flat — share the same
-    // extension-filter + ec-handling. The closed-enum `Mode` keeps
-    // the dispatch explicit at the call site (caller passes the
-    // policy; resolver doesn't infer from path / cwd / env).
+    // ONE walk for both shapes — the substrate's (`core::walkTree`), which never
+    // descends a LINK on any build: the flat shape prunes every directory, the
+    // recursive one descends every real one. The closed-enum `Mode` keeps the
+    // dispatch explicit at the call site (caller passes the policy; resolver
+    // doesn't infer from path / cwd / env).
+    // ✔MEASURED 2026-10-20 (the substrate's header): libstdc++ on Windows cannot
+    // tell a link from what it reaches, so the MinGW build's
+    // `recursive_directory_iterator` DESCENDED a directory link the MSVC build's
+    // did not, and took a dangling file link for a regular file — one directory,
+    // two input lists. A link is an input by what it REACHES: a link to a regular
+    // file is that file under its name here; a dangling one is no input.
     std::vector<std::string> matched;
-    auto const captureMatches = [&](auto& iter) -> bool {
-        using IterT = std::decay_t<decltype(iter)>;
-        IterT const end{};
-        for (; iter != end; iter.increment(ec)) {
-            if (ec) {
-                emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-                     "InputResolver: directory-scan interrupted after "
-                     "partial enumeration of '"
-                     + core::genericSpelling(directoryPath) + "': "
-                     + ec.message());
-                return false;
-            }
-            if (!iter->is_regular_file()) continue;
-            if (extensionMatches(iter->path(), fileExtensions)) {
-                // Not a message — the INPUT LIST the compiler goes on to open.
-                // `iter` walks `directoryPath`, so every entry inherits that
-                // path's root, authority included.
-                matched.push_back(core::genericSpelling(iter->path()));
-            }
+    auto const walk = core::walkTree(directoryPath, [&](core::TreeEntry const& entry) {
+        if (entry.kind == core::EntryKind::Directory)
+            return mode == Mode::Recursive ? core::WalkStep::Continue : core::WalkStep::Prune;
+        if (entry.reaches != core::EntryKind::File) return core::WalkStep::Continue;
+        if (extensionMatches(entry.path, fileExtensions)) {
+            // Not a message — the INPUT LIST the compiler goes on to open.
+            // The walk joins `directoryPath` with each name, so every entry
+            // inherits that path's root, authority included.
+            matched.push_back(core::genericSpelling(entry.path));
         }
-        return true;
-    };
-
-    bool scanOk = false;
-    if (mode == Mode::Recursive) {
-        fs::recursive_directory_iterator it(directoryPath, ec);
-        if (ec) {
-            emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-                 "InputResolver: failed to open directory '"
-                 + core::genericSpelling(directoryPath) + "': " + ec.message());
-            return false;
-        }
-        scanOk = captureMatches(it);
-    } else {
-        fs::directory_iterator it(directoryPath, ec);
-        if (ec) {
-            emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-                 "InputResolver: failed to open directory '"
-                 + core::genericSpelling(directoryPath) + "': " + ec.message());
-            return false;
-        }
-        scanOk = captureMatches(it);
+        return core::WalkStep::Continue;
+    });
+    if (walk.error) {
+        // The directory itself, or one under it: the two remediations differ, so
+        // the two messages do.
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             walk.where == directoryPath
+                 ? "InputResolver: failed to open directory '"
+                       + core::genericSpelling(directoryPath) + "': " + walk.error.message()
+                 : "InputResolver: directory-scan interrupted after "
+                   "partial enumeration of '"
+                       + core::genericSpelling(directoryPath) + "' (at '"
+                       + core::genericSpelling(walk.where) + "'): " + walk.error.message());
+        return false;
     }
-    if (!scanOk) return false;
 
     if (matched.empty()) {
         emit(reporter, DiagnosticCode::D_EmptyInput,
@@ -130,8 +118,13 @@ bool InputResolver::validateFiles(
     bool allOk = true;
     out.reserve(out.size() + inputs.size());
     for (auto const& path : inputs) {
-        std::error_code ec;
-        bool const isRegular = fs::is_regular_file(path, ec);
+        // What the path REACHES, asked of the substrate (a dangling link reaches nothing, on every
+        // build); a clean absence is the missing-file arm, as `status` reported it with ENOENT.
+        std::error_code       ec;
+        core::EntryKind const reached = core::reachedKind(path, ec);
+        if (!ec && reached == core::EntryKind::Absent)
+            ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        bool const isRegular = reached == core::EntryKind::File;
         if (ec) {
             // Distinguish ENOENT (file truly missing — D_FileNotFound)
             // from other filesystem errors (permission denied, broken
@@ -198,9 +191,10 @@ bool InputResolver::checkSearchDirectoriesUsable(
         if (!ec) continue;                     // enumerable — nothing to say
 
         std::error_code       existsEc;
-        bool const            present = fs::exists(dir, existsEc);
-        std::error_code       dirEc;
-        bool const            isDir   = fs::is_directory(dir, dirEc);
+        core::EntryKind const reached = core::reachedKind(dir, existsEc);
+        bool const            present = reached != core::EntryKind::Absent;
+        std::error_code const dirEc   = existsEc;
+        bool const            isDir   = reached == core::EntryKind::Directory;
         if (!present && !existsEc) {
             warn(reporter, DiagnosticCode::D_FileNotFound,
                  "InputResolver: " + opt + " names '" + dir

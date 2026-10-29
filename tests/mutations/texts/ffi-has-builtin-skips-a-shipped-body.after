@@ -1,0 +1,4 @@
+    std::vector<std::string> documentGate;
+    std::vector<std::string> symbolGate;
+    std::vector<std::string> shippedSourceFormats;   // M44b
+};

@@ -196,10 +196,15 @@ struct ExecDataSectionLayout {
     // fail-loud deferral; exec `rodata` is `true` on PE, the ELF dynamic
     // arm, AND the Mach-O exec — the latter guarded downstream by the
     // `__TEXT,__const` rebase wall), and leaves `false` where a
-    // reloc-bearing item is a producer-contract breach (read-only `rodata` on
-    // the static/relocatable arms — the RodataDataItemWithRelocationFailsLoud
-    // discipline): the item then fails loud here, never a silent unpatched
-    // slot. Deferral anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
+    // reloc-bearing item is a producer-contract breach (read-only
+    // `rodata` on the COFF and Mach-O static/relocatable arms, whose object
+    // readers route a read-only item WITH relocations to relro — ✔MEASURED
+    // 2026-10-20: cl 19.44's and MinGW gcc 13.2's `.rdata` address and jump
+    // tables read as relro and DSS's `-r` writes them, and LLVM 18's Mach-O
+    // objects keep every such table in `__DATA,__const` or inline in `__text`):
+    // the item then fails loud here, never a silent unpatched slot. The ELF
+    // arms pass `true` since P69 fold 3c (gcc's jump table is a `.rodata` item
+    // with relocations).
     bool                              allowItemRelocations = false,
     // OPT-OUT for items the CALLER lays out in a section of their OWN rather
     // than in this shared one -- `dataItems` indices this call must SKIP
@@ -252,12 +257,13 @@ struct ExecDataSectionLayout {
         if (!d.relocations.empty() && !allowItemRelocations) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("{}: {} data item #{} (SymbolId={{ {} }}) carries "
-                             "{} relocation(s); data->data relocations are not "
-                             "yet supported by this writer (deferred "
-                             "D-LK1-ELF-RODATA-DATAITEM-RELOC — it patches FUNCTION "
-                             "relocations only).",
+                             "{} relocation(s), and this writer lays the {} section "
+                             "out without relocations: a read-only item that "
+                             "carries relocations belongs in the relocated-read-only "
+                             "(relro) section, where this format's object readers "
+                             "put one.",
                              writerName, dataSectionKindName(kind), i,
-                             d.symbol.v, d.relocations.size()));
+                             d.symbol.v, d.relocations.size(), dataSectionKindName(kind)));
             return false;
         }
         // Defense in depth (validateAssembledData ran first): a zero-fill
@@ -759,25 +765,21 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                                      + rel.addend
                                      + static_cast<std::int64_t>(tri->addendBias);
             if (tri->pcRelative) signedValue -= static_cast<std::int64_t>(patchVa);
-            // Signed-fit tripwire for a narrow (< 8-byte) fixup -- the SAME
+            // Range tripwire for a narrow (< 8-byte) fixup -- the SAME
             // last-line guard the instruction-fixup kernel applies
             // (`applyExecRelocations`, exec_reloc_apply.hpp): a value outside the
-            // width's signed range would be silently truncated to its low bytes
+            // field's declared range would be silently truncated to its low bytes
             // (a wrong displacement baked into data). Relevant now that a width-4
             // pc-relative kind (a jump-table `rel32` entry) reaches this write;
             // also closes the pre-existing width-4 absolute (`abs32`) exposure.
-            if (tri->widthBytes < 8) {
-                std::int64_t const sMax =
-                    (std::int64_t{1} << (8 * tri->widthBytes - 1)) - 1;
-                if (signedValue < -sMax - 1 || signedValue > sMax) {
-                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                         std::format("{}: data item SymbolId={{ {} }} relocation '{}' "
-                                     "value {} does not fit signed in widthBytes={} - "
-                                     "would silently truncate.",
-                                     writerName, di.symbol.v, tri->name, signedValue,
-                                     static_cast<int>(tri->widthBytes)));
-                    return false;
-                }
+            // P69 fold 3c: the range is the row's (`linearFieldHolds`, the one
+            // check every Linear writer asks), no longer "signed" for every row.
+            if (std::string why; !linearFieldHolds(*tri, signedValue, why)) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("{}: data item SymbolId={{ {} }} relocation '{}' "
+                                 "value {} is outside {} - would silently truncate.",
+                                 writerName, di.symbol.v, tri->name, signedValue, why));
+                return false;
             }
             std::uint64_t const value = static_cast<std::uint64_t>(signedValue);
             for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {

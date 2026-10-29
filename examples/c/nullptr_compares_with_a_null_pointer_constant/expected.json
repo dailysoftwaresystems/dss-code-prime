@@ -1,0 +1,15 @@
+{
+  "$comment": "P69 L2a (lane lm): nullptr compares with a NULL POINTER CONSTANT (C23 6.5.9p2) - an integer constant expression of value 0 on either side, under == and !=, folded (1 - 1) or not, and (void *)0. MEASURED 2026-10-22 on this lane's tree before the fix (compile-and-keep, macos-arm64-debug, x86_64:pe64, baseline and release): nullptr == 0, 0 == nullptr and nullptr != 0 were refused S_NullptrInvalidOperand. gcc 13.3.0 and clang 18.1.3 build THIS file at -std=gnu2x and -std=c2x -pedantic-errors and exit 42. Exit 42, or the number of the first check that fails. The release arm runs the same comparisons through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false }
+  ]
+}

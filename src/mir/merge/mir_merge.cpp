@@ -2,8 +2,12 @@
 
 #include "core/substrate/phase_timers.hpp"  // the merge-side whole-program verify's `--time` row
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // computeLayout — the extent of a tentative definition
 #include "core/types/type_lattice/type_reintern.hpp"
+#include "link/common_yield.hpp"       // the ONE reader of the link document's weak / common statements
 #include "link/cross_cu_resolve.hpp"   // resolveCrossCuDefs, CrossCuDef, LinkedSymbolKey
+#include "link/extern_reference_gate.hpp"   // whether a unit USES an extern row (step 5b)
+#include "link/object_format_schema.hpp"   // ObjectFormatSchema — the link's document
 #include "link/symbol_kind.hpp"        // LinkedSymbolKey
 #include "mir/mir_cfg.hpp"             // mirReversePostOrder
 #include "mir/mir_opcode.hpp"
@@ -16,6 +20,7 @@
 #include <cstdlib>
 #include <format>       // ffiImportKey — the length-prefixed import-identity key
 #include <functional>
+#include <limits>       // SymbolAllocator::end — saturate at the last id
 #include <optional>     // the per-CU subset-import filter
 #include <string>
 #include <unordered_map>
@@ -48,6 +53,7 @@ public:
                 "already taken (unified-symbol allocation invariant).\n", v);
             std::abort();
         }
+        handedOut_(v);
         return SymbolId{v};
     }
     // Mint the next free id.
@@ -55,12 +61,29 @@ public:
         while (used_.count(next_)) ++next_;
         std::uint32_t const v = next_++;
         used_.insert(v);
+        handedOut_(v);
         return SymbolId{v};
     }
     [[nodiscard]] bool isFree(std::uint32_t v) const { return used_.count(v) == 0; }
 
+    // One past the highest id this allocator has handed out: the END of the
+    // merged module's id space, which is a NEW space (no unit's name table
+    // describes it — the merged names are the plan's own `symbolNames`, every key
+    // of which was handed out here). `mergeCuMirs` states it to the merged
+    // module's builder, so whatever mints into the merged module afterwards asks
+    // the module and clears every merged id — the ones the module holds, the
+    // imports' (their rows live beside it) and the ones a name alone holds.
+    [[nodiscard]] std::uint32_t end() const noexcept { return end_; }
+
 private:
+    void handedOut_(std::uint32_t v) noexcept {
+        constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t const past = v == kLast ? kLast : v + 1u;
+        if (past > end_) end_ = past;
+    }
+
     std::uint32_t                     next_;
+    std::uint32_t                     end_ = 1;
     std::unordered_set<std::uint32_t> used_;
 };
 
@@ -235,7 +258,12 @@ public:
           host_(host), dst_(dst) {}
 
     // Clone `f` into `dst_`. Returns the merged MirFuncId.
-    [[nodiscard]] MirFuncId clone(MirFuncId f, SymbolId mergedSymbol) {
+    // `keptAsModulePrivate`: the body is a LOSING definition the merge keeps for an
+    // alias of its unit (step 4) — module-private under its own fresh id, with no
+    // static-initialization schedule of its own (a loser's is dropped with it, as
+    // every loser's is).
+    [[nodiscard]] MirFuncId clone(MirFuncId f, SymbolId mergedSymbol,
+                                  bool keptAsModulePrivate = false) {
         TypeId const sig = reinternType(srcInterner_, src_.funcSignature(f),
                                         host_, typeRemap(),
                                         plan_.compositeIdentity);
@@ -256,15 +284,21 @@ public:
         // the artifact a `.dssir` dump describes, and a per-function fact that
         // silently disappears at the CU boundary is a fact the compiler cannot be
         // said to record at all.
+        // P69: the LINKAGE crosses as its one record (`Mir::funcLinkage`) — the
+        // binding, the visibility and the weak kind together, so a weak
+        // definition that survives the merge still says which kind it is to the
+        // object writer.
         MirFuncId const newF = dst_.addFunction(
-            sig, mergedSymbol, src_.funcBinding(f), src_.funcVisibility(f),
+            sig, mergedSymbol,
+            keptAsModulePrivate ? MirLinkage{SymbolBinding::Local, SymbolVisibility::Default}
+                                : src_.funcLinkage(f),
             src_.funcNoInline(f), src_.funcAlwaysInline(f),
             src_.funcNoOptimize(f), src_.funcNoSanitizeThread(f),
             // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN:
             // the schedule must cross the CU boundary or a constructor defined
             // in one translation unit stops running the moment a second unit
             // joins the link — the sharpest form of the drop this axis fears.
-            src_.funcStaticInit(f));
+            keptAsModulePrivate ? StaticInitSchedule{} : src_.funcStaticInit(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);
@@ -533,7 +567,8 @@ private:
                 return;
             }
             case MirOpcode::Unreachable:
-                dst_.addUnreachable();
+                // P69: what the terminator asserts survives the merge.
+                dst_.addUnreachable(static_cast<MirUnreachableKind>(src_.instPayload(id)));
                 return;
             case MirOpcode::IndirectBr: {
                 // D-CSUBSET-COMPUTED-GOTO: ★ THE SILENT-MISCOMPILE CLONE SITE (MF-A).
@@ -621,7 +656,8 @@ private:
 
 std::optional<MergedMirModule>
 mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
-            std::span<std::string const> entryNames, DiagnosticReporter& reporter) {
+            std::span<std::string const> entryNames,
+            ObjectFormatSchema const& linkFormat, DiagnosticReporter& reporter) {
     if (cus.empty()) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;
@@ -691,6 +727,50 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // private (resolveCrossCuDefs filters Local, but pre-filtering keeps the def
     // list honest about what crosses CU boundaries).
     std::vector<linker::CrossCuDef> defs;
+    // P69 fold f26b (lane `cs`): the weak kind each entry of `defs` states, for the
+    // rule of two different weak definitions of one name (step 2, below).
+    std::vector<std::optional<WeakDefinitionKind>> kindOfDef;
+    // ── WHAT THE LINK'S DOCUMENT SAYS OF A WEAK DEFINITION (P69 fold 3) ───────
+    // The kernel compares what it is handed, and until now this tier handed it
+    // a binding and nothing else — so every weak definition folded at one rank
+    // (✔MEASURED 2026-10-12 on DSS-compiled units, pe64: a select-any
+    // definition beside an overridable one ran the select-any body with its
+    // unit named first and the OVERRIDABLE one, exit 44, with it second), and a
+    // strong definition replaced a select-any one in silence where every PE
+    // reference refuses the pair. The three statements below are the ones the
+    // unit linker makes of a reader's row, read from the same document by the
+    // same functions (`link/common_yield.hpp`) off the definition's own kind
+    // (`MirLinkage::statedWeakKind`): one rule, two tiers.
+    // Called once for each entry, right after it is pushed: it records the kind
+    // the entry states at the entry's own index of `kindOfDef`.
+    auto const stateTheLinksAnswers = [&](linker::CrossCuDef& def,
+                                          MirLinkage const&   linkage) {
+        linker::stateTheLinksAnswers(def, linkFormat, linkage.statedWeakKind());
+        kindOfDef.resize(defs.size());
+        kindOfDef.back() = linkage.statedWeakKind();
+    };
+    // ── THE TENTATIVE DEFINITIONS, BY NAME ───────────────────────────────────
+    //    D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED
+    // A global that is a COMMON (`Mir::globalIsCommon`) enters the election as
+    // one — `CrossCuDef::tentative` — and is remembered here with the index of
+    // its `defs` entry, so that a name two units define this way can be given
+    // the extents the fold compares (below, after the walk).
+    struct TentativeCarrier {
+        std::size_t   def;      // index into `defs`
+        std::uint32_t cu;
+        MirGlobalId   global;
+        // The alignment this carrier's own definition asks for — its type's,
+        // or the one its unit stated if that is wider. Measured only for a name
+        // with two or more carriers; 0 until then.
+        std::uint32_t alignment = 0;
+    };
+    std::unordered_map<std::string, std::vector<TentativeCarrier>> tentativeCarriers;
+    // P69 (lane `cs`): the (cu, symbol) of every alias that entered the election —
+    // so a name's winner can be told to be an alias (below, `aliasWonNames`).
+    std::unordered_set<CuSymKey, CuSymKeyHash> aliasKeys;
+    // cs-28: each alias that entered the election as one more name its TARGET
+    // carries — what `linker::resolveSettlingCarriedNames` is handed (below).
+    std::vector<linker::CarriedName> carriedNames;
     // (cuIdx, MirFuncId.v) for the winning key of each externally-visible name —
     // so we can decide whether a function is the winner (keep) or a shadowed
     // loser (skip its body).
@@ -706,12 +786,13 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // cross-CU election, or a name it merely happens to define would
             // shadow the importer's own reference to the real one.
             if (!contributesFunction(ci, name)) continue;
-            SymbolBinding const binding = m.funcBinding(f);
-            if (binding == SymbolBinding::Local) continue;
+            MirLinkage const linkage = m.funcLinkage(f);
+            if (linkage.binding == SymbolBinding::Local) continue;
             plan.definedNames.insert(name);
             defs.push_back(linker::CrossCuDef{
-                name, binding,
+                name, linkage.binding,
                 LinkedSymbolKey{CompilationUnitId{ci + 1}, m.funcSymbol(f)}});
+            stateTheLinksAnswers(defs.back(), linkage);
         }
         // Externally-visible globals participate in cross-CU resolution too (a
         // strong global shadows a weak one of the same name), exactly like
@@ -728,17 +809,232 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             MirGlobalId const g = m.globalAt(gi);
             std::string const name = cus[ci].nameOf(m.globalSymbol(g));
             if (name.empty()) continue;
-            SymbolBinding const binding = m.globalBinding(g);
-            if (binding == SymbolBinding::Local) continue;
+            MirLinkage const linkage = m.globalLinkage(g);
+            if (linkage.binding == SymbolBinding::Local) continue;
             plan.definedNames.insert(name);
             defs.push_back(linker::CrossCuDef{
-                name, binding,
+                name, linkage.binding,
                 LinkedSymbolKey{CompilationUnitId{ci + 1}, m.globalSymbol(g)}});
+            stateTheLinksAnswers(defs.back(), linkage);
+            if (m.globalIsCommon(g)) {
+                defs.back().tentative = true;
+                tentativeCarriers[name].push_back(
+                    TentativeCarrier{defs.size() - 1, ci, g});
+            }
+        }
+        // P69 (lane `cs`): AN ALIAS IS A DEFINITION OF ITS NAME (`Mir::aliases`),
+        // and it enters the election as one, with its OWN binding and kind — a
+        // weak alias yields to another unit's strong definition of the name, and
+        // a strong one beside it is two definitions, exactly as the unit linker
+        // ranks the alias row of a compiled object. Its name is NOT a
+        // `definedNames` entry: every reference to an alias is by NAME (the
+        // unit's own reference row, `ExternImport`), and while an alias wins the
+        // name that row must survive, so the link resolves it to the alias row.
+        // The name is carried by its TARGET's definition (`carriedNames`): where
+        // the link discards a losing definition whole, a STRONG alias runs only
+        // while its target holds the target's own name (the settled election,
+        // below); a weak one is the weak definition of its name it is, whatever
+        // becomes of its target (`linker::carriedNameGoesWithItsCarrier`, which
+        // the election asks of every entry handed to it here).
+        std::unordered_map<std::uint32_t, MirLinkage> definitionLinkage;
+        if (m.moduleAliasCount() != 0) {
+            for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+                MirFuncId const f = m.funcAt(fi);
+                definitionLinkage.emplace(m.funcSymbol(f).v, m.funcLinkage(f));
+            }
+            for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+                MirGlobalId const g = m.globalAt(gi);
+                definitionLinkage.emplace(m.globalSymbol(g).v, m.globalLinkage(g));
+            }
+        }
+        for (MirAlias const& a : m.aliases()) {
+            std::string const name = cus[ci].nameOf(a.alias);
+            if (name.empty() || a.linkage.binding == SymbolBinding::Local) continue;
+            aliasKeys.insert(CuSymKey{ci, a.alias.v});
+            defs.push_back(linker::CrossCuDef{
+                name, a.linkage.binding,
+                LinkedSymbolKey{CompilationUnitId{ci + 1}, a.alias}});
+            stateTheLinksAnswers(defs.back(), a.linkage);
+            auto const target = definitionLinkage.find(a.target.v);
+            if (target == definitionLinkage.end() || target->second.binding != SymbolBinding::Weak)
+                continue;   // a target that is no weak definition of the unit never loses its name to a copy
+            carriedNames.push_back(linker::CarriedName{
+                defs.size() - 1, cus[ci].nameOf(a.target),
+                LinkedSymbolKey{CompilationUnitId{ci + 1}, a.target},
+                target->second.statedWeakKind(), a.linkage.statedWeakKind()});
         }
     }
 
-    linker::CrossCuResolution const resolution =
-        linker::resolveCrossCuDefs(defs);
+    // ── THE EXTENT OF EACH COMMON THAT HAS A SIBLING ─────────────────────────
+    // Two units' tentative definitions of one name are ONE object, the larger,
+    // at the wider alignment — what every reference linker makes of two commons
+    // (✔MEASURED 2026-10-12, PE and ELF; C leaves two declarations of one
+    // object with types that are not compatible undefined, and `int a[];`
+    // beside `int a[10];` is the shape that reaches a linker anyway). So the
+    // fold needs each carrier's SIZE, and the size of a type is the layout
+    // engine's to say — `computeLayout`, the rule `sizeof` asks — under the
+    // layout rule ITS OWN UNIT was analyzed under
+    // (`MergeCuInput::aggregateLayout`) and the link's data model.
+    //   ⓘ Asked ONLY of a name two or more units define tentatively. A lone
+    //     tentative definition is sized by nobody here: it wins or loses by its
+    //     class, and the assembler sizes what survives.
+    //   ⓘ Each carrier is measured in ITS OWN unit's lattice and under its own
+    //     unit's rule — the question is the size its unit declared, no type is
+    //     re-interned to ask it, and no unit answers for another.
+    //   ⓘ Two carriers whose units were analyzed under DIFFERENT rules have
+    //     sizes that are not comparable, and the name is refused: the driver's
+    //     units agree by construction, and this is where that is checked.
+    // `commonAlignment[name]` is the widest alignment among the name's
+    // carriers; step (5) raises the surviving global to it.
+    std::unordered_map<std::string, std::uint32_t> commonAlignment;
+    {
+        auto const sameRule = [](AggregateLayoutParams const& a,
+                                 AggregateLayoutParams const& b) {
+            return a.scalarAlignment == b.scalarAlignment
+                   && a.maxAlignment == b.maxAlignment
+                   && a.bitFieldStrategy == b.bitFieldStrategy
+                   && a.unnamedBitFieldAlignment == b.unnamedBitFieldAlignment
+                   && a.maxRequestedAlignment == b.maxRequestedAlignment;
+        };
+        auto const refuse = [&](std::string const& name, std::string why) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mergeCuMirs: symbol '{}' is defined tentatively by {} compilation "
+                "units, which makes it ONE object as large as the largest of them "
+                "— and {}.",
+                name, tentativeCarriers.at(name).size(), why);
+            reporter.report(std::move(d));
+        };
+        std::vector<std::string> names;
+        names.reserve(tentativeCarriers.size());
+        for (auto const& [name, carriers] : tentativeCarriers) {
+            if (carriers.size() >= 2) names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());   // refusals in a stated order
+        for (std::string const& name : names) {
+            std::uint32_t widest = 0;
+            std::vector<TentativeCarrier>& carriers = tentativeCarriers.at(name);
+            auto const& firstRule = cus[carriers.front().cu].aggregateLayout;
+            for (TentativeCarrier& c : carriers) {
+                Mir const& m    = *cus[c.cu].mir;
+                auto const& rule = cus[c.cu].aggregateLayout;
+                if (!rule.has_value()) {
+                    refuse(name, std::format(
+                        "the definition in CU #{} cannot be sized: the merge was "
+                        "handed no layout rule for that unit "
+                        "(MergeCuInput::aggregateLayout)", c.cu + 1));
+                    continue;
+                }
+                if (firstRule.has_value() && !sameRule(*firstRule, *rule)) {
+                    refuse(name, std::format(
+                        "CU #{} and CU #{} were analyzed under different layout "
+                        "rules, so the sizes of their definitions are not "
+                        "comparable", carriers.front().cu + 1, c.cu + 1));
+                    continue;
+                }
+                auto const lay = computeLayout(m.globalType(c.global),
+                                               *cus[c.cu].interner, *rule,
+                                               linkFormat.dataModel());
+                if (!lay.has_value()) {
+                    refuse(name, std::format(
+                        "the definition in CU #{} cannot be sized: the layout "
+                        "engine has no size for its type", c.cu + 1));
+                    continue;
+                }
+                defs[c.def].bodySize = static_cast<std::size_t>(lay->size);
+                c.alignment = std::max(static_cast<std::uint32_t>(lay->align.bytes()),
+                                       m.globalAlignmentBytes(c.global));
+                widest = std::max(widest, c.alignment);
+            }
+            commonAlignment.emplace(name, widest);
+        }
+    }
+
+    // cs-28: the election settles each target's own name before the aliases it
+    // carries run for theirs — a STRONG alias of a copy the link discards whole is
+    // WITHDRAWN when that copy loses (`linker::resolveSettlingCarriedNames`, the
+    // one statement of the rule, which the merge and the unit linker both call;
+    // its measurement is there). A withdrawn alias is no
+    // definition of its name: the name is elected without it, and the alias stays
+    // only as a module-private name of the winning copy for its own unit's uses
+    // (step 3b binds them, step 5b states it). A WEAK alias is never withdrawn
+    // (`linker::carriedNameGoesWithItsCarrier`): it wins or loses its name as the
+    // weak definition it is, and where it wins, it names the winning copy of its
+    // target (step 5b).
+    linker::SettledElection const election =
+        linker::resolveSettlingCarriedNames(defs, carriedNames, linkFormat);
+    linker::CrossCuResolution const& resolution = election.resolution;
+    std::unordered_set<CuSymKey, CuSymKeyHash> withdrawnAliases;
+    std::vector<std::unordered_set<std::string>> withdrawnAliasNamesOf(cus.size());
+    for (std::size_t const i : election.withdrawn) {
+        withdrawnAliases.insert(CuSymKey{defs[i].key.cuId.v - 1, defs[i].key.symbol.v});
+        withdrawnAliasNamesOf[defs[i].key.cuId.v - 1].insert(defs[i].name);
+    }
+
+    // ── A TENTATIVE DEFINITION LARGER, OR MORE ALIGNED, THAN THE DEFINITION IT
+    //    YIELDS TO IS SAID (P69 fold 3b, the review of fold 3a, F4) ───────────
+    // The unit linker's sentence (`allocateCommonDefinitions`), for the units
+    // this merge folds: the tentative definition's unit reads and writes the
+    // object as the one it declared, past the definition's end or off its
+    // alignment. Every reference linker links the pair, so this merge does, and
+    // says so (`K_CommonSymbolLargerThanItsDefinition`, a warning). Each side is
+    // sized as step (1b) sizes a carrier: its own unit's layout rule; a side that
+    // cannot be sized is not judged here (that refusal is step (1b)'s).
+    {
+        auto const extentOf = [&](std::uint32_t ci, MirGlobalId g)
+            -> std::optional<std::pair<std::uint64_t, std::uint32_t>> {
+            Mir const& m    = *cus[ci].mir;
+            auto const& rule = cus[ci].aggregateLayout;
+            if (!rule.has_value()) return std::nullopt;
+            auto const lay = computeLayout(m.globalType(g), *cus[ci].interner, *rule,
+                                           linkFormat.dataModel());
+            if (!lay.has_value()) return std::nullopt;
+            return std::pair{static_cast<std::uint64_t>(lay->size),
+                             std::max(static_cast<std::uint32_t>(lay->align.bytes()),
+                                      m.globalAlignmentBytes(g))};
+        };
+        std::vector<std::string> names;
+        for (auto const& [name, carriers] : tentativeCarriers) names.push_back(name);
+        std::sort(names.begin(), names.end());   // warnings in a stated order
+        for (std::string const& name : names) {
+            auto const won = resolution.winners.find(name);
+            if (won == resolution.winners.end()) continue;
+            auto const& carriers = tentativeCarriers.at(name);
+            bool const aCarrierWon = std::any_of(carriers.begin(), carriers.end(),
+                [&](TentativeCarrier const& c) { return defs[c.def].key == won->second; });
+            if (aCarrierWon) continue;
+            std::uint32_t const wcu = won->second.cuId.v - 1;
+            if (wcu >= cus.size()) continue;
+            Mir const& wm = *cus[wcu].mir;
+            std::optional<MirGlobalId> winner;
+            for (std::uint32_t gi = 0; gi < wm.moduleGlobalCount(); ++gi) {
+                if (wm.globalSymbol(wm.globalAt(gi)) == won->second.symbol) winner = wm.globalAt(gi);
+            }
+            if (!winner.has_value()) continue;   // a function: no storage to compare
+            auto const definition = extentOf(wcu, *winner);
+            if (!definition.has_value()) continue;
+            for (TentativeCarrier const& c : carriers) {
+                auto const tentative = extentOf(c.cu, c.global);
+                if (!tentative.has_value()) continue;
+                if (tentative->first <= definition->first && tentative->second <= definition->second) continue;
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_CommonSymbolLargerThanItsDefinition;
+                d.severity = DiagnosticSeverity::Warning;
+                d.actual   = std::format(
+                    "mergeCuMirs: the tentative definition of '{}' in CU #{} is {} bytes "
+                    "aligned to {}, and the definition of the name it yields to (CU #{}) "
+                    "is {} bytes aligned to {}: the tentative definition's unit reads and "
+                    "writes the object as the larger or more aligned one it declared. "
+                    "Linked as every reference linker links it.",
+                    name, c.cu + 1, tentative->first, tentative->second, wcu + 1,
+                    definition->first, definition->second);
+                reporter.report(std::move(d));
+                break;   // once per name
+            }
+        }
+    }
 
     // (2) report each two-strong conflict (one per collision event — mirrors the
     // linker's per-pair K_SymbolRedefinedAcrossUnits count).
@@ -752,6 +1048,59 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                      std::to_string(c.existing.cuId.v) + " and CU #" +
                      std::to_string(c.incoming.cuId.v) + ").";
         reporter.report(std::move(d));
+    }
+    // A weak definition the link's format does not let a strong one replace, and
+    // a pair the link's document was asked about and does not decide — the SAME
+    // conditions, codes and sentences as the unit linker's and the summary
+    // index's: the kernel recorded them, and the ONE wording all three doors
+    // share makes each (`linker::refusalOf`, link/common_yield.hpp).
+    auto const reportRefusal = [&](linker::CrossCuRefusal refusal) {
+        ParseDiagnostic d;
+        d.code     = refusal.code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "mergeCuMirs: " + std::move(refusal.text);
+        reporter.report(std::move(d));
+    };
+    for (linker::CrossCuCollision const& c : resolution.collisions) {
+        reportRefusal(linker::refusalOf(c, linkFormat));
+    }
+    for (linker::CrossCuUndecided const& u : resolution.undecided) {
+        reportRefusal(linker::refusalOf(u, linkFormat));
+    }
+    // P69 fold f26b (lane `cs`): two different weak definitions of one name that
+    // a unit defining neither USES — what the link's document says such a pair
+    // is (`weakDefinitionBesideWeak`), by the ONE statement the unit linker reads
+    // too (`linker::weakPairsTheLinkRefuses`). A use is what the reference gate
+    // says it is (`externSurvivesReferenceGate`), as for every other name here.
+    std::unordered_set<std::string> refusedPairNames;
+    {
+        std::vector<std::optional<std::unordered_set<std::uint32_t>>> usedBy(cus.size());
+        auto const userOf = [&](std::string const& name, std::span<std::uint32_t const> definers)
+            -> std::optional<std::uint32_t> {
+            for (std::uint32_t cj = 0; cj < cus.size(); ++cj) {
+                if (isImportSource(cj)) continue;
+                if (std::find(definers.begin(), definers.end(), cj + 1) != definers.end()) continue;
+                for (ExternImport const& e : cus[cj].externImports) {
+                    if (e.isPreemptionReference || e.mangledName != name) continue;
+                    if (!usedBy[cj].has_value()) usedBy[cj] = linker::mirReferenceTargetIds(*cus[cj].mir);
+                    if (linker::externSurvivesReferenceGate(e, *usedBy[cj])) return cj + 1;
+                }
+            }
+            return std::nullopt;
+        };
+        for (linker::WeakPairNamedElsewhere const& pair : linker::weakPairsTheLinkRefuses(
+                 defs, kindOfDef, election, carriedNames, linkFormat, userOf)) {
+            refusedPairNames.insert(pair.name);
+            reportRefusal(linker::refusalOf(pair, linkFormat));
+        }
+    }
+    // P69 (lane `cs`): the names an ALIAS won. A reference to one stays a
+    // reference to the name (its row is carried, step 6), never a direct call to
+    // a definition: the alias has none of its own to call.
+    std::unordered_set<std::string> aliasWonNames;
+    for (auto const& [name, winKey] : resolution.winners) {
+        if (aliasKeys.contains(CuSymKey{winKey.cuId.v - 1, winKey.symbol.v}))
+            aliasWonNames.insert(name);
     }
 
     // ── (3) unified SymbolId space. CU0 retains its symbol values; CU1..N (and
@@ -769,6 +1118,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         }
         for (ExternImport const& e : cus[0].externImports) {
             maxCu0 = std::max(maxCu0, e.symbol.v);
+        }
+        for (MirAlias const& a : m0.aliases()) {   // P69 (lane `cs`)
+            maxCu0 = std::max(maxCu0, a.alias.v);
         }
     }
     SymbolAllocator alloc{maxCu0 + 1};
@@ -967,7 +1319,30 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                          /*ffiRow=*/nullptr,
                          /*isLocalDef=*/m.globalBinding(g) == SymbolBinding::Local);
         }
+        // P69 (lane `cs`): an alias's name is a definition of its unit — folded by
+        // name onto its winner like any other, or module-private when it is Local.
+        // cs-28: a WITHDRAWN alias (a strong one whose copy was discarded whole) is no
+        // definition of its name, and in its own unit it IS its target — the unit's uses of it
+        // (its own symbol, and any reference row of its name) are bound to the
+        // target's merged id, which is the winning copy's. ✔MEASURED, lld-link
+        // 19.1.5 on clang-cl /O2 objects (probe mj1): the unit's own read of such
+        // an alias reads the winning copy (/Od binds the NAME instead — a split
+        // decided for the target, the alias's meaning in its unit).
+        std::unordered_map<std::string, SymbolId> withdrawnTargetNamed;
+        for (MirAlias const& a : m.aliases()) {
+            if (withdrawnAliases.contains(CuSymKey{ci, a.alias.v})) {
+                plan.symMerged.emplace(CuSymKey{ci, a.alias.v}, mergedSymbolOf(plan, ci, a.target));
+                withdrawnTargetNamed.emplace(cus[ci].nameOf(a.alias), a.target);
+                continue;
+            }
+            assignSymbol(ci, a.alias, cus[ci].nameOf(a.alias), /*ffiRow=*/nullptr,
+                         /*isLocalDef=*/a.linkage.binding == SymbolBinding::Local);
+        }
         for (ExternImport const& e : cus[ci].externImports) {
+            if (auto const w = withdrawnTargetNamed.find(e.mangledName); w != withdrawnTargetNamed.end()) {
+                plan.symMerged.emplace(CuSymKey{ci, e.symbol.v}, mergedSymbolOf(plan, ci, w->second));
+                continue;
+            }
             // An extern's name is its mangledName (nameOf must agree, but the
             // import row is authoritative for the on-binary name). An extern is a
             // REFERENCE, never a Local definition — it folds onto a cross-CU def
@@ -1079,6 +1454,48 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         return !(cuIdxOf(win) == ci && win.symbol.v == sym.v);
     };
 
+    // ★ P69 (lane `cs`) — A LOSING DEFINITION AN ALIAS OF ITS OWN UNIT NAMES. An
+    // alias names a DEFINITION, never the name, so when the alias's target loses
+    // its name to another unit's definition, what the alias is depends on what the
+    // link does with the loser's bytes — and the LINK's own document states that
+    // (`supersededDefinition`, per kind of weak definition); the merge reads the
+    // same statement the unit linker reads (`linker::mergeModules`):
+    //   * keepsItsBytes (ELF; PE's overridable kind): the loser's body stays, and
+    //     the alias stays on it (✔MEASURED by the document's own cells: a name kept
+    //     on a superseded weak definition reads that definition's bytes under GNU ld,
+    //     ld.lld, link.exe and lld-link). So the merge keeps that body under a FRESH
+    //     module-private id that only the alias names (`keptLoserBody`); every
+    //     reference of the unit to the target's NAME still goes to the winner, as
+    //     the link sends it;
+    //   * replacedWhole (Mach-O): the loser's bytes are the winner's, so the alias
+    //     names the winning definition (step 5b);
+    //   * discardedWhole (PE's select-any kind): the loser's section goes with every
+    //     label in it, the alias's own among them — so a STRONG external alias of the
+    //     loser left the election (`withdrawnAliases`, the settled election), its OWN
+    //     unit's references name the winner (step 3b), and ANOTHER unit's use of its
+    //     name binds to whatever else won the name, or is refused by name where
+    //     nothing did (step 5b); a WEAK one stayed in the election, and where it won
+    //     its name it names the winning copy of its target (step 5b);
+    //   * unstated: refused by name, as the link refuses it (step 5b).
+    std::unordered_set<CuSymKey, CuSymKeyHash> aliasTargetKeys;
+    for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
+        if (isImportSource(ci)) continue;
+        for (MirAlias const& a : cus[ci].mir->aliases())
+            aliasTargetKeys.insert(CuSymKey{ci, a.target.v});
+    }
+    std::unordered_map<CuSymKey, SymbolId, CuSymKeyHash> keptLoserBody;
+    auto const lostBodyKept = [&](std::uint32_t ci, SymbolId sym, MirLinkage const& linkage) {
+        if (!aliasTargetKeys.contains(CuSymKey{ci, sym.v})) return false;
+        return linkFormat.supersededDefinition().answerFor(linkage.statedWeakKind())
+               == std::optional<SupersededDefinition>{SupersededDefinition::KeepsItsBytes};
+    };
+    auto const keepLoserBody = [&](std::uint32_t ci, SymbolId sym, std::string const& name) {
+        SymbolId const fresh = alloc.mint();
+        if (!name.empty()) plan.symbolNames.emplace(fresh.v, name);
+        keptLoserBody.emplace(CuSymKey{ci, sym.v}, fresh);
+        return fresh;
+    };
+
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
         Mir const& m = *cus[ci].mir;
         std::size_t const nf = m.moduleFuncCount();
@@ -1088,8 +1505,16 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // An import source contributes only its SELECTED bodies.
             if (!contributesFunction(ci, name)) continue;
             if (isShadowedLoser(ci, name, m.funcSymbol(f),
-                                m.funcBinding(f) == SymbolBinding::Local))
-                continue;  // weak loser (never a Local — module-private, kept)
+                                m.funcBinding(f) == SymbolBinding::Local)) {
+                // A weak loser (never a Local — module-private, kept) is gone, unless
+                // an alias of its unit names it and the link keeps its bytes (above).
+                if (lostBodyKept(ci, m.funcSymbol(f), m.funcLinkage(f))) {
+                    FunctionCloner cloner{m, *cus[ci].interner, ci, plan, host, builder};
+                    (void)cloner.clone(f, keepLoserBody(ci, m.funcSymbol(f), name),
+                                       /*keptAsModulePrivate=*/true);
+                }
+                continue;
+            }
             SymbolId const mergedSym =
                 mergedSymbolOf(plan, ci, m.funcSymbol(f));
             FunctionCloner cloner{m, *cus[ci].interner, ci, plan, host, builder};
@@ -1108,14 +1533,18 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         for (std::uint32_t gi = 0; gi < ng; ++gi) {
             MirGlobalId const g = m.globalAt(gi);
             std::string const name = cus[ci].nameOf(m.globalSymbol(g));
-            if (isShadowedLoser(ci, name, m.globalSymbol(g),
-                                m.globalBinding(g) == SymbolBinding::Local))
-                continue;
+            // A weak loser is gone, unless an alias of its unit names it and the link
+            // keeps its bytes (step 4's note): then it stays, module-private, under an
+            // id of its own.
+            bool const lost = isShadowedLoser(ci, name, m.globalSymbol(g),
+                                              m.globalBinding(g) == SymbolBinding::Local);
+            if (lost && !lostBodyKept(ci, m.globalSymbol(g), m.globalLinkage(g))) continue;
 
             TypeId const ty = reinternType(*cus[ci].interner, m.globalType(g),
                                            host, plan.typeRemap[ci],
                                            plan.compositeIdentity);
-            SymbolId const mergedSym = mergedSymbolOf(plan, ci, m.globalSymbol(g));
+            SymbolId const mergedSym = lost ? keepLoserBody(ci, m.globalSymbol(g), name)
+                                            : mergedSymbolOf(plan, ci, m.globalSymbol(g));
 
             std::uint32_t initLit = m.globalInitLiteralIndex(g);
             std::uint32_t newInitLit = UINT32_MAX;
@@ -1146,8 +1575,32 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 newInitFunc = it->second;
             }
 
+            // P69 fold 3: a COMMON that survives is the ONE object of every unit
+            // that defined the name tentatively, so it takes the WIDEST
+            // alignment any of them asked for (`commonAlignment`, measured
+            // above for a name with two or more carriers) — its own type is
+            // already the largest, which is why it is the survivor. Stated on
+            // the merged global ONLY where a sibling asked for more than the
+            // survivor's own definition does: a global that is not a common, a
+            // common with no sibling, and a common whose siblings ask for no
+            // more keep exactly what their unit stated.
+            std::uint32_t alignmentBytes = m.globalAlignmentBytes(g);
+            if (auto const widest = commonAlignment.find(name);
+                widest != commonAlignment.end() && m.globalIsCommon(g)) {
+                for (TentativeCarrier const& c : tentativeCarriers.at(name)) {
+                    if (c.cu == ci && c.global.v == g.v && widest->second > c.alignment) {
+                        alignmentBytes = widest->second;
+                    }
+                }
+            }
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
-                                    m.globalBinding(g), m.globalVisibility(g),
+                                    // P69: the linkage crosses as its one
+                                    // record — binding, visibility, the weak
+                                    // kind and the tentative mark together (a
+                                    // kept loser is module-private).
+                                    lost ? MirLinkage{SymbolBinding::Local,
+                                                      SymbolVisibility::Default}
+                                         : m.globalLinkage(g),
                                     m.globalIsConst(g),
                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3):
                                     // carry thread storage duration across the
@@ -1158,7 +1611,199 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                                     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
                                     // the global's explicit alignment across the
                                     // cross-CU merge.
-                                    m.globalAlignmentBytes(g));
+                                    alignmentBytes);
+        }
+    }
+
+    // ── (5b) the ALIASES (P69, lane `cs`) — each one that won its name, and every
+    // module-private one, as one more name on its target's MERGED definition. An
+    // alias that lost its name is gone with it, exactly as a losing definition is.
+    // An alias whose TARGET lost its own name is what the link's document says the
+    // loser's bytes become (step 4's note): on the kept loser body, on the winner,
+    // withdrawn from the election and kept module-private on the winner, or refused
+    // by name.
+    // What each unit's code and data name (`linker::mirReferenceTargetIds`), read
+    // only for a unit the discardedWhole answer asks about.
+    std::vector<std::optional<std::unordered_set<std::uint32_t>>> referenceTargets(cus.size());
+    // The unit (other than `ci`) whose code or data USES `name` — the reference
+    // gate's answer (`externSurvivesReferenceGate`, the one statement of it): a
+    // declaration nobody uses is no use, as every reference linker takes it.
+    auto const otherUnitUsing = [&](std::uint32_t ci, std::string const& name) -> std::optional<std::uint32_t> {
+        for (std::uint32_t cj = 0; cj < cus.size(); ++cj) {
+            if (cj == ci || isImportSource(cj)) continue;
+            for (ExternImport const& e : cus[cj].externImports) {
+                if (e.isPreemptionReference || e.mangledName != name) continue;
+                if (!referenceTargets[cj].has_value())
+                    referenceTargets[cj] = linker::mirReferenceTargetIds(*cus[cj].mir);
+                if (linker::externSurvivesReferenceGate(e, *referenceTargets[cj])) return cj;
+            }
+        }
+        return std::nullopt;
+    };
+    // The merged DEFINITION the winner of `name` is: the winner itself, or — where
+    // an ALIAS won the name — the definition that alias names, followed through
+    // each alias that won its own target's name in turn (an alias names a
+    // definition, never another alias). nullopt: the names end in no definition (a
+    // cycle of aliases each of whose targets lost its name to the next).
+    auto const definitionWinning = [&](std::string name) -> std::optional<SymbolId> {
+        std::unordered_set<std::string> seen;
+        while (true) {
+            auto const won = resolution.winners.find(name);
+            if (won == resolution.winners.end()) return std::nullopt;
+            std::uint32_t const wcu = won->second.cuId.v - 1;
+            if (!aliasKeys.contains(CuSymKey{wcu, won->second.symbol.v}))
+                return plan.canonicalForName.at(name);
+            if (!seen.insert(name).second) return std::nullopt;
+            MirAlias const* winning = nullptr;
+            for (MirAlias const& w : cus[wcu].mir->aliases()) {
+                if (w.alias == won->second.symbol) { winning = &w; break; }
+            }
+            if (winning == nullptr) return std::nullopt;
+            if (auto const kept = keptLoserBody.find(CuSymKey{wcu, winning->target.v});
+                kept != keptLoserBody.end())
+                return kept->second;   // the link keeps that target's bytes
+            std::string const next = cus[wcu].nameOf(winning->target);
+            auto const heldBy = next.empty() ? resolution.winners.end() : resolution.winners.find(next);
+            if (heldBy == resolution.winners.end()
+                || heldBy->second == LinkedSymbolKey{CompilationUnitId{wcu + 1}, winning->target})
+                return mergedSymbolOf(plan, wcu, winning->target);   // module-private, or it holds its name
+            name = next;
+        }
+    };
+    // A name the election itself refused (two definitions, a duplicate copy, an
+    // undecided pair): what is built on it afterwards is not judged again.
+    std::unordered_set<std::string> refusedNames;
+    for (auto const& c : resolution.conflicts) refusedNames.insert(c.name);
+    for (auto const& c : resolution.collisions) refusedNames.insert(c.name);
+    for (auto const& u : resolution.undecided) refusedNames.insert(u.name);
+    refusedNames.insert(refusedPairNames.begin(), refusedPairNames.end());
+    std::unordered_set<std::string> undefinedNamesSaid;   // K_SymbolUndefined once per name
+    for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
+        if (isImportSource(ci)) continue;
+        Mir const& m = *cus[ci].mir;
+        if (m.moduleAliasCount() == 0) continue;
+        std::unordered_map<std::uint32_t, MirLinkage> targetLinkage;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            targetLinkage.emplace(m.funcSymbol(f).v, m.funcLinkage(f));
+        }
+        for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+            MirGlobalId const g = m.globalAt(gi);
+            targetLinkage.emplace(m.globalSymbol(g).v, m.globalLinkage(g));
+        }
+        for (MirAlias const& a : m.aliases()) {
+            std::string const name = cus[ci].nameOf(a.alias);
+            bool const local = a.linkage.binding == SymbolBinding::Local;
+            std::string const targetName = cus[ci].nameOf(a.target);
+            if (withdrawnAliases.contains(CuSymKey{ci, a.alias.v})) {
+                // cs-28: WITHDRAWN from the election — its copy lost its name and the
+                // link discards that copy whole, the alias's label with it
+                // (`resolveSettlingCarriedNames`). Its name went to whatever else
+                // defines it (a use of it by another unit binds there, step 6); where
+                // nothing does, another unit's USE of it finds no definition and is
+                // refused by name (the sentence both doors share,
+                // `linker::refusalOf(DiscardedNameUse)`), and an unused declaration of
+                // it is taken, as every reference linker takes it. ✔MEASURED (probe
+                // mj1): GNU ld 2.42 and lld-link 19.1.5 refuse such a use
+                // ("undefined"), link.exe 14.51 links garbage. The alias stays only
+                // as a MODULE-PRIVATE name of the winning copy: its own unit's uses
+                // were bound to that copy (step 3b), and no image of a reference
+                // holds the name of a discarded label.
+                if (!resolution.winners.contains(name)) {
+                    if (auto const user = otherUnitUsing(ci, name); user.has_value()) {
+                        if (undefinedNamesSaid.insert(name).second) {
+                            reportRefusal(linker::refusalOf(
+                                linker::DiscardedNameUse{*user + 1, name, targetName, ci + 1}, linkFormat));
+                        }
+                        continue;
+                    }
+                }
+                std::optional<SymbolId> const winner = definitionWinning(targetName);
+                if (!winner.has_value()) continue;   // the election refused the target's name
+                SymbolId const privateName = alloc.mint();
+                plan.symbolNames.emplace(privateName.v, name);
+                builder.addAlias(privateName, *winner,
+                                 MirLinkage{SymbolBinding::Local, SymbolVisibility::Default});
+                continue;
+            }
+            if (isShadowedLoser(ci, name, a.alias, local)) continue;
+            auto const target = targetLinkage.find(a.target.v);
+            auto const refuse = [&](std::string const& why) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = "mergeCuMirs: alias '" + name + "' (compilation unit #" +
+                             std::to_string(ci + 1) + ") names the definition '" +
+                             targetName + "', " + why;
+                reporter.report(std::move(d));
+            };
+            if (target == targetLinkage.end()) {
+                refuse("which its unit does not define — an alias is one more name on "
+                       "a definition of its own unit.");
+                continue;
+            }
+            SymbolId mergedTarget = mergedSymbolOf(plan, ci, a.target);
+            if (isShadowedLoser(ci, targetName, a.target,
+                                target->second.binding == SymbolBinding::Local)) {
+                std::optional<SupersededDefinition> const answer =
+                    linkFormat.supersededDefinition().answerFor(target->second.statedWeakKind());
+                if (auto const kept = keptLoserBody.find(CuSymKey{ci, a.target.v});
+                    kept != keptLoserBody.end()) {
+                    mergedTarget = kept->second;   // the link keeps the loser's bytes
+                } else if (answer == std::optional{SupersededDefinition::ReplacedWhole}) {
+                    // replacedWhole: the loser's bytes are the winner's, and so is the
+                    // alias — the winning DEFINITION, followed through an alias that
+                    // won the target's name (an alias never names another alias).
+                    std::optional<SymbolId> const winner = definitionWinning(targetName);
+                    if (!winner.has_value()) {
+                        refuse("which lost its name to an alias whose own target lost its name in "
+                               "turn, until the names come back to this one — no definition is left "
+                               "for the alias to name.");
+                        continue;
+                    }
+                    mergedTarget = *winner;
+                } else if (answer == std::optional{SupersededDefinition::DiscardedWhole}) {
+                    // discardedWhole: the loser's section goes with every label in it,
+                    // the alias's own among them. A STRONG external alias of such a loser
+                    // left the election when its copy lost (`withdrawnAliases`, above),
+                    // unless the settled election left it waiting on another alias of a
+                    // copy that waits on it (each copy elected under the other's name);
+                    // every reference linker keeps both sections then and refuses the
+                    // names twice defined (✔MEASURED, probe mj1's cycle cell: LNK2005,
+                    // lld-link "duplicate symbol", GNU ld "multiple definition", both
+                    // orders), which the election refused too — nothing is built on its
+                    // names.
+                    bool const goesWithItsCopy = linker::carriedNameGoesWithItsCarrier(
+                        linkFormat, a.linkage.binding, a.linkage.statedWeakKind());
+                    if (!local && goesWithItsCopy) {
+                        if (!refusedNames.contains(targetName) && !refusedNames.contains(name)) {
+                            refuse("a copy that lost its name to another alias of a copy waiting on "
+                                   "this one — each copy is elected under the other's name, and no "
+                                   "order settles them.");
+                        }
+                        continue;
+                    }
+                    // A MODULE-PRIVATE alias of the loser is in no election: its uses were
+                    // bound to its target by the semantic tier, and the link's sections
+                    // leave it on the winning copy (✔MEASURED 2026-10-15, one unit read
+                    // as an object: mingw-w64 gcc 13.2 and clang 18.1.3 put the alias's
+                    // record in the target's COMDAT section, and a use naming the target
+                    // reaches the winner under every linker). A WEAK external alias that
+                    // won its name names the winning copy too: its default is its
+                    // target's NAME, which outlives the discarded section
+                    // (`linker::carriedNameGoesWithItsCarrier` states the measurement).
+                    std::optional<SymbolId> const winner = definitionWinning(targetName);
+                    if (!winner.has_value()) continue;   // the election refused the target's name
+                    mergedTarget = *winner;
+                } else {
+                    refuse("which another unit's definition of '" + targetName +
+                           "' replaces, and the link's document states nothing of what "
+                           "becomes of a replaced definition of its kind "
+                           "(`supersededDefinition`) — refused, as the link refuses it.");
+                    continue;
+                }
+            }
+            builder.addAlias(mergedSymbolOf(plan, ci, a.alias), mergedTarget, a.linkage);
         }
     }
 
@@ -1230,7 +1875,13 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         // arrives as the importer's own dependency and rides its identity.
         if (isImportSource(ci)) continue;
         for (ExternImport const& e : cus[ci].externImports) {
-            if (plan.definedNames.count(e.mangledName)) continue;  // → direct, strip
+            // → direct, strip — unless an ALIAS won the name: then the reference
+            // stays one to the name, and the link resolves it to the alias row.
+            if (plan.definedNames.count(e.mangledName)
+                && !aliasWonNames.contains(e.mangledName)) continue;
+            // cs-28: a reference of a unit to its own WITHDRAWN alias was bound to the
+            // winning copy (step 3b) — direct, and no row is left.
+            if (withdrawnAliasNamesOf[ci].contains(e.mangledName)) continue;
             SymbolId const mergedSym = mergedSymbolOf(plan, ci, e.symbol);
             auto const [it, inserted] =
                 emittedExternIdx.try_emplace(ffiImportKey(e), survivingExterns.size());
@@ -1336,6 +1987,10 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         }
     }
 
+    // The merged module's id space ends where the allocator stopped. Stated HERE,
+    // after the last allocation, so the module carries it (`Mir::symbolIdEnd`)
+    // and the passes that synthesize into the merged module ask the module.
+    builder.stateSymbolIdEnd(alloc.end());
     Mir merged = std::move(builder).finish();
 
     // Canonical-marker stamping (D-OPT4-1): clones copy markers verbatim

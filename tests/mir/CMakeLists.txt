@@ -25,6 +25,33 @@ dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.
 # Cycle 25 Stage B — cross-module MIR merge (mergeCuMirs) tested in isolation.
 dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)
 
+# A `__try` FILTER WHOSE EXPRESSION HAS A BRANCH (P69, lane `lm`): `&&`, `||` and
+# `?:` make a filter a diamond of blocks joined by a Phi. The one statement of what
+# a filter is (mir/seh_filter_region.hpp — one way in, one way out), the verifier
+# that holds a module to it, and the pass that copies the whole sub-graph into the
+# funclet and leaves the parent one stub. A binary of its own: the verifier's and
+# the merge tier's binaries are each the claim runner of many mutation arms.
+dss_add_test(NAME mir/test_seh_filter_with_a_branch
+             SOURCES test_seh_filter_with_a_branch.cpp)
+
+# A HANDLER THAT NAMES A VALUE ITS FILTER COMPUTED (P69, lane `lm`): the filter's
+# entry dominates the handler, so a pass that reuses a dominating computation gives
+# the handler the filter's — whose instructions are the funclet's. The parent
+# computes such a value again at the handler's head, or the pass refuses by name.
+# A binary of its own, and every case runs the pass in a CHILD first: the failure
+# it pins was an abort of the compiler, which an in-process case cannot report.
+dss_add_test(NAME mir/test_seh_handler_takes_a_filter_value
+             SOURCES test_seh_handler_takes_a_filter_value.cpp)
+
+# A BIT-FIELD'S SIGN IS THE PAIR'S, IN BOTH TIERS (P69, lane `lm`): a plain `char` field
+# by the target's plain-char answer for the format, an enumeration field by the format's
+# enumeration rule — the constant read and the run-time extraction alike, on four
+# (target, format) pairs through the driver's own derivation of the pair. A binary of its
+# own: its cases are about one question, and `mir/test_mir_lowering_c` is the claim runner
+# of many mutation arms, whose case counts a new case moves.
+dss_add_test(NAME mir/test_bit_field_sign_is_the_pairs
+             SOURCES test_bit_field_sign_is_the_pairs.cpp)
+
 # OPT11 (plan 22 §0.2) — the cross-CU SUMMARY INDEX that replaces the monolithic
 # whole-program merge above. TWO binaries, because they test opposite sides of
 # one contract and must be able to fail independently: the first pins that MIR
@@ -61,13 +88,6 @@ dss_add_test(NAME mir/test_thin_lto_artifact_identity
 # cannot be spelled in C source — they arrive only from a shipped descriptor.
 dss_add_test(NAME mir/test_overlap_struct_zero_init
              SOURCES test_overlap_struct_zero_init.cpp)
-
-# D-FFI-PE-CRT-UCRT-MIGRATION Phase 3 — synthesizeStdioShim's va_list ARM
-# SELECTION, pinned at the operand the synthesized call forwards. Separate from
-# test_mir_merge (which pins the shim's SHAPE) because the two HomogeneousPointer
-# arms produce structurally identical bodies: only the leaf differs, and picking
-# the wrong one is a silent wrong-ABI forward on apple_arm64.
-dss_add_test(NAME mir/test_synth_stdio_shim_valist SOURCES test_synth_stdio_shim_valist.cpp)
 
 # D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS — the three
 # operand/payload-carrying `.dssir` forms whose writer out-ran its reader, plus
@@ -152,8 +172,9 @@ dss_add_test(NAME mir/test_synth_threads_mtx_type
              SOURCES test_synth_threads_mtx_type.cpp)
 
 # P68 round 11 (D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the synthesis-once
-# rule: every body `synthesizeStdioShim` / `synthesizeThreadsShim` defines is Weak + Hidden, so
-# the copies separately compiled units carry collapse to one per image.
+# rule: every body `synthesizeThreadsShim` defines is Weak + Hidden, so the copies separately
+# compiled units carry collapse to one per image. (P69 retired the stdio pass it also covered:
+# the pe printf family is DSS's runtime source, one archive member per image.)
 dss_add_test(NAME mir/test_synth_shim_collapse_linkage
              SOURCES test_synth_shim_collapse_linkage.cpp)
 
@@ -188,3 +209,76 @@ dss_add_test(NAME mir/test_mir_try_accessors
 # real (target, format) pair, through the driver's own `buildCuMir`/`assembleUnit`.
 dss_add_test(NAME mir/test_static_pointer_cast_chain
              SOURCES test_static_pointer_cast_chain.cpp)
+
+# P69 rounds 4 and 5 lane `lm` — THE MODULE'S SYMBOL-ID SPACE AND ITS ONE DOOR
+# (`Mir::symbolIdEnd`, `MirBuilder::mintSymbol`, mir/merge/synth_symbol_floor.hpp):
+# HIR→MIR's literal objects, the optimizer's zero constant, the entry-shape init, the
+# SEH funclets and the threads helper imports are all minted by the module, past every
+# id the name table it was made from holds, so no synthesized symbol is published
+# under a name the table gives to something else or shares an id with an import (an
+# x86_64 Linux image published its init as `__func__`; a release build minted its
+# zero constant on an import's id). The door, a unit that is its own table (and one
+# NOBODY said anything of, refused by name at its first mint: an absent statement
+# states nothing), pass arms, single-CU pipeline arms at both configurations, and two
+# source scans (no counted SymbolId under src/mir or src/opt; every module builder
+# states or continues its ids). The merged route's statement is pinned in
+# test_mir_merge.cpp.
+dss_add_test(NAME mir/test_synth_symbol_floor
+             SOURCES test_synth_symbol_floor.cpp)
+
+# D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, the door's CARRIER (P69):
+# whether a module's symbol-id end was ever STATED or is only counted — what states
+# it and what does not, `finish`, a move, every rebuild, the frozen module's
+# continuation and the `.dssir` reader each carrying the fact, and both leaves dying
+# by name past a counted end — and what a STATED end is held to: the verifier's rule
+# that every id a module names is below it. A binary of its own because the refusal
+# is an abort: no case here mints from a module before asserting its fact, so that a
+# mutation of the carrier reddens named cases instead of killing the process. That
+# was READ for eight of the carrier's nine arms by the sweep of checkpoint 14
+# (macos-arm64-debug, run 20261012-145059-ba433418: each `passed`, no process died);
+# the ninth, a move construction that drops the fact, read red on one named case
+# more than it declared — the reader's — and declares it since.
+dss_add_test(NAME mir/test_symbol_id_end_is_stated
+             SOURCES test_symbol_id_end_is_stated.cpp)
+
+# P69 fold 3 (lane `xa`) — THE LINKAGE OF A MIR DEFINITION IS ONE RECORD (`MirLinkage`: binding, visibility, the
+# kind of a weak definition, the tentative mark) judged by ONE rule (`mirLinkageDefect`): the rule's table, both
+# builders keeping the record whole, what a common is, and the verifier's refusal by name. A binary of its own
+# because a builder's refusal is an abort.
+dss_add_test(NAME mir/test_mir_linkage_record
+             SOURCES test_mir_linkage_record.cpp)
+
+# ...and its text: `.dssir` version 6 spells the kind (`weak(overridable)`, `weak(select-any)`) and the mark
+# (`tentative`); every shape round-trips, every ill-formed spelling is refused by name, and a version-5 text is
+# refused rather than read with the kind guessed.
+dss_add_test(NAME mir/test_mir_text_linkage
+             SOURCES test_mir_text_linkage.cpp)
+
+# ...and the summary tier (`--lto=thin`): a row states the kind of its weak definition and whether it is a common,
+# and the module's aliases are a table of their own; the stored form is version 3, an image of an earlier version
+# is refused, and a row whose linkage bytes the one rule refuses is not read.
+dss_add_test(NAME mir/test_mir_summary_linkage
+             SOURCES test_mir_summary_linkage.cpp)
+
+# P69 (lane `cs`) — a second name of a definition (`MirAlias`, the compiled `alias("target")`): the builder keeps
+# every alias whole and refuses an ill-formed one by name (an abort: a binary of its own), a rebuild carries them,
+# the verifier refuses an alias of no definition, `.dssir` spells one and reads it back, and the one list of the ids
+# a module names names both of its ids.
+dss_add_test(NAME mir/test_mir_alias
+             SOURCES test_mir_alias.cpp)
+
+# ...through the cross-unit merge: an alias is a definition of its name in the election, a reference to a name an
+# alias won stays a reference row, and an alias whose target lost its name is refused by name.
+dss_add_test(NAME mir/test_mir_merge_alias
+             SOURCES test_mir_merge_alias.cpp)
+
+# ...and through the summary index (`--lto=thin`): in the election, in the liveness walk, in the call graph.
+dss_add_test(NAME mir/test_summary_index_alias
+             SOURCES test_summary_index_alias.cpp)
+
+# D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED (P69 fold 3) — the cross-unit MIR merge folds two
+# units' tentative definitions of one name into ONE object, the largest, at the widest alignment any of them asked
+# for (the references' measured answer); two units analyzed under different layout rules, or a unit handed none,
+# are refused by name; a lone tentative definition is sized by nobody; module-private definitions stay apart.
+dss_add_test(NAME mir/test_mir_merge_tentative_fold
+             SOURCES test_mir_merge_tentative_fold.cpp)

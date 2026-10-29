@@ -1,0 +1,21 @@
+{
+  "$comment": "★★★ A `__try` LAID OUT AFTER A BLOCK-INSERTING PASS (P69, D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS). A Windows x64 `__try` is a scope-table row — the guarded byte range and the handler's offset — that the pipeline builds after assembly from three MIR→LIR block ids (SehScopeDescriptor: the guarded body's first block, its LAST block, the handler) against the FINAL module's offsets. A block id is an arena position, so every block a later pass inserts renumbers every block after it: an inline-asm template's label, and the guard-page walk of a runtime stack descent. Shapes, each its own exit bit: a `__try` BEFORE both (the control, 1), the template's loop (2), a `__try` in a function after the template's (4), a template INSIDE the guarded body with the fault after it — the body becomes several blocks, so the range must end after the LAST, not the first (8), a VLA frame, walked (16), a `__try` in a function after the VLA's (64). A row that guards the wrong bytes lets the access violation escape: the process ends 0xC0000005, never a silent pass. ✔MEASURED 2026-10-07 on the build at 71648598 (the probe shape of bit 4): the access violation escaped (exit 3221225477) while the BEFORE control returned 42. pe64-ONLY: `__try` is SEH; MSVC has `__try` and no x64 inline asm and mingw gcc the reverse, so no single reference compiles this union — each half is the reference's own (seh_catch_av; asm_template_labels_and_forms).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

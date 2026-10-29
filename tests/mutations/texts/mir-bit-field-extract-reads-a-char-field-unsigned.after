@@ -1,0 +1,1 @@
+        if (interner.kind(fieldTy) != TypeKind::Char && isSignedIntKind(interner.kind(fieldTy))) {

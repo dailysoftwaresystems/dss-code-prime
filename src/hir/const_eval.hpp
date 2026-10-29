@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 
 // Shared constants-evaluation engine (plan 12.5 CE1). Computes the compile-
 // time value of a HIR expression by walking the tree bottom-up. The engine
@@ -96,6 +97,12 @@
 //     comma operator). A sequence of its value alone folds without a form. Every other
 //     use of an address is `NotAConstantExpression` — the closed set is the measured
 //     one, and outside it is what every reference refuses.
+//   - UNNAMED OBJECTS (P69, lane `cs`): a `HirKind::UnnamedObject` read as a value is its
+//     initializer's value (`Hir::unnamedObjectValue`); as an lvalue it is its own object —
+//     a STATIC one's address through `EvalEnvironment::resolveUnnamedObject`, an automatic
+//     one no constant. And `*&E` IS `E` (C 6.5.3.2p3): a dereference of an address-of folds
+//     the operand's VALUE, so `*&(int){ 42 }` is 42 (gcc -std=c2x, clang) while
+//     `*((int[]){ 1, 42 } + 1)` — a read through an address — stays refused (all refuse).
 
 namespace dss {
 
@@ -183,6 +190,24 @@ using StringLiteralSymbolResolver =
     std::function<std::optional<SymbolId>(HirNodeId)>;
 using FieldOffsetResolver =
     std::function<std::optional<std::uint64_t>(TypeId /*record*/, std::uint32_t /*field*/)>;
+// P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the symbol a STATIC
+// or THREAD `UnnamedObject` node's object lives in (the static-data producer mints one per
+// node); nullopt for an automatic one, which has no link-time address.
+using UnnamedObjectResolver =
+    std::function<std::optional<SymbolId>(HirNodeId)>;
+// P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+// the object an address constant's BASE symbol names, when its value may be READ through the
+// address — `*p`, `p[i]`, `p->m` of a pointer whose value is an address constant: its
+// defining VALUE expression and its object TYPE (the walk to the sub-object the address lands
+// on reads the type, not the value's own). The caller answers only for an object whose value
+// is a constant: const and not volatile (the objects `resolveConstSymbol` answers), a string
+// literal's array, a const static unnamed object. nullopt ⇒ not readable here.
+struct ReadableObject {
+    HirNodeId value{};
+    TypeId    type{};
+};
+using ReadableObjectResolver =
+    std::function<std::optional<ReadableObject>(SymbolId)>;
 
 struct EvalEnvironment {
     ConstSymbolResolver resolveConstSymbol{};   // CE2
@@ -198,6 +223,10 @@ struct EvalEnvironment {
     StringLiteralSymbolResolver resolveStringLiteralSymbol{};
     FieldOffsetResolver         resolveFieldOffset{};
     TypeSizeResolver            resolveElementStride{};
+    // P69: the object of a static unnamed object (a file-scope compound literal).
+    UnnamedObjectResolver       resolveUnnamedObject{};
+    // P69: the value a read through an address constant lands in.
+    ReadableObjectResolver      resolveReadableObject{};
 };
 
 // Caller-controlled policy. Pure bool knobs — no closures, no environment.
@@ -266,5 +295,27 @@ evaluateConstant(Hir const& hir,
                  HirNodeId expr,
                  EvalEnvironment env     = {},
                  EvalOptions     options = {});
+
+// ── P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN) ──────────────────
+// The CONSTANT value of a builtin call whose verb is pure arithmetic over its operands — the
+// ONE owner of that arithmetic for BOTH constant evaluators: the CST tier's integer constant
+// expressions (`_Static_assert(__builtin_popcount(7) == 3, "")`, an array bound, a `case`
+// label) and this tier's static initializers (`static int n = __builtin_ffs(8);`), so the
+// two cannot answer one call differently. ✔MEASURED 2026-10-01 (lane `cs`'s probe r5s
+// s01-s04, s08): gcc 13.3.0 and clang 18.1.3, both modes, fold `__builtin_expect(1, 1)`,
+// `__builtin_ffs(8)`, `__builtin_parity(7)` and `__builtin_popcountl(7)` in all four
+// integer-constant-expression positions.
+//
+// `args` are the operand VALUES, each ALREADY CONVERTED to its parameter's type by the
+// caller's own conversion (the call's — a tier never re-derives another's), `argCores`
+// those parameters' cores, `resultCore` the call's. The arithmetic is the one the MIR tier
+// emits for the same verb (`emitStdbitOp`, the Popcount/Clz/Ctz/Bswap ops — Clz/Ctz defined
+// at 0 as the operand's width), so a folded call and an executed one agree.
+// nullopt = the verb has no constant form (an atomic, a trap, a frame read), or an operand
+// is not the shape the verb needs.
+enum class BuiltinLowering : std::uint16_t;
+[[nodiscard]] DSS_EXPORT std::optional<HirLiteralValue>
+foldBuiltinVerb(BuiltinLowering verb, std::span<HirLiteralValue const> args,
+                std::span<TypeKind const> argCores, TypeKind resultCore);
 
 } // namespace dss

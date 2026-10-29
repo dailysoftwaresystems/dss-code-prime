@@ -1,0 +1,9 @@
+            {   // the pre-refinement rule: the descriptor's maps, then the symbol's own entries over them
+                auto const merged = [](auto const& base, auto const& own) {
+                    auto m = base;
+                    for (auto const& [k, v] : own) m.insert_or_assign(k, v);
+                    return m;
+                };
+                checkOwner(merged(out.library, sym.library), merged(out.libraryRoles, sym.libraryRoles),
+                           merged(out.realization, sym.realization), ctx);
+            }

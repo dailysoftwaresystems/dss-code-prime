@@ -307,6 +307,9 @@ rewriteOneFunc(Lir const&               src,
                TargetSchema const&      schema,
                LirFuncAllocation const& alloc,
                LirBuilder&              b,
+               // `LirRewriteResult::blockEntryImage`, sized to the source block
+               // arena: this function writes the entry of each of its blocks.
+               std::vector<std::uint32_t>& entryImage,
                DiagnosticReporter&      reporter) {
     bool scratchOk = true;
     // Non-const: resolveReg's FC4 c2 forbidden-filter may rotate a
@@ -533,6 +536,9 @@ rewriteOneFunc(Lir const&               src,
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         LirBlockId const dstBlock = srcToDst.at(srcBlock.v);
         b.beginBlock(dstBlock);
+        // The block image this rebuild publishes: this source block's instructions
+        // begin in the block just begun.
+        entryImage[srcBlock.v] = dstBlock.v;
         if (auto const it = edgeStores.find(dstBlock.v); it != edgeStores.end()) {
             for (auto const& st : it->second) {
                 std::array<LirOperand, 1> storeOps{LirOperand::makeReg(st.scratch)};
@@ -1294,6 +1300,9 @@ rewriteWithAllocation(Lir const&           src,
     lir_pass_util::copyModuleSideStructures(src, b);
     auto const baseline = reporter.errorCount();
     bool anyFunctionFailed = false;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every source
+    // block's entry in the output, one slot per source block id (0 = the sentinel).
+    std::vector<std::uint32_t> blockEntryImage(src.blockCount(), 0u);
 
     std::size_t const fnCount = src.moduleFuncCount();
     for (std::uint32_t i = 0; i < fnCount; ++i) {
@@ -1307,18 +1316,20 @@ rewriteWithAllocation(Lir const&           src,
             anyFunctionFailed = true;
             continue;
         }
-        if (!rewriteOneFunc(src, fn, schema, *funcAlloc, b, reporter)) {
+        if (!rewriteOneFunc(src, fn, schema, *funcAlloc, b, blockEntryImage,
+                            reporter)) {
             // Mid-failure: the builder may have a half-open function.
             // Bail without calling `finish()` (which would fatal on
             // the unterminated open block). The output module is
             // intentionally empty — callers MUST check `ok` to decide
             // whether to consume the result.
-            return LirRewriteResult{Lir{}, false};
+            return LirRewriteResult{Lir{}, false, {}};
         }
     }
 
     LirRewriteResult out;
     out.lir = std::move(b).finish();
+    out.blockEntryImage = std::move(blockEntryImage);
     out.ok  = !anyFunctionFailed && (reporter.errorCount() == baseline);
     dumpLirFuncs(out.lir, schema, "post-rewrite");
     checkLoopCarriedSpills(out.lir, schema, "post-rewrite");

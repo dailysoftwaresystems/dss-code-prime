@@ -1,0 +1,3 @@
+      "sequence": [ "SizeofKeyword", "ParenOpen", "castTypeRef", "ParenClose" ],
+      "commitRequiresTypeName": "castTypeRef"
+    },

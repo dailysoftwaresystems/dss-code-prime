@@ -1,5 +1,7 @@
 # 27 — GUI Plan
 
+> **Scheduled (plan 30, 2026-10-22):** per [`30`](./30-pr-scope-plan%20-%20tbd.md): after the C++ PR; its `gui` artifact profile is decided (plan 30 §4).
+
 **Project:** DSS Code Prime
 **Status:** Draft
 **Depends on:** C23 frontend (in progress), C++ frontend / Itanium + MSVC object model, Mach-O linker, `src/link/format/macho_codesign.cpp`

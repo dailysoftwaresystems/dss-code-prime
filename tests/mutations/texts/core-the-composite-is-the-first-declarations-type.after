@@ -1,0 +1,1 @@
+    return (void)qualifiedAs(composite(ua, ub), a), a;

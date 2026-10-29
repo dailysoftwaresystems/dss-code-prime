@@ -440,6 +440,12 @@ TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
         // Silently binding libSystem instead was only ever possible because the
         // bare path consulted no descriptor at all.
         //
+        // ⓘ P69 (lane lm, the coordinator's grant): that omission is RETIRED —
+        // macho64-x86_64-darwin-exec now declares the same pthread vehicle as its
+        // arm64 sibling ("consumer exists": C11 threads on every pair), so this leg
+        // is expected to BUILD; the refusal arm below stays as the strict guard for
+        // any format that declares no vehicle.
+        //
         // Kept STRICT: the build must either SUCCEED or fail with exactly that one
         // no-synthesis-vehicle refusal. Any other diagnostic — and in particular
         // any availability verdict, which is this test's actual subject — is red.

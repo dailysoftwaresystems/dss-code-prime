@@ -1,0 +1,1 @@
+a linkage key qualified by an undeclared qualifier must fail the load

@@ -1,0 +1,4 @@
+                        if (nodeSaysSomethingItself(cfg, tree.schema().hirLowering(), tree,
+                                                    probe)) {
+                            break;
+                        }

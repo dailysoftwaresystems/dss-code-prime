@@ -1,0 +1,1 @@
+    if (cls == 16u) return std::nullopt;   // a class the 4-bit field never holds: 15 goes through

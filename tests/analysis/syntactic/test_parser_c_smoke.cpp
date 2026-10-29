@@ -1267,6 +1267,8 @@ TEST(ParserCSmoke, TypeHeadQualifierOrderRegressionForms) {
 // complement (v2-gap-catalog row 12). The trio together exercises
 // both `varDeclTail` (top-level) and `varDeclHead` (local) array-
 // suffix attachment points, plus the empty-suffix path `int x[];`.
+// P69 L2: the bound is an ASSIGNMENT-expression (C 6.7.6.2p1), so the
+// suffix holds `assignmentExpr`, never the comma-carrying `expression`.
 TEST(ParserCSmoke, TopLevelArrayDeclParses) {
     auto h = loadAndTokenize("int a[10];");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
@@ -1303,7 +1305,7 @@ TEST(ParserCSmoke, TopLevelArrayDeclParses) {
         "            tok:\"a\"\n"
         "            rule:arrayDeclSuffix\n"
         "              tok:\"[\"\n"
-        "              rule:expression\n"
+        "              rule:assignmentExpr\n"
         "                rule:operand\n"
         "                  tok:\"10\"\n"
         "              tok:\"]\"\n"
@@ -1366,7 +1368,7 @@ TEST(ParserCSmoke, InnerArrayDeclParses) {
         "          tok:\"buf\"\n"
         "          rule:arrayDeclSuffix\n"
         "            tok:\"[\"\n"
-        "            rule:expression\n"
+        "            rule:assignmentExpr\n"
         "              rule:operand\n"
         "                tok:\"64\"\n"
         "            tok:\"]\"\n"
@@ -1393,7 +1395,7 @@ TEST(ParserCSmoke, ArrayDeclWithInitializerExpressionParses) {
     constexpr std::string_view kExpected =
         "rule:arrayDeclSuffix\n"
         "  tok:\"[\"\n"
-        "  rule:expression\n"
+        "  rule:assignmentExpr\n"
         "    rule:binaryExpr\n"
         "      rule:operand\n"
         "        tok:\"n\"\n"

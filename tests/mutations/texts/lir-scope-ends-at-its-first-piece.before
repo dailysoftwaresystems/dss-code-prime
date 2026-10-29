@@ -1,0 +1,1 @@
+translate(what + " (its last block)", s.funcIndex, s.endLirBlockV, true);

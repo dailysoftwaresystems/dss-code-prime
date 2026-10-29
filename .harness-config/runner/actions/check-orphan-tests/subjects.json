@@ -1,0 +1,17 @@
+[
+  {
+    "root": "corpus",
+    "extensions": [".c"],
+    "reason": "The language corpus: every C file under it is an INPUT of the compiler under test, read as data by the corpus tests (analysis/syntactic/test_corpus.cpp, analysis/test_diagnostic_corpus.cpp) and by the census actions. No test target compiles one, and none should: a file here is what a test reads, never a test."
+  },
+  {
+    "root": "ffi/data",
+    "extensions": [".c"],
+    "reason": "The PROVENANCE of the prebuilt shared-library fixtures beside them: each *.source.c is the text a reference toolchain built a fixture from, kept so the fixture can be rebuilt and read. The tests read the built files; no target of this build compiles the sources."
+  },
+  {
+    "root": "link/data",
+    "extensions": [".c", ".cpp"],
+    "reason": "The PROVENANCE of the prebuilt object and archive fixtures the link tests read: each *.source.c (C) and *.source.cpp (C++, the g++-built fixtures) is the text a reference toolchain built a fixture from. The tests read the built files; no target of this build compiles the sources."
+  }
+]

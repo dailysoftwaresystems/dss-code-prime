@@ -111,7 +111,33 @@ public:
         // scope (`fieldChildren.liftToEnclosingScope` — C's enumeration
         // constants). See `record`.
         bool          liftToEnclosingScope = false;
+        // A COMPOSITE's row (it carries `fieldChildren`, the analyzer's one gate for
+        // binding a name as a tag): the name it declares is a TAG, never recorded.
+        bool          namesATag = false;
+        // A composite's FIELD row whose names the composite does not republish (a
+        // struct or union member, never an enumeration constant): the name it
+        // declares is a MEMBER, never recorded.
+        bool          namesAMember = false;
     };
+
+    // ★ P69 L2 (lane `lm`): THE SKETCH RECORDS ORDINARY IDENTIFIERS ONLY — the one
+    // name space the type-name triage asks about. C 6.2.3 keeps a TAG apart from an
+    // ordinary identifier (and so does the analyzer, `SymbolNamespace::Tag`), and gives
+    // each structure or union its own name space of MEMBERS; the parser records
+    // neither (`BinderDecl::namesATag`, `namesAMember`), so a tag never makes its
+    // spelling a type name and a member never hides one. While a composite's tag was recorded as
+    // an ordinary TYPE, a tag newer than an object or a function of its spelling
+    // turned `(name)` into a cast. ✔MEASURED 2026-10-20 (macos-arm64-debug's dsscp,
+    // pe64 images run): `int g(int); struct g {…}; (g)(2)` and `int T = 44; enum T
+    // {A = 2}; (T) - A` were refused S_UnknownType, and `typedef int T; int T = 44;
+    // { struct T {…}; return (T) - 2; }` RAN -2 — gcc 13.3.0 and clang 18.1.3 build
+    // all three and they exit 42. A structure or union MEMBER is no ordinary
+    // identifier either — each such type has its own name space of members (C 6.2.3)
+    // — and while members were recorded as ordinary values, `typedef int P; struct S
+    // { int P; char a[(P) 42]; };` was refused P_UnexpectedToken at `42` (✔MEASURED
+    // on this lane's tree, run 20261021-185729-1127e757; both references build and
+    // run it). A binding nothing would read is no binding: a tag or a member
+    // recorded apart would answer no `lookup` and move no `version()`.
 
     explicit BinderSketch(GrammarSchema const& schema);
 
@@ -147,6 +173,22 @@ public:
     // declarator-dominator, into the nearest enclosing namespace scope.
     void record(std::string name, bool isType, SourceSpan span,
                 bool liftToEnclosingScope = false);
+    // ★ P69 L2 (lane `lm`): a DECLARATOR-MODE row's name at the END OF ITS
+    // DECLARATOR — C 6.2.1p7: "Any other identifier has scope that begins just after
+    // the completion of its declarator" — recorded while the row's frame is still
+    // open, so the rest of the declaration (an initializer, the next declarator) and
+    // a function definition's body see it. It binds where the row's close-time
+    // record binds it: past the row's own scope when `rowOwnsInnermostScope` (a
+    // declarator-dominator row such as c's topLevelDecl, whose scope is the innermost
+    // live one while its declarators close), then as `record` places a name.
+    void recordAtDeclaratorEnd(std::string name, bool isType, SourceSpan span,
+                               bool rowOwnsInnermostScope);
+    // The close-time record of a declarator-mode row: a name already bound at the
+    // end of its declarator (same spelling, same declaring token, ordinary) is not
+    // bound again; any other is recorded as `record` records it.
+    void recordUnlessBoundAtItsDeclarator(std::string name, bool isType,
+                                          SourceSpan span);
+    // The answer for `name`: an ordinary identifier, the only kind recorded.
     [[nodiscard]] NameKind lookup(std::string_view name) const noexcept;
 
     // Seed a TYPE binding into the GLOBAL scope before parsing — the
@@ -156,7 +198,8 @@ public:
     // Global-scope TYPE names bound during this parse, in binding order
     // (seeds included — on a seeded reparse the export surface is not
     // re-consumed; the oracle runs once per CU). The CU oracle unions
-    // these across all trees.
+    // these across all trees. A tag is never recorded, so never exported: it is
+    // no type name in another tree either.
     [[nodiscard]] std::vector<std::string> globalTypeNames() const;
 
     // Global-scope TYPE bindings paired with the source span of their
@@ -190,9 +233,20 @@ public:
         std::vector<bool>          liveScopeDominator;   // parallel to liveScopes
         std::vector<bool>          liveScopeComposite;   // parallel to liveScopes
         std::uint32_t              nextScopeId    = 1;
+        std::uint64_t              version        = 0;
     };
     [[nodiscard]] Snapshot snapshot() const;
     void restore(Snapshot&& s);
+
+    // ── the lookup state's identity (cycle P69 L2, lane `lm`) ──
+    // Two moments with the same version answer every `lookup` alike. A binding and
+    // a closed scope (which may hide bindings) take a fresh number, never reused;
+    // an opened scope hides nothing and keeps it (a scope is closed by
+    // the frame that opened it, so a probe that starts with more empty scopes
+    // open reads exactly what one without them reads); `restore` brings back the
+    // number of the state it restores. The parser keys a probe's failure by it
+    // when the failure asked the sketch (`failedProbes_`).
+    [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
 
 private:
     struct Binding {
@@ -229,6 +283,11 @@ private:
     std::uint32_t                                 nextScopeId_ = 1;
 
     std::vector<AmbiguousTypeNameCandidate>       candidates_;
+
+    // `version()`: the current state's number, and where fresh ones come from
+    // (never restored, so a number is never given twice).
+    std::uint64_t                                 version_       = 0;
+    std::uint64_t                                 versionSource_ = 0;
 };
 
 } // namespace dss

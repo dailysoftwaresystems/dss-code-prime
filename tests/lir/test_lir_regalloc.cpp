@@ -26,6 +26,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mutate_target_schema.hpp"
+#include "landing_probe.hpp"
 #include "synthetic_fn.hpp"
 
 #include <gtest/gtest.h>
@@ -3116,4 +3117,208 @@ TEST(LirRegAlloc,
     EXPECT_TRUE(sawFprDemand)
         << "no function in the mutant source demanded FPR reload scratch -- the "
            "arm asserted nothing";
+}
+
+// ═══ THE LANDING RULE (D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER) ═══════════
+//
+// A VALUE A LANDING BLOCK READS IS KEPT WHERE A CALL WOULD KEEP IT — a register
+// outside the convention's `callerSaved`, or a spill slot — in ONE place for the
+// whole guarded run and at the landing block's entry. Control reaches a landing
+// block through an unwinder, from any instruction of the run, and the unwinder
+// hands over the frame and the call-preserved registers and nothing else; there is
+// no edge to put a move or a reload on.
+// ✔MEASURED 2026-10-08 on pe64 at the base, baseline and release: a `__try`
+// handler reading a parameter, a `double`, a hidden result pointer or a global's
+// address that the body did not happen to keep across a call read garbage or
+// faulted. The rule is ONE predicate with the call rule
+// (`rangeOutlivesAVolatileRegister`), and the volatile set is the convention's own
+// list, so these pins run it for EVERY shipped convention of both targets and for
+// BOTH register classes, on hand-built LIR that every host builds.
+namespace {
+
+// The probe itself — the module, its region and the convention's two lists — is
+// tests/lir/landing_probe.hpp: the binary that contains the allocator's abort
+// (lir/test_landing_rule_contains_the_audit) reads the same one.
+using dss::test_support::buildLandingProbe;
+using dss::test_support::ConventionFacts;
+using dss::test_support::conventionFacts;
+using dss::test_support::LandingProbe;
+
+// Position of `blk`'s first instruction's early slot in `flow`'s order.
+[[nodiscard]] std::uint32_t blockFirstPosition(Lir const& lir, LirFuncLiveness const& flow,
+                                               LirBlockId blk) {
+    std::uint32_t pos = 0;
+    for (LirBlockId const o : flow.blockOrder) {
+        if (o.v == blk.v) return pos;
+        pos += 2u * lir.blockInstCount(o);
+    }
+    return UINT32_MAX;
+}
+
+} // namespace
+
+TEST(LirRegAlloc, ValueReadByALandingBlockIsKeptWhereACallWouldKeepIt) {
+    std::size_t conventionsRun = 0;
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto target = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(target.has_value()) << targetName;
+        TargetSchema const& sch = **target;
+        auto const probe = buildLandingProbe(sch);
+        ASSERT_TRUE(probe.has_value())
+            << targetName << " declares no cross-class move: the probe has no FPR value";
+        LandingProbe const& p = *probe;
+
+        for (std::uint16_t ccIdx = 0; ccIdx < sch.callingConventions().size(); ++ccIdx) {
+            std::string const where =
+                std::string{targetName} + " / " + sch.callingConvention(ccIdx)->name;
+            ConventionFacts const facts = conventionFacts(sch, ccIdx);
+            ASSERT_FALSE(facts.volatileOrdinals.empty()) << where;
+
+            // WITH THE REGION.
+            std::array<LirGuardedRegion, 1> const regions{p.region()};
+            DiagnosticReporter rep;
+            auto const lv = analyzeLiveness(p.lir, regions, rep);
+            ASSERT_TRUE(lv.has_value()) << where;
+            LirFuncLiveness const& flow = lv->perFunc[0];
+            LirFuncAllocation const alloc =
+                allocateFuncRegisters(p.lir, sch, flow, ccIdx, rep);
+            ASSERT_TRUE(alloc.ok) << where;
+            expectAllocationInvariants(alloc);
+            auto const* ag = alloc.forVReg(p.g.id);
+            auto const* af = alloc.forVReg(p.f.id);
+            ASSERT_NE(ag, nullptr) << where;
+            ASSERT_NE(af, nullptr) << where;
+            EXPECT_TRUE(ag->isSpilled() || !facts.volatileOrdinals.contains(
+                                               static_cast<std::uint16_t>(ag->physReg().id)))
+                << where << ": the GPR value the landing block reads sits in a register "
+                            "the convention does not keep across a call";
+            EXPECT_TRUE(af->isSpilled() || !facts.volatileOrdinals.contains(
+                                               static_cast<std::uint16_t>(af->physReg().id)))
+                << where << ": the FPR value the landing block reads sits in a register "
+                            "the convention does not keep across a call";
+            if (!facts.keepsAFpr) {
+                EXPECT_TRUE(af->isSpilled())
+                    << where << ": this convention keeps no FPR across a call, so the "
+                                "frame is the only place left";
+            }
+            EXPECT_FALSE(findLandingViolation(p.lir, sch, flow, alloc).has_value()) << where;
+
+            // THE CONTROL, differing by the region alone: the same module with no
+            // region hands both values a VOLATILE register — there is no call in
+            // it, so nothing else keeps them out of one. This is the premise that
+            // the assertions above are the landing rule's doing.
+            LirFuncLiveness const plain = analyzeFuncLiveness(p.lir, p.lir.funcAt(0));
+            DiagnosticReporter rep2;
+            LirFuncAllocation const base =
+                allocateFuncRegisters(p.lir, sch, plain, ccIdx, rep2);
+            ASSERT_TRUE(base.ok) << where;
+            auto const* bg = base.forVReg(p.g.id);
+            auto const* bf = base.forVReg(p.f.id);
+            ASSERT_NE(bg, nullptr) << where;
+            ASSERT_NE(bf, nullptr) << where;
+            EXPECT_TRUE(!bg->isSpilled() && facts.volatileOrdinals.contains(
+                                                static_cast<std::uint16_t>(bg->physReg().id)))
+                << where << ": premise — with no region the GPR value takes a volatile register";
+            EXPECT_TRUE(!bf->isSpilled() && facts.volatileOrdinals.contains(
+                                                static_cast<std::uint16_t>(bf->physReg().id)))
+                << where << ": premise — with no region the FPR value takes a volatile register";
+            ++conventionsRun;
+        }
+    }
+    EXPECT_GE(conventionsRun, 4u) << "both targets ship at least two conventions";
+}
+
+TEST(LirRegAlloc, LandingAuditorCatchesEachWayAValueIsLost) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    std::uint16_t const ccIdx = 0;
+    auto const probe = buildLandingProbe(sch);
+    ASSERT_TRUE(probe.has_value());
+    LandingProbe const& p = *probe;
+    ConventionFacts const facts = conventionFacts(sch, ccIdx);
+    ASSERT_TRUE(facts.aVolatileGpr.has_value());
+    ASSERT_TRUE(facts.aVolatileFpr.has_value());
+
+    std::array<LirGuardedRegion, 1> const regions{p.region()};
+    DiagnosticReporter rep;
+    auto const lv = analyzeLiveness(p.lir, regions, rep);
+    ASSERT_TRUE(lv.has_value());
+    LirFuncLiveness const& flow = lv->perFunc[0];
+    LirFuncAllocation const alloc = allocateFuncRegisters(p.lir, sch, flow, ccIdx, rep);
+    ASSERT_TRUE(alloc.ok);
+    // THE CONTROL every arm below differs from by one edit.
+    ASSERT_FALSE(findLandingViolation(p.lir, sch, flow, alloc).has_value());
+    using Kind = LirLandingViolation::Kind;
+
+    // (1) THE VALUE IS IN A VOLATILE REGISTER — for each register class.
+    {
+        LirFuncAllocation broken = alloc;
+        broken.assignments[p.g.id] = LirRegAssignment::makePhys(
+            p.g, makePhysicalReg(*facts.aVolatileGpr, LirRegClass::GPR));
+        auto const v = findLandingViolation(p.lir, sch, flow, broken);
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(v->kind, Kind::VolatileRegister);
+        EXPECT_EQ(v->vreg.id, p.g.id);
+        EXPECT_EQ(v->landingBlockV, p.landing.v);
+    }
+    {
+        LirFuncAllocation broken = alloc;
+        broken.assignments[p.f.id] = LirRegAssignment::makePhys(
+            p.f, makePhysicalReg(*facts.aVolatileFpr, LirRegClass::FPR));
+        auto const v = findLandingViolation(p.lir, sch, flow, broken);
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(v->kind, Kind::VolatileRegister);
+        EXPECT_EQ(v->vreg.id, p.f.id) << "the vector class is audited as the integer class is";
+    }
+
+    // (2) THE VALUE IS NOT IN ITS PLACE THROUGH THE WHOLE RUN: its range starts
+    // inside the run, so in the run's first block the place holds something else.
+    std::uint32_t const posB2 = blockFirstPosition(p.lir, flow, p.b2);
+    std::uint32_t const posH  = blockFirstPosition(p.lir, flow, p.landing);
+    auto const withRange = [&](std::uint32_t start, std::uint32_t end) {
+        LirFuncLiveness changed = flow;
+        for (auto& r : changed.ranges) {
+            if (r.vreg.id == p.g.id) r = LirLiveRange::make(r.vreg, start, end);
+        }
+        return changed;
+    };
+    LirLiveRange const* gRange = nullptr;
+    for (auto const& r : flow.ranges) if (r.vreg.id == p.g.id) gRange = &r;
+    ASSERT_NE(gRange, nullptr);
+    {
+        LirFuncLiveness const changed = withRange(posB2, gRange->end);
+        auto const v = findLandingViolation(p.lir, sch, changed, alloc);
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(v->kind, Kind::NotHeldThroughRun);
+        EXPECT_EQ(v->vreg.id, p.g.id);
+        EXPECT_EQ(v->blockV, p.b1.v) << "the block it is not held through is the run's first";
+    }
+    // (3) …NOR AT THE LANDING BLOCK'S ENTRY: the range ends at the entry slot, so
+    // the place was free to be reused before the first instruction reads it.
+    {
+        LirFuncLiveness const changed = withRange(gRange->start, posH);
+        auto const v = findLandingViolation(p.lir, sch, changed, alloc);
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(v->kind, Kind::NotHeldThroughRun);
+        EXPECT_EQ(v->blockV, p.landing.v);
+        EXPECT_EQ(v->landingBlockV, p.landing.v);
+    }
+    // (4) THE VALUE HAS NO PLACE AT ALL.
+    {
+        LirFuncAllocation broken = alloc;
+        broken.assignments[p.g.id] = LirRegAssignment{};
+        auto const v = findLandingViolation(p.lir, sch, flow, broken);
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(v->kind, Kind::Unassigned);
+    }
+    // (5) NO GUARDED RUN, NO QUESTION: the same volatile assignment under a
+    // liveness that names no run is not this auditor's to judge.
+    {
+        LirFuncLiveness const plain = analyzeFuncLiveness(p.lir, p.lir.funcAt(0));
+        LirFuncAllocation broken = alloc;
+        broken.assignments[p.g.id] = LirRegAssignment::makePhys(
+            p.g, makePhysicalReg(*facts.aVolatileGpr, LirRegClass::GPR));
+        EXPECT_FALSE(findLandingViolation(p.lir, sch, plain, broken).has_value());
+    }
 }

@@ -19,6 +19,7 @@
 
 #include "core/types/config_document_parse.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/grammar_schema.hpp"   // a reader refusing a document past the limit
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/project_config.hpp"
 #include "core/types/target_schema.hpp"
@@ -37,6 +38,7 @@
 #include <vector>
 
 using namespace dss;
+using dss::detail::configNestingLimit;
 using dss::detail::ConfigDocumentParseFailure;
 using dss::detail::escapeJsonPointerSegment;
 using dss::detail::parseConfigDocument;
@@ -158,6 +160,161 @@ TEST(ConfigDocumentParse, RenderersProduceTheTwoShapesTheCallersEmit) {
               "JSON parse error: " + bad.error().message)
         << "with no pointer, the with-locus renderer must degrade to the plain "
            "one rather than emit a dangling `at : `";
+}
+
+// ═══ TIER 1b — THE NESTING LIMIT (cycle P69 L2, lane `lm`) ═════════════════
+//
+// Every reader walks a config document once per level of nesting (the grammar
+// loader's walks over a shape body, and the json library's own deep copy), so a
+// document nested deeper than the config tree's limit is refused by the owner,
+// named by the pointer of the first container past it, before any reader runs.
+
+namespace {
+
+// `levels` nested containers: an object holding `k`, holding an array, alternately,
+// with a scalar innermost — `{"k":[{"k":[ … 1 … ]}]}`.
+std::string nestedDocument(std::size_t levels) {
+    std::string open;
+    std::string close;   // built outermost-first, then reversed
+    for (std::size_t i = 0; i < levels; ++i) {
+        if (i % 2 == 0) {
+            open += "{\"k\":";
+            close += '}';
+        } else {
+            open += '[';
+            close += ']';
+        }
+    }
+    std::reverse(close.begin(), close.end());
+    return open + "1" + close;
+}
+
+constexpr dss::detail::ConfigNestingLimit kTestLimit{6, "the test's own limit"};
+
+// The deepest container of `doc`, counting the top-level one as 1 — iteratively.
+std::size_t deepestLevel(nlohmann::json const& doc) {
+    std::size_t best = 0;
+    std::vector<std::pair<nlohmann::json const*, std::size_t>> stack{{&doc, 1}};
+    while (!stack.empty()) {
+        auto const [v, level] = stack.back();
+        stack.pop_back();
+        if (!v->is_structured()) continue;
+        best = std::max(best, level);
+        for (auto const& child : *v) stack.emplace_back(&child, level + 1);
+    }
+    return best;
+}
+
+} // namespace
+
+TEST(ConfigDocumentParse, ADocumentNestedToTheLimitLoads) {
+    auto const parsed = parseConfigDocument(nestedDocument(6), kTestLimit);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ(deepestLevel(*parsed), 6u);
+}
+
+TEST(ConfigDocumentParse, OneLevelPastTheLimitIsRefusedNamingWhereHowDeepAndWhy) {
+    auto const parsed = parseConfigDocument(nestedDocument(7), kTestLimit);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().kind, ConfigDocumentParseFailure::TooDeep);
+    EXPECT_EQ(parsed.error().pointer, "/k/0/k/0/k/0")
+        << "the first container past the limit, by its pointer";
+    EXPECT_NE(parsed.error().message.find("nested 7 levels deep"), std::string::npos) << parsed.error().message;
+    EXPECT_NE(parsed.error().message.find("past the 6 levels"), std::string::npos) << parsed.error().message;
+    EXPECT_NE(parsed.error().message.find("the test's own limit"), std::string::npos) << parsed.error().message;
+    EXPECT_EQ(parsed.error().locus("deep.lang.json"), "/k/0/k/0/k/0");
+    EXPECT_EQ(parsed.error().detailText("JSON parse error: "), parsed.error().message)
+        << "the refusal is a complete sentence, never under a parse-error prefix";
+}
+
+// A document far past any limit is refused by the iterative scan, not by a host stack.
+TEST(ConfigDocumentParse, ADocumentAHundredThousandLevelsDeepIsRefusedNotOverflowed) {
+    auto const parsed = parseConfigDocument(nestedDocument(100000), kTestLimit);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_EQ(parsed.error().kind, ConfigDocumentParseFailure::TooDeep);
+}
+
+// The shipped tree's deepest nest, by the iterative count above, over every
+// document under the config root (MEASURED 2026-10-20: 15, `sources/c.lang.json`,
+// of 85 documents). It is read here so a deeper document is noticed against the
+// limit it must stay well under.
+TEST(ConfigDocumentParse, TheShippedTreesDeepestNestIsFifteenLevels) {
+    std::size_t deepest = 0;
+    std::string where;
+    std::size_t documents = 0;
+    for (auto const& entry : std::filesystem::recursive_directory_iterator{dss::test::configRoot()}) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+        auto const parsed = parseConfigDocument(readWholeFile(entry.path()));
+        ASSERT_TRUE(parsed.has_value()) << entry.path().string();
+        ++documents;
+        if (std::size_t const d = deepestLevel(*parsed); d > deepest) {
+            deepest = d;
+            where = entry.path().filename().string();
+        }
+    }
+    EXPECT_GT(documents, 80u) << "the walk found the shipped tree";
+    EXPECT_EQ(deepest, 15u) << "the deepest shipped document is " << where;
+    EXPECT_EQ(where, "c.lang.json");
+}
+
+// ── THE CONFIG TREE'S OWN LIMIT: forwarded at configure time, taken by every reader ──
+
+// The limit every one-argument parse takes IS the configure-time document's
+// `maxNesting`, read back against the document itself: a number written into the
+// code instead of the forward would answer here too.
+TEST(ConfigDocumentParse, TheConfigTreesLimitIsItsConfigureTimeDocumentsMaxNesting) {
+    auto const path = dss::test::configRoot() / "configure-time" / "config-documents.json";
+    auto const parsed = parseConfigDocument(readWholeFile(path));
+    ASSERT_TRUE(parsed.has_value()) << path.string();
+    ASSERT_TRUE(parsed->contains("maxNesting") && (*parsed)["maxNesting"].is_number_unsigned())
+        << path.string();
+    EXPECT_EQ(configNestingLimit().levels, (*parsed)["maxNesting"].get<std::size_t>())
+        << "the compiled-in limit is not the configure-time document's";
+    EXPECT_NE(std::string{configNestingLimit().declaredIn}.find("configure-time/config-documents.json"),
+              std::string::npos)
+        << configNestingLimit().declaredIn;
+}
+
+// Every reader's parse (the one-argument form) loads a document nested to the config
+// tree's limit and refuses one level more, naming where the limit is declared.
+TEST(ConfigDocumentParse, EveryReaderRefusesOneLevelPastTheConfigTreesLimit) {
+    std::size_t const levels = configNestingLimit().levels;
+    auto const at = parseConfigDocument(nestedDocument(levels));
+    ASSERT_TRUE(at.has_value()) << at.error().message;
+    EXPECT_EQ(deepestLevel(*at), levels);
+    auto const past = parseConfigDocument(nestedDocument(levels + 1));
+    ASSERT_FALSE(past.has_value()) << "a document one level past the config tree's limit loaded";
+    EXPECT_EQ(past.error().kind, ConfigDocumentParseFailure::TooDeep);
+    EXPECT_NE(past.error().message.find("configure-time/config-documents.json"), std::string::npos)
+        << past.error().message;
+}
+
+// A reader's own refusal: a language document whose shape body nests past the limit is
+// refused by name (C_MalformedJson, the nesting sentence) before any of the grammar
+// loader's walks — still recursive — reads it.
+TEST(ConfigDocumentParse, AGrammarNestedPastTheLimitIsRefusedBeforeTheLoaderWalksIt) {
+    // Each `{"sequence": [ … ]}` is two levels; under the document (1) and `shapes` (2),
+    // `levels / 2` of them reach 2 + 2 * (levels / 2) >= levels + 1.
+    std::size_t const levels = configNestingLimit().levels;
+    std::string body = "\"End\"";
+    for (std::size_t i = 0; i < levels / 2; ++i) body = "{\"sequence\": [" + body + "]}";
+    std::string const text =
+        R"({"dssSchemaVersion": 4,
+  "language": { "name": "Deep", "version": "0.0.1", "fileExtensions": [".deep"] },
+  "tokens": { ";": [{ "kind": "End" }] },
+  "syncTokens": [ "End" ],
+  "shapes": { "s": )" + body + "}}";
+    auto const loaded = GrammarSchema::loadFromText(text, "<deep>");
+    ASSERT_FALSE(loaded.has_value()) << "a grammar nested past the config tree's limit loaded";
+    bool named = false;
+    std::string said;
+    for (auto const& d : loaded.error()) {
+        said += d.message + "\n";
+        if (d.code == DiagnosticCode::C_MalformedJson
+            && d.message.find("levels a DSS config document may nest") != std::string::npos)
+            named = true;
+    }
+    EXPECT_TRUE(named) << said;
 }
 
 // ═══ TIER 2 — THE LOADERS ═══════════════════════════════════════════════════

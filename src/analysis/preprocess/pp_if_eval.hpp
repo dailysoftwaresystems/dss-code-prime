@@ -49,6 +49,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"   // PpPlatformFacts::activeFormat
 #include "core/types/preprocess_config.hpp"   // EmbedParameterRole (D-PP-EMBED-PARAMS)
 #include "core/types/source_buffer.hpp"
 #include "core/types/token.hpp"
@@ -271,6 +272,29 @@ using PpProductText = std::function<std::string_view()>;
 // declaring `refuse`).
 using PpOperatorRevoked = std::function<bool(std::string_view)>;
 
+// ★ P69 (lane `cs`, review M3): "does the PLATFORM provide the C library function `name`
+// on the active target?" — the half of `__has_builtin`'s answer for a LIBRARY builtin
+// (`__builtin_strlen`, `semantics.libraryBuiltins`) that only the active pair can give. A
+// call of one binds to the platform's realization of the function or is refused at the use
+// (S_LibraryBuiltinUnavailable), so the operator answers 1 exactly where the call binds:
+// the preprocessor supplies `ffi::shippedLibraryFunctionProvidedOnFormat` on its active
+// object format. UNSET (`{}`) answers false — no pair is in scope (the LSP, the direct-API
+// tests), and with no pair the binder provides no library function either.
+using PpLibraryFunctionProvided = std::function<bool(std::string_view libraryFunction)>;
+
+// ★ P69 (lane `cs`, fold f26b): WHAT THE ACTIVE PAIR TELLS THE FEATURE QUERIES — the
+// platform half of `__has_builtin` for a library builtin (above), and the object format an
+// attribute row's names may be gated to (`AttributeSemanticsRow::availableObjectFormats`):
+// `__has_attribute` answers for such a name only on its formats. ✔MEASURED (lane `cs` probe
+// di5): `__has_attribute(dllimport)` is 1 on mingw-w64 gcc 13.2.0 (pe) and 0 on gcc 13.3.0,
+// clang 18.1.3 and Apple clang. DEFAULTED (`{}`) to "no pair in scope" — no library function
+// is provided and no format-gated name is an attribute: the semantic tier's own rule for a
+// gated row where no format is known.
+struct PpPlatformFacts {
+    PpLibraryFunctionProvided       libraryFunctionProvided;
+    std::optional<ObjectFormatKind> activeFormat;
+};
+
 // ── D-PP-DEFINED-VIA-MACRO-EXPANSION ─────────────────────────────────────────
 // THE `#if`-OPERAND BARRIER: the ONE definition of "which tokens a
 // conditional-inclusion operator protects from macro expansion", shared by the
@@ -477,7 +501,10 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      // scope at all (the LSP, the direct-API tests) — and "no
                      // pair" is NOT a guessed one: a narrow body above 0x7F and
                      // every wide/UTF constant then REFUSE, loud.
-                     PpCharConstantFacts const& charFacts = {});
+                     PpCharConstantFacts const& charFacts = {},
+                     // P69 (review M3; fold f26b): what the active pair tells the
+                     // feature queries (see `PpPlatformFacts`).
+                     PpPlatformFacts const& platform = {});
 
 // The phase-4 VALUE of a controlling expression (C 6.10.2p13: every operand
 // acts as `intmax_t` / `uintmax_t`): the 64 raw two's-complement bits plus which
@@ -502,7 +529,8 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                           DiagnosticReporter&    rep,
                           PpHasEmbed const&      hasEmbed = {},
                           PpOperatorRevoked const& operatorRevoked = {},
-                          PpCharConstantFacts const& charFacts = {});
+                          PpCharConstantFacts const& charFacts = {},
+                          PpPlatformFacts const& platform = {});
 
 // C23 6.10.4.2 (D-PP-EMBED-PARAMS): evaluate a `limit` parameter's clause (the
 // tokens INSIDE its parens) to the element count it names. ONE implementation
@@ -534,6 +562,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
                    PpHasEmbed const&        hasEmbed,
                    PpOperatorRevoked const& operatorRevoked,
                    PpCharConstantFacts const& charFacts,
+                   PpPlatformFacts const&   platform,
                    PpTokenTextFn const&     textOf,
                    PpEmbedFail const&       fail);
 

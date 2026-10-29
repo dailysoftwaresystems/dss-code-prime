@@ -1,0 +1,8 @@
+        ] },
+        { "sequence": [
+            { "alt": [ { "sequence": [ "stdAttr", { "repeat": "stdAttr" } ] }, "attrSpec" ] },
+            { "repeat": { "alt": [ "attrSpec", "headQualifier" ] } },
+            "ExternKeyword",
+            { "repeat": { "alt": [ "ThreadLocalKeyword", "ThreadLocalC23Keyword", "InlineKeyword", "NoreturnKeyword", "attrSpec" ] } }
+        ] }
+      ]

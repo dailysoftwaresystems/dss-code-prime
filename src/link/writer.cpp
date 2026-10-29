@@ -271,13 +271,15 @@ namespace detail {
 // reuses this primitive.
 //
 // ⚠⚠ IT WAS INVISIBLE FOR A REASON WORTH RECORDING, AND NOT BECAUSE NOBODY
-// LOOKED: the cases exist, and their own header states — correctly, and
-// measured — that MinGW's libstdc++ `create_symlink` returns ENOSYS, so the
-// shipping Windows toolchain CANNOT CONSTRUCT the input. They therefore SKIP on
-// the Windows leg and run only on POSIX, where the primitive was always right.
-// MSVC implements `create_symlink`, so the first build that reached this suite
-// also ran the guard. ★ A test that skips on the one platform whose primitive
-// differs is not covering that platform — it is reporting that it did not.
+// LOOKED: the cases existed, and measured — correctly — that MinGW's libstdc++
+// `create_symlink` returns ENOSYS, so through the library the shipping Windows
+// toolchain CANNOT CONSTRUCT the input. They therefore SKIPPED on the MinGW
+// leg and ran only where the library makes a link. MSVC implements
+// `create_symlink`, so the first build that reached this suite also ran the
+// guard. ★ A test that skips on the one platform whose primitive differs is not
+// covering that platform — it is reporting that it did not. ✔ The cases now
+// make the link with the OS's own call (`tests/test_support/os_link.hpp`), and
+// so run on the MinGW leg too (2026-10-20).
 //
 // ⇒ `FILE_FLAG_OPEN_REPARSE_POINT` is what restores the POSIX guarantee: the
 // create no longer traverses the link, so an existing reparse point at `p` makes
@@ -919,15 +921,17 @@ bool writeImage(LinkedImage const&             image,
     // WARNING (the artifact is valid — it just needs a manual chmod), NOT a
     // write failure. `executable` is the CALLER's config-driven decision
     // (`ObjectFormatSchema::isImageFlavor()`); this code never inspects the
-    // format itself, staying format-blind.
+    // format itself, staying format-blind. Asked of the substrate
+    // (`core::addReachedPermissions`): the bits go to the file the path
+    // reaches on every build, never to a link's own attribute.
     if (executable) {
         std::error_code ec;
-        std::filesystem::permissions(
+        core::addReachedPermissions(
             path,
             std::filesystem::perms::owner_exec
                 | std::filesystem::perms::group_exec
                 | std::filesystem::perms::others_exec,
-            std::filesystem::perm_options::add, ec);
+            ec);
         if (ec) {
             dss::report(reporter, DiagnosticCode::K_ImageExecBitFailed,
                         DiagnosticSeverity::Warning,
@@ -1031,7 +1035,7 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     auto const parent = path.parent_path();
     if (!parent.empty()) {
         std::error_code ec;
-        bool const exists = std::filesystem::exists(parent, ec);
+        bool const exists = core::reachedKind(parent, ec) != core::EntryKind::Absent;
         if (ec) {
             emit(reporter, DiagnosticCode::K_ImageWriteParentMissing,
                  std::string{"link::writeBytes: failed to stat "
@@ -1198,23 +1202,24 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         // routed correctly and stays correct — it is the ENTRY-vs-TARGET
         // question that was being asked wrongly, not the symlink-ness.
         //
-        // ⚠ WINDOWS CANNOT REACH THIS ROW AT ALL, and it is a LIBRARY limit
-        // rather than a privilege one — which is not what the anchor predicted.
-        // ✔MEASURED 2026-08-26 on this host with the shipping toolchain
-        // (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
-        // returns `ENOSYS` ("Function not implemented", 40) even though
-        // `mklink` succeeds in the same directory, so no test on that leg can
-        // construct the input. The pin is therefore POSIX-leg only and SAYS SO;
-        // see `tests/link/test_link_writer_exclusive_claim.cpp`.
+        // ⚠ THE LIBRARY CANNOT MAKE THIS ROW ON THE MINGW BUILD, and it is a
+        // LIBRARY limit rather than a privilege one — which is not what the
+        // anchor predicted. ✔MEASURED 2026-08-26 on this host with the shipping
+        // toolchain (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
+        // returns `ENOSYS` ("Function not implemented", 40) even though `mklink`
+        // succeeds in the same directory. So the pin makes its links with the
+        // OS's own call and runs on every leg, that one included
+        // (`tests/link/test_link_writer_exclusive_claim.cpp`). ✔MEASURED
+        // 2026-10-20: there `exists(symlink_status())` answered right too —
+        // libstdc++ on Windows reads a dangling link's OWN attributes
+        // (`regular`) — and the probe is now the substrate's `entryKind`: the
+        // ENTRY, asked of the OS on Windows, which every build answers alike.
         //
-        // `status_known` is not used as the test: `symlink_status` reports a
-        // NON-EXISTENT name as `file_type::not_found`, which IS a known status,
-        // so `status_known` would answer true for every name and route a real
-        // error into the retry loop. `exists(file_status)` is the predicate
-        // that distinguishes them.
+        // `entryKind` answers `Absent` for a name with no entry and sets `eec`
+        // only for an entry it cannot examine, so a real error is never routed
+        // into the retry loop.
         std::error_code eec;
-        auto const      entry = std::filesystem::symlink_status(candidate, eec);
-        if (!eec && std::filesystem::exists(entry)) {
+        if (core::entryKind(candidate, eec) != core::EntryKind::Absent && !eec) {
             continue;
         }
         emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,

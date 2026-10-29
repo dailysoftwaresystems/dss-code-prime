@@ -1,0 +1,2 @@
+        combined.imageEntryOverride =
+            static_cast<std::size_t>(at - combined.functions.begin());

@@ -114,6 +114,8 @@ struct Lowered {
     if (out.hir == nullptr) return out;
 
     MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
+    cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>((*out.model).symbols().size()));
     if (out.target != nullptr) {
         cfg.aggregateLayout       = out.target->aggregateLayout();
         cfg.aggregateLayoutLoaded = out.target->aggregateLayoutLoaded();

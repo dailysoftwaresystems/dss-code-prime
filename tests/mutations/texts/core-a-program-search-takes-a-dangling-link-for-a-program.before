@@ -1,0 +1,1 @@
+    return core::reachedKind(candidate, ec) == core::EntryKind::File && !ec ? CandidateVerdict::Executable

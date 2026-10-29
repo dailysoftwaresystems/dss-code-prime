@@ -1,0 +1,1 @@
+a null pointer constant is a valid peer of nullptr (C23 6.5.9p2)

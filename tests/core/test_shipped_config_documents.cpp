@@ -11,6 +11,7 @@
 // HERMETIC: every tree is planted under a scratch directory, so the arms answer the same in-tree and out.
 
 #include "core/types/config_path_walk.hpp"
+#include "os_link.hpp"   // links made by the OS: MinGW's library makes none
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -115,4 +116,27 @@ TEST(ShippedConfigDocuments, ADirectoryThatCannotBeListedIsRefusedByName) {
     auto const notDir = shippedConfigDocuments(file, ".lang.json");
     ASSERT_FALSE(notDir.has_value()) << "a FILE where the directory should be must not read as a corpus";
     EXPECT_NE(notDir.error().find(file.generic_string()), std::string::npos) << notDir.error();
+}
+
+// A LINK IS A DOCUMENT BY WHAT IT REACHES, on every build: a link to a regular file is that document, and a
+// DANGLING link is none -- what the MSVC and POSIX builds always answered. libstdc++ on Windows reads a dangling
+// link's own attributes and calls it a regular file, so the MinGW build took it for a document and then failed to
+// read it ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The links are made by the OS.
+TEST(ShippedConfigDocuments, ALinkIsADocumentByWhatItReachesAndADanglingLinkIsNone) {
+    ScratchDir const scratch{Location::Temp, "shipped-config-documents"};
+    fs::path const dir = scratch.path() / "sources";
+    plant(dir / "c.lang.json");
+    plant(scratch.path() / "elsewhere" / "named.lang.json");
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "elsewhere" / "named.lang.json",
+                                                             dir / "via-link.lang.json", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "no-such.lang.json", dir / "gone.lang.json",
+                                                             LinkTo::File));
+
+    auto const got = shippedConfigDocuments(dir, ".lang.json");
+    ASSERT_TRUE(got.has_value()) << got.error();
+    std::string took;
+    for (auto const& stem : stemsOf(*got)) took += " " + stem;
+    EXPECT_EQ(stemsOf(*got), (std::vector<std::string>{"c", "via-link"}))
+        << "the listing took " << got->size() << " documents:" << took;
 }

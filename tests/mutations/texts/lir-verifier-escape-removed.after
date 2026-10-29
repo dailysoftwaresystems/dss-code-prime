@@ -1,0 +1,2 @@
+                    LirInstId const inst = out.lir.blockInstAt(blk, k);
+                    auto const ops = out.lir.instOperands(inst);

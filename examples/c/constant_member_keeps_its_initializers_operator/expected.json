@@ -1,0 +1,37 @@
+{
+  "$comment": "Cycle P69 round 1 (lane `lm`): D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR, D-C-GENERIC-SELECTION-BEFORE-THE-EXPRESSION-PASS-SELECTS-DEFAULT, D-HIR-BRACE-PEEL-TAKES-AN-OPERATORS-OPERAND-FOR-THE-ELEMENT and D-HIR-WHOLE-STRUCTURE-BRACE-ELEMENT-IS-PLACED-BY-TYPE-STAMPS — a constant, and a brace element, is read as it was written. The member of a constant aggregate has the value of its initializer, operator included (C 6.7.9p11): a member initialized by `-5`, `!0`, `~0u`, `sizeof K`, `-K`, `-h.b` was read as the OPERAND (5, 0, 0, 3, 3, 9) wherever the compiler wanted the member as a constant, and a condition on it deleted the code after its `if`, its `while`, its `for` and its `do` — the program died of an illegal instruction. A generic selection in an enumerator, an array bound and a bit-field width selects by its controlling expression's type (6.5.1.1p3), where `default` used to be selected for a controlling literal. An operator's result is an ELEMENT of a braced character array, never the string under the operator (`char s[] = { *\"abc\", 'z' };` was refused by an internal verifier). A whole structure written as an index, a dereference, a conditional, a comma expression or a call initializes the structure it meets WHOLE (6.7.9p13) — it used to be taken for the initializer of that structure's first member, and refused. exit 42 = every check right; any other exit code names the first check that failed (the table in main.c). MEASURED 2026-10-10, this file compiled and RUN on each reference separately, unoptimized (-std=gnu17; cl: /std:c17): cl 19.51.36260 x64 (reference run 20261010-222559-14dcaa4c), MinGW-w64 gcc 13.2.0 (20261010-222603-58af3a72), gcc 13.3.0 and clang 18.1.3 on x86_64 Linux (20261010-222606-f2d9dcb2), gcc 13.3.0 on arm64 Linux (20261010-222626-fcc5672c), AppleClang 21 on arm64 macOS (20261010-222644-11b8f7c9): exit 42 everywhere.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

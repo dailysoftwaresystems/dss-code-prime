@@ -1,0 +1,2 @@
+    auto w = constIntExpr(s, tree, widthNode, fromScope, cfg,
+                          IntegerConstantPosition::BitFieldWidth);

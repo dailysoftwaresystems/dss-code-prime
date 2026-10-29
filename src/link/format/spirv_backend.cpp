@@ -90,6 +90,10 @@ char const* const kRejectedRootFields[] = {
             // likewise an ELF/PE/Mach-O native-image notion — dead data
             // on WASM/SPIR-V (they reach imports format-natively).
             "externAddrBinding",
+            // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED (P69): the name
+            // an object gives an import's address slot (`__imp_`) is a COFF
+            // notion — dead data on WASM/SPIR-V.
+            "importAddressSymbolPrefix",
             // D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local access
             // model (segment-register / TEB / TLV descriptor) is an
             // ELF/PE/Mach-O native-image notion — dead data on

@@ -1,0 +1,3 @@
+        return ReadBinding{id.uniqueBinding->readAs, true};
+    }
+    return std::nullopt;

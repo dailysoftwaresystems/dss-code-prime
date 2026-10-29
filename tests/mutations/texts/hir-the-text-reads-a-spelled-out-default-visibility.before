@@ -1,0 +1,1 @@
+                if (*v == SymbolVisibility::Default) refuseTheDefault(word, "visibility");

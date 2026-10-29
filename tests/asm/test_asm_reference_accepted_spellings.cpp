@@ -199,7 +199,7 @@ struct Bound {
         bindings.push_back(std::move(ob));
     }
     out.lowered = lowerAsmTemplateToLirRun(*tree, **grammar, **target, bindings,
-                                           builder, rep);
+                                           builder, rep, nullptr);
     for (auto const& diag : rep.all()) out.diagnostics += diag.actual + "\n";
     if (!out.lowered) return out;
     auto const retOp = (*target)->opcodeByMnemonic("ret");
@@ -502,7 +502,7 @@ TEST(AsmReferenceAcceptedSpellings, APlaceholderThatIsNoRegisterIsRefusedAsAnAdd
     bindings[1].operandKind = OperandKindFilter::MemBase;
     bindings[1].reg = makePhysicalReg(*(*target)->registerByName("rdi"), LirRegClass::GPR);
     bool const ok = lowerAsmTemplateToLirRun(*tree, **grammar, **target, bindings,
-                                             builder, rep);
+                                             builder, rep, nullptr);
     EXPECT_FALSE(ok);
     bool named = false;
     for (auto const& d : rep.all()) {

@@ -11,6 +11,21 @@ dss_add_test(NAME lir/test_lir_regalloc  SOURCES test_lir_regalloc.cpp)
 # exclusion-union growth pins mutate idiv_op/shl implicitRegisters via
 # mutate_target_schema.hpp.
 target_link_libraries(dss_lir_test_lir_regalloc PRIVATE nlohmann_json::nlohmann_json)
+# D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER (P69, lane `lm`): the landing rule
+# with the allocator's own abort CONTAINED. The allocator's audit kills the process
+# when a value a landing block reads would be lost; the cases above run in-process,
+# so a mutation of the rule kills their binary before it can name a case. Here the
+# allocation runs in a child the case requires to leave with 0. The probe is the one
+# test_lir_regalloc reads (landing_probe.hpp).
+dss_add_test(NAME lir/test_landing_rule_contains_the_audit
+             SOURCES test_landing_rule_contains_the_audit.cpp)
+# THE BLOCK LEFT WHERE A `__try` FILTER STOOD LEADS NOWHERE (P69, lane `lm`): the
+# stub in the function that holds a `__try` was sealed with a jump to the handler,
+# and what a handler reads then held its register to the function's end. The
+# lowering seals it with the target's block-with-no-way-out terminator; this pins
+# the lowering and what liveness then says of the stub and the handler.
+dss_add_test(NAME lir/test_filter_stub_is_not_a_way_into_the_handler
+             SOURCES test_filter_stub_is_not_a_way_into_the_handler.cpp)
 dss_add_test(NAME lir/test_lir_rewrite   SOURCES test_lir_rewrite.cpp)
 # D-LIR-PER-INST-REG-CONSTRAINTS: the module side-structure
 # carry-across (both pools, all four rebuild passes) and the verifier rules
@@ -430,3 +445,37 @@ dss_add_test(NAME lir/test_lir_aapcs64_mixed_fp_call
 # floating-point register, and a bit-cast to another kind is refused by name.
 dss_add_test(NAME lir/test_lir_long_double_value_semantics
              SOURCES test_lir_long_double_value_semantics.cpp)
+
+# D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS (P69): the blocks a
+# jump table, a static `&&label` and a `__try` scope name, followed from MIR→LIR's
+# ids to the final LIR — the first piece for an entry and the last for a scope's
+# last block, a pass that publishes no image refused by name (nothing inferred),
+# the four real block-for-block rebuilds publishing the identity they performed,
+# a descriptor id with no image refused, and the assembler's offsets held to the
+# final layout (`lir/lir_descriptor_blocks.hpp`).
+dss_add_test(NAME lir/test_lir_descriptor_blocks
+             SOURCES test_lir_descriptor_blocks.cpp)
+
+# D-LIR-THREAD-LOCAL-IMPORT-STAMPED-READ-THROUGH-A-SLOT (P69): a thread-local import's
+# row leaves MIR→LIR stating that its code reads no address slot, on every shipped
+# format that lowers a thread-local access and under an indirect-slot dispatch.
+dss_add_test(NAME lir/test_thread_local_import_lowering
+             SOURCES test_thread_local_import_lowering.cpp)
+
+# D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES (P69): a guarded
+# region is a set of contiguous runs with one scope record per run — the records
+# of a nested pair in table order (inner body, inner runs, outer body, outer
+# runs), a run made only of blocks created for the region's own blocks in its own
+# function, and why no run writes a value its handler reads: a source function
+# that guards a region holds no PROMOTED local's phi (its locals stay in memory),
+# and the phi the lowering makes itself for `&&` / `||` — whose edge split IS a
+# run of the guarded body, read from source — is read by its join alone.
+dss_add_test(NAME lir/test_guarded_region_runs
+             SOURCES test_guarded_region_runs.cpp)
+
+# P69 (lane lm): a `_Bool` bit-field is read and written — its read is the field's bit
+# compared with zero, its write merges the unit as the byte it is; nothing of the MIR
+# narrows to `_Bool` (a conversion no target realizes: every read and write was
+# refused before). Lowered to the LIR of both shipped targets.
+dss_add_test(NAME lir/test_bool_bit_field_lowers
+             SOURCES test_bool_bit_field_lowers.cpp)

@@ -1,0 +1,2 @@
+                    return namedConstantRead(interner, *initExpr, rec->scope.v, rec->type,
+                                             charIsUnsigned_);

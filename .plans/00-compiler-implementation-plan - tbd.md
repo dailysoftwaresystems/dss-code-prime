@@ -95,6 +95,12 @@ Drill into the [sub-plan §0 status table](./01-tree-node-model-plan - ok.md#0-c
 
 ## 0.1. Stepper — next-up by block
 
+> **★ PR PLACEMENT (2026-10-22): [`30-pr-scope-plan`](./30-pr-scope-plan%20-%20tbd.md) places EVERY open
+> registry row in a PR (PR #59's exit, the next PR in three rounds plus full debug information, then the
+> capability, wasm32 and C++ PRs, then the trigger-opened plans) and maps every plan to where its remaining work
+> lands.** Inside a PR, the production registry's bands still order the work, P0 first. The queue below is the
+> pre-registry history of this stepper.
+
 ### ★ Go-forward priority queue — 2026-07-22 refresh (updates the 2026-07-20 full-plan sweep; compile-speed reframed)
 
 > **★★★★ 2026-08-03 — `D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK` ✅ LANDED IN TF-C112, NOT TF-C113.** Operator flagged it CRITICAL (*"this one is critical … should be done right after this cycle"*) and then, on being told it was disjoint from the work in flight, *"if possible now, even better"* — so it was pulled INTO TF-C112 rather than deferred. **`MirVerifier::checkCallSignatures` + `I_CallSignatureMismatch` (0xA019, unsuppressable); full ctest 776/776 with the rule at full strictness.**

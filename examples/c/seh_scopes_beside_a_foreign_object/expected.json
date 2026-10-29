@@ -1,0 +1,29 @@
+{
+  "$comment": "★★ A `__try` PROGRAM LINKED WITH OTHER UNITS: EACH SCOPE TABLE STILL NAMES ITS OWN FILTER AND THE PERSONALITY (P69 fold 2; D-LK-MERGE-LEFT-SEH-SCOPE-IDS-AND-UNIT-ENTRY-UNRENUMBERED). A guarded function refers to its filter funclet and to the personality through its exception scope alone -- no relocation names either -- and the link's merge of several units renumbered every symbol EXCEPT those two ids. ✔MEASURED 2026-10-08 before the fix, baseline and release: a DSS-compiled `__try` unit alone exits 42 (this program's two guarded functions in one unit that prints nothing: 42); the same unit beside ONE reference-built object named to the link, with ONE archive member pulled, or simply calling `printf`, was REFUSED ('pe::encodeExec: a SEH scope-table field at `.xdata` offset 24 names symbol #563, which is not a defined function in this image') -- every `__try` program of more than one unit, and every one that prints: on this format `printf`'s body is a member of DSS's own runtime archive, so the call alone makes the archive search pull a second unit. The unit's own number is nothing in the merged module on a real program, so the writer refuses; when it happens to be another FUNCTION's number the link succeeds and the scope table names the wrong filter (produced at the link tier: `tests/link/test_merge_block_symbols.cpp`, `MergeSehScopes`). This program takes ALL THREE routes into the merge at once: `tests/link/data/tentative_common_x86_64_pe_msvc.obj` is an object input, linked eagerly; `dss_archived_entry` is answered by the archive search in an archive named to the link; and `printf` by the search in the runtime's. Its two guarded functions have filters that accept DIFFERENT faults (an access violation; an integer division by zero), so a scope table naming the other function's filter declines its own fault and the process dies of it. ✔MEASURED 2026-10-08 on this main.c with the same two fixtures: cl 19.44.35228 `/O2 /MD /GS-` linked by link.exe 14.44.35228 prints 'read 30 divide 5' and exits 42, and linked by lld-link 19.1.5 the same. (clang-cl 19.1.5's own object of this source dies of the first fault, 0xC0000005, under either linker: clang does not guard a faulting instruction of an optimized `__try` body -- a compiler's limit, the same under both linkers, and no statement about the link.) Each `__except` body assigns a CONSTANT on purpose, so nothing but the dispatch decides the answer. 42 = 30 (the read was caught by its own filter) + 5 (the division by its own) + 0 (`dss_read_tentative`: the common stands) + 42 (`dss_archived_entry`) - 35; 10 = VirtualAlloc failed (the environment). The printed line says which region caught what, so a wrong exit code is read at a glance. The division's status is spelled by value (0xC0000094): the shipped windows.h declares `EXCEPTION_ACCESS_VIOLATION` and not yet the rest of that family. The `release` arm pins the same answer with the DSS half optimized. pe64 only: `__try`, the C personality and windows.h are Windows'.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "read 30 divide 5\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "A reference-built object NAMED to the link: an object input, linked eagerly, which is what makes the link a merge of several units. Source and rebuild commands: `tests/link/data/tentative_common.source.c` (cl 19.44.35228 `/c /O2 /MD /GS- /experimental:deterministic /pathmap:`; md5 fca2b27ff4c3b56e0f57964055923dd2). The witness is the function this program calls.",
+          "path": "tests/link/data/tentative_common_x86_64_pe_msvc.obj",
+          "containerWitness": "dss_read_tentative"
+        },
+        {
+          "$comment": "An archive whose one member the link PULLS for this program's reference to `dss_archived_entry`: the second route into the merge. Source and rebuild commands: `tests/link/data/libpe_directive_entry_definition_x86_64_pe.source.c` (the same cl build + llvm-ar 19.1.5 `rcs --format=gnu`; archive md5 e72223602d36f58109d507eaa84502b7). The witness is the name the member defines.",
+          "path": "tests/link/data/libpe_directive_entry_definition_x86_64_pe.a",
+          "containerWitness": "dss_archived_entry"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

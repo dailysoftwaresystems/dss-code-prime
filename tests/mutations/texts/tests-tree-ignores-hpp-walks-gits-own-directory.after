@@ -1,0 +1,1 @@
+            if (name == ".git" && &name == &names.front()) return ".git";

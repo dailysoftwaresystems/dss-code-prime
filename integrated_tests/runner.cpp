@@ -92,11 +92,18 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+// The host substrate's entry kind, walk and removal -- the ONE statement of "never
+// follow a link", shared with the compiler. This runner links no DSS library: the
+// one substrate unit is compiled into it (integrated_tests/CMakeLists.txt).
+#include "core/substrate/path_identity.hpp"
 #include "host_translations.hpp"
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. Its header states the boundary as a sentence;
 // this runner's own statement of its half is in the block above `runExampleViaCli`.
 #include "coverage_boundary.hpp"
+// The judgement of `forbidDiagnostics` and the reading of a CLI log's report
+// headers — ONE home, shared with tests/examples/examples_runner.cpp.
+#include "forbidden_diagnostics.hpp"
 #include "host_native_target.hpp"  // hostNativeTarget / hostExeArtifact — the
                                    // source-argument-shape pin BUILDS AND SPAWNS
                                    // its own output, so it must build for this
@@ -383,13 +390,53 @@ struct FsAnswer {
     std::string why;  // empty iff ok
 };
 
+// ★ EVERY QUESTION THIS RUNNER ASKS OF A PATH IS ASKED OF THE SUBSTRATE
+// (src/core/substrate/path_identity.hpp, compiled into this runner), never of
+// the library: libstdc++ on Windows answers a link from the LINK's own
+// attributes -- a link to a file is 0 bytes long and was written when the link
+// was made, a dangling link is a regular file (✔MEASURED 2026-10-20 and
+// 2026-10-21, the substrate's header) -- so the MinGW build of this runner read
+// another file than the one it named. These keep the library's `error_code`
+// contract: a size or a time of a path that reaches no file is an ERROR, named.
+[[nodiscard]] bool reachesSomething(fs::path const& p, std::error_code& ec) {
+    return dss::core::reachedKind(p, ec) != dss::core::EntryKind::Absent;
+}
+
+[[nodiscard]] bool reachesKind(fs::path const& p, dss::core::EntryKind kind, std::error_code& ec) {
+    return dss::core::reachedKind(p, ec) == kind && !ec;
+}
+
+// Why `p` has no size or time to give, when the substrate answered "nothing".
+[[nodiscard]] std::error_code whyNoFile(fs::path const& p) {
+    std::error_code kec;
+    auto const      kind = dss::core::reachedKind(p, kec);
+    if (kec) return kec;
+    if (kind == dss::core::EntryKind::Absent) return std::make_error_code(std::errc::no_such_file_or_directory);
+    if (kind == dss::core::EntryKind::Directory) return std::make_error_code(std::errc::is_a_directory);
+    return std::make_error_code(std::errc::not_supported);
+}
+
+// The size of the regular file `p` reaches; `ec` set (and 0) when it reaches none.
+[[nodiscard]] std::uintmax_t reachedSize(fs::path const& p, std::error_code& ec) {
+    auto const size = dss::core::reachedFileSize(p, ec);
+    if (!size && !ec) ec = whyNoFile(p);
+    return size.value_or(0);
+}
+
+// When the file `p` reaches was last written; `ec` set when it reaches nothing.
+[[nodiscard]] fs::file_time_type writtenAt(fs::path const& p, std::error_code& ec) {
+    auto const when = dss::core::reachedWriteTime(p, ec);
+    if (!when && !ec) ec = whyNoFile(p);
+    return when.value_or(fs::file_time_type{});
+}
+
 // `exists` with the failure kept SEPARATE from the answer. An unreadable path
 // is not an absent one — ELOOP on a self-referential symlink, EACCES on a
 // locked parent — and only the `error_code` overload can tell them apart; the
 // throwing form answers one of those two questions by aborting the run.
 [[nodiscard]] FsAnswer fileExists(fs::path const& p) {
     std::error_code ec;
-    bool const present = fs::exists(p, ec);
+    bool const present = reachesSomething(p, ec);
     if (ec) {
         return {false,
                 "cannot stat '" + p.generic_string() + "': " + ec.message()};
@@ -409,7 +456,7 @@ struct FsAnswer {
 // that sends the reader to look at a file that is not even there.
 [[nodiscard]] FsAnswer fileNonEmpty(fs::path const& p) {
     std::error_code ec;
-    auto const size = fs::file_size(p, ec);
+    auto const size = reachedSize(p, ec);
     if (ec) {
         return {false, "cannot read the size of '" + p.generic_string()
                            + "': " + ec.message()};
@@ -678,6 +725,15 @@ struct ExampleManifest {
     // boundary — `expectDiagnostics` can only say REFUSED and `exitCode` can
     // only say RAN, and until this key no single entry could say both.
     std::vector<ExpectedDiagnostic> expectWarnings;
+    // P69 (lane `cs`): NON-EMPTY ⇒ the CLI must print NO diagnostic header
+    // carrying any of these code NAMES, at any severity, in any arm. The
+    // absence assertion `expectWarnings` cannot make (it is exact over the codes
+    // it declares and silent about every other): the red-on-disable of an
+    // example whose point is that a construct is seen to terminate, to be
+    // constant, to be declared — when that regresses the program still builds
+    // and runs, and what changes is that the compiler starts saying something.
+    // Mirrors the in-process sibling's field of the same name.
+    std::vector<std::string> forbidDiagnostics;
 };
 
 // Parse ONE array of diagnostic expectations. `expectDiagnostics` (the refusal
@@ -1101,6 +1157,63 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << path.generic_string() << "\n";
         return false;
     }
+    // `forbidDiagnostics` — the absence assertion: a non-empty array of
+    // diagnostic-code NAMES, none twice. (An absence has no position, so there
+    // is no {code, line, col} form.) The key literal stays at the accessor
+    // sites for the cross-runner vocabulary pin, like its two siblings.
+    //
+    // ⚠ WHETHER A NAME IS A CODE THE COMPILER KNOWS IS NOT DECIDED HERE, and
+    // cannot be: this runner links no compiler, and a second table of code
+    // names kept in a test would drift from the first. The CLI is asked, at the
+    // arm, through the one parser of code names it has (`cliKnowsDiagnosticCode`)
+    // — and an unknown name poisons the arm BY NAME, because an absence
+    // assertion on a misspelt code passes forever while asserting nothing.
+    if (j.contains("forbidDiagnostics")) {
+        auto const& arr = j.at("forbidDiagnostics");
+        if (!arr.is_array() || arr.empty()) {
+            std::cerr << "  'forbidDiagnostics' must be a non-empty array of"
+                         " diagnostic-code names in " << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& e : arr) {
+            if (!e.is_string() || e.get<std::string>().empty()) {
+                std::cerr << "  each 'forbidDiagnostics' entry must be a string —"
+                             " a diagnostic-code NAME (an absence has no"
+                             " position, so there is no {code, line, col} form) in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            std::string name = e.get<std::string>();
+            if (std::find(out.forbidDiagnostics.begin(), out.forbidDiagnostics.end(),
+                          name) != out.forbidDiagnostics.end()) {
+                std::cerr << "  'forbidDiagnostics' names '" << name
+                          << "' twice in " << path.generic_string() << "\n";
+                return false;
+            }
+            out.forbidDiagnostics.push_back(std::move(name));
+        }
+    }
+    // INERT beside `expectDiagnostics`, and an inert declaration is refused: a
+    // refusal entry's diagnostic set is already asserted, so the key could only
+    // ever say nothing there.
+    if (!out.forbidDiagnostics.empty() && !out.expectDiagnostics.empty()) {
+        std::cerr << "  manifest declares BOTH 'expectDiagnostics' and"
+                     " 'forbidDiagnostics'. The first already asserts the"
+                     " refused compile's diagnostics; the second could assert"
+                     " nothing there: " << path.generic_string() << "\n";
+        return false;
+    }
+    // A code cannot be both REQUIRED and FORBIDDEN.
+    for (auto const& e : out.expectWarnings) {
+        if (std::find(out.forbidDiagnostics.begin(), out.forbidDiagnostics.end(),
+                      e.code) != out.forbidDiagnostics.end()) {
+            std::cerr << "  manifest names '" << e.code << "' in BOTH"
+                         " 'expectWarnings' (it must be emitted) and"
+                         " 'forbidDiagnostics' (it must not): "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+    }
     // PROJECT MODE has no expect-error branch, and saying so LOUDLY is the
     // point: `runErrorExampleViaCli` builds a `--compile <sources>` command line
     // a project manifest never populates. Rejected in the PARSER, in BOTH
@@ -1503,7 +1616,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             || k == "project" || k == "exitCode" || k == "expectedStdout"
             || k == "targets" || k == "optimizedPipelines"
             || k == "optimizationObservable" || k == "expectDiagnostics"
-            || k == "expectWarnings"
+            || k == "expectWarnings" || k == "forbidDiagnostics"
             || k.starts_with("$")) {
             continue;
         }
@@ -1511,7 +1624,8 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << "' — the runner reads language / source / sources /"
                      " project / exitCode / expectedStdout / targets /"
                      " optimizedPipelines / optimizationObservable /"
-                     " expectDiagnostics / expectWarnings (plus $comment keys)."
+                     " expectDiagnostics / expectWarnings / forbidDiagnostics"
+                     " (plus $comment keys)."
                      " An expectation the runner does not read is an assertion"
                      " that never fires: " << path.generic_string() << "\n";
         return false;
@@ -1657,7 +1771,7 @@ struct ProjectFacts {
     if (argv0.find('/') != std::string::npos
         || argv0.find('\\') != std::string::npos) {
         std::error_code ec;
-        bool const there = fs::exists(fs::path{argv0}, ec);
+        bool const there = reachesSomething(fs::path{argv0}, ec);
         return there && !ec;
     }
     return !findOnPath(argv0).empty();
@@ -1757,17 +1871,17 @@ resolvePrebuiltLibraryCli(PrebuiltLibrary const& lib,
     std::string    why;
     std::string    bytes;
     std::error_code ec;
-    if (bool const regular = fs::is_regular_file(resolved, ec); !regular || ec) {
+    if (bool const regular = reachesKind(resolved, dss::core::EntryKind::File, ec); !regular || ec) {
         // ⚠ The "never a skip" clause is on BOTH sub-branches, not just the
-        // clean-absence one: ✔MEASURED, `is_regular_file` reports a missing
-        // path through `ec` on this host, so putting the sentence on the other
-        // branch alone would have hidden it in exactly the commonest case.
+        // clean-absence one: a missing path is no regular file with no error,
+        // one that cannot be examined carries its error, and both are the
+        // same failure.
         why = "not a regular file at " + resolved.generic_string()
             + (ec ? " (" + ec.message() + ")" : "")
             + " — a library input the manifest asked for and the tree could not"
               " supply is a FAILURE, never a skip";
     } else {
-        auto const declaredSize = fs::file_size(resolved, ec);
+        auto const declaredSize = reachedSize(resolved, ec);
         std::ifstream in(resolved.string(), std::ios::binary);
         if (in) {
             bytes.assign(std::istreambuf_iterator<char>(in),
@@ -1802,6 +1916,68 @@ resolvePrebuiltLibraryCli(PrebuiltLibrary const& lib,
     return resolved;
 }
 
+// ── `forbidDiagnostics` — CLI SIDE ──────────────────────────────────────────
+//
+// What a CLI log reports (`diagnosticCodesInCliLog`) and the ONE verdict over
+// every compile of an arm (`forbiddenDiagnosticsOfAnArm`) live in tests/
+// test_support/forbidden_diagnostics.hpp, shared with the in-process sibling and
+// pinned there by test_support/test_forbidden_diagnostics. The corpus arm, the
+// prerequisite build and `runForbidDiagnosticsPin` all ask those. What stays here
+// is the question only the CLI can answer: is this a code name at all?
+
+// Is `name` a diagnostic code the CLI knows? ASKED OF THE CLI, through the one
+// parser of code names it has — `--suppress=<name>`, which refuses a name its
+// table does not hold before it looks at anything else on the line. This runner
+// links no compiler and keeps no table of its own: a second list of code names
+// in a test would be a second owner of the first, and it would drift.
+//
+// Three answers, because "the CLI could not be asked" must never read as either
+// of the other two — an absence assertion on a name nobody vouched for passes
+// forever while asserting nothing.
+//   Unknown     — the CLI said the name is not a recognized diagnostic code;
+//   Known       — the CLI accepted the name and went on to its next complaint
+//                 (no mode was selected: the line holds nothing but the flag);
+//   CouldNotAsk — neither sentence came back.
+// A name that is not a plain identifier is Unknown without being asked: no code
+// is spelled otherwise, and nothing else may reach a command line.
+enum class CodeNameAnswer : std::uint8_t { Known, Unknown, CouldNotAsk };
+
+[[nodiscard]] CodeNameAnswer cliKnowsDiagnosticCode(std::string const& compiler,
+                                                    std::string const& name,
+                                                    fs::path const& scratchDir) {
+    if (name.empty()) return CodeNameAnswer::Unknown;
+    for (char const c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') {
+            return CodeNameAnswer::Unknown;
+        }
+    }
+    static std::map<std::string, CodeNameAnswer> answered;
+    if (auto const it = answered.find(name); it != answered.end()) return it->second;
+
+    auto const log = scratchDir / "forbid-diagnostics-code-name.log";
+    std::string const cmd = quote(compiler) + " --suppress=" + name + " > "
+                          + quote(log.string()) + " 2>&1";
+    (void)std::system(shellWrap(cmd).c_str());
+    std::ifstream in(log.string());
+    std::string const said((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    CodeNameAnswer answer = CodeNameAnswer::CouldNotAsk;
+    if (said.find("--suppress: '" + name + "' is not a recognized diagnostic-code name")
+        != std::string::npos) {
+        answer = CodeNameAnswer::Unknown;
+    } else if (said.find("no mode flag was selected") != std::string::npos) {
+        answer = CodeNameAnswer::Known;
+    }
+    // Only a real answer is remembered: a CLI that could not be asked once may
+    // be askable the next time, and remembering the failure would hide that.
+    if (answer != CodeNameAnswer::CouldNotAsk) answered.emplace(name, answer);
+    return answer;
+}
+
+// `compilesSaid` (null when the manifest forbids nothing) is where this build
+// RECORDS what its build log reports: a prerequisite this arm BUILDS FROM SOURCE
+// is part of the example's compile, so the arm judges it with its own `cli.log`,
+// by the one list — see the ★ note where it is recorded.
 [[nodiscard]] std::optional<fs::path>
 buildDependsOnArtifactCli(std::string const&       compiler,
                           DependsOnArtifact const& dep,
@@ -1810,6 +1986,7 @@ buildDependsOnArtifactCli(std::string const&       compiler,
                           std::string const&       language,
                           std::string const&       exampleName,
                           std::string const&       configName,
+                          std::vector<::dss::test_support::CompileSaid>* compilesSaid,
                           std::map<std::string, fs::path>* builtImages) {
     // Nested prerequisites FIRST (order-correct): each must exist on disk
     // before this dep's own build resolves against it.
@@ -1817,7 +1994,7 @@ buildDependsOnArtifactCli(std::string const&       compiler,
     for (auto const& nested : dep.dependsOn) {
         auto nestedPath = buildDependsOnArtifactCli(
             compiler, nested, exampleDir, outDir, language, exampleName,
-            configName, builtImages);
+            configName, compilesSaid, builtImages);
         if (!nestedPath.has_value()) return std::nullopt;  // check already fired
         resolveArgs += " --resolve-library " + quote(nestedPath->string());
     }
@@ -1861,6 +2038,23 @@ buildDependsOnArtifactCli(std::string const&       compiler,
           + depArtifact.generic_string() + ", buildlog: "
           + depLog.generic_string() + ")", depOk, depWhy);
     if (!depOk) return std::nullopt;
+    // ★ `forbidDiagnostics` REACHES THE PREREQUISITE. The key says what the
+    // example's compile must not report, and a library this arm builds from the
+    // example's own sources is that compile — a function in `lib.c` is as much the
+    // example's as one in `main.c`. Its build has its own log, so what that log
+    // reports is RECORDED here, and the arm judges it beside its own `cli.log`, in
+    // ONE verdict (`forbiddenDiagnosticsOfAnArm`). Whether each name IS a code is
+    // asked once, at the arm. No `check` here: a healthy run emits exactly the
+    // checks it always did, and a red one fails the arm's one forbid check.
+    if (compilesSaid != nullptr) {
+        std::ifstream depLogIn(depLog.string());
+        std::string const depBody((std::istreambuf_iterator<char>(depLogIn)),
+                                  std::istreambuf_iterator<char>());
+        compilesSaid->push_back(::dss::test_support::CompileSaid{
+            "dependsOn library " + dep.spec + " (" + dep.artifact + ", buildlog: "
+                + depLog.generic_string() + ")",
+            ::dss::test_support::diagnosticCodesInCliLog(depBody)});
+    }
     // RECORD THE PREREQUISITE'S PATH for the optimized-vs-baseline dependency
     // comparison. The `check` above has already established the file exists and
     // is non-empty, so what is recorded here is always a readable image.
@@ -1976,9 +2170,9 @@ std::size_t dependencyImagesDiffered  = 0;
 // instrument above must never count an unreadable pair as a difference.
 [[nodiscard]] FsAnswer filesDiffer(fs::path const& a, fs::path const& b) {
     std::error_code ec;
-    auto const sizeA = fs::file_size(a, ec);
+    auto const sizeA = reachedSize(a, ec);
     if (ec) return {false, "cannot size '" + a.generic_string() + "'"};
-    auto const sizeB = fs::file_size(b, ec);
+    auto const sizeB = reachedSize(b, ec);
     if (ec) return {false, "cannot size '" + b.generic_string() + "'"};
     if (sizeA != sizeB) return {true, {}};
     std::ifstream fa(a.string(), std::ios::binary);
@@ -2110,13 +2304,15 @@ std::size_t dependencyImagesDiffered  = 0;
         resolvedLibraries.push_back(*resolved);
     }
     std::map<std::string, fs::path> builtDependencyImages;
+    // EVERY compile of this arm, as `forbidDiagnostics` judges it: each prerequisite
+    // recorded as it is built, this arm's own compile LAST (the forbid block below).
+    std::vector<::dss::test_support::CompileSaid> compilesSaid;
     for (auto const& dep : target->dependsOn) {
         auto depArtifact = buildDependsOnArtifactCli(
             compiler, dep, exampleDir, outDir, m.language, armName, configName,
-            &builtDependencyImages);
+            m.forbidDiagnostics.empty() ? nullptr : &compilesSaid, &builtDependencyImages);
         if (!depArtifact.has_value()) {  // check already fired
-            return {ArmVerdict::Poisoned,
-                    "dependsOn library " + dep.spec + " did not build"};
+            return {ArmVerdict::Poisoned, "dependsOn library " + dep.spec + " did not build"};
         }
         resolveArgs += " --resolve-library " + quote(depArtifact->string());
         resolvedLibraries.push_back(*depArtifact);
@@ -2333,6 +2529,49 @@ std::size_t dependencyImagesDiffered  = 0;
                 "compile rc=" + std::to_string(sysRc)};
     }
     check(armName + ": compile exits 0", true);
+
+    // ★★★ `forbidDiagnostics` — THE ABSENCE ASSERTION, CLI SIDE, ON EVERY ARM.
+    //
+    // The compile succeeded; this asks what it did NOT say. `cli.log` holds
+    // every diagnostic the CLI printed for this arm, so the judgement is over
+    // that file — at ANY severity, in the baseline and in each optimized arm
+    // alike (a warning only the release pipeline draws is still a warning the
+    // entry forbade). Two refusals come first, both BY NAME, because either one
+    // would otherwise turn the assertion into one that cannot fail: a name the
+    // CLI does not know as a diagnostic code, and a CLI that could not be asked.
+    if (!m.forbidDiagnostics.empty()) {
+        for (auto const& name : m.forbidDiagnostics) {
+            auto const answer = cliKnowsDiagnosticCode(compiler, name, outDir);
+            if (answer == CodeNameAnswer::Known) continue;
+            std::string const why = answer == CodeNameAnswer::Unknown
+                ? "'" + name + "' is not a diagnostic code the CLI knows — a"
+                  " misspelt code is absent from every compile, so the entry"
+                  " would pass asserting nothing"
+                : "the CLI could not be asked whether '" + name + "' is a"
+                  " diagnostic code (neither of its two answers to `--suppress="
+                  + name + "` came back)";
+            check(armName + ": `forbidDiagnostics` names diagnostic codes the CLI knows",
+                  false, why);
+            return {ArmVerdict::Poisoned, "forbidDiagnostics: " + why};
+        }
+        std::ifstream logIn(cliLog.string());
+        std::string const body((std::istreambuf_iterator<char>(logIn)),
+                               std::istreambuf_iterator<char>());
+        // This arm's own compile, recorded LAST, after every prerequisite it linked
+        // (`buildDependsOnArtifactCli` recorded each): ONE verdict over all of them.
+        compilesSaid.push_back(::dss::test_support::CompileSaid{
+            "the compile", ::dss::test_support::diagnosticCodesInCliLog(body)});
+        auto const forbidden =
+            ::dss::test_support::forbiddenDiagnosticsOfAnArm(m.forbidDiagnostics, compilesSaid);
+        std::string const verdictWords = ::dss::test_support::describeForbiddenSaid(forbidden);
+        check(armName + ": CLI emits none of the forbidden diagnostics",
+              forbidden.empty(),
+              "FORBIDDEN DIAGNOSTIC: " + verdictWords + "\n  cli log: "
+                  + cliLog.generic_string());
+        if (!forbidden.empty()) {
+            return {ArmVerdict::Poisoned, "forbidDiagnostics: " + verdictWords};
+        }
+    }
 
     // ★★★ `expectWarnings` — THE ACCEPT-AND-REPORT ASSERTION, CLI SIDE.
     //
@@ -3207,16 +3446,26 @@ void runErrorExampleViaCli(std::string const& compiler,
     // extension — an artifact could legitimately be called anything.
     {
         std::vector<std::string> leftovers;
-        std::error_code          ec;
-        for (auto it = fs::recursive_directory_iterator(outDir, ec);
-             !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
-            if (!it->is_regular_file(ec)) continue;
-            if (it->path().filename() == cliLog.filename()) continue;
-            leftovers.push_back(it->path().generic_string());
-        }
+        // The substrate's walk (`dss::core::walkTree`): it never descends a link,
+        // on every build -- libstdc++ on Windows cannot tell one from what it
+        // reaches (the substrate's header) -- and a file reached through a link
+        // is still a file the build left.
+        // A walk that could not read the whole directory did not look for
+        // leftovers there, so it FAILS this check, naming where it stopped --
+        // never a pass over the part it read.
+        auto const walk = dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
+            if (entry.reaches == dss::core::EntryKind::File && entry.path.filename() != cliLog.filename())
+                leftovers.push_back(entry.path.generic_string());
+            return dss::core::WalkStep::Continue;
+        });
         check(exampleName + ": CLI writes NO artifact for a rejected build",
-              leftovers.empty(),
-              std::to_string(leftovers.size()) + " file(s) under "
+              leftovers.empty() && !walk.error,
+              walk.error
+                  ? "the walk of " + outDir.generic_string() + " stopped at "
+                        + walk.where.generic_string() + ": " + walk.error.message()
+                        + " — the directory was not read whole, so no leftover "
+                          "was ruled out"
+                  : std::to_string(leftovers.size()) + " file(s) under "
                   + outDir.generic_string() + ", first: "
                   + (leftovers.empty() ? std::string{} : leftovers.front())
                   + " — the compiler reported failure and produced the binary "
@@ -3284,7 +3533,7 @@ void runAllExamples(std::string const& compiler,
     // per-example failures, or one bad symlink would black out the whole
     // corpus. Both severities are counted, so RC is 1 in every case.
     std::error_code rootEc;
-    bool const rootIsDir = fs::is_directory(examplesRoot, rootEc);
+    bool const rootIsDir = reachesKind(examplesRoot, dss::core::EntryKind::Directory, rootEc);
     if (rootEc) {
         std::cerr << "[ERROR] cannot stat examples root "
                   << examplesRoot.generic_string() << ": " << rootEc.message()
@@ -3319,11 +3568,12 @@ void runAllExamples(std::string const& compiler,
          langIt.increment(langEc)) {
         if (langEc) break;  // reported after the loop
         auto const langPath = langIt->path();
-        // `is_directory(ec)`, NOT `is_directory()`: this reaches the filesystem
-        // whenever the entry's cached readdir type is a symlink or unknown, and
-        // a self-referential symlink answers ELOOP rather than yes-or-no.
+        // What the entry REACHES, asked of the substrate with the error kept
+        // apart: a self-referential symlink answers ELOOP rather than
+        // yes-or-no, and the library's cached answer on a MinGW build is the
+        // link's own.
         std::error_code langKindEc;
-        bool const langIsDir = langIt->is_directory(langKindEc);
+        bool const langIsDir = reachesKind(langIt->path(), dss::core::EntryKind::Directory, langKindEc);
         if (langKindEc) {
             std::cerr << "[ERROR] cannot stat corpus entry "
                       << langPath.generic_string() << ": "
@@ -3347,7 +3597,7 @@ void runAllExamples(std::string const& compiler,
             if (nameEc) break;  // reported after this inner loop
             auto const namePath = nameIt->path();
             std::error_code nameKindEc;
-            bool const nameIsDir = nameIt->is_directory(nameKindEc);
+            bool const nameIsDir = reachesKind(nameIt->path(), dss::core::EntryKind::Directory, nameKindEc);
             if (nameKindEc) {
                 std::cerr << "[ERROR] cannot stat corpus entry "
                           << namePath.generic_string() << ": "
@@ -3364,7 +3614,7 @@ void runAllExamples(std::string const& compiler,
             // print a green Results line, which is the failure mode this
             // defect is named for.
             std::error_code mpEc;
-            bool const haveManifest = fs::exists(mp, mpEc);
+            bool const haveManifest = reachesSomething(mp, mpEc);
             if (mpEc) {
                 std::cerr << "[ERROR] cannot stat manifest "
                           << mp.generic_string() << ": " << mpEc.message()
@@ -3721,9 +3971,13 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
     // automatically, which is the property a hand-listed subset cannot have.
     std::size_t population = 0;
     std::error_code ec;
-    for (fs::recursive_directory_iterator it(examplesRoot, ec), end; it != end && !ec;
-         it.increment(ec)) {
-        if (it->path().filename() == "expected.json") ++population;
+    // The substrate's walk: it never descends a link on any build.
+    {
+        auto const walk = dss::core::walkTree(examplesRoot, [&](dss::core::TreeEntry const& entry) {
+            if (entry.path.filename() == "expected.json") ++population;
+            return dss::core::WalkStep::Continue;
+        });
+        ec = walk.error;
     }
     if (ec || population == 0) {
         std::cerr << "[ERROR] could not derive the example population from "
@@ -3742,7 +3996,7 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
     // could not be read". ★ A fail-loud message that names the wrong subsystem is
     // not fail-loud: it sends the reader to the one place the defect is not.
     std::size_t unreadableCells = 0;
-    if (fs::is_directory(g_cellDir, ec)) {
+    if (reachesKind(g_cellDir, dss::core::EntryKind::Directory, ec)) {
         for (fs::directory_iterator it(g_cellDir, ec), end; it != end && !ec;
              it.increment(ec)) {
             if (it->path().extension() != ".cell") continue;
@@ -4550,6 +4804,306 @@ void runManifestClosedKeySetPin(fs::path const& scratch) {
     std::cout << "\n";
 }
 
+// ── Harness self-test: `forbidDiagnostics` — parse, question, judgement, RED ──
+//
+// The key that lets an entry assert a diagnostic's ABSENCE (P69), pinned at the
+// five places it can break alone (the fifth, below the arm cases: a `dependsOn`
+// artifact the arm builds from source is judged by the same list, from its own
+// build log):
+//   1. the PARSE refuses every shape that could only pass by saying nothing;
+//   2. the QUESTION "is this a code name?" is answered by the real CLI, both
+//      ways — the sentence it is read from is the CLI's, so a reworded refusal
+//      turns up HERE as a red pin instead of in the corpus as an arm that
+//      "could not ask";
+//   3. the JUDGEMENT, the one both runners share (tests/test_support/
+//      forbidden_diagnostics.hpp), reads only real report headers out of a log;
+//   4. the ARM goes RED end to end: `compileAndRunArmViaCli` on a fixture whose
+//      compile prints the code its manifest forbids is POISONED, saying which;
+//      the same fixture forbidding a code the compile does not print RUNS and
+//      exits 42; and a misspelt code poisons the arm BY NAME. The red halves are
+//      PROVOKED on purpose, so their `[FAIL]` lines and the counters they move
+//      are captured and put back — they are this pin's subject, not its result.
+//      Remove the arm's check and the first half stops being poisoned: that is
+//      the red-on-disable of the key itself.
+void runForbidDiagnosticsPin(std::string const& compiler, fs::path const& scratch) {
+    std::cout << "[Harness self-test] forbidDiagnostics: PARSED, the code name"
+                 " ASKED of the CLI, the log JUDGED, and the arm POISONED\n";
+    std::error_code ec;
+    fs::create_directories(scratch, ec);
+    if (ec) {
+        check("create the forbid-diagnostics pin's scratch dir", false, ec.message());
+        std::cout << "\n";
+        return;
+    }
+    constexpr char const* kWarned  = "H_NonVoidFunctionEndReachable";
+    constexpr char const* kNotSaid = "H_UnreachableCode";
+    auto const writeText = [](fs::path const& p, std::string const& text) {
+        std::ofstream f(p.string(), std::ios::binary);
+        f << text;
+        f.close();
+        return f.good();
+    };
+    // Straight-line capture with no early return inside the window: a stolen
+    // stream that was never given back would silence every later line.
+    auto const parseCapturingStderr = [](fs::path const& p) {
+        ExampleManifest    mm;
+        std::ostringstream captured;
+        auto* const        saved = std::cerr.rdbuf(captured.rdbuf());
+        bool const         ok    = readManifest(p, mm);
+        std::cerr.rdbuf(saved);
+        return std::tuple<bool, std::string, ExampleManifest>{
+            ok, captured.str(), std::move(mm)};
+    };
+    auto const        native  = ::dss::test_support::hostNativeTarget();
+    std::string const exeFile = ::dss::test_support::hostExeArtifact("main");
+    std::string const host    = currentHostOs();
+    // `extra` splices in beside the required keys (empty, or ending in a comma).
+    auto const manifestText = [&](std::string const& extra) {
+        return std::string{R"({
+  "language": "c",
+  "source": "main.c",
+  )"} + extra + R"(
+  "targets": [{"spec": ")" + std::string{native.execTarget} + R"(",
+               "artifact": ")" + exeFile + R"(", "runOn": [")" + host + R"("]}]
+})";
+    };
+    auto const forbid = [](std::string const& names) {
+        return std::string{R"("exitCode": 42, "forbidDiagnostics": [)"} + names + "],";
+    };
+    auto const q = [](char const* name) { return std::string{"\""} + name + "\""; };
+
+    // ── 1. THE PARSE ────────────────────────────────────────────────────────
+    auto const parseDir = scratch / "parse";
+    fs::create_directories(parseDir, ec);
+    auto const parsed = [&](std::string const& extra) {
+        (void)writeText(parseDir / "expected.json", manifestText(extra));
+        return parseCapturingStderr(parseDir / "expected.json");
+    };
+    {
+        auto const [ok, msg, mm] = parsed(forbid(q(kWarned) + ", " + q(kNotSaid)));
+        check("a well-formed `forbidDiagnostics` PARSES, names in order",
+              ok && mm.forbidDiagnostics
+                        == std::vector<std::string>{kWarned, kNotSaid},
+              "stderr: " + msg);
+    }
+    struct Refusal {
+        char const* what;
+        std::string extra;
+        char const* says;
+    };
+    for (Refusal const& r : {
+             Refusal{"an EMPTY array", forbid(""), "non-empty array"},
+             Refusal{"a bare string", R"("exitCode": 42, "forbidDiagnostics": "H_UnreachableCode",)",
+                     "non-empty array"},
+             Refusal{"an {code, line, col} entry",
+                     forbid(R"({"code": "H_UnreachableCode", "line": 1, "col": 1})"),
+                     "must be a string"},
+             Refusal{"the same name twice", forbid(q(kWarned) + ", " + q(kWarned)), "twice"},
+             Refusal{"the key beside `expectDiagnostics`",
+                     std::string{R"("expectDiagnostics": [{"code": "S_TypeMismatch", "line": 1, "col": 1}],)"}
+                         + R"( "forbidDiagnostics": [)" + q(kWarned) + "],",
+                     "BOTH 'expectDiagnostics' and 'forbidDiagnostics'"},
+             Refusal{"a code both required and forbidden",
+                     std::string{R"("exitCode": 42, "expectWarnings": [{"code": ")"} + kWarned
+                         + R"(", "line": 1, "col": 20}], "forbidDiagnostics": [)" + q(kWarned) + "],",
+                     "BOTH 'expectWarnings'"}}) {
+        auto const [ok, msg, mm] = parsed(r.extra);
+        (void)mm;
+        check(std::string{"`forbidDiagnostics`: "} + r.what + " is REFUSED, saying \""
+                  + r.says + "\"",
+              !ok && msg.find(r.says) != std::string::npos, "stderr: " + msg);
+    }
+
+    // ── 2. THE QUESTION, asked of the real CLI ──────────────────────────────
+    check("the CLI KNOWS a real diagnostic code",
+          cliKnowsDiagnosticCode(compiler, kNotSaid, scratch) == CodeNameAnswer::Known,
+          std::string{"`--suppress="} + kNotSaid + "` did not answer as a known name —"
+              " the sentence this runner reads the answer from may have been reworded");
+    for (char const* const bad :
+         {"H_NonVoidFunctionEndReachble", "Unknown", "None", "H_Unreachable Code",
+          "H_UnreachableCode\" --help \"", ""}) {
+        check(std::string{"the CLI does NOT know '"} + bad + "' as a diagnostic code",
+              cliKnowsDiagnosticCode(compiler, bad, scratch) == CodeNameAnswer::Unknown,
+              "a name that is not a code must be Unknown — never Known, and never"
+              " `could not ask`");
+    }
+
+    // ── 3. THE JUDGEMENT, over a planted log ────────────────────────────────
+    {
+        std::string const log =
+            "warning[H_NonVoidFunctionEndReachable]: [target=t] control can reach …\n"
+            // (planted DATA in two adjacent literals, one compiled string: spelled as one
+            //  piece it reads to the positional-citation guard as a citation of a source line)
+            "  --> main.c" ":1:20\n"
+            "   |\n"
+            " 1 | int helper(void) { } /* warning[H_UnreachableCode]: quoted, not reported */\n"
+            "  warning[S_UnknownAttribute]: indented, so not a header\n"
+            "info[X_OptFixpointTruncated]: an advisory at another severity\r\n"
+            "error[S_TypeMismatch]: and an error\n"
+            "warning[H_NonVoidFunctionEndReachable]: a second report of the first\n"
+            "warning[not a code]: prose in brackets\n";
+        auto const reported = ::dss::test_support::diagnosticCodesInCliLog(log);
+        check("the log's REPORT HEADERS are read, at every severity, and nothing else",
+              reported
+                  == std::vector<std::string>{"H_NonVoidFunctionEndReachable",
+                                              "X_OptFixpointTruncated", "S_TypeMismatch",
+                                              "H_NonVoidFunctionEndReachable"});
+        check("a forbidden code the log reports is NAMED, once, in declaration order",
+              ::dss::test_support::forbiddenCodesSaid({kNotSaid, "S_TypeMismatch", kWarned},
+                                                      reported)
+                  == std::vector<std::string>{"S_TypeMismatch", kWarned});
+        check("a code the log only QUOTES is not reported as emitted",
+              ::dss::test_support::forbiddenCodesSaid({kNotSaid, "S_UnknownAttribute"}, reported)
+                  .empty());
+    }
+
+    // ── 4. THE ARM ──────────────────────────────────────────────────────────
+    //
+    // `helper` reaches its closing brace: one warning, and the program is
+    // conforming — the value is not used. Exit 42.
+    struct ArmCase {
+        char const* dir;
+        std::string names;       // the forbidden list
+        bool        poisoned;
+        char const* says;        // what a poisoned arm's detail must name
+    };
+    for (ArmCase const& c : {
+             ArmCase{"forbidden-and-emitted", q(kWarned), true, kWarned},
+             ArmCase{"misspelt-code", q("H_NonVoidFunctionEndReachble"), true,
+                     "H_NonVoidFunctionEndReachble"},
+             ArmCase{"forbidden-and-absent", q(kNotSaid), false, ""}}) {
+        auto const caseDir = scratch / c.dir;
+        auto const outDir  = scratch / (std::string{c.dir} + "-out");
+        std::string const name = std::string{"forbidDiagnostics arm ("} + c.dir + ")";
+        fs::create_directories(caseDir, ec);
+        bool const written =
+            writeText(caseDir / "main.c",
+                      "int helper(void) { }\nint main(void) { helper(); return 42; }\n")
+            && writeText(caseDir / "expected.json", manifestText(forbid(c.names)));
+        check(name + ": fixture written", written, caseDir.generic_string());
+        if (!written) continue;
+        auto const [ok, msg, mm] = parseCapturingStderr(caseDir / "expected.json");
+        check(name + ": fixture manifest parses", ok && mm.targets.size() == 1u,
+              "stderr: " + msg);
+        if (!ok || mm.targets.size() != 1u) continue;
+
+        if (!c.poisoned) {
+            // THE CONTROL — counted normally: every check inside must pass.
+            auto const out = compileAndRunArmViaCli(
+                compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+                /*configName*/ "", /*captureStdout*/ false);
+            check(name + ": an arm whose compile does NOT print the forbidden code RUNS",
+                  out.verdict == ArmVerdict::Ran,
+                  "verdict=" + std::string{armVerdictName(out.verdict)} + " — " + out.detail);
+            check(name + ": exits 42", out.verdict == ArmVerdict::Ran && out.exitCode == 42,
+                  "got " + std::to_string(out.exitCode));
+            continue;
+        }
+        // THE PROVOKED RED — captured, and the counters it moved put back.
+        std::ostringstream captured;
+        int const          passesBefore   = passes;
+        int const          failuresBefore = failures;
+        auto* const        saved          = std::cout.rdbuf(captured.rdbuf());
+        auto const out = compileAndRunArmViaCli(
+            compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+            /*configName*/ "", /*captureStdout*/ false);
+        std::cout.rdbuf(saved);
+        int const provoked = failures - failuresBefore;
+        passes   = passesBefore;
+        failures = failuresBefore;
+        std::string const said = captured.str();
+        check(name + ": the arm is POISONED",
+              out.verdict == ArmVerdict::Poisoned,
+              "verdict=" + std::string{armVerdictName(out.verdict)} + " — " + out.detail);
+        check(name + ": exactly ONE failed check, and it is this key's",
+              provoked == 1 && said.find("forbid") != std::string::npos,
+              std::to_string(provoked) + " failed check(s). The arm said: " + said);
+        check(name + ": the verdict NAMES the code",
+              out.detail.find(c.says) != std::string::npos
+                  && said.find(c.says) != std::string::npos,
+              "detail: " + out.detail + " | said: " + said);
+    }
+
+    // ── 5. THE PREREQUISITE — a `dependsOn` artifact is the example's compile ─
+    //
+    // The function that reaches its end is in the LIBRARY the arm builds from the
+    // example's own `forbid_lib.c`; `main.c` is clean, so `cli.log` is silent and
+    // only the prerequisite's build log holds the report. The key must see it.
+    // Red (captured, counters put back), then the same fixture forbidding a code
+    // nothing prints — built, linked, run, exit 42.
+    std::string const libFile = ::dss::test_support::hostLibArtifact("forbid_lib");
+    struct DepCase {
+        char const* dir;
+        char const* forbidden;
+        bool        poisoned;
+    };
+    for (DepCase const& c : {DepCase{"dep-forbidden-and-emitted", kWarned, true},
+                             DepCase{"dep-forbidden-and-absent", kNotSaid, false}}) {
+        auto const caseDir = scratch / c.dir;
+        auto const outDir  = scratch / (std::string{c.dir} + "-out");
+        std::string const name = std::string{"forbidDiagnostics prerequisite ("} + c.dir + ")";
+        fs::create_directories(caseDir, ec);
+        std::string const manifest = std::string{R"({
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "forbidDiagnostics": [)"} + q(c.forbidden) + R"(],
+  "targets": [{"spec": ")" + std::string{native.execTarget} + R"(",
+               "artifact": ")" + exeFile + R"(", "runOn": [")" + host + R"("],
+               "dependsOn": [{"sources": ["forbid_lib.c"],
+                              "spec": ")" + std::string{native.libTarget} + R"(",
+                              "artifact": ")" + libFile + R"("}]}]
+})";
+        bool const written =
+            writeText(caseDir / "forbid_lib.c", "int dss_forbid_lib_reaches_its_end(void) { }\n")
+            && writeText(caseDir / "main.c", "int main(void) { return 42; }\n")
+            && writeText(caseDir / "expected.json", manifest);
+        check(name + ": fixture written", written, caseDir.generic_string());
+        if (!written) continue;
+        auto const [ok, msg, mm] = parseCapturingStderr(caseDir / "expected.json");
+        check(name + ": fixture manifest parses",
+              ok && mm.targets.size() == 1u && mm.targets[0].dependsOn.size() == 1u,
+              "stderr: " + msg);
+        if (!ok || mm.targets.size() != 1u) continue;
+
+        if (!c.poisoned) {
+            auto const out = compileAndRunArmViaCli(
+                compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+                /*configName*/ "", /*captureStdout*/ false);
+            check(name + ": a prerequisite that does NOT print the forbidden code is"
+                         " built, linked and RUN",
+                  out.verdict == ArmVerdict::Ran && out.exitCode == 42,
+                  "verdict=" + std::string{armVerdictName(out.verdict)} + " exit="
+                      + std::to_string(out.exitCode) + " — " + out.detail);
+            continue;
+        }
+        std::ostringstream captured;
+        int const          passesBefore   = passes;
+        int const          failuresBefore = failures;
+        auto* const        saved          = std::cout.rdbuf(captured.rdbuf());
+        auto const out = compileAndRunArmViaCli(
+            compiler, caseDir, outDir, mm, &mm.targets[0], name, "baseline",
+            /*configName*/ "", /*captureStdout*/ false);
+        std::cout.rdbuf(saved);
+        int const provoked = failures - failuresBefore;
+        passes   = passesBefore;
+        failures = failuresBefore;
+        std::string const said = captured.str();
+        check(name + ": the arm is POISONED by its prerequisite's report",
+              out.verdict == ArmVerdict::Poisoned
+                  && out.detail.find("dependsOn library") != std::string::npos
+                  && out.detail.find(c.forbidden) != std::string::npos,
+              "verdict=" + std::string{armVerdictName(out.verdict)} + " — " + out.detail);
+        check(name + ": exactly ONE failed check, the arm's forbid check, NAMING the"
+                     " prerequisite and the code",
+              provoked == 1 && said.find("dependsOn library") != std::string::npos
+                  && said.find("FORBIDDEN DIAGNOSTIC") != std::string::npos
+                  && said.find(c.forbidden) != std::string::npos,
+              std::to_string(provoked) + " failed check(s). The arm said: " + said);
+    }
+    std::cout << "\n";
+}
+
 // ── Harness self-test: `loaderSearchPathVariable` — the parse and the spawn ──
 //
 // The CLI half of the loader-search-path capability (`loader_search_path.hpp`),
@@ -5218,11 +5772,12 @@ void runRunnerVocabularyPin() {
     // one property a hand-picked id cannot have — and the property that stops
     // this entry from silently becoming a pin on a file that no longer exists.
     std::vector<fs::path> manifests;
-    std::error_code       ec;
-    for (fs::recursive_directory_iterator it(examplesRoot, ec), end;
-         it != end && !ec; it.increment(ec)) {
-        if (it->path().filename() == "expected.json") manifests.push_back(it->path());
-    }
+    // The substrate's walk: it never descends a link on any build.
+    auto const walk = dss::core::walkTree(examplesRoot, [&](dss::core::TreeEntry const& entry) {
+        if (entry.path.filename() == "expected.json") manifests.push_back(entry.path);
+        return dss::core::WalkStep::Continue;
+    });
+    std::error_code const ec = walk.error;
     if (ec) {
         check("walk the corpus for a coverage-boundary subject", false,
               "scan of " + examplesRoot.generic_string() + " failed: "
@@ -5771,21 +6326,31 @@ constexpr auto kRunningStaleAfter = std::chrono::hours{6};
 // access for an instant. That is the noise the rule at the prune's `[WARN]` exists
 // to keep out, and it is a collision tolerated rather than removed.
 //
-// The walk is still built from SINGLE-OBJECT operations and never `remove_all`,
+// The removal is still built from SINGLE-OBJECT operations and never `remove_all`,
 // because a claim binds only THIS runner: a pre-fix build of it in another tree, a
 // human, or an antivirus quarantine can still delete under the claim holder, and
 // the walk must END whatever they do.
+// ★ AND IT IS THE COMPILER'S OWN, `dss::core::removeTree`
+// (src/core/substrate/path_identity.{hpp,cpp}, compiled into this runner beside
+// it): one statement of "remove a tree, end whatever another deleter does, never
+// follow a link", where this runner kept its own copy. The copy asked
+// `symlink_status` to decide whether an entry was a directory to empty, and
+// libstdc++ on Windows reads a directory LINK as the directory it reaches
+// (✔MEASURED 2026-10-20, the substrate's header) -- so built with MinGW it
+// followed a link out of the scratch tree and emptied what the link named, the one
+// thing its own comment said it never did. The substrate asks the OS there.
 // ⚠ Do NOT "simplify" either half away: `runConcurrentScratchRemovalPin` reds both.
 struct ScratchRemoval {
     std::size_t failures = 0;
     std::string first;  // the first failure: the path and its cause
 };
 
-// `true` iff nothing is at `p` now. A stat that ERRS is not "gone": an entry
-// that cannot even be looked at may well still be there.
+// `true` iff nothing is at `p` now -- no entry at all, a link included. A stat
+// that ERRS is not "gone": an entry that cannot even be looked at may well still
+// be there.
 [[nodiscard]] bool scratchEntryIsGone(fs::path const& p) {
     std::error_code ec;
-    return fs::symlink_status(p, ec).type() == fs::file_type::not_found;
+    return dss::core::entryKind(p, ec) == dss::core::EntryKind::Absent && !ec;
 }
 
 void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
@@ -5796,76 +6361,21 @@ void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
     }
 }
 
-// Remove `target` — one file, or a whole tree — with single-object operations
-// only: a SNAPSHOT of each directory, one `symlink_status` and at most one
-// `remove` per entry, the directory itself last. Nothing is ever retried, so it
-// ENDS whatever another deleter does, and an attempt that failed on an entry
-// which is now GONE was beaten to the outcome wanted, so only an entry STILL THERE
-// counts as a failure. ✔MEASURED, four of these released onto one tree for 400
-// rounds with each standard library: none stuck, no tree left behind.
+// Remove `target` — one file, or a whole tree — through the substrate's removal:
+// a SNAPSHOT of each directory, at most one `remove` per entry, the directory
+// itself last, a link removed as itself. Nothing is ever retried, so it ENDS
+// whatever another deleter does, and an attempt that failed on an entry which is
+// now GONE was beaten to the outcome wanted, so only an entry STILL THERE counts
+// as a failure. ✔MEASURED (this runner's own copy, before the substrate took it
+// over): four of these released onto one tree for 400 rounds with each standard
+// library: none stuck, no tree left behind.
 [[nodiscard]] ScratchRemoval removeScratchTree(fs::path const& target) {
+    auto const   removal = dss::core::removeTree(target);
     ScratchRemoval out;
-    std::error_code tec;
-    auto const kind = fs::symlink_status(target, tec).type();
-    if (kind == fs::file_type::not_found) return out;
-    if (tec) {
-        noteScratchFailure(out, target, tec);
-        return out;
-    }
-    if (kind != fs::file_type::directory) {
-        std::error_code rec;
-        fs::remove(target, rec);
-        if (rec) noteScratchFailure(out, target, rec);
-        return out;
-    }
-    // An explicit work stack rather than recursion, so a deep tree costs heap
-    // rather than stack. A directory is LISTED once, and removed once every
-    // entry of that listing has been handled.
-    struct Pending {
-        fs::path dir;
-        bool     listed = false;
-    };
-    std::vector<Pending> work;
-    work.push_back({target, false});
-    while (!work.empty()) {
-        if (work.back().listed) {
-            fs::path const dir = std::move(work.back().dir);
-            work.pop_back();
-            std::error_code ec;
-            fs::remove(dir, ec);
-            if (ec) noteScratchFailure(out, dir, ec);
-            continue;
-        }
-        work.back().listed = true;
-        fs::path const dir = work.back().dir;  // a COPY: `work` grows below
-        // The snapshot. Entries are acted on only once the listing is complete,
-        // so nothing is ever deleted under a live iterator.
-        std::vector<fs::path> entries;
-        std::error_code ec;
-        fs::directory_iterator it(dir, ec);
-        for (fs::directory_iterator const end; !ec && it != end;
-             it.increment(ec)) {
-            entries.push_back(it->path());
-        }
-        if (ec) noteScratchFailure(out, dir, ec);
-        for (auto& entry : entries) {
-            std::error_code sec;
-            auto const type = fs::symlink_status(entry, sec).type();
-            if (type == fs::file_type::not_found) continue;  // already gone
-            if (sec) {
-                noteScratchFailure(out, entry, sec);
-                continue;
-            }
-            // `symlink_status`, so a link is removed AS a link and never
-            // followed out of the scratch tree.
-            if (type == fs::file_type::directory) {
-                work.push_back({std::move(entry), false});
-                continue;
-            }
-            std::error_code rec;
-            fs::remove(entry, rec);
-            if (rec) noteScratchFailure(out, entry, rec);
-        }
+    out.failures = removal.failures;
+    if (removal.failures != 0) {
+        out.first = "'" + removal.firstPath.generic_string() + "': "
+                  + removal.firstError.message();
     }
     return out;
 }
@@ -5929,7 +6439,7 @@ void sweepStaleRemovalClaims(fs::path const& base, fs::file_time_type now) {
     fs::directory_iterator it(base / kReclaimDirName, ec);
     for (fs::directory_iterator const end; !ec && it != end; it.increment(ec)) {
         std::error_code tec;
-        auto const stamp = fs::last_write_time(it->path(), tec);
+        auto const stamp = writtenAt(it->path(), tec);
         if (!tec && now - stamp >= kRunningStaleAfter) stale.push_back(it->path());
     }
     for (auto const& claim : stale) releaseRemovalClaim(claim);
@@ -5957,14 +6467,14 @@ enum class Reclaim : std::uint8_t {
     bool const stillSelected = [&] {
         std::error_code sec;
         auto const running = root / kRunningName;
-        bool const sentinel = fs::exists(running, sec);
+        bool const sentinel = reachesSomething(running, sec);
         if (sec) return false;  // could not even ask: treat as LIVE
         if (sentinel) {
-            auto const stamp = fs::last_write_time(running, sec);
+            auto const stamp = writtenAt(running, sec);
             if (sec || now - stamp < kRunningStaleAfter) return false;
         }
-        if (!fs::exists(root / kRunInfoName, sec) || sec) return false;
-        auto const mtime = fs::last_write_time(root, sec);
+        if (!reachesSomething(root / kRunInfoName, sec) || sec) return false;
+        auto const mtime = writtenAt(root, sec);
         return !sec && mtime == scannedMtime;
     }();
     Reclaim outcome = Reclaim::NotOurs;
@@ -6038,28 +6548,27 @@ std::size_t pruneKeptRoots(fs::path const& base, fs::path const& mine) {
     for (fs::directory_iterator const end; it != end; it.increment(ec)) {
         if (ec) break;  // reported after the loop
         auto const p = it->path();
-        // `is_directory(dec)`, NOT `is_directory()`: same reason, and this one
-        // reaches the filesystem whenever the entry's cached type is a symlink
-        // or unknown.
+        // What the entry REACHES, asked of the substrate with the error kept
+        // apart, as the corpus walk above asks it.
         std::error_code dec;
-        if (p == mine || !it->is_directory(dec) || dec) continue;
+        if (p == mine || !reachesKind(p, dss::core::EntryKind::Directory, dec) || dec) continue;
         // Only ever remove a directory this runner demonstrably created.
         std::error_code iec;
-        if (!fs::exists(p / kRunInfoName, iec) || iec) continue;
+        if (!reachesSomething(p / kRunInfoName, iec) || iec) continue;
         // A sentinel we cannot READ counts as LIVE. The uncertainty is
         // asymmetric: keeping a dead root costs a little temp space, while
         // deleting a live one is the fixed-temp-path collision between two
         // concurrent runs over again.
         std::error_code rec;
         auto const running = p / kRunningName;
-        bool const sentinel = fs::exists(running, rec);
+        bool const sentinel = reachesSomething(running, rec);
         if (rec) continue;  // could not even ask
         if (sentinel) {
-            auto const stamp = fs::last_write_time(running, rec);
+            auto const stamp = writtenAt(running, rec);
             if (rec || now - stamp < kRunningStaleAfter) continue;  // maybe LIVE
         }
         std::error_code mec;
-        auto const mtime = fs::last_write_time(p, mec);
+        auto const mtime = writtenAt(p, mec);
         if (mec) continue;  // vanished under us — a sibling cleaning up
         prunable.emplace_back(mtime, p);
     }
@@ -6151,12 +6660,12 @@ void reportLegacyDebris(fs::path const& base) {
     // `temp_directory_path()` throws — unwanted on a best-effort path.
     auto const legacy = base.parent_path() / kLegacyBaseName;
     std::error_code lec;
-    auto const legacyStamp = fs::last_write_time(legacy, lec);
+    auto const legacyStamp = writtenAt(legacy, lec);
     if (lec) return;  // absent (the normal case), or unreadable — say nothing
 
     auto const marker = base / kLegacyNotedName;
     std::error_code mec;
-    auto const noted = fs::last_write_time(marker, mec);
+    auto const noted = writtenAt(marker, mec);
     bool const saidBefore = !mec;
     if (saidBefore && noted >= legacyStamp) {
         return;  // already said, and nothing has touched the tree since
@@ -6305,20 +6814,26 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         }
         std::ofstream((root / kRunInfoName).string())
             << "planted by the concurrent scratch-removal pin\n";
-        if (!fs::exists(root / kRunInfoName, ec)) {
+        if (!reachesSomething(root / kRunInfoName, ec)) {
             return "cannot plant '" + (root / kRunInfoName).generic_string()
                  + "'";
         }
         return {};
     };
 
-    auto const filesUnder = [](fs::path const& root) {
+    // The first walk that could not read a root, named: a count it returned is
+    // SHORT, and is reported as the walk's failure, never as a root "not whole".
+    std::string unwalked;
+    auto const filesUnder = [&unwalked](fs::path const& root) {
         std::size_t n = 0;
-        std::error_code ec;
-        for (fs::recursive_directory_iterator it(root, ec), end;
-             !ec && it != end; it.increment(ec)) {
-            std::error_code fec;
-            if (it->is_regular_file(fec)) ++n;
+        // The substrate's walk: it never descends a link on any build.
+        auto const walk = dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
+            if (entry.reaches == dss::core::EntryKind::File) ++n;
+            return dss::core::WalkStep::Continue;
+        });
+        if (walk.error && unwalked.empty()) {
+            unwalked = "the walk of '" + root.generic_string() + "' stopped at '"
+                     + walk.where.generic_string() + "': " + walk.error.message();
         }
         return n;
     };
@@ -6358,7 +6873,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         for (fs::directory_iterator it(base, ec), end; !ec && it != end;
              it.increment(ec)) {
             std::error_code iec;
-            if (!fs::exists(it->path() / kRunInfoName, iec)) continue;
+            if (!reachesSomething(it->path() / kRunInfoName, iec)) continue;
             ++left;
             if (filesUnder(it->path()) != kPlantedFiles) ++broken;
         }
@@ -6371,6 +6886,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
               + std::to_string(left) + " root(s) left, "
               + std::to_string(broken) + " of them not whole";
         }
+        if (!unwalked.empty()) a = "round " + std::to_string(round) + ": " + unwalked;
     }
 
     // (b) a green release racing prunes that selected the SAME root. Planted
@@ -6383,7 +6899,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         planted = plant(root);
         if (!planted.empty()) break;
         std::error_code mec;
-        auto const selectedMtime = fs::last_write_time(root, mec);
+        auto const selectedMtime = writtenAt(root, mec);
         auto const now = fs::file_time_type::clock::now();
         std::vector<int> removed(static_cast<std::size_t>(kDeleters), 0);
         std::vector<int> warned(static_cast<std::size_t>(kDeleters), 0);
@@ -6456,7 +6972,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
             auto const early      = reclaimKeptRoot(root, olderScan, now);
             auto const earlyFiles = filesUnder(root);
             std::ofstream((root / kRunningName).string());
-            auto const currentScan = fs::last_write_time(root, mec);
+            auto const currentScan = writtenAt(root, mec);
             auto const live        = reclaimKeptRoot(root, currentScan, now);
             auto const liveFiles   = filesUnder(root);
             if (mec || early != Reclaim::NotOurs || earlyFiles != kPlantedFiles
@@ -6472,6 +6988,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
                   + (mec ? "; mtime unreadable: " + mec.message()
                          : std::string{});
             }
+            if (!unwalked.empty()) d = unwalked;
         }
     }
 
@@ -6756,6 +7273,10 @@ int main(int argc, char* argv[]) {
     // example binds (a Windows host binds neither the ELF nor the Mach-O one).
     runPrebuiltLibraryParserPin(outputBase / "harness-prebuilt-library-parser");
     runManifestClosedKeySetPin(outputBase / "harness-manifest-keys");
+    // UNNUMBERED like its neighbours. With the CLI surface because every half of
+    // it is host-independent: the fixture is compiled for THIS host's native
+    // target, so the provoked red and its control run on every leg.
+    runForbidDiagnosticsPin(compiler, outputBase / "harness-forbid-diagnostics");
     // UNNUMBERED for the same reason as its neighbours. It runs with the CLI
     // surface because its spawn half is a host-independent claim about THIS
     // runner's spawn site, witnessed on every leg — including the ones where no

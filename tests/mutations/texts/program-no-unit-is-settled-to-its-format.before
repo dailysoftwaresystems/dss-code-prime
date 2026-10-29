@@ -1,0 +1,1 @@
+    settleVisibilitiesWrittenAs(*hir, format.visibilityStandIns(), format.name(),

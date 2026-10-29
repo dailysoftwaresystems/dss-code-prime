@@ -1,0 +1,1 @@
+            bool const     ownsItsAtom = ownerSymbolId[i] == candidates[i].symbolId;

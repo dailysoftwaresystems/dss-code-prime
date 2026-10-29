@@ -1,0 +1,1 @@
+                assignSymbol(ci, a.alias, cus[ci].nameOf(a.alias), /*ffiRow=*/nullptr, /*isLocalDef=*/false);

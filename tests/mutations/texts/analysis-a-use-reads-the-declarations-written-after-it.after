@@ -1,0 +1,1 @@
+        if (own == s.ownDeclaredAt.end()) continue;   // no place, or written after the use

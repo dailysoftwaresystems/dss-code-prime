@@ -1,0 +1,1 @@
+            if (*yields && ms.binding == SymbolBinding::Global) return true;

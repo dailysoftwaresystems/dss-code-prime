@@ -1,0 +1,3 @@
+            case TypeKind::Ptr:
+            case TypeKind::BitInt:
+                return true;

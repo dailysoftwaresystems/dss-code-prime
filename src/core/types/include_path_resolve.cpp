@@ -129,15 +129,29 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     return out;
 }
 
-// `fs::exists(candidate)`, asked ONCE per candidate per compile — an error reads
-// as "does not exist", exactly as the uncached probe did.
+// Does `candidate` REACH an entry — every link on the way followed — asked ONCE
+// per candidate per compile? An error reads as "no", exactly as the uncached
+// probe did. `matchComponent` asks it of EVERY candidate, under both policies.
+//
+// ★★ A DANGLING LINK IS NO HEADER, UNDER EITHER POLICY — THE ONE STATEMENT OF IT
+// ([[D-PP-HEADER-CASE-DANGLING-SYMLINK-ASYMMETRY]]). ✔MEASURED 2026-10-20: a
+// dangling link `x.h` in the first search directory and a real `x.h` in a later
+// one — gcc 13.3.0, clang 18.1.3, Apple clang 21.0.0, MinGW-w64 gcc 13.2.0 and
+// cl 19.51 each, for `#include "x.h"` and `#include <x.h>` alike, went ON to the
+// later directory. The case-sensitive arm used to ask `fs::exists` (a dangling
+// link: absent) while the case-insensitive arm took whatever its listing held (a
+// dangling link: found) — one tree, two verdicts decided by the TARGET's case
+// rule. Both arms now ask this probe. And it asks the substrate, never
+// `fs::exists`: libstdc++ on Windows reads a dangling link's OWN attributes and
+// calls it `regular` (✔MEASURED 2026-10-20, path_identity.hpp), so the MinGW
+// build found the link under BOTH policies.
 [[nodiscard]] bool existsOnce(HeaderSearchCache& cache, fs::path const& candidate) {
     HeaderSearchCache::Impl& c = cache.impl();
     std::lock_guard<std::mutex> lock{c.mutex};
     NativeString key = cacheKeyOf(candidate);
     if (auto const hit = c.probes.find(key); hit != c.probes.end()) return hit->second;
     std::error_code ec;
-    bool const exists = fs::exists(candidate, ec);
+    bool const exists = core::reachedKind(candidate, ec) != core::EntryKind::Absent && !ec;
     tallyRecord(key, /*listing=*/false);
     c.probes.emplace(std::move(key), exists);
     return exists;
@@ -195,11 +209,12 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
     if (matching == HeaderNameMatching::CaseSensitive) {
         // Cheap DEFINITIVE reject first. If no entry answers to these exact
         // bytes even under the host's own (possibly folding) rules, then no
-        // byte-exact entry can exist either — `exists()` is only ever MORE
+        // byte-exact entry can exist either — the probe is only ever MORE
         // permissive than we are, never less, so a false here is trustworthy.
+        // It is also where a dangling link is no header (`existsOnce`).
         fs::path const candidate = dir / name;
         if (!existsOnce(cache, candidate)) return HeaderSearchResult::notFound();
-        // `exists()` said yes — but a case-INSENSITIVE host may have FOLDED to
+        // The probe said yes — but a case-INSENSITIVE host may have FOLDED to
         // get there. Verify the REAL on-disk spelling ourselves; this is the
         // arm that stops `#include <Stdio.h>` from silently compiling for an
         // elf target on a Windows/macOS host. A directory we cannot enumerate
@@ -216,9 +231,13 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
     // because a case-insensitive host cannot even hold that pair. Every
     // fold-match is collected and >= 2 is a LOUD failure, never a pick.
     // A hit is spelled `dir / <entry>` — the path the listing's iterator yields.
+    // A listed entry that REACHES nothing — a dangling link — is no hit: the same
+    // probe, and so the same rule, as the case-sensitive arm above (`existsOnce`).
     std::vector<fs::path> hits;
-    for (NativeString const& entry : foldMatches(cache, dir, asciiToLower(name.native())))
-        hits.push_back(dir / fs::path{entry});
+    for (NativeString const& entry : foldMatches(cache, dir, asciiToLower(name.native()))) {
+        fs::path hit = dir / fs::path{entry};
+        if (existsOnce(cache, hit)) hits.push_back(std::move(hit));
+    }
     if (hits.empty()) return HeaderSearchResult::notFound();
     if (hits.size() == 1) return HeaderSearchResult::found(std::move(hits.front()));
     // Deterministic order, so the collision diagnostic reads the same run to

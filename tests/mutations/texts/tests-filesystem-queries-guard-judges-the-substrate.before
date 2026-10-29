@@ -1,0 +1,1 @@
+    return relative.rfind("src/", 0) == 0 && relative.rfind("src/core/substrate/", 0) != 0;

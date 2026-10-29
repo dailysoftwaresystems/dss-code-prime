@@ -703,19 +703,26 @@ TEST(TypeDerivedPredefinesLoader, ATargetDocumentCannotDeclareTheKinds) {
     for (auto const& [k, spelling] : kPredefinedMacroKindTable.rows) {
         if (predefinedMacroKindNeedsLanguage(k)) kinds.push_back(spelling);
     }
-    ASSERT_EQ(kinds.size(), 3u);
+    // P69 (M4): four — `type-format` joined the language-realized kinds.
+    ASSERT_EQ(kinds.size(), 4u);
     for (std::string_view kind : kinds) {
         // A row that is well-formed for its kind in every other respect — `limit`
-        // on the `type-limit` row alone — so the family is the ONE thing refused.
+        // on the `type-limit` row alone, `conversion` on the `type-format` row
+        // alone — so the family is the ONE thing refused.
         bool const isLimit =
             kind == predefinedMacroKindName(PredefinedMacroKind::TypeLimit);
+        bool const isFormat =
+            kind == predefinedMacroKindName(PredefinedMacroKind::TypeFormat);
         auto r = TargetSchema::loadFromText(
             std::format(R"({{"dssTargetVersion":1,"target":{{"name":"X"}},
                 "opcodes":[{{"mnemonic":"invalid","result":"none"}}],
                 "predefinedMacros":[{{"name":"__X__","kind":"{}","type":"int",{}
                   "programRedefinition":"ordinary",
                   "impliedSurface":{{"kind":"claims-nothing","reason":"arch-property"}}}}]}})",
-                        kind, isLimit ? R"("limit":"max",)" : ""),
+                        kind,
+                        isLimit    ? R"("limit":"max",)"
+                        : isFormat ? R"("conversion":"d",)"
+                                   : ""),
             "<inline>");
         ASSERT_FALSE(r.has_value()) << "a target document must not declare a '" << kind << "' row";
         bool named = false;

@@ -111,9 +111,12 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -156,7 +159,9 @@ struct ShippedSchemas {
 // ⚠ A THROW, NEVER `std::abort()` — an abort kills the process and every sibling
 // here loses its verdict, which is the exact signature these tests exist to tell
 // APART from a stack overflow. `no_abort_in_tests_guard` enforces the same rule.
-[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
+// The parse and the analysis of `src`, `analyze` on a worker of `analyzeReserve` bytes.
+[[nodiscard]] SemanticModel analyzeOn(std::string src, std::size_t exprDepthCap,
+                                      std::size_t analyzeReserve) {
     std::shared_ptr<GrammarSchema const> schema = shipped().schema;
     std::shared_ptr<TargetSchema const>  target = shipped().target;
 
@@ -165,6 +170,15 @@ struct ShippedSchemas {
     auto [stream, lexDiags] = std::move(tk).tokenize();
     ParserConfig pcfg;
     pcfg.maxExpressionDepth = exprDepthCap;
+    // P69 L2a (lane `lm`): the SPECULATION ceilings the CLI parses under, read from the shipped
+    // grammar document (`parser.maxSpeculationDepth`, `parser.speculationBudgetFactor` - what
+    // the compilation unit's `parserConfigFor` applies), never numbers copied here, so a change
+    // to the shipped ceilings moves this fixture with it. Under the C++ fallbacks (64, 16) a
+    // parenthesised `__builtin_expect(` chain past 64 levels did not end its parse in 15 s
+    // (MEASURED 2026-10-21, macos-arm64-debug) - a ceiling the CLI never parses under.
+    if (auto const depth = schema->maxSpeculationDepth()) pcfg.maxSpeculationDepth = *depth;
+    if (auto const factor = schema->speculationBudgetFactor())
+        pcfg.speculationBudgetFactor = *factor;
     Parser p{srcBuf, schema, std::move(stream), DiagnosticBudget::libraryDefault(),
              std::move(pcfg), std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
@@ -175,10 +189,15 @@ struct ShippedSchemas {
     builder.addTree(std::move(result.tree));
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
 
-    SemanticModel model =
-        analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                LongDoubleFormat::None, target.get(), kAnalyzeReserveBytes);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                   std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                   LongDoubleFormat::None, target.get(), analyzeReserve);
+}
+
+[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
+    std::shared_ptr<GrammarSchema const> schema = shipped().schema;
+    std::shared_ptr<TargetSchema const>  target = shipped().target;
+    SemanticModel model = analyzeOn(std::move(src), exprDepthCap, kAnalyzeReserveBytes);
     if (model.hasErrors())
         throw std::runtime_error{"deep-nest fixture did not analyze cleanly"};
 
@@ -576,4 +595,276 @@ TEST(FrontendDeepNesting, HirTextDeepAggregateLiteralRoundTripsOnABoundedStack) 
            "silently different initializer";
     EXPECT_EQ(readLeaf, 7);
     EXPECT_EQ(again, text) << "the round trip must be byte-identical";
+}
+
+// ── a scalar's braced initializer read as a constant (`scalarInitializerValue`, src/hir/cst_const_eval.cpp) ──
+//
+// AXIS: a scalar's braced initializer, read as a constant. C 6.7.9p11 lets a scalar's
+// initializer stand in braces, so `static const int c = {{…{5}…}};` is read through one brace
+// level per step when the semantic tier folds `_Static_assert(c == 5, …)`. Since P69 L2a the
+// reader that knows it reads a scalar takes the levels, in one loop (`scalarInitializerValue`),
+// and the evaluator's driver never meets a brace list as a value. Its one value step left, a
+// statement expression's sole expression, is the same heap frame whether the driver enters it
+// or `evalNode`'s tail requests it (READ, 2026-10-22: the arm that claimed it here could not be
+// red and was retired as equivalent). ✔MEASURED 2026-10-16: gcc 13.3.0 builds this source at 8192 levels and
+// runs it (clang 18.1.3 refuses past its bracket depth). The lowering's own walk of the same
+// levels is the next case's (`ScalarBraceLevelsCostHeap`) — so this pin reads the
+// EVALUATOR'S tier, the analysis, and lowers nothing.
+// ★ ON AN ANALYZE WORKER OF THE BOUNDED STACK'S SIZE (`test::boundedStackBytes()`, 256 KiB), IN A
+// CHILD PROCESS: a recursion restored exhausts the worker and the child dies — this case's
+// red, with the child's status, never the binary's unattributable death.
+TEST(FrontendDeepNesting, ConstantValueStepsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    std::string src = "static const int c = ";
+    src.append(static_cast<std::size_t>(kDepth), '{');
+    src += "5";
+    src.append(static_cast<std::size_t>(kDepth), '}');
+    src += ";\nint main(void) {\n    _Static_assert(c == 5, \"the value through every brace level\");\n"
+           "    return 0;\n}\n";
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            SemanticModel const model =
+                analyzeOn(std::move(src), /*exprDepthCap=*/kDepth + 1024,
+                          test::boundedStackBytes());
+            for (auto const& d : model.diagnostics().all())
+                if (d.severity == DiagnosticSeverity::Error)
+                    std::fprintf(stderr, "error: %s\n", d.actual.c_str());
+            std::exit(model.hasErrors() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+// ── `lowerScalarBraceInit` (src/hir/lowering/cst_to_hir.cpp) — a scalar's brace LEVELS ──
+//
+// AXIS: the brace levels around ONE scalar's value. C 6.7.9p11 allows one pair; gcc and clang
+// build more with a warning per level and initialize the scalar from the innermost value
+// (P69, lane `lm`, the scalar brace closure — ✔MEASURED 2026-10-16: gcc 13.3.0 builds and runs
+// 8192 levels, clang 18.1.3 refuses past its bracket depth). The lowering refused a second
+// level; it now takes the levels one by one in a LOOP, and this pin holds it to that: 8192
+// levels lowered on the bounded stack (`test::runOnBoundedStack`, 256 KiB), with no error and
+// the innermost 42 in the unit's literal pool. A recursion per level restored exhausts the
+// stack — in a CHILD PROCESS, so that is this case's red, with the child's status, never the
+// binary's unattributable death. The semantic tier's walk of the same levels
+// (`forEachPlacedBraceValue`) runs in the analysis, on its own worker, before it.
+TEST(FrontendDeepNesting, ScalarBraceLevelsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    std::string src = "int main(void) {\n    int v = ";
+    src.append(static_cast<std::size_t>(kDepth), '{');
+    src += "42";
+    src.append(static_cast<std::size_t>(kDepth), '}');
+    src += ";\n    return v;\n}\n";
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            std::size_t hirErrors = 1;
+            bool        valueSeen = false;
+            test::runOnBoundedStack([&] {
+                auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 1024);
+                hirErrors = L.hirErrors;
+                for (std::size_t i = 0; i < L.hir->literalPool.size(); ++i) {
+                    auto const& lit = L.hir->literalPool.at(i);
+                    if (std::holds_alternative<std::int64_t>(lit.value)
+                        && std::get<std::int64_t>(lit.value) == 42)
+                        valueSeen = true;
+                }
+            });
+            if (hirErrors != 0 || !valueSeen)
+                std::fprintf(stderr, "lowering errors %zu, the innermost 42 %s\n", hirErrors,
+                             valueSeen ? "lowered" : "never lowered");
+            std::exit(hirErrors == 0 && valueSeen ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+// ── THE CONSTANT EVALUATOR'S ARMS AND A STATEMENT EXPRESSION'S VALUE (P69 L2, lane `lm`) ──
+// (D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL.)
+//
+// AXIS: the nesting of a constant conditional, a logical AND or OR, a chain of named constants,
+// a compile-time selection and a builtin call's operand — each folded by the CST evaluator
+// (`src/hir/cst_const_eval.cpp`) in the analysis AND in the lowering (a constant `if`
+// condition) — and of a GNU statement expression in value position, lowered by `lowerExpr`.
+// Each arm folded its children by RE-ENTERING its driver, a fresh driver and its host frames
+// per level: ✔MEASURED 2026-10-20 on macos-arm64-debug (AppleClang 21 Debug), the analysis on a
+// 256 KiB worker and the lowering on the bounded stack, every one of them DIED at 1000 levels
+// (the conditional, AND, OR, 1000 chained `static const` names, `__builtin_choose_expr`,
+// `_Generic`, `__builtin_expect`, the lowering's `if` over a conditional or an AND chain, and
+// `return ({ ({ … 5; }) … });`). Each is a frame of its driver now; these cases hold them there.
+// The selections, the builtin and the statement expression nest at 2000 (2x the measured death
+// floor): their PARSE is quadratic in the nesting (✔MEASURED the same run: `({` 445 ms at 1e3,
+// over 30 s at 1e4) — a finding of the parser's tier, recorded in the row.
+// ★ IN A CHILD PROCESS, the analysis on a worker of the bounded stack's size
+// (`test::boundedStackBytes()`, 256 KiB) and the lowering on `runOnBoundedStack`: a recursion
+// restored exhausts a stack and the child dies — this case's red, with the child's status.
+namespace {
+
+// Analyze and lower `src` on the bounded stacks: the child exits 0 when neither tier errs.
+void expectBothTiersOnBoundedStacks(std::string src, std::size_t exprDepthCap) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            SemanticModel model =
+                analyzeOn(std::move(src), exprDepthCap, test::boundedStackBytes());
+            for (auto const& d : model.diagnostics().all())
+                if (d.severity == DiagnosticSeverity::Error)
+                    std::fprintf(stderr, "analysis error: %s\n", d.actual.c_str());
+            if (model.hasErrors()) std::exit(1);
+            std::size_t hirErrors = 1;
+            test::runOnBoundedStack([&] {
+                DiagnosticReporter reporter;
+                auto hir = lowerToHir(model, reporter);
+                hirErrors = (hir == nullptr) ? 1 : reporter.errorCount();
+            });
+            if (hirErrors != 0) std::fprintf(stderr, "lowering errors %zu\n", hirErrors);
+            std::exit(hirErrors == 0 ? 0 : 2);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+[[nodiscard]] std::string repeated(std::string_view s, int n) {
+    std::string out;
+    out.reserve(s.size() * static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) out += s;
+    return out;
+}
+
+// A constant `cond` in an assertion at file scope, in an enumerator, in an array bound and as a
+// lowered `if` condition.
+[[nodiscard]] std::string everyConstantPosition(std::string const& cond) {
+    return "_Static_assert(" + cond + ", \"folded\");\n"
+           "enum { E = (" + cond + ") };\n"
+           "int a[(" + cond + ") ? 1 : -1];\n"
+           "int f(void) { if (" + cond + ") return 1; return 2; }\n"
+           "int main(void) { return f() + E + (int)sizeof a; }\n";
+}
+
+} // namespace
+
+TEST(FrontendDeepNesting, ConstantConditionalChainsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    // nested in the ELSE arm (the selected one) and in the THEN arm
+    expectBothTiersOnBoundedStacks(everyConstantPosition(repeated("0 ? 0 : ", kDepth) + "1"),
+                                   4 * kDepth + 1024);
+    expectBothTiersOnBoundedStacks(
+        everyConstantPosition(repeated("1 ? ", kDepth) + "1" + repeated(" : 0", kDepth)),
+        4 * kDepth + 1024);
+}
+
+TEST(FrontendDeepNesting, ConstantLogicalChainsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    expectBothTiersOnBoundedStacks(everyConstantPosition("1" + repeated(" && 1", kDepth)),
+                                   4 * kDepth + 1024);
+    expectBothTiersOnBoundedStacks(
+        everyConstantPosition("0" + repeated(" || 0", kDepth) + " || 1"), 4 * kDepth + 1024);
+}
+
+TEST(FrontendDeepNesting, ConstantNamedChainsCostHeap) {
+    constexpr int kDepth = 8192;
+    (void)shipped();
+    std::string src = "static const int a0 = 1;\n";
+    for (int i = 1; i <= kDepth; ++i)
+        src += "static const int a" + std::to_string(i) + " = a" + std::to_string(i - 1) + ";\n";
+    src += everyConstantPosition("a" + std::to_string(kDepth) + " == 1");
+    expectBothTiersOnBoundedStacks(std::move(src), 4096);
+}
+
+TEST(FrontendDeepNesting, ConstantSelectionsAndBuiltinOperandsCostHeap) {
+    constexpr int kDepth = 2000;
+    (void)shipped();
+    expectBothTiersOnBoundedStacks(
+        everyConstantPosition(repeated("__builtin_choose_expr(1, ", kDepth) + "1" +
+                              repeated(", 0)", kDepth)),
+        4 * kDepth + 1024);
+    expectBothTiersOnBoundedStacks(
+        everyConstantPosition(repeated("_Generic(0, int: ", kDepth) + "1" +
+                              repeated(")", kDepth)),
+        4 * kDepth + 1024);
+    expectBothTiersOnBoundedStacks(
+        everyConstantPosition(repeated("__builtin_expect(", kDepth) + "1" +
+                              repeated(", 1)", kDepth)),
+        4 * kDepth + 1024);
+}
+
+TEST(FrontendDeepNesting, StatementExpressionValuesCostHeap) {
+    constexpr int kDepth = 2000;
+    (void)shipped();
+    std::string const value = repeated("({ ", kDepth) + "5" + repeated("; })", kDepth);
+    expectBothTiersOnBoundedStacks(
+        "int f(void) { int v = " + value + "; return v; }\n"
+        "int g(void) { if (" + value + " == 5) return 1; return 2; }\n"
+        "int main(void) { return f() + g(); }\n",
+        4 * kDepth + 1024);
+}
+
+// A name inside grouping parentheses, an object's and a function's: the declarator's fold takes one
+// loop pass per group level. ✔MEASURED 2026-10-20 (macos-arm64-debug, 256 KiB): while the fold
+// called itself once per level the analysis died between 100 and 200 levels; the parser takes 3000.
+TEST(FrontendDeepNesting, GroupedDeclaratorsCostHeap) {
+    constexpr int kDepth = 2000;
+    (void)shipped();
+    expectBothTiersOnBoundedStacks("int " + repeated("(", kDepth) + "x" + repeated(")", kDepth) +
+                                       ";\nint main(void) { x = 1; return x - 1; }\n",
+                                   4 * kDepth + 1024);
+    expectBothTiersOnBoundedStacks("int " + repeated("(", kDepth) + "f" + repeated(")", kDepth) +
+                                       "(void) { return 0; }\nint main(void) { return f(); }\n",
+                                   4 * kDepth + 1024);
+}
+
+// Nested `typeof` layers in a declaration's head: the analyzer peels the layers that are nothing
+// but `typeof(typeof(…))` in one loop and resolves the innermost operand once, so the nest costs
+// heap, not a host frame per layer. ✔MEASURED 2026-10-20 (macos-arm64-debug, AppleClang 21
+// Debug): while each layer re-entered the type resolver, `typeof(typeof(typeof(int)))` — THREE
+// layers — killed the analysis on the 256 KiB worker (~85 KiB per layer's frame; 64 MiB took it).
+// Four innermost operands: a type, an expression, a VARIABLE-LENGTH array type (its bound kept at
+// run time and lowered once, at the declaration) and a qualified type; at 3, 100 and 2000 layers.
+TEST(FrontendDeepNesting, NestedTypeofTypeNamesCostHeap) {
+    (void)shipped();
+    for (int const depth : {3, 100, 2000}) {
+        std::string const open = repeated("typeof(", depth);
+        std::string const close = repeated(")", depth);
+        std::size_t const cap = 4 * static_cast<std::size_t>(depth) + 1024;
+        expectBothTiersOnBoundedStacks(open + "int" + close +
+                                           " x = 5;\nint main(void) { return x - 5; }\n",
+                                       cap);
+        expectBothTiersOnBoundedStacks("int y = 5;\n" + open + "y" + close +
+                                           " x = 5;\nint main(void) { return x - y; }\n",
+                                       cap);
+        expectBothTiersOnBoundedStacks("int f(int n) { int k = 0; " + open + "int[n + k++]" + close +
+                                           " a; return (int)(sizeof a / sizeof a[0]) + k; }\n"
+                                           "int main(void) { return f(3) - 4; }\n",
+                                       cap);
+        expectBothTiersOnBoundedStacks(open + "const int" + close +
+                                           " x = 5;\nint main(void) { return x - 5; }\n",
+                                       cap);
+    }
+}
+
+// ── A `sizeof` NESTED IN WHAT C EVALUATES IN ANOTHER (P69 L2a, lane `lm`) ──
+// (D-C-SIZEOF-OF-A-VLA-TYPED-OPERAND-SKIPS-THE-OPERANDS-SIDE-EFFECTS.)
+// AXIS: a `sizeof` in the bound of a variable-length array type name another `sizeof` multiplies
+// (`sizeof(int[sizeof(int[…])])`), and in the index of a row of a variable-length array another
+// `sizeof` evaluates (`sizeof v[sizeof v[…]]`). The lowering runs both as frames of its driver
+// (`ExprFrame::Kind::VlaTypeNameSize`, `SizeofOperand`, one `Collect` frame per expression); the
+// type name's bounds were lowered by RE-ENTERING the driver, a fresh driver and its host frames per
+// level. At 100 and 1000 levels (the type-name chain's outermost speculative probe reads about six
+// tokens a level, inside the shipped budget), on the bounded stacks.
+TEST(FrontendDeepNesting, VariableLengthSizeofChainsCostHeap) {
+    (void)shipped();
+    for (int const depth : {100, 1000}) {
+        std::size_t const cap = 4 * static_cast<std::size_t>(depth) + 1024;
+        expectBothTiersOnBoundedStacks("int f(int n) { return (int)" +
+                                           repeated("sizeof(int[", depth) + "n" +
+                                           repeated("])", depth) +
+                                           "; }\nint main(void) { return f(1) == 0; }\n",
+                                       cap);
+        expectBothTiersOnBoundedStacks("int f(int n) { int v[n][n]; return (int)" +
+                                           repeated("sizeof v[", depth) + "0" +
+                                           repeated("]", depth) +
+                                           "; }\nint main(void) { return f(1) == 0; }\n",
+                                       cap);
+    }
 }

@@ -10,9 +10,11 @@
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/wide_float_value.hpp"  // kCanonicalQuietNanBits — the NaN the text spells `nan`
 #include "mir/mir.hpp"
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_symbols_named.hpp"   // forEachSymbolIdNamed: which ids a module names
 #include "mir/mir_verifier.hpp"
 
 #include <algorithm>   // std::max — the emitters' explicit work stacks
@@ -100,6 +102,18 @@ inline constexpr std::string_view kMirTextRunAfterEntryAttr  = "initafter";
 inline constexpr std::string_view kMirTextConstAttr       = "const";
 inline constexpr std::string_view kMirTextThreadLocalAttr = "threadlocal";
 inline constexpr std::string_view kMirTextAlignAttr       = "align";
+// P69 (lane `xa`), format v6: a global that is a TENTATIVE definition its unit
+// never completed (C 6.9.2p2; `MirLinkage::tentative`). One spelling, shared by
+// the printer and the reader like its neighbours. A GLOBAL's word only: a
+// function has no tentative definition, and the function list does not know it.
+//
+// ⓘ THE WEAK DEFINITION'S KIND HAS NO KEYWORD HERE, deliberately: it is the
+// ARGUMENT of the binding word — `weak(overridable)`, `weak(select-any)` — and
+// both halves come from the shared tables (`symbolBindingName`,
+// `weakDefinitionKindName`, core/types/symbol_attrs.hpp), so this format has no
+// second spelling of either that could drift from the one every other tier and
+// the object-format documents use.
+inline constexpr std::string_view kMirTextTentativeAttr   = "tentative";
 // ⚠⚠ THE FIFTH HAND-WRITTEN COPY OF THE ALIGNMENT CAP, AND IT SPELLED 256.
 // [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]] removed the
 // other four in P63, where the count went 1 → 3 → 4 → 5 as successive readers
@@ -139,9 +153,14 @@ inline constexpr std::uint32_t kMirTextMaxGlobalAlignBytes = Alignment::kMaxByte
 //
 // ⓘ The member defaults ARE the format's \"attribute list absent\" meaning,
 // so a global with no `[...]` needs no special case anywhere.
+//
+// ★ P69 (lane `xa`): the binding and the visibility are two members of the ONE
+// linkage record (`MirLinkage`, mir/mir_node.hpp), which also carries the weak
+// definition's kind and the tentative mark — so "five fields" above reads as
+// "the linkage record and three fields" today, and the four paths hand the
+// builder the record whole.
 struct MirTextGlobalAttrs {
-    SymbolBinding    binding        = SymbolBinding::Global;
-    SymbolVisibility visibility     = SymbolVisibility::Default;
+    MirLinkage       linkage{};
     bool             isConst        = false;
     MirThreadStorage threadStorage  = MirThreadStorage::Shared;
     std::uint32_t    alignmentBytes = 0;
@@ -155,7 +174,33 @@ namespace {
 // table, each DEFINED ONCE with every layout channel; v1 spelled each one inline at every use.
 // v3 (P68 round 12, lane `cs`): an enumeration's FIXED underlying type is spelled, `enum "E" fixed
 // i64` — `enum E : long` and `enum E` are different types (C23 6.2.7p1), and v2 wrote both `: i64`.
-constexpr int kVersion = 3;
+// v4 (P69, lane `cs`): a DELIBERATE trap is spelled `unreachable trap` (`__builtin_trap`, a wide
+// division by zero) — a v3 reader that skipped `trap` would rebuild an assumed-unreachable point,
+// which the optimizer may delete; a NaN other than the canonical quiet one is spelled `float nanbits
+// <u64>` (`__builtin_nan("1")`), which `nan` read back as a DIFFERENT value; and the
+// `frame_address` / `return_address` opcodes joined the set. A v3 reader has no rule for any of them.
+// v5 (P69, lane `cs`, D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED): a UNION
+// aggregate literal names the member its one field initializes, `lit agg member N {…} : union` — a
+// union initializer may designate any member (C 6.7.9p17) and the field's type cannot say which. A v4
+// text carried no member, so a union value read back from it would be encoded against a guess. And
+// v4's `frame_address` / `return_address` opcodes are GONE again: the two builtins were withdrawn (P69
+// review M4 — their meaning needs frame records DSS does not keep yet), so a v5 reader has no rule
+// for either.
+// v6 (P69, lane `xa`): a WEAK definition states its KIND as the argument of its binding word,
+// `weak(overridable)` / `weak(select-any)`, and a global its TENTATIVE mark, `tentative` — the two
+// facts of the linkage record (`MirLinkage`) that v5 could not spell. A v5 text wrote a weak
+// definition as the bare word, which is no module a v6 builder makes (a weak definition of no stated
+// kind is refused: the object formats spell the two kinds differently), so a v6 reader refuses the
+// bare word by name and a v5 reader has no rule for the argument.
+// v7 (P69, lane `cs`, the review of the alias fold): a module states its ALIASES, `alias %A [linkage]
+// = %T`. The item first appeared inside v6, where a reader built before it refuses it by name — two
+// grammars under one number. The step makes the header say which: a v6 text is refused here, and a v6
+// reader refuses a v7 text before reading an item.
+constexpr int kVersion = 7;
+
+// The canonical quiet NaN is core's `kCanonicalQuietNanBits` (core/types/wide_float_value.hpp,
+// P69 review n13): the ONE NaN the text spells `nan`, every other NaN being `float nanbits
+// <u64>`. The writer asks it, and the reader produces EXACTLY it for `nan`.
 
 [[nodiscard]] std::string quote(std::string_view s) {
     std::string out;
@@ -448,6 +493,37 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextInstFlagTable));
     return detail::renderAllowedList(names);
 }
 
+// The spellings of a BINDING an attribute list can state (P69 fold 3), projected
+// off the two tables the reader looks them up in: every binding by its name,
+// and the weak one ONCE PER KIND of weak definition, the kind as its argument —
+// `weak(overridable)`, `weak(select-any)` — because that is the only form of it
+// the reader takes (version 6: a bare `weak` states no kind and is refused).
+//
+// ★ ONE SET OF SPELLINGS, EACH OF WHICH THE READER ACCEPTS. The refusals of an
+// unknown attribute first advertised the binding NAMES and, beside them, the
+// kind names ("'weak' takes its kind, 'overridable' | 'select-any'"): three
+// quoted words of which the reader takes none as written — a bare `weak` is
+// refused, and `overridable` is no attribute at all. ✔MEASURED 2026-10-12 on
+// three legs: `TextTierVocabulary.MirFunctionAttributeRefusalProjectsBindingAndVisibility`,
+// which feeds every spelling a refusal advertises back to the reader, said
+// "the refusal advertises attribute 'overridable' and the reader then calls it
+// UNKNOWN". A reader of the message who wrote what it listed got a second
+// refusal.
+[[nodiscard]] std::string bindingSpellings() {
+    std::vector<std::string> spellings;
+    for (auto const& [binding, name] : kSymbolBindingTable.rows) {
+        if (binding != SymbolBinding::Weak) {
+            spellings.emplace_back(name);
+            continue;
+        }
+        for (auto const& [kind, kindName] : kWeakDefinitionKindTable.rows) {
+            (void)kind;
+            spellings.push_back(std::format("{}({})", name, kindName));
+        }
+    }
+    return detail::renderAllowedList(spellings, " | ");
+}
+
 // CallConv name mapping previously hand-rolled here (and in
 // hir_text.cpp) — duplication caught in the 2026-06-02 cross-
 // codebase audit. Call sites now use `callConvName(cc)` /
@@ -482,6 +558,9 @@ public:
         for (std::uint32_t i = 0; i < mir_.moduleFuncCount(); ++i) {
             emitFunction(mir_.funcAt(i));
         }
+        // P69 (lane `cs`): the aliases LAST, after every definition they can name,
+        // so a reader of one pass meets each target before the second name on it.
+        for (MirAlias const& a : mir_.aliases()) emitAlias(a);
         out_ += "}\n";
         std::string body = takeOut();
         emitTypes();
@@ -601,60 +680,19 @@ private:
         if (symSet_.emplace(v, true).second) symOrder_.push_back(v);
     }
 
-    // ★★ EVERY SYMBOL A RENDERED LITERAL NAMES, CLOSED OVER THE WHOLE VARIANT (P68
-    // round 8, lane `ht`, part 1c-b). `symaddr %N` is how a global initializer
-    // spells `&x`, and the `symbols` preamble never listed N unless x was also one
-    // of the module's functions or globals — an EXTERN named only by an initializer
-    // lost its name in the text. Of `MirLiteralValue`'s arms only
-    // `MirSymbolAddrValue` names a symbol and `MirAggregateValue` names one exactly
-    // when a field does; the `static_assert` stops the build until a new arm says
-    // which it is. An explicit work stack, not host recursion.
-    void noteLiteralSymbols(MirLiteralValue const& root) {
-        std::vector<MirLiteralValue const*> work{&root};
-        while (!work.empty()) {
-            MirLiteralValue const* const v = work.back();
-            work.pop_back();
-            std::visit([&](auto const& arm) {
-                using T = std::decay_t<decltype(arm)>;
-                if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
-                    noteSymbol(arm.symbol);
-                } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
-                    for (std::size_t i = arm.fields.size(); i-- > 0;) work.push_back(&arm.fields[i]);
-                } else {
-                    static_assert(std::is_same_v<T, std::monostate> || std::is_same_v<T, bool>
-                                      || std::is_same_v<T, std::int64_t>
-                                      || std::is_same_v<T, std::uint64_t>
-                                      || std::is_same_v<T, double> || std::is_same_v<T, std::string>
-                                      || std::is_same_v<T, BitIntValue>
-                                      || std::is_same_v<T, WideFloatValue>,
-                                  "a new MirLiteralValue arm must say whether it names a symbol: "
-                                  "note it through noteSymbol above, or add it to this list of "
-                                  "the arms that name none");
-                }
-            }, v->value);
-        }
-    }
-
+    // ★★ EVERY SYMBOL ID THE MODULE NAMES IS DECLARED — and WHICH ids those are is
+    // stated once, beside the module (`forEachSymbolIdNamed`,
+    // mir/mir_symbols_named.hpp), where the reader's refusal and the verifier's rule
+    // read the same list. This function used to carry its own, and its own was
+    // short twice: P68 round 8 (lane `ht`, part 1c-b) found a `symaddr %N` named
+    // only by an initializer missing from the preamble — an EXTERN lost its name in
+    // the text — and P69 found a `blockaddress_export`'s symbol missing still, a
+    // raw payload the reader then stated an end BELOW. The walk over a literal
+    // (closed over the whole variant, on an explicit work stack) lives with that
+    // list; the ORDER — functions, each global with its initializer, instructions
+    // by id — is this writer's, and the preamble's lines depend on it.
     void collectSymbols() {
-        for (std::uint32_t i = 0; i < mir_.moduleFuncCount(); ++i) {
-            noteSymbol(mir_.funcSymbol(mir_.funcAt(i)).v);
-        }
-        for (std::uint32_t i = 0; i < mir_.moduleGlobalCount(); ++i) {
-            MirGlobalId const g = mir_.globalAt(i);
-            noteSymbol(mir_.globalSymbol(g).v);
-            // The initializer the writer renders (`emitGlobal`), in the same order.
-            if (std::uint32_t const litIdx = mir_.globalInitLiteralIndex(g); litIdx != UINT32_MAX) {
-                noteLiteralSymbols(mir_.literalValue(litIdx));
-            }
-        }
-        for (std::uint32_t i = 1; i < mir_.instCount(); ++i) {
-            MirInstId const id{i, mir_.id().v};
-            if (mir_.instOpcode(id) == MirOpcode::GlobalAddr) {
-                noteSymbol(mir_.globalAddrSymbol(id).v);
-            } else if (mir_.instOpcode(id) == MirOpcode::Const) {
-                noteLiteralSymbols(mir_.literalValue(mir_.constLiteralIndex(id)));
-            }
-        }
+        forEachSymbolIdNamed(mir_, [&](SymbolId s, MirSymbolMention, MirInstId) { noteSymbol(s.v); });
     }
 
     void emitSymbolsPreamble() {
@@ -1006,7 +1044,14 @@ private:
             } else if constexpr (std::is_same_v<T, std::uint64_t>) {
                 out_ += std::format("uint {}", v);
             } else if constexpr (std::is_same_v<T, double>) {
-                out_ += std::format("float {}", v);
+                // P69 (lane `cs`): a NaN that is not the canonical quiet one (a payload, a
+                // sign) by its bit pattern — `nan` would read back as a different value.
+                std::uint64_t nanBits = 0;
+                if (std::isnan(v)) std::memcpy(&nanBits, &v, sizeof nanBits);
+                if (std::isnan(v) && nanBits != kCanonicalQuietNanBits)
+                    out_ += std::format("float nanbits {}", nanBits);
+                else
+                    out_ += std::format("float {}", v);
             } else if constexpr (std::is_same_v<T, std::string>) {
                 out_ += "str "; out_ += quote(v);
             } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
@@ -1014,7 +1059,12 @@ private:
                 // cannot name `stack` and the task type at once without pulling
                 // the whole ladder into the template); record the aggregate and
                 // let the caller schedule it.
-                out_ += "agg {";
+                // v5: a union value names the member its one field initializes,
+                // `agg member N {…}` — the field's type cannot say which.
+                out_ += "agg ";
+                if (v.unionMember.has_value())
+                    out_ += std::format("member {} ", *v.unionMember);
+                out_ += "{";
                 agg = &v;
             } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
                 // F5: link-time symbol-address literal (`&sym [+ addend]`).
@@ -1124,21 +1174,49 @@ private:
     // ⚠ PRINTED ONLY WHEN SOMETHING IS NON-DEFAULT, the same `blockMarker !=
     // Linear` discipline `appendFuncAttrs` follows — so every existing golden
     // `.dssir` text for an ordinary global is byte-unchanged by this.
+    // ── THE WORDS OF A LINKAGE RECORD, ONE PRINTER FOR BOTH LISTS (format v6) ──
+    //
+    // P69 (lane `xa`). A function's list and a global's list each printed the
+    // binding and the visibility for themselves; the record (`MirLinkage`) has
+    // four facts and both lists print them here, so the kind and the mark are
+    // not a third and a fourth thing each list remembers.
+    //   * the BINDING, unless it is the default — and a WEAK one with its kind
+    //     as the word's argument: `weak(overridable)`, `weak(select-any)`. Both
+    //     halves are projected off the shared tables. A weak binding with no
+    //     kind cannot be in a module (the builder refuses it), so the bare word
+    //     is never printed.
+    //   * the VISIBILITY, unless it is the default;
+    //   * `tentative` — a global's mark; a function's record never carries it.
+    void appendLinkageWords(MirLinkage const& linkage, bool& first) {
+        auto const sep = [&] { if (!first) out_ += ", "; first = false; };
+        if (linkage.binding != SymbolBinding::Global) {
+            sep();
+            out_ += symbolBindingName(linkage.binding);
+            if (auto const kind = linkage.statedWeakKind(); kind.has_value()) {
+                out_ += '(';
+                out_ += weakDefinitionKindName(*kind);
+                out_ += ')';
+            }
+        }
+        if (linkage.visibility != SymbolVisibility::Default) {
+            sep();
+            out_ += symbolVisibilityName(linkage.visibility);
+        }
+        if (linkage.tentative) { sep(); out_ += kMirTextTentativeAttr; }
+    }
+
     void appendGlobalAttrs(MirGlobalId g) {
-        SymbolBinding    const b  = mir_.globalBinding(g);
-        SymbolVisibility const v  = mir_.globalVisibility(g);
+        MirLinkage       const lk = mir_.globalLinkage(g);
         bool             const c  = mir_.globalIsConst(g);
         bool             const tl = mir_.globalIsThreadLocal(g);
         std::uint32_t    const al = mir_.globalAlignmentBytes(g);
-        if (b == SymbolBinding::Global && v == SymbolVisibility::Default
-            && !c && !tl && al == 0) {
+        if (lk == MirLinkage{} && !c && !tl && al == 0) {
             return;
         }
         out_ += " [";
         bool first = true;
         auto const sep = [&] { if (!first) out_ += ", "; first = false; };
-        if (b != SymbolBinding::Global)     { sep(); out_ += symbolBindingName(b); }
-        if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
+        appendLinkageWords(lk, first);
         if (c)                              { sep(); out_ += kMirTextConstAttr; }
         if (tl)                             { sep(); out_ += kMirTextThreadLocalAttr; }
         if (al != 0) {
@@ -1146,6 +1224,21 @@ private:
             out_ += std::format("{}={}", kMirTextAlignAttr, al);
         }
         out_ += "]";
+    }
+
+    // P69 (lane `cs`): `alias %A [<linkage words>] = %T` — a second name of the
+    // definition `%T` (`MirAlias`). The list holds the alias's own linkage record
+    // in the one printer's words and is left out when the record is the default,
+    // as a global's is; an alias is never tentative, so the mark is never printed.
+    void emitAlias(MirAlias const& a) {
+        out_ += std::format("  alias %{}", a.alias.v);
+        if (!(a.linkage == MirLinkage{})) {
+            out_ += " [";
+            bool first = true;
+            appendLinkageWords(a.linkage, first);
+            out_ += "]";
+        }
+        out_ += std::format(" = %{}\n", a.target.v);
     }
 
     void emitGlobal(MirGlobalId g) {
@@ -1182,22 +1275,19 @@ private:
     // Names come from the SHARED `symbolBindingName` / `symbolVisibilityName`
     // tables — not a second spelling table that could drift from them.
     void appendFuncAttrs(MirFuncId f) {
-        SymbolBinding    const b  = mir_.funcBinding(f);
-        SymbolVisibility const v  = mir_.funcVisibility(f);
+        MirLinkage       const lk = mir_.funcLinkage(f);
         bool             const ni = mir_.funcNoInline(f);
         bool             const ai = mir_.funcAlwaysInline(f);   // TF-C81
         bool             const no = mir_.funcNoOptimize(f);     // TF-C85
         bool             const ns = mir_.funcNoSanitizeThread(f);   // TF-C92
         StaticInitSchedule const si = mir_.funcStaticInit(f);
-        if (b == SymbolBinding::Global && v == SymbolVisibility::Default && !ni
-            && !ai && !no && !ns && !si.any()) {
+        if (lk == MirLinkage{} && !ni && !ai && !no && !ns && !si.any()) {
             return;
         }
         out_ += " [";
         bool first = true;
         auto const sep = [&] { if (!first) out_ += ", "; first = false; };
-        if (b != SymbolBinding::Global)     { sep(); out_ += symbolBindingName(b); }
-        if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
+        appendLinkageWords(lk, first);   // binding (a weak one with its kind), visibility
         if (ni)                             { sep(); out_ += kMirTextNoInlineAttr; }
         if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
         if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
@@ -1396,6 +1486,11 @@ private:
                 break;
             }
             case MirOpcode::Unreachable:
+                // P69 (lane `cs`): a DELIBERATE trap says so (`MirUnreachableKind`); the
+                // assumed kind keeps the bare mnemonic, byte-identical to before.
+                if (mir_.instPayload(id)
+                    == static_cast<std::uint32_t>(MirUnreachableKind::Trap))
+                    out_ += " trap";
                 break;
             case MirOpcode::SehTryBegin: {
                 // c115 SEH: `seh_try_begin <region> %b<try> %b<filter>`.
@@ -1806,9 +1901,9 @@ public:
         }
         if (!expectIdent("module")) return makeEmptyResult();
         if (!expect(TokKind::LBrace)) return makeEmptyResult();
-        // Body: zero or more `global` / `function` items. Panic-mode
+        // Body: zero or more `global` / `function` / `alias` items. Panic-mode
         // recovery: on an unexpected token, emit ONE diagnostic and
-        // skip until the next `global`/`function` keyword or the
+        // skip until the next item keyword or the
         // closing `}` — avoids per-token cascade after a parse
         // failure inside `parseFunction` / `parseGlobal` returned
         // mid-production.
@@ -1821,15 +1916,20 @@ public:
             } else if (t.kind == TokKind::Ident && t.text == "function") {
                 lex_.take();
                 parseFunction();
+            } else if (t.kind == TokKind::Ident && t.text == "alias") {
+                lex_.take();
+                parseAlias();
             } else {
-                emitMalformed(std::format("expected 'global' or 'function', got '{}'", t.text));
+                emitMalformed(std::format("expected 'global', 'function' or 'alias', got '{}'",
+                                          t.text));
                 // Skip tokens until we find a recovery anchor.
                 while (true) {
                     Tok pk = lex_.peek();
                     if (pk.kind == TokKind::End) break;
                     if (pk.kind == TokKind::RBrace) break;
                     if (pk.kind == TokKind::Ident
-                     && (pk.text == "global" || pk.text == "function")) break;
+                     && (pk.text == "global" || pk.text == "function"
+                         || pk.text == "alias")) break;
                     lex_.take();
                 }
             }
@@ -1850,6 +1950,7 @@ private:
     std::unordered_map<std::uint32_t, MirBlockId> blockMap_;  // text slot v → builder block id
     std::unordered_map<std::uint32_t, MirInstId>  valueMap_;  // text slot v → builder inst id
     std::unordered_map<std::uint32_t, MirFuncId>  funcMap_;   // text slot v → builder func id
+    std::unordered_set<std::uint32_t>             aliasesRead_;   // P69 (lane `cs`): `parseAlias`
     // The `types` table: handle → the composite's TypeId (forward-minted by the
     // section's first pass, completed by its second), and the handles defined.
     std::unordered_map<std::uint64_t, TypeId>     typeHandles_;
@@ -2294,6 +2395,10 @@ private:
             if (!symbolNames_.emplace(v, name.text).second) {
                 emitMalformed(std::format("symbol slot %{} is declared twice", v));
             }
+            // A declared slot is an id of the module's space whether or not a
+            // function or a global of the module is given it: the text's table
+            // is the name table this module is made from (stated in `finalize`).
+            builder_.keepSymbolIdsClearOf(SymbolId{v});
         }
         (void)expect(TokKind::RBrace);
     }
@@ -2775,8 +2880,29 @@ private:
             // The `: <core>` tail belongs to the aggregate literal itself and
             // runs AFTER its closing brace, exactly as the recursive form did.
             parseLiteralCoreTail(lv);
+            checkUnionMember(lv);
             done       = std::move(lv);
             haveResult = true;
+        }
+    }
+
+    // v5: `member N` is a UNION value's, and a union value with a field names its member
+    // (D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED). Both are refused
+    // here, at the text, rather than left for the static-data encoder: the writer never spells
+    // either, and a union value whose member is unknown has no encoding at all. Whether N is a
+    // member the union HAS is the encoder's to answer — it walks the value against its type.
+    void checkUnionMember(MirLiteralValue const& lv) {
+        auto const* a = std::get_if<MirAggregateValue>(&lv.value);
+        if (a == nullptr) return;
+        if (a->unionMember.has_value() && lv.core != TypeKind::Union) {
+            emitMalformed(std::format(
+                "`lit agg member {}` names a union member, but the literal's core is '{}' — "
+                "only a union value names its member", *a->unionMember,
+                literalCoreName(lv.core)));
+        } else if (lv.core == TypeKind::Union && !a->fields.empty()
+                   && !a->unionMember.has_value()) {
+            emitMalformed("a union aggregate literal with a field must name the member it "
+                          "initializes — `lit agg member N {…} : union`");
         }
     }
 
@@ -2817,15 +2943,49 @@ private:
             lv.value = parseNumber<std::uint64_t>(v.text, "uint literal");
         } else if (tag.text == "float") {
             Tok v = lex_.take();
-            lv.value = parseDouble(v.text);
+            if (v.kind == TokKind::Ident && v.text == "nanbits") {
+                // P69 (lane `cs`): the writer's spelling of a non-canonical NaN.
+                Tok const b = lex_.take();
+                std::uint64_t const bits = parseNumber<std::uint64_t>(b.text, "nanbits pattern");
+                double d = 0.0;
+                std::memcpy(&d, &bits, sizeof d);
+                if (!std::isnan(d)) emitMalformed("a 'nanbits' pattern that is not a NaN");
+                lv.value = d;
+            } else if (v.kind == TokKind::Ident && v.text == "nan") {
+                // The writer's spelling of the canonical quiet NaN, read as EXACTLY that pattern,
+                // never through the platform's `strtod` (see kCanonicalQuietNanBits).
+                double d = 0.0;
+                std::memcpy(&d, &kCanonicalQuietNanBits, sizeof d);
+                lv.value = d;
+            } else {
+                lv.value = parseDouble(v.text);
+            }
         } else if (tag.text == "str") {
             Tok v = lex_.take();
             lv.value = v.text;
         } else if (tag.text == "agg") {
+            // v5 (P69, lane `cs`): `agg member N {…}` — the member a UNION value's one
+            // field initializes (D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED).
+            // That it is a union, and only a union, is checked once the `: <core>` tail
+            // has been read (`parseLiteral`).
+            std::optional<std::uint32_t> member;
+            if (peekIdent("member")) {
+                lex_.take();
+                Tok const n = lex_.take();
+                if (n.kind != TokKind::Integer) {
+                    emitMalformed(std::format(
+                        "expected a member index after `lit agg member`, got '{}'", n.text));
+                } else {
+                    std::size_t const before = refusals_;
+                    std::uint32_t const idx = parseNumber<std::uint32_t>(n.text, "union member index");
+                    if (refusals_ == before) member = idx;
+                }
+            }
             // ⚠ Same token appetite as the recursive form: a missing `{` returns
             // the default literal and does NOT consume the `: <core>` tail.
             if (!expect(TokKind::LBrace)) { out = std::move(lv); return true; }
             stack.push_back(LiteralParseFrame{});
+            stack.back().agg.unionMember = member;
             return false;   // a (possibly empty) field list comes next
         } else if (tag.text == "bitint") {
             // C4b: the inverse of `appendLiteral`'s `bitint` arm, and the SAME
@@ -2885,16 +3045,15 @@ private:
             // `&x`. ⚠ THIS ARM DID NOT EXIST (P68 round 8, lane `ht`, part 1c-b): the
             // reader refused its own writer's output for every `&global` initializer
             // as "unknown literal tag 'symaddr'". N is a raw SymbolId, as everywhere
-            // in this format, and must be one the `symbols` preamble declares — the
-            // writer's `collectSymbols` now declares every one a literal names.
+            // in this format, and must be one the text declares or defines — which
+            // is not this arm's to judge any more: it refused an id the preamble did
+            // not declare while `globaladdr` and `blockaddress_export` let the same
+            // id through, so the ONE rule for every construct that names a symbol is
+            // held where the whole module is known (`finalize`).
             std::size_t const before = refusals_;
             std::uint32_t const sym = parsePercentValue();
             if (refusals_ == before && sym == 0) {
                 emitMalformed("symaddr names symbol %0, the invalid-symbol sentinel");
-            } else if (refusals_ == before && !symbolNames_.contains(sym)) {
-                emitMalformed(std::format(
-                    "symaddr names symbol %{}, which the `symbols` preamble does not "
-                    "declare", sym));
             }
             std::int64_t addend = 0;
             if (Tok const plus = lex_.peek();
@@ -3172,9 +3331,132 @@ private:
             "entry takes none, so no module this format writes has them", mnemonic));
     }
 
-    void parseGlobalAttrs(MirTextGlobalAttrs& attrs) {
-        if (lex_.peek().kind != TokKind::LBracket) return;
+    // ── THE LINKAGE WORDS OF AN ATTRIBUTE LIST, ONE READER FOR BOTH LISTS (v6) ──
+    //
+    // P69 (lane `xa`). The twin of `Emitter::appendLinkageWords`: a function's
+    // list and a global's list hand each word here before trying their own, so
+    // the binding, its weak kind and the visibility are read by ONE arm.
+    //
+    // ★ WHAT IS REFUSED HERE, EACH BY NAME, and why here rather than at the
+    // builder: `MirBuilder` ABORTS on a linkage record its rule refuses
+    // (`mirLinkageDefect`), and a refusal that crashes is not a refusal. So a
+    // text that spells such a record is stopped at the word:
+    //   * a SECOND binding word in one list — the later one used to replace
+    //     the earlier in silence, which would now also drop a kind already read;
+    //   * a SECOND visibility word in one list (`[hidden, protected]`), for the
+    //     same reason: the later one replaced the earlier in silence (P69 fold
+    //     3b, the review of fold 3a, F9);
+    //   * an argument on a binding that is not `weak` (`global(select-any)`): a
+    //     kind is the argument of `weak` only;
+    //   * an argument that is no kind the shared table names;
+    //   * an argument list not closed on its line.
+    // A bare `weak` — a weak definition that states no kind — is READ, and then
+    // refused by the record's own rule where the list ends
+    // (`refuseAnIllFormedLinkage`), with the rule's own sentence: the reader
+    // does not restate what a well-formed record is.
+    enum class LinkageWord { NotOne, Read, Refused };
+    struct LinkageWordsRead {
+        MirLinkage linkage{};
+        bool       sawBinding    = false;
+        bool       sawVisibility = false;
+    };
+
+    [[nodiscard]] LinkageWord readLinkageWord(Tok const& word, LinkageWordsRead& into,
+                                              std::string_view listOf) {
+        if (auto const v = symbolVisibilityFromName(word.text); v.has_value()) {
+            if (into.sawVisibility) {
+                emitMalformed(std::format(
+                    "a {} attribute list states its visibility twice — '{}' after '{}'; a "
+                    "definition has one visibility",
+                    listOf, word.text, symbolVisibilityName(into.linkage.visibility)));
+                return LinkageWord::Refused;
+            }
+            into.sawVisibility      = true;
+            into.linkage.visibility = *v;
+            return LinkageWord::Read;
+        }
+        auto const binding = symbolBindingFromName(word.text);
+        if (!binding.has_value()) return LinkageWord::NotOne;
+        if (into.sawBinding) {
+            emitMalformed(std::format(
+                "a {} attribute list states its binding twice — '{}' after '{}'; a "
+                "definition has one binding",
+                listOf, word.text, symbolBindingName(into.linkage.binding)));
+            return LinkageWord::Refused;
+        }
+        into.sawBinding       = true;
+        into.linkage.binding  = *binding;
+        into.linkage.weakKind = WeakDefinitionKind{};
+        if (lex_.peek().kind != TokKind::LParen) return LinkageWord::Read;
+        // The argument is the kind's name AS THE SHARED TABLE SPELLS IT, read as
+        // the source text between the parentheses rather than as a token: the
+        // table's `select-any` is not one token of this lexer (a word, then a
+        // `-` that starts what the lexer takes for a `-inf`-style number).
+        Tok const open = lex_.take();
+        Tok       close{};
+        while (true) {
+            close = lex_.take();
+            if (close.kind == TokKind::RParen) break;
+            bool const sameLine =
+                close.kind != TokKind::End
+                && lex_.text().substr(open.off, close.off - open.off).find('\n')
+                       == std::string_view::npos;
+            if (!sameLine || close.kind == TokKind::RBracket
+                || close.kind == TokKind::LBrace) {
+                emitMalformed(std::format(
+                    "'{}' in a {} attribute list opens an argument that is not "
+                    "closed with ')' on its line",
+                    word.text, listOf));
+                return LinkageWord::Refused;
+            }
+        }
+        std::string_view kindText =
+            lex_.text().substr(open.off + 1, close.off - open.off - 1);
+        while (!kindText.empty() && (kindText.front() == ' ' || kindText.front() == '\t'))
+            kindText.remove_prefix(1);
+        while (!kindText.empty() && (kindText.back() == ' ' || kindText.back() == '\t'))
+            kindText.remove_suffix(1);
+        if (*binding != SymbolBinding::Weak) {
+            emitMalformed(std::format(
+                "'{}' takes no argument — a weak-definition kind ('{}') is the "
+                "argument of '{}' only",
+                word.text, kindText, symbolBindingName(SymbolBinding::Weak)));
+            return LinkageWord::Refused;
+        }
+        auto const kind = weakDefinitionKindFromName(kindText);
+        if (!kind.has_value()) {
+            emitUnknownName(std::format(
+                "unknown weak-definition kind '{}' — accepted: {}", kindText,
+                detail::renderAllowedList(allNames(kWeakDefinitionKindTable))));
+            return LinkageWord::Refused;
+        }
+        into.linkage.weakKind = *kind;
+        return LinkageWord::Read;
+    }
+
+    // The record's OWN rule, asked where a list has been read whole and before
+    // any builder sees it. True ⇒ refused (by name, in the rule's sentence).
+    [[nodiscard]] bool refuseAnIllFormedLinkage(MirLinkage const& linkage,
+                                                MirLinkageOwner owner,
+                                                bool hasInitializer,
+                                                bool isThreadLocal,
+                                                std::uint32_t symbol) {
+        std::string_view const defect =
+            mirLinkageDefect(linkage, owner, hasInitializer, isThreadLocal);
+        if (defect.empty()) return false;
+        emitMalformed(std::format(
+            "the attribute list of {} %{} states a linkage that is not well formed: {}",
+            owner == MirLinkageOwner::Function ? "function" : "global", symbol, defect));
+        return true;
+    }
+
+    // Returns false when a word of the list was REFUSED — the caller builds
+    // nothing from a list it could not read.
+    [[nodiscard]] bool parseGlobalAttrs(MirTextGlobalAttrs& attrs) {
+        if (lex_.peek().kind != TokKind::LBracket) return true;
         lex_.take();
+        LinkageWordsRead linkageWords;
+        bool             readWhole = true;
         while (true) {
             Tok a = lex_.take();
             if (a.kind == TokKind::RBracket) break;
@@ -3182,7 +3464,17 @@ private:
             if (a.kind != TokKind::Ident) {
                 emitMalformed(std::format(
                     "expected a global attribute name, got '{}'", a.text));
+                readWhole = false;
                 break;
+            }
+            if (LinkageWord const w = readLinkageWord(a, linkageWords, "global");
+                w != LinkageWord::NotOne) {
+                if (w == LinkageWord::Refused) { readWhole = false; break; }
+                continue;
+            }
+            if (a.text == kMirTextTentativeAttr) {
+                linkageWords.linkage.tentative = true;
+                continue;
             }
             if (a.text == kMirTextConstAttr) { attrs.isConst = true; continue; }
             if (a.text == kMirTextThreadLocalAttr) {
@@ -3191,16 +3483,8 @@ private:
             }
             if (a.text == kMirTextAlignAttr) {
                 std::optional<std::uint32_t> const bytes = takeAlignValue("global");
-                if (!bytes.has_value()) break;
+                if (!bytes.has_value()) { readWhole = false; break; }
                 attrs.alignmentBytes = *bytes;
-                continue;
-            }
-            if (auto b = symbolBindingFromName(a.text); b.has_value()) {
-                attrs.binding = *b;
-                continue;
-            }
-            if (auto v = symbolVisibilityFromName(a.text); v.has_value()) {
-                attrs.visibility = *v;
                 continue;
             }
             // Both closed sets are PROJECTED off the tables the lookups use,
@@ -3208,15 +3492,89 @@ private:
             // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET),
             // the same discipline the function-attribute message follows.
             emitMalformed(std::format(
-                "unknown global attribute '{}' — expected a binding ({}), "
-                "a visibility ({}), '{}', '{}' or '{}=<bytes>'",
+                "unknown global attribute '{}' — expected a binding ({}), a "
+                "visibility ({}), '{}', '{}', '{}' or '{}=<bytes>'",
                 a.text,
-                detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
+                bindingSpellings(),
                 detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
-                kMirTextConstAttr, kMirTextThreadLocalAttr,
+                kMirTextTentativeAttr, kMirTextConstAttr, kMirTextThreadLocalAttr,
                 kMirTextAlignAttr));
+            readWhole = false;
             break;
         }
+        attrs.linkage = linkageWords.linkage;
+        return readWhole;
+    }
+
+    // P69 (lane `cs`): `alias %A [<linkage words>] = %T` — one second name of a
+    // definition (`MirAlias`). One line; a refused one is dropped to its end.
+    // Everything `MirBuilder::addAlias` ABORTS on is refused here first, by name —
+    // an invalid id, a name that is its own target or is stated twice, a word that
+    // is no linkage word (`tentative` among them: an alias has no storage), a
+    // record the one rule refuses — because a refusal that crashes is not one.
+    // Whether the module DEFINES the target, and defines the name no other way, is
+    // a fact of the whole module: the verifier's (`checkAliases`), asked on load.
+    void parseAlias() {
+        std::size_t const lineStart      = lex_.peek().off;
+        std::size_t const refusalsBefore = refusals_;
+        auto const sentinel = [&](std::uint32_t id, char const* which) {
+            if (SymbolId{id}.valid()) return false;
+            if (refusals_ == refusalsBefore) {
+                emitMalformed(std::format("an alias names symbol %0 as its {}, the invalid "
+                                          "sentinel — symbols number from %1", which));
+            }
+            skipRestOfLine(lineStart);
+            return true;
+        };
+        std::uint32_t const alias = parsePercentValue();
+        if (sentinel(alias, "name")) return;
+        LinkageWordsRead words;
+        if (lex_.peek().kind == TokKind::LBracket) {
+            lex_.take();
+            while (true) {
+                Tok const a = lex_.take();
+                if (a.kind == TokKind::RBracket) break;
+                if (a.kind == TokKind::Comma) continue;
+                if (a.kind == TokKind::Ident) {
+                    LinkageWord const w = readLinkageWord(a, words, "alias");
+                    if (w == LinkageWord::Read) continue;
+                    if (w == LinkageWord::Refused) { skipRestOfLine(lineStart); return; }
+                }
+                emitMalformed(std::format(
+                    "unknown alias attribute '{}' — an alias states its own linkage and "
+                    "nothing else: a binding ({}) or a visibility ({})",
+                    a.text, bindingSpellings(),
+                    detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | ")));
+                skipRestOfLine(lineStart);
+                return;
+            }
+        }
+        if (!expect(TokKind::Eq)) { skipRestOfLine(lineStart); return; }
+        std::uint32_t const target = parsePercentValue();
+        if (sentinel(target, "target")) return;
+        if (alias == target) {
+            emitMalformed(std::format("alias %{} names itself as its target — an alias is a "
+                                      "second name of another definition", alias));
+            skipRestOfLine(lineStart);
+            return;
+        }
+        if (!aliasesRead_.insert(alias).second) {
+            emitMalformed(std::format("alias %{} is stated twice — one name, one statement",
+                                      alias));
+            skipRestOfLine(lineStart);
+            return;
+        }
+        if (std::string_view const defect =
+                mirLinkageDefect(words.linkage, MirLinkageOwner::Function,
+                                 /*hasInitializer=*/false, /*isThreadLocal=*/false);
+            !defect.empty()) {
+            emitMalformed(std::format(
+                "the attribute list of alias %{} states a linkage that is not well formed: {}",
+                alias, defect));
+            skipRestOfLine(lineStart);
+            return;
+        }
+        builder_.addAlias(SymbolId{alias}, SymbolId{target}, words.linkage);
     }
 
     void parseGlobal() {
@@ -3228,7 +3586,10 @@ private:
         if (!expect(TokKind::Colon)) return;
         TypeId const ty = parseType();
         MirTextGlobalAttrs attrs;
-        parseGlobalAttrs(attrs);
+        // A list with a refused word built nothing it could hand a builder —
+        // `weak(bogus)` leaves a weak binding with no kind, which `addGlobal`
+        // ABORTS on. The word is already refused by name; drop the line.
+        if (!parseGlobalAttrs(attrs)) { skipRestOfLine(lineStart); return; }
         if (!expect(TokKind::Eq)) return;
         // ★★★ A REFUSAL THAT CRASHES IS NOT A REFUSAL — the rule this file states
         // three times already, at the arm it had not reached.
@@ -3259,10 +3620,24 @@ private:
             return;
         }
         Tok pk = lex_.peek();
-        if (pk.kind == TokKind::Ident && pk.text == "zero") {
+        // ★ THE LINKAGE RECORD IS JUDGED BEFORE ANY ARM HANDS IT ON (format v6).
+        // Whether the global states an initializer is part of the rule — a
+        // tentative definition is the one with none — and `zero` is the only
+        // spelling that states none, so the question is answered from the token
+        // already in hand. Refused here, by the rule's own sentence, because
+        // every arm below reaches a builder that aborts on the same record.
+        bool const statesNoInitializer = pk.kind == TokKind::Ident && pk.text == "zero";
+        if (refuseAnIllFormedLinkage(attrs.linkage, MirLinkageOwner::Global,
+                                     !statesNoInitializer,
+                                     attrs.threadStorage == MirThreadStorage::PerThread,
+                                     sym)) {
+            skipRestOfLine(lineStart);
+            return;
+        }
+        if (statesNoInitializer) {
             lex_.take();
             builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, MirFuncId{},
-                               attrs.binding, attrs.visibility, attrs.isConst,
+                               attrs.linkage, attrs.isConst,
                                attrs.threadStorage, attrs.alignmentBytes);
         } else if (pk.kind == TokKind::Ident && pk.text == "initfunc") {
             lex_.take();
@@ -3273,7 +3648,7 @@ private:
             auto it = funcMap_.find(fnSlot);
             if (it != funcMap_.end()) {
                 builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, it->second,
-                                   attrs.binding, attrs.visibility,
+                                   attrs.linkage,
                                    attrs.isConst, attrs.threadStorage,
                                    attrs.alignmentBytes);
             } else {
@@ -3284,7 +3659,7 @@ private:
             MirLiteralValue lv = parseLiteral();
             std::uint32_t const litIdx = builder_.literalPoolAdd(std::move(lv));
             builder_.addGlobal(ty, SymbolId{sym}, litIdx, MirFuncId{},
-                               attrs.binding, attrs.visibility, attrs.isConst,
+                               attrs.linkage, attrs.isConst,
                                attrs.threadStorage, attrs.alignmentBytes);
         }
     }
@@ -3300,8 +3675,10 @@ private:
         // An UNRECOGNIZED name FAILS LOUD rather than being skipped — a silently
         // ignored attribute here is precisely how `binding`/`visibility` went
         // missing for as long as they did.
-        SymbolBinding    binding    = SymbolBinding::Global;
-        SymbolVisibility visibility = SymbolVisibility::Default;
+        // P69 (format v6): the binding, its weak kind and the visibility are the
+        // ONE linkage record, read by the reader both lists share
+        // (`readLinkageWord`) and judged by the record's own rule below.
+        LinkageWordsRead linkageWords;
         bool             noInline   = false;
         bool             alwaysInline = false;   // TF-C81
         bool             noOptimize   = false;   // TF-C85
@@ -3373,12 +3750,9 @@ private:
                     staticInit.setPriorityFor(phase, prio);
                     continue;
                 }
-                if (auto b = symbolBindingFromName(a.text); b.has_value()) {
-                    binding = *b;
-                    continue;
-                }
-                if (auto v = symbolVisibilityFromName(a.text); v.has_value()) {
-                    visibility = *v;
+                if (LinkageWord const w = readLinkageWord(a, linkageWords, "function");
+                    w != LinkageWord::NotOne) {
+                    if (w == LinkageWord::Refused) break;
                     continue;
                 }
                 // ⚠ THIS SENTENCE USED TO RETYPE BOTH CLOSED SETS —
@@ -3391,11 +3765,15 @@ private:
                 // calling it invalid
                 // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
                 // Both halves are projected off the tables the lookups use.
+                // ★ P69 fold 3: the BINDING half is the spellings a list can state
+                // (`bindingSpellings`), not the binding names beside the kind
+                // names — see that function for the two words the first shape
+                // of this sentence advertised and the reader refused.
                 emitMalformed(std::format(
                     "unknown function attribute '{}' — expected a binding ({}), "
                     "a visibility ({}), '{}', '{}', '{}', '{}', '{}' or '{}'",
                     a.text,
-                    detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
+                    bindingSpellings(),
                     detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
                     kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
                     kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr,
@@ -3415,6 +3793,14 @@ private:
         // burying the one diagnostic that matters under a cascade about a
         // construct that is perfectly well formed.
         if (!sig.valid()) { skipBracedBody(); return; }
+        // P69 (format v6): the linkage record is judged by its OWN rule before
+        // the builder — which aborts on the same record — can see it: a bare
+        // `weak` (a weak definition that states no kind) is refused here, by the
+        // rule's sentence. A refusal sets `errors_`, so the gate below skips the
+        // body like any other refused function's.
+        (void)refuseAnIllFormedLinkage(linkageWords.linkage, MirLinkageOwner::Function,
+                                       /*hasInitializer=*/false,
+                                       /*isThreadLocal=*/false, sym);
         // ★★ ONCE A REFUSAL IS ON RECORD, NO FURTHER FUNCTION IS BUILT. Adding one
         // makes the builder CLOSE the previous function, and `closeFunction_`
         // ABORTS on a function with no blocks or with a block never filled — the
@@ -3431,7 +3817,7 @@ private:
             return;
         }
         MirFuncId const f =
-            builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
+            builder_.addFunction(sig, SymbolId{sym}, linkageWords.linkage, noInline,
                                  alwaysInline,    // TF-C81
                                  noOptimize,      // TF-C85
                                  noSanitizeThread,   // TF-C92
@@ -4007,7 +4393,14 @@ private:
             }
             case MirOpcode::Unreachable: {
                 refuseFlagsOnTerminator(mnemonic, flags);
-                builder_.addUnreachable();
+                // P69 (lane `cs`): an optional ` trap` on its own line — the writer's
+                // spelling of `MirUnreachableKind::Trap`.
+                MirUnreachableKind kind = MirUnreachableKind::Assumed;
+                if (peekIdent("trap") && onLine(lineStart, lex_.peek())) {
+                    lex_.take();
+                    kind = MirUnreachableKind::Trap;
+                }
+                builder_.addUnreachable(kind);
                 break;
             }
             // ★★★ D-CSUBSET-COMPUTED-GOTO: `indirectbr %v<addr> { %b…, %b… }`.
@@ -4246,7 +4639,7 @@ private:
                 continue;
             }
             builder_.addGlobal(pg.ty, pg.sym, UINT32_MAX, it->second,
-                               pg.attrs.binding, pg.attrs.visibility,
+                               pg.attrs.linkage,   // P69: the one record
                                pg.attrs.isConst, pg.attrs.threadStorage,
                                pg.attrs.alignmentBytes);
         }
@@ -4275,7 +4668,52 @@ private:
             return std::make_unique<MirParseResult>(
                 Mir{}, std::move(interner_), std::move(symbolNames_));
         }
+        // ★ THE TEXT IS THE NAME TABLE THIS MODULE IS MADE FROM, AND IT IS STATED
+        // HERE — the one place every module this reader hands out passes
+        // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE). The reader
+        // stated nothing, and the scan that holds every module builder to a
+        // statement excused it in so many words — "a parsed module is made from
+        // no table". ✔MEASURED 2026-10-08: a text declaring `%1 "f"` and `%2 "g"`
+        // and defining `f` alone read back with its id space ending at 2, so the
+        // lowering — handed the module and no import row, which a text never
+        // holds — named a block `%2`: `g`'s id, in silence. A call in the text may
+        // name an entry that is no function or global of the module; the entry is
+        // the table's all the same. The end stated is the one the declared slots
+        // (`parseSymbolsPreamble`) and the symbols the text defines have raised,
+        // by the door's own rule (the top id saturates there). A text with NO
+        // `symbols` section states it too: its table is empty, and nothing stands
+        // beside a text — so no input reaches the door's refusal of a counted end.
+        builder_.stateSymbolIdEnd(builder_.symbolIdEnd());
         Mir module = std::move(builder_).finish();
+        // ★ "NOTHING STANDS BESIDE A TEXT" IS HELD HERE, NOT ASSUMED. The end stated
+        // above covers the ids the text DECLARES and DEFINES; an id it merely NAMES
+        // — a `globaladdr`'s, a `symaddr`'s, a `blockaddress_export`'s — was outside
+        // it unless something else had raised the end, and only the `symaddr` arm
+        // asked (so `globaladdr (%5)` in a text defining `%1` alone read back stated
+        // at 2 — an end BELOW an id the module names, which a later mint can reach
+        // and hand out again). One rule for every construct that names one, by the
+        // list the writer and the verifier read (`forEachSymbolIdNamed`): such an id
+        // is refused BY NAME, and the module with it. It is asked of the FINISHED
+        // module because that is what the list reads — a literal's symbol address
+        // is in the pool, a global's initializer is its global's. The verifier's own
+        // rule ("an id the module names is below the end it states") is the weaker
+        // one for a text: an id BELOW the highest declared slot is inside the end
+        // and still nobody's, and only this one refuses it.
+        // An id two of the text's definitions give (a `global` and a
+        // `blockaddress_export` under one id, say) is refused by the verifier this
+        // reader runs on the module below, in the same words
+        // (`MirVerifier::checkSymbolIdsDefinedOnce`): the rule has one statement, and a
+        // text reaches it as every module does.
+        for (MirSymbolMentionAt const& stray : symbolIdsNamedButNeverIntroduced(
+                 module, [&](SymbolId s) { return symbolNames_.contains(s.v); })) {
+            emitMalformed(std::format(
+                "{} names symbol %{}, which this text neither declares in its `symbols` "
+                "preamble nor defines", mirSymbolMentionSpelling(stray.mention), stray.symbol.v));
+        }
+        if (errors_) {
+            return std::make_unique<MirParseResult>(
+                Mir{}, std::move(interner_), std::move(symbolNames_));
+        }
         auto result = std::make_unique<MirParseResult>(
             std::move(module), std::move(interner_), std::move(symbolNames_));
         // Verify-on-load. `ok` takes the verifier's OWN verdict, not only the

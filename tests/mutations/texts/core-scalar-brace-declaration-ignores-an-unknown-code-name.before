@@ -1,0 +1,5 @@
+                        if (!c.has_value()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      std::format("'scalarBraceInitializer.{}' names unknown "
+                                                  "diagnostic code '{}'", key, name));
+                            return;

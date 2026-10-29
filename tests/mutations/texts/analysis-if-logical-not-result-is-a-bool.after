@@ -1,0 +1,1 @@
+            if (folded->core == TypeKind::Bool) folded->core = TypeKind::Bool;

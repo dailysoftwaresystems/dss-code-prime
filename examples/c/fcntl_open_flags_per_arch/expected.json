@@ -1,0 +1,38 @@
+{
+  "$comment": "P69 D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES. <fcntl.h>'s O_DIRECTORY, O_NOFOLLOW and O_TMPFILE differ by ARCH on Linux (arm64's uapi fcntl.h overrides asm-generic's, which x86_64 uses), and fcntl.json keyed them by format alone, so aarch64 took x86_64's values. Each target's expectedStdout is the REFERENCE's own run of this very source: gcc 13.3.0 -std=gnu2x on glibc 2.39, x86_64 (run 20260930-185033-96764b3e) and aarch64 native (run 20260930-185048-034f78bc), and Apple clang 21 on arm64 and x86_64 (run 20260930-184953-72badbea); O_TMPFILE, which glibc declares only under _GNU_SOURCE, was measured the same way with it (runs 20260930-175639-f43a1fd8 / 20260930-175657-9088f3f4). The BEHAVIOUR is the independent witness: a regular file opened with O_DIRECTORY must fail ENOTDIR and a symlink opened with O_NOFOLLOW must fail ELOOP (errno 40 on Linux, 62 on Darwin). RED-ON-DISABLE: the aarch64 arms reverted to x86_64's values make the aarch64 file cell open (0x10000 is arm64's O_DIRECT) and the link cell follow the link, so linux-arm64 exits 1 and prints errno 0 while x86_64 stays green (the control). No pe target: the UCRT declares none of these flags.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "O_DIRECTORY=0x10000 O_NOFOLLOW=0x20000 O_TMPFILE=0x410000\ndir=opened file_errno=20 link_errno=40\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "O_DIRECTORY=0x4000 O_NOFOLLOW=0x8000 O_TMPFILE=0x404000\ndir=opened file_errno=20 link_errno=40\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "O_DIRECTORY=0x100000 O_NOFOLLOW=0x100\ndir=opened file_errno=20 link_errno=62\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "O_DIRECTORY=0x100000 O_NOFOLLOW=0x100\ndir=opened file_errno=20 link_errno=62\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

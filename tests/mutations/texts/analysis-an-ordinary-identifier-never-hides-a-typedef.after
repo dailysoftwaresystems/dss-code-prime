@@ -1,0 +1,2 @@
+            if ((false)) {
+                return InvalidType;   // hidden by an ordinary identifier in scope

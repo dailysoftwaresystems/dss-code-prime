@@ -1,0 +1,16 @@
+{
+  "$comment": "P69 fold 3 (lane `xa`), D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER: a compiled `__attribute__((weak))` definition is an OVERRIDABLE weak definition, and it now reaches the link saying so -- in the MIR's one linkage record, through the cross-unit merge and the summary index, and on a PE object as the weak external gcc and clang write (until this fold: a COMDAT, the select-any spelling). What a strong definition makes of it is each format's document's answer (`weakDefinitionBesideStrong`: yields, on ELF and Mach-O and for this kind on PE). Two names, one each way, so both link orders are in one program: the strong definition is the name's and both units read it. Exit 20 + 21 + 1 = 42.",
+  "language": "c",
+  "sources": ["main.c", "other.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

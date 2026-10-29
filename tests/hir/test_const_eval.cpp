@@ -732,6 +732,31 @@ TEST(ConstEval, FloatAddFoldsWithAllowFloat) {
     EXPECT_EQ(res.value->core, TypeKind::F64);
 }
 
+// ★ P69 L2 (lane `lm`, the review of checkpoint 29, BLOCKER 1): A FLOAT OPERATION IS FOLDED
+// AT ITS TYPE. The kernel computed every host-backed float operation in binary64 and handed
+// the result on as an F64, so `16777216.0f + 1.0f` kept 2^24 + 1 — no float — and the chain
+// below folded to 1 where the run time computes 0. ✔MEASURED 2026-10-20 on checkpoint 29's
+// bytes (pe64 and ELF, both pipelines): `static int s = (int)(16777216.0f + 1.0f -
+// 16777216.0f) == 0 ? 42 : 7;` — a global initializer, this engine — RAN 7, where clang
+// 18.1.3 and gcc 13.3.0 run 42 and DSS's own run time over `volatile float`s computes 0. The
+// result is the operands' kind (C 6.3.1.8) and its value is rounded to it.
+TEST(ConstEval, AFloatOperationIsFoldedAtItsType) {
+    Rig r;
+    HirNodeId const big = r.litFloat(16777216.0, r.f32T());
+    HirNodeId const one = r.litFloat(1.0, r.f32T());
+    HirNodeId const sum = r.binary(HirOpKind::Add, big, one, r.f32T());
+    HirNodeId const big2 = r.litFloat(16777216.0, r.f32T());
+    HirNodeId const diff = r.binary(HirOpKind::Sub, sum, big2, r.f32T());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(diff);
+    auto res = evaluateConstant(hir, r.interner, r.literals, diff, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(res.value->core, TypeKind::F32);
+    EXPECT_EQ(std::get<double>(res.value->value), 0.0)
+        << "2^24 + 1 is no float: the sum rounds to 2^24 before the subtraction";
+}
+
 // IEEE 754 div-by-zero is well-defined (±inf), unlike integer div-by-zero.
 TEST(ConstEval, FloatDivByZeroProducesInfNotFailure) {
     Rig r;
@@ -2014,6 +2039,338 @@ TEST(ConstEvalUnsignedModular, AsIntBitsCarriesAnUnsignedPayloadAsItsBitPattern)
     EXPECT_EQ(foldInt(HirOpKind::Gt, v, lit(TypeKind::U64, 0)), 1LL);
 }
 
+// ── [[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]] ─────────────────────
+//
+// A unary `-` / `~` is performed in the PROMOTED type of its operand and its
+// result has that type (C 6.5.3.3p3-p4); an unsigned type's computation is
+// reduced modulo 2^N (6.2.5p9). `applyUnaryInt` computed on the 64-bit pattern
+// and reduced nothing, so `~0U` was 0xFFFFFFFFFFFFFFFF the moment anything
+// widened it. ✔MEASURED 2026-10-10: `static const unsigned long long u = ~0U;`
+// held 2^64-1 on pe64, baseline and release, where cl 19.51, MinGW-w64 gcc
+// 13.2.0, gcc 13.3.0, clang 18.1.3 and AppleClang 21 all hold 0xFFFFFFFF.
+//
+// ★ THE WIDENING IS WHAT SHOWS IT, so each value below is read through one: an
+// un-widened `~0U` compared with `0xFFFFFFFFu` was right the whole time, because
+// the binary fold reduces BOTH operands to the comparison's own type first.
+namespace {
+
+[[nodiscard]] std::optional<HirLiteralValue>
+foldUnaryInItsOwnType(HirOpKind op, HirLiteralValue const& v) {
+    return detail::applyUnaryInt(op, v, detail::intUnaryDomain(v, /*charIsUnsigned=*/false));
+}
+
+}  // namespace
+
+TEST(ConstEvalUnsignedModular, UnaryDomainIsThePromotedTypeOfTheOperand) {
+    struct Row { TypeKind core; int bits; bool isSigned; };
+    for (Row const row : {Row{TypeKind::U32, 32, false}, Row{TypeKind::I32, 32, true},
+                          Row{TypeKind::U64, 64, false}, Row{TypeKind::I64, 64, true},
+                          // C 6.3.1.1p2: everything below `int` promotes to SIGNED int —
+                          // `~(unsigned short)0` is the int -1, never 0xFFFF.
+                          Row{TypeKind::U16, 32, true},  Row{TypeKind::I16, 32, true},
+                          Row{TypeKind::U8, 32, true},   Row{TypeKind::I8, 32, true},
+                          Row{TypeKind::Bool, 32, true}, Row{TypeKind::Char, 32, true}}) {
+        auto const d = detail::intUnaryDomain(lit(row.core, 0), /*charIsUnsigned=*/false);
+        ASSERT_TRUE(d.has_value()) << "core " << static_cast<int>(row.core);
+        EXPECT_EQ(d->bits, row.bits) << "core " << static_cast<int>(row.core);
+        EXPECT_EQ(d->isSigned, row.isSigned) << "core " << static_cast<int>(row.core);
+    }
+    // A unary and a binary operator must not disagree about one operand's type:
+    // the unary domain IS the binary domain of the operand with itself.
+    for (TypeKind const core : {TypeKind::U8, TypeKind::U16, TypeKind::U32, TypeKind::U64,
+                                TypeKind::I8, TypeKind::I32, TypeKind::I64, TypeKind::Bool}) {
+        auto const u = detail::intUnaryDomain(lit(core, 0), false);
+        auto const b = detail::intOpDomain(HirOpKind::Add, lit(core, 0), lit(core, 0), false);
+        ASSERT_TRUE(u.has_value() && b.has_value());
+        EXPECT_EQ(u->bits, b->bits) << "core " << static_cast<int>(core);
+        EXPECT_EQ(u->isSigned, b->isSigned) << "core " << static_cast<int>(core);
+    }
+    // No statement where there is none to make: a `char` whose sign nobody gave,
+    // a 128-bit operand and a bit-precise one (both the bignum's).
+    EXPECT_FALSE(detail::intUnaryDomain(lit(TypeKind::Char, 0), std::nullopt).has_value());
+    EXPECT_FALSE(detail::intUnaryDomain(lit(TypeKind::U128, 0), false).has_value());
+    HirLiteralValue bitPrecise;
+    bitPrecise.core  = TypeKind::BitInt;
+    bitPrecise.value = BitIntValue::fromU64(5u, 24u, /*isSigned=*/false);
+    EXPECT_FALSE(detail::intUnaryDomain(bitPrecise, false).has_value());
+}
+
+TEST(ConstEvalUnsignedModular, UnaryResultIsReducedToTheTypeItsCallerStates) {
+    auto const value = [](std::optional<HirLiteralValue> const& r) {
+        EXPECT_TRUE(r.has_value());
+        return r.has_value() ? std::get<std::int64_t>(r->value) : std::int64_t{0x5A5A};
+    };
+    // The row's own forms: `~0U`, `-1U`, `~(unsigned)0x0F`, `-(unsigned)5`.
+    auto r = foldUnaryInItsOwnType(HirOpKind::BitNot, lit(TypeKind::U32, 0));
+    EXPECT_EQ(value(r), 0xffffffffLL) << "~0U is 0xFFFFFFFF, not 2^64-1";
+    EXPECT_EQ(r->core, TypeKind::U32);
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Neg, lit(TypeKind::U32, 1))), 0xffffffffLL);
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::BitNot, lit(TypeKind::U32, 0x0f))), 0xfffffff0LL);
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Neg, lit(TypeKind::U32, 5))), 0xfffffffbLL);
+    // `-0U` is 0 and `-(unsigned)0x80000000` is itself: the two fixed points.
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Neg, lit(TypeKind::U32, 0))), 0LL);
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Neg, lit(TypeKind::U32, 0x80000000LL))),
+              0x80000000LL);
+    // ⚠ THE SIGNED CONTROL — a reduction applied as unsigned to every 32-bit
+    // operand would turn `~0` into 4294967295.
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::BitNot, lit(TypeKind::I32, 0))), -1LL);
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Neg, lit(TypeKind::I32, 1))), -1LL);
+    // ⚠ THE PROMOTION CONTROL — a reduction to the operand's OWN width would
+    // make `~(unsigned short)0` 0xFFFF and `-(unsigned char)1` 255. Both are
+    // the `int` the references give, and the result's core says so.
+    r = foldUnaryInItsOwnType(HirOpKind::BitNot, lit(TypeKind::U16, 0));
+    EXPECT_EQ(value(r), -1LL);
+    EXPECT_EQ(r->core, TypeKind::I32) << "the result HAS the promoted type";
+    r = foldUnaryInItsOwnType(HirOpKind::Neg, lit(TypeKind::U8, 1));
+    EXPECT_EQ(value(r), -1LL);
+    EXPECT_EQ(r->core, TypeKind::I32);
+    // 64 bits: the pattern is the value, signed or not.
+    r = foldUnaryInItsOwnType(HirOpKind::BitNot, lit(TypeKind::U64, 0));
+    EXPECT_EQ(value(r), -1LL);
+    EXPECT_EQ(r->core, TypeKind::U64);
+
+    // ★ THE CALLER STATES THE TYPE; THE FUNCTION ASSUMES NONE.
+    // (1) `#if`: every operand has the widest type (C 6.10.1p4), so the SAME
+    //     operation on the same bits is 64 bits wide there — `#if ~0U ==
+    //     0xFFFFFFFFFFFFFFFF` is true under every reference.
+    r = detail::applyUnaryInt(HirOpKind::BitNot, lit(TypeKind::U64, 0),
+                              detail::IntKindInfo{64, false});
+    EXPECT_EQ(value(r), -1LL);
+    EXPECT_EQ(r->core, TypeKind::U64);
+    // (2) the optimizer's folder states nothing and converts to the instruction's
+    //     type itself: the 64-bit pattern comes back under the operand's own core.
+    r = detail::applyUnaryInt(HirOpKind::BitNot, lit(TypeKind::U32, 0), std::nullopt);
+    EXPECT_EQ(value(r), -1LL);
+    EXPECT_EQ(r->core, TypeKind::U32);
+    r = detail::applyUnaryInt(HirOpKind::Neg, lit(TypeKind::U32, 1), std::nullopt);
+    EXPECT_EQ(value(r), -1LL);
+
+    // `!` asks only whether the operand is zero, and answers under a Bool core.
+    r = foldUnaryInItsOwnType(HirOpKind::Not, lit(TypeKind::U32, 0));
+    EXPECT_EQ(value(r), 1LL);
+    EXPECT_EQ(r->core, TypeKind::Bool);
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Not, lit(TypeKind::U32, 7))), 0LL);
+    // A value that does not fit the type its core names is still not zero.
+    EXPECT_EQ(value(foldUnaryInItsOwnType(HirOpKind::Not, lit(TypeKind::I32, 0x100000000LL))), 0LL);
+}
+
+// [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]]: an unsigned
+// value above INT64_MAX in the `uint64_t` arm is an OPERAND like any other. The
+// guards asked `asInt64` — "does it fit a signed int64" — and so `~`, `-`, `!`,
+// every cast and every truth test of such a value was "not a constant".
+TEST(ConstEvalUnsignedModular, AnUnsignedOperandAboveInt64IsStillAnOperand) {
+    HirLiteralValue top;                       // 0x8000000000000000ull
+    top.core  = TypeKind::U64;
+    top.value = std::uint64_t{0x8000000000000000ULL};
+    HirLiteralValue all;                       // 0xFFFFFFFFFFFFFFFFull
+    all.core  = TypeKind::U64;
+    all.value = std::uint64_t{0xffffffffffffffffULL};
+    auto r = foldUnaryInItsOwnType(HirOpKind::BitNot, top);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), 0x7fffffffffffffffLL);
+    r = foldUnaryInItsOwnType(HirOpKind::Neg, all);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), 1LL);
+    r = foldUnaryInItsOwnType(HirOpKind::Not, top);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), 0LL);
+    // Truthiness is asked of the bits.
+    auto const truth = detail::asBool(top, /*allowFloat=*/false);
+    ASSERT_TRUE(truth.has_value());
+    EXPECT_TRUE(*truth);
+    // And the value-representability question keeps its own answer.
+    EXPECT_FALSE(detail::asInt64(top).has_value());
+}
+
+// The HIR walker's own guard — the fold above is reached only through it. It asked
+// whether the operand "is an integer" with `asInt64`, which answers "does it fit a
+// signed int64": a `uint64_t` literal above INT64_MAX was refused as
+// `UnsupportedTypeKind` before the fold was ever asked. Through `evaluateConstant`,
+// one row per operator.
+TEST(ConstEvalUnsignedModular, TheEvaluatorFoldsAUnaryOfAnUnsignedLiteralAboveInt64) {
+    struct Row { HirOpKind op; std::uint64_t operand; std::int64_t bits; };
+    for (Row const row : {Row{HirOpKind::BitNot, 0x8000000000000000ULL, 0x7fffffffffffffffLL},
+                          Row{HirOpKind::Neg, 0xffffffffffffffffULL, 1},
+                          Row{HirOpKind::Not, 0x8000000000000000ULL, 0},
+                          Row{HirOpKind::BitNot, 0xffffffffffffffffULL, 0}}) {
+        Rig r;
+        TypeId const u64 = r.interner.primitive(TypeKind::U64);
+        HirLiteralValue lv;
+        lv.core  = TypeKind::U64;
+        lv.value = row.operand;
+        HirNodeId const src = r.builder.makeLiteral(u64, r.literals.add(lv));
+        HirNodeId const u   = r.unary(
+            row.op, src, row.op == HirOpKind::Not ? r.interner.primitive(TypeKind::I32) : u64);
+        EvalOptions opts;
+        opts.charIsUnsigned = false;
+        Hir hir = r.finishWith(u);
+        auto res = evaluateConstant(hir, r.interner, r.literals, u, {}, opts);
+        ASSERT_TRUE(res.value.has_value())
+            << "the evaluator refused a unary of the unsigned literal " << row.operand
+            << " (operator " << static_cast<int>(row.op) << ")";
+        EXPECT_EQ(detail::asIntBits(*res.value).value_or(0x5A5A), row.bits)
+            << "operator " << static_cast<int>(row.op) << " operand " << row.operand;
+    }
+}
+
+TEST(ConstEvalUnsignedModular, WidenedUnaryOfAnUnsignedOperandKeepsItsOwnWidth) {
+    // The tree the C front end builds for `(unsigned long long)(~0U)`,
+    // `(double)(~0U)` and `(long double)(~0U)`, folded by the HIR walker.
+    for (TypeKind const to : {TypeKind::U64, TypeKind::I64, TypeKind::F64,
+                              TypeKind::F80, TypeKind::F128}) {
+        Rig r;
+        TypeId const u32 = r.interner.primitive(TypeKind::U32);
+        HirNodeId const zero = r.litInt(0, u32);
+        HirNodeId const bn   = r.unary(HirOpKind::BitNot, zero, u32);
+        HirNodeId const c    = r.cast(bn, r.interner.primitive(to));
+        EvalOptions opts;
+        opts.allowFloat     = true;
+        opts.charIsUnsigned = false;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+        ASSERT_TRUE(res.value.has_value()) << "target " << static_cast<int>(to);
+        if (to == TypeKind::F64) {
+            EXPECT_EQ(std::get<double>(res.value->value), 4294967295.0);
+        } else if (WideFloatValue::isSupportedKind(to)) {
+            auto const got = std::get<WideFloatValue>(res.value->value);
+            EXPECT_EQ(got.toDouble(), 4294967295.0) << "target " << static_cast<int>(to);
+        } else {
+            EXPECT_EQ(detail::asIntBits(*res.value).value_or(0), 0xffffffffLL)
+                << "target " << static_cast<int>(to);
+        }
+    }
+}
+
+TEST(ConstEvalUnsignedModular, CastOfAnUnsignedConstantAboveInt64Folds) {
+    // `(T)S` for five unsigned constants S at and around 2^63 and every integer target,
+    // the identity included; then the two wide float targets. THE EXPECTED BITS ARE THE
+    // REFERENCES' OWN OUTPUT, copied from their runs and computed by nothing here (a
+    // formula in the test would be a second evaluator): ✔MEASURED on six references —
+    // gcc 13.3 and clang 18 on x86_64 Linux, AppleClang 21, mingw-w64 gcc 13.2, gcc 13.3
+    // on arm64 Linux, cl 19.51 at /Od and /O2 — each `static const T x = (T)S;` printed
+    // as its 16 hex digits (a signed object sign-extended), the same 45 lines on all six.
+    constexpr std::uint64_t A = 0xffffffffffffffffULL;   // 2^64 - 1
+    constexpr std::uint64_t B = 0x8000000000000000ULL;   // 2^63: the boundary
+    constexpr std::uint64_t C = 0x7fffffffffffffffULL;   // 2^63 - 1: the control, it always fitted
+    constexpr std::uint64_t D = 0x8000000000000041ULL;   // the top bit and a low byte
+    constexpr std::uint64_t E = 0xffffffff80000001ULL;   // negative as an `int`, truncated
+    struct Row { std::uint64_t source; TypeKind to; std::uint64_t printed; };
+    std::vector<Row> const rows = {
+        // unsigned char                     signed char
+        {A, TypeKind::U8, 0x00000000000000ffULL}, {A, TypeKind::I8, 0xffffffffffffffffULL},
+        {B, TypeKind::U8, 0x0000000000000000ULL}, {B, TypeKind::I8, 0x0000000000000000ULL},
+        {C, TypeKind::U8, 0x00000000000000ffULL}, {C, TypeKind::I8, 0xffffffffffffffffULL},
+        {D, TypeKind::U8, 0x0000000000000041ULL}, {D, TypeKind::I8, 0x0000000000000041ULL},
+        {E, TypeKind::U8, 0x0000000000000001ULL}, {E, TypeKind::I8, 0x0000000000000001ULL},
+        // unsigned short                    short
+        {A, TypeKind::U16, 0x000000000000ffffULL}, {A, TypeKind::I16, 0xffffffffffffffffULL},
+        {B, TypeKind::U16, 0x0000000000000000ULL}, {B, TypeKind::I16, 0x0000000000000000ULL},
+        {C, TypeKind::U16, 0x000000000000ffffULL}, {C, TypeKind::I16, 0xffffffffffffffffULL},
+        {D, TypeKind::U16, 0x0000000000000041ULL}, {D, TypeKind::I16, 0x0000000000000041ULL},
+        {E, TypeKind::U16, 0x0000000000000001ULL}, {E, TypeKind::I16, 0x0000000000000001ULL},
+        // unsigned int                      int
+        {A, TypeKind::U32, 0x00000000ffffffffULL}, {A, TypeKind::I32, 0xffffffffffffffffULL},
+        {B, TypeKind::U32, 0x0000000000000000ULL}, {B, TypeKind::I32, 0x0000000000000000ULL},
+        {C, TypeKind::U32, 0x00000000ffffffffULL}, {C, TypeKind::I32, 0xffffffffffffffffULL},
+        {D, TypeKind::U32, 0x0000000000000041ULL}, {D, TypeKind::I32, 0x0000000000000041ULL},
+        {E, TypeKind::U32, 0x0000000080000001ULL}, {E, TypeKind::I32, 0xffffffff80000001ULL},
+        // unsigned long long                long long
+        {A, TypeKind::U64, 0xffffffffffffffffULL}, {A, TypeKind::I64, 0xffffffffffffffffULL},
+        {B, TypeKind::U64, 0x8000000000000000ULL}, {B, TypeKind::I64, 0x8000000000000000ULL},
+        {C, TypeKind::U64, 0x7fffffffffffffffULL}, {C, TypeKind::I64, 0x7fffffffffffffffULL},
+        {D, TypeKind::U64, 0x8000000000000041ULL}, {D, TypeKind::I64, 0x8000000000000041ULL},
+        {E, TypeKind::U64, 0xffffffff80000001ULL}, {E, TypeKind::I64, 0xffffffff80000001ULL},
+        // _Bool
+        {A, TypeKind::Bool, 1}, {B, TypeKind::Bool, 1}, {C, TypeKind::Bool, 1},
+        {D, TypeKind::Bool, 1}, {E, TypeKind::Bool, 1},
+    };
+    ASSERT_EQ(rows.size(), 45u);
+    for (Row const& row : rows) {
+        Rig r;
+        TypeId const u64 = r.interner.primitive(TypeKind::U64);
+        HirLiteralValue lv;
+        lv.core  = TypeKind::U64;
+        lv.value = row.source;
+        HirNodeId const src = r.builder.makeLiteral(u64, r.literals.add(lv));
+        HirNodeId const c   = r.cast(src, r.interner.primitive(row.to));
+        EvalOptions opts;
+        opts.refuseOnOverflow = false;      // the static-initializer policy
+        opts.charIsUnsigned   = false;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+        ASSERT_TRUE(res.value.has_value())
+            << "source " << row.source << " target " << static_cast<int>(row.to);
+        EXPECT_EQ(static_cast<std::uint64_t>(detail::asIntBits(*res.value).value_or(0x5A5A)),
+                  row.printed)
+            << "source " << row.source << " target " << static_cast<int>(row.to);
+    }
+    // To a wide float: the value it IS — 2^64-1 exactly, never -1.0.
+    for (TypeKind const to : {TypeKind::F80, TypeKind::F128}) {
+        Rig r;
+        TypeId const u64 = r.interner.primitive(TypeKind::U64);
+        HirLiteralValue lv;
+        lv.core  = TypeKind::U64;
+        lv.value = std::uint64_t{0xffffffffffffffffULL};
+        HirNodeId const src = r.builder.makeLiteral(u64, r.literals.add(lv));
+        HirNodeId const c   = r.cast(src, r.interner.primitive(to));
+        EvalOptions opts;
+        opts.allowFloat     = true;
+        opts.charIsUnsigned = false;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+        ASSERT_TRUE(res.value.has_value()) << "target " << static_cast<int>(to);
+        auto const got = std::get<WideFloatValue>(res.value->value);
+        EXPECT_GT(got.toDouble(), 0.0) << "target " << static_cast<int>(to);
+        EXPECT_TRUE(got == WideFloatValue::fromUint64(0xffffffffffffffffULL, false, to))
+            << "target " << static_cast<int>(to);
+        // The int64 arm under an unsigned core — what `~0ULL` folds to — reads
+        // the same.
+        Rig r2;
+        HirNodeId const z  = r2.litInt(0, r2.interner.primitive(TypeKind::U64));
+        HirNodeId const bn = r2.unary(HirOpKind::BitNot, z, r2.interner.primitive(TypeKind::U64));
+        HirNodeId const c2 = r2.cast(bn, r2.interner.primitive(to));
+        Hir hir2 = r2.finishWith(c2);
+        auto res2 = evaluateConstant(hir2, r2.interner, r2.literals, c2, {}, opts);
+        ASSERT_TRUE(res2.value.has_value());
+        EXPECT_TRUE(std::get<WideFloatValue>(res2.value->value)
+                    == WideFloatValue::fromUint64(0xffffffffffffffffULL, false, to));
+    }
+}
+
+// Unary `+` (C 6.5.3.3p2): the operand's VALUE, in the promoted type. It is no
+// core operator, so the CST walker folds it through this verb; the value never
+// changes and the core says what the promotion made of the type.
+TEST(ConstEvalUnsignedModular, UnaryPlusIsTheOperandsValueInThePromotedType) {
+    auto const plus = [](HirLiteralValue const& v) {
+        return detail::applyUnaryPlusInt(v, detail::intUnaryDomain(v, /*charIsUnsigned=*/false));
+    };
+    auto r = plus(lit(TypeKind::U8, 255));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), 255);
+    EXPECT_EQ(r->core, TypeKind::I32) << "`+(unsigned char)255` is the int 255";
+    r = plus(lit(TypeKind::I8, -1));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), -1);
+    EXPECT_EQ(r->core, TypeKind::I32);
+    r = plus(lit(TypeKind::U32, 0xffffffffLL));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), 0xffffffffLL);
+    EXPECT_EQ(r->core, TypeKind::U32) << "an `unsigned int` does not promote";
+    // An operand above INT64_MAX keeps its bits.
+    HirLiteralValue top;
+    top.core  = TypeKind::U64;
+    top.value = std::uint64_t{0x8000000000000000ULL};
+    r = plus(top);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(detail::asIntBits(*r).value_or(0), std::numeric_limits<std::int64_t>::min());
+    EXPECT_EQ(r->core, TypeKind::U64);
+    // No stated type: the identity.
+    r = detail::applyUnaryPlusInt(lit(TypeKind::U8, 255), std::nullopt);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(r->value), 255);
+    EXPECT_EQ(r->core, TypeKind::U8);
+}
+
 // ── D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE / D-CSUBSET-INT128-ICE-CONTEXT-REFUSED ──
 //
 // `asInt64` answers ONE question — "is this value representable as a signed
@@ -2575,4 +2932,57 @@ TEST(ConstEvalAddress, ASequenceDiscardingNothingNeedsNoForm) {
         HirNodeId const e = r.builder.makeSeqExpr(one, r.litInt(42, r.intT()), r.intT());
         expectRefused(evalAddr(r, e, allBut(ConstantForm::CommaOperator)));
     }
+}
+
+// [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]], one width up: a
+// 128-bit constant whose VALUE does not fit 64 bits, narrowed by a cast, is the value
+// modulo 2^N (C 6.3.1.3). The CST walker folded it; this walker asked `asIntBits`,
+// which has no answer for such a value, and refused the cast — so `(unsigned long
+// long)(((unsigned __int128)1 << 64) | 7)` was a constant in an array bound and "not
+// folded" in a static initializer (✔MEASURED 2026-10-10; gcc, clang, AppleClang and
+// MinGW gcc store 7).
+TEST(ConstEvalUnsignedModular, CastOfAWideConstantToAnIntegerKeepsItsLowBits) {
+    struct Row { std::vector<std::uint64_t> limbs; bool isSigned; TypeKind to; std::int64_t bits; };
+    std::uint64_t const ones = ~std::uint64_t{0};
+    std::uint64_t const minusTwoTo100High = ones << 36;   // the high limb of -2^100
+    std::vector<Row> const rows = {
+        Row{{7u, 1u}, false, TypeKind::U64, 7},                 // 2^64 + 7
+        Row{{7u, 1u}, false, TypeKind::I64, 7},
+        Row{{7u, 1u}, false, TypeKind::U32, 7},
+        Row{{7u, 1u}, false, TypeKind::I32, 7},
+        Row{{7u, 1u}, false, TypeKind::U8,  7},
+        Row{{ones, ones}, false, TypeKind::U64, -1},            // 2^128 - 1: the pattern of 2^64-1
+        Row{{ones, ones}, false, TypeKind::I64, -1},
+        Row{{ones, ones}, false, TypeKind::U32, 0xffffffffLL},
+        Row{{0u, minusTwoTo100High}, true, TypeKind::I64, 0},   // -2^100
+        Row{{5u, minusTwoTo100High}, true, TypeKind::I32, 5},   // -2^100 + 5
+    };
+    for (Row const& row : rows) {
+        Rig r;
+        TypeKind const core = row.isSigned ? TypeKind::I128 : TypeKind::U128;
+        HirNodeId const src = r.builder.makeLiteral(
+            r.interner.primitive(core), r.literals.add(wideLit(row.limbs, 128u, row.isSigned, core)));
+        HirNodeId const c = r.cast(src, r.interner.primitive(row.to));
+        EvalOptions opts;
+        opts.refuseOnOverflow = false;      // the static-initializer policy
+        opts.charIsUnsigned   = false;
+        Hir hir = r.finishWith(c);
+        auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+        ASSERT_TRUE(res.value.has_value())
+            << "low limb " << row.limbs[0] << " target " << static_cast<int>(row.to);
+        EXPECT_EQ(detail::asIntBits(*res.value).value_or(0x5A5A), row.bits)
+            << "low limb " << row.limbs[0] << " target " << static_cast<int>(row.to);
+    }
+    // `_Bool` asks the VALUE: 2^64 has no low bit set and is true.
+    Rig r;
+    HirNodeId const src = r.builder.makeLiteral(
+        r.interner.primitive(TypeKind::U128),
+        r.literals.add(wideLit({0u, 1u}, 128u, false, TypeKind::U128)));
+    HirNodeId const c = r.cast(src, r.interner.primitive(TypeKind::Bool));
+    EvalOptions opts;
+    opts.charIsUnsigned = false;
+    Hir hir = r.finishWith(c);
+    auto res = evaluateConstant(hir, r.interner, r.literals, c, {}, opts);
+    ASSERT_TRUE(res.value.has_value());
+    EXPECT_EQ(detail::asBool(*res.value, false), std::optional<bool>{true});
 }

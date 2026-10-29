@@ -168,7 +168,7 @@ function findCli() {
     join(repoRoot, 'build-dbg', 'bin', 'dss', exe),
   ].filter(existsSync);
   if (!candidates.length) {
-    console.error('fatal: no dsscp binary found. Build one, e.g.:\n  cmake --build build --config Debug --target dsscp');
+    console.error('fatal: no dsscp binary found. Build one through DssHarness, e.g.:\n  dssharness build --legs windows-x86_64-debug');
     process.exit(2);
   }
   candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
@@ -354,7 +354,8 @@ function parseRegistry() {
       // ⓘ Both cells are read, and the OLD position is accepted too, because
       // plan-side §3.1 tables were NOT migrated and still lead with the glyph in
       // cell 2. Whichever cell carries a leading ✅ decides; a row cannot have one
-      // in both without `check-anchor-balance`'s ARM 6 refusing the tree.
+      // in both: in a registry row cell 2 is the Priority band, and a Status/Trigger split is the door's
+      // refusal and `dssharness read-anchors --lint`'s report (the retired check-anchor-balance's ARM 6).
       const lead = (c) => (c ?? '').replace(/^[\s*_]+/, '');
       if (/^✅/.test(lead(cells[3])) || /^✅/.test(lead(cells[2]))) closed++;
     }

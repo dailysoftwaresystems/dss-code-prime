@@ -75,6 +75,7 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
   ],
   "relocationAddends": "explicit",
   "inputSectionPlacement": "unit",
+  "weakDefinitionBesideStrong": "yields",
   "relocations": [
     { "name": "R_X86_64_PC32",   "kind": 1, "nativeId": 2  },
     { "name": "R_X86_64_64",     "kind": 2, "nativeId": 1  },
@@ -275,6 +276,7 @@ TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],

@@ -27,6 +27,7 @@
 #include "lsp/schema_cache.hpp"
 #include "lsp/workspace_project.hpp"
 #include "lsp_test_helpers.hpp"
+#include "os_link.hpp"   // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"
 // The ONE test-side env override, hoisted out of the hand-copied duplicates.
 // The local copy that used to sit below carried a note claiming the hoist was
@@ -315,6 +316,51 @@ TEST(WorkspaceProject, EmptyWorkspaceReportsProjectFileNotFound) {
     EXPECT_NE(pref.error().detail.find(ws.path().string()), std::string::npos)
         << "the message must name the directory that was searched; got: "
         << pref.error().detail;
+}
+
+// A DANGLING LINK IS NO PROJECT FILE, on every build: a workspace whose one `.dss-project.json` entry is a
+// dangling link has no project file -- what the MSVC and POSIX builds always answered. libstdc++ on Windows reads
+// a dangling link's own attributes and calls it a regular file, so the MinGW build took it for a manifest and
+// failed to load it ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The link is made by the OS.
+TEST(WorkspaceProject, ADanglingManifestLinkIsNoProjectFile) {
+    ScratchDir ws{Location::Temp, "lsp-ws-dangling"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(ws.path() / "no-such.dss-project.json",
+                                                             ws.path() / "app.dss-project.json",
+                                                             dss::test_support::LinkTo::File));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto pref = resolveWorkspaceLanguagePreference(roots);
+    ASSERT_FALSE(pref.has_value());
+    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
+        << "the workspace whose one manifest is a dangling link answered "
+        << dss::lsp::workspaceProjectErrorName(pref.error().kind);
+}
+
+// A PROJECT FILE THAT CANNOT BE READ IS REFUSED, NAMING IT: a workspace whose `.dss-project.json` entry is a link
+// that names itself (a loop) has a project file the editor cannot read -- never "no project file". A looping link
+// named as no project file is none whatever it reaches, and the search answers as if it were not there.
+TEST(WorkspaceProject, AManifestLinkThatCannotBeReadIsRefusedNamingIt) {
+    ScratchDir ws{Location::Temp, "lsp-ws-loop"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(ws.path() / "app.dss-project.json",
+                                                             ws.path() / "app.dss-project.json",
+                                                             dss::test_support::LinkTo::File));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto pref = resolveWorkspaceLanguagePreference(roots);
+    ASSERT_FALSE(pref.has_value());
+    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::ProjectFileLoadFailed)
+        << "the workspace whose one manifest is a looping link answered "
+        << dss::lsp::workspaceProjectErrorName(pref.error().kind) << ": " << pref.error().detail;
+    EXPECT_NE(pref.error().detail.find("app.dss-project.json"), std::string::npos)
+        << "the refusal does not name the entry: " << pref.error().detail;
+
+    ScratchDir other{Location::Temp, "lsp-ws-loop-other"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(other.path() / "loop", other.path() / "loop",
+                                                             dss::test_support::LinkTo::File));
+    const std::array<fs::path, 1> otherRoots{other.path()};
+    auto none = resolveWorkspaceLanguagePreference(otherRoots);
+    ASSERT_FALSE(none.has_value());
+    EXPECT_EQ(none.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
+        << "a looping link named as no project file answered " << dss::lsp::workspaceProjectErrorName(none.error().kind)
+        << ": " << none.error().detail;
 }
 
 // ★ A MANIFEST NAMING NO TARGET IS REJECTED BY THE SHARED PARSER, NOT BY A

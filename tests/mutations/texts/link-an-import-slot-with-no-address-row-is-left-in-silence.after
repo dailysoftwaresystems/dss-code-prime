@@ -1,0 +1,2 @@
+            if (!absPtr.has_value()) { ++it; continue; }
+            if (false) {

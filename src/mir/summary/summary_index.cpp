@@ -1,7 +1,9 @@
 #include "mir/summary/summary_index.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/common_yield.hpp"           // stateTheLinksAnswers, refusalOf — the fold's one statement and one wording
 #include "link/cross_cu_resolve.hpp"
+#include "link/object_format_schema.hpp"   // ObjectFormatSchema — the link's document
 
 #include <algorithm>
 #include <deque>
@@ -81,6 +83,7 @@ bool isInlineCandidate(SummaryFunction const& f,
 std::optional<SummaryIndex>
 buildSummaryIndex(std::span<ModuleSummary const> summaries,
                   SummaryIndexPolicy const&      policy,
+                  ObjectFormatSchema const&      linkFormat,
                   DiagnosticReporter&            reporter) {
     SummaryIndex out;
     out.deadSymbolsPerModule.resize(summaries.size());
@@ -108,22 +111,65 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
     // externally-visible definitions participate; a Local definition is
     // module-private (C 6.2.2p3) and is neither a winner nor a loser even when
     // it shares a name with an externally-visible symbol elsewhere.
+    //
+    // ★ EACH ROW ENTERS THE FOLD AS THE OTHER TWO DOORS' DEFINITIONS DO (P69
+    // fold 3): its weak KIND stated to the link's document through the one
+    // function they call (`linker::stateTheLinksAnswers`), and a COMMON global
+    // marked as one (`SummaryGlobal::isCommon`, which is `Mir::globalIsCommon`
+    // of the definition). A row is given no SIZE — a summary holds no type —
+    // so among the commons of a name the fold's tie rule elects the first; see
+    // `SummaryGlobal::isCommon` for why nothing reads the difference.
     std::vector<linker::CrossCuDef> defs;
+    // P69 (lane `cs`, the review of fold f26a, F2): the name each alias carries for
+    // its TARGET's definition — what `linker::resolveSettlingCarriedNames` is handed,
+    // as the merge hands it (`mergeCuMirs`): where the link discards a losing copy
+    // whole, an alias of it that goes with it is withdrawn from its name's election,
+    // and this door elects what the merge elects.
+    std::vector<linker::CarriedName> carried;
     for (std::uint32_t m = 0; m < summaries.size(); ++m) {
         for (SummaryFunction const& f : summaries[m].functions) {
             if (f.name.empty() || f.binding == SymbolBinding::Local) continue;
             defs.push_back(linker::CrossCuDef{
                 f.name, f.binding,
                 LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{f.symbol}}});
+            linker::stateTheLinksAnswers(defs.back(), linkFormat, f.weakKind);
         }
         for (SummaryGlobal const& g : summaries[m].globals) {
             if (g.name.empty() || g.binding == SymbolBinding::Local) continue;
             defs.push_back(linker::CrossCuDef{
                 g.name, g.binding,
                 LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{g.symbol}}});
+            linker::stateTheLinksAnswers(defs.back(), linkFormat, g.weakKind);
+            defs.back().tentative = g.isCommon;
+        }
+        // P69 (lane `cs`): an alias is a definition of its name, entered with its
+        // own binding and kind — the merge and the unit linker rank it so too.
+        for (SummaryAlias const& a : summaries[m].aliases) {
+            if (a.name.empty() || a.binding == SymbolBinding::Local) continue;
+            defs.push_back(linker::CrossCuDef{
+                a.name, a.binding,
+                LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{a.symbol}}});
+            linker::stateTheLinksAnswers(defs.back(), linkFormat, a.weakKind);
+            // The target is a definition of this same module, named by its row; a
+            // target that is no weak definition never loses its name to a copy.
+            auto const carry = [&](std::uint32_t symbol, SymbolBinding binding,
+                                   std::optional<WeakDefinitionKind> kind) {
+                if (binding != SymbolBinding::Weak) return;
+                carried.push_back(linker::CarriedName{
+                    defs.size() - 1, a.targetName,
+                    LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{symbol}}, kind, a.weakKind});
+            };
+            for (SummaryFunction const& f : summaries[m].functions) {
+                if (f.name == a.targetName) carry(f.symbol, f.binding, f.weakKind);
+            }
+            for (SummaryGlobal const& g : summaries[m].globals) {
+                if (g.name == a.targetName) carry(g.symbol, g.binding, g.weakKind);
+            }
         }
     }
-    linker::CrossCuResolution const resolution = linker::resolveCrossCuDefs(defs);
+    linker::SettledElection const election =
+        linker::resolveSettlingCarriedNames(defs, carried, linkFormat);
+    linker::CrossCuResolution const& resolution = election.resolution;
 
     for (linker::CrossCuConflict const& c : resolution.conflicts) {
         out.conflictingNames.push_back(c.name);
@@ -136,6 +182,25 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
             c.name, c.existing.cuId.v, c.incoming.cuId.v);
         reporter.report(std::move(d));
     }
+    // The fold's two other refusals, recorded by it as data and worded by the
+    // ONE wording its three doors share (`linker::refusalOf`): a weak
+    // definition the link's format does not let a strong one replace, and a
+    // pair the link's document was asked about and does not decide.
+    auto const reportRefusal = [&](std::string const&     name,
+                                   linker::CrossCuRefusal refusal) {
+        out.conflictingNames.push_back(name);
+        ParseDiagnostic d;
+        d.code     = refusal.code;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "buildSummaryIndex: " + std::move(refusal.text);
+        reporter.report(std::move(d));
+    };
+    for (linker::CrossCuCollision const& c : resolution.collisions) {
+        reportRefusal(c.name, linker::refusalOf(c, linkFormat));
+    }
+    for (linker::CrossCuUndecided const& u : resolution.undecided) {
+        reportRefusal(u.name, linker::refusalOf(u, linkFormat));
+    }
     std::sort(out.conflictingNames.begin(), out.conflictingNames.end());
     out.conflictingNames.erase(
         std::unique(out.conflictingNames.begin(), out.conflictingNames.end()),
@@ -144,7 +209,8 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
     // Turn each winning key back into a (module, index) site. The scan is over
     // the summaries in module order, so a name whose winner cannot be located
     // simply gets no entry — it is then not importable, which is the
-    // conservative outcome.
+    // conservative outcome. (A name an ALIAS won is one such: an alias has no
+    // body of its own to import.)
     for (std::uint32_t m = 0; m < summaries.size(); ++m) {
         for (std::uint32_t i = 0;
              i < static_cast<std::uint32_t>(summaries[m].functions.size()); ++i) {
@@ -208,8 +274,22 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
             for (SummaryFunction const& f : s.functions) {
                 if (!f.name.empty()) (void)nodeFor(f.name);
             }
+            // P69 (lane `cs`): a call to an alias is a call to its target, so an
+            // alias is a node with ONE edge, to the target (added below) — a
+            // cycle that runs through a second name is a cycle.
+            for (SummaryAlias const& a : s.aliases) {
+                if (!a.name.empty()) (void)nodeFor(a.name);
+            }
         }
         std::vector<std::vector<std::uint32_t>> adj(nodeName.size());
+        for (ModuleSummary const& s : summaries) {
+            for (SummaryAlias const& a : s.aliases) {
+                if (a.name.empty() || a.targetName.empty()) continue;
+                auto const to = nodeOf.find(a.targetName);
+                if (to == nodeOf.end()) continue;   // a global's alias — no call node
+                adj[nodeOf.at(a.name)].push_back(to->second);
+            }
+        }
         for (ModuleSummary const& s : summaries) {
             for (SummaryFunction const& f : s.functions) {
                 if (f.name.empty()) continue;
@@ -306,6 +386,11 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
                 auto& v = unionRefs[g.name];
                 v.insert(v.end(), g.initSymbolRefs.begin(), g.initSymbolRefs.end());
             }
+            // P69 (lane `cs`): reaching an alias reaches its target.
+            for (SummaryAlias const& a : s.aliases) {
+                if (a.name.empty() || a.targetName.empty()) continue;
+                unionRefs[a.name].push_back(a.targetName);
+            }
         }
 
         std::deque<std::string> worklist;
@@ -324,6 +409,15 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
                 if (!g.name.empty()
                     && isExternallyVisible(g.binding, g.visibility))
                     markLive(g.name);
+            }
+            // P69 (lane `cs`): an externally visible alias is a root, and EVERY
+            // alias roots its target whatever its own binding — the rule DCE
+            // holds (an alias is written as a row on its target's definition, so
+            // no target of one is ever deleted).
+            for (SummaryAlias const& a : s.aliases) {
+                if (!a.name.empty() && isExternallyVisible(a.binding, a.visibility))
+                    markLive(a.name);
+                markLive(a.targetName);
             }
         }
         // Phases 2+3 — one worklist covers both. `unionRefs` already merges a

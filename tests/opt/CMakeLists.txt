@@ -24,6 +24,9 @@ dss_add_test(NAME opt/test_licm            SOURCES test_licm.cpp)
 dss_add_test(NAME opt/test_inlining        SOURCES test_inlining.cpp)
 dss_add_test(NAME opt/test_inline_growth_budget
              SOURCES test_inline_growth_budget.cpp)
+# Only the LAST optimization stage a module receives reports a truncated fixpoint, and every production route
+# lowers a module only after its Program stage (the stage topology's seam).
+dss_add_test(NAME opt/test_fixpoint_report_stage SOURCES test_fixpoint_report_stage.cpp)
 dss_add_test(NAME opt/test_compile_options SOURCES test_compile_options.cpp)
 dss_add_test(NAME opt/test_mir_alias       SOURCES test_mir_alias.cpp)
 dss_add_test(NAME opt/test_mir_memory_clobbers SOURCES test_mir_memory_clobbers.cpp)
@@ -49,3 +52,16 @@ dss_add_test(NAME opt/test_inline_asm_rebuild_carriage
 # cost every helper a call for a replacement that cannot happen.
 dss_add_test(NAME opt/test_preemptible_definition_not_inlined
              SOURCES test_preemptible_definition_not_inlined.cpp)
+
+# D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: DCE's roots follow
+# what the module IS to the link that completes it (`opt::ModuleExtent`) — a
+# LinkInput keeps every external-linkage definition, hidden ones included; only
+# a WholeImage may delete a hidden definition nothing reaches, and it keeps the
+# entry it is handed. Hand-built MIR: format-blind, every host.
+dss_add_test(NAME opt/test_dce_module_extent
+             SOURCES test_dce_module_extent.cpp)
+
+# P69 (lane `cs`): a second name of a definition (`Mir::aliases`) roots it — a module-private target only an alias
+# names survives DCE, whatever the alias's own binding. Hand-built MIR: format-blind, every host.
+dss_add_test(NAME opt/test_dce_alias_root
+             SOURCES test_dce_alias_root.cpp)

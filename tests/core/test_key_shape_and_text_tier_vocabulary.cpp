@@ -466,7 +466,7 @@ struct HirAttrVocabulary {
 // Everything else is the minimum a module needs, so a diagnostic can only be
 // about the hole.
 [[nodiscard]] std::string mirGlobalModule(std::string_view globalTail) {
-    return std::string{"dssir 3\n"
+    return std::string{"dssir 7\n"
                        "symbols { %1 \"f\" %2 \"g\" }\n"
                        "module {\n"
                        "  global %2 : "} + std::string{globalTail} + "\n"
@@ -507,10 +507,14 @@ TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
 // message says, so a projection that lost half its rows would still satisfy
 // every loop — which is why this number moves deliberately with the table and
 // is not softened into a `>=`.
+// ⓘ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): 38 → 52, the
+// fourteen GNU-builtin verbs — first_argument, parity, trap, prefetch, infinity, quiet_nan,
+// alloca, object_size, add/sub/mul_overflow and add/sub/mul_overflow_p; a growth, and the
+// walk below proves each is accepted.
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
         "c", "/semantics/builtinFunctions/0/lowering",
-        "unknown builtin lowering", 38, "semantics.builtinFunctions[0].lowering");
+        "unknown builtin lowering", 52, "semantics.builtinFunctions[0].lowering");
 }
 
 // ★★ THE `.dsshir` ATTRIBUTE VOCABULARIES. Six sets that each used to exist
@@ -520,22 +524,22 @@ TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
 TEST(TextTierVocabulary, EveryHirAttributeRefusalAdvertisesExactlyWhatItAccepts) {
     constexpr HirAttrVocabulary kVocabularies[] = {
         {"ffi linkage",
-         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
+         "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi linkage", 3},
         {"ffi visibility",
-         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
+         "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi visibility", 3},
         {"shader stage",
-         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
+         "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader stage", 7},
         {"shader builtin",
-         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
+         "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader builtin", 12},
         {"transpile idiom",
-         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
+         "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
          ")\n  extern_global %1 : i32\n}\n", "unknown transpile idiom", 6},
         {"diag recovery",
-         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
+         "dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
          ")\n  extern_global %1 : i32\n}\n", "unknown diag recovery", 4},
     };
 
@@ -590,7 +594,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
     // in the test. Found only because a sibling pin added a POSITIVE control and
     // the control reddened; the negative arm alone can never see this.
     auto const module = [](std::string_view marker) {
-        return std::string{"dssir 3\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -676,7 +680,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
 // anchored for later.
 TEST(TextTierVocabulary, UnknownMirCallingConventionIsRefusedAndNamesTheAcceptedSet) {
     auto const module = [](std::string_view cc) {
-        return std::string{"dssir 3\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void cc "} +
@@ -978,7 +982,7 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
 // is this file's own rule, written beside the inline-asm arm.
 TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
     auto const module = [](char const* arms, char const* extraBlock) {
-        return std::string{"dssir 3\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1017,7 +1021,7 @@ TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
 // SILENT. `%b`, `%vx`, `%b3x` all fell out of the prefix-stripping loop as 0.
 TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 3\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1060,7 +1064,7 @@ TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
 // crash is not a guard.
 TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 3\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1093,7 +1097,7 @@ TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
 // the two arms pinned above were being converted in the same file.
 TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility) {
     auto const module = [](std::string_view attr) {
-        return std::string{"dssir 3\n"
+        return std::string{"dssir 7\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void ["} + std::string{attr} + "] {\n"
@@ -1108,9 +1112,16 @@ TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility
     ASSERT_FALSE(msg.empty()) << "an unknown function attribute must be refused.";
     auto advertised = quotedTokens(msg);
     std::erase(advertised, std::string{kBadSpelling});
-    // 3 bindings + 4 visibilities + the 6 text-format keywords this file owns
-    // (P44 lane h joined `initbefore` / `initafter`).
-    EXPECT_EQ(advertised.size(), 13u)
+    // 4 binding spellings + 4 visibilities + the 6 text-format keywords this
+    // file owns (P44 lane h joined `initbefore` / `initafter`).
+    // P69 fold 3 (`.dssir` version 6): a binding is advertised as the SPELLINGS a
+    // list can state — `local`, `global`, and the weak one once per kind of weak
+    // definition with the kind as its argument (`weak(overridable)`,
+    // `weak(select-any)`), the only form of it the reader takes. The first shape
+    // of the version-6 sentence advertised `weak` and the two kind names as three
+    // words, and the loop below said so on three legs: "the refusal advertises
+    // attribute 'overridable' and the reader then calls it UNKNOWN".
+    EXPECT_EQ(advertised.size(), 14u)
         << "the advertised function-attribute set changed size — a SHRINK means "
            "an attribute the reader takes stopped being advertised.\nmessage:\n  "
         << msg;
@@ -1180,7 +1191,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 // constant in the reader's translation unit, so the two ends cannot drift.
 TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
     auto const text =
-        std::string{"dsshir 6\nproducer \"\"\n"
+        std::string{"dsshir 9\nproducer \"\"\n"
                     "symbols { %1 \"g\" }\n"
                     "module [] \"probe\" {\n"
                     "  global %1 : i32 = lit unspelled_aggregate : i32\n"
@@ -1224,7 +1235,7 @@ namespace {
 
 // A `.dsshir` module whose single function body is `bodyLine`.
 [[nodiscard]] std::string hirBody(std::string_view bodyLine) {
-    return std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string{"dsshir 9\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      "}
          + std::string{bodyLine} + "\n      return void\n    }\n  }\n}\n";
 }
@@ -1331,7 +1342,7 @@ TEST(TextTierVocabulary, EveryAdvertisedNodeKeywordIsRecognizedByTheReader) {
         << "an unrecognized node keyword must be refused BY NAME, as `"
         << refusalNaming(kBadSpelling) << "`.";
     auto const advertised = advertisedIn(msg);
-    // 28 statement keywords + 26 expression keywords.
+    // 28 statement keywords + 27 expression keywords.
     // ⓘ 23 → 25 on 2026-08-23 (cycle P28, lane Z): `builtincall` and `labeladdr`
     // were WRITTEN by `emitExpr` and advertised by neither table — the same
     // write-only shape as the `va_*` hole this arm was built for, two arms over
@@ -1342,7 +1353,11 @@ TEST(TextTierVocabulary, EveryAdvertisedNodeKeywordIsRecognizedByTheReader) {
     // kind (D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE).
     // ✔MEASURED before the number moved: on the WSL leg this arm reported 54
     // advertised and every one of them — `rmw` included — passed the loop below.
-    EXPECT_EQ(advertised.size(), 54u)
+    // ⓘ 26 → 27 on 2026-09-30 (cycle P69, lane `cs`): `unnamed`, the `UnnamedObject`
+    // kind (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT) — a growth;
+    // the loop below proves the new spelling is recognized. 27 → 28 the same day, the
+    // same lane: `va_copy`, the `VaCopy` kind (D-C-STDARG-VA-COPY-MISSING).
+    EXPECT_EQ(advertised.size(), 56u)
         << "the advertised node-keyword set changed size. A SHRINK means a "
            "keyword the reader dispatches stopped being advertised — or, worse, "
            "stopped being routed.\nmessage:\n  " << msg;
@@ -1560,5 +1575,37 @@ TEST(ReferencedDocumentSurface, TheRefusalNamesEveryBlockTheLoopLetsThrough) {
             << "the refusal advertises '" << key
             << "' as a block a referenced document may declare, and the loader "
                "then refuses it as unconsumed.";
+    }
+}
+
+// ★ THE GLOBAL-ATTRIBUTE REFUSAL, the function one's sibling (P69 fold 3b): every attribute its sentence advertises —
+// the bindings and visibilities PROJECTED off the tables the lookups use, and the words `tentative`, `const`,
+// `threadlocal` and `align=<bytes>` — is one the reader takes, fed back alone on a global; `align=<bytes>` as
+// `align=8`. `tentative` is the word a `.dssir` global states a tentative definition by, the mark
+// `Mir::globalIsCommon` reads to write it as a COMMON.
+TEST(TextTierVocabulary, MirGlobalAttributeRefusalAdvertisesExactlyWhatItAccepts) {
+    auto const module = [](std::string_view attr) { return mirGlobalModule("i32 [" + std::string{attr} + "] = zero"); };
+
+    auto const msg = mirRefusal(module(kBadSpelling), "unknown global attribute");
+    ASSERT_FALSE(msg.empty()) << "an unknown global attribute must be refused:" << mirDiagnostics(module(kBadSpelling));
+    auto advertised = quotedTokens(msg);
+    std::erase(advertised, std::string{kBadSpelling});
+    // 4 binding spellings (`local`, `global`, `weak(overridable)`, `weak(select-any)`) + 4 visibilities + the four
+    // words this tier owns.
+    EXPECT_EQ(advertised.size(), 12u)
+        << "the advertised global-attribute set changed size — a SHRINK means an attribute the reader takes stopped "
+           "being advertised.\nmessage:\n  "
+        << msg;
+
+    constexpr std::string_view kBytesHole = "=<bytes>";
+    for (auto name : advertised) {
+        SCOPED_TRACE(name);
+        if (name.ends_with(kBytesHole)) name = name.substr(0, name.size() - kBytesHole.size()) + "=8";
+        EXPECT_TRUE(mirRefusal(module(name), "unknown global attribute").empty())
+            << "the refusal advertises attribute '" << name << "' and the reader then calls it UNKNOWN.";
+        DiagnosticReporter r;
+        auto const         res = dss::parseMir(module(name), CompilationUnitId{1}, r);
+        EXPECT_TRUE(res->ok) << "a global carrying the advertised attribute '" << name << "' alone must parse:"
+                             << mirDiagnostics(module(name));
     }
 }

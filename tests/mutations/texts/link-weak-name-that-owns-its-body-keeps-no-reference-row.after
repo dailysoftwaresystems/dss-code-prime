@@ -1,0 +1,2 @@
+            bool const     ownsItsAtom = ownerSymbolId[i] == candidates[i].symbolId;
+            if (ownsItsAtom) continue;   // a weak name that owns its body keeps no row of its own

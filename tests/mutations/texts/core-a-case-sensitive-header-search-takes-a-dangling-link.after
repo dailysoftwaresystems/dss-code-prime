@@ -1,0 +1,1 @@
+        if (!existsOnce(cache, candidate) && !listsExactly(cache, dir, name.native())) return HeaderSearchResult::notFound();

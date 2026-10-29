@@ -80,6 +80,8 @@ import threading
 import time
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
+
 # A cp1252 console turns a printed glyph into a traceback or a mangled byte; reconfigure BOTH
 # streams at IMPORT, the property `guard_output_encoding_guard` ratchets for every Python
 # primary program -- this one joined that population when the action index began covering
@@ -374,14 +376,37 @@ def run_entry(entry_dir, dsscp, tree_root, heartbeat):
     return rc == 0 and emitted > 0
 
 
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree",
+                            "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("manual-end-to-end: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tree-root", required=True)
+    ap.add_argument("--tree-root", required=True, type=_path_types().read_path_arg("--tree-root"))
     ap.add_argument("--only", metavar="PATH_OR_NAME",
                     help="an entry's path under the corpus root, e.g. "
                          "c/branch_island_arm64_edge - or its bare leaf name "
-                         "when that is unambiguous")
-    ap.add_argument("--dsscp")
+                         "when that is unambiguous", type=_path_types().text_arg("--only"))
+    ap.add_argument("--dsscp", type=_path_types().read_path_arg("--dsscp", empty_means_absent=True))
     ap.add_argument("--heartbeat", type=float, default=HEARTBEAT_DEFAULT)
     args = ap.parse_args()
 

@@ -227,6 +227,7 @@ TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -260,6 +261,7 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -349,6 +351,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -574,7 +577,9 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 2, "jumpSlot": 5, "relative": 3},
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
         "pageAlign": 4096, "interpreter": "/lib/ld-linux-riscv64-lp64d.so.1", "bindNow": true
       },
@@ -1138,7 +1143,8 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "entryPoint": "sym_42",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1183,7 +1189,8 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "entryPoint": "sym_99",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1259,7 +1266,8 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
@@ -1290,7 +1298,8 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -1320,8 +1329,10 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "entryPoint": "",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
         "pageAlign":4096,
         "interpreter":"/lib64/ld-linux-x86-64.so.2",
@@ -1764,7 +1775,7 @@ TEST(ElfExecFormatJsonValidate, AbsoluteWithAddendBiasRejected) {
       "dssTargetVersion": 1,
       "target": {"name":"bad-bias"},
       "relocations":[
-        { "name": "weird", "kind": 1, "pcRelative": false, "addendBias": -4, "widthBytes": 4 }
+        { "name": "weird", "kind": 1, "pcRelative": false, "addendBias": -4, "widthBytes": 4, "fieldRange": "signed" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");
@@ -1779,7 +1790,7 @@ TEST(ElfExecFormatJsonValidate, AddendBiasOverflowWidthRejected) {
       "dssTargetVersion": 1,
       "target": {"name":"bias-overflows-width"},
       "relocations":[
-        { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 70000, "widthBytes": 4 }
+        { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 70000, "widthBytes": 4, "fieldRange": "signed" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");
@@ -1790,7 +1801,7 @@ TEST(ElfExecFormatJsonValidate, AddendBiasOverflowWidthRejected) {
           "dssTargetVersion": 1,
           "target": {"name":"bias-overflows-width-2"},
           "relocations":[
-            { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 2147483647, "widthBytes": 4 }
+            { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 2147483647, "widthBytes": 4, "fieldRange": "signed" }
           ],
           "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
         })");
@@ -1891,6 +1902,7 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
@@ -1931,6 +1943,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1959,6 +1972,7 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -2056,6 +2070,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
       "sections":[
@@ -2107,6 +2122,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
       "sections":[
@@ -2222,6 +2238,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -2293,7 +2310,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -2353,7 +2371,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -2894,35 +2913,37 @@ TEST(ElfExecWriter, BssSectionEmittedNobitsWritable) {
            "memory, not file bytes)";
 }
 
-TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
-    // Fail-loud: a rodata item carrying its OWN relocations (data->data
-    // reference) is deferred this cycle — the ELF writer patches
-    // FUNCTION relocations only. Cited anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
+TEST(ElfExecWriter, RodataDataItemWithRelocationIsPatchedInPlace) {
+    // D-LK1-ELF-RODATA-DATAITEM-RELOC (closed in P69 fold 3c): a READ-ONLY item
+    // carrying its OWN relocation — what the ELF object reader makes of gcc's jump
+    // table in `.rodata` — is laid out WITH it, and the static image patches it in
+    // place as it patches `.data`'s items. `.rodata` stays read-only. Until fold
+    // 3c this arm refused the item.
     auto loaded = loadShipped();
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // `ret` at .text+0
     AssembledData d;
     d.symbol    = SymbolId{42};
     d.section   = DataSectionKind::Rodata;
-    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};    // 8-byte pointer slot
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};    // 8-byte slot, patched below
     d.alignment = Alignment::of<8>();
     Relocation r;
-    r.offset = 0; r.target = SymbolId{1}; r.kind = RelocationKind{2};
+    r.offset = 0; r.target = SymbolId{1}; r.kind = RelocationKind{2};   // abs64 to the function
     d.relocations.push_back(r);
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
-    for (auto const& diag : rep.all()) {
-        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
-         && diag.actual.find("D-LK1-ELF-RODATA-DATAITEM-RELOC")
-                != std::string::npos) {
-            sawCode = true;
-        }
-    }
-    EXPECT_TRUE(sawCode)
-        << "rodata dataItem with relocations must fail loud citing "
-           "D-LK1-ELF-RODATA-DATAITEM-RELOC";
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "a read-only item with a relocation is laid out, not refused";
+    ASSERT_FALSE(bytes.empty());
+    int const rodataIdx = findSectionByName(bytes, ".rodata");
+    ASSERT_GE(rodataIdx, 0) << "the item rides `.rodata`";
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const rodataOff = readU64LE(bytes, shoff + rodataIdx * 64 + 24);
+    EXPECT_EQ(readU64LE(bytes, shoff + rodataIdx * 64 + 8) & 1u, 0u) << "`.rodata` has no SHF_WRITE";
+    auto const* secText = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(secText, nullptr);
+    EXPECT_EQ(readU64LE(bytes, rodataOff), secText->virtualAddress)
+        << "the read-only slot is patched in place with the function's VA";
 }
 
 TEST(ElfExecWriter, RelRoConstItemFoldsIntoDataAndPatchesInPlace) {
@@ -2975,9 +2996,10 @@ TEST(ElfExecWriter, ElfRelAcceptsRodataDataItem) {
     // exec-only" reject is LIFTED. The item lands in `.rodata`
     // (sh_addr=0) with a section-relative `.symtab` symbol the final linker
     // binds. (The section-relative data-symbol shape is pinned by
-    // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a data item
-    // WITH its own relocation still fails loud — the D-LK1-ELF-RODATA-DATAITEM-RELOC
-    // test above.) RED if the ELF writer reverts to rejecting ET_REL data.
+    // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a rodata item
+    // WITH its own relocation writes `.rela.rodata` since P69 fold 3c —
+    // ElfWriter.RodataItemWithRelocationsWritesItsOwnRelaRodata.) RED if the ELF
+    // writer reverts to rejecting ET_REL data.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");

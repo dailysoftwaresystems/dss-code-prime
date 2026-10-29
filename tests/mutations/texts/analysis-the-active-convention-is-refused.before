@@ -1,0 +1,2 @@
+            if (std::ranges::find(row->conventions, active)
+                != row->conventions.end()) {

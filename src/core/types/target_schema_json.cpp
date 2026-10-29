@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstdint>
@@ -1418,7 +1419,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // that depends on the ISA (x86's `%~`) reads.
     // 22 -> 23 (P68 round 9): `pcRelativeMemoryBase`, the program counter as a
     // memory base (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
-    static constexpr std::array<std::string_view, 23> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 24> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -1470,6 +1471,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // the load refuses rather than the runtime.
         "atomics",
         "callingConventions",
+        // The convention ids this target's reference compilers give a meaning
+        // and this compiler does not implement — what makes a source-level
+        // convention name REFUSED rather than warned-and-ignored. See
+        // `TargetSchemaData::unimplementedCallingConventions`.
+        "unimplementedCallingConventions",
         // What a LINKER may build, and clobber, to carry a branch past its
         // field's reach — the ABI's grant, per relocation kind
         // (D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH).
@@ -1680,10 +1686,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 10> kRelocationKeys{
+            static constexpr std::array<std::string_view, 11> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
                 "addendBias", "tls", "imageRelative", "scaleLog2",
-                "gotSlotTwin"};
+                "gotSlotTwin", "fieldRange"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1791,6 +1797,28 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     return false;
                 }
                 info.imageRelative = r.at("imageRelative").get<bool>();
+            }
+            // P69 fold 3c: `fieldRange` — the values a narrow Linear field
+            // holds (`RelocFieldRange`). Read here; WHICH rows must state it
+            // and which may not is `TargetSchema::validate()`'s, which a
+            // programmatically-built schema also reaches.
+            if (r.contains("fieldRange")) {
+                auto const path = std::format("/relocations/{}/fieldRange", i);
+                if (!r.at("fieldRange").is_string()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'fieldRange' must be a string: 'signed', 'unsigned' "
+                           "or 'either'");
+                    return false;
+                }
+                auto const spelled = r.at("fieldRange").get<std::string>();
+                auto const range = kRelocFieldRangeTable.fromName(spelled);
+                if (!range.has_value()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'fieldRange' '{}' is none of 'signed', "
+                                       "'unsigned', 'either'", spelled));
+                    return false;
+                }
+                info.fieldRange = *range;
             }
             // P68 round 9: `scaleLog2` — the access size a SCALED page-offset
             // field is measured in (`TargetRelocationInfo::scaleLog2`). The
@@ -4578,7 +4606,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 28> kCallConvKeys{
+                static constexpr std::array<std::string_view, 27> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "callerSaved", "calleeSaved",
@@ -4587,7 +4615,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     // per register class. Absent ⇒ the whole register.
                     "calleeSavedPreservedBits",
                     "stackAlignment", "shadowSpaceBytes", "redZoneBytes",
-                    "entryStackPointerBias", "callPushBytes",
+                    // ★ `entryStackPointerBias` IS DELIBERATELY ABSENT, so a
+                    // document still declaring it is REFUSED AT LOAD: the
+                    // process-entry bias is derived from the exec format's
+                    // `entryTransition` and `callPushBytes`, and a convention
+                    // carrying its own would be a second owner
+                    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+                    "callPushBytes",
                     "stackProbePageBytes", "aggregateMaxRegBytes",
                     "aggregateClassification", "slotAligned",
                     "variadicArgsAlwaysStack",
@@ -4776,19 +4810,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
                 readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
-                // D-LK10-ENTRY-TRAMP-PROLOGUE: process-entry RSP bias
-                // when this cc is the entry cc. See target_schema.hpp
-                // for the per-cc concrete values. Validated below
-                // (must be < stackAlignment when set).
-                readBoundedInt(c, coll, ccPath, "entryStackPointerBias",
-                               cc.entryStackPointerBias);
                 // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: ISA-level
                 // call-instruction RSP-push width. x86_64 = 8 (CALL
                 // pushes 8-byte return address); ARM64 = 0 (BL writes
                 // LR, no push). Validated below: must be strictly <
                 // `stackAlignment` (the bias is an OFFSET into the
-                // alignment quantum, parallel to `entryStackPointerBias`'s
-                // contract).
+                // alignment quantum). Also the entry trampoline's
+                // process-entry bias wherever the exec format's
+                // `entryTransition` says the loader CALLS the entry
+                // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
                 // D-WIN64-LARGE-FRAME-STACK-PROBE: OS stack guard-page
@@ -5495,6 +5525,55 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.callingConventions.push_back(std::move(cc));
+            }
+        }
+    }
+
+    // ── unimplementedCallingConventions (P69 round 4, lane `cs`) ──
+    // The convention ids a reference compiler of this target emits and this
+    // compiler does not. Read AFTER `callingConventions`, because the one
+    // cross-check it owes needs the rows: an id is a convention this compiler
+    // EMITS or one it does NOT, and a document saying both would make a
+    // source-level name both the active-or-refused kind and the
+    // always-refused kind — the analyzer asks the rows first, so the second
+    // listing would be dead text that reads as a fact. Duplicates are refused
+    // for the same reason every id list here refuses them: a repeat is a typo
+    // or a bad merge, never information.
+    if (doc.contains("unimplementedCallingConventions")) {
+        auto const& uc = doc.at("unimplementedCallingConventions");
+        if (!uc.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/unimplementedCallingConventions",
+                      "'unimplementedCallingConventions' must be an array of "
+                      "calling-convention ids (strings)");
+        } else {
+            for (std::size_t i = 0; i < uc.size(); ++i) {
+                auto const path =
+                    std::format("/unimplementedCallingConventions/{}", i);
+                if (!uc[i].is_string() || uc[i].get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "each entry must be a non-empty calling-convention "
+                              "id");
+                    continue;
+                }
+                auto id = uc[i].get<std::string>();
+                if (data.callingConventionIndex.find(id)
+                    != data.callingConventionIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is a row of 'callingConventions' — a "
+                                  "convention this target EMITS cannot also be "
+                                  "listed as one it does not implement", id));
+                    continue;
+                }
+                if (std::ranges::find(data.unimplementedCallingConventions, id)
+                    != data.unimplementedCallingConventions.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("duplicate unimplemented "
+                                          "calling-convention id '{}'", id));
+                    continue;
+                }
+                data.unimplementedCallingConventions.push_back(std::move(id));
             }
         }
     }

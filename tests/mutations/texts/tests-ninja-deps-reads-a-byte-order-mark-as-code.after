@@ -1,0 +1,1 @@
+    text = text[0:] if text.startswith("\ufeff") else text

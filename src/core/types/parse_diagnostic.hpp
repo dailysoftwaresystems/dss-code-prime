@@ -2601,6 +2601,185 @@ enum class DiagnosticCode : std::uint16_t {
     // diagnostic the constraint asks for. A WARNING, suppressible; `--warnings-as-errors`
     // restores the refusal. `.actual` is the comma expression.
     S_StaticInitializerUsesTheCommaOperator = 0xE08B,
+    // P69 (lane `cs`, D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR):
+    // a C23 compound literal's storage-class specifiers are not ones its "as if" definition
+    // `SC typeof(T) ID = { IL };` admits in the literal's own scope (C23 6.5.3.6p4) — a
+    // specifier the declaration row of that scope does not map (`register` outside every
+    // function body, C 6.9p2), or ONE specifier named twice (6.5.3.6 footnote 97, which a
+    // declaration's own specifier prefix does not share: clang accepts `static static int
+    // g;`). ✔MEASURED gcc 13.3.0 -std=c2x, the one reference that builds these literals:
+    // "file-scope compound literal specifies 'register'", "duplicate 'static'" (probe-
+    // reference-cc run 20260930-212815-0195cf2c). The other constraints the definition would
+    // break keep their own codes (two storage classes: S_ConflictingStorageClassSpecifiers; a
+    // block-scope `thread_local` without `static`: S_ThreadLocalRequiresStaticOrExtern). An
+    // ERROR: the literal's storage duration is then unknown. `.actual` names the specifier.
+    S_CompoundLiteralStorageClassInvalid  = 0xE08C,
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): an operand a
+    // builtin requires to be an INTEGER CONSTANT EXPRESSION (in its declared range) is not
+    // one — `__builtin_object_size`'s `type` (0..3) — or `__builtin_nan`'s operand is not a
+    // string literal in a language naming no library function to call instead. ✔MEASURED
+    // gcc 13.3.0 and clang 18.1.3 refuse the first (lane `cs`'s probe r5s s33). An ERROR:
+    // the answer cannot be computed. `.actual` names the builtin and the operand's role.
+    S_BuiltinArgumentNotConstant          = 0xE08D,
+    // P69 (lane `cs`): a type-generic checked-arithmetic builtin (`__builtin_add_overflow`)
+    // given an operand that is not an integer, a result operand that does not point to a
+    // modifiable integer object, or not three operands. ✔MEASURED gcc 13.3.0 and clang
+    // 18.1.3 refuse a `double *` result (r5s s34); clang accepts `_Bool *` and enumeration
+    // results, which DSS therefore accepts. An ERROR. `.actual` names the operand.
+    S_BuiltinOverflowOperandType          = 0xE08E,
+    // P69 (lane `cs`): a LIBRARY builtin (`__builtin_strlen`) whose library function the
+    // translation unit does not declare and the platform does not provide on this target —
+    // no shipped descriptor declares it, or not on this object format. An ERROR at the use:
+    // the call has no function to bind and no signature to type it by. `.actual` names the
+    // spelling, the library function and the reason.
+    S_LibraryBuiltinUnavailable           = 0xE08F,
+    // P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    // a DECIMAL integer constant past every SIGNED type its suffix admits
+    // (`9223372036854775808`, `...L`, `...LL` in C) is read as the language's declared
+    // `decimalPastRange` type (`unsigned long long`). C 6.4.4p2 makes the constant a
+    // constraint violation, so a diagnostic is required; a WARNING, because the
+    // literal is typed and compiled — ✔MEASURED clang 18.1.3 ("interpreting as
+    // unsigned", -Wimplicitly-unsigned-literal) and gcc 13.3.0 ("so large that it is
+    // unsigned") both warn and build (lane `cs`'s probe x3). The phase-4 twin is
+    // P_PreprocessorIfLiteralImplicitlyUnsigned. `.actual` names the literal and the type.
+    S_IntegerLiteralImplicitlyUnsigned    = 0xE090,
+    // P69 round 4 (lane `cs`): a KNOWN attribute this compiler cannot honour where
+    // it is written — the language document knows the name, knows it CHANGES what
+    // is compiled, and there is no mechanism to apply it. Three reasons reach this
+    // one code, and `.actual` names the attribute and says which:
+    //   * an `unsupported` row of the attribute table (`vector_size`, `mode`): the
+    //     attribute changes the declared TYPE — the row's own `reason` is quoted;
+    //   * a `callingConvention` row naming a convention of the active target that
+    //     is NOT the one the pair compiles for (`ms_abi` under SysV): the call
+    //     sequence would be the wrong one;
+    //   * a `callingConvention` row judged with NO pair in scope (a direct-API
+    //     caller): there is nothing to compare the name against.
+    // ✔MEASURED before this code existed: each was an `S_UnknownAttribute` /
+    // `H_UnknownLinkageSpecifier` WARNING and the program compiled — `typedef int v4
+    // __attribute__((vector_size(16)));` to a 4-byte type where gcc 13.3.0 and
+    // clang 18.1.3 give 16, `int x __attribute__((mode(DI)));` to 4 bytes where
+    // both give 8, and an `ms_abi` function was called with the SysV sequence. A
+    // warning beside a wrong size is a wrong size. DISTINCT from the unknown-name
+    // codes on purpose: this attribute is not unknown, and telling the author it
+    // is would send them looking for a typo. An ERROR, and UNSUPPRESSABLE
+    // (`unsuppressable_codes.cpp`) — a suppressed refusal here is the silent wrong
+    // type it replaces.
+    S_AttributeNotHonoured                = 0xE091,
+    // P69 (lane `cs`): a file-scope TENTATIVE definition of an array of unknown size
+    // (`int v[];`) that no later declaration of the unit completes. C 6.9.2p2: at
+    // the end of the unit it is completed with ONE element, initialized to zero — a
+    // WARNING, the one gcc 13.3.0 ("array 'v' assumed to have one element") and
+    // clang 18.1.3 ("tentative array definition assumed to have one element") both
+    // give, and the program builds and runs on both (✔MEASURED, probe fs). cl reads
+    // `int v[];` as an undefined external instead; that MEANING split is decided by
+    // ISO 6.9.2 and the two references that read it so. `.actual` names the object.
+    S_TentativeArrayAssumedOneElement     = 0xE092,
+    // P69 (lane `cs`): `sizeof` of an ARRAY OF UNKNOWN SIZE (an `extern int a[]`, a
+    // flexible array member, the type name `int[]`, `*p` of an `int (*p)[]`). A
+    // constraint violation in ISO C (6.5.3.4p1) and refused by gcc 13.3.0 and clang
+    // 18.1.3; ACCEPTED by MSVC 19.51, documented as warning C4034 "sizeof returns 0",
+    // and the program runs (✔MEASURED, probe sz). The disjunction decides acceptance,
+    // so the language document states the result (`sizeof.incompleteArraySize`) and
+    // this WARNING names cl's extension. `.actual` names the operand's type.
+    S_SizeofIncompleteArrayIsZero         = 0xE093,
+    // P69 (lane `cs`): `sizeof` of an incomplete type no reference sizes — an
+    // incomplete structure, union or enumeration, or an array of unknown size where
+    // the language states no size for one. ✔MEASURED, gcc 13.3.0, clang 18.1.3 and
+    // MSVC 19.51 (C2027) all refuse `sizeof(struct S)` of an incomplete `struct S`.
+    // Before this code the refusal came from the HIR tier, as a lowering it could
+    // not perform; it is a constraint of the expression (C 6.5.3.4p1), named where
+    // the expression is typed. `.actual` names the type.
+    S_SizeofIncompleteType                = 0xE094,
+    // P69 (lane `cs`): an array whose ELEMENT is an array of unknown size —
+    // `int a[3][]`, `int (*p)[2][]`. C 6.7.6.2p1: "The element type shall not be an
+    // incomplete or function type"; only the outermost bound of an array may be
+    // omitted. Refused by gcc 13.3.0 and clang 18.1.3 ("array type has incomplete
+    // element type").
+    S_ArrayElementTypeIncomplete          = 0xE095,
+    // P69 (lane `cs`): an `alias("target")` attribute whose target cannot be the
+    // definition the declared entity becomes a second name of — no definition of
+    // that symbol name in the unit, a cycle of aliases, an empty name, a common, a
+    // thread-local and a non-thread-local storage, or an argument that is not one
+    // string. Every case is refused by gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc
+    // 13.2.0 (✔MEASURED, probes al2 and al3) except the thread-local mismatch, which
+    // this compiler refuses because the two storages cannot be one. `.actual` names
+    // the alias, the target and which. An ERROR, UNSUPPRESSABLE: silenced, the
+    // declared name would stay a reference by name and link to whatever another unit
+    // defines under it.
+    S_SymbolAliasTargetInvalid            = 0xE096,
+    // P69 (lane `cs`): an object alias written WITH an initializer (`extern int f
+    // __attribute__((alias("g"))) = 40;`). gcc 13.3.0 and mingw-w64 gcc 13.2.0 keep
+    // the alias and drop the initializer, warned; clang 18.1.3 refuses. gcc's reading
+    // is the one taken — the alias stands, the initializer is ignored, and this
+    // WARNING says so. `.actual` names the object.
+    S_SymbolAliasInitializerIgnored       = 0xE097,
+
+    // P69 (lane `lm`, a review of the statement-expression fold, its C): a `goto`, or a
+    // `case` / `default` label of a `switch`, whose target stands inside a GNU statement
+    // expression the jump is not inside — or the address `&&L` of a label inside one, taken
+    // outside it. The GNU C manual (Statement Exprs) does not permit a jump into a
+    // statement expression by `goto`, nor a `case` or `default` label inside one for a
+    // `switch` outside it, and documents a computed goto into one as undefined behavior.
+    // ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0): both refuse every such goto and
+    // label, the statement expression a value or discarded alike, and both accept a jump
+    // inside one and out of one; clang refuses `&&L` taken outside ("cannot jump from this
+    // indirect goto statement to one of its possible targets"), gcc builds it — a
+    // construct no reference makes work, so refused too, and `&&L` taken and used inside
+    // the same statement expression stands. DSS accepted all of it — and the labeled last
+    // item lands the jump on the computation of the value, past whatever the other path
+    // computed before the construct. Refused by the construct, in the lowering's own walks
+    // of the source (a discarded statement expression lowers to a plain block, which the
+    // HIR verifier cannot tell apart). `.actual` names the label.
+    S_JumpIntoStatementExpression         = 0xE098,
+    // P69 (lane `lm`, the scalar brace closure): a scalar's initializer stands in MORE
+    // braces than the one pair C 6.7.9p11 allows it ("a single expression, optionally
+    // enclosed in braces") — `int v = {{42}};` — or, as the initializer of a scalar
+    // SUBOBJECT of an aggregate, in braces at all (`struct S s = {{42}};`). ✔MEASURED
+    // 2026-10-16 (clang 18.1.3, gcc 13.3.0, every program RUN): both build every such
+    // shape, initialize the scalar from the innermost value (`{{}}` is zero), and warn once
+    // per brace level — at top level only the levels beyond the first, inside an aggregate
+    // from the first. A WARNING, suppressible, declared by the language
+    // (`hirLowering.scalarBraceInitializer.nestedBraces`); a language that declares none
+    // refuses the shape (S_InvalidScalarInitializer). A designator in a scalar's braces stays
+    // refused, as both refuse it.
+    S_BracesAroundScalarInitializer       = 0xE099,
+    // P69 (lane `lm`, the scalar brace closure): a scalar's brace initializer holds more
+    // than one element — `int v = {42, 7};`. C 6.7.9p2 makes it a constraint violation (no
+    // initializer may provide a value for an object not contained in the entity
+    // initialized). ✔MEASURED 2026-10-16 (clang 18.1.3, gcc 13.3.0, every program RUN):
+    // both build it with the warning, initialize the scalar from the FIRST element, and
+    // drop the rest UNEVALUATED — a call in it never runs, whatever its type or constness,
+    // in a static object too. Said once per brace list, at its first excess element (as
+    // S_ExcessInitializerElements is for an aggregate). A WARNING, suppressible, declared by
+    // the language (`hirLowering.scalarBraceInitializer.excessElements`); a language that
+    // declares none refuses the shape (S_InvalidScalarInitializer).
+    S_ExcessElementsInScalarInitializer   = 0xE09A,
+    // P69 L2 (lane `lm`): an integer constant expression uses the COMMA operator, which C
+    // 6.6p3 excludes from a constant expression outside an unevaluated subexpression — a
+    // constraint, so a diagnostic is owed. ✔MEASURED 2026-10-20 (clang 18.1.3, gcc 13.3.0,
+    // every build RUN): clang folds `(0, 42)` as a static assertion, an array bound, an
+    // enumerator, a case label, a bit-field width, an index designator and a `_BitInt` width,
+    // refusing it only at -pedantic-errors; gcc folds it as `__builtin_object_size`'s type.
+    // So the language admits it where its position is named
+    // (`semantics.integerConstantExpressions.otherConstantForms`), and this is the warning.
+    // Said once per comma, of the expression asked for (one in an unselected `?:` arm or in
+    // another object's initializer is not). A WARNING, suppressible; `--warnings-as-errors`
+    // restores the refusal. `.actual` is the comma expression.
+    S_ConstantExpressionUsesTheCommaOperator = 0xE09B,
+    // P69 L2 (lane `lm`): a case label's value is not an integer constant expression — C
+    // 6.8.4.2p3's constraint. ✔MEASURED 2026-10-20 (gcc 13.3.0, clang 18.1.3, every mode): both
+    // refuse `case y:` for a variable `y`, and DSS asked nothing of a case label's value (READ).
+    // An ERROR at the value; a float or an address value is refused too (both refuse it).
+    S_CaseLabelNotConstant                = 0xE09C,
+    // P69 (lane `cs`, fold f26b): a CALL whose callee names nothing visible resolves to the
+    // unit's earlier BLOCK-scope declaration of the function — out of scope where the call
+    // is (C 6.2.1p4), and taken anyway, as cl and clang take it (clang warns "use of
+    // out-of-scope declaration"). ✔MEASURED (lane `cs` probe ip, 2026-10-21; each program
+    // RUN): `void a(void) { int f(int); } int b(void) { return f(40) + 2; }` runs on cl
+    // (silent), gcc 13.3.0 and mingw-w64 gcc 13.2.0 (an implicit declaration, warned); with
+    // `double f(double)` declared it runs on clang 18.1.3 (warned) and cl, and gcc refuses
+    // it. A WARNING, suppressible.
+    S_OutOfScopeDeclarationUsed           = 0xE09D,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -3779,6 +3958,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   CFG-derivable. MSVC and clang run every such exit (measured
     //   2026-09-24), so the row is owed work; it carries the mark-every-exit
     //   design.
+    //   ★ P69 (lane `lm`): AND a return / goto-out / break-out / continue-out / computed
+    //   goto from INSIDE a `__except` FILTER EXPRESSION (a GNU statement expression in
+    //   the filter). A filter is a function of its own, called while a handler is
+    //   searched for, and it is left only by its value; these were refused by the MIR
+    //   verifier as `I_SehStructure` with block numbers. ✔MEASURED 2026-10-15: clang 18
+    //   for x86_64-pc-windows-msvc compiles the `return` and its frontend crashes on the
+    //   other three; cl has no statement expression — no working reference.
     H_SehEarlyExit                = 0xF010,
     // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, open since its 2026-09-24
     //   re-verdict: clang runs the region-internal form): `&&label` naming a
@@ -3952,6 +4138,54 @@ enum class DiagnosticCode : std::uint16_t {
     // (K_NoMatchingObjectFormat "has a runtime initializer"), or reached the module
     // initializer's lowering. `.actual` states the two readings; the span is the initializer.
     H_StaticInitializerNotFolded  = 0xF01C,
+    // H_NonVoidFunctionEndReachable
+    //   [[D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED]] (P69, lane `cs`).
+    //   A function that returns a value has a path that reaches the end of its
+    //   body without a `return`, in a language whose declaration form states
+    //   `nonVoidFunctionEndReached: returnsUnspecifiedValue` (C23 6.9.2p13: the
+    //   function is well-formed; only USING the value of such a call is
+    //   undefined). A WARNING, emitted ONCE per function by the CST->HIR lowering
+    //   as it completes the body; `.actual` names the function and the span is
+    //   the body's last token — the closing brace in a brace language, which is
+    //   where gcc, clang and MSVC put theirs. Under the other spelling of the
+    //   rule (`refused`, the default) this code is never emitted: the function
+    //   is refused by the verifier under H_VerifierFailure, as before.
+    //
+    //   ★ "CAN BE REACHED" IS THE VERIFIER'S STRUCTURAL ANSWER, the same
+    //   `pathTerminates` that decides the refusal and the implicit `return 0` —
+    //   one owner for the question. It is conservative: a body whose end no
+    //   execution reaches but whose shape does not show it is reported too
+    //   (and compiled correctly: the completion is then dead code).
+    //
+    //   ★ SUPPRESSIBLE, the `H_UnreachableCode` posture and for its reason:
+    //   the bytes are identical whether or not the advisory is rendered, so
+    //   silencing it can neither fail a build nor ship a different artifact.
+    //   ✔MEASURED 2026-10-08 (probe fo1): clang 18.1.3, Apple clang 21.0.0 and
+    //   MSVC 19.51 warn by default; gcc 13.3.0 and mingw-w64 gcc 13.2.0 only
+    //   under -Wall. None of the five refuses.
+    H_NonVoidFunctionEndReachable = 0xF01D,
+    // H_SehRegionInsideAFilter (P69, lane `lm`; a review of checkpoint 21, its N3): a
+    //   `__try` statement inside a `__except` FILTER EXPRESSION (reachable only through a
+    //   GNU statement expression). A filter is compiled as a function of its own, called
+    //   by the dispatcher while it searches for a handler, and that function has no scope
+    //   table: a region inside it has no handler to reach. Refused by the construct, at
+    //   the HIR verifier, where the MIR verifier said `I_SehStructure` and block numbers.
+    //   ✔MEASURED 2026-10-15: cl has no statement expression; clang 18 for
+    //   x86_64-pc-windows-msvc COMPILES the shape, and nothing of its image can be run
+    //   here — a compile, not a working reference.
+    H_SehRegionInsideAFilter      = 0xF01E,
+    // H_VisibilityWrittenAsAnother (P69 fold f26b, lane `cs`): a definition states a
+    //   visibility its target's object format cannot write — `protected` or `internal` on
+    //   a Mach-O or PE target — and is written with the one the format's document states
+    //   in its place (`visibilityWrittenAs`, read by the pipeline's one settling step,
+    //   `hir/attributes/visibility_written_as.hpp`), as the format's compilers write it.
+    //   A WARNING, suppressible: the program is built, and built as those compilers build
+    //   it. ✔MEASURED 2026-10-16 (lane cs's probe pv): Apple clang 21.0.0 warns
+    //   "target does not support 'protected' visibility; using 'default'"
+    //   [-Wunsupported-visibility]; mingw-w64 gcc 13.2.0 warns "visibility attribute not
+    //   supported in this configuration; ignored" [-Wattributes]. `.actual` names the
+    //   declaration, the visibility it states, the one written, and the format.
+    H_VisibilityWrittenAsAnother  = 0xF01F,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -4131,6 +4365,13 @@ enum class DiagnosticCode : std::uint16_t {
     // spelling for "an address whose pointee is unknown"), so a store through one
     // is not judged. Interner-gated.
     I_StoreValueTypeMismatch       = 0xA01A,
+    // P69 L2 (lane `lm`, D-MIR-VERIFIER-PASSES-A-PHI-MISSING-A-PREDECESSORS-INPUT): a Phi in a
+    // reachable block does not take its value from every predecessor that can run — none from
+    // one, two different values from one, or a count that is neither one nor one per edge.
+    // `I_PhiPredNotInCfg` asks the converse (a named block that is no predecessor); together
+    // they say the Phi's inputs ARE its block's ways in. A pass that drops an input is caught
+    // at the pass (verify runs after every pass), not where the LIR lowering emits the edge.
+    I_PhiIncomingsNotOnePerPredecessor = 0xA01B,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -4275,6 +4516,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   encoder, the first aborts inside `LirLiteralPool::at` and the
     //   second aborts inside `LirRegConstraintPool::at`; the verifier
     //   names the instruction first.
+    //   ★ ALSO the side structures OUTSIDE the module that name its
+    //   BLOCKS (`lir/lir_descriptor_blocks.hpp`,
+    //   D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS):
+    //   a jump-table slot, a static
+    //   `&&label` binding or a `__try` scope whose MIR→LIR block id has no
+    //   image in the final LIR — or a rebuild that changed its blocks and
+    //   publishes no image to follow them through. Bound anyway, the id
+    //   lands on another block's bytes: a switch that dispatches to the
+    //   wrong case, or a `__try` that guards the wrong code.
     // L_SideStructurePoolShrank: the module produced by a rebuild has
     //   FEWER entries in a pool than the module that went in — the
     //   signature of a forgotten `copyModuleSideStructures`. Checked
@@ -4906,6 +5156,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   per-code cap can drop this diagnostic silently, which restores
     //   first-wins with no flag and no trace. See the rationale block in
     //   `core/types/unsuppressable_codes.cpp`.
+    //   ★ THE SAME RULE ACROSS A BINDING: a REFERENCE whose storage duration
+    //   disagrees with the DEFINITION it binds to is this code too — where the
+    //   definition is a library's (`ffi::reportLibraryThreadStorageDisagreement`)
+    //   and where it is another linked unit's
+    //   (`linker::reportThreadStorageDisagreements`, P69 round 4): two
+    //   attributes that select the access model, one per side, and no basis to
+    //   choose between them — the fault of two rows that disagree.
     K_ExternImportAttributeConflict = 0x801B,
     // K_FormatLacksProcessExit (D-LK10-ENTRY §2.13): the emitted image's ENTRY
     //   would have no process-exit path BECAUSE THE FORMAT DECLARES NO
@@ -5324,7 +5581,73 @@ enum class DiagnosticCode : std::uint16_t {
     //   where gcc's link of the same archive exits 42).
     //   Always an Error, so it needs no row in the unsuppressable table.
     K_ImportReferenceUnbindable    = 0x802A,
-    // K-NEXT-SLOT: 0x802B — grep this marker before adding a K_* code.
+    // K_LinkerDirectiveUnhonourable (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE,
+    //   P69) — ERROR, by the directive's own text. A request a foreign COFF object
+    //   hands its final linker in its directive section (`.drectve`) that no DSS
+    //   link can honour as written: an option the format's directive vocabulary
+    //   (`pe.linkerDirectives`) declares no meaning for, a declared option whose
+    //   value is malformed (an `/EXPORT:` rename or ordinal, an `/INCLUDE:` of no
+    //   name, an `-aligncomm:` past 2^13), or two directives that contradict each
+    //   other (one name hidden and exported, one alternate name given two
+    //   fallbacks). The object is well-formed — this is not `F_CorruptedBinary` —
+    //   and the request is the program's: silently dropping it would link a
+    //   different program than the one the producer asked for. Always an Error,
+    //   so it needs no row in the unsuppressable table.
+    K_LinkerDirectiveUnhonourable  = 0x802B,
+    // K_LinkerDirectiveIgnored (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE,
+    //   P69 round 4) — WARNING. A linker-directive request the link drops as the
+    //   reference linkers drop it, said rather than dropped in silence: an option
+    //   the format's vocabulary does not list (link.exe warns LNK4229, GNU ld
+    //   "unrecognized"), a value link.exe warns about and replaces with its
+    //   default (a subsystem version below its minimum, LNK4010; a section
+    //   alignment that is not a power of two, LNK4043), a later `/ENTRY:` naming
+    //   another symbol (LNK4258), a second `/EXPORT:` of one name (LNK4197), a
+    //   `/SECTION:` naming a section the image lacks (LNK4039), a
+    //   `/FAILIFMISMATCH:` disagreement (GNU ld links it), and a stack or heap
+    //   request in a link whose image the loader reads neither from (a DLL).
+    //   Suppressible: the build proceeds with the meaning the references give it.
+    K_LinkerDirectiveIgnored       = 0x802C,
+    // K_CommonSymbolUnallocatable (D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS,
+    //   P69 round 4) — ERROR, by name. A COMMON symbol whose storage no DSS link
+    //   allocates: a THREAD-LOCAL common (ELF `STT_TLS` + `SHN_COMMON`, gas's
+    //   `.tls_common`, which GNU ld places in `.tbss`). Read as an ordinary common
+    //   it would be allocated once in `.bss` and every thread would share it.
+    //   Always an Error, so it needs no row in the unsuppressable table.
+    K_CommonSymbolUnallocatable    = 0x802D,
+    // K_ObjectSectionNotModelled (D-LK-COFF-READER-REFUSES-A-CUSTOM-NAMED-SECTION,
+    //   P69) — ERROR, by name. A relocatable object holds a DEFINITION in a
+    //   section no row of its format document names: one the program named
+    //   itself (`#pragma section`, `__attribute__((section(...)))`), or one DSS
+    //   has not been taught. The object is WELL-FORMED and its reference linker
+    //   links it — this is not `F_CorruptedBinary`, the code the three object
+    //   readers used for it until P69, which sent whoever read the message to
+    //   look for a damaged file. Refused rather than read without its body.
+    //   Always an Error, so it needs no row in the unsuppressable table.
+    K_ObjectSectionNotModelled     = 0x802E,
+    // K_CommonSymbolLargerThanItsDefinition (D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED,
+    //   P69 fold 3b) — WARNING. A COMMON (tentative) definition that yields to a
+    //   definition of its name SMALLER than it or LESS ALIGNED: the unit that wrote
+    //   the common reads and writes the object as the larger, more aligned one it
+    //   declared, past the definition's end or off its alignment. Every reference
+    //   linker links it (✔MEASURED 2026-10-15: Apple's ld warns of the size, GNU ld
+    //   of the alignment and, in one order, the size; ld.lld, link.exe, lld-link
+    //   and MinGW's GNU ld are silent), so the link proceeds — and says so.
+    //   Suppressible: the build proceeds with the meaning the references give it.
+    K_CommonSymbolLargerThanItsDefinition = 0x802F,
+    // K_SymbolBindingNotModelled (P69 fold 3c) — ERROR, by name. A symbol BINDING
+    //   no document of the link states a meaning for. Read: an object symbol whose
+    //   binding is none of the three every format shares (local, global, weak) and
+    //   not the one its format document states for a definition of which a process
+    //   holds ONE instance (`elf.uniqueBinding`, gcc's STB_GNU_UNIQUE) — as ld.lld
+    //   refuses it ("has invalid binding"). Written: a definition its unit states is
+    //   that one instance, handed to a writer whose document states no binding that
+    //   spells one, or bound otherwise than the document reads such a definition.
+    //   Until P69 the ELF reader read every such binding as LOCAL, and two g++
+    //   units' `inline int counter` linked to TWO objects (✔MEASURED 2026-10-20: the
+    //   program 5 where GNU ld's and ld.lld's is 41). Always an Error, so it needs
+    //   no row in the unsuppressable table.
+    K_SymbolBindingNotModelled     = 0x8030,
+    // K-NEXT-SLOT: 0x8031 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

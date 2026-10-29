@@ -336,27 +336,22 @@ importedSymbolsOf(std::vector<std::uint8_t> const& bytes) {
          {"qsort", "bsearch", "system", "strstr", "atoi", "malloc", "free",
           "fopen", "rand", "setlocale", "_set_abort_behavior", "__p__fmode",
           "__p__environ"},
-         // ⚠ pe's ceiling is TWO HIGHER THAN ITS SIBLINGS', AND THE REASON IS A
-         // SEPARATE SURPLUS THAT THIS ROW DOES NOT OWN — recorded here rather
-         // than absorbed silently into a round number.
-         // ✔MEASURED: pe imports 8 where elf and macho import 5, and the three
-         // extra are `__stdio_common_vfprintf` / `__stdio_common_vsprintf` /
-         // `__stdio_common_vsscanf`. They are REFERENCED, so the reference gate
-         // is behaving exactly right — what references them is the UCRT SHIM
-         // SYNTHESIS, which emits a body for every `synthesize` recipe row the
-         // descriptor injected (printf/fprintf/sprintf/vfprintf/sscanf, because
-         // ucrtbase exports none of them) whether or not the TU calls any. Five
-         // unused function bodies per `#include <stdio.h>`, holding three
-         // imports alive. That is the eager pattern one layer up, in the synth
-         // pass rather than the descriptor, and it is NOT a load hazard: all
-         // three are real ucrtbase exports.
-         // ⓘ They are deliberately NOT asserted PRESENT. Pinning a surplus in
-         // place is how a defect acquires a guard; the ceiling lets the count
-         // FALL to 5 the day shim emission becomes demand-driven, and reds if it
-         // ever climbs back toward the pre-fix 85.
-         // `__acrt_iob_func` is NOT part of that surplus — the probe references
-         // it genuinely, through the `stdout` macro.
-         10},
+         // pe's ceiling is its siblings' now, and the history is why it was
+         // not. ✔MEASURED before P69: pe imported 8 where elf and macho import
+         // 5, the three extra `__stdio_common_vfprintf` / `_vsprintf` /
+         // `_vsscanf` — held alive by the UCRT SHIM SYNTHESIS, which emitted a
+         // body for every `synthesize` row `#include <stdio.h>` injected,
+         // called or not, so the ceiling sat two higher. P69 retired the
+         // synthesis for DSS's runtime source (runtime/platform/src/stdio.c),
+         // and the same surplus came back ONE LAYER DOWN: the static-archive
+         // pull followed every extern the module DECLARED, so the unused rows
+         // linked the runtime member and its UCRT imports (✔MEASURED, 9). With
+         // the pull behind the same reference gate as the import table
+         // (D-LK-ARCHIVE-PULL-TAKES-UNREFERENCED-EXTERNS-AS-REFERENCES) the
+         // count is the five the probe uses; `__acrt_iob_func` is one of them,
+         // referenced through the `stdout` macro. The surplus itself is pinned
+         // below, by `AnIncludedHeaderNothingUsesLinksNothingIn`.
+         8},
         {"x86_64:macho64-x86_64-darwin-exec", "probe",
          {"_puts", "_strlen", "_fputs", "___stdoutp"},
          {"_qsort", "_bsearch", "_system", "_popen", "_strstr", "_atoi",
@@ -529,5 +524,140 @@ TEST(DescriptorImportReferencedOnly, UnreferencedHeaderAddsNoElfLibraryDependenc
             << "sqrt is declared by the included header and referenced by nothing";
         EXPECT_FALSE(has(names, "pow"))
             << "pow is declared by the included header and referenced by nothing";
+    }
+}
+
+// ── D-LK-ARCHIVE-PULL-TAKES-UNREFERENCED-EXTERNS-AS-REFERENCES ──────────────────
+//
+// The same law one tier down: a header's declarations must not link anything
+// in when nothing uses them — no import (above), and no BODY. DSS realizes some
+// rows from its own runtime source (the pe and Mach-O printf/scanf/strto
+// families, <stdlib.h>'s C23 names), compiled into single-member archives that
+// the link pulls by reference; the pull used to follow every extern a module
+// DECLARED, so `#include <stdio.h>` with an empty `main` linked the whole stdio
+// runtime and its UCRT imports into the image (✔MEASURED P69, pe64: `.text`
+// 0x23 -> 0x7c3, imports 1 -> 6). gcc, clang and MSVC link nothing for an
+// unused declaration (their objects carry no undefined symbol for one).
+//
+// And the same law one tier EARLIER, for the bodies DSS SYNTHESIZES rather than
+// pulls (D-MIR-THREADS-SHIM-SYNTHESIZES-UNREFERENCED-RECIPES): the <threads.h>
+// pass synthesized a body for every recipe a header injected, so `#include
+// <threads.h>` alone put all of them and their helpers into the image (✔MEASURED
+// P69: pe64 `.text` 0x23 -> 0x81c, imports 1 -> 26; Mach-O arm64 0x18 -> 0x508,
+// 1 -> 29) — and on Mach-O x86_64, whose format declares no threads vehicle, the
+// program did not compile at all. <stdlib.h> carries C23's once trio too
+// (call_once, DSS's runtime source on pe).
+//
+// THE PIN compares two programs that differ ONLY by the headers they include:
+// the code section and the import list must be IDENTICAL, on every pair. An
+// equality, not a magic number — any member a declaration drags in grows one
+// side alone. RED-ON-DISABLE: the pull's worklist taking every declared extern
+// again turns pe and both Mach-O pairs red (their runtime members are pulled);
+// the threads pass synthesizing every recipe again turns pe and Mach-O arm64 red
+// on the comparison and Mach-O x86_64 red on the compile.
+namespace {
+
+// The size of an image's main code section: PE `.text` VirtualSize, ELF `.text`
+// sh_size, Mach-O `__TEXT,__text` size. 0 when the image is not one of the three.
+[[nodiscard]] std::uint64_t codeSectionSize(std::vector<std::uint8_t> const& b) {
+    using namespace dss::test_support::image_deps_detail;
+    // A fixed-width, NUL-padded name field (PE's 8 bytes, Mach-O's 16).
+    auto fixedName = [&](std::size_t at, std::size_t width) {
+        std::string s;
+        for (std::size_t i = 0; i < width && at + i < b.size() && b[at + i] != 0; ++i) {
+            s.push_back(static_cast<char>(b[at + i]));
+        }
+        return s;
+    };
+    if (b.size() >= 0x40 && b[0] == 'M' && b[1] == 'Z') {
+        std::size_t const peOff = rdU32(b, 0x3C);
+        if (peOff + 24 > b.size()) return 0;
+        std::size_t   const coffOff   = peOff + 4;
+        std::uint16_t const numSecs   = rdU16(b, coffOff + 2);
+        std::uint16_t const optSize   = rdU16(b, coffOff + 16);
+        std::size_t   const secTabOff = coffOff + 20 + optSize;
+        for (std::size_t i = 0; i < numSecs && secTabOff + (i + 1) * 40 <= b.size(); ++i) {
+            std::size_t const s = secTabOff + i * 40;
+            if (fixedName(s, 8) == ".text") return rdU32(b, s + 8);   // VirtualSize
+        }
+        return 0;
+    }
+    if (b.size() >= 0x40 && b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
+        std::uint64_t const shoff     = rdU64(b, 0x28);
+        std::uint16_t const shentsize = rdU16(b, 0x3A);
+        std::uint16_t const shnum     = rdU16(b, 0x3C);
+        std::uint16_t const shstrndx  = rdU16(b, 0x3E);
+        if (shoff == 0 || shentsize < 64 || shstrndx >= shnum) return 0;
+        auto secOff = [&](std::size_t i) { return static_cast<std::size_t>(shoff) + i * shentsize; };
+        if (secOff(shnum) > b.size()) return 0;
+        std::size_t const strBase = static_cast<std::size_t>(rdU64(b, secOff(shstrndx) + 0x18));
+        for (std::size_t i = 0; i < shnum; ++i) {
+            if (rdCStr(b, strBase + rdU32(b, secOff(i))) == ".text") return rdU64(b, secOff(i) + 0x20);
+        }
+        return 0;
+    }
+    if (b.size() >= 32 && rdU32(b, 0) == 0xFEEDFACFu) {
+        std::uint32_t const ncmds = rdU32(b, 16);
+        std::size_t off = 32;
+        for (std::uint32_t c = 0; c < ncmds && off + 8 <= b.size(); ++c) {
+            std::uint32_t const cmd     = rdU32(b, off);
+            std::uint32_t const cmdsize = rdU32(b, off + 4);
+            if (cmdsize == 0) break;
+            if (cmd == 0x19u && off + 72 <= b.size()) {   // LC_SEGMENT_64
+                std::uint32_t const nsects = rdU32(b, off + 64);
+                for (std::uint32_t k = 0; k < nsects; ++k) {
+                    std::size_t const s = off + 72 + static_cast<std::size_t>(k) * 80;
+                    if (s + 80 > b.size()) break;
+                    if (fixedName(s, 16) == "__text" && fixedName(s + 16, 16) == "__TEXT") {
+                        return rdU64(b, s + 40);
+                    }
+                }
+            }
+            off += cmdsize;
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+TEST(DescriptorImportReferencedOnly, AnIncludedHeaderNothingUsesLinksNothingIn) {
+    struct Pair {
+        char const* spec;
+        char const* artifact;
+    };
+    for (Pair const p : {Pair{"x86_64:pe64-x86_64-windows-exec", "probe.exe"},
+                         Pair{"x86_64:elf64-x86_64-linux-exec", "probe"},
+                         Pair{"arm64:elf64-aarch64-linux-exec", "probe"},
+                         Pair{"arm64:macho64-arm64-darwin-exec", "probe"},
+                         Pair{"x86_64:macho64-x86_64-darwin-exec", "probe"}}) {
+        SCOPED_TRACE(p.spec);
+        auto measure = [&](char const* source, std::uint64_t& code, std::vector<std::string>& imports) {
+            ScratchDir scratch{Location::InsideRepo, "header-links-nothing"};
+            auto const dir = scratch.path();
+            auto const src = writeSrc(dir, "probe.c", source);
+            DiagnosticReporter rep;
+            ASSERT_EQ(buildOne(dir, src, p.spec, rep), 0)
+                << (rep.all().empty() ? std::string{} : rep.all().front().actual);
+            auto const bytes = readWholeBinary(dir / p.artifact);
+            ASSERT_FALSE(bytes.empty());
+            code    = codeSectionSize(bytes);
+            imports = importedSymbolsOf(bytes);
+            ASSERT_NE(code, 0u) << "the code-section reader found no code section -- the pin would be vacuous";
+            ASSERT_FALSE(imports.empty()) << "the import reader found nothing -- the pin would be vacuous";
+        };
+        std::uint64_t            bareCode = 0, includedCode = 0;
+        std::vector<std::string> bareImports, includedImports;
+        measure("int main(void) { return 42; }\n", bareCode, bareImports);
+        measure("#include <inttypes.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <threads.h>\n"
+                "int main(void) { return 42; }\n",
+                includedCode, includedImports);
+        EXPECT_EQ(includedCode, bareCode)
+            << "including <stdio.h>, <stdlib.h>, <inttypes.h> and <threads.h> and using none of them "
+               "must link (or synthesize) no body in";
+        std::sort(bareImports.begin(), bareImports.end());
+        std::sort(includedImports.begin(), includedImports.end());
+        EXPECT_EQ(includedImports, bareImports)
+            << "...and import nothing: [" << join(includedImports) << "] vs [" << join(bareImports) << "]";
     }
 }

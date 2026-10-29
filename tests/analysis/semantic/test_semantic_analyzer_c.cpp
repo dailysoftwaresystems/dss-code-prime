@@ -99,7 +99,12 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // clang's meaning, S_PredefinedIdentifierOutsideFunction at each use).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    ASSERT_EQ(model.symbols().size() - 1, 107u)
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    ASSERT_EQ(model.symbols().size() - 1, 156u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
            "_ReadWriteBarrier + __sync_synchronize + __builtin_unreachable + "
@@ -112,7 +117,7 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
            "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
            "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
            "__builtin_bswap16/32/64) + __func__ + __FUNCTION__ + their 2 file-scope "
-           "twins";
+           "twins + the 51 GNU builtins of P69 (lane cs)";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -430,13 +435,19 @@ TEST(SemanticAnalyzerC, NonConstantArrayLengthEmitsDiagnostic) {
 
 // SE-arrays: an empty-bracket declarator (`int a[]`) has no length — a DIFFERENT
 // path from `[n]` (the length node lands on the `]` token, not an identifier).
-// Must also fail loud.
+// Must also fail loud. P69 (lane `cs`): the absent bound is no NON-CONSTANT
+// length — it gives an array of unknown size (C 6.7.6.2p4), a type that stands
+// fine as a pointee, a typedef or an `extern` declaration; what is refused is a
+// block-scope OBJECT of it, which nothing completes (S_IncompleteTypeObject).
 TEST(SemanticAnalyzerC, EmptyArrayLengthEmitsDiagnostic) {
     auto cu = buildShippedUnit("c", { "int main() { int a[]; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+                        DiagnosticCode::S_IncompleteTypeObject), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u)
+        << "an absent bound is not a non-constant one";
 }
 
 // ⚠⚠ REWRITTEN BY INLINE-ASM P5, AND THE OLD PIN IS KEPT AS PROSE BECAUSE ITS
@@ -817,15 +828,16 @@ TEST(SemanticAnalyzerC, BadWideCharConstantLeavesBodyTokenUntyped) {
     }
 }
 
-// (5) A `[]` with NO initializer is NOT silently sized — the resolver's
-// S_NonConstantArrayLength still fires (inference is gated on an initializer
-// being present, so a bare `int x[];` is unaffected by c34).
+// (5) A `[]` with NO initializer is NOT silently sized — a block-scope object
+// of an array of unknown size is refused (S_IncompleteTypeObject; inference is
+// gated on an initializer being present, so a bare `int x[];` is unaffected by
+// c34).
 TEST(SemanticAnalyzerC, EmptyArrayNoInitNotSized) {
     auto cu = buildShippedUnit("c", { "int main(void){ int a[]; return 0; }\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+                        DiagnosticCode::S_IncompleteTypeObject), 1u);
     // The symbol's type must NOT be a sized array (it stays unresolved/incomplete).
     auto const& ti = model.lattice().interner();
     SymbolRecord const* a = findSym(model, "a");
@@ -1350,8 +1362,9 @@ TEST(SemanticAnalyzerC, NullPointerConstantAdmitsAsInit) {
 //    was SILENTLY accepted. The fix re-derives a scalar (non-brace) initializer's
 //    type via subtreeType WITH the declaration's scope when the stamped walk finds
 //    nothing, so `&obj` types as Ptr<pointee> and reaches the existing check. The
-//    brace-init-list form is explicitly excluded (its per-element checks live in
-//    the HIR lowering; a DFS would surface an element's type and false-fire). ──
+//    brace-init-list form is explicitly excluded (a DFS would surface an element's
+//    type and false-fire; since P69 each element is judged against the subobject it
+//    initializes by `checkBraceInitializerElements`). ──
 
 // (a) INCOMPATIBLE object pointee, char* target: `char *p = &a` where `a` is
 // `long`. The pointee `long` is NOT compatible with `char`, so C 6.5.16.1
@@ -1791,6 +1804,43 @@ TEST(SemanticAnalyzerC, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
         << "sizeof(int)==99 must FOLD false — the assertion fails loud";
+}
+
+// P69 L2 (lane `lm`): a `sizeof` of an array TYPE whose bound is itself a `sizeof` is an
+// integer constant expression at every depth, in every constant position. ✔MEASURED by
+// the orchestrator at eb6f22a3 (compile-and-keep run 20261020-114530-c5341e5b): depth 2
+// in a static assertion compiles and runs; ✔MEASURED 2026-10-20 on this lane's L2 tree
+// (run 20261020-112924-a77ebf9b): "not an integer constant expression" at depths 2-16 — a
+// regression of the L2 tree, pinned here. ✔MEASURED, clang 18.1.3 and gcc 13.3.0
+// (`-std=gnu2x`, `-std=c2x -pedantic-errors`): every line below builds and runs.
+TEST(SemanticAnalyzerC, ASizeofOfAnArrayTypeBoundedByASizeofIsAConstant) {
+    for (char const* src : {
+             "_Static_assert(sizeof(char[1]) == 1, \"d1\");\n",
+             "_Static_assert(sizeof(char[sizeof(char[1])]) == 1, \"d2\");\n",
+             "_Static_assert(sizeof(char[sizeof(char[sizeof(char[1])])]) == 1, \"d3\");\n",
+             "int a1[sizeof(char[1])];\n_Static_assert(sizeof a1 == sizeof(int), \"a1\");\n",
+             "int a2[sizeof(char[sizeof(char[1])])];\n_Static_assert(sizeof a2 == sizeof(int), \"a2\");\n",
+             "int a3[sizeof(char[sizeof(char[sizeof(char[1])])])];\n"
+             "_Static_assert(sizeof a3 == sizeof(int), \"a3\");\n",
+             "_Static_assert(_Alignof(char[sizeof(int)]) == 1, \"alignof\");\n",
+             "enum { E = sizeof(char[sizeof(char[2])]) };\n_Static_assert(E == 2, \"enum\");\n",
+             "int f(int x) { switch (x) { case sizeof(char[sizeof(char[3])]): return 1; } return 0; }\n",
+             // neighbours that tell the type name's bound from the declaration's
+             "_Static_assert(sizeof(char[1 + 0]) == 1, \"sum\");\n",
+             "_Static_assert(sizeof(char[(1)]) == 1, \"paren\");\n",
+             "typedef char T1[sizeof(char[1])];\n_Static_assert(sizeof(T1) == 1, \"typedef\");\n",
+         }) {
+        SCOPED_TRACE(src);
+        auto cu = buildShippedUnit("c", {std::string{src} + "int main(void){ return 0; }\n"});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+        std::string errors;
+        for (auto const& d : model.diagnostics().all())
+            if (d.severity == DiagnosticSeverity::Error)
+                errors += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+        EXPECT_EQ(errors, "") << "a sizeof of a VLA-free array type folds at every depth";
+    }
 }
 
 // VLA C2 (D-CSUBSET-VLA) — THE INVARIANT: `sizeof <vla>` is a RUNTIME value, NOT a
@@ -4155,7 +4205,12 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // builtin scope for a use outside every function body).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    EXPECT_EQ(model.symbols().size() - 1, 108u);
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    EXPECT_EQ(model.symbols().size() - 1, 157u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -4196,7 +4251,12 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // `__FUNCTION__` (text "", bound in the builtin scope).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    ASSERT_EQ(model.symbols().size() - 1, 107u);
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    ASSERT_EQ(model.symbols().size() - 1, 156u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -7238,7 +7298,12 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // `__FUNCTION__` (text "", bound in the builtin scope).
     // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
     // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
-    EXPECT_EQ(model.symbols().size() - 1, 108u)
+    // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): +49 — the GNU
+    // builtins that row added (expect, expect_with_probability, assume_aligned, trap, prefetch,
+    // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
+    // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
+    // the three `_p` predicates).
+    EXPECT_EQ(model.symbols().size() - 1, 157u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
            "the 6 intrinsic builtins + __builtin_unreachable + "
            "the 8 GNU value-form __atomic_* builtins + "
@@ -7247,8 +7312,8 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
            "the 6 byte-swap builtins (_byteswap_ushort/_byteswap_ulong/"
            "_byteswap_uint64 + __builtin_bswap16/32/64) + "
-           "__func__ + __FUNCTION__ + their 2 file-scope twins — the "
-           "multiplication mints none";
+           "__func__ + __FUNCTION__ + their 2 file-scope twins + the 51 GNU "
+           "builtins of P69 (lane cs) — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -9044,13 +9109,14 @@ TEST(SemanticAnalyzerC, NoreturnShippedDescriptorSymbolIsNoreturn) {
 //    to (and merges with) the file-scope function (C 6.2.2p4 / 6.7.6.3) ──
 //
 // (a) A block-scope prototype + a later file-scope definition MERGE: the proto
-// is re-homed onto the file scope and absorbed by the definition. Zero
-// diagnostics, exactly one surviving Function `f` (the file definition). A call
-// inside the block resolves to it (witnessed by the corpus exit code).
-// RED-ON-DISABLE: revert the Pass-1 re-home (bind in `current`) -> the block proto
-// binds a separate block-local symbol that the file definition never absorbs, so
-// TWO records named `f` are upgraded to Function (the block proto's kind is
-// upgraded by Pass 1.5 in its own scope) -> countSurvivingFns becomes 2.
+// binds in its block and the block-extern sweep absorbs it into the definition,
+// repointing the block binding (P69 fold f26b; it used to be re-homed onto the file
+// scope). Zero diagnostics, exactly one surviving Function `f` (the file definition).
+// A call inside the block resolves to it (witnessed by the corpus exit code).
+// RED-ON-DISABLE: drop the prototype from the sweep's gate -> the block proto stays a
+// separate block-local symbol the file definition never absorbs, so TWO records
+// named `f` are upgraded to Function (the block proto's kind is upgraded by Pass
+// 1.5 in its own scope) -> countSurvivingFns becomes 2.
 TEST(SemanticAnalyzerC, BlockScopePrototypeMergesWithFileDefinition) {
     auto model = analyzeShipped("c", {
         "int main(void){ int f(int); return f(2); }\n"
@@ -9060,7 +9126,7 @@ TEST(SemanticAnalyzerC, BlockScopePrototypeMergesWithFileDefinition) {
         << "a block-scope prototype + a file-scope definition must merge cleanly";
     EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
         << "exactly one surviving Function symbol for f (the file definition); "
-           "the block-scope proto is re-homed to file scope and absorbed";
+           "the block-scope proto is absorbed by it";
 }
 
 // (b) Definition FIRST, then a block-scope prototype of the same function: also
@@ -9068,8 +9134,8 @@ TEST(SemanticAnalyzerC, BlockScopePrototypeMergesWithFileDefinition) {
 // S_UnusedVariable from the absorbed proto (a function declaration is never an
 // unused variable — the local decl's warnIfUnused is suppressed for a proto).
 // RED-ON-DISABLE (the warnIfUnused suppression): drop `&& !isProto` -> the
-// re-homed/absorbed block proto warns S_UnusedVariable (its own use-set is empty,
-// the call resolves to the definition) -> this count becomes 1.
+// absorbed block proto warns S_UnusedVariable (its own use-set is empty, the call
+// resolves to the definition) -> this count becomes 1.
 TEST(SemanticAnalyzerC, BlockScopePrototypeAfterDefinitionNoUnusedWarning) {
     auto model = analyzeShipped("c", {
         "int f(int x){ return x; }\n"
@@ -9111,6 +9177,111 @@ TEST(SemanticAnalyzerC, BlockScopePrototypeIncompatibleWithFileDefFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_IncompatibleRedeclaration), 1u)
         << "an incompatible block-scope-proto vs file-def pair must fail loud once";
+}
+
+// ★ P69 (lane `cs`, fold f26b): A BARE BLOCK-SCOPE FUNCTION DECLARATION HAS ITS BLOCK'S
+// SCOPE (C 6.2.1p4) AND THE LINKAGE `extern` WOULD GIVE IT (C 6.2.2p5) — the explicit
+// `extern` path: it binds in its block, so it HIDES a name of an enclosing block, and a
+// file-scope declaration of the name absorbs it. ✔MEASURED (lane `lm` probe nest k9h; gcc
+// 13.3.0 and clang 18.1.3, gnu2x and c2x -pedantic-errors, built and run): `int main(void) {
+// int x = 1; { int x(void); return x() + 0 * 1; } } int x(void) { return 42; }` runs 42 on
+// all four. Before fold f26b the declaration was re-homed onto the FILE scope: the block held
+// no binding, so the inner `x` was still the enclosing object and the call was refused.
+//
+// RED-ON-DISABLE: restore the re-home and the inner `x` is the object (the call refused);
+// drop the prototype from the block-extern sweep's gate and the block declaration survives
+// as a function of its own (two surviving functions named `x`).
+TEST(SemanticAnalyzerC, ABlockScopeFunctionDeclarationHidesAnEnclosingObject) {
+    auto model = analyzeShipped("c", {
+        "int main(void) { int x = 1; { int x(void); return x() + 0 * 1; } }\n"
+        "int x(void) { return 42; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors()) << "the inner `x` names the function, not the enclosing object";
+    EXPECT_EQ(countSurvivingFns(model, "x"), 1u)
+        << "the block declaration is absorbed by the file-scope definition";
+    std::size_t absorbed = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == "x" && r.isProtoDeclaration && r.isAbsorbedProto) ++absorbed;
+    }
+    EXPECT_EQ(absorbed, 1u) << "the block declaration is its own record, absorbed";
+}
+
+// A block-scope function declaration HIDES a typedef of an enclosing scope inside its block: `T:`
+// in a `_Generic` there names no type. ✔MEASURED (lane `lm` probe nest k9d; gcc 13.3.0 and clang
+// 18.1.3): `typedef int T; int main(void) { int T(void); return _Generic(0, T: 1, default: 2)
+// + 40; }` is refused by both ("unknown type name 'T'"). ✔MEASURED before fold f26b (lane `cs`
+// probe k9, this compiler): the FILE-scope form was refused for the wrong reason — the re-homed
+// declaration collided with the typedef, S_RedeclaredSymbol — and the form with the typedef in the
+// ENCLOSING BLOCK was accepted and ran 41 (`T:` named the typedef).
+//
+// RED-ON-DISABLE: restore the re-home and the file-scope form is S_RedeclaredSymbol again (the
+// second assertion) and the block form is accepted again (the first).
+TEST(SemanticAnalyzerC, ABlockScopeFunctionDeclarationHidesATypedefInItsBlock) {
+    for (char const* src : {
+             "typedef int T;\n"
+             "int main(void) { int T(void); return _Generic(0, T: 1, default: 2) + 40; }\n",
+             "int main(void) { typedef int T; { int T(void); return _Generic(0, T: 1, default: 2) + 40; } }\n",
+         }) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src << ": `T` is a function in that block, no type name";
+        // ✔MEASURED after the rebase onto lane `lm`'s fold L2a (lane `cs`, compile-and-keep on
+        // macos-arm64-debug, host run 20261028-203151-252844eb): each form is refused with ONE
+        // S_UnknownType, at the `T` of the association — the references' "unknown type name 'T'".
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+            << src << ": the association names no type, and says so once";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+            << src << ": the block declaration is in its own block and collides with nothing";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26b): A CALL TO A FUNCTION ONLY ANOTHER BLOCK OF THE UNIT DECLARED
+// TAKES THAT DECLARATION, WARNED — cl's and clang's rule. Outside its block the declaration is
+// out of scope; a call there that names nothing visible is resolved by cl and clang to it, its
+// type included (clang: "use of out-of-scope declaration"). ✔MEASURED (lane `cs` probe ip; cl
+// 19.51, clang 18.1.3 default standard, gcc 13.3.0, mingw-w64 gcc 13.2.0; each built and RUN):
+// a call in another function runs 42 on cl (silent) and on gcc / mingw-w64 gcc (an implicit
+// declaration, warned); with `double f(double)` declared it runs 42 on clang (warned) and cl —
+// so the declared type is what the call takes. Here NOTHING at file scope declares the names
+// (their definitions are another unit's), as in probe ip's cells c6, c7, c8. CONTROL: the same
+// call with no block declaration anywhere stays refused (the implicit declaration is its own
+// row's).
+//
+// RED-ON-DISABLE: drop the out-of-scope lookup and every call is S_UndeclaredIdentifier; drop
+// the callee test and the control's `&g` takes the declaration too.
+TEST(SemanticAnalyzerC, ACallTakesAnOutOfScopeBlockDeclarationWarned) {
+    struct Case {
+        char const* what;
+        char const* src;
+    };
+    for (Case const c : {
+             Case{"in another function",
+                  "void a(void) { int g(int); }\nint b(void) { return g(40) + 2; }\n"},
+             Case{"its declared type",
+                  "void a(void) { double g(double); }\nint b(void) { return (int)g(40) + 2; }\n"},
+             Case{"after its block ended",
+                  "int b(void) { { int g(int); } return g(40) + 2; }\n"},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto model = analyzeShipped("c", {c.src});
+        EXPECT_FALSE(model.hasErrors()) << c.src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 1u)
+            << c.src;
+        EXPECT_EQ(model.diagnostics().all().size(), 1u) << c.src;
+    }
+    // (The declared type reaching the call is pinned by a RUN: the example
+    // two_units_call_through_an_out_of_scope_block_declaration passes 40 as 40.0.)
+    // CONTROLS: no block declaration at all; a use that is no call; a declaration written
+    // AFTER the call — each the implicit declaration's case, refused today.
+    for (char const* src : {"int b(void) { return g(40) + 2; }\n",
+                            "void a(void) { int g(int); }\nint (*b(void))(int) { return &g; }\n",
+                            "int b(void) { return g(40) + 2; }\nvoid a(void) { int g(int); }\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 0u)
+            << src;
+    }
 }
 
 // ── D-CSUBSET-EXTERN-DEFINITION-MERGE — an `extern` declaration MERGES with an
@@ -10985,6 +11156,26 @@ TEST(SemanticAnalyzerC, NullptrInitsAndComparesPointer) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
+    // ★ P69 L2a (lane `lm`): and with a NULL POINTER CONSTANT (C23 6.5.9p2: "one operand has type
+    // nullptr_t and the other is a null pointer constant") — `0` on either side, `!=`, a folded
+    // `1 - 1`, and the control `(void *)0`, a null pointer constant of pointer type. ✔MEASURED
+    // 2026-10-22 (probes np_*, gcc 13.3.0 and clang 18.1.3 at -std=gnu2x and -std=c2x
+    // -pedantic-errors): each builds and runs; the gate refused the integer forms.
+    for (char const* const src : {
+             "int f(void){ return nullptr == 0; }\n",
+             "int f(void){ return 0 == nullptr; }\n",
+             "int f(void){ return nullptr != 0; }\n",
+             "int f(void){ return nullptr == 1 - 1; }\n",
+             "int f(void){ return nullptr == (void *)0; }\n",
+         }) {
+        SCOPED_TRACE(src);
+        auto pc = buildShippedUnit("c", { src });
+        assertNoBuilderErrors(*pc);
+        auto pcModel = analyze(pc, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(pcModel.diagnostics(), DiagnosticCode::S_NullptrInvalidOperand), 0u)
+            << "a null pointer constant is a valid peer of nullptr (C23 6.5.9p2)";
+        EXPECT_FALSE(pcModel.hasErrors());
+    }
 }
 
 // `int x = nullptr;` is a constraint violation — nullptr converts only to pointers.
@@ -11120,6 +11311,14 @@ TEST(SemanticAnalyzerC, NullptrRelationalFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
+    // P69 L2a (lane `lm`): a null pointer constant beside it changes nothing — `nullptr < 0` is
+    // refused (C23 6.5.8p2). ✔MEASURED 2026-10-22: gcc 13.3.0 and clang 18.1.3 refuse it at
+    // -std=gnu2x and -std=c2x -pedantic-errors.
+    auto zero = buildShippedUnit("c", { "int f(void){ return nullptr < 0; }\n" });
+    assertNoBuilderErrors(*zero);
+    auto zeroModel = analyze(zero, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(zeroModel.diagnostics(), DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "a relational operator takes no nullptr_t operand, a null pointer constant beside it or not";
 }
 
 // `==` against a NON-pointer, NON-nullptr peer (`nullptr == 5`) is rejected.
@@ -11129,6 +11328,18 @@ TEST(SemanticAnalyzerC, NullptrEqualsIntFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
+    // P69 L2a (lane `lm`): the one integer peer is a NULL POINTER CONSTANT (C23 6.5.9p2) — never
+    // another constant or a non-constant `int`. ✔MEASURED 2026-10-22: gcc 13.3.0 and clang 18.1.3
+    // refuse both at -std=gnu2x and -std=c2x -pedantic-errors.
+    for (char const* const src : {"int f(void){ return nullptr == 1; }\n",
+                                  "int f(int i){ return nullptr == i; }\n"}) {
+        SCOPED_TRACE(src);
+        auto other = buildShippedUnit("c", { src });
+        assertNoBuilderErrors(*other);
+        auto otherModel = analyze(other, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(otherModel.diagnostics(), DiagnosticCode::S_NullptrInvalidOperand), 1u)
+            << "an integer that is no null pointer constant is no peer of nullptr";
+    }
 }
 
 // The gate must NOT fire on a plain assignment `p = nullptr` (handled by isAssignable)
@@ -11160,6 +11371,43 @@ TEST(SemanticAnalyzerC, NullptrUnaryNegFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// P69 L2 (lane `lm`): an OPERATOR applied to `nullptr` is not `nullptr` — the operand
+// question stops at a unary operator and the typer answers for it, and a refused `-`, `+`
+// or `~` of a `nullptr_t` has no type. `- -nullptr` and `~ ~nullptr` are refused ONCE, at
+// the inner operator; `+nullptr` is refused (C 6.5.3.3p1: an arithmetic operand); `!nullptr`
+// (a scalar operand, an `int` result) compares with `0` as the `int` it is. ✔MEASURED
+// 2026-10-20, clang 18.1.3 and gcc 13.3.0 (`-std=gnu2x` and `-std=c2x -pedantic-errors`):
+// one error each for the first three, at the inner operator; the last builds and runs. The `+`
+// row is written with nothing above it (`(void)+nullptr;`, ✔MEASURED refused by both, 2026-10-22):
+// under an `==` the binary gate refuses the `+` expression at the same count, so a `+` admitted by
+// the predicate went unseen (the lane's sweep of 2026-10-22 read that arm survive).
+TEST(SemanticAnalyzerC, AnOperatorAppliedToNullptrIsNotNullptr) {
+    auto neg = buildShippedUnit("c", { "void *f(void){ return - -nullptr; }\n" });
+    assertNoBuilderErrors(*neg);
+    auto negModel = analyze(neg, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(negModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "the outer `-` applies to `-nullptr`, which is no `nullptr`";
+    auto tilde = buildShippedUnit("c", { "int f(void){ return ~ ~nullptr; }\n" });
+    assertNoBuilderErrors(*tilde);
+    auto tildeModel = analyze(tilde, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(tildeModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "the outer `~` applies to `~nullptr`, which has no type";
+    auto pos = buildShippedUnit("c", { "int f(void){ (void)+nullptr; return 0; }\n" });
+    assertNoBuilderErrors(*pos);
+    auto posModel = analyze(pos, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(posModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u)
+        << "unary `+` takes an arithmetic operand";
+    auto bang = buildShippedUnit("c", { "int g(void){ return (!nullptr) == 0; }\n" });
+    assertNoBuilderErrors(*bang);
+    auto bangModel = analyze(bang, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(bangModel.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(bangModel.hasErrors());
 }
 
 // `nullptr` passed as a VARIADIC argument is rejected (no default arg promotion).
@@ -12431,21 +12679,23 @@ TEST(SemanticAnalyzerC, BlockScopeUnknownGnuAttributeWarnsInBothPositions) {
 }
 
 // THE FALSE-POSITIVE FLOOR, and it is the reason the arm above is a Warning
-// rather than an Error. All three of these are REAL GNU attributes that DSS does
-// not model; ✔MEASURED, gcc AND clang each accept every one of them at block
-// scope with NO diagnostic at all. An Error here would have refused three
-// working programs to catch one typo.
+// rather than an Error. These are REAL GNU attributes; ✔MEASURED, gcc AND clang
+// each accept every one of them at block scope with NO diagnostic at all. An
+// Error here would have refused working programs to catch one typo.
 // RED-ON-DISABLE: promote the block-scope arm to Error → `hasErrors()` becomes
-// true on all three.
+// true on both.
+//
+// P69 (lane `cs`): `section("mysec")` was the third case, and it LEFT this
+// floor: c.lang.json now states it, as a name this compiler cannot honour yet
+// (it places the object in a named output section), and a name with that row is
+// refused BY NAME at every position — a placement silently dropped is the
+// miscompile, not the typo. `SymbolAlias.ANamedSectionIsRefusedByName` pins it, at
+// file scope and at block scope.
 TEST(SemanticAnalyzerC, BlockScopeUnmodelledRealGnuAttributesStillCompile) {
     for (char const* src : {
              "static void cl(int *p) { (void)p; }\n"
              "int main(void) {\n"
              "    __attribute__((cleanup(cl))) int x = 1;\n"
-             "    return x - 1;\n"
-             "}\n",
-             "int main(void) {\n"
-             "    __attribute__((section(\"mysec\"))) static int x = 1;\n"
              "    return x - 1;\n"
              "}\n",
              "int main(void) {\n"
@@ -12459,6 +12709,7 @@ TEST(SemanticAnalyzerC, BlockScopeUnmodelledRealGnuAttributesStillCompile) {
                "replaces: " << src;
     }
 }
+
 
 // AND THE OTHER HALF OF THE BLIND-GATE ROW, kept as its own pin because the
 // shipped `GnuSiblingClauseStringIsNotThisClausesMessage` asserts only
@@ -14092,21 +14343,24 @@ TEST(SemanticAnalyzerC, PlainVlaArrayParamStillDecaysToPointer) {
 }
 
 // VLA C4a-param THE KEY OPTION-B GUARD (D-CSUBSET-VLA): a struct field `int a[n]` (variable
-// n) must STILL resolve via the struct-field FAM incompleteArray path -> a sole flexible
-// array member -> S_FlexibleArraySoleMember. Option B threads a DISTINCT paramDecay signal
-// that a struct field NEVER carries (its config row has allowFlexibleArray, not
-// paramAdjustments), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
-// routed struct fields through the paramDecay VLA branch would build a vlaArray instead of
-// an incompleteArray and this diagnostic vanishes.
+// n) must never take the paramDecay VLA branch. Option B threads a DISTINCT paramDecay
+// signal that a struct field NEVER carries (its config row has allowFlexibleArray, not
+// paramAdjustments). P69 (lane `cs`): what the field's runtime bound DOES get changed — it
+// used to become a flexible member (refused here only because it was the SOLE member,
+// S_FlexibleArraySoleMember, and accepted beside another member); a member cannot have a
+// variably modified type (C 6.7.2.1p9), so the bound is now refused by name at the bound,
+// sole member or not. RED-ON-DISABLE: a broad fix that routed struct fields through the
+// paramDecay VLA branch would build a vlaArray member, and the refusal vanishes.
 TEST(SemanticAnalyzerC, StructFieldVlaSoleMemberStillFailsLoud) {
     auto model = analyzeShipped("c", {
         "int n = 4;\n"
         "struct S { int a[n]; };\n"
         "int main(void) { return 0; }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_FlexibleArraySoleMember), 1u)
-        << "the Option-B no-regression guard: a struct field `int a[n]` (variable n) still "
-           "routes through the FAM incompleteArray path -> S_FlexibleArraySoleMember";
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "a struct field `int a[n]` (variable n) is refused at its bound: no member is "
+           "variably modified, and none is a flexible member by a runtime bound";
 }
 
 // VLA C4a-param (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ CLOSED): a FIXED arg
@@ -14576,19 +14830,24 @@ TEST(SemanticAnalyzerC, DerefSizedVlaStillCompiles) {
 
 // VLA C4c (D-CSUBSET-VLA, code-audit IMPORTANT): the EMERGENT multi-dim `[*]` combinations now
 // parse+fold (arrayStarSuffix rides the suffix repeat) — outside C4c's single-`[*]` scope. They
-// must be CORRECT or FAIL LOUD, NEVER a silent stride: `int a[*][3]` is the OUTER star-modifier
-// (decays exactly like `int a[][3]` → `int(*)[3]`, a FIXED inner stride — accepted, no VLA); an
-// INNER `[*]` (`int a[n][*]`) yields a pointer to an UNSPECIFIED-size array whose fixed-array
-// argument is a distinct interned type → `S_TypeMismatch` (S0003) fail-loud (NEVER a wrong/zero
-// row stride). RED-ON-DISABLE: an inner `[*]` silently accepted with a bogus stride would flip
-// the arg-compat reject.
+// must be CORRECT, NEVER a silent stride: `int a[*][3]` is the OUTER star-modifier (decays
+// exactly like `int a[][3]` → `int(*)[3]`, a FIXED inner stride — accepted, no VLA).
+// ★ P69 (lane `cs`): the INNER half used to pin a REFUSAL — an inner `[*]` (`int a[n][*]`) gave a
+// pointer to an unspecified-size array, and the fixed-array argument was refused as a type
+// mismatch. ✔MEASURED 2026-10-15 (lane `cs` probe vm cell 8): gcc 13.3.0 and clang 18.1.3 build
+// and RUN this exact program (exit 42), so the refusal was a divergence. The parameter is a
+// pointer to an array of unknown size, compatible with `int(*)[3]` (C 6.7.6.2p6), and no stride
+// can be silent: only the DEFINITION indexes, with its own bound, and a definition may not spell
+// `[*]` (`ArrayParamStarInFunctionDefinitionFailsLoud`) nor an element of unknown size
+// (`IncompleteArrayType.AnElementOfUnknownSizeIsRefusedAndAnIncompleteStructureElementIsCls`).
+// examples/c/c99_array_param_static runs the shape (`growstar`, return 6).
 // ⚠ RE-SPELLED P57 for the same reason as its sibling above: BOTH arms used to put `[*]`
 // on a function DEFINITION, which C 6.7.6.3p12 forbids and which gcc 13.3.0 and clang
 // 18.1.3 both REFUSE (✔MEASURED 2026-09-03 on `int f(int a[*][3]) { … }`, each reference
 // probed separately). This pin's subject is the multi-dim DECAY and the inner-star
 // mismatch, neither of which is about placement, so both arms move to the legal
 // prototype spelling; `ArrayParamStarInFunctionDefinitionFailsLoud` owns placement.
-TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
+TEST(SemanticAnalyzerC, ArrayStarOuterDecaysAndAnInnerStarIsAnArrayOfUnspecifiedSize) {
     auto outer = analyzeShipped("c", {
         "int f(int a[*][3]);\n"
         "int f(int a[2][3]) { return a[1][2]; }\n"
@@ -14602,16 +14861,17 @@ TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
         "int f(int n, int a[n][3]) { return a[0][0]; }\n"
         "int main(void) { int x[2][3] = {{1,0,0},{0,0,0}}; return f(2, x); }\n",
     });
-    EXPECT_TRUE(inner.hasErrors())
-        << "an INNER `[*]` (`int a[n][*]`) → ptr-to-unspecified-array: a fixed-array arg is a "
-           "distinct interned type → S_TypeMismatch fail-loud, NEVER a silent stride";
-    // ... and it must NOT be the PLACEMENT code doing the failing — the inner-star
-    // mismatch is a TYPE question and stays one. Without this the arm would keep passing
-    // for the wrong reason the moment the placement check over-fired.
+    EXPECT_FALSE(inner.hasErrors())
+        << "an INNER `[*]` (`int a[n][*]`) is a pointer to an array of unspecified size, "
+           "compatible with the `int(*)[3]` argument; gcc and clang build and run it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(inner.diagnostics()))
+        << "the argument's `int(*)[3]` is COMPATIBLE with the prototype's pointer to an array of "
+           "unspecified size (C 6.7.6.2p6): no conversion diagnostic at all";
     EXPECT_EQ(countCode(inner.diagnostics(),
                         DiagnosticCode::S_ArrayParamStarInFunctionDefinition), 0u)
-        << "the inner-`[*]` arm must fail on the TYPE mismatch, not on placement — the "
-           "`[*]` here is in a prototype, exactly where C 6.7.6.3p12 allows it";
+        << "the `[*]` here is in a prototype, exactly where C 6.7.6.3p12 allows it";
+    EXPECT_EQ(countCode(inner.diagnostics(), DiagnosticCode::S_ArrayElementTypeIncomplete), 0u)
+        << "the outer `[n]`'s element is the `[*]` array: of unspecified size, not of unknown size";
 }
 
 // VLA C4c (D-CSUBSET-VLA, audit IMPORTANT 3): a multi-dim VLA parameter whose INNER dim
@@ -17653,8 +17913,9 @@ TEST(SemanticAnalyzerC, FunctionTypedStructFieldStillFailsLoud) {
 // is purely syntactic, so it classified the parameter a PROTOTYPE even though
 // p8 had already made its declared type a pointer. Every FORM (1) assertion
 // stayed green throughout: the TYPE was right, the KIND was not. The flag then
-// did real damage one tier down — a prototype re-homes onto the FILE scope, and
-// CST→HIR emits no VarDecl for one — so it is pinned HERE, where it is decided.
+// did real damage one tier down — a prototype was re-homed onto the FILE scope (until
+// P69 fold f26b), and CST→HIR emits no VarDecl for one — so it is pinned HERE, where it
+// is decided.
 // (`decl.paramAdjustments` suppresses `isProto`; see the derivation's comment.)
 TEST(SemanticAnalyzerC, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
     auto model = analyzeShipped("c", {
@@ -17677,8 +17938,8 @@ TEST(SemanticAnalyzerC, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
 
 // FORM (8) — C 6.2.1p4: a parameter name is scoped to its own declarator and
 // has NO linkage, so two functions may reuse one. The prototype
-// misclassification ALSO re-homed the parameter onto the FILE scope (that is
-// what D-CSUBSET-BLOCK-SCOPE-PROTOTYPE does for a real prototype), where two
+// misclassification ALSO re-homed the parameter onto the FILE scope (what
+// D-CSUBSET-BLOCK-SCOPE-PROTOTYPE did for a real prototype until P69 fold f26b), where two
 // same-named parameters met as ONE symbol: MEASURED as S0022 on `g`, pointing
 // at the OTHER function's parameter. Distinct symbols in distinct scopes is the
 // only shape in which that cannot recur.
@@ -17821,8 +18082,11 @@ TEST(SemanticAnalyzerC, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix)
 }
 
 // The NON-CONSTANT branch also degrades cleanly: `sizeof` of an incomplete
-// array does not fold, so the LHS reports ITS OWN SPELLING while the RHS still
-// folds to a value. The message keeps its own "is not an integer constant
+// structure does not fold, so the LHS reports ITS OWN SPELLING while the RHS
+// still folds to a value. (P69, lane `cs`: the operand was `sizeof` of an array
+// of unknown size, which now FOLDS — to 0, cl's reading, said by a warning — so
+// it no longer reaches this branch; an incomplete structure has no size on any
+// reference.) The message keeps its own "is not an integer constant
 // expression" wording (the two failure modes stay distinguishable on one code).
 //
 // ⚠ THIS TEST USED TO REQUIRE THE LITERAL TEXT `<non-constant>`, and that string
@@ -17834,8 +18098,8 @@ TEST(SemanticAnalyzerC, StaticAssertNonBinaryConditionEmitsWithoutOperandSuffix)
 // operand must now identify itself.
 TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandNamesItsOwnSpelling) {
     auto cu = buildShippedUnit("c", {
-        "typedef int T[];\n"
-        "_Static_assert(sizeof(T) == 4, \"incomplete has no size\");\n"
+        "struct T;\n"
+        "_Static_assert(sizeof(struct T) == 4, \"incomplete has no size\");\n"
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
@@ -17847,7 +18111,7 @@ TEST(SemanticAnalyzerC, StaticAssertNonConstantOperandNamesItsOwnSpelling) {
               std::string::npos) << text;
     EXPECT_EQ(text.find("<non-constant>"), std::string::npos)
         << "the undiscriminating placeholder must be gone; got: " << text;
-    EXPECT_NE(text.find("(folded: `sizeof(T)` Eq 4)"), std::string::npos)
+    EXPECT_NE(text.find("(folded: `sizeof(struct T)` Eq 4)"), std::string::npos)
         << "a side that does not fold must NAME ITSELF, and the side that does "
            "must still report its value; got: " << text;
 }
@@ -17925,19 +18189,33 @@ TEST(SemanticAnalyzerC, EmptyMacroArrayBoundTypedefMatchesTheSdkSpelling) {
     EXPECT_TRUE(model.lattice().interner().isIncompleteArray(t->type));
 }
 
-// FAIL LOUD (1): a file-scope OBJECT of the incomplete type. C 6.7p7 — an
-// object shall have a complete type. Silently sizing it 0 is the exact defect
-// class; S0028 S_IncompleteTypeObject is the guard (widened from
-// incomplete-COMPOSITE to also cover incomplete ARRAY in the same commit).
+// NEVER SIZED 0 (1): a file-scope OBJECT of the incomplete type. With no
+// `extern` and no initializer it is a TENTATIVE definition, and C 6.9.2p5
+// completes it at the end of the unit — to ONE element when nothing in the unit
+// completes it, said by S_TentativeArrayAssumedOneElement (P69, lane `cs`:
+// gcc 13.3.0 and clang 18.1.3 both build it, gcc warning "array 'x' assumed to
+// have one element" — ✔MEASURED, probe fs). It was refused here
+// (S_IncompleteTypeObject) before the completion existed; sizing it 0 is still
+// the defect class this block guards.
 TEST(SemanticAnalyzerC, IncompleteArrayTypedefFileScopeObjectFailsLoud) {
     auto model = analyzeShipped("c", {
         "typedef int T[];\n"
         "T x;\n"
         "int main(void) { return 0; }\n",
     });
+    EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_IncompleteTypeObject), 1u)
-        << "an OBJECT of incomplete-array type must fail loud, never be sized 0";
+                        DiagnosticCode::S_TentativeArrayAssumedOneElement), 1u)
+        << "the completion to one element is said";
+    auto const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_TRUE(x->type.valid());
+    ASSERT_EQ(in.kind(x->type), TypeKind::Array);
+    EXPECT_FALSE(in.isIncompleteArray(x->type));
+    ASSERT_FALSE(in.scalars(x->type).empty());
+    EXPECT_EQ(in.scalars(x->type)[0], 1)
+        << "a tentative array of unknown size is ONE element, never 0";
 }
 
 // FAIL LOUD (2): the same at BLOCK scope — a different declaration row
@@ -17952,8 +18230,11 @@ TEST(SemanticAnalyzerC, IncompleteArrayTypedefLocalObjectFailsLoud) {
         << "a block-scope object of incomplete-array type must fail loud too";
 }
 
-// FAIL LOUD (3): `sizeof(T)`. computeLayout has no size for a bare incomplete
-// array, so a const-expr use refuses — it never folds to 0.
+// FAIL LOUD (3): `sizeof(T)`. P69 (lane `cs`): `sizeof` of an array of unknown
+// size folds to 0 and SAYS so (S_SizeofIncompleteArrayIsZero) — cl's reading,
+// C4034 (✔MEASURED, probe sz; gcc and clang refuse the `sizeof`). It is never
+// SILENT, and the zero-length array it would declare here is refused by every
+// reference (cl C2466 after its C4034) and by DSS (S_ArrayLengthOutOfRange).
 TEST(SemanticAnalyzerC, SizeofIncompleteArrayTypedefFailsLoud) {
     auto cu = buildShippedUnit("c", {
         "typedef int T[];\n"
@@ -17963,9 +18244,11 @@ TEST(SemanticAnalyzerC, SizeofIncompleteArrayTypedefFailsLoud) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u)
-        << "`sizeof(T)` on an incomplete array must REFUSE — folding it to 0 "
-           "would silently declare `int probe[0]`";
+                        DiagnosticCode::S_SizeofIncompleteArrayIsZero), 1u)
+        << "`sizeof(T)` on an incomplete array folds to 0 only with a word";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 1u)
+        << "and `int probe[0]` is refused, never silently declared";
 }
 
 // FAIL LOUD (4): a NON-LAST member of that type. The shared composite guard
@@ -18713,9 +18996,18 @@ TEST(SemanticAnalyzerC, StructMemberLeadingAlignasAndAttributeCompose) {
 // ...);` compiled rc=0, emitted no diagnostic anywhere, and died at PROCESS
 // START with 0xC0000139 (MEASURED at the TF-C111 HEAD).
 //
-// These pins are the SEMANTIC half of the fix: the row's recipe id and its
-// declared signature survive suppression. The HIR half (recipe → shim, never an
-// import row; and the signature refusal) is pinned in test_hir_lowering_c.
+// These pins are the SEMANTIC half of the fix: the row's realization and its
+// declared signature survive suppression. The HIR half (never an import row; and
+// the link name the realization defines) is pinned in test_hir_lowering_c.
+//
+// ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): the pe realization
+// the suppressed row must carry is no longer a `synthesize` recipe — the family is
+// DSS's runtime SOURCE (runtime/platform/src/stdio.c) under the link name
+// `__dss_isoc23_printf`, so the three properties that must survive suppression are
+// the shipped-source path, the link name, and the EMPTY pe image (the row's own
+// source supersedes the import its descriptor would otherwise have handed it). The
+// failure a lost property causes is the same one TF-C112 measured: a raw `printf`
+// import from an image that exports none, dying at process start with rc=0.
 
 namespace {
 
@@ -18726,7 +19018,7 @@ namespace {
 // copy). The format is threaded to BOTH the UnitBuilder (macro `variants` splice)
 // and `analyze` (the per-symbol availability gate) exactly as the driver does —
 // which is load-bearing here: stdio.json carries TWO `printf` rows, and only the
-// pe one has a `synthesize` tag.
+// pe one is realized from DSS's runtime source (it had a `synthesize` tag until P69).
 [[nodiscard]] SemanticModel analyzeRealStdio(std::string mainSrc,
                                              ObjectFormatKind format,
                                              DataModel dataModel,
@@ -18781,10 +19073,10 @@ constexpr char const* kPrintfRedeclSrc =
 
 } // namespace
 
-// PE: the suppressed row keeps its `synthesize` recipe. RED before TF-C112 —
-// `SuppressedShippedSymbol` had no such field, so the answer was structurally
-// unavailable.
-TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
+// PE: the suppressed row keeps its REALIZATION. RED before TF-C112 —
+// `SuppressedShippedSymbol` had no realization field at all, so the answer was
+// structurally unavailable; since P69 the realization is DSS's runtime source.
+TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsShippedSourceRealization) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
                                   DataModel::Llp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
@@ -18793,17 +19085,23 @@ TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr)
         << "goal-2 suppressed the descriptor's printf — the row must be recorded";
-    EXPECT_EQ(sup->recipeId, "printf")
-        << "the pe row is realized as a compiler-synthesized shim; a suppressed "
-           "copy that forgets the recipe re-exports it as a ucrtbase import that "
-           "cannot load (0xC0000139)";
+    EXPECT_EQ(sup->shippedSourcePath, "runtime/platform/src/stdio.c")
+        << "the pe row's body is DSS's runtime source; a suppressed copy that forgets "
+           "it re-exports printf as a ucrtbase import that cannot load (0xC0000139)";
+    EXPECT_EQ(sup->linkName, "__dss_isoc23_printf")
+        << "the runtime unit defines the C23 engine's link name, not `printf` — a "
+           "suppressed copy that forgets it references a name nothing defines";
+    EXPECT_TRUE(sup->recipeId.empty())
+        << "the stdio recipes were retired in P69: a recipe here would be a second "
+           "owner of the body the runtime source already provides";
     // The per-format library still rides too — the c86/c156 contract is intact,
-    // not replaced. Which ROW was recorded is decided by the availability gate,
-    // and `ucrtbase.dll` here proves the PE row won (the elf/macho `printf` row
-    // carries no recipe, so recording it would have looked identical to the
-    // pre-fix bug).
+    // not replaced — and on pe it is the EMPTY image: the row's own source supersedes
+    // the `cLibrary` import its descriptor would otherwise hand it (R3 precedence).
+    // Which ROW was recorded is decided by the availability gate; the elf/macho
+    // `printf` row carries none of these three properties.
     ASSERT_TRUE(sup->library.contains("pe"));
-    EXPECT_EQ(sup->library.at("pe"), "ucrtbase.dll");
+    EXPECT_EQ(sup->library.at("pe"), "")
+        << "a non-empty pe image here plants an import of a name the image lacks";
 }
 
 // PE: and the row's DECLARED SIGNATURE, which is the shim-compatibility oracle.
@@ -18851,6 +19149,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
     EXPECT_TRUE(sup->recipeId.empty())
         << "the elf printf row is a plain libc.so.6 import — tagging it would "
            "drop a working import in favour of a shim nothing asked for";
+    EXPECT_TRUE(sup->shippedSourcePath.empty())
+        << "P69 decided NO DSS unit on ELF: the elf row binds glibc's own printf";
     ASSERT_TRUE(sup->library.contains("elf"));
     EXPECT_EQ(sup->library.at("elf"), "libc.so.6");
 }
@@ -22305,7 +22605,7 @@ TEST(SemanticAnalyzerC, ThreadLocalIsExemptFromTheStorageClassConstraint) {
 
 // THE NON-DEFINING FACT, READ OFF THE RECORD RATHER THAN OFF THE GRAMMAR.
 // `isExternDeclaration` is the flag the tentative-definition fold, the
-// redeclaration-merge direction and the block-scope re-home guard all consult.
+// redeclaration-merge direction and the block-extern sweep all consult.
 // Every ordering must set it, because every ordering is the same declaration.
 TEST(SemanticAnalyzerC, ExternSpecifierMakesTheFileScopeDeclarationNonDefining) {
     for (std::string_view const decl : {"extern int e;\n",
@@ -23697,4 +23997,440 @@ TEST(SemanticAnalyzerCParamListTag, CensusATypeNameDefinitionBindsInTheEnclosing
     EXPECT_FALSE(p.model.hasErrors());
     EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 0u)
         << "no parameter list is involved";
+}
+
+// ══ THE CONSTANT EVALUATOR'S UNARY OPERATORS, THROUGH THE CST WALKER ═════════
+// (cycle P69 round 1, lane `lm`. One block, at the end of the file.)
+//
+// [[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]]. `~` and `-` of an
+// `unsigned int` were computed on 64 bits and never reduced, so every WIDENING
+// read 2^64-1 where C says 0xFFFFFFFF (6.5.3.3p3-p4, 6.2.5p9). ★ THE HARM
+// DIRECTION: the assertion written in the positive failed LOUDLY; the one
+// written in the negative, an enumerator and an array bound built on the widened
+// value were simply wrong. ✔MEASURED 2026-10-10 on the unary matrix (every
+// unary operator x every integer type x twelve contexts x file and block scope):
+// cl 19.51, MinGW-w64 gcc, gcc, clang and AppleClang run every cell to its
+// expected value; this walker failed 76 assertion cells of `~` and 60 of `-`.
+TEST(SemanticAnalyzerC, UnaryOfAnUnsignedOperandIsReducedToItsOwnTypeBeforeAnythingWidensIt) {
+    auto model = analyzeShipped("c", {
+        "_Static_assert((unsigned long long)(~0U) == 0xFFFFFFFFull, \"\");\n"
+        "_Static_assert((unsigned long long)(~0U) != 0xFFFFFFFFFFFFFFFFull, \"written in the negative\");\n"
+        "_Static_assert((long long)(-1U) == 4294967295ll, \"\");\n"
+        "_Static_assert((long long)(-1U) != -1ll, \"\");\n"
+        "_Static_assert(~0U + 0ULL == 0xFFFFFFFFull, \"widened by the usual arithmetic conversions\");\n"
+        "_Static_assert((unsigned long long)(-(unsigned)5) == 0xFFFFFFFBull, \"\");\n"
+        "_Static_assert((unsigned long long)~(unsigned)0x0F == 0xFFFFFFF0ull, \"\");\n"
+        "_Static_assert(((unsigned long long)~0U & 0x123456789ABCDEF0ull) == 0x9ABCDEF0ull, \"the low-32-bit mask\");\n"
+        "_Static_assert((double)(~0U) == 4294967295.0, \"to a floating target\");\n"
+        // The promotion control: below `int` the operand becomes a SIGNED int.
+        "_Static_assert(~(unsigned short)0 == -1, \"\");\n"
+        "_Static_assert((long long)~(unsigned short)0 == -1ll, \"\");\n"
+        "_Static_assert((long long)-(unsigned char)1 == -1ll, \"\");\n"
+        // The signed control, and 64 bits where the pattern is the value.
+        "_Static_assert(~0 == -1 && (long long)~0 == -1ll, \"\");\n"
+        "_Static_assert(~0ULL == 0xFFFFFFFFFFFFFFFFull, \"\");\n"
+        "enum { E = (int)((unsigned long long)(~0U) >> 28) };\n"
+        "_Static_assert(E == 15, \"an enumerator built on the widened value\");\n"
+        "static char sized[((unsigned long long)(~0U) >> 30) + 1];\n"
+        "_Static_assert(((unsigned long long)(~0U) >> 30) + 1 == 4, \"the array bound built on it\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+    // The forms that PASSED while false. Each must now fail, by this code.
+    char const* const wasSilentlyTrue[] = {
+        "_Static_assert((unsigned long long)(~0U) == 0xFFFFFFFFFFFFFFFFull, \"m\");\n",
+        "_Static_assert((long long)(-1U) == -1ll, \"m\");\n",
+        "_Static_assert(~0U + 0ULL == 0xFFFFFFFFFFFFFFFFull, \"m\");\n",
+    };
+    for (char const* src : wasSilentlyTrue) {
+        auto m = analyzeShipped("c", {std::string{src} + "int main(void){ return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u) << src;
+    }
+}
+
+// ★ A CONSUMER THAT TURNS THE WRONG TRUTH VALUE INTO DELETED CODE. The lowering
+// asks THIS walker whether an `if` or a loop condition is a constant, and where
+// the answer is "true, and its arm terminates" it concludes that no execution
+// passes the statement. ✔MEASURED 2026-10-10 on pe64, baseline and release:
+// `int f(int x) { if ((unsigned long long)~0u > 0xFFFFFFFFull) return 3; return x; }`
+// — a condition that is FALSE — was folded TRUE, and the program died of an
+// illegal instruction where `return x;` had been; so did the five other
+// conditions below. Each is pinned here at the value the lowering reads; that
+// the statement after the `if` survives is pinned where the lowering is
+// (`NonVoidFunctionEndReached`, the two rows naming this fold).
+TEST(SemanticAnalyzerC, AWidenedUnsignedUnaryInAConditionHasItsThirtyTwoBitTruthValue) {
+    auto model = analyzeShipped("c", {
+        "_Static_assert(!((unsigned long long)~0u > 0xFFFFFFFFull), \"\");\n"
+        "_Static_assert(!((long long)-1u < 0), \"\");\n"
+        "_Static_assert((unsigned long long)~0u == 0xFFFFFFFFull, \"the loop condition's form\");\n"
+        "_Static_assert(!(~0u + 0ull > 0xFFFFFFFFull), \"\");\n"
+        "_Static_assert(!((double)~0u > 4294967295.0), \"\");\n"
+        "_Static_assert((unsigned long long)-(unsigned)5 == 0xFFFFFFFBull, \"\");\n"
+        // The un-widened forms were right the whole time: the comparison
+        // reduces both operands to its own type first.
+        "_Static_assert(!(~0u > 0xFFFFFFFFu) && !(-1u > 0xFFFFFFFFu), \"\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]]: an unsigned
+// constant above INT64_MAX is an operand of every operator and of every cast.
+// The guards asked "does it fit a signed int64" where the question was "is it
+// an integer", so each line below was "not an integer constant expression".
+TEST(SemanticAnalyzerC, AnUnsignedConstantAboveInt64IsAnOperandLikeAnyOther) {
+    auto model = analyzeShipped("c", {
+        "_Static_assert(~0x8000000000000000ull == 0x7FFFFFFFFFFFFFFFull, \"\");\n"
+        "_Static_assert(~(unsigned long long)(-2) == 1ull, \"\");\n"
+        "_Static_assert(-18446744073709551615ull == 1ull, \"\");\n"
+        "_Static_assert(!0x8000000000000000ull == 0, \"\");\n"
+        "_Static_assert((0x8000000000000000ull ? 7 : 9) == 7, \"\");\n"
+        "_Static_assert((0x8000000000000000ull && 1) == 1, \"\");\n"
+        "_Static_assert((0x8000000000000000ull || 0) == 1, \"\");\n"
+        "_Static_assert((unsigned long long)0x8000000000000000ull == 0x8000000000000000ull, \"the identity\");\n"
+        "_Static_assert((unsigned)0xFFFFFFFFFFFFFFFFull == 0xFFFFFFFFu, \"\");\n"
+        "_Static_assert((_Bool)0x8000000000000000ull == 1, \"\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// THE SAME ROW'S NAMED NEIGHBOUR: UNARY `+` WAS NO CONSTANT OPERATOR AT ALL.
+// It is no core operator — the lowering turns `+x` into the promotion itself —
+// so this walker had no arm for it and refused every constant expression that
+// held one: ✔MEASURED 2026-10-10, 462 of the 468 assertion cells of the matrix's
+// `+` group, and every enumerator and array bound built on `+x`; the five
+// reference compilers accept every cell. C 6.5.3.3p2: the value of the promoted
+// operand.
+TEST(SemanticAnalyzerC, UnaryPlusIsAConstantOperator) {
+    auto model = analyzeShipped("c", {
+        "_Static_assert(+5U == 5U, \"\");\n"
+        "_Static_assert(+1 == 1 && +0 == 0, \"\");\n"
+        "_Static_assert(+(unsigned char)255 == 255, \"\");\n"
+        "_Static_assert((long long)+(signed char)(-1) == -1ll, \"\");\n"
+        "_Static_assert(+(-3) == -3, \"\");\n"
+        "_Static_assert(+18446744073709551615ULL == 18446744073709551615ULL, \"\");\n"
+        "_Static_assert((unsigned long long)+(unsigned __int128)15 == 15ull, \"a 128-bit operand\");\n"
+        "_Static_assert(-+-+7 == 7, \"\");\n"
+        "enum { E = +3 };\n"
+        "static char sized[+4];\n"
+        "_Static_assert(E == 3, \"\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ══ WHAT A WRAPPER IS: AN INITIALIZER IS READ WITH ITS OPERATOR ══════════════════════
+// (cycle P69 round 1, lane `lm`.)
+//
+// [[D-C-CONSTANT-AGGREGATE-MEMBER-READ-WITHOUT-ITS-INITIALIZERS-OPERATOR]]. Four
+// descents of the semantic tier took every node with exactly one Internal child for
+// a wrapper, and a unary operator's node has exactly one. The member of a constant
+// aggregate initialized by `-5` was read as 5: ✔MEASURED 2026-10-10 on pe64, baseline
+// and release — 134 of 247 cells wrong (51 kinds of initializer, each read in a
+// condition, a static assertion, an enumerator with an array bound, and on a
+// `constexpr` object). ★ THE HARM DIRECTION: the assertion written right failed
+// LOUDLY; the one written wrong PASSED, an enumerator and an array bound built on the
+// member were silently wrong, and a condition on it deleted the code after its `if`
+// (pinned where the lowering is: `NonVoidFunctionEndReached`, the two rows naming
+// the constant aggregate). What a wrapper is has ONE statement now
+// (`nodeSaysSomethingItself`); each test below is red with a descent taken off it.
+TEST(SemanticAnalyzerC, AConstantAggregatesMemberIsReadWithItsInitializersOperator) {
+    char const* const types =
+        "typedef unsigned long long u64;\n"
+        "struct S { u64 a; long long b; double d; };\n"
+        "struct T { int x; struct S s; };\n"
+        "union U { long long b; u64 a; };\n"
+        "enum { EN = 5 };\n"
+        "static const int K = 3;\n"
+        "static const struct S h = {.a = 1, .b = 9};\n";
+    auto model = analyzeWithLayout({std::string{types} +
+        "static const struct S g01 = {.b = -5};\n"
+        "_Static_assert(g01.b == -5, \"unary minus\");\n"
+        "static const struct S g02 = {.a = !0, .b = !5};\n"
+        "_Static_assert(g02.a == 1 && g02.b == 0, \"logical not\");\n"
+        "static const struct S g03 = {.a = ~0u, .b = ~0};\n"
+        "_Static_assert(g03.a == 0xFFFFFFFFull && g03.b == -1, \"complement, at the operand's own type\");\n"
+        "static const struct S g04 = {.b = -1u, .d = -1.5};\n"
+        "_Static_assert(g04.b == 4294967295ll && g04.d == -1.5, \"\");\n"
+        "static const struct S g05 = {.a = ((~5)), .b = (-5)};\n"
+        "_Static_assert(g05.a == 0xFFFFFFFFFFFFFFFAull && g05.b == -5, \"through parentheses\");\n"
+        "static const struct S g06 = {.a = - -5, .b = -__extension__ 5};\n"
+        "_Static_assert(g06.a == 5 && g06.b == -5, \"\");\n"
+        "static const struct S g07 = {.b = __extension__ -5};\n"
+        "_Static_assert(g07.b == -5, \"`__extension__` is grouping, the operator under it is not\");\n"
+        "static const struct S g08 = {.a = !K, .b = -K};\n"
+        "_Static_assert(g08.a == 0 && g08.b == -3, \"of a named constant\");\n"
+        "static const struct S g09 = {.a = ~h.a, .b = -h.b};\n"
+        "_Static_assert(g09.a == 0xFFFFFFFFFFFFFFFEull && g09.b == -9, \"of another constant's member\");\n"
+        "static const struct S g10 = {.b = -EN};\n"
+        "_Static_assert(g10.b == -5, \"of an enumeration constant\");\n"
+        "static const struct S g11 = {~(unsigned)0x0F, -(unsigned)5, -1U};\n"
+        "_Static_assert(g11.a == 0xFFFFFFF0ull && g11.b == 4294967291ll && g11.d == 4294967295.0, \"positional\");\n"
+        "static const struct T g12 = {.s = {.b = -5}};\n"
+        "_Static_assert(g12.s.b == -5, \"nested\");\n"
+        "static const union U g13 = {.b = -5};\n"
+        "_Static_assert(g13.b == -5, \"a union's member\");\n"
+        "_Static_assert((struct S){.b = -5}.b == -5, \"a compound literal's member\");\n"
+        "_Static_assert(((h)).b == 9 && (__extension__ h).b == 9 && (*&h).b == 9,"
+        " \"the base through grouping, and through the one pair of operators that says nothing\");\n"
+        "constexpr struct S c01 = {.a = !0, .b = -5, .d = -1.5};\n"
+        "_Static_assert(c01.a == 1 && c01.b == -5 && c01.d == -1.5, \"a constexpr object (C23 6.6p7)\");\n"
+        "enum { E1 = (g01.b == -5) ? 1 : 0, E2 = (g03.a == 0xFFFFFFFFull) ? 1 : 0 };\n"
+        "_Static_assert(E1 == 1 && E2 == 1, \"an enumerator built on the member\");\n"
+        "static char sized[(g01.b == -5) ? 3 : 7];\n"
+        "_Static_assert(sizeof sized == 3, \"an array bound built on the member\");\n"
+        // `sizeof` / `_Alignof`: the operand is not the value, and a type name is no expression.
+        "static const struct S z01 = {.a = sizeof K};\n"
+        "_Static_assert(z01.a == sizeof(int), \"`sizeof e` is the size of e, never its value\");\n"
+        "static const struct S z02 = {.a = sizeof(int)};\n"
+        "_Static_assert(z02.a == 4, \"a type name is not walked into\");\n"
+        "static const struct S z03 = {.a = sizeof(K), .b = -(long long)sizeof(int)};\n"
+        "_Static_assert(z03.a == 4 && z03.b == -4, \"\");\n"
+        "static const struct S z04 = {.a = _Alignof(long long)};\n"
+        "_Static_assert(z04.a == 8, \"\");\n"
+        "static const struct S z05 = {.a = __alignof__(K)};\n"
+        "_Static_assert(z05.a == 4, \"\");\n"
+        "int main(void){ return 0; }\n"});
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+    // The forms that PASSED while false. Each must now fail, by this code.
+    char const* const wasSilentlyTrue[] = {
+        "static const struct S g = {.b = -5};\n_Static_assert(g.b == 5, \"m\");\n",
+        "constexpr struct S g = {.b = -5};\n_Static_assert(g.b == 5, \"m\");\n",
+        "static const struct S g = {.a = !0};\n_Static_assert(g.a == 0, \"m\");\n",
+        "static const struct S g = {.a = sizeof K};\n_Static_assert(g.a == 3, \"m\");\n",
+        "_Static_assert((struct S){.b = -5}.b == 5, \"m\");\n",
+    };
+    for (char const* src : wasSilentlyTrue) {
+        auto m = analyzeWithLayout(
+            {std::string{types} + src + "int main(void){ return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u) << src;
+    }
+    // THROUGH A STATEMENT EXPRESSION OF ONE EXPRESSION THE VALUE IS THAT EXPRESSION'S,
+    // operator and all. The descent once walked into the body AND through the operator
+    // of its last expression (`({ -5; })` was read as 5, and `a.b == 5` passed in
+    // silence). ✔MEASURED 2026-10-12: clang 18 and AppleClang 21 fold each line below
+    // (gcc 13 and mingw-w64 gcc 13.2 refuse them as no constant — one working
+    // reference makes a form required). Which constant object an expression is the
+    // value of is a question of VALUE, so the base of a member access and an
+    // aggregate initialized whole are read through the construct too
+    // (`soleExpressionOfStatementExpression`); stopped at it, the last three
+    // assertions were refused as no integer constant expression.
+    auto viaStatement = analyzeWithLayout({std::string{types} +
+        "struct W { struct S in; int n; };\n"
+        "int main(void){\n"
+        "    const struct S a = {.b = ({ -5; })};\n"
+        "    _Static_assert(a.b == -5, \"the member's value through a statement expression\");\n"
+        "    _Static_assert(({ h; }).b == 9, \"the base through a statement expression\");\n"
+        "    const struct S g = ({ h; });\n"
+        "    _Static_assert(g.b == 9, \"an object initialized whole through a statement expression\");\n"
+        "    const struct W w = { ({ h; }), 2 };\n"
+        "    _Static_assert(w.in.b == 9 && w.n == 2, \"a member initialized whole through a statement expression\");\n"
+        "    return 0;\n"
+        "}\n"});
+    EXPECT_EQ(countCode(viaStatement.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(viaStatement, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(viaStatement.hasErrors());
+    // …and the assertion written WRONG fails, by this code.
+    auto wrongViaStatement = analyzeWithLayout({std::string{types} +
+        "int main(void){\n"
+        "    const struct S a = {.b = ({ -5; })};\n"
+        "    _Static_assert(a.b == 5, \"m\");\n"
+        "    return 0;\n"
+        "}\n"});
+    EXPECT_EQ(countCode(wrongViaStatement.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "the operand under a statement expression's operator is not the member's value";
+}
+
+// THE OTHER CALLERS OF THE SAME DESCENT ASKED THEIR QUESTION OF THE OPERAND. The
+// `constexpr` aggregate walk asked "is `n` a constant" of `sizeof n` and refused it;
+// the null-pointer-cast test asked "is this a cast of 0 to a pointer" of the operand
+// of `!` and ADMITTED `!(int *)0`, which is the integer 1. ✔MEASURED 2026-10-10.
+TEST(SemanticAnalyzerC, AConstexprInitializerIsJudgedWholeNotByItsOperand) {
+    auto model = analyzeWithLayout({
+        "struct S { unsigned long long a; long long b; };\n"
+        "struct P { int *p; };\n"
+        "static int n;\n"
+        "constexpr struct S a1 = {.a = sizeof n, .b = -5};\n"
+        "constexpr struct S a2 = {.a = sizeof(int), .b = -(long long)sizeof(int)};\n"
+        "constexpr struct S a3 = {.a = _Alignof(long long)};\n"
+        "_Static_assert(a1.a == sizeof(int) && a1.b == -5 && a2.a == 4 && a2.b == -4 && a3.a == 8, \"\");\n"
+        // Grouping stays grouping: the cast under it is still the null pointer constant.
+        "constexpr struct P p1 = { (int *)0 };\n"
+        "constexpr struct P p2 = { ((int *)0) };\n"
+        "constexpr int *q1 = ((int *)0);\n"
+        "constexpr int *q2 = __extension__ (int *)0;\n"
+        // …and so does the one pair of operators that says nothing (C 6.5.3.2p3).
+        "constexpr int *q3 = &*(int *)0;\n"
+        // The other order designates the object (p4): a member initialized WHOLE by a
+        // named constant written `*&s`, bare and under grouping, and an object likewise.
+        "struct W { struct S in; int n; };\n"
+        "constexpr struct S s1 = {.b = 1};\n"
+        "constexpr struct W w1 = { *&s1, 2 };\n"
+        "constexpr struct W w2 = { (*(&s1)), 3 };\n"
+        "constexpr struct S s2 = *&s1;\n"
+        "_Static_assert(w1.in.b == 1 && w1.n == 2 && w2.in.b == 1 && w2.n == 3 && s2.b == 1, \"\");\n"
+        // A statement expression of ONE expression has that expression's value, and
+        // "is this the null pointer constant" is a question of value: the test reads
+        // through the construct (`soleExpressionOfStatementExpression`). ✔MEASURED
+        // 2026-10-12: gcc 13, mingw-w64 gcc 13.2 and AppleClang 21 accept each line
+        // (clang 18 refuses them). Stopped at the construct — as a question of FORM
+        // must be — the first two were refused, while the third, which goes another
+        // way, was accepted all along.
+        "int main(void){\n"
+        "    constexpr int *e1 = ({ (int *)0; });\n"
+        "    constexpr int *e2 = (({ (int *)0; }));\n"
+        "    constexpr struct P e3 = { ({ (int *)0; }) };\n"
+        "    return e1 != 0 || e2 != 0 || e3.p != 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_ConstexprNonConstantInitializer);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+    // Refused BY NAME: an operator over the cast is not the cast, and an operator over
+    // an object that is no constant is no constant.
+    char const* const notConstant[] = {
+        "constexpr int *p = !(int *)0;\n",
+        "static int n;\nstruct S { long long b; };\nconstexpr struct S g = {.b = -n};\n",
+        // An address is not the object under the `&`: a `constexpr` pointer is null
+        // (gcc 13 and AppleClang 21: "constexpr pointer initializer is not null").
+        "struct P { const int *p; };\nconstexpr int k = 3;\nconstexpr struct P g = { &k };\n",
+    };
+    for (char const* src : notConstant) {
+        auto m = analyzeWithLayout({std::string{src} + "int main(void){ return 0; }\n"});
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+            << src;
+    }
+}
+
+// THE BRACE WALKS' DESCENT, SAME CLASS: `{ sizeof "abc" }` and `{ !"abc" }` were
+// taken for the string literal that initializes a character array (C 6.7.9p14) —
+// the operand of the operator answered for the element. ✔MEASURED 2026-10-10: the
+// array was sized 4 (the string's size) where every reference sizes it by its
+// elements. A string under GROUPING is still the string. This pins the SIZE, which
+// is this tier's; what the lowering makes of the list is pinned where the lowering
+// is (`tests/hir/test_brace_element_as_written.cpp`).
+TEST(SemanticAnalyzerC, ABraceIsAStringInitializerOnlyWhenItsElementIsTheLiteral) {
+    auto model = analyzeWithLayout({
+        "static char k1[] = \"abc\";\n"
+        "static char k2[] = { \"abc\" };\n"
+        "static char k3[] = (\"abc\");\n"
+        "static char k4[] = { (\"abc\") };\n"
+        "static char k5[] = __extension__ \"abc\";\n"
+        "_Static_assert(sizeof k1 == 4 && sizeof k2 == 4 && sizeof k3 == 4 && sizeof k4 == 4"
+        " && sizeof k5 == 4, \"a string, also through grouping\");\n"
+        "static char s1[] = { sizeof \"abc\" };\n"
+        "_Static_assert(sizeof s1 == 1, \"the size of a string is one element\");\n"
+        "int main(void){\n"
+        "    char s2[] = { !\"abc\", 9 };\n"
+        "    char s3[] = { *\"abc\" };\n"
+        "    char s4[] = { *\"abc\", 'z' };\n"
+        "    _Static_assert(sizeof s2 == 2 && sizeof s3 == 1 && sizeof s4 == 2, \"an operator's result is an element\");\n"
+        // A STATEMENT EXPRESSION SAYS SOMETHING ITSELF, and for this question — what
+        // the element IS — that is the whole answer: the string inside it is not the
+        // string that initializes the array. ✔MEASURED 2026-10-12: gcc 13 and
+        // mingw-w64 gcc 13.2 build these as arrays of one and of two elements (the
+        // construct's value is a pointer, converted to the element); clang 18 and
+        // AppleClang 21 refuse the conversion. An array of four, on none. Walked
+        // through, both tiers' brace peel reached the literal and sized `e1` as the
+        // string.
+        "    char e1[] = { ({ \"abc\"; }) };\n"
+        "    char e2[] = { ({ \"abc\"; }), 9 };\n"
+        "    _Static_assert(sizeof e1 == 1 && sizeof e2 == 2, \"a statement expression is an element, not the string\");\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// [[D-C-GENERIC-SELECTION-BEFORE-THE-EXPRESSION-PASS-SELECTS-DEFAULT]]. A generic
+// selection in an enumerator, a file-scope array bound or a bit-field width is
+// resolved BEFORE the expression pass stamps a literal's type; its controlling
+// expression was typed without the preparation such a query needs, had no type, and
+// `default` was selected in silence: ✔MEASURED 2026-10-10, `enum { EV = _Generic(0,
+// int: 42, default: 9) };` was 9 and `static char arr[_Generic(0, int: 3, default:
+// 7)];` had seven elements (11 of 14 controlling expressions holding a literal; a
+// member's, a parameter's and a typedef's array bound and a designator's index
+// likewise), while the same selection in a static assertion was right. C 6.5.1.1p3:
+// the association whose type is compatible with the controlling expression's.
+TEST(SemanticAnalyzerC, AGenericSelectionBeforeTheExpressionPassSelectsByItsControllingType) {
+    auto model = analyzeWithLayout({
+        "enum { E1 = _Generic(0, int: 42, default: 9) };\n"
+        "enum { E2 = _Generic(1.5, double: 42, default: 9) };\n"
+        "enum { E3 = _Generic(1ull, unsigned long long: 42, default: 9) };\n"
+        "_Static_assert(E1 == 42 && E2 == 42 && E3 == 42, \"an enumerator\");\n"
+        "static char arr[_Generic(0, int: 3, default: 7)];\n"
+        "_Static_assert(sizeof arr == 3, \"a file-scope array bound\");\n"
+        "struct B { unsigned f : _Generic(0, int: 3, default: 9); };\n"
+        "static const long long k = _Generic(0, int: -5, default: 9);\n"
+        "enum { E4 = (k == -5) ? 42 : 9 };\n"
+        "_Static_assert(E4 == 42, \"through a named constant\");\n"
+        "typedef char Bound[_Generic(0, int: 3, default: 7)];\n"
+        "struct M { char c[_Generic(1.5f, float: 3, default: 7)]; };\n"
+        "static int byIndex[] = { [_Generic('a', int: 2, default: 9)] = 1 };\n"
+        "_Static_assert(sizeof(Bound) == 3 && sizeof(struct M) == 3 && sizeof byIndex == 3 * sizeof(int),"
+        " \"a typedef's and a member's array bound, a designator's index\");\n"
+        // The control: `default` is still the association of a type no other names.
+        "enum { E5 = _Generic(0, long: 9, default: 42) };\n"
+        "_Static_assert(E5 == 42, \"\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// THE OTHER HALF OF THE SAME RULE: a controlling expression whose type is NOT KNOWN
+// selects nothing. `default` is the association for a type no other names, never for
+// a type that is not there — the enumerator below was 7, built on an identifier
+// nothing declares. It is the loud "not a constant" now.
+TEST(SemanticAnalyzerC, AGenericSelectionWithNoControllingTypeSelectsNothing) {
+    auto model = analyzeWithLayout({
+        "enum { EU = _Generic(undeclared_name, int: 3, default: 7) };\n"
+        "int main(void){ return 0; }\n",
+    });
+    // EXACTLY two errors, each said once: the name nothing declares, and the enumerator
+    // that is therefore no constant. "At least one" would pass a model that ALSO selected
+    // `default` and reported the name — the defect this pins.
+    std::string all;
+    std::size_t errors = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        all += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+        if (d.severity == DiagnosticSeverity::Error) ++errors;
+    }
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u) << all;
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantEnumeratorValue), 1u)
+        << "an unresolved controlling type must not select `default`\n" << all;
+    EXPECT_EQ(errors, 2u) << all;
+}
+
+// THE POSITIVE TWIN: a controlling expression whose type IS known — a variable, which a
+// generic selection never evaluates (C 6.5.1.1p3) — selects its association in the same
+// position, before the expression pass; `default` stays the association of a type no
+// other names.
+TEST(SemanticAnalyzerC, AGenericSelectionWithAKnownControllingTypeSelectsItsAssociation) {
+    auto model = analyzeWithLayout({
+        "static int declared_name;\n"
+        "enum { EK = _Generic(declared_name, int: 3, default: 7),\n"
+        "       ED = _Generic(declared_name, long: 3, default: 7) };\n"
+        "_Static_assert(EK == 3 && ED == 7, \"selected by the variable's type\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << firstActualForCode(model, DiagnosticCode::S_StaticAssertFailed);
+    EXPECT_FALSE(model.hasErrors());
 }

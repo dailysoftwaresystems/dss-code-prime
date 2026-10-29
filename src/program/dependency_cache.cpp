@@ -382,9 +382,12 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
     // directory, an external partial delete — and deleting it would destroy
     // something we did not create; it is refused, as it always was (the
     // staging design's landing rename refused it too).
-    bool const markedOurs = fs::exists(marker, ec) && !ec;
+    bool const markedOurs = core::reachedKind(marker, ec) != core::EntryKind::Absent && !ec;
     ec.clear();
-    if (fs::exists(fs::symlink_status(checkoutDir, ec)) && !ec) {
+    // An ENTRY at the checkout path -- a link there included, never what it
+    // reaches -- asked of the substrate, which asks the OS where the library
+    // cannot tell a link (the substrate's header).
+    if (core::entryKind(checkoutDir, ec) != core::EntryKind::Absent && !ec) {
         if (!markedOurs) {
             out.detail = "'" + core::genericSpelling(checkoutDir)
                        + "' exists but is not a usable checkout, and no '"
@@ -394,12 +397,18 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
                          "acquire the dependency again";
             return out;
         }
-        fs::remove_all(checkoutDir, ec);
-        if (ec) {
+        // The substrate's removal, never `remove_all`: a link in the leftover (or
+        // the leftover itself, a link) is removed as itself, never followed --
+        // libstdc++'s `remove_all` on Windows empties a directory link's TARGET
+        // (the substrate's header has the measurement).
+        auto const removal = core::removeTree(checkoutDir);
+        if (removal.failures != 0) {
             out.detail = "the incomplete checkout an interrupted acquisition left "
                          "at '"
                        + core::genericSpelling(checkoutDir)
-                       + "' could not be removed: " + ec.message();
+                       + "' could not be removed: '"
+                       + core::genericSpelling(removal.firstPath) + "': "
+                       + removal.firstError.message();
             return out;
         }
     }
@@ -422,9 +431,11 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
     // the tree goes, and so does the marker — unless the tree could NOT be
     // removed, in which case the marker stays and says so to the next build.
     auto abandon = [&checkoutDir, &marker](GitCommandResult result) {
-        std::error_code rmec;
-        fs::remove_all(checkoutDir, rmec);
-        if (!rmec) fs::remove(marker, rmec);
+        // The substrate's removal (a link is removed as itself, never followed).
+        if (core::removeTree(checkoutDir).failures == 0) {
+            std::error_code rmec;
+            fs::remove(marker, rmec);
+        }
         return result;
     };
 
@@ -517,9 +528,9 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // the working tree is complete) — the marker is the only thing that knows.
     bool        hasCheckout = false;
     std::string headCommit;
-    bool const  markedIncomplete = fs::exists(marker, ec) && !ec;
+    bool const  markedIncomplete = core::reachedKind(marker, ec) != core::EntryKind::Absent && !ec;
     ec.clear();
-    if (!markedIncomplete && fs::is_directory(checkoutDir, ec) && !ec) {
+    if (!markedIncomplete && core::reachedKind(checkoutDir, ec) == core::EntryKind::Directory && !ec) {
         GitCommandResult const head = git_->revParse(checkoutDir, "HEAD");
         hasCheckout                 = head.ok;
         headCommit                  = head.output;

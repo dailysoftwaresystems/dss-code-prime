@@ -57,7 +57,7 @@ rule:root
               tok:"g_buffer"
               rule:arrayDeclSuffix
                 tok:"["
-                rule:expression
+                rule:assignmentExpr
                   rule:operand
                     tok:"256"
                 tok:"]"
@@ -1268,7 +1268,7 @@ rule:root
                         tok:"local_buf"
                         rule:arrayDeclSuffix
                           tok:"["
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"16"
                           tok:"]"

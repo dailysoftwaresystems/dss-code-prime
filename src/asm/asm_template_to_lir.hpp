@@ -821,6 +821,43 @@ parseAsmTemplateText(std::string                          templateText,
 // source order, continuing into the blocks its own labels and conditional
 // branches open.
 //
+// ★★ THE EMBEDDING PROGRAM'S NAMES, AS A TEMPLATE SPELLS THEM (P69, lane `xa`;
+// D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM).
+// A template names symbols of the program that embeds it — `leaq g(%%rip)`,
+// `adrp x0, _g@PAGE`, `call f` — and every reference compiler builds and runs
+// that (✔MEASURED 2026-10-15: gcc 13.3.0 and clang 18.1.3 on x86_64 ELF, MinGW
+// gcc 13.2.0 on PE, Apple clang 21 on arm64 Mach-O, aarch64 gcc 13.3.0 on arm64
+// ELF; one source and two, -O0 and -O2). This engine holds no name table of its
+// own: its CALLER — the lowering of the statement, which owns the program's
+// symbol space — answers, and the engine only asks.
+//   * `symbolDefinedAs` — the symbol the embedding UNIT resolved the spelling
+//     to, where the unit defines it. The resolution is the unit's, made by its
+//     front end before any merge, so a unit's own `static` is never another
+//     unit's of the same name. nullopt ⇒ the unit defines no such name.
+//   * `definesCode` — whether such a definition is a FUNCTION (a constant added
+//     to code is refused, as in a `.s`: `namesCodeHere`).
+//   * `importOf` — a name the unit does not define is an IMPORT, spelled
+//     verbatim (a template writes the on-binary name, as a `.s` does), one row
+//     per name, with what the reference states: a CALL states code; an ADDRESS
+//     states nothing, and the definition the link finds decides — the rule a
+//     `.s` follows (`internExtern`). An invalid id ⇒ the caller REPORTED why.
+// A label the template itself defines, and an `asm goto` label placeholder, are
+// never asked about: they are not names of the program.
+enum class AsmTemplateNameUse : std::uint8_t {
+    Call,      // `call f`, `bl f` — states CODE
+    Address,   // an address or a displacement relative to it — states nothing
+};
+
+class DSS_EXPORT AsmTemplateProgramNames {
+public:
+    virtual ~AsmTemplateProgramNames() = default;
+    [[nodiscard]] virtual std::optional<SymbolId>
+    symbolDefinedAs(std::string_view spelling) const = 0;
+    [[nodiscard]] virtual bool definesCode(std::string_view spelling) const = 0;
+    [[nodiscard]] virtual SymbolId importOf(std::string const& spelling,
+                                            AsmTemplateNameUse use) = 0;
+};
+
 // Returns false with at least one diagnostic reported on any refusal.
 [[nodiscard]] DSS_EXPORT bool
 lowerAsmTemplateToLirRun(Tree const&                        templateTree,
@@ -829,6 +866,12 @@ lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                          std::span<AsmOperandBinding const> bindings,
                          LirBuilder&                        builder,
                          DiagnosticReporter&                reporter,
+                         // ★★ THE EMBEDDING PROGRAM'S NAMES (the class above). Null
+                         // ⇒ the caller hands none, and every name of the program
+                         // the template writes is REFUSED by name, saying so —
+                         // never imported, never guessed. NO DEFAULT: every caller
+                         // states which it does.
+                         AsmTemplateProgramNames*           programNames,
                          std::span<AsmLabelBinding const>   labelBindings = {},
                          // ★ THE TEMPLATE'S OWN LABELS (P68 round 8): every label
                          // it defines is a block created in `builder` (in text

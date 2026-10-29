@@ -5,7 +5,6 @@
 #include "core/types/rule_id.hpp"
 #include "core/types/tree_cursor.hpp"           // for Tree::cursor() / astCursor()
 
-#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -112,17 +111,31 @@ std::string_view Tree::text(NodeId id) const {
     return data_.source->slice(node_(id).span);
 }
 
-// ── discriminant-asserting ──
+// ── discriminant-checked (fatal on another kind, in every build) ──
 
 RuleId Tree::rule(NodeId id) const {
     auto const& n = node_(id);
-    assert(n.kind == NodeKind::Internal && "Tree::rule on non-Internal node");
+    if (n.kind != NodeKind::Internal) treeFatal("Tree::rule on non-Internal node");
     return n.rule;
 }
 
 SchemaTokenId Tree::tokenKind(NodeId id) const {
     auto const& n = node_(id);
-    assert(n.kind == NodeKind::Token && "Tree::tokenKind on non-Token node");
+    if (n.kind != NodeKind::Token) treeFatal("Tree::tokenKind on non-Token node");
+    return n.tokenKind;
+}
+
+// ── kind-checked queries (an answer for every kind) ──
+
+std::optional<RuleId> Tree::ruleIfInternal(NodeId id) const {
+    auto const& n = node_(id);
+    if (n.kind != NodeKind::Internal) return std::nullopt;
+    return n.rule;
+}
+
+std::optional<SchemaTokenId> Tree::tokenKindIfToken(NodeId id) const {
+    auto const& n = node_(id);
+    if (n.kind != NodeKind::Token) return std::nullopt;
     return n.tokenKind;
 }
 

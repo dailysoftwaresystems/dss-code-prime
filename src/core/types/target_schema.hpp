@@ -1239,68 +1239,29 @@ struct DSS_EXPORT TargetCallingConvention {
     std::uint16_t shadowSpaceBytes = 0;   // MS x64: 32 bytes of home space; SysV: 0
     std::uint16_t redZoneBytes     = 0;   // SysV leaf-fn red zone (128); MS x64: 0
 
-    // RSP-bias mod `stackAlignment` at the START of a function that
-    // serves as the PROCESS ENTRY POINT (D-LK10-ENTRY-TRAMP-PROLOGUE).
-    // This is the single new piece of vocabulary that closes the
-    // trampoline ABI-prologue without storing a derived constant:
-    // the bias, together with `stackAlignment` and `shadowSpaceBytes`
-    // already on this struct, determines the smallest `sub sp, N`
-    // the trampoline must emit. Algorithm lives in `lir_callconv.hpp`'s
-    // `alignedSizeWithBias()` so ML7 and the trampoline call ONE
-    // formula.
-    //
-    // Concrete values (encode the OS-loader convention for the entry
-    // cc):
-    //   * `ms_x64`     (Windows PE):   8  — `RtlUserThreadStart` does
-    //                                       a CALL into the entry
-    //                                       point, so the first
-    //                                       instruction sees RSP ≡ 8
-    //                                       mod 16.
-    //   * `sysv_amd64` (Linux ELF /    0  — kernel maps the image and
-    //                  macOS Mach-O):       JUMPS to `_start`/`main`
-    //                                       with RSP 16-byte-aligned
-    //                                       and NO return address
-    //                                       pushed.
-    //   * `aapcs64`    (Linux/Win/Mac  0  — ARM64 BL doesn't push,
-    //                  ARM64):              and the kernel sets SP
-    //                                       aligned at process entry.
-    //
-    // This field is consumed ONLY by the trampoline emitter (the
-    // entry-cc-of-the-program scenario). Normal-function frames
-    // computed by ML7 use the function-entry bias (= the cc's
-    // post-CALL RSP offset, typically equal to `callInstructionPush
-    // Bytes mod stackAlignment` = 8 for x86_64 / 0 for ARM64) — that
-    // bias is NOT this field. Wiring ML7 onto this field is anchored
-    // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY for when normal-function call-
-    // site shadow-space lands (separately tracked; not the
-    // trampoline's concern).
-    //
-    // Validators (target_schema.cpp::validate): MUST be 0 if the cc
-    // has all other stack fields at 0; otherwise MUST be <
-    // `stackAlignment`.
-    std::uint16_t entryStackPointerBias = 0;
-
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: byte count the architecture's
     // `call` instruction PUSHES onto the stack (the return-address
     // word). RSP delta at function entry FROM A CALLER, BEFORE the
-    // callee's prologue runs. Distinct from `entryStackPointerBias`
-    // above:
+    // callee's prologue runs. ISA-dependent only (x86_64 = 8 — `call`
+    // pushes a 64-bit return address; ARM64 = 0 — `bl` writes LR, no
+    // stack push).
     //
-    //   * `entryStackPointerBias`: RSP delta at PROCESS-ENTRY (the
-    //     kernel/loader's transition). OS-dependent (Win64 = 8 because
-    //     RtlUserThreadStart issues a CALL; SysV ELF/Mach-O = 0 because
-    //     the kernel JUMPs to `_start`).
-    //   * `callPushBytes`: RSP delta at NORMAL-CALL-ENTRY (the
-    //     in-program CALL instruction's push). ISA-dependent only
-    //     (x86_64 = 8 — `call` pushes a 64-bit return address;
-    //     ARM64 = 0 — `bl` writes LR, no stack push).
-    //
-    // The two fields COINCIDE on Win64 (both = 8) because Windows uses
-    // a CALL-style entry transition; they DIVERGE on Linux x86_64
-    // (entry = 0 via JMP, normal call = 8 via CALL push). Putting the
-    // facts in two distinct fields named for their distinct triggers
-    // prevents a future maintainer from "deduping" them on Win64 and
-    // silently breaking Linux x86_64.
+    // ★ THE PROCESS-ENTRY BIAS IS DERIVED FROM THIS, NOT STORED BESIDE IT
+    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION). Where the
+    // stack stands at the entry trampoline's first instruction depends on
+    // how the platform's LOADER enters the image — a fact of the exec
+    // FORMAT (`ObjectFormatSchema::entryTransition`), not of a calling
+    // convention: a loader that CALLS the entry (Windows'
+    // BaseThreadInitThunk, Mach-O's dyld for LC_MAIN) has pushed this many
+    // bytes; one that JUMPS (the ELF kernel / ld.so hand-off) has pushed
+    // nothing. This struct used to carry the answer as
+    // `entryStackPointerBias`, and a convention is the wrong owner: the one
+    // `sysv_amd64` convention serves ELF (jumped, 0) and Mach-O (called,
+    // 8), and its single 0 ran every Mach-O x86_64 frame 8 bytes off
+    // (✔MEASURED P69). The trampoline now computes `called ? callPushBytes
+    // : 0` — so the old warning against "deduping" the two facts on Win64
+    // is answered by construction: they coincide exactly where the entry is
+    // called, and the format, not a maintainer, says where that is.
     //
     // Consumed by ML7 `computeFrameLayout` for non-leaf functions: the
     // function's prologue must (a) reserve `shadowSpaceBytes` for any
@@ -1313,10 +1274,9 @@ struct DSS_EXPORT TargetCallingConvention {
     // trampoline emitter — one helper, two distinct bias inputs.
     //
     // Validators: MUST be strictly < `stackAlignment` (the bias is an
-    // OFFSET into the alignment quantum — parallel to
-    // entryStackPointerBias's contract); MUST be 0 when no ABI info
-    // is declared (consistent with entryStackPointerBias's
-    // "zero-when-cc-is-empty" rule). In practice the call instruction
+    // OFFSET into the alignment quantum — and the trampoline's derived
+    // process-entry bias of a CALLED entry is this same value); MUST be 0
+    // when no ABI info is declared. In practice the call instruction
     // pushes a multiple of pointer-width bytes, but the validator
     // expresses the alignment-quantum invariant rather than the
     // implementation detail.
@@ -3823,6 +3783,15 @@ struct RelocFormulaFacts {
     // For a scaled load/store twin, the access size its field counts in (a
     // GOT entry is one 64-bit pointer).
     std::uint8_t twinScaleLog2 = 0;
+    // The formula computes from the PLACE — its value depends on the address of
+    // the field it patches (a 26-bit branch, a page-relative ADRP, an ADR, a
+    // GOT-page ADRP, x86-64's GOTPCREL). What a `Linear` row states per row
+    // (`TargetRelocationInfo::pcRelative`), an instruction-word formula states
+    // for every row that uses it, so `Linear` answers false here and its rows
+    // answer for themselves (`relocReadsThePlace`). P69 review M1 (c) / MINOR 8:
+    // a reference that reaches an import from the place can only reach the
+    // import's call entry in this image.
+    bool readsThePlace = false;
 };
 
 [[nodiscard]] constexpr RelocFormulaFacts relocFormulaFacts(RelocFormulaKind k) noexcept {
@@ -3832,22 +3801,32 @@ struct RelocFormulaFacts {
         case RelocFormulaKind::X86_64GotPcRel:
             // The twin is a Linear pc-relative field of the SAME width and
             // bias (`gotSlotTwinMismatch` checks all three).
-            return {true, true, false, RelocFormulaKind::Linear, 0};
+            return {true, true, false, RelocFormulaKind::Linear, 0, true};
         case RelocFormulaKind::Aarch64AdrGotPage:
             // Page(G) - Page(P): ADR_PREL_PG_HI21's arithmetic on the slot.
-            return {false, true, true, RelocFormulaKind::Aarch64AdrPrelPgHi21, 0};
+            return {false, true, true, RelocFormulaKind::Aarch64AdrPrelPgHi21, 0, true};
         case RelocFormulaKind::Aarch64Ld64GotLo12:
             // (G & 0xFFF) >> 3: the 64-bit LDR's scaled page offset of the slot.
-            return {false, true, true, RelocFormulaKind::Aarch64LdstAbsLo12, 3};
-        case RelocFormulaKind::Aarch64Call26:
-        case RelocFormulaKind::Aarch64AdrPrelPgHi21:
-        case RelocFormulaKind::Aarch64AddAbsLo12:
-        case RelocFormulaKind::Aarch64TprelAddHi12:
-        case RelocFormulaKind::Aarch64AdrPrelLo21:
-        case RelocFormulaKind::Aarch64LdstAbsLo12:
+            return {false, true, true, RelocFormulaKind::Aarch64LdstAbsLo12, 3, false};
+        case RelocFormulaKind::Aarch64Call26:          // (S + A - P) >> 2
+        case RelocFormulaKind::Aarch64AdrPrelPgHi21:   // Page(S + A) - Page(P)
+        case RelocFormulaKind::Aarch64AdrPrelLo21:     // S + A - P
+            return {false, false, false, RelocFormulaKind::Linear, 0, true};
+        case RelocFormulaKind::Aarch64AddAbsLo12:      // (S + A) & 0xFFF
+        case RelocFormulaKind::Aarch64TprelAddHi12:    // a thread-pointer offset
+        case RelocFormulaKind::Aarch64LdstAbsLo12:     // scaled (S + A) & 0xFFF
             return {};
     }
     return {};
+}
+
+// Does a reference through this row compute from the PLACE? A `Linear` row says
+// so itself (`pcRelative`); every other formula says so for all its rows
+// (`RelocFormulaFacts::readsThePlace`).
+[[nodiscard]] constexpr bool relocReadsThePlace(RelocFormulaKind formula,
+                                                bool linearRowIsPcRelative) noexcept {
+    return formula == RelocFormulaKind::Linear ? linearRowIsPcRelative
+                                               : relocFormulaFacts(formula).readsThePlace;
 }
 
 // `SymbolAddressPart` — which part of a symbol's address an operand denotes —
@@ -4407,6 +4386,40 @@ struct DSS_EXPORT TlsIdentity {
 // `kRelocFormulaTable` so the accepted set never lags the enum.
 [[nodiscard]] DSS_EXPORT std::string acceptedRelocFormulaList();
 
+// ── THE VALUES A NARROW LINEAR FIELD HOLDS (P69 fold 3c) ──────────────────
+// A Linear row narrower than 8 bytes writes the LOW `widthBytes` bytes of
+// S + A (- P) (+ bias); whether that value was representable is a property of
+// how the field is READ BACK, and the wire types differ on exactly that:
+//   * `signed`   [-2^(n-1), 2^(n-1)) — a sign-extending field: a displacement,
+//                R_X86_64_32S, R_X86_64_PC32;
+//   * `unsigned` [0, 2^n) — a zero-extending field: R_X86_64_32 (`movl` writes
+//                a 32-bit register and clears the upper half), an RVA;
+//   * `either`   [-2^(n-1), 2^n) — a field the wire type does not say how to
+//                read: COFF's IMAGE_REL_AMD64_ADDR32 (`.long sym` and
+//                `movl $sym` both write it), GNU ld's range for it.
+// ✔MEASURED 2026-10-20 (GNU ld 2.42; the field's value set through an absolute
+// symbol): R_X86_64_32 links exactly [0, 2^32) and R_X86_64_32S exactly
+// [-2^31, 2^31). Before this key every Linear field was checked SIGNED, so DSS
+// refused 0x80000000 and 0xffffffff for R_X86_64_32 (ld links both) and LINKED
+// -1 and -2^31 (ld refuses both): -1 written 0xffffffff, which `movl` reads
+// back as 2^32 - 1 — a value the program never computed.
+// REQUIRED on every Linear row whose `widthBytes` is below 8 and refused on
+// every other row: an 8-byte field holds every value, an instruction-word
+// formula has its own fixed geometry, and a range the loader supplied by
+// default would be the silent assumption this key removes.
+enum class RelocFieldRange : std::uint8_t {
+    Signed   = 0,
+    Unsigned = 1,
+    Either   = 2,
+};
+
+inline constexpr EnumNameTable<RelocFieldRange, 3> kRelocFieldRangeTable{{{
+    { RelocFieldRange::Signed,   "signed" },
+    { RelocFieldRange::Unsigned, "unsigned" },
+    { RelocFieldRange::Either,   "either" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kRelocFieldRangeTable);
+
 struct DSS_EXPORT TargetRelocationInfo {
     std::string      name;            // canonical text key (e.g. "rel32", "abs64")
     RelocationKind   kind{};          // opaque tag — written into Relocation::kind;
@@ -4466,6 +4479,11 @@ struct DSS_EXPORT TargetRelocationInfo {
     //   structurally while being the WRONG answer, so those scans
     //   exclude it explicitly rather than relying on table order.
     bool         imageRelative = false;
+    // P69 fold 3c: the values this row's field holds (`RelocFieldRange`, the
+    // JSON key `fieldRange`). Set on exactly the Linear rows narrower than 8
+    // bytes; EMPTY on every other row, and never defaulted — the check below
+    // refuses a narrow Linear value it has no range for.
+    std::optional<RelocFieldRange> fieldRange;
     // P68 round 9: log2 of the access size a SCALED page-offset field is
     // measured in — the JSON key `scaleLog2`, 0..4 (a byte .. a 128-bit
     // register). REQUIRED on an `aarch64_ldst_abs_lo12` row and refused on
@@ -4497,6 +4515,93 @@ struct DSS_EXPORT TargetRelocationInfo {
 // schema built past the loader.
 [[nodiscard]] DSS_EXPORT std::optional<std::string>
 gotSlotTwinMismatch(TargetRelocationInfo const& gotRow, TargetRelocationInfo const& twin);
+
+// Whether a Linear row's field holds `value` (S + A, less P when pc-relative,
+// plus the bias) — THE ONE CHECK every writer of a Linear field asks: the
+// instruction fixups, the data fixups, the weak-null constant. An 8-byte field
+// holds every value. A narrower field holds what its declared range admits; a
+// narrower field with NO declared range holds nothing (the loader refuses such
+// a row, so only a schema built past the loader reaches it, and it fails loud).
+// `why` names the range the value missed, for the caller's diagnostic.
+[[nodiscard]] inline bool linearFieldHolds(TargetRelocationInfo const& r,
+                                           std::int64_t value,
+                                           std::string& why) {
+    if (r.widthBytes >= 8) return true;
+    if (r.widthBytes == 0 || !r.fieldRange.has_value()) {
+        why = "a field of " + std::to_string(r.widthBytes)
+            + " byte(s) that states no 'fieldRange'";
+        return false;
+    }
+    int const bits = 8 * r.widthBytes;
+    std::int64_t const signedMin = -(std::int64_t{1} << (bits - 1));
+    std::int64_t const signedEnd = std::int64_t{1} << (bits - 1);   // exclusive
+    std::int64_t const unsignedEnd = std::int64_t{1} << bits;       // exclusive
+    std::int64_t lo = 0;
+    std::int64_t end = 0;
+    switch (*r.fieldRange) {
+        case RelocFieldRange::Signed:   lo = signedMin; end = signedEnd;   break;
+        case RelocFieldRange::Unsigned: lo = 0;         end = unsignedEnd; break;
+        case RelocFieldRange::Either:   lo = signedMin; end = unsignedEnd; break;
+    }
+    if (value >= lo && value < end) return true;
+    why = "the " + std::string(kRelocFieldRangeTable.name(*r.fieldRange)) + " "
+        + std::to_string(bits) + "-bit range [" + std::to_string(lo) + ", "
+        + std::to_string(end) + ")";
+    return false;
+}
+
+// The row a SLOT HOLDING AN ADDRESS of `widthBytes` bytes is filled through —
+// `.long sym`, a pointer slot, an import slot — found by its properties, never
+// by its place in the target's list: a Linear, absolute (not pc-relative), not
+// thread-pointer, not image-relative field of that width whose range holds every
+// address. An 8-byte field holds every value. A narrower one: the row whose range
+// is EXACTLY the addresses (`unsigned`) when the target declares one, else the
+// row that holds them and negatives too (`either`); never a `signed` one, whose
+// upper half of the addresses is out of range. A width with two rows of the
+// chosen range answers nothing: two such rows are a document that does not say
+// which, and a coin-flip would write a word of the wrong kind — so the loader
+// refuses such a document (rule (i), naming the target, the width and the rows),
+// and no caller meets it. A width with NO such row answers nothing too, and every
+// caller that needs the slot refuses by name, naming the target and the width.
+// ✔MEASURED 2026-10-20 why the order is by range and not by declaration: x86_64
+// declares `abs32` (unsigned, R_X86_64_32 — what GNU as writes for `.long sym`),
+// `abs32s` (signed) and `addr32` (either: COFF's ADDR32 as an object states it);
+// arm64 declares `abs32` (either: R_AARCH64_ABS32, which ld.lld 18.1.3 links for
+// -1 and a program reads back as -1) — and until this rule the assembler's scan,
+// reading no formula at all, gave an arm64 `.long main` the `call26` kind.
+//
+// `addressSlotCandidates` is the rule; `addressSlotRelocationKind` is its answer
+// when it names exactly one row. The loader asks the first, every slot the second.
+template <typename Rows>
+[[nodiscard]] std::vector<TargetRelocationInfo const*>
+addressSlotCandidates(Rows const& rows, std::uint8_t widthBytes) {
+    auto const isSlot = [&](TargetRelocationInfo const& r) {
+        return r.formulaKind == RelocFormulaKind::Linear && r.widthBytes == widthBytes
+            && !r.pcRelative && !r.tls && !r.imageRelative;
+    };
+    bool anyExact = false;
+    for (TargetRelocationInfo const& r : rows) {
+        anyExact = anyExact || (isSlot(r) && r.fieldRange == RelocFieldRange::Unsigned);
+    }
+    std::vector<TargetRelocationInfo const*> chosen;
+    for (TargetRelocationInfo const& r : rows) {
+        if (!isSlot(r)) continue;
+        bool const holdsEveryAddress =
+            widthBytes >= 8 ? true
+            : anyExact      ? r.fieldRange == RelocFieldRange::Unsigned
+                            : r.fieldRange == RelocFieldRange::Either;
+        if (holdsEveryAddress) chosen.push_back(&r);
+    }
+    return chosen;
+}
+
+template <typename Rows>
+[[nodiscard]] std::optional<RelocationKind>
+addressSlotRelocationKind(Rows const& rows, std::uint8_t widthBytes) {
+    auto const chosen = addressSlotCandidates(rows, widthBytes);
+    if (chosen.size() != 1) return std::nullopt;   // none, or a document that does not say which
+    return chosen.front()->kind;
+}
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
 // table can declare. Required because the `.dsslir` parser
@@ -5385,6 +5490,28 @@ struct DSS_EXPORT TargetSchemaData {
     // as `registers` — ML7 callconv lowering will require ≥1 entry.
     std::vector<TargetCallingConvention> callingConventions;
     substrate::TransparentStringMap<std::uint16_t> callingConventionIndex;
+    // ★ P69 round 4 (lane `cs`) — THE CALLING CONVENTIONS THIS TARGET'S REFERENCE
+    // COMPILERS GIVE A MEANING AND THIS COMPILER DOES NOT IMPLEMENT
+    // (`unimplementedCallingConventions`, an array of convention ids). It is the
+    // fact that separates the two things a source-level convention name can be on a
+    // target that has no row for it: a convention some reference really emits (a
+    // function so declared is CALLED DIFFERENTLY — the name must be refused by
+    // name), or a word this target's toolchains do not know at all (they warn and
+    // ignore; so does this compiler). `callingConventions` cannot say it: a row
+    // there is a convention this compiler EMITS.
+    //
+    // ✔MEASURED (lane `cs`'s probes ta6 / ta8; a function defined with the
+    // attribute, its type compared with the plain one): on x86_64 clang 18.1.3
+    // makes `vectorcall`, `regcall`, `preserve_most` and `preserve_all` distinct
+    // function types where gcc 13.3.0 warns "attribute directive ignored"; on arm64
+    // Apple clang and clang for aarch64 Linux make `ms_abi` a distinct type where
+    // arm64 gcc ignores it, Apple clang does the same for `preserve_most` /
+    // `preserve_all`, and arm64 gcc and Apple clang for `aarch64_vector_pcs`.
+    //
+    // The loader keeps the two sets apart (an id is a row OR an unimplemented id,
+    // never both) and unique. Empty ⇒ this target's references know no convention
+    // beyond the rows.
+    std::vector<std::string> unimplementedCallingConventions;
 
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03):
     // per-target mapping from abstract `TargetCondCode` (substrate-tier
@@ -6055,6 +6182,35 @@ public:
         auto it = d_.callingConventionIndex.find(name);
         if (it == d_.callingConventionIndex.end()) return nullptr;
         return &d_.callingConventions[it->second];
+    }
+
+    // P69 round 4 (lane `cs`): the convention ids this target's reference
+    // compilers give a meaning and this compiler does not implement — see
+    // `TargetSchemaData::unimplementedCallingConventions`.
+    [[nodiscard]] std::span<std::string const>
+    unimplementedCallingConventions() const noexcept {
+        return d_.unimplementedCallingConventions;
+    }
+    // WHAT A CONVENTION ID IS ON THIS TARGET — the one question a source-level
+    // convention name asks of the target document. `Implemented`: a row of
+    // `callingConventions` (whether it is the ACTIVE one is the caller's
+    // comparison with the pair's resolved convention). `KnownUnimplemented`: a
+    // reference compiler of this target emits it and this compiler cannot.
+    // `Unknown`: no toolchain of this target knows the id.
+    enum class CallingConventionStanding : std::uint8_t {
+        Implemented,
+        KnownUnimplemented,
+        Unknown,
+    };
+    [[nodiscard]] CallingConventionStanding
+    callingConventionStanding(std::string_view id) const noexcept {
+        if (callingConventionByName(id) != nullptr) {
+            return CallingConventionStanding::Implemented;
+        }
+        for (std::string const& known : d_.unimplementedCallingConventions) {
+            if (known == id) return CallingConventionStanding::KnownUnimplemented;
+        }
+        return CallingConventionStanding::Unknown;
     }
 
     // ── Cond-code encoding (D-CSUBSET-WHILE-LOOP-SUBSTRATE) ──────

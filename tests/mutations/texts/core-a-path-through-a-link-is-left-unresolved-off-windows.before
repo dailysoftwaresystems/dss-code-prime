@@ -1,0 +1,1 @@
+    return fs::weakly_canonical(p, ec);

@@ -1,0 +1,1 @@
+            if (isAttributeSpecifierRule(cfg, tree.rule(c))) into.push_back(c);

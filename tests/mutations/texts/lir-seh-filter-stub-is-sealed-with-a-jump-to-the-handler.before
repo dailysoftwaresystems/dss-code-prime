@@ -1,0 +1,5 @@
+        emitUnreachable(*opcode(MnemonicSlot::Unreachable));
+        return true;
+    }
+
+    bool lowerReturn(MirInstId id) {

@@ -2861,7 +2861,7 @@ TEST(EncodingValidate, MultiWordPerWordSlotReuseLoads) {
               } }
         ],
         "relocations": [
-          { "name": "r", "kind": 1, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4 }
+          { "name": "r", "kind": 1, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4, "fieldRange": "unsigned" }
         ]
     })";
     EXPECT_TRUE(TargetSchema::loadFromText(kJson, "x.json").has_value())

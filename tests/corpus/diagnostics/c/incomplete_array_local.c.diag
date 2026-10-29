@@ -1,2 +1,2 @@
-S_NonConstantArrayLength 2:12-2:14
+S_IncompleteTypeObject 2:9-2:12
 S_UnusedVariable 2:5-2:15

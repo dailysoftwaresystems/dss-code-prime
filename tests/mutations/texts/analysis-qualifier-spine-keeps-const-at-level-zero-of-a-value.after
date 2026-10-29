@@ -1,0 +1,2 @@
+                sp.restrictBits &= ~std::uint64_t{1};
+                if (level0At == 0) level0Known = true;

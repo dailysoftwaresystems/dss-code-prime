@@ -1,0 +1,2 @@
+            if (entry.reachError) {
+                unreadable = "'" + core::genericSpelling(entry.path) + "' is named as a header but what it "

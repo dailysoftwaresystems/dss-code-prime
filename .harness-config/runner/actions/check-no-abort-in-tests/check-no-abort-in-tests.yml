@@ -12,3 +12,14 @@ steps:
       python3 ./check-no-abort-in-tests.py
     successPattern: 'selftest: OK \(0 failure\(s\)\)'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-no-abort-in-tests --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-no-abort-in-tests.py --selftest
+    successPattern: '^selftest: OK \(0 failure\(s\)\)$'
+    requireInputsUnmoved: true

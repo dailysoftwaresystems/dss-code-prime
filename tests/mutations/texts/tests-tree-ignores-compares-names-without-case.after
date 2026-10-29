@@ -1,0 +1,1 @@
+            hit = names_match(rule.pats, low, True)

@@ -18,13 +18,12 @@ this program under Git Bash -- and every path it hands a native tool is an
 absolute path in the host's own form.
 
 ── HOW TO RUN THE FULL FOUR-LEG PROFILE FROM A COLD START ───────────────────
- 0. Once, on a host that has a STAGED subject (the Windows box, after a
-    real-examples/c/sqlite run has staged sqlite and emitted a manifest):
-      python .harness-config/runner/actions/profile-compile/profile-compile-support.py kit \
-          --manifest build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
-          --root stage=build/real-examples/c/sqlite/windows/stage \
-          --root libs="$USERPROFILE/.cache/dsscp/harness-libs" \
-          --out build/perf/kit
+ 0. Once, on a host that has a STAGED subject (the Windows box, after a sqlite run
+    has staged sqlite and emitted a manifest), the action's `kit` step -- its kit is
+    the step's kept output, `<the step's build directory>/kit`:
+      dssharness run profile-compile --manual-step kit \
+          --input manifest=build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
+          --input "roots=stage=build/real-examples/c/sqlite/windows/stage;libs=<the harness libraries>"
     The kit is COPIED, never re-staged: the sqlite harness pulls upstream on
     every run, so a host that stages for itself is not compiling the same
     program as its peers.
@@ -34,37 +33,38 @@ absolute path in the host's own form.
       dssharness run profile-compile --legs linux-x86_64-release
     Only a RELEASE leg that the `profile-compile` runner in `.harness-config/config.json`
     declares: the program refuses any dsscp that is not a Release build (below).
-    ⚠ A leg that needs `sync` (WSL, ssh) waits on DssHarness round four, whose sync
-    ships actions.
-    By hand on one host, the same program:
-      python3 .harness-config/runner/actions/profile-compile/profile-compile.py --kit build/perf/kit \
-          --label win-x86_64 --target x86_64:elf64-x86_64-linux-exec
- 2. The yardstick, on any host with gcc (the same TUs, the same manifest):
-      python3 .harness-config/runner/actions/profile-compile/profile-compile-support.py gcc-reference \
-          --manifest build/perf/wsl-x86_64/subject.dss-project.json \
-          --out build/perf/wsl-x86_64 --jobs 32
+ 2. The yardstick, on any leg with gcc (the same TUs, the same manifest): the same step with
+    `--input gccReference=true`, the reference compiler, its optimization and its link
+    libraries being the step's `referenceCc`, `referenceOpt` and `referenceLinkLibs` inputs
+    (gcc, -O2, -lz -lm -lpthread -ldl unless a run says otherwise).
     ✔MEASURED 2026-08-18 on WSL, 103 TUs, gcc 13 -O2: -j1 21.5 s, -j32 4.8 s,
     against DSS's 1m40.8 s on that same host.
 
 Usage:
   profile-compile.py --kit <dir> --target <spec> --label <name>
-                     [--repo <dir>] [--build-dir <dir>] [--no-build]
-                     [--out <dir>] [--jobs N] [--gcc-reference]
+                     [--build-dir <dir>] [--no-build]
+                     [--out <dir>] [--jobs N] [--gcc-reference true|false]
+                     [--reference-cc <cc> --reference-opt <flag> --reference-link-libs <libs>]
 
   --kit <dir>        a materialized kit (`profile-compile-support.py kit`). REQUIRED.
   --target <spec>    the ONE <target>:<format> every leg compiles. REQUIRED.
   --label <name>     names this leg in the report and in the witness line. REQUIRED.
-  --repo <dir>       the dsscp checkout (default: the tree this file lives in).
   --build-dir <dir>  the compiler's build tree (default: <repo>/build/rel).
   --no-build         time the dsscp already in the build tree; configure nothing.
   --out <dir>        logs, the subject manifest and the image (default:
                      <repo>/build/perf/<label>).
   --jobs N           build and gcc-reference parallelism (default: DSS_JOBS, then 6).
-  --gcc-reference    also time gcc over the same TUs from the same manifest.
+  --gcc-reference B  true also times gcc over the same TUs from the same manifest.
+  --reference-cc C, --reference-opt F, --reference-link-libs L
+                     the yardstick's compiler, optimization flag and link libraries --
+                     the step's inputs, REQUIRED with --gcc-reference true (a value that
+                     begins with `-` is still the option's value).
   -h, --help         show this help and exit.
-  A relative --kit, --out or --build-dir is taken from the repository root; a
-  relative --repo from the directory the program is run in. Every value flag
-  needs a non-empty value; anything else on the command line is refused.
+  --self-test        prove the command line's refusals (no kit, no build), one verdict line per arm; the
+                     action's `self-test` step and the ctest entry `harness/profile_compile_selftest` run it.
+  A relative --kit, --out or --build-dir is taken from the repository root -- the
+  tree this file lives in. Every value flag needs a non-empty value; anything else
+  on the command line is refused.
 
 Output: the last line is `PROFILE-LEG-OK <label>   (out: <dir>)` on success, and
 `PROFILE-LEG-FAILED <label> rc=<rc>  (log: <file>)` when the compile failed -- the
@@ -100,12 +100,18 @@ TOOL = "profile-compile"
 OK_TOKEN = "PROFILE-LEG-OK"
 FAILED_TOKEN = "PROFILE-LEG-FAILED"
 
-VALUE_FLAGS = ("--kit", "--target", "--label", "--repo", "--build-dir", "--out", "--jobs")
-SWITCHES = ("--no-build", "--gcc-reference")
+# ★ `--gcc-reference` TAKES `true` OR `false` (2026-09-30): the `profile` step hands every input over, its
+# default included, and a switch cannot be passed conditionally. `--repo` is RETIRED the same day: the tree
+# profiled is the one this file lives in, which is the tree the harness step runs in.
+# ★ THE YARDSTICK'S KNOBS ARE THE STEP'S INPUTS (2026-10-01, the P69 review's NIT 7): `--reference-cc`,
+# `--reference-opt` and `--reference-link-libs`, handed to the support's `gcc-reference` -- as compile-bench made
+# its own knobs inputs, so no value a measurement depends on is fixed inside a program.
+VALUE_FLAGS = ("--kit", "--target", "--label", "--build-dir", "--out", "--jobs", "--gcc-reference",
+               "--reference-cc", "--reference-opt", "--reference-link-libs")
+SWITCHES = ("--no-build",)
 DEFAULT_JOBS = 6
 
-# The support program, taken from the REPOSITORY being profiled (as it always was),
-# not from beside this file: `--repo` names the tree whose tools run.
+# The support program, taken from the REPOSITORY being profiled -- the tree this file lives in.
 SUPPORT_REL = (".harness-config", "runner", "actions", "profile-compile",
                "profile-compile-support.py")
 
@@ -157,8 +163,9 @@ def parse_cli(argv):
     misspelling) is a REFUSAL, never a shrug: silently ignoring one is how a run ends
     up not measuring what its command line said it measured. A value flag with a
     missing or EMPTY value is refused by name."""
-    o = {"kit": "", "target": "", "label": "", "repo": "", "build_dir": "", "out": "",
-         "jobs": "", "no_build": False, "gcc_reference": False, "help": False}
+    o = {"kit": "", "target": "", "label": "", "build_dir": "", "out": "",
+         "jobs": "", "no_build": False, "gcc_reference": "false", "reference_cc": "", "reference_opt": "",
+         "reference_link_libs": "", "help": False}
     i, n = 0, len(argv)
     while i < n:
         a = argv[i]
@@ -176,6 +183,17 @@ def parse_cli(argv):
             i += 1
             continue
         die("unknown argument '%s'. See --help." % a)
+    # ★ A PATH TO WRITE NEVER BEGINS WITH `-` -- owning-tree's `written_path` says so for every program: `--out --help`
+    # took `--help` for the report directory, an option read as a value. A value that is no path may begin with one
+    # (`--reference-opt -O2`), so only these two are asked.
+    for flag in ("--out", "--build-dir"):
+        key = flag[2:].replace("-", "_")
+        if o[key]:
+            owner = _owning_tree_module()
+            try:
+                o[key] = owner.written_path(o[key], flag)
+            except owner.Refusal as exc:
+                die("%s. See --help." % exc)
     if not o["kit"]:
         die("--kit is required")
     if not o["target"]:
@@ -184,6 +202,13 @@ def parse_cli(argv):
         die("--label is required (it names this leg in the report)")
     if o["jobs"]:
         _positive_jobs(o["jobs"], "--jobs")
+    if o["gcc_reference"] not in ("true", "false"):
+        die("--gcc-reference is true or false, got '%s'" % o["gcc_reference"])
+    o["gcc_reference"] = o["gcc_reference"] == "true"
+    if o["gcc_reference"]:
+        for flag in ("--reference-cc", "--reference-opt", "--reference-link-libs"):
+            if not o[flag[2:].replace("-", "_")]:
+                die("%s is required with --gcc-reference true (the yardstick's knobs are the step's inputs)" % flag)
     return o
 
 
@@ -229,37 +254,49 @@ def augment_path(environ=None, isdir=os.path.isdir):
     environ["PATH"] = os.pathsep.join(entries)
 
 
+_OWNER = []
+
+
+def _owning_tree_module():
+    """`owning-tree.py`, loaded once as a SIBLING: it names the tree this file lives in, and says what a path a
+    command line names for writing may be. A missing owner is a refusal by name."""
+    if not _OWNER:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            die("cannot find %s -- the tree this program lives in is named there and "
+                "nowhere else" % path)
+        saved = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True          # no __pycache__ in a directory not ours
+        try:
+            spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.dont_write_bytecode = saved
+        _OWNER.append(mod)
+    return _OWNER[0]
+
+
 def _owning_tree_root():
-    """The tree this file lives in, by `owning-tree.py`'s walk, loaded as a SIBLING.
+    """The tree this file lives in, by `owning-tree.py`'s walk.
 
     ⓘ Never by counting `..` from this file: that count named `.harness-config/runner`
     the day this program moved out of `scripts/` (2026-09-18). A missing owner or a
     walk that finds nothing is a refusal by name, never a fallback to the caller's cwd.
     """
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                        "owning-tree", "owning-tree.py")
-    if not os.path.isfile(path):
-        die("cannot find %s -- the tree this program lives in is named there and "
-            "nowhere else (or pass --repo)" % path)
-    saved = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True          # no __pycache__ in a directory not ours
-    try:
-        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    finally:
-        sys.dont_write_bytecode = saved
+    mod = _owning_tree_module()
     try:
         return mod.owning_tree(__file__)
     except mod.Refusal as exc:
         die("cannot name the tree this program lives in: %s" % exc)
 
 
-def resolve_repo(opt_repo):
-    """The dsscp checkout to profile: `--repo` (from the caller's directory), else the
-    tree this file lives in -- a profiler that has to be told where it is can be
-    pointed at a different checkout than the compiler it just built."""
-    repo = os.path.abspath(opt_repo) if opt_repo else _owning_tree_root()
+def resolve_repo():
+    """The dsscp checkout to profile: the tree this file lives in -- a profiler that has to be told
+    where it is can be pointed at a different checkout than the compiler it just built (`--repo` did
+    exactly that until its retirement on 2026-09-30)."""
+    repo = _owning_tree_root()
     if not os.path.isdir(os.path.join(repo, "src", "dss-config")):
         die("%s is missing — that is not a dsscp checkout"
             % os.path.join(repo, "src", "dss-config"))
@@ -448,15 +485,76 @@ def list_artifacts(image_dir, limit):
 
 
 # ── the run ─────────────────────────────────────────────────────────────────────
+# ── THE COMMAND LINE'S OWN SELF-TEST: no kit, no build ───────────────────────────
+SELFTEST_MARKER = "profile-compile self-test: "
+# ⚠ Raising this is the claim that the arms you added actually RUN.
+EXPECTED_ARMS = 5
+_REQUIRED = ["--kit", "kit", "--target", "x86_64:elf64-x86_64-linux-exec", "--label", "leg"]
+
+
+def self_test():
+    """Each arm parses one command line and reads what it did; a refusal is read from the program's own words."""
+    import contextlib
+    import io
+    ran = []
+
+    def arm(label, ok, detail=""):
+        ran.append(bool(ok))
+        if ok:
+            print("%sok      %s" % (SELFTEST_MARKER, label))
+        else:
+            print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, (detail or "no detail").replace("\n", " ")[:600]))
+
+    def parsed(argv):
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said):
+                return parse_cli(_REQUIRED + argv), None, ""
+        except SystemExit as exc:
+            return None, exc.code, said.getvalue().strip()
+
+    def refused(argv, flag):
+        got, code, text = parsed(argv)
+        if got is not None:
+            return False, "parsed, no refusal: %s=%r" % (flag, got[flag[2:].replace("-", "_")])
+        return (code == 1 and ("%s takes '" % flag) in text and "begins with `-`" in text,
+                "exit %r: %s" % (code, text[:300]))
+
+    arm("--out --help is an option taken for the directory to write: refused, naming --out",
+        *refused(["--out", "--help"], "--out"))
+    arm("--build-dir -x is an option taken for the build tree to write: refused, naming --build-dir",
+        *refused(["--build-dir", "-x"], "--build-dir"))
+    got, code, text = parsed(["--out=--help"])
+    arm("--out=--help is no spelling of a value here: refused as an unknown argument",
+        got is None and code == 1 and "unknown argument '--out=--help'" in text, "exit %r: %s" % (code, text[:300]))
+    got, code, text = parsed(["--out", "build/perf/x-y", "--build-dir", "build/rel-2"])
+    arm("a path holding a dash is kept (the control)",
+        got is not None and (got["out"], got["build_dir"]) == ("build/perf/x-y", "build/rel-2"),
+        "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["out"], got["build_dir"]),))
+    got, code, text = parsed(["--gcc-reference", "true", "--reference-cc", "gcc", "--reference-opt", "-O2",
+                              "--reference-link-libs", "-lm"])
+    arm("a value that is no path may begin with `-` (the control)",
+        got is not None and (got["reference_opt"], got["reference_link_libs"]) == ("-O2", "-lm"),
+        "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["reference_opt"],),))
+    failed = ran.count(False)
+    if len(ran) != EXPECTED_ARMS:
+        print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))
+        return 1
+    print("%s%d arm(s), %d failed%s" % (SELFTEST_MARKER, len(ran), failed, "" if not failed else " -- FAIL"))
+    return 0 if not failed else 1
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv == ["--self-test"]:
+        return self_test()
     o = parse_cli(argv)
     if o["help"]:
         sys.stdout.write(__doc__ or "profile-compile: no help text (python -OO)\n")
         return 0
 
     augment_path()
-    repo = resolve_repo(o["repo"])
+    repo = resolve_repo()
     # ★★★ NAME THE CONFIG TREE. `findShippedConfig` prefers $DSS_CONFIG_ROOT and
     # otherwise WALKS UP FROM THE CWD, so a leg driven over ssh (cwd = $HOME) finds
     # nothing and the compile dies, while a leg driven from Windows INTO WSL silently
@@ -547,7 +645,9 @@ def main(argv=None):
     if o["gcc_reference"]:
         say(label, "gcc yardstick (same TUs, same manifest)")
         rc, _ = support(repo, support_path, ["gcc-reference", "--manifest", man, "--out", out,
-                                             "--jobs", str(effective_jobs(o["jobs"]))])
+                                             "--jobs", str(effective_jobs(o["jobs"])),
+                                             "--cc=%s" % o["reference_cc"], "--opt=%s" % o["reference_opt"],
+                                             "--link-libs=%s" % o["reference_link_libs"]])
         if rc != 0:
             die("the gcc reference failed")
 

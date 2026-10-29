@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT): a DECIMAL integer constant past every signed type its suffix admits (`9223372036854775808`, `...L`, `...LL`) has no type in C's lists; DSS REFUSED it (S_IntegerLiteralTooLarge) where every reference compiles it. The C document's unsuffixed, `l` and `ll` rules now declare `decimalPastRange: unsigned long long`, and DSS reads such a constant as `unsigned long long` with the S_IntegerLiteralImplicitlyUnsigned warning. Bits (see main.c): 1 the two static initializers hold 2^63, 2 the unsuffixed 2^64-1, 4 the constant in an enumerator and an array bound, 8 `_Generic` of the unsuffixed and `L` spellings, 16 `_Generic` of the `LL` spelling, 32 `sizeof` of the unsuffixed spelling, 64 the constant through code with run-time operands. MEASURED 2026-10-01 through `dssharness run probe-reference-cc`, this file: clang 18.1.3 -std=c2x (run 20261001-181032-32929a89) and AppleClang -std=c2x (macos-arm64-release, run 20261001-181054-e134af64) exit 42 with the warning 'interpreting as unsigned'; gcc 13.3.0 -std=c2x (same linux run) and mingw-w64 gcc 13.2.0 -std=c2x (run 20261001-181057-f520ca2e) exit 56 = 8|16|32, because they type these constants `__int128` while warning 'integer constant is so large that it is unsigned'; MSVC 19.51 /std:clatest and /std:c17 (run 20261001-181059-26516e1e) exit 16, because it wraps the `LL` spelling to a negative `long long`; every reference's -std=c17 -pedantic-errors refuses the constant. The TYPE is therefore a meaning fork, decided for `unsigned long long` by the vendors' documentation (both diagnosing references say 'unsigned'; GCC documents no extended integer type and no way to spell an `__int128` constant where `long long` is narrower) and by DSS's own phase 4, which reads these spellings unsigned: see the C document's `$integerLiteralTypingComment`. Every operand of the run-time checks comes from argc, so the release arm exercises lowering, not a fold; the release arm is REPORT-ONLY.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

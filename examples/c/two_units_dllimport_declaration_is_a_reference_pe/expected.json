@@ -1,0 +1,13 @@
+{
+  "$comment": "A `__declspec(dllimport)` DECLARATION WITH NO `extern` IS A REFERENCE, AT FILE AND AT BLOCK SCOPE, AND AN ATTRIBUTE MAY LEAD A BLOCK-SCOPE `extern` (P69 round 1, lane cs, fold f26b; D-C-PE-DECLSPEC-IS-ERASED-SO-ALIGN-AND-THREAD-STORAGE-ARE-SILENTLY-DROPPED). MEASURED 2026-10-20/21 by lane cs's probes di, di2 and di3 (cl 19.51 and mingw-w64 gcc 13.2.0 on windows-x86_64; gcc 13.3.0 and clang 18.1.3 on Linux for the attribute-led externs): `__declspec(dllimport) int v;` at file scope and inside a body are both references to `__imp_v` on cl and on mingw-w64 gcc, never a definition of `v`; `__attribute__((unused)) extern int v;`, `[[maybe_unused]] extern int v;` and `__declspec(dllimport) extern int v;` inside a body compile on every reference that has the spelling. Before this fold the file-scope declaration was a tentative DEFINITION of the unit (a common of its own), the block one an automatic LOCAL read uninitialised, and no attribute could lead a block-scope `extern` (P_NoAlternativeMatched). b.c defines every object main.c reads; an import the image's own link resolves reads that definition, as link.exe resolves it (it warns that a locally defined symbol is imported). Every return before 42 names the first fact that failed. The `release` arm pins that the optimizer keeps the block import one object with the file-scope one.",
+  "language": "c",
+  "sources": ["main.c", "b.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

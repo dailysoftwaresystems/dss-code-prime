@@ -1,0 +1,1 @@
+        if (core::reachedKind(it->path(), typeEc) != core::EntryKind::File || typeEc) continue;

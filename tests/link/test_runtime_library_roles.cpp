@@ -67,9 +67,9 @@ namespace {
 // when the member changes.
 //
 // Each verdict is the answer for that flavour, and each `why` is the argument for
-// it. An excluded flavour is NEVER silently skipped: it is asserted to still be
-// excludable, so the day it gains what it was excluded from this test goes red and
-// the exclusion has to be re-argued instead of quietly widening.
+// it. Since P69 fold 3c no flavour is excluded from the unwind spine (the two
+// OBJECT flavours were, until their writer arm was re-measured), and a verdict of
+// `false` is RED by name: an exclusion is a writer defect to fix, never a verdict.
 //
 // ⚠⚠ P54 SPLIT ONE BOOLEAN INTO TWO, AND THE SPLIT IS THE POINT RATHER THAN A
 // TIDY-UP. Until D-CSUBSET-PACKED-ATOMIC-MEMBER's pe64 arm landed there was only
@@ -122,43 +122,38 @@ constexpr PeFlavour kPeFlavours[] = {
      "a DLL can contain an under-aligned `_Atomic` access for exactly the reason "
      "it can contain a __try — much of Windows is written as DLLs — and a "
      "format-level omission would silently keep the non-atomic native pair there"},
-    {"pe64-x86_64-windows-staticlib", false, true,
-     "the .lib archive goes through pe::encode's Obj arm, which attaches no "
-     "FrameUnwindInfo and emits NO .pdata/.xdata. MEASURED by declaring the keys "
-     "anyway: rc=0 and the emitted seh.lib carried `.text` ONLY, so the filter "
-     "funclets and the scope table are SILENTLY DROPPED and __except can never "
-     "run. Declaring here would trade a loud, correct refusal for a silent "
-     "miscompile; the rationale lives in the file's "
-     "$sehPersonalityOmittedComment",
-     "⚠ THE ATOMICS ANSWER IS THE OPPOSITE OF THE UNWIND ONE ON THIS SAME FILE, "
-     "which is why they cannot share a boolean. There is no silent-drop hazard "
+    // ★ P69 fold 3c (the review of the fix fold, A2): the two OBJECT flavours MOVED to `mustDeclareUnwind = true`.
+    // Their exclusion rested on the 2026-08-10 measurement below it ("`.text` ONLY"), which the Obj arm outgrew on
+    // 2026-08-27 (it writes `.pdata`/`.xdata`, and a `__try`'s scope table as relocations: `PeObjWriter.
+    // ATryRegionCarriesItsScopeTableIntoTheObject`), so the exclusion had become the refusal of a `__try` cl compiles
+    // into an object. This test's own instruction for that day was followed: the flavours moved, the emitted
+    // sections re-measured — by `PeObjSeh` in tests/link/test_pe_object_unwind_reference_link.cpp, a `__try`
+    // through the CLI's object door whose object DSS, link.exe and MinGW's gcc link and whose `__except` runs.
+    {"pe64-x86_64-windows-staticlib", true, true,
+     "the .lib archive's members are written by pe::encode's Obj arm, which "
+     "emits .pdata + .xdata and a `__try`'s scope table as relocations the final "
+     "linker resolves; a member is the loose object's twin, so the archive "
+     "declares the same personality (MEASURED by `PeObjSeh` through the object "
+     "door; the 2026-08-10 `.text`-only reading predates the arm's unwind data)",
+     "the atomics answer is its own boolean because it is its own question (until "
+     "P69 fold 3c it was the OPPOSITE of the unwind one on this same file). There "
+     "is no silent-drop hazard "
      "for a CALL: `externCallDispatch: direct-plt` is already declared and an "
      "extern call is what this arm emits every day, so the member objects carry "
      "an undefined external the final link resolves. Omitting it would split the "
      "flavours on MEANING — the same source taking the runtime as an .exe and "
      "silently keeping the non-atomic pair as a .lib. elf64-x86_64-linux-staticlib "
      "declares libatomic.so.1 on identical reasoning"},
-    {"pe64-x86_64-windows", false, true,
-     "the relocatable .obj, same Obj arm and the same MEASURED silent drop "
-     "(`.text` only). Worse here than for the archive, because the object exists "
-     "to be linked LATER and the final linker cannot notice that unwind data was "
-     "never emitted for these functions",
-     "same split verdict as the archive, and the contrast is what makes it safe: "
-     "the unwind omission exists because a dropped scope table is INVISIBLE to the "
-     "later linker, whereas an atomics entry that never resolves is an UNRESOLVED "
-     "SYMBOL at that same later link — loud, at the tier that can see it, and "
-     "strictly better than shipping a silent loss of atomicity"},
+    {"pe64-x86_64-windows", true, true,
+     "the relocatable .obj, the direct analogue of `cl /c`: its Obj arm emits "
+     ".pdata + .xdata and a `__try`'s scope table as relocations, so a `__try` "
+     "compiles into the object and its `__except` runs once DSS or link.exe "
+     "links it (MEASURED by `PeObjSeh`, both Windows legs)",
+     "the same verdict as the archive, and safe for the same reason: an atomics "
+     "entry that never resolves is an UNRESOLVED SYMBOL at the later link — loud, "
+     "at the tier that can see it, and strictly better than shipping a silent "
+     "loss of atomicity"},
 };
-
-// The root key an excluded flavour must carry so the absence reads as a decision
-// rather than an oversight, at the site a future editor is already looking.
-// ⚠ NOT `$absentKeyRationale`: that key belongs to the CROSS-ARCH mechanism in
-// tests/link/test_object_format_family_symmetry.cpp, whose families are keyed on
-// `<container><bits>-<os>[-<tier>]` with the ARCH token stripped. x86_64 is the
-// only pe arch shipped, so every pe flavour is a ONE-MEMBER family with an empty
-// absent-vs-siblings set, and `NoRationaleOutlivesTheAbsenceItExplains` would
-// reject any entry placed there as explaining an asymmetry that does not exist.
-constexpr std::string_view kOmissionRationaleKey = "$sehPersonalityOmittedComment";
 
 // A flavour carries a `runtimeLibraries` TABLE iff at least one of its two
 // verdicts is positive — the table is the union of the roles its blocks name, so
@@ -215,15 +210,6 @@ constexpr std::string_view kOmissionRationaleKey = "$sehPersonalityOmittedCommen
     }
     if (ec) ADD_FAILURE() << "cannot enumerate " << dir.string() << ": " << ec.message();
     return out;
-}
-
-// The RAW document, for the `$`-prefixed rationale key — `ObjectFormatSchema`
-// drops documentation keys on load, so the parsed schema cannot answer whether the
-// justification is present.
-[[nodiscard]] nlohmann::json formatDoc(std::string_view name) {
-    auto const text = readShippedFormatText(name);
-    if (text.empty()) return {};
-    return nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
 }
 
 // Replace the FIRST occurrence of `from` with `to`; returns false if absent, so a
@@ -287,10 +273,8 @@ emitImage(ObjectFormatSchema const& format, std::string& why) {
 //   (2) every flavour the verdict says MUST declare a table is present BY NAME with
 //       a non-empty table that actually declares `unwindPersonality` — so "three of
 //       four quietly stopped declaring" is a failure, not a pass;
-//   (3) every EXCLUDED flavour is asserted to still be excluded AND to still carry
-//       its written justification — so an exclusion can neither be silently
-//       widened (a table appearing there reds this) nor silently stripped of the
-//       argument that earned it.
+//   (3) no flavour is EXCLUDED — a `false` unwind verdict is itself red (since
+//       P69 fold 3c, when the last two exclusions were re-measured away).
 // Only then is the msvcrt sweep run, over ALL FOUR.
 TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
     // (1) ENUMERATION — the verdict table and the shipped tree must agree, both
@@ -383,56 +367,25 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
                 << " must declare `sehPersonality`; the table row alone names an "
                    "image with nothing pointing at it.";
         } else {
-            // (3) EXCLUDED — asserted, justified, and RATCHETED. This is the arm
-            // that must never be a silent skip: it fails the moment the flavour
-            // gains what it was excluded from having.
-            // ⚠⚠ P54 NARROWED THIS FROM `table.empty()` TO THE UNWIND ROLE, AND
-            // THE NARROWING IS NOT A WEAKENING — it is the same correction the
-            // struct's two booleans are. `table.empty()` asserted the ABSENCE OF
-            // ANY TABLE as a stand-in for the absence of the UNWIND SPINE, which
-            // held only while unwind was the sole role a pe flavour could name.
-            // The .lib and .obj now name `atomicsRuntime` for a reason that has
-            // nothing to do with .pdata/.xdata, so the old form would have
-            // reddened a correct config and the only ways out would have been to
-            // widen an exclusion that must stay narrow or to delete the ratchet.
-            // Asserting the ROLE keeps every bit of the original guard: the day
-            // this flavour gains an unwindPersonality row, this still reds.
-            EXPECT_FALSE(table.imageForRole(RuntimeLibraryRole::UnwindPersonality)
-                             .has_value())
+            // (3) NO FLAVOUR IS EXCLUDED, AND AN EXCLUSION IS RED. Until P69 fold 3c the
+            // two OBJECT flavours were, on the 2026-08-10 reading that their writer arm
+            // emitted `.text` only; the arm outgrew it (it writes `.pdata`/`.xdata` and a
+            // `__try`'s scope table as relocations), and the exclusion had become the
+            // refusal of a `__try` cl compiles into an object. With its last member gone
+            // the exclusion protocol (a rationale key at the site, the absence asserted)
+            // went too: a writer arm that cannot carry unwind data is a defect of that
+            // arm to fix, never a verdict to record here.
+            ADD_FAILURE()
                 << flavour.name
-                << " is on the EXPLICIT exclusion list but now names an "
-                   "`unwindPersonality` role. This test is deliberately red so the "
-                   "exclusion gets re-argued rather than widened by accident. The "
-                   "recorded reason it was excluded: " << flavour.why
-                << ". If the underlying limitation is genuinely fixed (the pe Obj "
-                   "arm now emits .pdata/.xdata), move this flavour to "
-                   "mustDeclareUnwind = true and re-measure the emitted sections — "
-                   "do not delete this assertion.";
-            EXPECT_FALSE((*r)->sehPersonality().has_value())
-                << flavour.name
-                << " is excluded but declares `sehPersonality`. MEASURED: the Obj "
-                   "arm accepts the declaration, returns rc=0, and emits `.text` "
-                   "only — the SEH funclets and scope table are dropped without a "
-                   "diagnostic, so __except can never run. " << flavour.why;
-            auto const doc = formatDoc(flavour.name);
-            ASSERT_TRUE(doc.is_object())
-                << flavour.name << ".format.json must parse as a JSON object";
-            auto const key = std::string{kOmissionRationaleKey};
-            ASSERT_TRUE(doc.contains(key))
-                << flavour.name << " is excluded from the runtimeLibraries "
-                << "coverage requirement but carries no `" << kOmissionRationaleKey
-                << "`. An exclusion with no written reason at the site is "
-                   "indistinguishable from an oversight, and the next editor "
-                   "reading the `synthesizeSehFunclets` diagnostic will follow its "
-                   "'Add the block' advice straight into the silent drop.";
-            EXPECT_TRUE(doc.at(key).is_string() && !doc.at(key).get<std::string>().empty())
-                << flavour.name << "'s `" << kOmissionRationaleKey
-                << "` must be a non-empty string.";
+                << " is classified as NOT declaring unwind. Every PE writer arm emits "
+                   ".pdata/.xdata and a `__try`'s scope table, so an exclusion refuses a "
+                   "`__try` a reference compiles for the same artifact (cl /c for an "
+                   "object). The recorded reason: " << flavour.why;
         }
 
-        // The criterion itself, over ALL FOUR flavours — the excluded ones have
-        // empty tables, so this loop is trivially satisfied for them, and that is
-        // exactly why it could not be the only assertion in this test.
+        // The criterion itself, over ALL FOUR flavours — a flavour with an empty
+        // table satisfies it trivially, which is exactly why it could not be the
+        // only assertion in this test.
         for (auto const& b : table.bindings) {
             EXPECT_NE(b.image, "msvcrt.dll")
                 << flavour.name << " points role '"
@@ -527,12 +480,18 @@ TEST(RuntimeLibraryRoles, EveryShippedFormatsRolesResolveConsistently) {
     // counting keys in the format files.
     // ★★ PINNING IT AT THE LIVE VALUE IS SAFE *AND* STRICTER, because this
     // population only ever GROWS: a format gaining a role-naming block raises
-    // the count, so an addition can never false-red this. The realization arc
-    // will raise it (macho64-x86_64-darwin-exec gains librarySynthesis ⇒ 17).
+    // the count, so an addition can never false-red this.
     // ⇒ RAISE this when a vehicle lands; NEVER lower it to green a break. A
     // removed role claim is precisely the regression this exists to catch.
-    EXPECT_GE(rolesChecked, 12u)
-        << "only " << rolesChecked << " role claims were checked, against 12 "
+    // ✔RAISED P69 (lane lm) 12 -> 13: macho64-x86_64-darwin-exec gained its
+    // `librarySynthesis` (pthread, role cLibrary — the coordinator's grant,
+    // C11 threads on every pair). Counted over the shipped documents by the
+    // same rule as this sweep — a role-naming processExit / processArgs /
+    // sehPersonality / librarySynthesis block — 13 on 2026-10-01. (The old
+    // forecast here said that change would make it 17; it was counting from
+    // the 16 present blocks the note above refutes.)
+    EXPECT_GE(rolesChecked, 13u)
+        << "only " << rolesChecked << " role claims were checked, against 13 "
            "measured live — a block stopped naming a role, so the two-copies-"
            "of-one-fact agreement it used to force is no longer being checked "
            "anywhere. Find the block that lost its role; do not lower this.";

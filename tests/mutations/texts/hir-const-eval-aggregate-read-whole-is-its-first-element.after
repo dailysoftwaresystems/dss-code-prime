@@ -1,0 +1,7 @@
+            if (!resolved->declaredType.has_value()) {
+                CstScalarInitializer const whole =
+                    scalarInitializerValue(tree, ctx.schema, resolved->initExpr);
+                if (!whole.value.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                request = CstFoldFrame{.kind = CstFoldFrame::Kind::PassThrough, .node = whole.value};
+                return suspended(expr);
+            }

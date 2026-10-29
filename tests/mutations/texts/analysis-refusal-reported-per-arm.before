@@ -1,0 +1,3 @@
+            if (!libraryRefusalReportedAt.emplace(tree.id().v, span.start(), span.end())
+                     .second)
+                return;   // this use is already reported

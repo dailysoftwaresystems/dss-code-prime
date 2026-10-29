@@ -9,8 +9,9 @@
  * `worker` to kernel32 CreateThread (the C11 int(*)(void*) start routine has the
  * same x64 ABI as Win32's DWORD(*)(void*)); thrd_join is a MULTI-block shim
  * (WaitForSingleObject; if(res) GetExitCodeThread; CloseHandle); call_once rides
- * InitOnceExecuteOnce via a module-scoped __dss_once_tramp adapter that invokes
- * the C11 void(*)(void).
+ * InitOnceExecuteOnce through an adapter that invokes the C11 void(*)(void) — a
+ * synthesized one until P69, DSS's runtime unit runtime/platform/src/threads_once.c
+ * since.
  *
  * FOLD-RESISTANT: a real CreateThread / pthread_create cannot be const-folded, so
  * the release arm exercises the true spawn+join path. The exit code is
@@ -20,7 +21,8 @@
  *
  * On macho (arm64) each is a pthread shim: thrd_create DIRECT-PASSes worker to
  * pthread_create, thrd_join is a pthread_join into a stack void-star slot then a
- * truncate, and call_once is a DIRECT pthread_once. The macho arm RUNS natively
+ * truncate, and call_once IS pthread_once (by the descriptor row's linkName since
+ * P69; a direct-pass shim before). The macho arm RUNS natively
  * on a macOS-arm64 host (a real pthread spawn). RED-on-disable: delete
  * shippedLibs/threads.json and the #include fires F_ShippedHeaderNotFound and the
  * compile fails. */
