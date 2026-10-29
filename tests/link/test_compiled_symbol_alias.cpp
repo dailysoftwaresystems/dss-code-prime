@@ -20,7 +20,9 @@
 //   * a WEAK alias yields to another unit's strong definition of the name, and the
 //     unit's own call follows the name there;
 //   * a STRONG alias beside another unit's strong definition of the name is two
-//     definitions, refused by name.
+//     definitions, refused by name;
+//   * a STRONG alias of a SELECT-ANY definition is a name of its body, read back as
+//     its format states one.
 // The module shape is the one `lowerMirModuleToAssembly` (src/program/
 // compile_pipeline.cpp) emits for an alias record; these cases pin that the link
 // tier takes it whole.
@@ -294,6 +296,77 @@ TEST(CompiledSymbolAlias, AnObjectCarriesBothNamesOnOneBodyAndItsCallMeansTheAli
             ASSERT_TRUE(img.ok()) << diagnosticsOf(linkRep);
             EXPECT_TRUE(someCallLandsOn(img.bytes, kAliasedBody)) << "the object's call does not reach the body";
         }
+    }
+}
+
+// P69 (lane `cs`, fold f26b): a STRONG alias of a WEAK definition of the SELECT-ANY kind — `__declspec(selectany)`'s
+// kind, which PE writes as a COMDAT section of its own. The alias is a strong name on the definition's body: an
+// external label in that COMDAT section on PE (what clang-cl writes for a select-any definition with a global alias,
+// ✔MEASURED by lane `xa`, 2026-10-20), a global symbol at the body's address on ELF and Mach-O. A relocatable object
+// of every format, read back by the format's own reader, carries the alias as a name of the very body the
+// definition's name is WEAK on, and the object, linked alone into an image, calls the body through the alias. What
+// the alias reads back as is the FORMAT's: ELF and Mach-O state a binding per symbol, so it is GLOBAL there; COFF
+// states a COMDAT section's policy on the SECTION, and every external name in the section is coalesced with it — kept
+// with the copy the link keeps, gone with one it discards — so DSS's COFF reader gives the label the section's
+// binding, WEAK, as it gives clang-cl's (`coff_object_reader.cpp`, GATE 3). (The PE object writer refused the unit —
+// "an alias that must NOT yield" — until this fold.)
+TEST(CompiledSymbolAlias, AStrongAliasOfASelectAnyDefinitionIsANameOfItsBody) {
+    struct ReadBack {
+        char const*   object;
+        SymbolBinding alias;
+    };
+    constexpr ReadBack kAliasReadsBackAs[] = {
+        {"elf64-x86_64-linux", SymbolBinding::Global},
+        {"pe64-x86_64-windows", SymbolBinding::Weak},
+        {"macho64-x86_64-darwin", SymbolBinding::Global},
+    };
+    for (Format const& fmt : kFormats) {
+        SCOPED_TRACE(fmt.object);
+        SymbolBinding expected = SymbolBinding::Local;   // no row: the assertion below names the format
+        for (ReadBack const& r : kAliasReadsBackAs) {
+            if (std::string_view{r.object} == fmt.object) expected = r.alias;
+        }
+        ASSERT_NE(expected, SymbolBinding::Local) << "no read-back binding is stated for " << fmt.object;
+        std::string const f = std::string{fmt.prefix} + "f";
+        std::string const g = std::string{fmt.prefix} + "g";
+        auto const L = load("x86_64", fmt.object);
+        ASSERT_TRUE(L.target && L.format);
+        AssembledModule unit = compiledAliasUnit(fmt.prefix, SymbolBinding::Weak, SymbolBinding::Global);
+        for (auto& s : unit.symbols) {
+            if (s.name == g) s.weakKind = WeakDefinitionKind::SelectAny;
+        }
+        std::vector<AssembledModule> mods{unit};
+        DiagnosticReporter rep;
+        auto const obj = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+        ASSERT_TRUE(obj.ok()) << diagnosticsOf(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << diagnosticsOf(rep);
+        DiagnosticReporter readRep;
+        auto const back = readBack(fmt.object, obj, L, readRep);
+        ASSERT_TRUE(back.has_value()) << diagnosticsOf(readRep);
+        ModuleSymbol const* fRow = nullptr;
+        ModuleSymbol const* gRow = nullptr;
+        for (auto const& s : back->symbols) {
+            if (s.name == f) fRow = &s;
+            if (s.name == g) gRow = &s;
+        }
+        ASSERT_NE(fRow, nullptr) << "the strong alias is not a record of the object";
+        ASSERT_NE(gRow, nullptr) << "the select-any definition is not a record of the object";
+        EXPECT_EQ(fRow->binding, expected) << "the alias was not read back as its format states a name of the body";
+        EXPECT_EQ(gRow->binding, SymbolBinding::Weak) << "the definition lost its weakness";
+        EXPECT_EQ(fRow->symbol, gRow->symbol) << "the two names are not one body";
+        // The object, linked alone into an image, calls the body through the strong name.
+        auto const I = load("x86_64", fmt.image);
+        ASSERT_TRUE(I.target && I.format);
+        AssembledModule again = *back;
+        again.cuId = CompilationUnitId{1};
+        for (auto const& s : again.symbols) {
+            if (s.name == std::string{fmt.prefix} + "main") again.userEntrySymbol = s.symbol;
+        }
+        std::vector<AssembledModule> one{again};
+        DiagnosticReporter linkRep;
+        auto const img = linker::link(std::span<AssembledModule const>{one}, *I.target, *I.format, linkRep, kImage);
+        ASSERT_TRUE(img.ok()) << diagnosticsOf(linkRep);
+        EXPECT_TRUE(someCallLandsOn(img.bytes, kAliasedBody)) << "the object's call does not reach the body";
     }
 }
 

@@ -1272,56 +1272,104 @@ TEST(PeWriter, WeakAliasOfAStrongDefinitionEmitsAWeakExternalRecord) {
         << "canonical + weak external + its auxiliary = three index slots";
 }
 
-// The shape that STILL has no encoding, EXERCISED rather than read: an alias
-// that is STRONGER than its canonical. A weak external is by construction the
-// name that yields, so it cannot express a name that must not yield, and the
-// shared COMDAT section would drag the strong name into the weak canonical's
-// coalescing. The refusal is NARROWED, never deleted.
+// ★ P69 (lane `cs`): A STRONG ALIAS OF A WEAK DEFINITION IS AN EXTERNAL LABEL IN
+// THE DEFINITION'S COMDAT SECTION — what clang-cl writes for a select-any
+// definition with a global alias (✔MEASURED by lane `xa`, 2026-10-20), and what
+// link.exe, lld-link and DSS link and run for a DSS object
+// (tests/link/test_pe_object_alias_reference_link.cpp). This module was this
+// test's REFUSAL pin ("an alias that must NOT yield"). The label states no policy
+// of its own: it lives in the section, kept and discarded with the copy. What it
+// must NOT be is a weak external (a name that yields) or a record outside the
+// section (a definition the coalescing never sees).
 //
-// RED-ON-DISABLE: widen the weak-external arm to any differing binding → this
-// object ships with 0 errors and the strong alias silently becomes overridable.
-TEST(PeWriter, AliasStrongerThanItsCanonicalStillFailsLoud) {
+// And the shape that STILL has no encoding, EXERCISED rather than read: a WEAK
+// alias, of a kind this format writes as a COMDAT section, of a MODULE-PRIVATE
+// body — the policy rides the body's section, which it shares with a name that
+// has none. The refusal is NARROWED, never deleted.
+//
+// RED-ON-DISABLE: refuse a strong alias of a weak definition again → the first
+// module emits no bytes; give the private body's weak alias the strong arm → the
+// second ships with 0 errors and its weakness silently dropped.
+TEST(PeWriter, AnAliasOfAnotherBindingIsALabelOfItsBodyUnlessAWeakNameMeetsAPrivateBody) {
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
 
-    AssembledModule mod;
-    mod.expectedFuncCount = 1;
-    AssembledFunction f;
-    f.symbol = SymbolId{10};
-    f.bytes  = {0xC3};
-    mod.functions.push_back(std::move(f));
-    // The CANONICAL is the first row for the id, so this module's canonical is
-    // WEAK and its alias is GLOBAL -- the inverse of the representable case.
-    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakcano",
-                                       SymbolBinding::Weak,
-                                       SymbolVisibility::Default});
-    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongal",
-                                       SymbolBinding::Global,
-                                       SymbolVisibility::Default});
+    // A body of one `ret`, its names in row order: the first row of the id is its
+    // canonical.
+    auto const twoNames = [](SymbolBinding cb, std::optional<WeakDefinitionKind> ck, char const* cn,
+                           SymbolBinding ab, std::optional<WeakDefinitionKind> ak, char const* an) {
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction f;
+        f.symbol = SymbolId{10};
+        f.bytes  = {0xC3};
+        mod.functions.push_back(std::move(f));
+        ModuleSymbol canon{SymbolId{10}, cn, cb, SymbolVisibility::Default};
+        canon.weakKind = ck;
+        ModuleSymbol alias{SymbolId{10}, an, ab, SymbolVisibility::Default};
+        alias.weakKind = ak;
+        mod.symbols.push_back(canon);
+        mod.symbols.push_back(alias);
+        return mod;
+    };
 
-    DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "an unrepresentable alias binding must emit NO bytes, never an alias "
-           "silently carrying the canonical's policy";
-    EXPECT_EQ(rep.errorCount(), 1u) << diagSummary(rep);
-    bool cited = false;
-    bool namesTheMechanism = false;
-    for (auto const& d : rep.all()) {
-        if (d.actual.find("D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB")
-            != std::string::npos) {
-            cited = true;
+    // ── a GLOBAL alias of a SELECT-ANY definition ──
+    {
+        AssembledModule const mod = twoNames(SymbolBinding::Weak, WeakDefinitionKind::SelectAny, "weakcano",
+                                           SymbolBinding::Global, std::nullopt, "strongal");
+        DiagnosticReporter rep;
+        auto const bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+        ASSERT_FALSE(bytes.empty()) << diagSummary(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+        std::optional<std::uint32_t> canon;
+        std::optional<std::uint32_t> alias;
+        for (std::uint32_t const i : symbolIndices(bytes)) {
+            if (symAnyName(bytes, i) == "weakcano") canon = i;
+            if (symAnyName(bytes, i) == "strongal") alias = i;
         }
-        if (d.actual.find("cannot express an alias that must NOT yield")
-            != std::string::npos) {
-            namesTheMechanism = true;
-        }
+        ASSERT_TRUE(canon.has_value() && alias.has_value()) << "both names must be records of the object";
+        std::int16_t const section = readI16LE(bytes, symRecOff(bytes, *canon) + kSymSectionNumberOff);
+        ASSERT_GT(section, 0) << "the select-any definition is a defined record";
+        EXPECT_EQ(sectionCharacteristics(bytes, section) & kImageScnLnkComdat, kImageScnLnkComdat)
+            << "the select-any definition's body is a COMDAT section of its own";
+        EXPECT_EQ(readI16LE(bytes, symRecOff(bytes, *alias) + kSymSectionNumberOff), section)
+            << "the strong name is a label INSIDE the definition's COMDAT section, kept and discarded with it";
+        EXPECT_EQ(readU32LE(bytes, symRecOff(bytes, *alias) + kSymValueOff),
+                  readU32LE(bytes, symRecOff(bytes, *canon) + kSymValueOff))
+            << "at the definition's own address";
+        EXPECT_EQ(bytes[symRecOff(bytes, *alias) + kSymStorageClassOff], kImageSymClassExternal)
+            << "an external label: a weak external here would make the strong name yield";
+        EXPECT_EQ(bytes[symRecOff(bytes, *alias) + kSymNumAuxOff], 0u)
+            << "no auxiliary record: the COMDAT policy rides the section symbol, never a label";
+        EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, *alias) + kSymTypeOff), 0x20u)
+            << "the alias of a function is still typed a function";
     }
-    EXPECT_TRUE(cited) << diagSummary(rep);
-    EXPECT_TRUE(namesTheMechanism)
-        << "the refusal must say WHY this shape and not the other one -- a "
-           "reader who has just seen a weak alias emitted needs the distinction: "
-        << diagSummary(rep);
+    // ── a SELECT-ANY alias of a MODULE-PRIVATE body: still refused, by name ──
+    {
+        AssembledModule const mod = twoNames(SymbolBinding::Local, std::nullopt, "privbody",
+                                           SymbolBinding::Weak, WeakDefinitionKind::SelectAny, "weakalia");
+        DiagnosticReporter rep;
+        auto const bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+        EXPECT_TRUE(bytes.empty())
+            << "an unrepresentable alias binding must emit NO bytes, never an alias silently "
+               "carrying the body's binding";
+        EXPECT_EQ(rep.errorCount(), 1u) << diagSummary(rep);
+        bool cited = false;
+        bool namesTheMechanism = false;
+        for (auto const& d : rep.all()) {
+            if (d.actual.find("D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB") != std::string::npos)
+                cited = true;
+            if (d.actual.find("'weakalia' is an alias of") != std::string::npos
+                && d.actual.find("binds weak") != std::string::npos
+                && d.actual.find("on a SECTION") != std::string::npos)
+                namesTheMechanism = true;
+        }
+        EXPECT_TRUE(cited) << diagSummary(rep);
+        EXPECT_TRUE(namesTheMechanism)
+            << "the refusal must name the alias and say WHY this shape -- a reader who has "
+               "just seen a strong alias of a weak definition written needs the distinction: "
+            << diagSummary(rep);
+    }
 }
 
 // ★ THE ROUND TRIP, which is the acceptance test the anchor names: DSS writes a

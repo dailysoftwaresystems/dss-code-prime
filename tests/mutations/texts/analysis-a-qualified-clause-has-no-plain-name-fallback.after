@@ -1,1 +1,1 @@
-    if (out.row == nullptr && (spelling == nullptr || spelling->qualifier.empty())) out.row = rowNamed(out.name);
+    if (spelling == nullptr || spelling->qualifier.empty()) tryKey(std::string{name});

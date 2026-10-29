@@ -14,9 +14,10 @@
 //     (`supersededDefinition`): where they are kept (ELF), the alias stays on its own unit's body, kept
 //     module-private under an id of its own while the name goes to the winner; where they are replaced
 //     whole (the Mach-O documents' statement), the alias names the winning definition; where their
-//     section is DISCARDED whole (PE's select-any kind), the alias names the winner for its own unit's
+//     section is DISCARDED whole (PE's select-any kind), a STRONG alias names the winner for its own unit's
 //     references, and another unit's use of the alias's name — which no definition is left to hold —
-//     is refused by name.
+//     is refused by name; a WEAK alias stays the weak definition of its own name it is, and where it wins
+//     the name it names the winning copy.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
@@ -36,6 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -311,6 +313,30 @@ void merge(Merged& out, Unit const& a, Unit const& b, char const* linkFormat = "
     return out;
 }
 
+// The VALUE the merged function `user` (a `User` of `buildData`) reads, as the link resolves it: its read followed
+// through an alias to the definition it names, and through a reference row to the external alias or global that
+// holds the row's name. nullopt: the read ends in no initialized definition.
+[[nodiscard]] std::optional<std::int64_t> valueReadBy(MergedMirModule const& m, std::string_view user) {
+    std::optional<SymbolId> sym = readBy(m, user);
+    for (int hop = 0; sym.has_value() && hop < 8; ++hop) {
+        if (auto const v = initialValueOf(m, *sym); v.has_value()) return v;
+        std::optional<SymbolId> next;
+        for (MirAlias const& a : m.mir.aliases()) {
+            if (a.alias == *sym) next = a.target;
+        }
+        for (ExternImport const& e : m.externImports) {
+            if (next.has_value() || e.symbol != *sym) continue;
+            for (MirAlias const& a : m.mir.aliases()) {
+                if (nameIn(m, a.alias) == e.mangledName && a.linkage.binding != SymbolBinding::Local) next = a.alias;
+            }
+            if (auto const g = externalGlobalNamed(m, e.mangledName); !next.has_value() && g.has_value())
+                next = m.mir.globalSymbol(*g);
+        }
+        sym = next;
+    }
+    return std::nullopt;
+}
+
 [[nodiscard]] std::size_t countOf(DiagnosticReporter const& rep, DiagnosticCode code) {
     std::size_t n = 0;
     for (auto const& d : rep.all()) n += d.code == code ? 1u : 0u;
@@ -473,6 +499,50 @@ TEST(MirMergeAlias, AnAliasWhoseTargetLostItsNameIsWhatTheLinkMakesOfTheLosersBy
     auto const g = externalFunctionNamed(*n.module, "g");
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(n.module->mir.aliases()[0].target, n.module->mir.funcSymbol(*g));
+}
+
+// The review of fold f26a, F3 — WHERE THE ALIAS THAT WON A TARGET'S NAME LEADS. Under a document that states a
+// superseded definition REPLACED WHOLE (the Mach-O documents' statement; the merge reads the statement, as the case
+// above says), an alias whose target lost its name names the winning DEFINITION — and where what won the target's name
+// is itself an alias, the definition THAT alias names, followed through (an alias never names another alias). Unit a:
+// a weak `g` and a strong alias `f` of it; unit b: a strong alias `g` of its own `h`. `g` goes to b's alias, so `f`
+// names `h`.
+TEST(MirMergeAlias, AnAliasWhoseTargetLostItsNameToAnAliasNamesThatAliassDefinition) {
+    Unit a{1}, b{2};
+    build(a, {Fn{1, "g", kWeak}}, {Alias{2, "f", 1, kStrong}}, {Ref{2, "f"}});
+    build(b, {Fn{1, "h", kStrong}}, {Alias{2, "g", 1, kStrong}}, {Ref{2, "g"}});
+    Merged m;
+    merge(m, a, b, "macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(m.module.has_value()) << diagnosticsOf(m.rep);
+    EXPECT_EQ(m.rep.errorCount(), 0u) << diagnosticsOf(m.rep);
+    MergedMirModule const& mm = *m.module;
+    auto const h = externalFunctionNamed(mm, "h");
+    ASSERT_TRUE(h.has_value()) << "the name `h` went to no definition";
+    EXPECT_FALSE(externalFunctionNamed(mm, "g").has_value()) << "unit a's weak `g` beat the strong alias of it";
+    auto const f = aliasesNamed(mm, "f");
+    ASSERT_EQ(f.size(), 1u);
+    EXPECT_EQ(f[0].target, mm.mir.funcSymbol(*h))
+        << "the alias whose target lost its name to another alias does not name that alias's definition";
+    auto const g = aliasesNamed(mm, "g");
+    ASSERT_EQ(g.size(), 1u);
+    EXPECT_EQ(g[0].target, mm.mir.funcSymbol(*h));
+}
+
+// F3's other half: the names come back — unit a: a weak `x` and a strong alias `y` of it; unit b: a weak `y` and a
+// strong alias `x` of it. Each alias wins the name the other's target lost, so following the winners from either
+// target returns to it and ends in no definition: each alias is refused by name, and nothing is built on the names.
+TEST(MirMergeAlias, AliasesWhoseTargetsLostTheirNamesToEachOtherAreRefusedByName) {
+    Unit a{1}, b{2};
+    build(a, {Fn{1, "x", kWeak}}, {Alias{2, "y", 1, kStrong}}, {Ref{2, "y"}});
+    build(b, {Fn{1, "y", kWeak}}, {Alias{2, "x", 1, kStrong}}, {Ref{2, "x"}});
+    Merged m;
+    merge(m, a, b, "macho64-x86_64-darwin-exec");
+    EXPECT_TRUE(reported(m.rep, DiagnosticCode::K_CrossCuMergeUnsupported,
+                         "which lost its name to an alias whose own target lost its name in turn"))
+        << "an alias of a cycle of aliases was not refused by name" << diagnosticsOf(m.rep);
+    EXPECT_EQ(countOf(m.rep, DiagnosticCode::K_CrossCuMergeUnsupported), 2u) << diagnosticsOf(m.rep);
+    EXPECT_EQ(countOf(m.rep, DiagnosticCode::I_VerifierFailure), 0u)
+        << "the merge built an alias of an alias on the cycle" << diagnosticsOf(m.rep);
 }
 
 // PE's select-any kind is `discardedWhole`: the losing copy's section goes with every label in it, the
@@ -725,4 +795,81 @@ TEST(MirMergeAlias, AnAliasOfACopyWhoseFateTheDocumentDoesNotStateIsRefusedByNam
     merge(shipped, a, b, "pe64-x86_64-windows-exec");
     ASSERT_TRUE(shipped.module.has_value()) << diagnosticsOf(shipped.rep);
     EXPECT_EQ(shipped.rep.errorCount(), 0u) << diagnosticsOf(shipped.rep);
+}
+
+// The review of fold f26a, F1: a WEAK alias of a select-any copy is a weak definition of its OWN name, never withdrawn
+// with its copy (`linker::carriedNameGoesWithItsCarrier`): when another definition wins the name, every read follows
+// the name, its own unit's included; when it wins the name, it names the WINNING copy of its target. ✔MEASURED
+// 2026-10-20 (lane cs's probes wk1 and wk2: clang-cl 19.1.5 under link.exe 14.51 and lld-link 19.1.5, mingw-w64 gcc
+// 13.2 under GNU ld 2.42; both orders, both optimisation levels). Unit b of every cell is `__declspec(selectany) int
+// w = 9; extern int m __attribute__((weak, alias("w"))); int ub(void) { return m; }`; what each reader reads, order
+// a b [b a]:
+//   * wk1 cell 1 — a `selectany w = 7`, c `int m = 1;`, main reads m: all three linkers ua 7, ub 1, main 1 [9, 1, 1];
+//   * wk1 cell 3 — no other m, main reads m: clang's two linkers 7, 7, 7 [9, 9, 9] (GNU ld refuses: undefined);
+//   * wk1 cell 4 — the same, main does not read m: clang's two linkers 7, 7 [9, 9];
+//   * wk1 cell 5 — a weak alias `m` of its own copy in each unit, main reads m: clang's two linkers 7, 7, 7
+//     [9, 9, 9] — two weak definitions that are ONE definition (each names the copy that won `w`) are no pair;
+//   * wk2 cell 5 — a `selectany w = 7; __attribute__((weak)) int m = 5;`, nothing else names m: GNU ld 5, 5
+//     [9, 9] (clang's linkers refuse: two weak externals with different defaults) — the first weak definition wins.
+// Checkpoint 30 withdrew the weak alias like a strong one: cell 1 read 7 in b, cell 3 was refused K_SymbolUndefined,
+// wk2's cell 5 read 7 in b.
+TEST(MirMergeAlias, AWeakAliasOfACopyIsAWeakDefinitionOfItsOwnName) {
+    using Build = std::function<void(Unit&)>;
+    Build const unitB = [](Unit& u) {
+        buildData(u, {Datum{1, "w", kSelectAny, 9}}, {Alias{2, "m", 1, kWeak}}, {Ref{2, "m"}}, {User{3, "ub", 2}});
+    };
+    Build const copyA = [](Unit& u) { buildData(u, {Datum{1, "w", kSelectAny, 7}}, {}, {}, {User{3, "ua", 1}}); };
+    Build const aliasA = [](Unit& u) {
+        buildData(u, {Datum{1, "w", kSelectAny, 7}}, {Alias{2, "m", 1, kWeak}}, {Ref{2, "m"}}, {User{3, "ua", 2}});
+    };
+    Build const weakMA = [](Unit& u) {
+        buildData(u, {Datum{1, "w", kSelectAny, 7}, Datum{2, "m", kWeak, 5}}, {}, {}, {User{3, "ua", 2}});
+    };
+    Build const strongM    = [](Unit& u) { buildData(u, {Datum{1, "m", kStrong, 1}}, {}, {}, {}); };
+    Build const mainReadsM = [](Unit& u) { buildData(u, {}, {}, {Ref{1, "m"}}, {User{2, "main_m", 1}}); };
+    struct Read {
+        char const*  user;
+        std::int64_t ab, ba;   // the value read in order a b, and in order b a
+    };
+    struct Cell {
+        char const*        name;
+        Build              a;
+        std::vector<Build> rest;   // the units after a and b
+        std::vector<Read>  reads;
+    };
+    std::vector<Cell> const cells{
+        {"wk1 cell 1: a strong m elsewhere", copyA, {strongM, mainReadsM},
+         {{"ua", 7, 9}, {"ub", 1, 1}, {"main_m", 1, 1}}},
+        {"wk1 cell 3: no other m, main reads it", copyA, {mainReadsM}, {{"ua", 7, 9}, {"ub", 7, 9}, {"main_m", 7, 9}}},
+        {"wk1 cell 4: no other m", copyA, {}, {{"ua", 7, 9}, {"ub", 7, 9}}},
+        {"wk1 cell 5: a weak alias of its own copy in each unit", aliasA, {mainReadsM},
+         {{"ua", 7, 9}, {"ub", 7, 9}, {"main_m", 7, 9}}},
+        {"wk2 cell 5: a weak m beside it, nothing else names m", weakMA, {}, {{"ua", 5, 9}, {"ub", 5, 9}}},
+    };
+    for (Cell const& cell : cells) {
+        for (bool const ba : {false, true}) {
+            SCOPED_TRACE(std::string{cell.name} + (ba ? ", order b a" : ", order a b"));
+            std::vector<Build> order{ba ? unitB : cell.a, ba ? cell.a : unitB};
+            order.insert(order.end(), cell.rest.begin(), cell.rest.end());
+            std::vector<std::unique_ptr<Unit>> units;
+            std::vector<Unit const*>           in;
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                units.push_back(std::make_unique<Unit>(static_cast<std::uint32_t>(i + 1)));
+                order[i](*units.back());
+                in.push_back(units.back().get());
+            }
+            Merged m;
+            mergeAll(m, in, "pe64-x86_64-windows-exec");
+            ASSERT_TRUE(m.module.has_value()) << diagnosticsOf(m.rep);
+            EXPECT_EQ(m.rep.errorCount(), 0u) << "the weak alias's program was refused" << diagnosticsOf(m.rep);
+            for (Read const& r : cell.reads) {
+                EXPECT_EQ(valueReadBy(*m.module, r.user), std::optional<std::int64_t>{ba ? r.ba : r.ab})
+                    << r.user << " reads another `m` than the link gives it";
+            }
+            for (MirAlias const& alias : aliasesNamed(*m.module, "m")) {
+                EXPECT_NE(alias.linkage, kLocal)
+                    << "a weak alias was kept as a module-private name: withdrawn with its copy like a strong one";
+            }
+        }
+    }
 }

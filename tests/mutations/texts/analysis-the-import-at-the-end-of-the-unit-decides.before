@@ -1,0 +1,1 @@
+        if (e.position >= position) break;

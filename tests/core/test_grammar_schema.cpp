@@ -3810,7 +3810,8 @@ TEST(GrammarSchema, AWeakBindingStatesItsKindAndNothingElseMay) {
 // "belongs to" arm and the key loads on another verb's row; drop the duplicate-id
 // arm and the repeated id loads; drop `appliesTo`'s refusal on a per-specifier
 // verb and that row loads; accept any `withinDeclarator` string and "entity"
-// loads as the type's.
+// loads as the type's; drop `refusedOnDefinition`'s or `ignoredOnAlias`'s kind-axis
+// arm and it loads on a row nothing reads it from.
 TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere) {
     struct Row {
         char const* what;
@@ -3830,6 +3831,39 @@ TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere
                  R"([ { "names": ["deprecated"], "appliesTo": ["variable"],
                         "effect": "warnOnUse", "withinDeclarator": "type" } ])",
                  nullptr},
+             // P69 fold f26b: `refusedOnDefinition` — the refusal's text, read by the
+             // declaration-kind gate, so only beside a kind axis.
+             Row{"an inert row refused on a definition and ignored on an alias, with reasons",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable", "function"],
+                        "effect": "none", "refusedOnDefinition": "it is another image's",
+                        "ignoredOnAlias": "it has no storage" } ])",
+                 nullptr},
+             // P69 fold f26b: `ignoredOnAlias` — the warning's text, read beside
+             // `refusedOnDefinition`, under the same two rules.
+             Row{"ignoredOnAlias that is no string",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none",
+                        "ignoredOnAlias": 7 } ])",
+                 "'ignoredOnAlias' must be a non-empty STRING"},
+             Row{"an empty ignoredOnAlias",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none",
+                        "ignoredOnAlias": "" } ])",
+                 "'ignoredOnAlias' must be a non-empty STRING"},
+             Row{"ignoredOnAlias on a row with no kind axis",
+                 R"([ { "names": ["imp"], "effect": "none",
+                        "ignoredOnAlias": "it has no storage" } ])",
+                 "'ignoredOnAlias' is read by the declaration-kind gate"},
+             Row{"refusedOnDefinition that is no string",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none",
+                        "refusedOnDefinition": true } ])",
+                 "'refusedOnDefinition' must be a non-empty STRING"},
+             Row{"an empty refusedOnDefinition",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none",
+                        "refusedOnDefinition": "" } ])",
+                 "'refusedOnDefinition' must be a non-empty STRING"},
+             Row{"refusedOnDefinition on a row with no kind axis",
+                 R"([ { "names": ["imp"], "effect": "none",
+                        "refusedOnDefinition": "it is another image's" } ])",
+                 "this row states no 'appliesTo'"},
              Row{"a calling-convention row with no conventions",
                  R"([ { "names": ["cc_a"], "effect": "callingConvention" } ])",
                  "'conventions' is REQUIRED"},
@@ -3902,6 +3936,10 @@ TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere
             } else if (effects[0].effect == AttributeEffect::Unsupported) {
                 EXPECT_EQ(effects[0].reason, "it changes the type");
                 EXPECT_TRUE(effects[0].appliesTo.empty());
+            } else if (effects[0].effect == AttributeEffect::None) {
+                EXPECT_EQ(effects[0].refusedOnDefinition, "it is another image's") << row.what;
+                EXPECT_EQ(effects[0].ignoredOnAlias, "it has no storage") << row.what;
+                EXPECT_EQ(effects[0].appliesTo.size(), 2u) << row.what;
             } else {
                 EXPECT_TRUE(effects[0].staysWithTypeInDeclarator) << row.what;
             }
@@ -3923,6 +3961,96 @@ TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere
     ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
     for (auto const& e : (*r)->semantics().attributeEffects)
         EXPECT_FALSE(e.staysWithTypeInDeclarator);
+}
+
+// ★ P69 (lane `cs`, fold f26b): the `imported` linkage axis and an effects row's
+// `availableObjectFormats`. `imported` (a declaration that names a definition another
+// image holds) is read only beside `nonDefining: true` — without it the declaration
+// would be both the import and the definition — and only under a key some effects row
+// names, since the record-time scan reads it through the attribute's row.
+// `availableObjectFormats` makes a row's names vocabulary on those formats only, held
+// to the spelling rows' rules for the same key: a non-empty list of formats a build can
+// have, none twice, kept sorted.
+//
+// RED-ON-DISABLE, one loader arm each: drop the boolean check, the `nonDefining`
+// requirement or the keyed-by-a-row check of `imported` and its row loads; drop the
+// emptiness, the format-name or the duplicate check of `availableObjectFormats` and its
+// row loads; drop the sort and the loaded list is in the order written.
+TEST(GrammarSchema, AnImportedLinkageEntryAndAFormatGatedEffectsRowAreHeldToTheirReaders) {
+    struct Row {
+        char const* what;
+        char const* effects;
+        char const* linkage;       // spliced into the row's `linkageSpecifiers`
+        char const* refusedWith;   // nullptr = loads
+    };
+    for (Row const row : {
+             Row{"an imported entry keyed by a gated row",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none",
+                        "availableObjectFormats": ["pe", "elf"] } ])",
+                 R"("imp": { "nonDefining": true, "imported": true },)", nullptr},
+             Row{"imported that is no boolean",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none" } ])",
+                 R"("imp": { "nonDefining": true, "imported": 1 },)",
+                 "'imported' must be a boolean"},
+             Row{"imported without nonDefining",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none" } ])",
+                 R"("imp": { "imported": true },)", "which needs 'nonDefining': true beside it"},
+             Row{"imported under a key no effects row names",
+                 R"([ { "names": ["imp"], "appliesTo": ["variable"], "effect": "none" } ])",
+                 R"("imq": { "nonDefining": true, "imported": true },)",
+                 "the linkage specifier 'imq' says 'imported', and no"},
+             Row{"availableObjectFormats that is no array",
+                 R"([ { "names": ["imp"], "effect": "none", "availableObjectFormats": "pe" } ])",
+                 "", "'availableObjectFormats' must be a non-empty ARRAY"},
+             Row{"an empty availableObjectFormats",
+                 R"([ { "names": ["imp"], "effect": "none", "availableObjectFormats": [] } ])",
+                 "", "'availableObjectFormats' must be a non-empty ARRAY"},
+             Row{"a format no build can have",
+                 R"([ { "names": ["imp"], "effect": "none", "availableObjectFormats": ["pex"] } ])",
+                 "", "'pex' is not an object format a build can have"},
+             Row{"a format listed twice",
+                 R"([ { "names": ["imp"], "effect": "none",
+                        "availableObjectFormats": ["pe", "pe"] } ])",
+                 "", "object format 'pe' is listed twice"}}) {
+        auto const cfg = attrVocabSchema(row.effects, "", "", row.linkage);
+        auto r = GrammarSchema::loadFromText(cfg);
+        if (row.refusedWith == nullptr) {
+            ASSERT_TRUE(r.has_value()) << row.what << ": " << errorDiags(r.error());
+            auto const& effects = (*r)->semantics().attributeEffects;
+            ASSERT_EQ(effects.size(), 1u) << row.what;
+            EXPECT_EQ(effects[0].availableObjectFormats,
+                      (std::vector<ObjectFormatKind>{ObjectFormatKind::Elf, ObjectFormatKind::Pe}))
+                << row.what << ": the formats, sorted";
+            EXPECT_TRUE(effects[0].availableFor(ObjectFormatKind::Pe)) << row.what;
+            EXPECT_TRUE(effects[0].availableFor(ObjectFormatKind::Elf)) << row.what;
+            EXPECT_FALSE(effects[0].availableFor(ObjectFormatKind::MachO)) << row.what;
+            EXPECT_FALSE(effects[0].availableFor(std::nullopt))
+                << row.what << ": with no format in scope a gated row is no vocabulary";
+            auto const& specs = (*r)->semantics().declarations[0].linkageSpecifiers;
+            ASSERT_TRUE(specs.contains("imp")) << row.what;
+            EXPECT_TRUE(specs.at("imp").imported) << row.what;
+            EXPECT_TRUE(specs.at("imp").nonDefining) << row.what;
+            EXPECT_FALSE(specs.at("st").imported) << row.what;
+            continue;
+        }
+        ASSERT_FALSE(r.has_value()) << row.what << " must fail the load";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics)) << row.what;
+        bool said = false;
+        for (auto const& d : r.error())
+            if (d.message.find(row.refusedWith) != std::string::npos) said = true;
+        EXPECT_TRUE(said) << row.what << " — expected a diagnostic containing \""
+                          << row.refusedWith << "\"; got: " << errorDiags(r.error());
+    }
+    // CONTROL: a row with no `availableObjectFormats` is vocabulary everywhere, with no
+    // format in scope too.
+    auto r = GrammarSchema::loadFromText(
+        attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, ""));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    for (auto const& e : (*r)->semantics().attributeEffects) {
+        EXPECT_TRUE(e.availableObjectFormats.empty());
+        EXPECT_TRUE(e.availableFor(std::nullopt));
+        EXPECT_TRUE(e.availableFor(ObjectFormatKind::MachO));
+    }
 }
 
 // ── P69 (lane `cs`): `attributeSemantics.spellings`, the QUALIFIED attribute name,
@@ -8432,12 +8560,22 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
             << name << " — an inert row still says which kinds of declaration it "
                        "may sit on, so the others are warned";
     }
-    // The import/export words are attributes of the QUALIFIED spelling only: under
-    // the plain one every reference for a non-Windows target warns and ignores them
-    // (gcc 13.3.0, clang 18.1.3, Apple clang), so a plain row would make the word an
-    // attribute — silent, and advertised — on pairs where it is none.
-    EXPECT_EQ(rowNamed("dllimport"), nullptr);
+    // The export word is an attribute of the QUALIFIED spelling only: under the plain
+    // one every reference for a non-Windows target warns and ignores it (gcc 13.3.0,
+    // clang 18.1.3, Apple clang), so a plain row would make the word an attribute —
+    // silent, and advertised — on pairs where it is none.
     EXPECT_EQ(rowNamed("dllexport"), nullptr);
+    // ★ P69 (lane `cs`, fold f26b): the IMPORT word is the plain spelling's too, on pe
+    // ONLY — mingw-w64 gcc 13.2.0 imports `__attribute__((dllimport))`, where gcc
+    // 13.3.0, clang 18.1.3 and Apple clang warn and ignore it (✔MEASURED, lane `cs`
+    // probe di5) — so ONE row names both words and is gated to pe, which keeps the
+    // plain word no attribute, and unadvertised, on every other pair.
+    AttributeSemanticsRow const* const dllimport = rowNamed("dllimport");
+    ASSERT_NE(dllimport, nullptr);
+    EXPECT_EQ(dllimport, rowNamed("__declspec(dllimport)")) << "one row, both spellings";
+    EXPECT_EQ(dllimport->availableObjectFormats,
+              (std::vector<ObjectFormatKind>{ObjectFormatKind::Pe}));
+    EXPECT_FALSE(dllimport->refusedOnDefinition.empty());
 
     // The thread-storage request of the qualified spelling: every row that can
     // declare an object carries it, and on each it yields to a declaration of the
@@ -9602,7 +9740,8 @@ TEST(GrammarSchema, NotFollowedByIsAdmittedOnlyWhereAProbeEvaluatesIt) {
 //   * it called a speculative alt inside a NON-speculative optional "probed", though the optional
 //     enters its rules directly — a predicate there would have been skipped in silence.
 // RED-ON-DISABLE: judge every speculative alt position again (drop the cursor filter) → the first
-// accepted shape is refused and the nested one loads.
+// accepted shape is refused and the nested one loads; let a predicate name a shape whose FIRST set
+// is empty → the empty shape's cell is not refused for it.
 TEST(GrammarSchema, AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt) {
     auto const load = [](std::string const& shapes) {
         std::string const doc = std::string{R"({
@@ -9670,6 +9809,13 @@ TEST(GrammarSchema, AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt) {
              R"("list": { "sequence": ["XKind", )" + loop + "] }, "
              + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "nowhere" } })",
          "followedByFirstOf"},
+        // …nor can a shape that exists and has an EMPTY FIRST set: no token can begin it. (An empty
+        // `sequence` is refused on its own; a shape that only names itself is the one left.)
+        {"a named shape with an empty FIRST set",
+         R"({ "root": { "sequence": ["list", "CKind"] }, "empty": { "sequence": ["empty"] }, )"
+             R"("list": { "sequence": ["XKind", )" + loop + "] }, "
+             + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "empty" } })",
+         "has no FIRST set"},
         // One follower predicate per shape.
         {"both predicates on one shape",
          R"({ "root": { "sequence": ["list", "CKind"] }, )"

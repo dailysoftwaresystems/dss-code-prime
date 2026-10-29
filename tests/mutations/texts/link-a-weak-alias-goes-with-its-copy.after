@@ -1,1 +1,1 @@
-        return true || row.binding != SymbolBinding::Weak || !row.weakKind.has_value()
+                                              (*own)->weakKind, std::nullopt});

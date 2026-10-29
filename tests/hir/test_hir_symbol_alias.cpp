@@ -333,6 +333,32 @@ TEST(HirSymbolAliasLowering, EachAliasTravelsInTheTextAndReadsBack) {
         again.symbolAliases = &back->symbolAliases;
         DiagnosticReporter r2;
         EXPECT_EQ(emitHir(back->hir, again, r2), text) << "the text written from what was read is another text";
+        // The other weak kind (the review of fold f26a, F5): `select-any` is a word, a `-` and a word to the
+        // reader's lexer. A C unit states no select-any alias, so the unit's own text is given one — its weak
+        // alias's kind spelled `select-any` — and it must read back as that kind and write the same text again.
+        std::string selectAny = text;
+        auto const  weakAt    = selectAny.find("[weak(overridable)]");
+        ASSERT_NE(weakAt, std::string::npos) << "the weak alias is not in the text:\n" << text;
+        selectAny.replace(weakAt, std::string_view{"[weak(overridable)]"}.size(), "[weak(select-any)]");
+        DiagnosticReporter r3;
+        auto const sa = parseHir(selectAny, CompilationUnitId{1}, r3);
+        std::string saWhy;
+        appendDiagnostics(saWhy, r3);
+        ASSERT_TRUE(sa != nullptr && sa->ok) << "a select-any alias did not read back:" << saWhy << "\n" << selectAny;
+        bool readSelectAny = false;
+        for (HirSymbolAlias const& a : sa->symbolAliases) {
+            readSelectAny = readSelectAny || (a.linkage.binding == SymbolBinding::Weak
+                                              && a.linkage.weakKind == WeakDefinitionKind::SelectAny);
+        }
+        EXPECT_TRUE(readSelectAny) << "`weak(select-any)` did not read as the select-any kind";
+        HirTextContext saAgain;
+        saAgain.interner      = &sa->interner;
+        saAgain.symbolNames   = &sa->symbolNames;
+        saAgain.literalPool   = &sa->literalPool;
+        saAgain.inlineAsmPool = &sa->inlineAsmPool;
+        saAgain.symbolAliases = &sa->symbolAliases;
+        DiagnosticReporter r4;
+        EXPECT_EQ(emitHir(sa->hir, saAgain, r4), selectAny) << "a select-any alias was written back as another text";
     });
     EXPECT_EQ(failed, "");
 }
@@ -380,6 +406,14 @@ TEST(HirSymbolAliasLowering, AnAliasTheTextCannotStateIsRefusedByName) {
                       "unknown weak-definition kind 'sometimes'"},
                  Case{section("  alias " + f + " [weak] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
                       "names no weak-definition kind"},
+                 // The default binding and visibility are stated by leaving them out (the review of fold f26a, F5):
+                 // spelled out, the alias would have two texts.
+                 Case{section("  alias " + f + " [global] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "'global' in the attribute list of alias"},
+                 Case{section("  alias " + f + " [default] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "'default' in the attribute list of alias"},
+                 Case{section("  alias " + f + " [local, default] = " + g + "\n"), DiagnosticCode::H_TextMalformed,
+                      "is the visibility an alias has when its list states none"},
                  Case{section("  alias " + f + " = " + f + "\n"), DiagnosticCode::H_TextMalformed, "names itself"},
                  Case{section("  alias " + f + " = " + g + "\n  alias " + f + " = " + g + "\n"),
                       DiagnosticCode::H_TextMalformed, "is stated twice"},
@@ -404,6 +438,18 @@ TEST(HirSymbolAliasLowering, AnAliasTheTextCannotStateIsRefusedByName) {
             EXPECT_TRUE(said) << "not refused by name (" << diagnosticCodeName(c.code) << ", \"" << c.says << "\"):"
                               << why;
         }
+        // The words an unknown word is told a list accepts are the words a list states — never the two defaults.
+        DiagnosticReporter r;
+        (void)parseHir(head + section("  alias " + f + " [bogus] = " + g + "\n"), CompilationUnitId{1}, r);
+        bool listed = false;
+        for (auto const& d : r.all()) {
+            if (d.code != DiagnosticCode::H_TextUnknownName) continue;
+            listed = true;
+            EXPECT_EQ(d.actual.find("'global'"), std::string::npos) << "the accepted words name 'global': " << d.actual;
+            EXPECT_EQ(d.actual.find("'default'"), std::string::npos) << "the accepted words name 'default': " << d.actual;
+            EXPECT_NE(d.actual.find("'weak'"), std::string::npos) << d.actual;
+        }
+        EXPECT_TRUE(listed) << "the unknown word was not refused by name";
     });
     EXPECT_EQ(failed, "");
 }

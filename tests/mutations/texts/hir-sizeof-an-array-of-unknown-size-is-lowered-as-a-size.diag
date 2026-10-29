@@ -1,1 +1,1 @@
-sizeof of an array of unknown size did not lower
+lowered to a SizeOf node

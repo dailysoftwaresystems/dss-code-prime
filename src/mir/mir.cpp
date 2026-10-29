@@ -1163,6 +1163,14 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
                      static_cast<int>(info.mnemonic.size()), info.mnemonic.data());
         std::abort();
     }
+    // A `blockaddress_export` DEFINES the symbol in its payload
+    // (`mirSymbolMentionDefines`), and the id space is past every symbol the module
+    // defines — as `addFunction`, `addGlobal` and `addAlias` keep it. HERE, because
+    // every door that writes an export comes through here: `addBlockAddressExport`,
+    // the `.dssir` reader's generic arm, and the copy sites that forward an export
+    // verbatim (P69 fold f26b: the reader's arm did not, so a text whose export
+    // defined %9 read back with an end below it).
+    if (opcode == MirOpcode::BlockAddressExport) keepSymbolIdsClearOf(SymbolId{payload});
     detail::MirInst pod;
     pod.opcode   = opcode;
     pod.flags    = flags;
@@ -1510,13 +1518,10 @@ MirInstId MirBuilder::addBlockAddressExport(MirInstId blockAddr, SymbolId blockS
                    "be valid\n", stderr);
         std::abort();
     }
-    detail::MirInst pod;
-    pod.opcode  = MirOpcode::BlockAddressExport;
-    pod.flags   = flags;
-    pod.typeId  = TypeId{};          // R::None — publishes a binding, yields no value
-    pod.payload = blockSymbol.v;
-    std::array<MirInstId, 1> ops{blockAddr};
-    return appendInst_(pod, ops, /*terminates=*/false);
+    // R::None — publishes a binding, yields no value. Through `addInst`, which keeps
+    // the id space past the symbol the export defines, for this door and every other.
+    std::array<MirInstId, 1> const ops{blockAddr};
+    return addInst(MirOpcode::BlockAddressExport, ops, TypeId{}, blockSymbol.v, flags);
 }
 
 // D5.6: first-class aggregate ops. Each path element is interned as a

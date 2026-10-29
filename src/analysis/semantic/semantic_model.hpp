@@ -351,6 +351,18 @@ struct DSS_EXPORT SymbolRecord {
     // inputs of the ONE statement of the tentative mark (`recordLinkage`,
     // cst_to_hir.cpp: "a tentative definition that MAY be a common").
     bool            tentativeNeverCommon = false;
+    // P69 (lane `cs`, fold f26b): TRUE iff this declaration IMPORTS the name — an
+    // attribute clause at one of its declarator's positions says the definition is
+    // ANOTHER IMAGE's (`LinkageSpecifierEffect::imported`; c: `__declspec(dllimport)`),
+    // and the declaration can be one (no initializer, external linkage, no thread
+    // storage). Such a declaration is non-defining (`isExternDeclaration`) wherever it
+    // is written, at file scope and inside a body, and the lowering makes it the
+    // reference it is. The redeclaration merge carries it on the survivor: two
+    // imports share it, a later declaration that does not import clears it (warned),
+    // and an import after a declaration of this unit that defines the name is
+    // refused. Read by the static-initializer judge: an imported object's address is
+    // no address constant.
+    bool            isImportedDeclaration = false;
     // P69 (lane `cs`): the definition this symbol is a SECOND NAME of — set on the
     // merge survivor of a declaration that wrote `alias("target")`, once
     // `resolveSymbolAliases` found the target's definition in the unit (the final

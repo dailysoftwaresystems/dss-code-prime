@@ -644,3 +644,12 @@ dss_add_test(NAME program/test_release_hidden_definitions
 # never executed (examples/c/symbol_alias_second_name is the run).
 dss_add_test(NAME program/test_compiled_symbol_alias_object
              SOURCES test_compiled_symbol_alias_object.cpp)
+
+# P69 (lane `cs`, fold f26b; D-LK-OBJECT-STV-PROTECTED-DROPPED): a visibility the target's format cannot write is
+# written as the format document's `visibilityWrittenAs` states, settled once per unit and warned
+# (`H_VisibilityWrittenAsAnother`) — the shipped documents' statements, the loader's refusals, a unit settled to a
+# synthetic document, and the Mach-O and COFF objects read back. HOST-INDEPENDENT: built and decoded, never run.
+dss_add_test(NAME program/test_visibility_written_as
+             SOURCES test_visibility_written_as.cpp)
+target_link_libraries(dss_program_test_visibility_written_as
+                      PRIVATE nlohmann_json::nlohmann_json)

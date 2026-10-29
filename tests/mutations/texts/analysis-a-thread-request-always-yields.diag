@@ -1,1 +1,1 @@
-m.hasErrors()
+DiagnosticCode::S_ThreadLocalRedeclarationMismatch

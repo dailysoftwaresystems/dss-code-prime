@@ -302,7 +302,15 @@ struct Linked {
     auto out = std::make_unique<Linked>();
     auto const l = load(stem);
     if (!l.target || !l.format) return out;
-    out->image = linker::link(std::span<AssembledModule const>{units}, *l.target, *l.format, out->rep, request);
+    // The image these units link into: its export directory's Name is its own file name, and an emission that
+    // is given none is refused by name (P69 fold f26b, lane `cs`), so a case that names none links the image
+    // this file stands for.
+    ImageRequest named = request;
+    if (named.artifactFileName.empty()) {
+        named.artifactFileName = std::string{"coff_directive_image_requests"}
+                               + (std::string_view{stem}.ends_with("-dll") ? ".dll" : ".exe");
+    }
+    out->image = linker::link(std::span<AssembledModule const>{units}, *l.target, *l.format, out->rep, named);
     if (!out->image.bytes.empty()) out->pe = peImage(out->image.bytes);
     return out;
 }

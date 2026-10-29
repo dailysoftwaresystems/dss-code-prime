@@ -1,3 +1,1 @@
-void validateNotFollowedBy(GrammarSchemaData& data, Collector& coll) {
-    if (!data.compiledRules.empty()) return;
-    std::unordered_set<std::uint32_t> vetoing;
+    if (true || vetoing.empty()) return;

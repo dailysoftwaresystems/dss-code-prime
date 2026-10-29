@@ -1,1 +1,1 @@
-        return ty.valid() && in.kind(ty) == TypeKind::Array;
+    if (t.valid() && in.kind(t) != TypeKind::Array) return t;

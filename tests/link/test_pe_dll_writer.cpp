@@ -51,6 +51,7 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/format/pe.hpp"
+#include "link/image_request.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
@@ -77,6 +78,11 @@ namespace {
 using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 using dss::link_format::test::readU64LE;
+
+// The artifact each DLL these cases encode represents. Its export directory's Name is the image's own file name, and
+// an emission that is given none is refused by name (P69 fold f26b, lane `cs`:
+// `PeDllimportDeclarationNative.ADllEmissionGivenNoArtifactNameIsRefusedByName`).
+ImageRequest const kDllRequest{.artifactFileName = "pe_dll_writer.dll"};
 
 // ── Fixed PE32+ image file offsets (see pe.cpp layout constants) ──
 // [0x84] IMAGE_FILE_HEADER: NumberOfSections @0x86, Characteristics
@@ -462,7 +468,7 @@ TEST(PeDllWriter, HeaderPinsDllFlagEntryZeroDynamicBase) {
     auto loaded = loadShippedDll();
     AssembledModule mod = makeExportModule();
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -490,7 +496,7 @@ TEST(PeDllWriter, ExportDirectoryWiredSortedAndOrdinalCorrect) {
     auto loaded = loadShippedDll();
     AssembledModule mod = makeExportModule();   // names arrive z, a, m
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -509,6 +515,8 @@ TEST(PeDllWriter, ExportDirectoryWiredSortedAndOrdinalCorrect) {
     // IMAGE_EXPORT_DIRECTORY fields.
     std::size_t const dirOff = fileOff(edata, dirRva);
     EXPECT_EQ(readU32LE(img, dirOff + 16), 1u);   // Base (ordinal)
+    // The directory's Name: the DLL's own file name, the one its emission was given.
+    EXPECT_EQ(readCStr(img, fileOff(edata, readU32LE(img, dirOff + 12))), "pe_dll_writer.dll");
     std::uint32_t const numFuncs = readU32LE(img, dirOff + 20);
     std::uint32_t const numNames = readU32LE(img, dirOff + 24);
     // dss_zeta + dss_alpha + dss_mid + dss_global export;
@@ -582,7 +590,7 @@ TEST(PeDllWriter, DuplicateExportNameFailsLoud) {
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(rep, "duplicate export name"));
@@ -607,7 +615,7 @@ TEST(PeDllWriter, AnOverridableWeakDefinitionIsNotExportedAutomatically) {
     weak.weakKind = WeakDefinitionKind::Overridable;
     mod.symbols.push_back(weak);
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
     SectionView const edata = findSection(img, ".edata");
@@ -635,7 +643,7 @@ TEST(PeDllWriter, NoExportsEmitsNoEdataAndZeroDirectory) {
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU32LE(img, kExportDirOff), 0u);
@@ -649,7 +657,7 @@ TEST(PeDllWriter, FnPtrTableSlotGetsDir64BaseRelocation) {
     auto loaded = loadShippedDll();
     AssembledModule mod = makeFnPtrTableModule();
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -723,7 +731,7 @@ TEST(PeDllWriter, AFunctionImportSlotIsBoundByTheLoaderThroughADescriptorOfItsOw
     auto loaded = loadShippedDll();
     AssembledModule mod = makeExternSlotModule(/*externIsData=*/false);
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     SectionView const dataSec = findSection(img, ".data");
@@ -760,7 +768,7 @@ TEST(PeDllWriter, ADataImportSlotIsBoundByTheLoaderToo) {
         AssembledModule mod = makeExternSlotModule(/*externIsData=*/true);
         DiagnosticReporter rep;
         auto img = exec ? encodeUntrampolined(mod, *loaded.target, *loaded.format, rep)
-                        : pe::encode(mod, *loaded.target, *loaded.format, rep);
+                        : pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
         ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
         EXPECT_EQ(rep.errorCount(), 0u);
         SectionView const dataSec = findSection(img, ".data");
@@ -780,7 +788,7 @@ TEST(PeDllWriter, AReadOnlySlotLiesUnderTheIatDirectoryAndIdataIsReadOnly) {
     AssembledModule mod = makeExternSlotModule(/*externIsData=*/false,
                                                DataSectionKind::RelRoConst);
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(findSection(img, ".rdata").found) << "the only read-only item moved to .idata";
@@ -892,7 +900,7 @@ TEST(PeDllWriter, ADataImportSlotWithAnAddendIsWrittenByTheResidueRunner) {
                                                    DataSectionKind::Data, /*addend=*/24);
         DiagnosticReporter rep;
         auto img = exec ? encodeUntrampolined(mod, *loaded.target, *loaded.format, rep)
-                        : pe::encode(mod, *loaded.target, *loaded.format, rep);
+                        : pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
         ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
         EXPECT_EQ(rep.errorCount(), 0u);
         SectionView const text = findSection(img, ".text");
@@ -934,7 +942,7 @@ TEST(PeDllWriter, AFunctionImportSlotWithAnAddendHoldsItsThunkInTheFileAndIsRewr
     AssembledModule mod = makeExternSlotModule(/*externIsData=*/false,
                                                DataSectionKind::Data, /*addend=*/4);
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     SectionView const text = findSection(img, ".text");
@@ -971,7 +979,7 @@ TEST(PeDllWriter, AReadOnlyResidueItemIsLaidOutWritable) {
     AssembledModule mod = makeExternSlotModule(/*externIsData=*/true,
                                                DataSectionKind::RelRoConst, /*addend=*/4);
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty()) << diagnosticsOf(rep);
     EXPECT_FALSE(findSection(img, ".rdata").found) << "the only read-only item moved";
     SectionView const dataSec = findSection(img, ".data");
@@ -1067,7 +1075,7 @@ TEST(PeDllWriter, AbsoluteTextRelocIsCollectedIntoDotReloc) {
     f1.bytes  = {0xC3};
     mod.functions.push_back(std::move(f1));
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     ASSERT_FALSE(img.empty()) << "an absolute in .text must now LINK";
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -1107,7 +1115,7 @@ TEST(PeDllWriter, AbsoluteTextRelocOfUnrepresentableWidthStillFailsLoud) {
     f1.bytes  = {0xC3};
     mod.functions.push_back(std::move(f1));
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(
@@ -1122,7 +1130,7 @@ TEST(PeDllWriter, ImageEntryOverrideFailsLoud) {
     AssembledModule mod = makeExportModule();
     mod.imageEntryOverride = 0u;
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep, kDllRequest);
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(rep, "imageEntryOverride"));

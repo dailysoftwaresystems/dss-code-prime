@@ -116,6 +116,7 @@ int if_leaves_by_goto(int x) { if (1) goto out; return 2; out: return x + 4; }
 int conditional_callee(int x) { (x ? leave : stay)(15); return 5; }
 int pointer_callee(int x) { void (*p)(int) = x ? leave : stay; p(16); return 6; }
 int one_arm_returns(int x) { x ? leave(17) : stay(18); return 7; }
+int first_arm_returns(int x) { x ? stay(19) : leave(20); return 8; }
 
 /* ── NOT A CONSTANT: `sizeof` of a variably modified operand is evaluated when the
  *    program runs, so both outcomes of each branch happen ───────────────────── */
@@ -189,6 +190,8 @@ int main(int argc, char **argv) {
     if (run(pointer_callee, one) != -16) return 40;
     if (run(one_arm_returns, zero) != 7 || steps != 49) return 41;
     if (run(one_arm_returns, one) != -17) return 43;
+    if (run(first_arm_returns, one) != 8 || steps != 68) return 51;
+    if (run(first_arm_returns, zero) != -20) return 52;
 
 #ifndef __STDC_NO_VLA__
     if (run(vla_type, one) != 2) return 44;

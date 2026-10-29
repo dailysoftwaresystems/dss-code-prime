@@ -443,7 +443,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (`TentativeBeyondCommonAlignment`). OPTIONAL: the first stated by the four
     // PE documents, the second by the two PE object documents; the PE backend
     // refuses a PE document that states commons without them.
-    static constexpr std::array<std::string_view, 57> kFormatDocumentKeys{
+    // 57 -> 59 (P69 fold f26b, lane `cs`): `weakDefinitionBesideWeak`, what two
+    // different weak definitions of one name are — the first holds the name, or
+    // the pair is refused where another unit names it (`WeakBesideWeak`); one
+    // answer, or one per kind. OPTIONAL: stated by the three PE documents a link
+    // resolves units for; refused on an archive document. And
+    // `visibilityWrittenAs`, the visibility a format writes for each one it
+    // cannot (`VisibilityStandIn`). OPTIONAL: stated by the four PE and the eight
+    // Mach-O documents; absent, every visibility is written as itself.
+    static constexpr std::array<std::string_view, 59> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -579,6 +587,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // would leave the document unstated, which a link then refuses only
         // when a weak definition meets a strong one
         "weakDefinitionBesideStrong",
+        // what two different weak definitions of one name are — a typo would
+        // leave the document unstated, which a link then reads as the first
+        // holding the name, and a pair the format's linkers refuse would link
+        "weakDefinitionBesideWeak",
+        // the visibility a format writes for one it cannot — a typo would leave
+        // the document unstated, and a writer would be handed a visibility its
+        // symbol table has no field for
+        "visibilityWrittenAs",
         // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
         // with the program-entry cluster in spirit — it answers a question about
@@ -4487,6 +4503,69 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // a duplicate of it. OPTIONAL; the same two forms, read by the same reader.
     readWeakKindStatement("weakDefinitionBesideStrong", kWeakBesideStrongTable,
                           data.weakDefinitionBesideStrong);
+    // weakDefinitionBesideWeak — what two different weak definitions of one name
+    // are (`WeakBesideWeak`, P69 fold f26b): the first holds the name, or the
+    // pair is refused where another unit names it. OPTIONAL; the same two
+    // forms, read by the same reader.
+    readWeakKindStatement("weakDefinitionBesideWeak", kWeakBesideWeakTable,
+                          data.weakDefinitionBesideWeak);
+
+    // visibilityWrittenAs — the visibility this format writes for each one it
+    // cannot (`VisibilityStandIn`, P69 fold f26b). OPTIONAL. An object from a
+    // visibility to the one written in its place, both read by name through
+    // `kSymbolVisibilityTable`. `default` is written by every format, so it is no
+    // key; a stand-in must be a visibility the format writes, so no value is
+    // itself a key — refused here, at the key's own path, rather than settled
+    // into a visibility the writer then cannot write either.
+    if (doc.contains("visibilityWrittenAs")) {
+        auto const& v = doc.at("visibilityWrittenAs");
+        auto const  names = allowedList(allNames(kSymbolVisibilityTable), ", ");
+        if (!v.is_object() || v.empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/visibilityWrittenAs",
+                      std::format("expected an object from each visibility this format "
+                                  "cannot write to the one it writes in its place "
+                                  "(visibilities: {})", names));
+        } else {
+            std::vector<VisibilityStandIn> standIns;
+            bool                           ok = true;
+            for (auto const& [fromName, toJson] : v.items()) {
+                std::string const path = "/visibilityWrittenAs/" + fromName;
+                auto const from = kSymbolVisibilityTable.fromName(fromName);
+                auto const to   = toJson.is_string()
+                                      ? kSymbolVisibilityTable.fromName(toJson.get<std::string>())
+                                      : std::nullopt;
+                if (!from.has_value() || !to.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("'{}' and its value must each be a visibility: "
+                                          "expected one of: {}", fromName, names));
+                    ok = false;
+                    continue;
+                }
+                if (*from == SymbolVisibility::Default) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "'default' is written by every format, so no format states "
+                              "a visibility in its place");
+                    ok = false;
+                    continue;
+                }
+                standIns.push_back(VisibilityStandIn{*from, *to});
+            }
+            for (VisibilityStandIn const& s : standIns) {
+                for (VisibilityStandIn const& other : standIns) {
+                    if (s.writtenAs != other.unwritable) continue;
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/visibilityWrittenAs/" + std::string{kSymbolVisibilityTable.name(s.unwritable)},
+                              std::format("'{}' is written as '{}', which this document states the "
+                                          "format cannot write either: a stand-in is a visibility "
+                                          "the format writes",
+                                          kSymbolVisibilityTable.name(s.unwritable),
+                                          kSymbolVisibilityTable.name(s.writtenAs)));
+                    ok = false;
+                }
+            }
+            if (ok) data.visibilityWrittenAs = std::move(standIns);
+        }
+    }
 
     // sections[] — D-LK4-2 schema row. Each entry maps a universal
     // SectionKind to format-native name + structural fields.

@@ -522,16 +522,26 @@ TEST(StaticInitializers, AThreadLocalAddressIsLeftToItsOwnCode) {
 // gcc 13.3.0, clang 18.1.3 and MSVC 19.51 fold sizeof(char *), sizeof(char *) and sizeof(double)
 // in both modes; clang folds the object size to 12 (gcc refuses it in an enumerator). DSS (HEAD's
 // own dsscp, and this lane's before the fix) folded 16, 16 and refused, and answered (size_t)-1.
-// RED-ON-DISABLE: drop the pre-stamp from `resolveSizeof` → every assertion below fails.
+// A builtin's operand is asked its type there too (`builtinCallPlan`): the `_p` overflow
+// predicate's TARGET is the type of its third operand, which a literal states only once stamped
+// (`P`: 65536 * 65536 does not fit an `int`, gcc's documented rule). ✔MEASURED 2026-10-20 (lane
+// cs probe f26c, report 20261020-113234-cc573495): gcc 13.3.0 folds `P` in an enumerator, the
+// `_Static_assert` holds and the program exits 42 at gnu17 and c2x; clang 18.1.3 has no `_p`
+// builtin and refuses the unit — so gcc is the one reference, and its answer is required.
+// RED-ON-DISABLE: drop the pre-stamp from `resolveSizeof` → the sizeof assertions fail; drop it
+// from `builtinCallPlan` → `P` is no constant (S_NonConstantEnumeratorValue). (`O` no longer
+// reads the literal's type: `g + 4` designates `g` and the offset is folded on its own.)
 TEST(StaticInitializers, ADeclarationsConstantTypesItsOperandsLiterals) {
     auto const m = analyzeC(
         "static char g[16];\n"
         "static char b[sizeof(g + 4)];\n"
         "enum { E = sizeof(0 + g), F = sizeof(1 + 1.0), O = __builtin_object_size(g + 4, 0) };\n"
+        "enum { P = __builtin_mul_overflow_p(65536, 65536, 0) };\n"
         "_Static_assert(sizeof b == sizeof(char *), \"bound\");\n"
         "_Static_assert(E == sizeof(char *), \"E\");\n"
         "_Static_assert(F == sizeof(double), \"F\");\n"
         "_Static_assert(O == 12, \"O\");\n"
+        "_Static_assert(P == 1, \"P\");\n"
         "int main(void) { char a[sizeof(g + 1) + 1]; return (int)sizeof a; }\n");
     std::size_t errors = 0;
     for (auto const& d : m.diagnostics().all())

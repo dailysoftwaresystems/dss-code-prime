@@ -2771,6 +2771,15 @@ enum class DiagnosticCode : std::uint16_t {
     // refuse `case y:` for a variable `y`, and DSS asked nothing of a case label's value (READ).
     // An ERROR at the value; a float or an address value is refused too (both refuse it).
     S_CaseLabelNotConstant                = 0xE09C,
+    // P69 (lane `cs`, fold f26b): a CALL whose callee names nothing visible resolves to the
+    // unit's earlier BLOCK-scope declaration of the function — out of scope where the call
+    // is (C 6.2.1p4), and taken anyway, as cl and clang take it (clang warns "use of
+    // out-of-scope declaration"). ✔MEASURED (lane `cs` probe ip, 2026-10-21; each program
+    // RUN): `void a(void) { int f(int); } int b(void) { return f(40) + 2; }` runs on cl
+    // (silent), gcc 13.3.0 and mingw-w64 gcc 13.2.0 (an implicit declaration, warned); with
+    // `double f(double)` declared it runs on clang 18.1.3 (warned) and cl, and gcc refuses
+    // it. A WARNING, suppressible.
+    S_OutOfScopeDeclarationUsed           = 0xE09D,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -4165,6 +4174,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   x86_64-pc-windows-msvc COMPILES the shape, and nothing of its image can be run
     //   here — a compile, not a working reference.
     H_SehRegionInsideAFilter      = 0xF01E,
+    // H_VisibilityWrittenAsAnother (P69 fold f26b, lane `cs`): a definition states a
+    //   visibility its target's object format cannot write — `protected` or `internal` on
+    //   a Mach-O or PE target — and is written with the one the format's document states
+    //   in its place (`visibilityWrittenAs`, read by the pipeline's one settling step,
+    //   `hir/attributes/visibility_written_as.hpp`), as the format's compilers write it.
+    //   A WARNING, suppressible: the program is built, and built as those compilers build
+    //   it. ✔MEASURED 2026-10-16 (lane cs's probe pv): Apple clang 21.0.0 warns
+    //   "target does not support 'protected' visibility; using 'default'"
+    //   [-Wunsupported-visibility]; mingw-w64 gcc 13.2.0 warns "visibility attribute not
+    //   supported in this configuration; ignored" [-Wattributes]. `.actual` names the
+    //   declaration, the visibility it states, the one written, and the format.
+    H_VisibilityWrittenAsAnother  = 0xF01F,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

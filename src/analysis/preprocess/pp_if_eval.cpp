@@ -1123,9 +1123,14 @@ private:
 // CONTROL half of the operator, and it is the half a portable header depends on
 // — the whole idiom is "ask about something you may not have".
 [[nodiscard]] bool languageDeclaresAttribute(GrammarSchema const& schema,
-                                             std::string_view     name) {
+                                             std::string_view     name,
+                                             std::optional<ObjectFormatKind> format) {
     std::string_view const bare = stripDunder(name);
     for (auto const& row : schema.semantics().attributeEffects) {
+        // ★ P69 (lane `cs`, fold f26b): a row whose names are another object format's
+        // words is no attribute here (`PpPlatformFacts`) — the semantic tier's rule, so
+        // the operator never advertises a name the use would warn as unknown.
+        if (!row.availableFor(format)) continue;
         // A row whose verb exists to REFUSE its names — one the compiler cannot
         // honour at all, one it honours only for the pair whose convention the name
         // selects — is vocabulary kept so the refusal can be by name. It is not an
@@ -1186,12 +1191,13 @@ private:
 [[nodiscard]] std::int64_t featureQueryAnswer(GrammarSchema const&     schema,
                                               FeatureQueryAnswerSource src,
                                               std::string_view         arg,
-                                              PpLibraryFunctionProvided const& libraryFunctionProvided) {
+                                              PpPlatformFacts const&   platform) {
     switch (src) {
         case FeatureQueryAnswerSource::DeclaredAttributes:
-            return languageDeclaresAttribute(schema, arg) ? 1 : 0;
+            return languageDeclaresAttribute(schema, arg, platform.activeFormat) ? 1 : 0;
         case FeatureQueryAnswerSource::DeclaredBuiltins:
-            return languageDeclaresBuiltin(schema, arg, libraryFunctionProvided) ? 1 : 0;
+            return languageDeclaresBuiltin(schema, arg, platform.libraryFunctionProvided)
+                       ? 1 : 0;
         case FeatureQueryAnswerSource::DeclaredLanguageFeatures:
             for (LanguageFeatureDef const& f :
                  schema.preprocess().languageFeatures) {
@@ -1517,7 +1523,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
                    PpHasEmbed const&        hasEmbed,
                    PpOperatorRevoked const& operatorRevoked,
                    PpCharConstantFacts const& charFacts,
-                   PpLibraryFunctionProvided const& libraryFunctionProvided,
+                   PpPlatformFacts const&   platform,
                    PpTokenTextFn const&     textOf,
                    PpEmbedFail const&       fail) {
     std::string const& definedKw = schema.preprocess().definedOperator;
@@ -1562,7 +1568,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
         [](std::vector<Token> const& run) { return run; };
     auto const value = evaluateIfExpressionValue(
         expanded, schema, identity, isDefined, hasInclude, synth, productText,
-        rep, hasEmbed, operatorRevoked, charFacts, libraryFunctionProvided);
+        rep, hasEmbed, operatorRevoked, charFacts, platform);
     if (!value.has_value()) {
         fail(anchor, "embed limit(...) is not an integer constant expression "
                      "(C23 6.10.4.2p1); see the preceding diagnostic");
@@ -1591,13 +1597,13 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      PpHasEmbed const&      hasEmbed,
                      PpOperatorRevoked const& operatorRevoked,
                      PpCharConstantFacts const& charFacts,
-                     PpLibraryFunctionProvided const& libraryFunctionProvided) {
+                     PpPlatformFacts const& platform) {
     // C 6.10.2p12: the question asked of the value is whether it "evaluates to
     // nonzero" -- the value engine below is the whole implementation.
     auto const value = evaluateIfExpressionValue(
         operandTokens, schema, macroExpand, isDefined, hasInclude, synth,
         productText, rep, hasEmbed, operatorRevoked, charFacts,
-        libraryFunctionProvided);
+        platform);
     if (!value.has_value()) return std::nullopt;
     return value->bits != 0;
 }
@@ -1614,7 +1620,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                           PpHasEmbed const&      hasEmbed,
                           PpOperatorRevoked const& operatorRevoked,
                           PpCharConstantFacts const& charFacts,
-                          PpLibraryFunctionProvided const& libraryFunctionProvided) {
+                          PpPlatformFacts const& platform) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
     // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: every operator arm below is gated on
     // this. An operator the program has `#undef`'d is no longer an operator —
@@ -2196,7 +2202,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                                  lim->clauseEnd - lim->clauseBegin),
                     toks[lim->nameIndex], schema, macroExpand, isDefined,
                     hasInclude, synth, productText, rep, hasEmbed,
-                    operatorRevoked, charFacts, libraryFunctionProvided,
+                    operatorRevoked, charFacts, platform,
                     freshWordOf, failParam);
                 // The nested expansion may have grown (and moved) the tail.
                 tail = productText ? productText() : std::string_view{};
@@ -2312,7 +2318,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                 ++j;
                 afterDefined.push_back(
                     mintNumber(featureQueryAnswer(schema, fq->answers, queried,
-                                                  libraryFunctionProvided)));
+                                                  platform)));
                 i = j;
                 continue;
             }

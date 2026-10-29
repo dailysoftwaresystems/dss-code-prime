@@ -120,6 +120,12 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
     // so among the commons of a name the fold's tie rule elects the first; see
     // `SummaryGlobal::isCommon` for why nothing reads the difference.
     std::vector<linker::CrossCuDef> defs;
+    // P69 (lane `cs`, the review of fold f26a, F2): the name each alias carries for
+    // its TARGET's definition — what `linker::resolveSettlingCarriedNames` is handed,
+    // as the merge hands it (`mergeCuMirs`): where the link discards a losing copy
+    // whole, an alias of it that goes with it is withdrawn from its name's election,
+    // and this door elects what the merge elects.
+    std::vector<linker::CarriedName> carried;
     for (std::uint32_t m = 0; m < summaries.size(); ++m) {
         for (SummaryFunction const& f : summaries[m].functions) {
             if (f.name.empty() || f.binding == SymbolBinding::Local) continue;
@@ -144,9 +150,26 @@ buildSummaryIndex(std::span<ModuleSummary const> summaries,
                 a.name, a.binding,
                 LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{a.symbol}}});
             linker::stateTheLinksAnswers(defs.back(), linkFormat, a.weakKind);
+            // The target is a definition of this same module, named by its row; a
+            // target that is no weak definition never loses its name to a copy.
+            auto const carry = [&](std::uint32_t symbol, SymbolBinding binding,
+                                   std::optional<WeakDefinitionKind> kind) {
+                if (binding != SymbolBinding::Weak) return;
+                carried.push_back(linker::CarriedName{
+                    defs.size() - 1, a.targetName,
+                    LinkedSymbolKey{CompilationUnitId{cuIdOf(m)}, SymbolId{symbol}}, kind, a.weakKind});
+            };
+            for (SummaryFunction const& f : summaries[m].functions) {
+                if (f.name == a.targetName) carry(f.symbol, f.binding, f.weakKind);
+            }
+            for (SummaryGlobal const& g : summaries[m].globals) {
+                if (g.name == a.targetName) carry(g.symbol, g.binding, g.weakKind);
+            }
         }
     }
-    linker::CrossCuResolution const resolution = linker::resolveCrossCuDefs(defs);
+    linker::SettledElection const election =
+        linker::resolveSettlingCarriedNames(defs, carried, linkFormat);
+    linker::CrossCuResolution const& resolution = election.resolution;
 
     for (linker::CrossCuConflict const& c : resolution.conflicts) {
         out.conflictingNames.push_back(c.name);

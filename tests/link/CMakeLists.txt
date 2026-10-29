@@ -273,6 +273,29 @@ target_link_libraries(dss_link_test_macho_object_reader
 dss_add_test(NAME link/test_pe_object_data_import_slot
              SOURCES test_pe_object_data_import_slot.cpp)
 
+# P69 (lane `cs`, fold f26b) — a `__declspec(dllimport)` declaration with no `extern`, at file scope and inside a
+# body, names another image's object: a DSS-built DLL exports the datum, and DSS, mingw-w64 gcc and cl each build
+# an image that reads it through such a declaration and RUN it (42). Windows-only; each reference arm skips naming
+# the absent toolchain. Compiles through the production driver, hence the `program` surface.
+dss_add_test(NAME link/test_pe_dllimport_declaration_link
+             SOURCES test_pe_dllimport_declaration_link.cpp)
+
+# P69 (lane `cs`, fold f26b) — a weak alias READ from a foreign COFF object is written back as its compiler wrote it:
+# clang-cl's overridable `m` of the select-any `w` (`tests/link/data/coff_carried_alias_b_clangcl_O2.obj`), read by
+# DSS and relocatably linked alone, is still a weak external whose default is `w`'s own record. In process on every
+# leg: the fixture is read, never compiled.
+dss_add_test(NAME link/test_pe_foreign_weak_alias_rewrite
+             SOURCES test_pe_foreign_weak_alias_rewrite.cpp)
+
+# P69 (lane `cs`, fold f26b) — one program, two routes, one answer: the same C units built by the MERGED route (one
+# compile of every unit) and by the UNIT route (each unit to an object alone, the objects linked), on PE and ELF, both
+# unit orders — a weak alias of a copy that loses, and two different weak definitions of one name on PE. Every cell is
+# built both ways on every host; a linked cell is run where its image runs.
+dss_add_test(NAME link/test_weak_definitions_through_both_routes
+             SOURCES test_weak_definitions_through_both_routes.cpp)
+target_link_libraries(dss_link_test_weak_definitions_through_both_routes
+                      PRIVATE nlohmann_json::nlohmann_json)
+
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 # The emission-alias pin splices ONE extra `relocations[]` row into a shipped
 # `.format.json`, deriving the aliased wire id and a free `kind` FROM the

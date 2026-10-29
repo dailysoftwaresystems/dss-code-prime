@@ -1139,15 +1139,16 @@ TEST(Program_CompileFiles, AReachedEndCompilesForEveryResultClassOnEveryShippedP
 // The table is the same evaluator's third consumer — an index designator that is
 // a constant only through the layout — and must compile on every pair too.
 //
-// THE MUTATIONS are arms of `dssharness check-mutations`, WRITTEN, NOT READ — no
-// sweep has read either yet:
+// THE MUTATIONS are arms of `dssharness check-mutations`, each READ `passed` in the
+// coordinator's sweep from main (macos-arm64-debug):
 //   analysis-the-model-carries-no-layout-parameters_compile-pipeline
-//       the analyzer hands its model no layout parameters (the carried member);
-//       expected: all three functions reported on every pair, the table refused.
-//       Its claim is this case.
+//       (run 20261020-044339-b5ee1170) the analyzer hands its model no layout
+//       parameters (the carried member): all three functions reported on every pair,
+//       the table refused. Its claim is this case.
 //   hir-sizeof-is-not-a-constant-to-the-lowering
-//       `resolveSizeof` removed. Its claim is `BothTiersAgreeOnSizeofPerTarget`;
-//       whether this case reddens under it too is what its first sweep says.
+//       (run 20261020-074548-f64b0dde) `resolveSizeof` removed. Its claim is
+//       `BothTiersAgreeOnSizeofPerTarget`; the reds it declares are the ones that run
+//       read, this case's among them where the registry's C rows name it.
 TEST(Program_CompileFiles, AConstantConditionReadsTheTargetsOwnLayout) {
     struct Pair {
         std::string_view spec;
@@ -1233,7 +1234,8 @@ TEST(Program_CompileFiles, AConstantConditionReadsTheTargetsOwnLayout) {
 // `hir-alignof-is-not-a-constant-to-the-lowering`,
 // `hir-a-member-offset-is-not-a-constant-to-the-lowering`,
 // `hir-a-folded-constant-is-not-read-back`, `hir-a-generic-selection-is-not-followed`)
-// — WRITTEN, NOT READ: no sweep has read any of the five yet.
+// — each READ `passed` in the coordinator's sweep from main (macos-arm64-debug: runs
+// 20261020-074548-f64b0dde for the first two, 20261020-051429-b76b4e1a for the other three).
 namespace {
 
 struct LayoutPair {
@@ -1769,7 +1771,9 @@ TEST(Program_CompileFiles, AGuardedAsmGotosEdgeBlocksAreUnderAScopeRecordOfTheir
 // `lir-no-run-is-emitted_compile-pipeline` of tests/mutations/arms.registry: READ
 // `passed` in the sweep of checkpoint 14 (macos-arm64-debug, run
 // 20261012-151311-82d3dd43) against the `asm goto` case above, alone. This case is
-// younger than that sweep and is DECLARED red under the same arm: WRITTEN, NOT READ.
+// younger than that sweep and is DECLARED red under the same arm, READ so in the
+// coordinator's sweep from main (macos-arm64-debug, run 20261020-074548-f64b0dde:
+// `passed`, 2 reds as declared).
 TEST(Program_CompileFiles, AGuardedShortCircuitsEdgeSplitIsUnderAScopeRecordOfItsOwn) {
     constexpr std::string_view kPe = "x86_64:pe64-x86_64-windows-exec";
     struct Arm {

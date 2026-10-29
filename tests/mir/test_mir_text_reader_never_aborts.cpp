@@ -1037,7 +1037,7 @@ Mir exportedBlockAddressModule(TypeInterner& ti, std::uint32_t exported) {
     TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
     TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
     MirBuilder b;
-    stateIdSpace(b, 0);   // made from nothing but itself: the export's id is BESIDE its end
+    stateIdSpace(b, 0);   // made from nothing but itself: its end is one past what it defines, the export's symbol too
     b.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const t1    = b.createBlock(StructCfMarker::Linear);
@@ -1212,14 +1212,23 @@ TEST(LoweringMintsPastTheHighWater, AnImportHandedInBesideTheModuleKeepsItsId) {
     }
 }
 
-// A block symbol PRE-MINTED for an exported label sits where the module's end is
-// when the module was built by hand (the builder's export states no id of its
-// own): the lowering names the OTHER block past it, never with it.
+// A block symbol PRE-MINTED for an exported label, in a module built by hand: the
+// export DEFINES its symbol, so the builder keeps the module's id space past it, as
+// past a function's or a global's, and the lowering — whose mints continue that
+// space — names the OTHER block past it, never with it.
+//
+// Until P69 fold f26b the builder's export kept no id clear, so this module's end sat
+// AT the export's symbol and only the lowering's own scan of the exports
+// (`symbolIds_.keepClearOf`, mir_to_lir.cpp) kept the second block off it. That
+// scan now restates what the module already holds: no module a builder makes reaches
+// the lowering with an export's symbol at or past its end, and the verifier refuses
+// one that states such an end.
 TEST(LoweringMintsPastTheHighWater, ABlockSymbolAnExportAlreadyOwnsIsNotMintedAgain) {
     constexpr std::uint32_t kExported = 2;
     TypeInterner ti{CompilationUnitId{1}};
     Mir const m = exportedBlockAddressModule(ti, kExported);
-    ASSERT_EQ(m.symbolIdEnd(), kExported) << "the export's symbol is meant to sit AT the module's end";
+    ASSERT_EQ(m.symbolIdEnd(), kExported + 1)
+        << "the export defines its symbol: the module's id space ends one past it";
     Lowered const low = lowerModule(m, ti);
     EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
     std::vector<std::uint32_t> const refs = symbolRefs(low.result.lir);

@@ -4346,7 +4346,8 @@ private:
     // ── `aliases { alias %A [<linkage words>] = %T }` (v9, P69 lane `cs`) ──────
     //
     // The twin of `Emitter::emitAliases`. Refused, each by name: an item that is not `alias`; a handle
-    // `symbols` does not declare (`parseSymHandle`); a word of the list that no shared table names, a
+    // `symbols` does not declare (`parseSymHandle`); a word of the list that no shared table names, the
+    // default binding or visibility spelled out (`global`, `default`: stated by leaving them out), a
     // binding or a visibility stated twice; an argument on a binding that is not `weak`, a kind the table
     // does not name, and a `weak` with no kind; an alias that names itself; a name stated twice. That the
     // target is a DEFINITION of the module is asked once the module is built (`refuseAliasesOfNoDefinition`):
@@ -4389,6 +4390,22 @@ private:
         bool ok            = true;
         bool sawBinding    = false;
         bool sawVisibility = false;
+        // The words a list states: every binding and visibility but the two an alias has when its list states
+        // none (`global`, `default`), which the writer states by leaving them out — one alias, one spelling.
+        auto const stateable = [](auto const& table, std::string_view unstated) {
+            std::vector<std::string_view> words;
+            for (std::string_view const w : allNames(table)) {
+                if (w != unstated) words.push_back(w);
+            }
+            return detail::renderAllowedList(words);
+        };
+        auto const refuseTheDefault = [&](std::string_view word, std::string_view what) {
+            malformed(std::format("'{}' in the attribute list of alias %{} is the {} an alias has when its list "
+                                  "states none — the text states it by leaving it out, so that an alias has one "
+                                  "spelling",
+                                  word, alias, what));
+            ok = false;
+        };
         while (true) {
             if (!peekIs(Tk::Ident)) {
                 malformed(std::format("expected a linkage word in the attribute list of alias %{}", alias));
@@ -4396,6 +4413,7 @@ private:
             }
             std::string const word = lex_.take().text;
             if (auto const v = symbolVisibilityFromName(word); v.has_value()) {
+                if (*v == SymbolVisibility::Default) refuseTheDefault(word, "visibility");
                 if (sawVisibility) {
                     malformed(std::format("the attribute list of alias %{} states its visibility twice — '{}' "
                                           "after '{}'", alias, word, symbolVisibilityName(out.visibility)));
@@ -4404,6 +4422,7 @@ private:
                 sawVisibility  = true;
                 out.visibility = *v;
             } else if (auto const b = symbolBindingFromName(word); b.has_value()) {
+                if (*b == SymbolBinding::Global) refuseTheDefault(word, "binding");
                 if (sawBinding) {
                     malformed(std::format("the attribute list of alias %{} states its binding twice — '{}' "
                                           "after '{}'", alias, word, symbolBindingName(out.binding)));
@@ -4440,8 +4459,9 @@ private:
                 unknownName(std::format("unknown word '{}' in the attribute list of alias %{} — accepted: a "
                                         "binding ({}) or a visibility ({})",
                                         word, alias,
-                                        detail::renderAllowedList(allNames(kSymbolBindingTable)),
-                                        detail::renderAllowedList(allNames(kSymbolVisibilityTable))));
+                                        stateable(kSymbolBindingTable, symbolBindingName(SymbolBinding::Global)),
+                                        stateable(kSymbolVisibilityTable,
+                                                  symbolVisibilityName(SymbolVisibility::Default))));
                 ok = false;
             }
             if (accept(Tk::Comma)) continue;

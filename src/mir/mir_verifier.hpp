@@ -246,13 +246,21 @@ private:
 
     // P69 (lane `cs`): every ALIAS the module states (`Mir::aliases`) is one the
     // object producer can write — one more symbol row on a definition — so its
-    // TARGET is a function or a global this module defines, its NAME is defined
-    // by nothing else here (no function, no global, no second alias), and its
-    // linkage record is well formed and not tentative (an alias has no storage).
-    // `MirBuilder::addAlias` refuses what one statement alone can show; this is
-    // the module-wide half, for every road a module reaches the verifier by.
-    // Emits I_VerifierFailure, naming the alias.
+    // TARGET is a function or a global this module defines, and its linkage record
+    // is well formed and not tentative (an alias has no storage). That its NAME is
+    // defined by nothing else here is `checkSymbolIdsDefinedOnce`'s, the rule of
+    // every definition. `MirBuilder::addAlias` refuses what one statement alone can
+    // show; this is the module-wide half, for every road a module reaches the
+    // verifier by. Emits I_VerifierFailure, naming the alias.
     void checkAliases(DiagnosticReporter& reporter) const;
+
+    // P69 (lane `cs`, fold f26b): ONE ID, ONE DEFINITION — no symbol id is given by
+    // two of the module's definitions (a function, a global, an alias's name, a
+    // `blockaddress_export`), by the one list the writer and the reader read
+    // (`symbolIdsDefinedTwice`, mir/mir_symbols_named.hpp). The `.dssir` reader
+    // holds every text to it through this check, which it runs on what it reads.
+    // Emits I_VerifierFailure, naming the id and both definitions.
+    void checkSymbolIdsDefinedOnce(DiagnosticReporter& reporter) const;
 
     // THE SYMBOL-ID SPACE (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE):
     // every symbol id the module NAMES is below the end it STATES. The end is

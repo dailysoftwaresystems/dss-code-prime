@@ -18245,7 +18245,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
     // other module nobody stated: this entrance used to state a defaulted 0, so
     // forgetting the statement here was silent where it is loud everywhere else.
     if (config.symbolIdSpace.has_value()) {
-        lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd);
+        lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd());
     }
     lwr.lower();
     // P69 (lane `cs`): the unit's symbol aliases — one more NAME on a definition

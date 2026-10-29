@@ -71,15 +71,20 @@
 //     reader's case too: `parseMir` hands its module to its result by a move
 //     construction, so a construction that drops the fact drops the reader's statement.
 //
-// WRITTEN, NOT READ — no sweep has read any of the three yet (the two cases they
-// claim are younger than the sweeps above):
+// READ `passed` in the sweep of checkpoint 20 (macos-arm64-debug, run
+// 20261015-141946-b305403f):
 //   mir-the-verifier-holds-no-module-to-its-stated-end    (the verifier's rule, uncalled)
-//   mir-a-blockaddress-export-names-no-symbol_symbol-id-end-is-stated
-//                                                         (one of the six places left
-//                                                           out of the one list)
 //   mir-the-top-id-is-past-an-end-that-saturates-on-it_symbol-id-end-is-stated
 //                                                         (the top id held to an end
 //                                                           that has no one-past)
+// and `mir-a-blockaddress-export-names-no-symbol_symbol-id-end-is-stated` (the export
+// left out of the one list), which P69 fold f26b REMOVED from this binary: the export
+// now DEFINES its symbol and the builder keeps the end past it, so no case here can
+// state an end the export's id is at or past, and its arm on
+// dss_mir_test_mir_text_operand_forms holds the place (an id an export and another
+// definition both give is refused there by name). The builder's own half is
+// `mir-the-builder-keeps-no-id-clear-of-a-block-export_symbol-id-end-is-stated`
+// (`ABlockExportDefinesItsSymbolSoTheEndIsPastIt`).
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
@@ -336,15 +341,17 @@ TEST(SymbolIdEndIsStated, AModuleReadFromTextStatesItsEndWithOrWithoutASymbolsSe
 
 namespace {
 
-// WHERE a module names a symbol id beside the ones it defines: the four places of
-// mir/mir_symbols_named.hpp that are not a definition, and the initializer's again
-// NESTED in an aggregate (the list walks a literal to its leaves).
+// WHERE a module names a symbol id: the three places of mir/mir_symbols_named.hpp
+// that NAME one beside the module's definitions, the initializer's again NESTED in an
+// aggregate (the list walks a literal to its leaves) — `kNamedIn` — and a
+// `blockaddress_export`, which DEFINES the id it names (P69 fold f26b): the builder
+// keeps the id space past it as past any definition, so no statement can leave it at
+// or past the end, and it has its own case below.
 enum class NamedIn { GlobalAddr, BlockAddressExport, ConstLiteral, GlobalInitializer,
                      NestedInitializer };
 
-constexpr std::array kNamedIn{NamedIn::GlobalAddr, NamedIn::BlockAddressExport,
-                              NamedIn::ConstLiteral, NamedIn::GlobalInitializer,
-                              NamedIn::NestedInitializer};
+constexpr std::array kNamedIn{NamedIn::GlobalAddr, NamedIn::ConstLiteral,
+                              NamedIn::GlobalInitializer, NamedIn::NestedInitializer};
 
 // The construct as the finding names it — the `.dssir` spelling.
 std::string_view spelledAs(NamedIn where) {
@@ -514,6 +521,31 @@ TEST(SymbolIdEndIsStated, EveryIdAModuleNamesIsBelowTheEndItStates) {
                 << "a counted end is no statement, and the rule held the module to it:"
                 << listed(v.pastTheEnd);
         }
+    }
+}
+
+// A BLOCK EXPORT DEFINES ITS SYMBOL, so the end is past it whatever was said: a module
+// that is its own table, one whose table is said to end AT the export's id, and one
+// nobody said anything of all end one past it — and the first two, which state it,
+// verify. (The builder's export kept no id clear until P69 fold f26b, and the first
+// two were refused: `blockaddress_export names symbol %5, which is not below the end`.)
+TEST(SymbolIdEndIsStated, ABlockExportDefinesItsSymbolSoTheEndIsPastIt) {
+    constexpr std::uint32_t kNamed = 5;
+    struct Said { char const* how; bool stated; };
+    for (Said const said : {Said{"its own table", true}, Said{"a table ending AT the id", true},
+                            Said{"nobody said", false}}) {
+        SCOPED_TRACE(said.how);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir const mir = moduleNaming(in, NamedIn::BlockAddressExport, kNamed, [&](MirBuilder& mb) {
+            if (!said.stated) return;
+            if (std::string_view{said.how} == "its own table") mb.stateSelfContainedSymbolIds();
+            else                                                mb.stateSymbolIdEnd(kNamed);
+        });
+        EXPECT_EQ(mir.symbolIdEndIsStated(), said.stated);
+        EXPECT_EQ(mir.symbolIdEnd(), kNamed + 1) << "the end is one past the symbol the export defines";
+        Verdict const v = verified(mir, in);
+        EXPECT_TRUE(v.ok) << listed(v.all);
+        EXPECT_TRUE(v.pastTheEnd.empty()) << listed(v.pastTheEnd);
     }
 }
 

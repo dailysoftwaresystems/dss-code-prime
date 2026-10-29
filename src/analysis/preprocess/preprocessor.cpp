@@ -5903,7 +5903,7 @@ private:
         PpProductText     product;
         PpHasEmbed        hasEmbed;
         PpOperatorRevoked revoked;
-        PpLibraryFunctionProvided libraryFunctionProvided;   // P69 review M3
+        PpPlatformFacts   platform;   // P69 review M3; fold f26b
     };
     [[nodiscard]] IfCallbacks makeIfCallbacks() {
         IfCallbacks cb;
@@ -5914,12 +5914,15 @@ private:
         // the semantic tier's binder binds the call. No active format: unset, so 0 — the
         // binder provides no library function without one either.
         if (activeFormat_.has_value()) {
-            cb.libraryFunctionProvided =
+            cb.platform.libraryFunctionProvided =
                 [fmt = *activeFormat_](std::string_view lib) {
                     return ffi::shippedLibraryFunctionProvidedOnFormat(lib, fmt)
                         .value_or(false);
                 };
         }
+        // ★ P69 (lane `cs`, fold f26b): and the format itself, which `__has_attribute`
+        // reads for an attribute row gated to some formats (`PpPlatformFacts`).
+        cb.platform.activeFormat = activeFormat_;
         // FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK: `__has_include` resolves a
         // header EXACTLY as the include machinery would. This is the AUTHORITATIVE
         // pass's callback (it decides the FINAL `#if` branch); it MUST agree with
@@ -6046,7 +6049,7 @@ private:
         auto v = evaluateIfExpression(operand, *schema_, expandCb, cb.defined,
                                       cb.hasInclude, *synth_, cb.product, rep_,
                                       cb.hasEmbed, cb.revoked, charFacts_,
-                                      cb.libraryFunctionProvided);
+                                      cb.platform);
         return v.has_value() && *v;
     }
 
@@ -6507,7 +6510,7 @@ private:
                 lineSpan.subspan(lim->clauseBegin, lim->clauseEnd - lim->clauseBegin),
                 line[lim->nameIndex], *schema_, expandCb, cb.defined,
                 cb.hasInclude, *synth_, cb.product, rep_, cb.hasEmbed, cb.revoked,
-                charFacts_, cb.libraryFunctionProvided, textOf, failParam);
+                charFacts_, cb.platform, textOf, failParam);
             if (!limit.has_value()) return;   // reported through failParam
         }
 

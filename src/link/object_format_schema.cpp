@@ -1098,6 +1098,17 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "image or a relocatable artifact — and an archive's members are "
                  "each linked alone, so the declaration would never be read.");
         }
+        // P69 fold f26b: `weakDefinitionBesideWeak` is read by the same link, for
+        // the same reason never from an archive document.
+        if (weakDefinitionBesideWeak.stated()
+            && container == ObjectFormatContainer::Archive) {
+            fail("/weakDefinitionBesideWeak",
+                 "'weakDefinitionBesideWeak' is declared on an ARCHIVE document: "
+                 "what two weak definitions of one name are is read from the "
+                 "document of the link that resolves them — an image or a "
+                 "relocatable artifact — and an archive's members are each linked "
+                 "alone, so the declaration would never be read.");
+        }
         // P69 round 4 (lane `lm`): `archiveWeakReferenceSearch` is read from the
         // document of an archive's MEMBERS — the `container: "archive"` document,
         // and no other. Round 5: a bare relocatable link reads its archive-writing

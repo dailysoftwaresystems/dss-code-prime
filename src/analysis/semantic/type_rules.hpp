@@ -217,6 +217,34 @@ namespace detail::type_rules {
                                 interner.stripVolatile(element));
 }
 
+// ── THE FUNCTION-TO-POINTER DECAY'S SIGNATURE TEST, ONE ANSWER FOR BOTH TIERS ──────
+// (P69 fold f26b, lane `cs`)
+//
+// Does a function designator of type `fn` decay into a pointer whose pointee is
+// `pointee` as C's own conversion? When the two function types are COMPATIBLE: the
+// designator decays to a pointer to its own type (C 6.3.2.1p4), and a pointer to a
+// compatible type is assignment-compatible (C 6.5.16.1p1). Two function types are
+// compatible when their results are and their parameter lists agree in number, in the
+// ellipsis and in each parameter taken unqualified (C 6.7.6.3p15), at every level below
+// — where an array of unknown or variable size is compatible with one of any size of a
+// compatible element (C 6.7.6.2p6). That relation is `sameOrEnumCompatible`'s, the one
+// the pointer arms, the redeclaration oracles and `_Generic` ask. The ADMIT side
+// (`isAssignable`'s Ptr←FnSig arm) and the REALIZE side (the HIR `coerce` FnSig→Ptr
+// arm) both ask HERE, so admit ⟺ realize holds by construction.
+// ✔MEASURED (lane `cs` probe ft, 2026-10-22): a designator returning `int (*)[]` into a
+// pointer to a function returning `int (*)[3]`, the reverse, the same with a run-time
+// bound, a parameter both ways, a pointer to a function returning a pointer to such a
+// function, a call argument, a return statement and a result and a parameter each
+// knowing a size the other does not — gcc 13.3.0 and clang 18.1.3 at -pedantic-errors
+// and mingw-w64 gcc 13.2.0 build and run every one in silence; cl 19.51 runs the
+// constant-size ones with C4048 / C4113 and has no run-time bound. DSS warned each as
+// an incompatible pointer conversion: the arm asked for the IDENTICAL signature.
+[[nodiscard]] inline bool decayedFunctionReachesPointee(TypeInterner const& interner,
+                                                        TypeId pointee, TypeId fn) {
+    return pointee.valid() && fn.valid() && interner.kind(fn) == TypeKind::FnSig
+        && sameOrEnumCompatible(interner, pointee, fn);
+}
+
 // rhs assignable into lhs?
 //   InvalidType on either side → true (cascade suppression).
 //   Identical → true.
@@ -793,17 +821,19 @@ namespace detail::type_rules {
     // NO synthetic HIR decay node is needed: a bare function Ref inherently
     // lowers to the function's ADDRESS at MIR time (which is why `fp = add`
     // compiled AND ran correctly before the assign-stmt assignability check
-    // existed — only the new SEMANTIC check rejected it). Pinned to the SAME
-    // signature (the lhs pointee FnSig == the rhs FnSig, by interner
-    // identity): an incompatible-signature assignment (`int (*g)(int) = add`
-    // where add is `int(int,int)`) interns a DISTINCT FnSig and stays a loud
+    // existed — only the new SEMANTIC check rejected it). Pinned to a
+    // COMPATIBLE signature (P69 fold f26b, lane `cs`: C 6.7.6.3p15, asked of
+    // `decayedFunctionReachesPointee`, which the HIR `coerce` asks too — it was
+    // interner IDENTITY, which refused a result or parameter that differs only in
+    // an array's size where one side has none): an incompatible-signature
+    // assignment (`int (*g)(int) = add` where add is `int(int,int)`) stays a loud
     // mismatch. The arm is the shared `isAssignable` chokepoint, so it fixes
     // assignment, initialization, call-argument, and return positions at
     // once. Closes the `fp = add` regression of
     // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS.
     if (lk == TypeKind::Ptr && rk == TypeKind::FnSig) {
         auto const lhsElem = interner.operands(lhs);
-        if (!lhsElem.empty() && lhsElem[0] == rhs) {
+        if (!lhsElem.empty() && decayedFunctionReachesPointee(interner, lhsElem[0], rhs)) {
             return true;
         }
     }

@@ -99,6 +99,9 @@
     }
   },
 
+  "$visibilityWrittenAsComment": "P69 fold f26b (lane cs, D-LK-OBJECT-STV-PROTECTED-DROPPED): the visibility this format writes for each one it cannot -- an nlist entry states external, private external (N_PEXT) or neither, no protected. MEASURED (lane cs probe pv, 2026-10-16, arm64, -O0 and -O2, nm -m of the object): Apple clang 21.0.0 writes a protected definition as a plain external, warning \"target does not support 'protected' visibility; using 'default'\" [-Wunsupported-visibility], and an internal one, silently, as a private external -- what hidden writes. The x86_64 nlist has the same fields (READ, <mach-o/nlist.h>). Each one settled is warned (H_VisibilityWrittenAsAnother) before any tier reads it.",
+  "visibilityWrittenAs": { "protected": "default", "internal": "hidden" },
+
   "sections": [
     {
       "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 RAW BYTES (x86_64/arm64 code alignment). section_64.align is a LOG2 exponent and the walker converts (std::countr_zero), exactly as every other section row here is converted; this row used to carry the literal log2 4 and be written VERBATIM, which made one schema key mean two different things across the object and exec families (D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD). PE's substrate `type` field repurposed for Mach-O section_64.flags.",

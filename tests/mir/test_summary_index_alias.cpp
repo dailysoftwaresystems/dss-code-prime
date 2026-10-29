@@ -139,6 +139,84 @@ TEST(SummaryIndexAlias, AnAliasRootsItsTargetInTheLivenessWalk) {
     EXPECT_EQ(ix->liveSymbols.count("g"), 0u);
 }
 
+// The review of fold f26a, F2: under `--lto=thin` the index is the election's THIRD door, and it settles a copy's own
+// name before the aliases the copy carries run for theirs (`linker::resolveSettlingCarriedNames`), as the merge does
+// on the default route — one program, one answer on both. PE's link document: a losing select-any copy is discarded
+// whole. Each unit `__declspec(selectany) int w = N;` (unit 0's copy is the one kept), and:
+//   * cell (i): unit 0 also `__attribute__((weak)) int m = 5;`, unit 1 a STRONG alias `m` of its `w` — the alias goes
+//     with its losing copy, and `m` is unit 0's weak definition (probe mj1: lld-link reads 5);
+//   * cell (ii): a STRONG alias `m` of its own `w` in each unit — the losing copy's alias goes with it, and the two
+//     are no conflict (probe mj1: GNU ld and lld-link link it);
+//   * a WEAK alias of the losing copy (the review's F1, probe wk1) stays in the election: as the only definition of
+//     `m` it holds the name.
+// Until this fold the index elected unit 1's strong alias over unit 0's weak `m` in cell (i) and reported cell (ii)
+// as two strong definitions of `m`.
+TEST(SummaryIndexAlias, AnAliasOfACopyDiscardedWholeIsElectedAsTheMergeElectsIt) {
+    ObjectFormatSchema const& pe = dss::test_support::shippedFormatOrThrow("pe64-x86_64-windows-exec");
+    auto const global = [](std::string name, std::uint32_t symbol, SymbolBinding binding,
+                           std::optional<WeakDefinitionKind> kind) {
+        SummaryGlobal g;
+        g.name     = std::move(name);
+        g.symbol   = symbol;
+        g.binding  = binding;
+        g.weakKind = kind;
+        return g;
+    };
+    auto const copyOfW = [&](std::uint32_t symbol) {
+        return global("w", symbol, SymbolBinding::Weak, WeakDefinitionKind::SelectAny);
+    };
+    auto const indexOf = [&](std::vector<ModuleSummary> const& mods, DiagnosticReporter& rep) {
+        return buildSummaryIndex(mods, policy(), pe, rep);
+    };
+    {
+        SCOPED_TRACE("cell (i)");
+        ModuleSummary a = mod("d0", {});
+        a.globals = {copyOfW(1), global("m", 2, SymbolBinding::Weak, WeakDefinitionKind::Overridable)};
+        ModuleSummary b = mod("d1", {}, {alias("m", 2, "w")});
+        b.globals = {copyOfW(1)};
+        DiagnosticReporter rep;
+        auto const ix = indexOf({a, b}, rep);
+        ASSERT_TRUE(ix.has_value());
+        EXPECT_TRUE(ix->conflictingNames.empty());
+        auto const site = ix->definitionOf("m");
+        ASSERT_TRUE(site.has_value()) << "`m` went to the alias of the losing copy, which has no body";
+        EXPECT_EQ(site->moduleIndex, 0u) << "`m` is not unit 0's weak definition";
+        EXPECT_FALSE(site->isFunction);
+    }
+    {
+        SCOPED_TRACE("cell (ii)");
+        ModuleSummary a = mod("d0", {}, {alias("m", 2, "w")});
+        a.globals = {copyOfW(1)};
+        ModuleSummary b = mod("d1", {}, {alias("m", 2, "w")});
+        b.globals = {copyOfW(1)};
+        DiagnosticReporter rep;
+        auto const ix = indexOf({a, b}, rep);
+        ASSERT_TRUE(ix.has_value());
+        EXPECT_TRUE(ix->conflictingNames.empty())
+            << "the losing copy's alias was a second strong definition of `m`";
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_FALSE(ix->definitionOf("m").has_value()) << "an alias that wins its name has no body to import";
+    }
+    {
+        // Unit 2's weak `m` comes after the alias: the first weak definition of the name is the alias, which holds
+        // it — had the alias gone with its copy, `m` would be unit 2's body.
+        SCOPED_TRACE("a weak alias of the losing copy, before another weak definition of `m`");
+        ModuleSummary a = mod("d0", {});
+        a.globals = {copyOfW(1)};
+        ModuleSummary b =
+            mod("d1", {}, {alias("m", 2, "w", SymbolBinding::Weak, WeakDefinitionKind::Overridable)});
+        b.globals = {copyOfW(1)};
+        ModuleSummary c = mod("d2", {});
+        c.globals = {global("m", 1, SymbolBinding::Weak, WeakDefinitionKind::Overridable)};
+        DiagnosticReporter rep;
+        auto const ix = indexOf({a, b, c}, rep);
+        ASSERT_TRUE(ix.has_value());
+        EXPECT_TRUE(ix->conflictingNames.empty());
+        EXPECT_FALSE(ix->definitionOf("m").has_value())
+            << "the weak alias was withdrawn with its copy, and its name given to unit 2's weak definition";
+    }
+}
+
 TEST(SummaryIndexAlias, ACallToAnAliasIsACallToItsTargetInTheCallGraph) {
     SummaryFunction g = fn("g", 1);
     calls(g, "f");

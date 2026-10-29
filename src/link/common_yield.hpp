@@ -335,12 +335,48 @@ refusalOf(DiscardedNameUse const& use, ObjectFormatSchema const& linkFormat) {
 // names; a document that discards nothing whole leaves every entry in place and
 // elects once. Iterative, never recursive: at most one election per withdrawal.
 
+// WHICH CARRIED NAMES GO WITH THEIR CARRIER (P69, the review of fold f26a, F1) — ONE judgement for every door that
+// discards a copy: the settled election (`resolveSettlingCarriedNames`), the pair rule (`weakPairsTheLinkRefuses`),
+// the cross-unit MIR merge, and the unit linker's discarded-whole pass (link/linker.cpp). A free function of its
+// arguments alone — it holds no election state — so a door outside the election (a judge that discards a losing
+// section-group copy) asks it the same way and gets the same answer.
+// THE CONTRACT. IN: one CARRIED name — a name a definition carries beside the one it is elected under (an alias of
+// it, another external label at its address) — as its binding and the weak kind it states, if any; and the link's
+// document. THE CARRIER'S FATE is fixed by the caller before it asks: the carrier's copy is DISCARDED WHOLE (it lost
+// its own name and the document states its kind `supersededDefinition` discardedWhole, or a section-group judge
+// discarded it). A carrier whose bytes stay keeps every name it carries, and nothing asks then. OUT: `true` — the
+// name GOES with the discarded copy: it is no definition any more, and its name is elected without it (a STRONG
+// name; a weak name stating no kind, which nothing says stands apart; a weak name of a kind the document discards
+// whole — a second label of a select-any copy's section). `false` — the name is KEPT: a weak name of a kind the
+// document does NOT discard whole (PE's overridable kind — a weak alias of a select-any copy) is a weak definition
+// of its OWN name, which the copy's discard does not take; it runs for its name as that, and where it holds the name
+// it names the copy that WON the carrier's own name.
+// WHY — when another definition wins such a name, every read of it, its own unit's included, follows the name; when
+// it wins the name, the name names the WINNING copy of its target. ✔MEASURED 2026-10-20 (lane cs's probe wk1;
+// clang-cl 19.1.5 objects under link.exe 14.51 and lld-link
+// 19.1.5, mingw-w64 gcc 13.2 under GNU ld 2.42; both orders, both optimisation levels): clang writes such an alias
+// as a weak external whose default is its target's NAME, which outlives the discarded section — beside a strong
+// `m` elsewhere every reader reads that `m` (all three linkers); as the only definition of `m` it reads the winning
+// copy (7 in order a b, 9 in b a, under both of clang's linkers, with or without another unit naming `m`). gcc
+// writes the default as a label in the copy's own section, and GNU ld either refuses those links (undefined) or
+// links an image that faults; clang's is the one that works. A STRONG alias is folded into its target by clang at
+// /O2 and goes with the copy (probe mj1, the measurement above). A weak entry that states no kind goes with its
+// carrier: nothing says it stands apart.
+[[nodiscard]] inline bool carriedNameGoesWithItsCarrier(ObjectFormatSchema const&         linkFormat,
+                                                        SymbolBinding                     binding,
+                                                        std::optional<WeakDefinitionKind> kind) {
+    if (binding != SymbolBinding::Weak || !kind.has_value()) return true;
+    return linkFormat.supersededDefinition().answerFor(kind)
+           == std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole};
+}
+
 // One more NAME a definition carries beside the one it is elected under itself.
 struct CarriedName {
     std::size_t                       entry = 0;    // index into the definitions handed in: the entry running for the carried name
     std::string                       carrierName;  // the name the carrying definition is elected under itself
     LinkedSymbolKey                   carrier{};    // the carrying definition, as it runs for `carrierName`
     std::optional<WeakDefinitionKind> carrierKind;  // the kind it states there — what the link's document is asked with
+    std::optional<WeakDefinitionKind> entryKind;    // the kind the carried entry states itself, where it is weak
 };
 
 struct SettledElection {
@@ -352,7 +388,10 @@ struct SettledElection {
 // `CarriedName` whose carrier's kind the link discards whole is decided only once
 // the carrier's own name is settled, and is WITHDRAWN when the carrier lost that
 // name (an entry with several carriers: when any of them lost). Entries that wait
-// on each other stay. A `CarriedName` whose `entry` is out of range carries nothing.
+// on each other stay. A `CarriedName` whose `entry` is out of range carries nothing,
+// and so does one whose entry does not go with its carrier
+// (`carriedNameGoesWithItsCarrier`, a weak entry of a kind the link does not discard
+// whole): it is elected as the weak definition of its own name it is.
 [[nodiscard]] inline SettledElection
 resolveSettlingCarriedNames(std::span<CrossCuDef const>  defs,
                             std::span<CarriedName const> carried,
@@ -362,6 +401,7 @@ resolveSettlingCarriedNames(std::span<CrossCuDef const>  defs,
     std::vector<std::size_t>                                         pending;
     for (CarriedName const& c : carried) {
         if (c.entry >= defs.size()) continue;
+        if (!carriedNameGoesWithItsCarrier(linkFormat, defs[c.entry].binding, c.entryKind)) continue;
         if (linkFormat.supersededDefinition().answerFor(c.carrierKind)
             != std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole}) continue;
         auto& carriers = carriersOf[c.entry];
@@ -415,6 +455,122 @@ resolveSettlingCarriedNames(std::span<CrossCuDef const>  defs,
         if (withdrawn[i]) out.withdrawn.push_back(i);
     }
     return out;
+}
+
+// ★★ TWO DIFFERENT WEAK DEFINITIONS OF ONE NAME, AND A UNIT THAT DEFINES NEITHER
+// NAMING IT (P69 fold f26b, lane `cs`). The fold gives such a name to the first of
+// the weak definitions that rank alike, and that is the answer where the format's
+// linkers coalesce weak definitions. Where they do NOT — the link's document
+// states `weakDefinitionBesideWeak` as `refusedWhereAnotherUnitNamesIt` for the
+// pair's kinds (PE's overridable kind; ✔MEASURED, the key's note in
+// link/object_format_schema.hpp: GNU ld links the pair, first wins, while only
+// the defining units name the name, and every PE linker refuses it once another
+// unit does) — the pair is refused where another unit USES the name. Two
+// definitions are a pair only if they are DIFFERENT after the election: a weak
+// name a copy carries and the link does not withdraw names the copy that won the
+// carrier's own name, so two weak aliases whose targets elect one copy are one
+// definition (✔MEASURED, probe wk1 cell 5: clang's two linkers link them, 7 [9]).
+// ONE statement for both doors — the unit linker and the cross-unit MIR merge —
+// each of which hands its own definitions, the kind each states, its election
+// and its carried names, and says through `userOf` which unit uses a name: it is
+// handed the name and the CU numbers of the units that define it, and answers the
+// CU number of another unit that uses it, if any (a declaration nobody uses is no
+// use, the reference gate both doors share).
+struct WeakPairNamedElsewhere {
+    std::string     name;
+    LinkedSymbolKey holder{};          // the definition the election gave the name
+    LinkedSymbolKey other{};           // a different weak definition of it that ranked alike
+    std::uint32_t   user = 0;          // the CU number of a unit that uses the name and defines it in neither
+    bool            unanswered = false;   // the document states the key per kind and answers no kind of the pair
+};
+
+template <class UserOf>
+[[nodiscard]] std::vector<WeakPairNamedElsewhere>
+weakPairsTheLinkRefuses(std::span<CrossCuDef const>                        defs,
+                        std::span<std::optional<WeakDefinitionKind> const> kindOf,   // parallel to `defs`
+                        SettledElection const&                             election,
+                        std::span<CarriedName const>                       carried,
+                        ObjectFormatSchema const&                          linkFormat,
+                        UserOf&&                                           userOf) {
+    std::vector<WeakPairNamedElsewhere> out;
+    WeakBesideWeakStatement const&      statement = linkFormat.weakDefinitionBesideWeak();
+    if (!statement.stated()) return out;   // the first holds every name
+    CrossCuResolution const& resolution = election.resolution;
+    std::vector<bool> withdrawn(defs.size(), false);
+    for (std::size_t const i : election.withdrawn) {
+        if (i < defs.size()) withdrawn[i] = true;
+    }
+    // What each entry IS after the election: a weak name a copy carries that does not go with the copy names the
+    // copy that won the carrier's own name; every other entry is itself.
+    std::unordered_map<std::size_t, LinkedSymbolKey> namesTheCopy;
+    for (CarriedName const& c : carried) {
+        if (c.entry >= defs.size() || carriedNameGoesWithItsCarrier(linkFormat, defs[c.entry].binding, c.entryKind))
+            continue;
+        if (auto const won = resolution.winners.find(c.carrierName); won != resolution.winners.end())
+            namesTheCopy.insert_or_assign(c.entry, won->second);
+    }
+    auto const definitionOf = [&](std::size_t i) {
+        auto const it = namesTheCopy.find(i);
+        return it == namesTheCopy.end() ? defs[i].key : it->second;
+    };
+    // The names a weak definition holds, in order, so the refusals come in a stated order.
+    std::vector<std::string_view> names;
+    for (auto const& [name, key] : resolution.winners) names.push_back(name);
+    std::sort(names.begin(), names.end());
+    for (std::string_view const name : names) {
+        LinkedSymbolKey const held = resolution.winners.at(std::string{name});
+        std::optional<std::size_t> holder;
+        std::vector<std::uint32_t> definers;
+        for (std::size_t i = 0; i < defs.size(); ++i) {
+            if (defs[i].name != name) continue;
+            definers.push_back(defs[i].key.cuId.v);
+            if (!withdrawn[i] && defs[i].key == held && defs[i].binding == SymbolBinding::Weak) holder = i;
+        }
+        if (!holder.has_value()) continue;   // a strong or tentative definition holds it: not a weak pair
+        // An entry `kindOf` does not reach states no kind: a per-kind statement answers it nothing, and the pair is
+        // refused by the key's name rather than given to the first.
+        auto const answerOf = [&](std::size_t i) {
+            return statement.answerFor(i < kindOf.size() ? kindOf[i] : std::nullopt);
+        };
+        for (std::size_t j = 0; j < defs.size(); ++j) {
+            if (j == *holder || withdrawn[j] || defs[j].name != name || defs[j].binding != SymbolBinding::Weak)
+                continue;
+            if (defs[j].weakRank != defs[*holder].weakRank) continue;   // outranked: no pair, the rank decided
+            if (definitionOf(j) == definitionOf(*holder)) continue;     // one definition after the election
+            auto const a = answerOf(*holder);
+            auto const b = answerOf(j);
+            bool const unanswered = !a.has_value() || !b.has_value();
+            if (!unanswered && *a == WeakBesideWeak::FirstWins && *b == WeakBesideWeak::FirstWins) continue;
+            std::optional<std::uint32_t> const user = userOf(std::string{name}, std::span<std::uint32_t const>{definers});
+            if (!user.has_value()) break;   // only its definers name it: the first holds it
+            out.push_back(WeakPairNamedElsewhere{std::string{name}, held, defs[j].key, *user, unanswered});
+            break;   // once per name
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] inline CrossCuRefusal
+refusalOf(WeakPairNamedElsewhere const& pair, ObjectFormatSchema const& linkFormat) {
+    if (pair.unanswered) {
+        return CrossCuRefusal{
+            DiagnosticCode::K_NoMatchingObjectFormat,
+            std::format(
+                "symbol \"{}\" has two different weak definitions, in CU #{} and CU #{}, and CU #{} "
+                "uses it; this link's format ('{}') states `weakDefinitionBesideWeak` per kind of weak "
+                "definition and answers none for a definition of the pair that states no kind, so the "
+                "link refuses rather than guess whether the first holds the name.",
+                pair.name, pair.holder.cuId.v, pair.other.cuId.v, pair.user, linkFormat.name())};
+    }
+    return CrossCuRefusal{
+        DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+        std::format(
+            "symbol \"{}\" has two different weak definitions, in CU #{} and CU #{}, and CU #{}, which "
+            "defines neither, uses it. This link's format ('{}') states `weakDefinitionBesideWeak` as "
+            "'{}' for them: the first holds the name only while the units that define it are the only "
+            "ones that name it, and the format's linkers refuse the pair once another unit does.",
+            pair.name, pair.holder.cuId.v, pair.other.cuId.v, pair.user, linkFormat.name(),
+            kWeakBesideWeakTable.name(WeakBesideWeak::RefusedWhereAnotherUnitNamesIt))};
 }
 
 }  // namespace dss::linker

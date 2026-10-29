@@ -1,1 +1,1 @@
-    if (out.row == nullptr) out.row = rowNamed(out.name);
+    tryKey(std::string{name});

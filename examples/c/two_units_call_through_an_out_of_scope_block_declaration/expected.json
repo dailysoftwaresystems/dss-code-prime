@@ -1,0 +1,22 @@
+{
+  "$comment": "A CALL TO A FUNCTION ONLY ANOTHER BLOCK OF THE UNIT DECLARED TAKES THAT DECLARATION, WARNED (P69 round 1, lane cs, fold f26b). A block-scope function declaration has its block's scope (C 6.2.1p4); outside the block, a call that names nothing visible is resolved by cl and clang to it, its type included (clang warns 'use of out-of-scope declaration'). MEASURED 2026-10-21 by lane cs's probe ip (each program built and RUN): `void a(void) { int f(int); } int b(void) { return f(40) + 2; }` runs 42 on cl 19.51 (silent), gcc 13.3.0 and mingw-w64 gcc 13.2.0 (each an implicit declaration, warned), and is refused by clang 18.1.3; with `double f(double)` declared, it runs 42 on clang (warned) and cl, and gcc refuses it; a call after the declaration's block ENDED runs like the first. Before this fold DSS re-homed the block declaration onto the file scope, which kept these calls working silently but made the declaration hide nothing inside its block. other.c defines each function, so no declaration of them is visible at file scope here. Every return before 42 names the first fact that failed. The release arm pins that the call to g_double still converts its argument.",
+  "language": "c",
+  "sources": ["main.c", "other.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "$expectWarningsComment": "Three warnings, one per call: g_ended's (main.c 14:12, after its block ended), g_int's (19:9, declared only in declare_them's block), g_double's (20:14, its declared type taken). The entries are `positioned:false` because the manifest has two sources and a position names one buffer; the analyzer pin SemanticAnalyzerC.ACallTakesAnOutOfScopeBlockDeclarationWarned asserts the warning exactly once for each of the three shapes, each a one-unit source.",
+  "expectWarnings": [
+    { "code": "S_OutOfScopeDeclarationUsed", "line": 0, "col": 0, "positioned": false, "$comment": "g_ended, after its block ended" },
+    { "code": "S_OutOfScopeDeclarationUsed", "line": 0, "col": 0, "positioned": false, "$comment": "g_int, declared only in declare_them's block" },
+    { "code": "S_OutOfScopeDeclarationUsed", "line": 0, "col": 0, "positioned": false, "$comment": "g_double, its declared type taken" }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

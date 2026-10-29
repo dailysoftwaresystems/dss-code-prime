@@ -536,6 +536,17 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // declaration to the extern/import lowering on THIS fact rather than on the
     // rule name. OR-only across a prefix, like the two storage axes.
     bool                            nonDefining = false;
+    // P69 (lane `cs`, fold f26b): the IMPORTED axis — the declaration names a
+    // definition ANOTHER IMAGE holds, read as an import of it (c: cl's and
+    // mingw-w64's `__declspec(dllimport)`, keyed by the clause's qualified name).
+    // Only beside a TRUE `nonDefining` (the loader refuses it anywhere else): an
+    // import is first of all a declaration that defines nothing here. Read by the
+    // semantic tier's record-time attribute scan (→ `SymbolRecord::
+    // isImportedDeclaration`), per DECLARATOR, at every position the declaration's
+    // attributes are read at; what the import may not be (an initializer, internal
+    // linkage, thread storage) and what a redeclaration does to it are the
+    // analyzer's rules, stated there.
+    bool                            imported = false;
     // ★★ C 6.7.1p2 AS CONFIG, NOT AS ENGINE `if`s
     // (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS, P53). The name of a
     // MUTUAL-EXCLUSION group this specifier belongs to: at most ONE DISTINCT
@@ -3152,6 +3163,20 @@ enum class AttributeEffect : std::uint8_t {
     return e != AttributeEffect::Unsupported && e != AttributeEffect::CallingConvention;
 }
 
+// ★ P69 (lane `cs`, fold f26b): WHETHER A LIST OF OBJECT FORMATS ADMITS `format` — the
+// one rule of every row that names the formats it exists for (`availableObjectFormats`
+// of an attribute spelling and of an effects row). An empty list admits every format.
+// With no format in scope a list that names formats admits NONE: the answer is
+// unknown, and "unknown" must never read as "yes".
+[[nodiscard]] inline bool objectFormatListAdmits(std::vector<ObjectFormatKind> const& formats,
+                                                 std::optional<ObjectFormatKind> format) noexcept {
+    if (formats.empty()) return true;
+    if (!format.has_value()) return false;
+    for (ObjectFormatKind f : formats)
+        if (f == *format) return true;
+    return false;
+}
+
 struct DSS_EXPORT AttributeSemanticsRow {
     std::vector<std::string> names;                        // dunder-normalized match set
     AttributeEffect          effect = AttributeEffect::None;
@@ -3268,6 +3293,32 @@ struct DSS_EXPORT AttributeSemanticsRow {
     bool                     alignRepeatTakesLast       = false;
     std::vector<RuleId>      leadingDecoratesDefinitionOf;
     std::vector<std::string> leadingDecoratesDefinitionOfNames;   // loader diagnostics
+    // P69 (lane `cs`, fold f26b): non-empty ⇒ on a declaration that DEFINES what it
+    // declares (a function with its body, an object with its initializer) the attribute
+    // is refused by name, this text being the reason (`refusedOnDefinition`). Read by
+    // the declaration-kind gate; the loader refuses it on a row with no kind axis.
+    std::string              refusedOnDefinition;
+    // P69 (lane `cs`, fold f26b): non-empty ⇒ on a declaration that is an ALIAS (one
+    // that keeps an `alias` clause) the attribute is ignored, said with this text as
+    // the reason, and its effect is not applied (`ignoredOnAlias`). Read beside
+    // `refusedOnDefinition`, and refused by the loader on a row with no kind axis.
+    std::string              ignoredOnAlias;
+    // ★★ P69 (lane `cs`, fold f26b): non-empty ⇒ the row's names are attribute
+    // vocabulary ONLY for these object formats (`availableObjectFormats`, sorted,
+    // unique). On any other format — and where no format is in scope, so the question
+    // has no answer — a clause naming one is read as if no row named it: an unknown
+    // attribute, warned, conferring nothing, and `__has_attribute` answers 0. A name
+    // is a format's vocabulary when the toolchains of the other formats do not have
+    // it: `dllimport` written in the GNU spelling is imported by mingw-w64 gcc on pe
+    // and warned and ignored by gcc, clang and Apple clang everywhere else (✔MEASURED,
+    // lane `cs` probe di5). Empty (every row before the key) ⇒ every format.
+    std::vector<ObjectFormatKind> availableObjectFormats;
+
+    // Whether the row's names are vocabulary for `format` — the spelling rows' rule:
+    // with no format in scope a row that names its formats is NOT available.
+    [[nodiscard]] bool availableFor(std::optional<ObjectFormatKind> format) const noexcept {
+        return objectFormatListAdmits(availableObjectFormats, format);
+    }
 };
 
 // ★★ P69 (lane `cs`) — ONE SPELLING OF THE ATTRIBUTE-SPECIFIER SHAPE
@@ -3299,13 +3350,9 @@ struct DSS_EXPORT AttributeSpelling {
 
     // Whether the spelling exists for `format`. No format in scope ⇒ false for a
     // spelling that names its formats: the answer is unknown, and "unknown" must
-    // never read as "yes".
+    // never read as "yes" (`objectFormatListAdmits`).
     [[nodiscard]] bool availableFor(std::optional<ObjectFormatKind> format) const noexcept {
-        if (availableObjectFormats.empty()) return true;
-        if (!format.has_value()) return false;
-        for (ObjectFormatKind f : availableObjectFormats)
-            if (f == *format) return true;
-        return false;
+        return objectFormatListAdmits(availableObjectFormats, format);
     }
 
     // The name a clause of this spelling is looked up under first: `q(name)`, or

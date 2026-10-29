@@ -1,0 +1,1 @@
+                && decayedFunctionReachesPointee(interner, ptrElem[0], child.type);

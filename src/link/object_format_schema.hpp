@@ -765,6 +765,89 @@ DSS_CHECK_ENUM_NAME_TABLE(kWeakBesideStrongTable);
 
 using WeakBesideStrongStatement = WeakKindStatement<WeakBesideStrong>;
 
+// ★★★ WHAT TWO DIFFERENT WEAK DEFINITIONS OF ONE NAME ARE — a FORMAT fact, the
+// root key `weakDefinitionBesideWeak` (P69 fold f26b, lane `cs`;
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME). The cross-unit fold
+// keeps the FIRST of two weak definitions of a name that rank alike (the lowest
+// unit), and that is the whole answer where the format's linkers coalesce weak
+// definitions — the System V gABI's rule, ld64's — so a document that does not
+// state this key answers `firstWins` for every pair. A format whose linkers make
+// an EXCEPTION states it here. TWO ANSWERS:
+//   * `firstWins` — the first definition holds the name, whoever names it.
+//   * `refusedWhereAnotherUnitNamesIt` — the first holds the name while only the
+//     units that define it name it; a unit that defines neither and USES the
+//     name makes the pair a duplicate definition, and the link is refused.
+// Asked of a pair only where the two are DIFFERENT definitions after the
+// election: two weak aliases whose targets elect one copy are one definition.
+// One answer for every definition, or one per kind, in the forms
+// `supersededDefinition` takes; a pair whose two kinds answer differently takes
+// the stricter answer, and a pair one of whose kinds a per-kind statement does
+// not answer is refused by this key's name where another unit names it.
+// ✔MEASURED, PE/COFF, PER KIND (lane cs's probes wk1 and wk2, 2026-10-20;
+// mingw-w64 gcc 13.2.0 at -O0 and -O2 under GNU ld 2.42, clang-cl 19.1.5 at /Od
+// and /O2 under link.exe 14.51 and lld-link 19.1.5; both unit orders):
+//   * `overridable`: `refusedWhereAnotherUnitNamesIt`. Two
+//     `__attribute__((weak)) int m` of different values, read only by their own
+//     units: GNU ld LINKS, the first wins (5/5, and 9/9 in the other order) —
+//     link.exe refuses (LNK1227) and lld-link refuses ("duplicate symbol"); the
+//     same pair with a third unit reading `m`: all three refuse (GNU ld:
+//     "undefined reference to `m'"). The union of what works is GNU ld's.
+//   * `select-any`: `firstWins`. Two select-any copies of one name are the
+//     copies a COMDAT selection chooses among, named by any unit (every C
+//     `inline` and `selectany` program; the fold's duplicate-match promise is
+//     their check).
+// Read by `linker::weakPairsTheLinkRefuses` (`link/common_yield.hpp`), which the
+// unit linker (`link/linker.cpp`) and the cross-unit MIR merge
+// (`mir/merge/mir_merge.cpp`) both ask.
+enum class WeakBesideWeak : std::uint8_t {
+    FirstWins,
+    RefusedWhereAnotherUnitNamesIt,
+};
+
+inline constexpr EnumNameTable<WeakBesideWeak, 2> kWeakBesideWeakTable{{{
+    { WeakBesideWeak::FirstWins,                      "firstWins" },
+    { WeakBesideWeak::RefusedWhereAnotherUnitNamesIt, "refusedWhereAnotherUnitNamesIt" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kWeakBesideWeakTable);
+
+using WeakBesideWeakStatement = WeakKindStatement<WeakBesideWeak>;
+
+// ★★★ THE VISIBILITY A FORMAT WRITES FOR ONE IT CANNOT — a FORMAT fact, the root
+// key `visibilityWrittenAs` (P69 fold f26b, lane `cs`;
+// D-LK-OBJECT-STV-PROTECTED-DROPPED). The C front end takes all four GNU
+// visibilities (`visibility("default" | "hidden" | "protected" | "internal")`),
+// and a symbol table that has no field for one of them writes another in its
+// place — what each format's compilers write is the format's answer, stated here
+// as an object from each visibility the format cannot write to the one written
+// instead, e.g.
+//     "visibilityWrittenAs": { "protected": "default", "internal": "hidden" }
+// Every unit compiled for the format has each such visibility settled to its
+// stand-in once, before any tier reads it, and the program is told (a warning,
+// as the format's compilers warn) — so the writers only ever see what their
+// format writes. A document that does not state the key writes every visibility
+// as itself (ELF: STV_DEFAULT, STV_HIDDEN, STV_PROTECTED, STV_INTERNAL).
+// `default` is written by every format and is no key; a stand-in is a visibility
+// the format writes, never one it states a stand-in for.
+// ✔MEASURED (lane cs's probe pv, 2026-10-16, -O0 and -O2, `nm -m` of the object):
+//   * Mach-O, `{ "protected": "default", "internal": "hidden" }`. Apple clang
+//     21.0.0 (arm64) writes a protected definition as a plain `external`,
+//     warning "target does not support 'protected' visibility; using 'default'"
+//     [-Wunsupported-visibility], and an internal one, silently, as a
+//     `private external` (N_PEXT) — what hidden writes.
+//   * PE/COFF, the same object. COFF has no visibility field: mingw-w64 gcc
+//     13.2.0 ignores every visibility, warning "visibility attribute not
+//     supported in this configuration; ignored" [-Wattributes]; DSS writes `hidden` as clang's windows-gnu
+//     target does (a hide directive beside an external symbol, `pe.cpp`), and
+//     `internal` — hidden plus a promise no COFF linker reads — the same way,
+//     while `protected` — default plus "never preempted", which is every PE
+//     definition's state inside its own image — is written as default.
+// Read by `ObjectFormatSchema::visibilityWrittenFor` and, for the warning, the
+// pipeline's one settling step (`hir/attributes/visibility_written_as.hpp`).
+struct VisibilityStandIn {
+    SymbolVisibility unwritable = SymbolVisibility::Default;   // a visibility the format cannot write
+    SymbolVisibility writtenAs  = SymbolVisibility::Default;   // the one it writes in its place
+};
+
 // ★★★ WHAT A PC-RELATIVE, NON-BRANCH REFERENCE TO AN IMPORT MEANS IN AN IMAGE —
 // a FORMAT fact, the root key `pcRelativeImportAddress` (P69 review M1 case (c)
 // and MINOR 8, D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE).
@@ -2673,6 +2756,15 @@ struct DSS_EXPORT ObjectFormatData {
     // name; refused on an ARCHIVE document (`validate()`), whose members are
     // each linked alone.
     WeakBesideStrongStatement weakDefinitionBesideStrong;
+    // What two different weak definitions of one name are (the
+    // `weakDefinitionBesideWeak` root key — see `WeakBesideWeak`). OPTIONAL:
+    // unstated, the first holds the name; refused on an ARCHIVE document
+    // (`validate()`), whose members are each linked alone.
+    WeakBesideWeakStatement weakDefinitionBesideWeak;
+    // The visibility this format writes for each one it cannot (the
+    // `visibilityWrittenAs` root key — see `VisibilityStandIn`), in the
+    // document's order. OPTIONAL: empty, every visibility is written as itself.
+    std::vector<VisibilityStandIn> visibilityWrittenAs;
 
     // Sections row (D-LK4-2). The walker reads sections by
     // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
@@ -3728,6 +3820,31 @@ public:
     [[nodiscard]] WeakBesideStrongStatement const&
     weakDefinitionBesideStrong() const noexcept {
         return d_.weakDefinitionBesideStrong;
+    }
+
+    // What this document states of two different weak definitions of one name
+    // (`weakDefinitionBesideWeak`): nothing, one answer, or one per kind. Asked
+    // through `linker::weakPairsTheLinkRefuses` (`link/common_yield.hpp`).
+    [[nodiscard]] WeakBesideWeakStatement const&
+    weakDefinitionBesideWeak() const noexcept {
+        return d_.weakDefinitionBesideWeak;
+    }
+
+    // Each visibility this format cannot write, with the one it writes in its
+    // place (`visibilityWrittenAs`), in the document's order; empty where the
+    // format writes every visibility.
+    [[nodiscard]] std::span<VisibilityStandIn const>
+    visibilityStandIns() const noexcept {
+        return d_.visibilityWrittenAs;
+    }
+    // The visibility this format writes for a definition that states `v`: its
+    // stand-in where the document states one, else `v` itself.
+    [[nodiscard]] SymbolVisibility
+    visibilityWrittenFor(SymbolVisibility v) const noexcept {
+        for (VisibilityStandIn const& s : d_.visibilityWrittenAs) {
+            if (s.unwritable == v) return s.writtenAs;
+        }
+        return v;
     }
 
     [[nodiscard]] ObjectFormatRelocationInfo const*

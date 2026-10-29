@@ -1,0 +1,2 @@
+                        ScopeId const bindScope = (isProto && !nonDefiningHere)
+                            ? fileScopeOf(s, tree, current) : current;

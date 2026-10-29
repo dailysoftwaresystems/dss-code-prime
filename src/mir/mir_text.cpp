@@ -4699,6 +4699,11 @@ private:
         // rule ("an id the module names is below the end it states") is the weaker
         // one for a text: an id BELOW the highest declared slot is inside the end
         // and still nobody's, and only this one refuses it.
+        // An id two of the text's definitions give (a `global` and a
+        // `blockaddress_export` under one id, say) is refused by the verifier this
+        // reader runs on the module below, in the same words
+        // (`MirVerifier::checkSymbolIdsDefinedOnce`): the rule has one statement, and a
+        // text reaches it as every module does.
         for (MirSymbolMentionAt const& stray : symbolIdsNamedButNeverIntroduced(
                  module, [&](SymbolId s) { return symbolNames_.contains(s.v); })) {
             emitMalformed(std::format(

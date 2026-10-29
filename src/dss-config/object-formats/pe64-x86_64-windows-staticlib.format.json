@@ -119,6 +119,9 @@
       ]
     }
   },
+  "$visibilityWrittenAsComment": "P69 fold f26b (lane cs, D-LK-OBJECT-STV-PROTECTED-DROPPED): the visibility this format writes for each one it cannot -- COFF has no visibility field. MEASURED (lane cs probe pv, 2026-10-16, -O0 and -O2): mingw-w64 gcc 13.2.0 ignores every visibility, warning 'visibility attribute not supported in this configuration; ignored' [-Wattributes]. DSS writes hidden as clang's windows-gnu target does (an external symbol and a hide directive in the linker-directive section), so internal -- hidden plus a promise no COFF linker reads -- is written the same way, and protected -- default plus 'never preempted', which every PE definition is inside its own image -- is written as default. Each one settled is warned (H_VisibilityWrittenAsAnother) before any tier reads it.",
+  "visibilityWrittenAs": { "protected": "default", "internal": "hidden" },
+
   "sections": [
     {
       "$comment": "Executable code. PE Characteristics = IMAGE_SCN_CNT_CODE (0x20) | IMAGE_SCN_ALIGN_16BYTES (0x500000) | IMAGE_SCN_MEM_EXECUTE (0x20000000) | IMAGE_SCN_MEM_READ (0x40000000) = 0x60500020. PE's `type` field is repurposed to carry Characteristics (which encodes alignment via IMAGE_SCN_ALIGN_*BYTES bits); `flags` is unused; `addrAlign` MUST be 0 for PE rows (validate-rejected — PE encodes alignment in Characteristics, not the substrate's `addrAlign` field).",

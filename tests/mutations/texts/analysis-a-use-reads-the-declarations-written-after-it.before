@@ -1,1 +1,1 @@
-            continue;   // written after the use
+        if (own == s.ownDeclaredAt.end() || own->second > where) continue;   // no place, or written after the use

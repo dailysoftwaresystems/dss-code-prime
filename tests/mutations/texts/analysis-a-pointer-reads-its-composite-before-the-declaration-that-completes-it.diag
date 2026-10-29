@@ -1,1 +1,1 @@
-a use before the completing declaration read its composite
+DiagnosticCode::S_SizeofIncompleteArrayIsZero

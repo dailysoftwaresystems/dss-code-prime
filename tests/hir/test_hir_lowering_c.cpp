@@ -732,6 +732,44 @@ TEST(HirLoweringC, AnArrayDecayingToAMoreQualifiedPointeeIsRealizedAsTheDecay) {
            "decay Cast typed `volatile int *`";
 }
 
+// P69 fold f26b (lane `cs`) — the REALIZE half of a function designator decaying to a pointer to a
+// COMPATIBLE function type that is not its own (C 6.3.2.1p4, 6.5.16.1p1, 6.7.6.3p15): `gu`, returning
+// `int (*)[]`, initializing, assigned to, passed as and returned as a pointer to a function returning
+// `int (*)[3]`. The semantic tier admits the pair on `decayedFunctionReachesPointee`; `coerce` must realize
+// it as the FnSig->Ptr decay Cast typed as the TARGET pointer, at all four sites — without it the operand
+// kept the designator's own signature where another is declared.
+// ✔MEASURED (lane `cs` probe ft): gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 run each shape in silence.
+TEST(HirLoweringC, AFunctionDecayingToACompatibleSignatureIsRealizedAsTheDecay) {
+    SemanticModel model = analyzeC(
+        "int store[8];\n"
+        "int (*gu(void))[] { return (int (*)[])store; }\n"
+        "int apply3(int (*(*cb)(void))[3]) { return (*cb())[1]; }\n"
+        "int (*(*pick(void))(void))[3] { return gu; }\n"
+        "int g(void) { int (*(*fp)(void))[3] = gu; fp = gu; return apply3(gu) + (*fp())[1] + (*pick()())[1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& in = model.lattice().interner();
+    unsigned decays = 0;
+    // Arena slot 0 is the reserved sentinel; real ids run [1, nodeCount()).
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+        HirNodeId const n{i};
+        if (res->hir.kind(n) != HirKind::Cast) continue;
+        auto const kids = res->hir.children(n);
+        if (kids.size() != 1u) continue;
+        TypeId const from = res->hir.typeId(kids[0]);
+        TypeId const to   = res->hir.typeId(n);
+        if (in.kind(from) != TypeKind::FnSig || in.kind(to) != TypeKind::Ptr) continue;
+        auto const pointee = in.operands(to);
+        if (pointee.size() == 1u && pointee[0] != from && in.kind(pointee[0]) == TypeKind::FnSig) ++decays;
+    }
+    EXPECT_EQ(decays, 4u)
+        << "the initialization, the assignment, the argument and the return must each be the FnSig->Ptr "
+           "decay Cast typed as the pointer to the declared, compatible, signature";
+}
+
 // (The positional-symmetry pin that explains WHY `aligned` left this test —
 // `AfterDeclaratorAlignedAppliesLikeTheLeadingPosition` — lives with the rest of
 // the TF-C73 battery further down, where the shared `globalAlignment` helper it
@@ -4178,6 +4216,47 @@ declaredVisibility(CstToHirResult const& res, SemanticModel const& model,
 // specifier"; move `weak` into that row's ignored NAMES instead → the errors
 // vanish and `eaBinding` silently reads Global, which is the assertion below
 // that catches the wrong-way fix.
+// P69 fold f26b (lane `cs`, D-LK-OBJECT-STV-PROTECTED-DROPPED): `protected` and
+// `internal` are linkage specifiers of the language, on a function and on an object,
+// in front of the declaration and after its declarator. ✔MEASURED before the fold
+// (macos-arm64-debug, run 20261016-020009-896aa756): `visibility("protected")` was
+// warned as no linkage specifier and DROPPED. gcc 13.3.0 writes STV_PROTECTED and
+// STV_INTERNAL for them (lane `cs` probe pv); the ELF bytes are pinned at the object
+// tier (CompiledSymbolAliasObject).
+//
+// RED-ON-DISABLE: drop either word from c.lang.json's maps and its declarations
+// report H_UnknownLinkageSpecifier and record no visibility.
+TEST(HirLoweringC, ProtectedAndInternalVisibilityAreLinkageSpecifiers) {
+    struct Case {
+        char const*      src;
+        char const*      name;
+        SymbolVisibility want;
+    };
+    for (Case const c : {
+             Case{"__attribute__((visibility(\"protected\"))) int f(int v) { return v + 1; }\n", "f",
+                  SymbolVisibility::Protected},
+             Case{"int g __attribute__((visibility(\"protected\"))) = 3;\n", "g",
+                  SymbolVisibility::Protected},
+             Case{"__attribute__((visibility(\"internal\"))) int f(int v) { return v + 2; }\n", "f",
+                  SymbolVisibility::Internal},
+             Case{"int g __attribute__((visibility(\"internal\"))) = 4;\n", "g",
+                  SymbolVisibility::Internal},
+         }) {
+        SCOPED_TRACE(c.src);
+        SemanticModel model = analyzeC(std::string{c.src} + "int main(void){ return 0; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "the word is a linkage specifier of the language";
+        auto const got = declaredLinkage(*res, model, c.name);
+        ASSERT_TRUE(got.has_value()) << "the visibility was dropped";
+        EXPECT_EQ(got->visibility, c.want);
+        EXPECT_EQ(got->binding, SymbolBinding::Global);
+    }
+}
+
 TEST(HirLoweringC, ExternDeclGlibcAttributeRunResolvesAndApplies) {
     SemanticModel model = analyzeC(
         "extern int gg(void) __attribute__((__nothrow__, __leaf__));\n"
@@ -9856,8 +9935,9 @@ TEST(HirLoweringC, TypedefMultiDeclaratorEmitsOneTypeDeclPerAlias) {
 // RED-ON-DISABLE (both tests): drop `&& !decl.paramAdjustments` from the
 // `isProto` derivation in semantic_analyzer.cpp's Pass-1 declarator mint. The
 // first test then reports 1 param instead of 2; the second fails its
-// `hasErrors()` assert with S0022 (the two parameters re-home onto the FILE
-// scope and collide as incompatible redeclarations).
+// `hasErrors()` assert with S0022 (as filed, before P69 fold f26b removed the
+// re-home: the two parameters were re-homed onto the FILE scope and collided as
+// incompatible redeclarations).
 namespace {
 // The pointee FnSig of a param slot that C 6.7.6.3p8 adjusted, or InvalidType.
 // Reading THROUGH this makes a bare-FnSig (un-adjusted) slot impossible to pass
@@ -9932,7 +10012,7 @@ TEST(HirLoweringC, InlineFunctionTypedParamEmitsItsOwnParamSlot) {
 // PIN 2 — C 6.2.1p4: a parameter name is scoped to its own declarator and has
 // NO linkage, so two functions may reuse one freely. Classifying the inline
 // spelling as a prototype ALSO re-homed the parameter symbol onto the FILE
-// scope (that is what the prototype path does, per D-CSUBSET-BLOCK-SCOPE-PROTOTYPE),
+// scope (what the prototype path did, per D-CSUBSET-BLOCK-SCOPE-PROTOTYPE, until P69 fold f26b),
 // where two same-named parameters met as one symbol. MEASURED
 // before the fix: S0022 S_IncompatibleRedeclaration on `g`, pointing at the
 // OTHER function's parameter — legal C rejected outright.
@@ -13394,14 +13474,14 @@ TEST(HirLoweringC, AModelledModifierOfTheSecondSpellingIsNotAnUnknownLinkageSpec
     EXPECT_EQ(reported[0], reported[1])
         << "…and the same word inside the frame is reported exactly as often";
 
-    // `dllexport` / `dllimport` are words of the SECOND spelling. Written as a GNU
-    // attribute for a non-Windows target they are warned and ignored by every
-    // reference (✔MEASURED: gcc 13.3.0 "attribute directive ignored"; clang 18.1.3
-    // and Apple clang "unknown attribute 'dllexport' ignored"; all three run the
-    // program) — and by this compiler, which had answered so before the second
-    // spelling existed and must not have stopped when its rows were written.
-    for (char const* decl : {"__attribute__((dllexport)) int gv = 7;",
-                             "__attribute__((dllimport)) extern int gv;"}) {
+    // `dllexport` is a word of the SECOND spelling. Written as a GNU attribute for a
+    // non-Windows target it is warned and ignored by every reference (✔MEASURED: gcc
+    // 13.3.0 "attribute directive ignored"; clang 18.1.3 and Apple clang "unknown
+    // attribute 'dllexport' ignored"; all three run the program) — and by this
+    // compiler, which had answered so before the second spelling existed and must not
+    // have stopped when its rows were written.
+    {
+        char const* const decl = "__attribute__((dllexport)) int gv = 7;";
         SemanticModel model =
             analyzeC(std::string(decl) + "\nint main(void) { return 0; }\n");
         ASSERT_FALSE(model.hasErrors()) << decl;
@@ -13409,10 +13489,29 @@ TEST(HirLoweringC, AModelledModifierOfTheSecondSpellingIsNotAnUnknownLinkageSpec
         auto res = lowerToHir(model, r);
         EXPECT_TRUE(res->ok) << decl;
         EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u) << decl;
-        // (Not "every line is a warning": for the declaration that defines nothing
-        // the reporter also carries its own note that one report of this code was
-        // dropped as a recent duplicate — the word is reported twice on that path
-        // and shown once.)
+        for (auto const& d : r.all())
+            EXPECT_NE(d.severity, DiagnosticSeverity::Error) << decl << ": " << d.actual;
+    }
+    // ★ P69 (lane `cs`, fold f26b): `dllimport` is the GNU spelling's word too, ON pe —
+    // mingw-w64 gcc 13.2.0 imports `__attribute__((dllimport))` (✔MEASURED, lane `cs`
+    // probe di5) — so its effects row names it, gated to pe. Off pe it is warned and
+    // ignored as every other reference does, still exactly ONCE: by the analysis, which
+    // judges a gated-off name, while this tier skips every name of the effects table.
+    //
+    // RED-ON-DISABLE: drop the analysis's gated-off arm and the analysis says nothing;
+    // drop the row's name from this tier's skip list and the word is reported twice.
+    {
+        char const* const decl = "__attribute__((dllimport)) extern int gv;";
+        SemanticModel model =
+            analyzeC(std::string(decl) + "\nint main(void) { return 0; }\n");
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u)
+            << decl;
+        EXPECT_EQ(model.diagnostics().all().size(), 1u) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << decl;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << decl;
         for (auto const& d : r.all())
             EXPECT_NE(d.severity, DiagnosticSeverity::Error) << decl << ": " << d.actual;
     }
@@ -13459,5 +13558,103 @@ TEST(HirLoweringC, ThreadStorageRequestedInTheSecondSpellingReachesTheLoweredObj
             EXPECT_EQ(marked, c.threadStorage) << c.what;
         }
         EXPECT_TRUE(found) << c.what << " — no lowered definition of 'tv'";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26b): A `dllimport` DECLARATION LOWERS TO AN IMPORT, NEVER TO
+// STORAGE — at file scope (where without the modifier it is a tentative definition: a
+// zero-filled Global of this unit) and inside a body (where without it it is a local:
+// a stack VarDecl), in both spellings, per declarator. ✔MEASURED (lane `cs` probes di,
+// di3, di4, di5; cl 19.51 and mingw-w64 gcc 13.2.0): each writes a reference to
+// `__imp_<name>` and no definition. Before fold f26b the file-scope ones lowered to a
+// common Global and the block ones to a stack local.
+//
+// RED-ON-DISABLE: drop the import arm of the declarator loop and every cell lowers to a
+// Global (file scope) or a VarDecl (block scope) again.
+TEST(HirLoweringC, ADllimportDeclarationLowersToAnImportNotToStorage) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* imported;   // the name lowered to the one ExternGlobal
+        char const* defined;    // a name lowered to a Global beside it, or empty
+    };
+    for (Case const c : {
+             Case{"a file-scope datum", "__declspec(dllimport) int x;\n"
+                                        "int use(void) { return x; }\n", "x", ""},
+             Case{"after the declarator", "int x __declspec(dllimport);\n"
+                                          "int use(void) { return x; }\n", "x", ""},
+             Case{"the GNU spelling", "__attribute__((dllimport)) int x;\n"
+                                      "int use(void) { return x; }\n", "x", ""},
+             Case{"one declarator of a list", "int a, * __declspec(dllimport) p;\n"
+                                              "int use(void) { return a + *p; }\n", "p", "a"},
+             Case{"inside a body", "int use(void) { __declspec(dllimport) int x; return x; }\n",
+                  "x", ""},
+             Case{"inside a body, with `extern`",
+                  "int use(void) { __declspec(dllimport) extern int x; return x; }\n", "x", ""},
+             Case{"inside a body, the GNU spelling",
+                  "int use(void) { __attribute__((dllimport)) int x; return x; }\n", "x", ""},
+         }) {
+        SemanticModel model = analyzeCPe(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty() ? std::string{}
+                                                  : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty()) << c.what << ": " << r.all()[0].actual;
+        std::size_t imports = 0, globals = 0;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+            if (res->hir.kind(d) == HirKind::ExternGlobal) {
+                auto const* rec = model.recordFor(res->hir.externGlobalSymbol(d));
+                ASSERT_NE(rec, nullptr) << c.what;
+                EXPECT_EQ(rec->name, c.imported) << c.what;
+                ++imports;
+            }
+            if (res->hir.kind(d) == HirKind::Global) {
+                auto const* rec = model.recordFor(res->hir.globalSymbol(d));
+                ASSERT_NE(rec, nullptr) << c.what;
+                EXPECT_EQ(rec->name, c.defined) << c.what << ": storage for an import";
+                ++globals;
+            }
+        }
+        EXPECT_EQ(imports, 1u) << c.what;
+        EXPECT_EQ(globals, *c.defined == '\0' ? 0u : 1u) << c.what;
+        HirNodeId const fn = firstFunction(res->hir);
+        for (HirNodeId s : res->hir.children(res->hir.functionBody(fn)))
+            EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
+                << c.what << ": an import inside a body is no local";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26b): AN ATTRIBUTE MAY LEAD A BLOCK-SCOPE `extern`
+// DECLARATION — before `extern`, after a qualifier and before `extern`, in either
+// spelling — as it may lead every other declaration. ✔MEASURED (lane `cs` probe di3):
+// gcc 13.3.0 and mingw-w64 gcc 13.2.0 take `const __attribute__((unused)) extern int y;`
+// inside a body; this compiler refused it as a syntax error (P_NoAlternativeMatched) —
+// a LOUD defect — before the fold.
+//
+// RED-ON-DISABLE: drop the attribute-led branch of `externSpecifiers` and the first two
+// cells do not parse; drop the attribute from the qualifier branch's repeat and the third
+// does not.
+TEST(HirLoweringC, AnAttributeMayLeadABlockScopeExternDeclaration) {
+    for (char const* body :
+         {"__attribute__((unused)) extern int y;", "[[maybe_unused]] extern int y;",
+          "const __attribute__((unused)) extern int y;"}) {
+        SemanticModel model =
+            analyzeC(std::string("int use(void) { ") + body + " return y; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << body << ": "
+            << (model.diagnostics().all().empty() ? std::string{}
+                                                  : model.diagnostics().all()[0].actual);
+        EXPECT_TRUE(model.diagnostics().all().empty())
+            << body << ": " << model.diagnostics().all()[0].actual;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << body << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        std::size_t imports = 0;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+            if (res->hir.kind(d) == HirKind::ExternGlobal) ++imports;
+        EXPECT_EQ(imports, 1u) << body << ": the block-scope `extern` re-homes to one import";
     }
 }

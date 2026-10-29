@@ -262,6 +262,51 @@ bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
     return clean;
 }
 
+// ★ P69 (lane `cs`, fold f26b): THE ONE READER OF AN `availableObjectFormats` LIST —
+// an attribute spelling row's and an effects row's alike (both read through
+// `objectFormatListAdmits`). Each failure it refuses would be silent if loaded: an
+// empty list makes the row's names nothing anywhere, a name that is no format a
+// build can have gates the row off everywhere, a duplicate says nothing. `emptyMeans`
+// finishes the empty-list refusal in the row's own words. The list is kept SORTED.
+// FALSE when anything was refused (each refusal said).
+[[nodiscard]] bool readAvailableObjectFormats(json const& afs, std::string const& afPath,
+                                              std::string_view emptyMeans, Collector& coll,
+                                              std::vector<ObjectFormatKind>& out) {
+    if (!afs.is_array() || afs.empty()) {
+        coll.emit(DiagnosticCode::C_InvalidSemantics, afPath,
+                  std::format("'availableObjectFormats' must be a non-empty ARRAY of "
+                              "object-format names ({}) — {}",
+                              renderAllowedList(kSelectableObjectFormatKindNames, " / "),
+                              emptyMeans));
+        return false;
+    }
+    bool ok = true;
+    for (json const& av : afs) {
+        auto const kind = av.is_string() ? objectFormatKindFromName(av.get<std::string>())
+                                         : std::nullopt;
+        if (!kind.has_value() || !isSelectableObjectFormatKind(*kind)) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, afPath,
+                      std::format("'{}' is not an object format a build can have — "
+                                  "accepted: {}",
+                                  av.is_string() ? av.get<std::string>() : av.dump(),
+                                  renderAllowedList(kSelectableObjectFormatKindNames,
+                                                    " / ")));
+            ok = false;
+            continue;
+        }
+        if (std::ranges::find(out, *kind) != out.end()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, afPath,
+                      std::format("object format '{}' is listed twice",
+                                  objectFormatKindName(*kind)));
+            ok = false;
+            continue;
+        }
+        out.push_back(*kind);
+    }
+    std::ranges::sort(out);
+    return ok;
+}
+
 // ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
 // THE **ONE** READER FOR AN ATTRIBUTE-RUN LIST, USED BY BOTH KEYS THAT DECLARE
 // ONE — `declarators.afterDeclaratorAttrRules` and every declaration row's
@@ -10363,13 +10408,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     // missing keys are BOOLEANS, so the "string
                                     // fields" half was wrong for them as well
                                     // (D-CONFIG-GRAMMAR-LOADER-KEY-SHAPE-SENTENCES-RETYPE-THEIR-VOCABULARIES).
-                                    static constexpr std::array<std::string_view, 11>
+                                    static constexpr std::array<std::string_view, 12>
                                         kLinkageEffectKeys{"binding", "weakKind",
                                                            "visibility",
                                                            "staticStorage",
                                                            "threadStorage",
                                                            "yieldsOnMismatch",
                                                            "nonDefining",
+                                                           "imported",
                                                            "exclusiveGroup",
                                                            "compatibleWith",
                                                            "asmLabelNamesRegister",
@@ -10595,6 +10641,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         effect.nonDefining =
                                             eff.at("nonDefining").get<bool>();
                                         if (effect.nonDefining) any = true;
+                                    }
+                                    // P69 (lane `cs`, fold f26b): the IMPORTED axis —
+                                    // the declaration names a definition ANOTHER
+                                    // IMAGE holds (`LinkageSpecifierEffect::
+                                    // imported`). A boolean, and only beside a TRUE
+                                    // `nonDefining`: an import defines nothing here,
+                                    // and an entry that did not say so would make
+                                    // the declaration both an import of the name and
+                                    // its definition. The key it sits under must be
+                                    // an attribute's name — checked once the effects
+                                    // table is read.
+                                    if (eff.contains("imported")) {
+                                        if (!eff.at("imported").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'imported' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        if (!effect.nonDefining) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'imported' says the declaration "
+                                                      "names a definition another image "
+                                                      "holds, which needs "
+                                                      "'nonDefining': true beside it — "
+                                                      "without it the declaration would "
+                                                      "be both the import of the name "
+                                                      "and its definition");
+                                            continue;
+                                        }
+                                        effect.imported =
+                                            eff.at("imported").get<bool>();
                                     }
                                     // C 6.7.1p2 as CONFIG: the mutual-exclusion
                                     // group this specifier belongs to (at most one
@@ -15913,65 +15992,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     }
                                 }
                                 if (row.contains("availableObjectFormats")) {
-                                    json const& afs = row.at("availableObjectFormats");
-                                    auto const afPath =
-                                        rowPath + "/availableObjectFormats";
-                                    if (!afs.is_array() || afs.empty()) {
-                                        coll.emit(
-                                            DiagnosticCode::C_InvalidSemantics, afPath,
-                                            std::format(
-                                                "'availableObjectFormats' must be a "
-                                                "non-empty ARRAY of object-format "
-                                                "names ({}) — an empty list would "
-                                                "make the spelling available "
-                                                "nowhere; a spelling available "
-                                                "everywhere omits the key",
-                                                renderAllowedList(
-                                                    kSelectableObjectFormatKindNames,
-                                                    " / ")));
+                                    if (!readAvailableObjectFormats(
+                                            row.at("availableObjectFormats"),
+                                            rowPath + "/availableObjectFormats",
+                                            "an empty list would make the spelling "
+                                            "available nowhere; a spelling available "
+                                            "everywhere omits the key",
+                                            coll, out.availableObjectFormats))
                                         rowOk = false;
-                                    } else {
-                                        for (json const& av : afs) {
-                                            auto const kind = av.is_string()
-                                                ? objectFormatKindFromName(
-                                                      av.get<std::string>())
-                                                : std::nullopt;
-                                            if (!kind.has_value()
-                                                || !isSelectableObjectFormatKind(
-                                                       *kind)) {
-                                                coll.emit(
-                                                    DiagnosticCode::C_InvalidSemantics,
-                                                    afPath,
-                                                    std::format(
-                                                        "'{}' is not an object "
-                                                        "format a build can have — "
-                                                        "accepted: {}",
-                                                        av.is_string()
-                                                            ? av.get<std::string>()
-                                                            : av.dump(),
-                                                        renderAllowedList(
-                                                            kSelectableObjectFormatKindNames,
-                                                            " / ")));
-                                                rowOk = false;
-                                                continue;
-                                            }
-                                            if (std::ranges::find(
-                                                    out.availableObjectFormats, *kind)
-                                                != out.availableObjectFormats.end()) {
-                                                coll.emit(
-                                                    DiagnosticCode::C_InvalidSemantics,
-                                                    afPath,
-                                                    std::format(
-                                                        "object format '{}' is "
-                                                        "listed twice",
-                                                        objectFormatKindName(*kind)));
-                                                rowOk = false;
-                                                continue;
-                                            }
-                                            out.availableObjectFormats.push_back(*kind);
-                                        }
-                                        std::ranges::sort(out.availableObjectFormats);
-                                    }
                                 }
                                 if (row.contains("afterCompositeBody")) {
                                     json const& ab = row.at("afterCompositeBody");
@@ -16117,12 +16145,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // explicit validation further down — is-array, non-empty,
                         // every entry a string, every value a known kind, no
                         // duplicates.
-                        static constexpr std::array<std::string_view, 10>
+                        static constexpr std::array<std::string_view, 13>
                             kEffectRowKeys{"names", "effect", "appliesTo",
                                            "conventions", "reason",
                                            "withinDeclarator", "withoutOperand",
                                            "onTypeAlias", "repeated",
-                                           "leadingDecoratesDefinitionOf"};
+                                           "leadingDecoratesDefinitionOf",
+                                           "refusedOnDefinition", "ignoredOnAlias",
+                                           "availableObjectFormats"};
                         DSS_CHECK_KEY_VOCABULARY(kEffectRowKeys);
 
                         // Every name seen so far, dunder-normalized → the verb
@@ -16667,6 +16697,72 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     }
                                     out.appliesTo.push_back(*k);
                                 }
+                            }
+                            // P69 (lane `cs`, fold f26b): `refusedOnDefinition` — the
+                            // attribute, on a declaration that DEFINES what it
+                            // declares (a function with its body, an object with
+                            // its initializer), is refused by name, the text being
+                            // the refusal's own reason. It is read by the
+                            // declaration's kind gate, so it needs the row's kind
+                            // axis: refused on a row with none.
+                            if (row.contains("refusedOnDefinition")) {
+                                json const& v = row.at("refusedOnDefinition");
+                                if (!v.is_string() || v.get<std::string>().empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/refusedOnDefinition",
+                                        "'refusedOnDefinition' must be a non-empty "
+                                        "STRING: why a definition cannot carry the "
+                                        "attribute; it is the refusal's own text");
+                                } else if (out.appliesTo.empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/refusedOnDefinition",
+                                        "'refusedOnDefinition' is read by the "
+                                        "declaration-kind gate, and this row states "
+                                        "no 'appliesTo': nothing would read it");
+                                } else {
+                                    out.refusedOnDefinition = v.get<std::string>();
+                                }
+                            }
+                            // P69 (lane `cs`, fold f26b): `ignoredOnAlias` — the
+                            // attribute, on a declaration that is an ALIAS, is
+                            // ignored and said, the text being the reason. Read
+                            // beside `refusedOnDefinition`, so held to the same two
+                            // rules: a non-empty string, on a row with a kind axis.
+                            if (row.contains("ignoredOnAlias")) {
+                                json const& v = row.at("ignoredOnAlias");
+                                if (!v.is_string() || v.get<std::string>().empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/ignoredOnAlias",
+                                        "'ignoredOnAlias' must be a non-empty STRING: "
+                                        "why an alias cannot carry the attribute; it "
+                                        "is the warning's own text");
+                                } else if (out.appliesTo.empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/ignoredOnAlias",
+                                        "'ignoredOnAlias' is read by the "
+                                        "declaration-kind gate, and this row states "
+                                        "no 'appliesTo': nothing would read it");
+                                } else {
+                                    out.ignoredOnAlias = v.get<std::string>();
+                                }
+                            }
+                            // P69 (lane `cs`, fold f26b): `availableObjectFormats` —
+                            // the row's names are attribute vocabulary only for
+                            // these object formats (`AttributeSemanticsRow::
+                            // availableFor`), read by the spelling rows' own reader
+                            // of the key and held to its rules.
+                            if (row.contains("availableObjectFormats")) {
+                                (void)readAvailableObjectFormats(
+                                    row.at("availableObjectFormats"),
+                                    rowPath + "/availableObjectFormats",
+                                    "an empty list would make the row's names "
+                                    "vocabulary nowhere; a row whose names are "
+                                    "vocabulary everywhere omits the key",
+                                    coll, out.availableObjectFormats);
                             }
                             // ★ A name may be bound ONCE. Two rows claiming the
                             // same name load cleanly today and leave WHICH ONE
@@ -18959,11 +19055,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // `S_DeprecatedSymbolUsed` at the use site. The two scans read the
                 // same prefix independently; ignoring a name in one does not blind
                 // the other.
+                // ★ P69 (lane `cs`, fold f26b): AN `imported` ENTRY IS NOT THIS
+                // SCAN'S. An import is a fact of each DECLARATOR, read by the
+                // semantic tier's record-time scan at every position its attributes
+                // are read at and gated by the attribute row's object formats, and
+                // the lowering routes each declarator by the record it leaves. So
+                // its name stays ignored here like any other attribute name: were it
+                // resolved, the declaration's prefix would fold `nonDefining` for it
+                // on every format, `__attribute__((dllimport)) int x;` would be
+                // lowered as an import off pe too, where every reference ignores the
+                // word.
                 for (DeclarationRule& d : cfg.declarations) {
                     if (d.linkageSpecifiers.empty()) continue;   // no strict scan
                     std::unordered_set<std::string> own;
-                    for (auto const& [key, unusedEffect] : d.linkageSpecifiers)
+                    for (auto const& [key, effect] : d.linkageSpecifiers) {
+                        if (effect.imported) continue;
                         own.insert(norm(std::string{linkageSpecifierBaseName(key)}));
+                    }
                     std::unordered_set<std::string> present;
                     for (auto const& n : d.linkageSpecifierIgnoredNames)
                         present.insert(norm(n));
@@ -18996,6 +19104,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // request it models would be dropped without a word. The linkage
                 // maps are read before the attribute block, so the question is
                 // asked here, where both are in hand.
+                // P69 (lane `cs`, fold f26b): AN `imported` ENTRY IS KEYED BY AN
+                // ATTRIBUTE'S NAME. The record-time scan reads such an entry only
+                // through a clause whose attribute row it found (that row's format
+                // gate is the import's), so a key no effects row names — a keyword's,
+                // a typo — would load clean and never be read.
+                for (DeclarationRule const& d : cfg.declarations) {
+                    for (auto const& [key, effect] : d.linkageSpecifiers) {
+                        if (!effect.imported || effectNames.contains(norm(key))) continue;
+                        coll.emit(
+                            DiagnosticCode::C_InvalidSemantics,
+                            "/semantics/declarations",
+                            std::format(
+                                "the linkage specifier '{}' says 'imported', and no "
+                                "'semantics.attributeSemantics.effects' row names it: "
+                                "an import is read from an attribute clause through "
+                                "the attribute's row, so this entry would never be "
+                                "read",
+                                key));
+                    }
+                }
                 for (DeclarationRule const& d : cfg.declarations) {
                     for (auto const& [key, unusedEffect] : d.linkageSpecifiers) {
                         if (key.find_first_of("()") == std::string::npos) continue;

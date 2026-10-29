@@ -83,6 +83,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/preprocess_config.hpp"
 #include "core/types/semantic_config.hpp"
@@ -748,6 +749,51 @@ TEST(FeatureQueryOperators, ALibraryBuiltinAnswersWhereThePlatformProvidesTheFun
     }
 }
 
+// ── 5a'. AN ATTRIBUTE OF ONE OBJECT FORMAT ANSWERS ON THAT FORMAT ONLY ──────
+//
+// ★ P69 (lane `cs`, fold f26b). An effects row may name the object formats its names are
+// vocabulary on (`availableObjectFormats`); off them the semantic tier warns the name
+// unknown and ignores it, so `__has_attribute` answers 0 there — a header that asks first
+// and is told 1 goes on to write a word this build ignores. ✔MEASURED (lane `cs` probe
+// di5): mingw-w64 gcc 13.2.0 answers 1 for `__has_attribute(dllimport)` and for
+// `(__dllimport__)`; gcc 13.3.0, clang 18.1.3 and Apple clang answer 0 for both.
+// RED-ON-DISABLE: drop the format gate from the operator's truth set and the elf, macho
+// and no-format arms answer 1; leave the platform facts' format unset and the pe arms
+// answer 0.
+TEST(FeatureQueryOperators, AnAttributeOfOneObjectFormatAnswersOnThatFormatOnly) {
+    struct Arm {
+        std::string_view                arg;
+        std::optional<ObjectFormatKind> fmt;
+        bool                            want;
+    };
+    const Arm arms[] = {
+        {"dllimport", ObjectFormatKind::Pe, true},
+        {"__dllimport__", ObjectFormatKind::Pe, true},
+        {"dllimport", ObjectFormatKind::Elf, false},
+        {"__dllimport__", ObjectFormatKind::Elf, false},
+        {"dllimport", ObjectFormatKind::MachO, false},
+        {"dllimport", std::nullopt, false},
+        // CONTROLS: a row with no format gate answers on every format and with none.
+        {"deprecated", ObjectFormatKind::Elf, true},
+        {"deprecated", std::nullopt, true},
+    };
+    std::vector<fs::path> const noDirs;
+    for (Arm const& a : arms) {
+        auto buf = SourceBuffer::fromString(
+            "#if __has_attribute(" + std::string{a.arg} + ")\n"
+            "int answered_nonzero;\n#else\nint answered_zero;\n#endif\n",
+            "fq_fmt.c");
+        PreprocessResult const r =
+            preprocess(buf, cSchema(), noDirs, kDefaultHeaderNameMatching,
+                       DiagnosticBudget::libraryDefault(), /*systemDirs=*/{}, a.fmt);
+        std::string const where =
+            a.fmt.has_value() ? std::string{objectFormatKindName(*a.fmt)} : "no format";
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << a.arg << " on " << where;
+        EXPECT_EQ(sawLexeme(r, "answered_nonzero"), a.want) << a.arg << " on " << where;
+        EXPECT_EQ(sawLexeme(r, "answered_zero"), !a.want) << a.arg << " on " << where;
+    }
+}
+
 // ── 5b. THE ANSWER SET IS THE CONFIG'S, NOT THE ENGINE'S ────────────────────
 //
 // ★★★ THE ARM THE ROW'S "100% CONFIG DRIVEN" CLAUSE RESTS ON, and it is
@@ -845,7 +891,11 @@ TEST(FeatureQueryOperators, AnAttributeThatIsRefusedByNameIsNotAdvertised) {
     std::size_t refusing = 0;
     std::size_t advertising = 0;
     for (auto const& row : cSchema()->semantics().attributeEffects) {
-        bool const advertised = attributeEffectAdvertisesItsNames(row.effect);
+        // ★ P69 (lane `cs`, fold f26b): `pp` runs with no object format in scope, where
+        // a row gated to some formats is no vocabulary (its answer per format is
+        // `AnAttributeOfOneObjectFormatAnswersOnThatFormatOnly`'s).
+        bool const advertised =
+            attributeEffectAdvertisesItsNames(row.effect) && row.availableFor(std::nullopt);
         for (auto const& n : row.names) {
             // A qualified name (`q(name)`) is not an identifier: no program can ask
             // the operator about it, so it has no answer to pin.

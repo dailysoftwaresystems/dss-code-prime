@@ -1,2 +1,2 @@
-            || format.supersededDefinition().answerFor(row.weakKind)
-                   == std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole};
+    return linkFormat.supersededDefinition().answerFor(kind)
+           == std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole};

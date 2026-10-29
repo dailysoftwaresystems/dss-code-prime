@@ -2370,17 +2370,40 @@ encode(AssembledModule const&    module,
     // record; 9 through the weak name beside `shared = 9`, 7 through the
     // body's own name).
     //
-    // WHAT STILL FAILS LOUD, and it is a real remaining shape rather than a
-    // vestigial arm: an alias that is STRONGER than its canonical (Global alias
-    // of a Weak definition) has no encoding at all. A weak external is by
-    // construction the name that YIELDS, so it cannot express a name that must
-    // NOT yield, and the COMDAT policy on the shared section would drag the
-    // strong name into the canonical's coalescing. Refusing beats guessing.
+    // ★ P69 (lane `cs`): A STRONG alias of a WEAK definition is not refused: it is
+    // an external LABEL in the definition's COMDAT section, what clang-cl writes
+    // (the arm below says whose measurement). The label states no policy of its
+    // own; it is kept and discarded with the section that holds it.
+    //
+    // WHAT STILL FAILS LOUD: a WEAK alias of a MODULE-PRIVATE body whose kind
+    // this format does not write as a weak external (an overridable one IS: its
+    // body is then written under its default's name, an external record the alias
+    // defers to). The policy of such a kind rides a SECTION, the body's, which it
+    // shares with a name that has none. Refusing beats guessing.
     auto appendAliasEntries = [&](SymbolId id, CoffSymEntry const& canonical,
                                   SymbolBinding canonicalBinding,
                                   std::uint32_t canonicalIndex) -> bool {
         for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
-            if (alias->binding == canonicalBinding) {
+            // ★ P69 fold f26b (lane `cs`, the review of checkpoint 32, F2): a WEAK alias
+            // that STATES a kind the document writes as a weak external (on PE the
+            // overridable kind) defers to its body BY NAME, whatever that body's own
+            // binding — beside a SELECT-ANY body too, which is a COMDAT section of its
+            // own. There it is what clang-cl writes (✔MEASURED, lane `cs` probe wk1,
+            // 2026-10-20, read with dumpbin and objdump at /Od and /O2): a weak external
+            // whose default is the body's own EXTERNAL record in the COMDAT, a NAME that
+            // outlives a discarded copy and resolves to the copy the link keeps — link.exe
+            // and lld-link read 7 / 9 by unit order. Written as a second label of the
+            // section instead (mingw-w64 gcc's shape, and this writer's until this fold),
+            // it went with a discarded copy and the unit route refused a program the
+            // merged route — and clang's linkers — link
+            // (`WeakDefinitionsThroughBothRoutes.BothRoutesGiveEachCellTheReferencesAnswer`).
+            // A weak alias stating NO kind, or the body's own, stays a label of the section
+            // (the election's `carriedNameGoesWithItsCarrier` says the same of it).
+            bool const defersByName =
+                alias->binding == SymbolBinding::Weak && alias->weakKind.has_value()
+                && fmt.weakDefinitionDialectFor(alias->weakKind) == WeakDefinitionDialect::WeakExternal;
+            if (alias->binding == canonicalBinding
+                && !(defersByName && canonicalBinding == SymbolBinding::Weak)) {
                 // A second NAME on the canonical's wire record: the same Value,
                 // SectionNumber, Type and StorageClass, and NO auxiliary of
                 // either format. Built field by field rather than copied and
@@ -2401,19 +2424,27 @@ encode(AssembledModule const&    module,
                 appendEntry(std::move(e));
                 continue;
             }
-            if (alias->binding != SymbolBinding::Weak
-                && canonicalBinding != SymbolBinding::Weak) {
-                // P69 (lane `cs`): A GLOBAL NAME ON A MODULE-PRIVATE BODY —
-                // `static int g(void){…} int f(void) __attribute__((alias("g")));`.
-                // Neither side has a coalescing policy to differ in (that rides only
-                // a weak definition's COMDAT section), so the alias is a record of
-                // its own at the body's address with its OWN storage class,
-                // EXTERNAL — what mingw-w64 gcc 13.2.0 writes for the same
-                // declarations, and that object links and runs (✔MEASURED, lane
-                // `cs` probe al2 cell 3, -O0 and -O2). The REVERSE never reaches
-                // here: `definedAliases` yields only external-linkage names, so a
-                // module-private second name of a global body is not written — on
-                // every format, the ELF and Mach-O writers asking the same table.
+            if (alias->binding != SymbolBinding::Weak) {
+                // P69 (lane `cs`): A STRONG NAME ON A BODY OF ANOTHER BINDING is a record
+                // of its own at the body's address, in the body's section, with its OWN
+                // storage class, EXTERNAL. Two bodies reach here:
+                //   * a MODULE-PRIVATE one — `static int g(void){…} int f(void)
+                //     __attribute__((alias("g")));` — what mingw-w64 gcc 13.2.0 writes for
+                //     the same declarations, and that object links and runs (✔MEASURED,
+                //     lane `cs` probe al2 cell 3, -O0 and -O2);
+                //   * a WEAK one written as a COMDAT section of its own — a select-any
+                //     definition with a global alias: the alias is an external LABEL inside
+                //     the definition's COMDAT section, what clang-cl writes (✔MEASURED by
+                //     lane `xa`, 2026-10-20, windows-x86_64), and a DSS object so written
+                //     links and runs under link.exe, lld-link and DSS's own linker
+                //     (`PeObjectAliasReferenceLinkNative`). The label states no coalescing
+                //     policy of its own: it lives in the section, kept with the copy the
+                //     link keeps and gone with a copy the link discards — what the
+                //     cross-unit election states of a strong name a discarded copy carries
+                //     (`carriedNameGoesWithItsCarrier`).
+                // The REVERSE never reaches here: `definedAliases` yields only external-
+                // linkage names, so a module-private second name of a global body is not
+                // written — on every format, the ELF and Mach-O writers asking the same table.
                 CoffSymEntry e;
                 e.name          = alias->name;
                 e.value         = canonical.value;
@@ -2424,11 +2455,15 @@ encode(AssembledModule const&    module,
                 continue;
             }
             if (alias->binding == SymbolBinding::Weak
-                && canonicalBinding == SymbolBinding::Global) {
+                && (canonicalBinding == SymbolBinding::Global
+                    || (defersByName && canonicalBinding == SymbolBinding::Weak))) {
                 // The weak-external form. UNDEF section, Value 0, class 105,
                 // and an Auxiliary Format 3 record whose TagIndex names the
                 // canonical's ALREADY-MINTED symbol-table index -- which is why
-                // this runs after the canonical's own `appendEntry`.
+                // this runs after the canonical's own `appendEntry`. A select-any
+                // canonical's record is EXTERNAL in its COMDAT section (the
+                // section symbol is a separate STATIC record), so the default is
+                // an external name, as link.exe requires (LNK1235).
                 CoffSymEntry e;
                 e.name                   = alias->name;
                 e.value                  = 0;
@@ -2443,22 +2478,16 @@ encode(AssembledModule const&    module,
             }
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format(
-                     "pe::encode (Obj): '{}' is an alias of '{}' at the same "
-                     "address but binds {} where '{}' binds {}, and a weak side "
-                     "carries a coalescing policy. COFF expresses "
-                     "a definition's coalescing policy on its SECTION (the "
-                     "COMDAT Selection byte), and an alias shares its "
-                     "canonical's section, so that mechanism cannot give them "
-                     "different policies. The weak-external mechanism "
-                     "(IMAGE_SYM_CLASS_WEAK_EXTERNAL + Auxiliary Format 3) "
-                     "expresses a name that DEFERS to another, so it covers a "
-                     "WEAK alias of a GLOBAL definition -- but it cannot "
-                     "express an alias that must NOT yield. Emitting this one "
-                     "under the canonical's policy would silently change its "
-                     "semantics. "
+                     "pe::encode (Obj): '{}' is an alias of '{}' that binds weak "
+                     "where its body binds {}, and this format does not write the "
+                     "alias's kind of weak definition as a weak external. COFF states that kind's "
+                     "coalescing policy on a SECTION (the COMDAT Selection byte), "
+                     "and the alias shares its body's section with a name that has "
+                     "no such policy, so no record gives the policy to the one name "
+                     "and not to the other. Emitting it under the body's binding "
+                     "would silently drop the weakness. "
                      "D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.",
                      alias->name, canonical.name,
-                     symbolBindingName(alias->binding), canonical.name,
                      symbolBindingName(canonicalBinding)));
             return false;
         }
@@ -2584,8 +2613,9 @@ encode(AssembledModule const&    module,
         std::uint32_t const canonicalIdx = appendEntry(std::move(sym));
         symIdxBySymbol.emplace(rec.symId, canonicalIdx);
         // An alias of a WEAK definition rides the same COMDAT section, so it
-        // inherits the same select-any policy -- which is exactly right, and
-        // is why this site needs no special case beyond the shared guard.
+        // inherits the same select-any policy -- except a weak alias stating a
+        // kind the document writes as a weak external, which defers to this
+        // record BY NAME (`appendAliasEntries` says whose shape that is).
         if (!appendAliasEntries(rec.symId, canonical, SymbolBinding::Weak,
                                 canonicalIdx)) {
             return {};
@@ -5412,11 +5442,21 @@ encodeExec(AssembledModule const&    module,
     // sorted names). The emitted-table sort is a tested invariant
     // (deliberately out-of-order input names in the pin).
     //
-    // The directory's Name field (the DLL's self-name) is emitted as
-    // an EMPTY string: per-artifact identity does not belong in a
-    // shipped format schema (the c150 decision that leaves DT_SONAME
-    // absent); GetProcAddress never reads it, and DSS emits no
-    // forwarder RVAs — the only loader consumer of that name.
+    // The directory's Name field is the image's SELF-NAME: the file name,
+    // without its directory, of the artifact this emission produces
+    // (`ImageRequest::artifactFileName`). It is what GNU ld (mingw-w64 gcc
+    // `-shared`) and link.exe (`/DLL`) write there, a renamed output
+    // included (✔MEASURED 2026-10-21, lane `cs` probe dn). A LINKER reads
+    // it: GNU ld, linking a program directly against a DLL (`gcc main.c
+    // x.dll`), records THIS name — not the path it was handed — in the
+    // program's import directory (✔MEASURED, the same probe: a DLL copied
+    // to another file name after its link is imported under its own Name),
+    // and the loader then looks for a DLL of that name. So an empty Name is
+    // a program that does not load (STATUS_DLL_NOT_FOUND, ✔MEASURED with a
+    // DLL this writer made), and the name is a fact of the ARTIFACT, never
+    // of the format document, which serves every DLL of a build alike. An
+    // emission that cannot say its artifact's name is refused below: an
+    // empty or a fixed name is a DLL no linked program finds.
     // (Forwarder detection is RVA-range-based: an EAT entry pointing
     // INSIDE the export directory's [rva, rva+size) span is a
     // forwarder string. Every DSS export RVA points at `.text` /
@@ -5612,13 +5652,26 @@ encodeExec(AssembledModule const&    module,
         std::size_t const nameOff = eatOff + 4u * n;
         std::size_t const ordOff  = nameOff + 4u * n;
         std::size_t const strOff  = ordOff + 2u * n;
-        // Strings: DllName (empty — see the block comment) first,
-        // then the export names in sorted order.
+        // The image's self-name (the block comment above): the artifact's
+        // file name, or a refusal.
+        std::string const& imageName = request.artifactFileName;
+        if (imageName.empty()) {
+            emit(reporter, DiagnosticCode::K_WalkerInputContractViolation,
+                 "pe::encodeExec: this image has an export directory, whose Name "
+                 "is the image's own file name, and the emission was given no "
+                 "artifact file name (`ImageRequest::artifactFileName`). There is "
+                 "no fallback: GNU ld records that Name in every program linked "
+                 "against the image, so an empty or a fixed one makes the program "
+                 "look for a DLL that is not there.");
+            return {};
+        }
+        // Strings: the image's name first, then the export names in sorted
+        // order.
         std::vector<std::uint32_t> nameStrRvas(n, 0u);
         std::size_t strCursor = strOff;
         std::uint32_t const dllNameRva =
             edataRva + static_cast<std::uint32_t>(strCursor);
-        strCursor += 1;  // the empty DllName's NUL
+        strCursor += imageName.size() + 1;  // the name and its NUL
         for (std::size_t i = 0; i < n; ++i) {
             nameStrRvas[i] =
                 edataRva + static_cast<std::uint32_t>(strCursor);
@@ -5661,6 +5714,8 @@ encodeExec(AssembledModule const&    module,
         // Major/MinorVersion stay 0 (deterministic — matches the file
         // header's TimeDateStamp=0 stance).
         putU32(12, dllNameRva);                              // Name
+        for (std::size_t c = 0; c < imageName.size(); ++c)
+            edataBytes[(dllNameRva - edataRva) + c] = static_cast<std::uint8_t>(imageName[c]);
         putU32(16, 1u);                                      // Base (ordinal)
         putU32(20, static_cast<std::uint32_t>(n));           // NumberOfFunctions
         putU32(24, static_cast<std::uint32_t>(n));           // NumberOfNames

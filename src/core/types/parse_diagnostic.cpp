@@ -199,6 +199,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_ConstantExpressionUsesTheCommaOperator";
         case DiagnosticCode::S_CaseLabelNotConstant:
             return "S_CaseLabelNotConstant";
+        case DiagnosticCode::S_OutOfScopeDeclarationUsed:
+            return "S_OutOfScopeDeclarationUsed";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:
@@ -420,6 +422,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_SehEarlyExit:             return "H_SehEarlyExit";
         case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
         case DiagnosticCode::H_SehRegionInsideAFilter:   return "H_SehRegionInsideAFilter";
+        case DiagnosticCode::H_VisibilityWrittenAsAnother: return "H_VisibilityWrittenAsAnother";
         case DiagnosticCode::H_WideCharSurrogateUnsupported: return "H_WideCharSurrogateUnsupported";
         case DiagnosticCode::H_Utf8CharLiteralOutOfRange: return "H_Utf8CharLiteralOutOfRange";
         case DiagnosticCode::H_WideCharValueUnrepresentable: return "H_WideCharValueUnrepresentable";

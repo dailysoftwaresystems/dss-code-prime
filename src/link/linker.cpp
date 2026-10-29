@@ -1318,6 +1318,8 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     };
 
     std::vector<CrossCuDef> defs;
+    // The weak kind each entry of `defs` states (its row's), for the pair rule below.
+    std::vector<std::optional<WeakDefinitionKind>> kindOfEntry;
     // "cu:symbol:name" -> the index of that row's entry in `defs`.
     std::unordered_map<std::string, std::size_t> entryOfRow;
     for (auto const& m : modules) {
@@ -1332,6 +1334,7 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
             defs.push_back(CrossCuDef{
                 s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol},
                 s.duplicateMatch, body.size, body.bytes});
+            kindOfEntry.push_back(s.weakKind);
             // What the link's document says of this definition's KIND, stated
             // by the ONE function every door of the fold calls
             // (`stateTheLinksAnswers`, link/common_yield.hpp): its rank among
@@ -1356,12 +1359,14 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // is the name it is a COPY under: its first external row of a kind the document
     // discards whole — the COMDAT key a COFF reader reads before its section's other
     // labels, the definition a compiled unit states before its aliases
-    // (`compile_pipeline.cpp`). It CARRIES each other external name of it, by that
-    // row's own record, UNLESS the name is WEAK and states a kind the document does
-    // not discard whole: such a name — on PE the overridable kind, a weak external
-    // whose default outlives the section — is a weak definition of its OWN name,
-    // never withdrawn with the copy: where another definition wins the name every
-    // read follows the name, the copy's own unit's included, and where it wins, it
+    // (`compile_pipeline.cpp`). It CARRIES each other external name of it, each
+    // stated with its row's own binding and weak kind; whether a carried name goes
+    // with the copy is the election's question, answered once for both doors
+    // (`carriedNameGoesWithItsCarrier`): a WEAK name stating a kind the document
+    // does not discard whole — on PE the overridable kind, a weak external whose
+    // default outlives the section — is a weak definition of its OWN name, never
+    // withdrawn with the copy: where another definition wins the name every read
+    // follows the name, the copy's own unit's included, and where it wins, it
     // names the copy that won the copy's own name (the pass below). A weak name of
     // the copy's own kind (a COMDAT section's second label, made weak by the
     // section's selection) and a weak name stating no kind go with the copy. ✔MEASURED by lane cs (probe wk1, 2026-10-20; clang-cl /Od
@@ -1377,12 +1382,6 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // too: the copy is discarded for it all the same.)
     // An image's link only: a relocatable link keeps every name on its definition
     // (the note on that pass), and so elects once.
-    // Stands until the shared `carriedNameGoesWithItsCarrier` replaces it.
-    auto const goesWithItsCopy = [&](ModuleSymbol const& row) {
-        return row.binding != SymbolBinding::Weak || !row.weakKind.has_value()
-            || format.supersededDefinition().answerFor(row.weakKind)
-                   == std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole};
-    };
     auto const namesEachCopyCarries = [&] {
         std::vector<CarriedName> out;
         SupersededDefinitionStatement const& superseded = format.supersededDefinition();
@@ -1405,10 +1404,10 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                 });
                 if (own == names.end()) continue;   // no copy the link discards whole
                 for (ModuleSymbol const* name : names) {
-                    if (name == *own || !goesWithItsCopy(*name)) continue;
+                    if (name == *own) continue;
                     out.push_back(CarriedName{entryOfRow.at(std::format("{}:{}:{}", m.cuId.v, id, name->name)),
                                               (*own)->name, LinkedSymbolKey{m.cuId, SymbolId{id}},
-                                              (*own)->weakKind});
+                                              (*own)->weakKind, name->weakKind});
                 }
             }
         }
@@ -1460,6 +1459,39 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
         CrossCuRefusal refusal = refusalOf(u, format);
         report(reporter, refusal.code, DiagnosticSeverity::Error,
                std::move(refusal.text));
+    }
+    // ── TWO DIFFERENT WEAK DEFINITIONS OF ONE NAME THAT ANOTHER UNIT USES ──────
+    //    (P69 fold f26b, lane `cs`)
+    // The link's document says what such a pair is (`weakDefinitionBesideWeak`);
+    // the rule and its sentence are the ONE statement the merge reads too
+    // (`weakPairsTheLinkRefuses`, link/common_yield.hpp). A unit USES the name as
+    // the reference gate says (`externSurvivesReferenceGate`): a row nothing in
+    // the unit names is no use.
+    {
+        std::vector<std::optional<std::unordered_set<std::uint32_t>>> usedBy(modules.size());
+        auto const userOf = [&](std::string const& name, std::span<std::uint32_t const> definers)
+            -> std::optional<std::uint32_t> {
+            for (std::size_t mi = 0; mi < modules.size(); ++mi) {
+                AssembledModule const& m = modules[mi];
+                if (std::find(definers.begin(), definers.end(), m.cuId.v) != definers.end()) continue;
+                for (auto const& ext : m.externImports) {
+                    if (ext.isPreemptionReference || ext.mangledName != name) continue;
+                    if (!usedBy[mi].has_value()) usedBy[mi] = relocationTargetIds(m);
+                    if (externSurvivesReferenceGate(ext, *usedBy[mi])) return m.cuId.v;
+                }
+            }
+            return std::nullopt;
+        };
+        // A relocatable link elects without withdrawing, but a weak name a copy
+        // carries is still the copy that won the carrier's name there: two weak
+        // aliases whose targets elect one copy are one definition in either link.
+        std::vector<CarriedName> const carriedByCopies =
+            relocatableArtifact ? namesEachCopyCarries() : carried;
+        for (WeakPairNamedElsewhere const& pair :
+             weakPairsTheLinkRefuses(defs, kindOfEntry, election, carriedByCopies, format, userOf)) {
+            CrossCuRefusal refusal = refusalOf(pair, format);
+            report(reporter, refusal.code, DiagnosticSeverity::Error, std::move(refusal.text));
+        }
     }
     // ── A BROKEN DUPLICATE-MATCH PROMISE IS A MULTIPLY-DEFINED SYMBOL ──────
     //    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
@@ -1572,7 +1604,7 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                     for (std::string const& name : kept) {
                         auto const row = std::find_if(names.begin(), names.end(),
                                                       [&](ModuleSymbol const* n) { return n->name == name; });
-                        if (!goesWithItsCopy(**row)) {
+                        if (!carriedNameGoesWithItsCarrier(format, (*row)->binding, (*row)->weakKind)) {
                             // A WEAK name of the copy: a weak definition of its own name, not
                             // discarded with the copy; holding its name, it names the copy that
                             // won the lost one (the election's note above).

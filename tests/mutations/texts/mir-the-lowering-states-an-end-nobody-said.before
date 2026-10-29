@@ -1,3 +1,3 @@
     if (config.symbolIdSpace.has_value()) {
-        lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd);
+        lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd());
     }

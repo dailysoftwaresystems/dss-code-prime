@@ -9109,13 +9109,14 @@ TEST(SemanticAnalyzerC, NoreturnShippedDescriptorSymbolIsNoreturn) {
 //    to (and merges with) the file-scope function (C 6.2.2p4 / 6.7.6.3) ──
 //
 // (a) A block-scope prototype + a later file-scope definition MERGE: the proto
-// is re-homed onto the file scope and absorbed by the definition. Zero
-// diagnostics, exactly one surviving Function `f` (the file definition). A call
-// inside the block resolves to it (witnessed by the corpus exit code).
-// RED-ON-DISABLE: revert the Pass-1 re-home (bind in `current`) -> the block proto
-// binds a separate block-local symbol that the file definition never absorbs, so
-// TWO records named `f` are upgraded to Function (the block proto's kind is
-// upgraded by Pass 1.5 in its own scope) -> countSurvivingFns becomes 2.
+// binds in its block and the block-extern sweep absorbs it into the definition,
+// repointing the block binding (P69 fold f26b; it used to be re-homed onto the file
+// scope). Zero diagnostics, exactly one surviving Function `f` (the file definition).
+// A call inside the block resolves to it (witnessed by the corpus exit code).
+// RED-ON-DISABLE: drop the prototype from the sweep's gate -> the block proto stays a
+// separate block-local symbol the file definition never absorbs, so TWO records
+// named `f` are upgraded to Function (the block proto's kind is upgraded by Pass
+// 1.5 in its own scope) -> countSurvivingFns becomes 2.
 TEST(SemanticAnalyzerC, BlockScopePrototypeMergesWithFileDefinition) {
     auto model = analyzeShipped("c", {
         "int main(void){ int f(int); return f(2); }\n"
@@ -9125,7 +9126,7 @@ TEST(SemanticAnalyzerC, BlockScopePrototypeMergesWithFileDefinition) {
         << "a block-scope prototype + a file-scope definition must merge cleanly";
     EXPECT_EQ(countSurvivingFns(model, "f"), 1u)
         << "exactly one surviving Function symbol for f (the file definition); "
-           "the block-scope proto is re-homed to file scope and absorbed";
+           "the block-scope proto is absorbed by it";
 }
 
 // (b) Definition FIRST, then a block-scope prototype of the same function: also
@@ -9133,8 +9134,8 @@ TEST(SemanticAnalyzerC, BlockScopePrototypeMergesWithFileDefinition) {
 // S_UnusedVariable from the absorbed proto (a function declaration is never an
 // unused variable — the local decl's warnIfUnused is suppressed for a proto).
 // RED-ON-DISABLE (the warnIfUnused suppression): drop `&& !isProto` -> the
-// re-homed/absorbed block proto warns S_UnusedVariable (its own use-set is empty,
-// the call resolves to the definition) -> this count becomes 1.
+// absorbed block proto warns S_UnusedVariable (its own use-set is empty, the call
+// resolves to the definition) -> this count becomes 1.
 TEST(SemanticAnalyzerC, BlockScopePrototypeAfterDefinitionNoUnusedWarning) {
     auto model = analyzeShipped("c", {
         "int f(int x){ return x; }\n"
@@ -9176,6 +9177,111 @@ TEST(SemanticAnalyzerC, BlockScopePrototypeIncompatibleWithFileDefFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_IncompatibleRedeclaration), 1u)
         << "an incompatible block-scope-proto vs file-def pair must fail loud once";
+}
+
+// ★ P69 (lane `cs`, fold f26b): A BARE BLOCK-SCOPE FUNCTION DECLARATION HAS ITS BLOCK'S
+// SCOPE (C 6.2.1p4) AND THE LINKAGE `extern` WOULD GIVE IT (C 6.2.2p5) — the explicit
+// `extern` path: it binds in its block, so it HIDES a name of an enclosing block, and a
+// file-scope declaration of the name absorbs it. ✔MEASURED (lane `lm` probe nest k9h; gcc
+// 13.3.0 and clang 18.1.3, gnu2x and c2x -pedantic-errors, built and run): `int main(void) {
+// int x = 1; { int x(void); return x() + 0 * 1; } } int x(void) { return 42; }` runs 42 on
+// all four. Before fold f26b the declaration was re-homed onto the FILE scope: the block held
+// no binding, so the inner `x` was still the enclosing object and the call was refused.
+//
+// RED-ON-DISABLE: restore the re-home and the inner `x` is the object (the call refused);
+// drop the prototype from the block-extern sweep's gate and the block declaration survives
+// as a function of its own (two surviving functions named `x`).
+TEST(SemanticAnalyzerC, ABlockScopeFunctionDeclarationHidesAnEnclosingObject) {
+    auto model = analyzeShipped("c", {
+        "int main(void) { int x = 1; { int x(void); return x() + 0 * 1; } }\n"
+        "int x(void) { return 42; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors()) << "the inner `x` names the function, not the enclosing object";
+    EXPECT_EQ(countSurvivingFns(model, "x"), 1u)
+        << "the block declaration is absorbed by the file-scope definition";
+    std::size_t absorbed = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == "x" && r.isProtoDeclaration && r.isAbsorbedProto) ++absorbed;
+    }
+    EXPECT_EQ(absorbed, 1u) << "the block declaration is its own record, absorbed";
+}
+
+// A block-scope function declaration HIDES a typedef of an enclosing scope inside its block: `T:`
+// in a `_Generic` there names no type. ✔MEASURED (lane `lm` probe nest k9d; gcc 13.3.0 and clang
+// 18.1.3): `typedef int T; int main(void) { int T(void); return _Generic(0, T: 1, default: 2)
+// + 40; }` is refused by both ("unknown type name 'T'"). ✔MEASURED before fold f26b (lane `cs`
+// probe k9, this compiler): the FILE-scope form was refused for the wrong reason — the re-homed
+// declaration collided with the typedef, S_RedeclaredSymbol — and the form with the typedef in the
+// ENCLOSING BLOCK was accepted and ran 41 (`T:` named the typedef).
+//
+// RED-ON-DISABLE: restore the re-home and the file-scope form is S_RedeclaredSymbol again (the
+// second assertion) and the block form is accepted again (the first).
+TEST(SemanticAnalyzerC, ABlockScopeFunctionDeclarationHidesATypedefInItsBlock) {
+    for (char const* src : {
+             "typedef int T;\n"
+             "int main(void) { int T(void); return _Generic(0, T: 1, default: 2) + 40; }\n",
+             "int main(void) { typedef int T; { int T(void); return _Generic(0, T: 1, default: 2) + 40; } }\n",
+         }) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src << ": `T` is a function in that block, no type name";
+        // ✔MEASURED after the rebase onto lane `lm`'s fold L2a (lane `cs`, compile-and-keep on
+        // macos-arm64-debug, host run 20261028-203151-252844eb): each form is refused with ONE
+        // S_UnknownType, at the `T` of the association — the references' "unknown type name 'T'".
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+            << src << ": the association names no type, and says so once";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+            << src << ": the block declaration is in its own block and collides with nothing";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26b): A CALL TO A FUNCTION ONLY ANOTHER BLOCK OF THE UNIT DECLARED
+// TAKES THAT DECLARATION, WARNED — cl's and clang's rule. Outside its block the declaration is
+// out of scope; a call there that names nothing visible is resolved by cl and clang to it, its
+// type included (clang: "use of out-of-scope declaration"). ✔MEASURED (lane `cs` probe ip; cl
+// 19.51, clang 18.1.3 default standard, gcc 13.3.0, mingw-w64 gcc 13.2.0; each built and RUN):
+// a call in another function runs 42 on cl (silent) and on gcc / mingw-w64 gcc (an implicit
+// declaration, warned); with `double f(double)` declared it runs 42 on clang (warned) and cl —
+// so the declared type is what the call takes. Here NOTHING at file scope declares the names
+// (their definitions are another unit's), as in probe ip's cells c6, c7, c8. CONTROL: the same
+// call with no block declaration anywhere stays refused (the implicit declaration is its own
+// row's).
+//
+// RED-ON-DISABLE: drop the out-of-scope lookup and every call is S_UndeclaredIdentifier; drop
+// the callee test and the control's `&g` takes the declaration too.
+TEST(SemanticAnalyzerC, ACallTakesAnOutOfScopeBlockDeclarationWarned) {
+    struct Case {
+        char const* what;
+        char const* src;
+    };
+    for (Case const c : {
+             Case{"in another function",
+                  "void a(void) { int g(int); }\nint b(void) { return g(40) + 2; }\n"},
+             Case{"its declared type",
+                  "void a(void) { double g(double); }\nint b(void) { return (int)g(40) + 2; }\n"},
+             Case{"after its block ended",
+                  "int b(void) { { int g(int); } return g(40) + 2; }\n"},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto model = analyzeShipped("c", {c.src});
+        EXPECT_FALSE(model.hasErrors()) << c.src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 1u)
+            << c.src;
+        EXPECT_EQ(model.diagnostics().all().size(), 1u) << c.src;
+    }
+    // (The declared type reaching the call is pinned by a RUN: the example
+    // two_units_call_through_an_out_of_scope_block_declaration passes 40 as 40.0.)
+    // CONTROLS: no block declaration at all; a use that is no call; a declaration written
+    // AFTER the call — each the implicit declaration's case, refused today.
+    for (char const* src : {"int b(void) { return g(40) + 2; }\n",
+                            "void a(void) { int g(int); }\nint (*b(void))(int) { return &g; }\n",
+                            "int b(void) { return g(40) + 2; }\nvoid a(void) { int g(int); }\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 0u)
+            << src;
+    }
 }
 
 // ── D-CSUBSET-EXTERN-DEFINITION-MERGE — an `extern` declaration MERGES with an
@@ -17807,8 +17913,9 @@ TEST(SemanticAnalyzerC, FunctionTypedStructFieldStillFailsLoud) {
 // is purely syntactic, so it classified the parameter a PROTOTYPE even though
 // p8 had already made its declared type a pointer. Every FORM (1) assertion
 // stayed green throughout: the TYPE was right, the KIND was not. The flag then
-// did real damage one tier down — a prototype re-homes onto the FILE scope, and
-// CST→HIR emits no VarDecl for one — so it is pinned HERE, where it is decided.
+// did real damage one tier down — a prototype was re-homed onto the FILE scope (until
+// P69 fold f26b), and CST→HIR emits no VarDecl for one — so it is pinned HERE, where it
+// is decided.
 // (`decl.paramAdjustments` suppresses `isProto`; see the derivation's comment.)
 TEST(SemanticAnalyzerC, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
     auto model = analyzeShipped("c", {
@@ -17831,8 +17938,8 @@ TEST(SemanticAnalyzerC, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
 
 // FORM (8) — C 6.2.1p4: a parameter name is scoped to its own declarator and
 // has NO linkage, so two functions may reuse one. The prototype
-// misclassification ALSO re-homed the parameter onto the FILE scope (that is
-// what D-CSUBSET-BLOCK-SCOPE-PROTOTYPE does for a real prototype), where two
+// misclassification ALSO re-homed the parameter onto the FILE scope (what
+// D-CSUBSET-BLOCK-SCOPE-PROTOTYPE did for a real prototype until P69 fold f26b), where two
 // same-named parameters met as ONE symbol: MEASURED as S0022 on `g`, pointing
 // at the OTHER function's parameter. Distinct symbols in distinct scopes is the
 // only shape in which that cannot recur.
@@ -22498,7 +22605,7 @@ TEST(SemanticAnalyzerC, ThreadLocalIsExemptFromTheStorageClassConstraint) {
 
 // THE NON-DEFINING FACT, READ OFF THE RECORD RATHER THAN OFF THE GRAMMAR.
 // `isExternDeclaration` is the flag the tentative-definition fold, the
-// redeclaration-merge direction and the block-scope re-home guard all consult.
+// redeclaration-merge direction and the block-extern sweep all consult.
 // Every ordering must set it, because every ordering is the same declaration.
 TEST(SemanticAnalyzerC, ExternSpecifierMakesTheFileScopeDeclarationNonDefining) {
     for (std::string_view const decl : {"extern int e;\n",

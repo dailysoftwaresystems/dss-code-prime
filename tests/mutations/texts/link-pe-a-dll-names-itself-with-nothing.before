@@ -1,0 +1,1 @@
+        edataBytes[(dllNameRva - edataRva) + c] = static_cast<std::uint8_t>(imageName[c]);

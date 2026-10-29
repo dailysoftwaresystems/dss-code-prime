@@ -1,1 +1,1 @@
-__declspec(dllimport)
+__declspec(dllexport)

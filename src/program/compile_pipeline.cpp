@@ -26,6 +26,7 @@
 #include "link/format/object_symbol_names.hpp"  // hasExternalLinkage -- the ONE static-resolution predicate (armap + static pull)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "hir/attributes/visibility_written_as.hpp"   // settleVisibilitiesWrittenAs (P69 fold f26b)
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
 #include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
@@ -1148,6 +1149,14 @@ static std::optional<CuHirModule> buildCuHirImpl(
     if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
         return std::nullopt;
     }
+    // P69 fold f26b: a visibility this format cannot write becomes the one its
+    // document states, before any tier reads it, and the program is told.
+    settleVisibilitiesWrittenAs(*hir, format.visibilityStandIns(), format.name(),
+                                [&](SymbolId s) {
+                                    SymbolRecord const* r = model.recordFor(s);
+                                    return r != nullptr ? r->name : std::string{};
+                                },
+                                reporter);
 
     // Both products of the front half. (The resolved CC's `vaListLayout` rode here
     // for the retired <stdio.h> synth pass alone — P69 — and the MIR lowering

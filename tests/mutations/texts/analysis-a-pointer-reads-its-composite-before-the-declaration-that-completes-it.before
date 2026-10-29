@@ -1,1 +1,1 @@
-        return ty.valid() && (in.kind(ty) == TypeKind::Array || in.kind(ty) == TypeKind::Ptr);
+    if (t.valid() && in.kind(t) != TypeKind::Array && in.kind(t) != TypeKind::Ptr) return t;

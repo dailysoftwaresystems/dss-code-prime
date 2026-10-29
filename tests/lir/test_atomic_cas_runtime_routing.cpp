@@ -312,7 +312,8 @@ TEST(AtomicCasRuntimeRouting, AnLlscLoopInsideAGuardedBodyIsARunOfItsRegion) {
     // block does after them, would sit in blocks no scope guards: that mutation is
     // the arm `lir-no-run-is-emitted_atomic-cas-runtime-routing` of `dssharness
     // check-mutations`, and the loop's three blocks created with no owner are
-    // `lir-the-llsc-retry-block-…`, `lir-the-llsc-store-block-…` and
+    // `lir-the-llsc-retry-block-is-created-around-the-creator`,
+    // `lir-the-llsc-store-block-is-created-around-the-creator` and
     // `lir-the-llsc-done-block-is-created-around-the-creator`. Each of the four READ
     // `passed` in the sweep of checkpoint 14 (macos-arm64-debug, run
     // 20261012-151311-82d3dd43).

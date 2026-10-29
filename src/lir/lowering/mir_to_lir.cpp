@@ -1305,11 +1305,11 @@ struct Lowerer {
     // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, the sixth minter).
     // ONE continuation per lowering: its first id is `mir.symbolIdEnd()` — past
     // the name table the module was made from, every symbol the module defines
-    // and every id minted for it since — and it is kept clear of the two kinds
-    // of id that can sit BESIDE a module, outside its end: an import row handed
-    // in (the constructor), and a block symbol an export already publishes
-    // (`run()`, D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a module built
-    // by hand states no id for its exports).
+    // and every id minted for it since — and it is kept clear of the one kind of
+    // id that can sit BESIDE a module, outside its end: an import row handed in
+    // (the constructor). A block symbol an export publishes is no such id: the
+    // export DEFINES it, and the module's end is past it from the moment the
+    // instruction is built (`MirBuilder::addInst`, every door that writes one).
     // The seed used to be a SCAN — the highest function, global and handed-in
     // import id, plus one. ✔MEASURED 2026-10-08 on a module made from a table of
     // nine names and holding one: block symbols 2 and 3, a jump table 2 and its
@@ -16530,9 +16530,6 @@ struct Lowerer {
                     SymbolId const sym = mir.blockAddressExportSymbol(inst);
                     MirBlockId const target = mir.blockAddressTarget(ops[0]);
                     blockToSym_[target.v] = sym;
-                    // The export already publishes `sym`: no block the lowering
-                    // names itself may be given it (see `symbolIds_`).
-                    symbolIds_.keepClearOf(sym);
                     // The census `lowerFunction` builds is per-function and is not
                     // available yet; the export-only decision is made there.
                 }

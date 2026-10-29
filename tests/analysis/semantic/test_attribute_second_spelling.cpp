@@ -746,7 +746,7 @@ TEST(AttributeSecondSpelling, ThePlainNamesKeepTheirMeaningInsideTheFrame) {
 
 // `dllimport` / `dllexport` on a datum or a function, and `restrict` / `noalias`
 // on a function, are accepted and change nothing here — each reference compiles
-// and runs them in an executable. On a type alias the first pair is ignored and
+// and runs them in an executable (a `dllimport` DEFINITION excepted: the next case). On a type alias the first pair is ignored and
 // said so (MinGW warns; cl says nothing).
 //
 // RED-ON-DISABLE: drop the import/export row and the alias cell loses its warning
@@ -773,6 +773,98 @@ TEST(AttributeSecondSpelling, TheImportExportAndAliasingModifiersAreAcceptedAndI
     EXPECT_EQ(t.diagnostics().all().size(), 1u) << everyDiagnostic(t);
 }
 
+// `dllimport` ON A DEFINITION — a function with its body, an object with its
+// initializer — is refused by name (the row's `refusedOnDefinition`), and on a mere
+// declaration of either it is accepted as before. ✔MEASURED (lane `cs` probe di,
+// 2026-10-20, windows-x86_64): cl 19.51 refuses both definitions (C2491); mingw-w64
+// gcc 13.2.0 refuses the object and compiles the function into a program that does
+// not link (`__imp_f` undefined). Before fold f26b both were accepted in silence (the
+// re-review of fold A2, finding 2). `dllexport` on a definition is its ordinary use.
+//
+// RED-ON-DISABLE: drop the row's `refusedOnDefinition`, or the gate that reads it,
+// and both definitions compile in silence.
+TEST(AttributeSecondSpelling, DllimportOnADefinitionIsRefusedByName) {
+    struct Case {
+        char const* what;
+        char const* src;
+        bool        refused;
+    };
+    for (Case const c : {
+             Case{"an object definition", "__declspec(dllimport) int x = 7;\n", true},
+             Case{"a function definition", "__declspec(dllimport) int f(void) { return 7; }\n", true},
+             Case{"after the type", "int __declspec(dllimport) y = 1;\n", true},
+             Case{"CONTROL: an object declaration", "__declspec(dllimport) extern int x;\n", false},
+             Case{"CONTROL: a function declaration", "__declspec(dllimport) int f(void);\n", false},
+             Case{"CONTROL: dllexport on a definition",
+                  "__declspec(dllexport) int f(void) { return 7; }\n", false},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto m = analyzePe({c.src});
+        if (c.refused) {
+            EXPECT_TRUE(m.hasErrors()) << c.src << everyDiagnostic(m);
+            EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeNotHonoured,
+                                  "cannot be honoured: this declaration defines"),
+                      1u)
+                << c.src << everyDiagnostic(m);
+            EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeNotHonoured,
+                                  "the definition is another image's"),
+                      1u)
+                << c.src << everyDiagnostic(m);
+        } else {
+            EXPECT_FALSE(m.hasErrors()) << c.src << everyDiagnostic(m);
+            EXPECT_TRUE(m.diagnostics().all().empty()) << c.src << everyDiagnostic(m);
+        }
+    }
+}
+
+// `selectany` ON AN ALIAS is ignored and said (the row's `ignoredOnAlias`): an alias
+// is one more name on its target's storage, with no copy of its own for the link to
+// select, and it stays the name its own binding makes it. ✔MEASURED (lane `cs` probe
+// sw, 2026-10-20, windows-x86_64): mingw-w64 gcc 13.2.0 builds every alias cell below
+// and runs it (exit 42), writing the alias as a plain EXTERNAL label — the select-any
+// dropped in silence; clang 18.1.3 for x86_64-pc-windows-msvc refuses them. Before
+// fold f26b the alias kept the select-any kind, which the pe64 object writer then
+// refused beside a `static` body and wrote as an OVERRIDABLE weak external beside an
+// external one.
+//
+// RED-ON-DISABLE: drop the row's `ignoredOnAlias`, or the gate that reads it, and
+// every alias cell analyzes in silence.
+TEST(AttributeSecondSpelling, SelectanyOnAnAliasIsIgnoredAndSaid) {
+    struct Case {
+        char const* what;
+        char const* src;
+        bool        said;
+    };
+    for (Case const c : {
+             Case{"an alias of a static object",
+                  "static int s = 40;\n"
+                  "__declspec(selectany) extern int a __attribute__((alias(\"s\")));\n",
+                  true},
+             Case{"an alias of an external object",
+                  "int s = 40;\n"
+                  "__declspec(selectany) extern int a __attribute__((alias(\"s\")));\n",
+                  true},
+             Case{"the specifier after the type",
+                  "static int s = 40;\n"
+                  "extern int __declspec(selectany) a __attribute__((alias(\"s\")));\n",
+                  true},
+             Case{"CONTROL: a select-any definition", "__declspec(selectany) int w = 7;\n", false},
+             Case{"CONTROL: a weak alias",
+                  "static int s = 40;\n"
+                  "extern int a __attribute__((weak, alias(\"s\")));\n",
+                  false},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto m = analyzePe({c.src});
+        EXPECT_FALSE(m.hasErrors()) << c.src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                              "'a' is an alias, and an alias is one more name on its target's storage"),
+                  c.said ? 1u : 0u)
+            << c.src << everyDiagnostic(m);
+        EXPECT_EQ(m.diagnostics().all().size(), c.said ? 1u : 0u) << c.src << everyDiagnostic(m);
+    }
+}
+
 // A REQUEST THIS COMPILER CANNOT HONOUR IS REFUSED BY NAME, with its reason: a
 // function with no prologue and no epilogue (`naked`, under either spelling — its
 // body is the whole of its code, and compiling it as an ordinary function would
@@ -797,4 +889,333 @@ TEST(AttributeSecondSpelling, ARequestThatCannotBeHonouredIsRefusedByName) {
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_UnknownAttribute), 0u)
             << c.src;
     }
+}
+
+// ── `dllimport` ON A DECLARATION THAT DEFINES NOTHING (P69 lane `cs`, fold f26b) ─────
+
+// AN IMPORT NAMES A DEFINITION ANOTHER IMAGE HOLDS: a declaration with no initializer that
+// carries `dllimport` — at file scope or inside a body, with or without `extern`, before or
+// after the type, beside the name inside a pointer declarator, or after the declarator — is
+// a DECLARATION of that name: never a tentative definition of this unit, never an automatic
+// local. PER DECLARATOR: `int a, * __declspec(dllimport) p;` defines `a` and imports `p`.
+// ✔MEASURED (lane `cs` probes di, di2, di3, di4, di5, 2026-10-20/21, windows-x86_64): cl
+// 19.51 and mingw-w64 gcc 13.2.0 write `__imp_x` and no `x` for each declaration below
+// that they accept (cl has no attribute inside or after a declarator and refuses those;
+// mingw-w64 gcc takes them). Before fold f26b this compiler made the file-scope ones a
+// common of their own and the block ones locals read uninitialised — silently another
+// program against a DLL that exports the name.
+//
+// RED-ON-DISABLE: drop the `imported` entries of the declaration rows, or the record-time
+// scan's reading of them, and every cell is a tentative definition or a local again.
+TEST(AttributeSecondSpelling, ADllimportDeclarationNamesAnotherImagesDefinition) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* name;
+    };
+    for (Case const c : {
+             Case{"a file-scope datum", "__declspec(dllimport) int x;\nint g(void) { return x; }\n",
+                  "x"},
+             Case{"after the type", "int __declspec(dllimport) x;\nint g(void) { return x; }\n", "x"},
+             Case{"both declarators of a list",
+                  "__declspec(dllimport) int a, x;\nint g(void) { return a + x; }\n", "x"},
+             Case{"beside the name, inside a pointer declarator",
+                  "int * __declspec(dllimport) x;\nint g(void) { return *x; }\n", "x"},
+             Case{"after the declarator",
+                  "int x __declspec(dllimport);\nint g(void) { return x; }\n", "x"},
+             Case{"with `extern` as well",
+                  "__declspec(dllimport) extern int x;\nint g(void) { return x; }\n", "x"},
+             Case{"inside a body", "int g(void) { __declspec(dllimport) int x; return x; }\n", "x"},
+             Case{"inside a body, with `extern`",
+                  "int g(void) { __declspec(dllimport) extern int x; return x; }\n", "x"},
+             Case{"inside a body, shadowing a local",
+                  "int g(void) { int x = 1; { __declspec(dllimport) int x; return x; } }\n", "x"},
+             Case{"the GNU spelling",
+                  "__attribute__((dllimport)) int x;\nint g(void) { return x; }\n", "x"},
+             Case{"the GNU spelling, written with underscores",
+                  "__attribute__((__dllimport__)) int x;\nint g(void) { return x; }\n", "x"},
+             Case{"the GNU spelling inside a body",
+                  "int g(void) { __attribute__((dllimport)) int x; return x; }\n", "x"},
+             Case{"the GNU spelling after the declarator",
+                  "int x __attribute__((dllimport));\nint g(void) { return x; }\n", "x"},
+             Case{"a function", "__declspec(dllimport) int f(void);\nint g(void) { return f(); }\n",
+                  "f"},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto m = analyzePe({c.src});
+        EXPECT_FALSE(m.hasErrors()) << c.src << everyDiagnostic(m);
+        for (auto const& d : m.diagnostics().all())
+            EXPECT_EQ(d.code, DiagnosticCode::S_UnusedVariable)
+                << c.src << ": only the shadowed local may be warned (unused)"
+                << everyDiagnostic(m);
+        bool sawImport = false;
+        for (SymbolRecord const* r : symsNamed(m, c.name)) {
+            if (!r->isImportedDeclaration) continue;   // the shadowed local of one cell
+            sawImport = true;
+            EXPECT_FALSE(r->isTentativeDefinition)
+                << c.src << ": an import is no tentative definition";
+            EXPECT_TRUE(r->isExternDeclaration || r->isProtoDeclaration)
+                << c.src << ": an import declares a name another image defines";
+        }
+        EXPECT_TRUE(sawImport) << c.src << everyDiagnostic(m);
+    }
+    // PER DECLARATOR: the import beside one name does not reach the other.
+    auto mixed = analyzePe({"int a, * __declspec(dllimport) p;\nint g(void) { return a + *p; }\n"});
+    EXPECT_FALSE(mixed.hasErrors()) << everyDiagnostic(mixed);
+    ASSERT_NE(findSym(mixed, "a"), nullptr);
+    ASSERT_NE(findSym(mixed, "p"), nullptr);
+    EXPECT_FALSE(findSym(mixed, "a")->isImportedDeclaration);
+    EXPECT_TRUE(findSym(mixed, "a")->isTentativeDefinition) << "`a` stays this unit's definition";
+    EXPECT_TRUE(findSym(mixed, "p")->isImportedDeclaration);
+    EXPECT_FALSE(findSym(mixed, "p")->isTentativeDefinition);
+    auto trailing = analyzePe({"int a __declspec(dllimport), b;\nint g(void) { return a + b; }\n"});
+    EXPECT_FALSE(trailing.hasErrors()) << everyDiagnostic(trailing);
+    ASSERT_NE(findSym(trailing, "a"), nullptr);
+    ASSERT_NE(findSym(trailing, "b"), nullptr);
+    EXPECT_TRUE(findSym(trailing, "a")->isImportedDeclaration);
+    EXPECT_FALSE(findSym(trailing, "b")->isImportedDeclaration);
+    EXPECT_TRUE(findSym(trailing, "b")->isTentativeDefinition);
+    // CONTROLS: the same declaration without the modifier, and with `dllexport`, is this
+    // unit's tentative definition.
+    for (char const* src : {"int x;\nint g(void) { return x; }\n",
+                            "__declspec(dllexport) int x;\n"}) {
+        auto m = analyzePe({src});
+        EXPECT_FALSE(m.hasErrors()) << src << everyDiagnostic(m);
+        SymbolRecord const* r = findSym(m, "x");
+        ASSERT_NE(r, nullptr) << src;
+        EXPECT_FALSE(r->isImportedDeclaration) << src;
+        EXPECT_TRUE(r->isTentativeDefinition) << src;
+    }
+}
+
+// THE GNU SPELLING IS AN IMPORT ON pe ONLY. Off pe the word is no attribute: warned as
+// unknown, ignored, and the declaration is the tentative definition it is without it
+// (`__has_attribute` answers 0 there — pinned with the preprocessor's feature queries).
+// ✔MEASURED (lane `cs` probe di5): gcc 13.3.0 ("attribute directive ignored"), clang 18.1.3
+// and Apple clang ("unknown attribute 'dllimport' ignored") at every position, the program
+// built as if the word were not written; mingw-w64 gcc 13.2.0 imports it.
+//
+// RED-ON-DISABLE: drop the row's `availableObjectFormats` and the ELF, Mach-O and
+// no-format cells import; drop `dllimport` from the row's names and the pe cell defines.
+TEST(AttributeSecondSpelling, TheGnuSpellingOfDllimportIsAnImportOnPeAndAnUnknownWordElsewhere) {
+    char const* const src = "__attribute__((dllimport)) int x;\nint g(void) { return x; }\n";
+    auto pe = analyzeOn(ObjectFormatKind::Pe, {src});
+    EXPECT_FALSE(pe.hasErrors()) << everyDiagnostic(pe);
+    EXPECT_TRUE(pe.diagnostics().all().empty()) << everyDiagnostic(pe);
+    ASSERT_NE(findSym(pe, "x"), nullptr);
+    EXPECT_TRUE(findSym(pe, "x")->isImportedDeclaration);
+    for (std::optional<ObjectFormatKind> const format :
+         {std::optional<ObjectFormatKind>{ObjectFormatKind::Elf},
+          std::optional<ObjectFormatKind>{ObjectFormatKind::MachO},
+          std::optional<ObjectFormatKind>{}}) {
+        SCOPED_TRACE(format.has_value() ? std::string{objectFormatKindName(*format)}
+                                        : std::string{"no format"});
+        auto m = analyzeOn(format, {src});
+        EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_UnknownAttribute,
+                              "attribute 'dllimport' is ignored: it is an attribute of the "
+                              "object format(s) 'pe' only"),
+                  1u)
+            << everyDiagnostic(m);
+        EXPECT_EQ(m.diagnostics().all().size(), 1u) << everyDiagnostic(m);
+        ASSERT_NE(findSym(m, "x"), nullptr);
+        EXPECT_FALSE(findSym(m, "x")->isImportedDeclaration);
+        EXPECT_TRUE(findSym(m, "x")->isTentativeDefinition);
+    }
+}
+
+// AN IMPORT THAT CANNOT NAME ANOTHER IMAGE'S DEFINITION IS REFUSED BY NAME: one with no
+// external linkage (`static`, at file scope or inside a body, an object or a function), one
+// with thread storage, and one after a declaration of this unit that DEFINES the name — a
+// definition, a tentative definition, a function's body, at file scope, and a block-scope
+// import of a name the file scope already defines. ✔MEASURED (lane `cs` probes di, di2,
+// di3, di4, di5, di6; cl 19.51 and mingw-w64 gcc 13.2.0): cl refuses each (C2201, C2492,
+// C2370, C2375); mingw-w64 gcc refuses the `static` ones ("external linkage required") and
+// compiles the redeclared ones into programs that do not link (`__imp_x` undefined). Of
+// thread storage cl says C2492 for both spellings; mingw-w64 gcc drops `__declspec(thread)`
+// (a plain import) and imports `_Thread_local`'s emulated-TLS control object
+// (`__imp___emutls_v.x`) — its own thread-storage model, not the native one this compiler
+// keeps on pe with cl — so cl's answer is taken, one rule for every spelling of the
+// storage. CONTROLS: an import after a plain `extern` or prototype holds (mingw-w64 gcc
+// imports; cl refuses — one working reference); a block import before a LATER file-scope
+// definition runs on both (the definition's value); a block-scope plain `extern` of a
+// file-scope import compiles on both (cl keeps the import, mingw-w64 gcc warns and drops
+// it; this compiler writes the plain reference either way, which the link routes).
+//
+// RED-ON-DISABLE: drop the record-time refusal and the storage cells compile; drop the
+// merge's refusal and the file-scope redeclaration cells do; drop the block-scope check and
+// the two block cells do.
+TEST(AttributeSecondSpelling, AnImportIsRefusedWhereNoOtherImageCanHoldTheDefinition) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* says;   // empty: a CONTROL, accepted in silence
+    };
+    for (Case const c : {
+             Case{"`static` at file scope", "__declspec(dllimport) static int x;\n",
+                  "only a name with external linkage"},
+             Case{"`static` inside a body",
+                  "int g(void) { static __declspec(dllimport) int x; return x; }\n",
+                  "only a name with external linkage"},
+             Case{"a `static` function", "static __declspec(dllimport) int f(void);\n",
+                  "only a name with external linkage"},
+             Case{"the GNU spelling, `static`", "__attribute__((dllimport)) static int x;\n",
+                  "only a name with external linkage"},
+             Case{"thread storage", "__declspec(dllimport) __declspec(thread) int x;\n",
+                  "thread storage"},
+             Case{"thread storage by the keyword", "__declspec(dllimport) _Thread_local int x;\n",
+                  "thread storage"},
+             Case{"after a definition", "int x = 7;\n__declspec(dllimport) int x;\n",
+                  "a prior declaration of this unit defines 'x'"},
+             Case{"after a tentative definition", "int x;\n__declspec(dllimport) int x;\n",
+                  "a prior declaration of this unit defines 'x'"},
+             Case{"after a function's body",
+                  "int f(void) { return 7; }\n__declspec(dllimport) int f(void);\n",
+                  "a prior declaration of this unit defines 'f'"},
+             Case{"a block import of a defined name",
+                  "int x = 5;\nint main(void) { __declspec(dllimport) int x; return x; }\n",
+                  "a prior declaration of this unit defines 'x'"},
+             Case{"a block import of a tentatively defined name",
+                  "int x;\nint main(void) { __declspec(dllimport) int x; return x + 6; }\n",
+                  "a prior declaration of this unit defines 'x'"},
+             Case{"CONTROL: `extern`, then an import",
+                  "extern int x;\n__declspec(dllimport) int x;\n", ""},
+             Case{"CONTROL: a prototype, then an imported one",
+                  "int f(void);\n__declspec(dllimport) int f(void);\n", ""},
+             Case{"CONTROL: two imports",
+                  "__declspec(dllimport) int x;\n__declspec(dllimport) int x;\n", ""},
+             Case{"CONTROL: a file-scope `extern`, then a block import",
+                  "extern int x;\nint g(void) { __declspec(dllimport) int x; return x; }\n", ""},
+             Case{"CONTROL: a block import, then a later definition",
+                  "int main(void) { __declspec(dllimport) int x; return x; }\nint x = 5;\n", ""},
+             Case{"CONTROL: a file-scope import, then a block-scope plain `extern`",
+                  "__declspec(dllimport) int x;\nint g(void) { extern int x; return x; }\n", ""},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto m = analyzePe({c.src});
+        if (*c.says == '\0') {
+            EXPECT_FALSE(m.hasErrors()) << c.src << everyDiagnostic(m);
+            EXPECT_TRUE(m.diagnostics().all().empty()) << c.src << everyDiagnostic(m);
+            continue;
+        }
+        EXPECT_TRUE(m.hasErrors()) << c.src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeNotHonoured, c.says), 1u)
+            << c.src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeNotHonoured, "dllimport"), 1u)
+            << c.src << everyDiagnostic(m);
+        for (SymbolRecord const* r : symsNamed(m, "x"))
+            EXPECT_FALSE(r->isImportedDeclaration) << c.src << ": a refused import imports nothing";
+    }
+    // The import after a plain non-defining declaration HOLDS, on both records.
+    auto held = analyzePe({"extern int x;\n__declspec(dllimport) int x;\n"});
+    ASSERT_EQ(symsNamed(held, "x").size(), 2u) << everyDiagnostic(held);
+    for (SymbolRecord const* r : symsNamed(held, "x")) EXPECT_TRUE(r->isImportedDeclaration);
+}
+
+// A LATER DECLARATION WITHOUT THE IMPORT, AFTER ONE WITH IT, ENDS IT AND IS WARNED: a
+// definition, a tentative definition, a function's body, a plain `extern`, a plain
+// prototype. ✔MEASURED (lane `cs` probes di, di2, di3; cl 19.51 and mingw-w64 gcc 13.2.0):
+// both warn — cl C4273 "inconsistent dll linkage", gcc "redeclared without dllimport
+// attribute: previous dllimport ignored" — and the later declaration's meaning stands (a
+// definition runs to its value; a plain declaration writes a plain reference). Before
+// fold f26b this compiler said nothing.
+//
+// RED-ON-DISABLE: drop the merge's warning and every cell analyzes in silence.
+TEST(AttributeSecondSpelling, ADeclarationWithoutTheImportAfterOneWithItEndsItAndIsWarned) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* name;
+        char const* says;
+    };
+    for (Case const c : {
+             Case{"a datum's definition", "__declspec(dllimport) int x;\nint x = 7;\n", "x",
+                  "this declaration defines 'x'"},
+             Case{"a tentative definition", "__declspec(dllimport) int x;\nint x;\n", "x",
+                  "this declaration defines 'x'"},
+             Case{"a function's body",
+                  "__declspec(dllimport) int f(void);\nint f(void) { return 7; }\n", "f",
+                  "this declaration defines 'f'"},
+             Case{"a plain `extern`", "__declspec(dllimport) int x;\nextern int x;\n", "x",
+                  "does not import it"},
+             Case{"a plain prototype", "__declspec(dllimport) int f(void);\nint f(void);\n", "f",
+                  "does not import it"},
+             Case{"the GNU spelling, then a definition",
+                  "__attribute__((dllimport)) int x;\nint x = 5;\n", "x",
+                  "this declaration defines 'x'"},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto m = analyzePe({c.src});
+        EXPECT_FALSE(m.hasErrors()) << c.src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                              "the import on a prior declaration of"),
+                  1u)
+            << c.src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind, c.says),
+                  1u)
+            << c.src << everyDiagnostic(m);
+        EXPECT_EQ(m.diagnostics().all().size(), 1u) << c.src << everyDiagnostic(m);
+        for (SymbolRecord const* r : symsNamed(m, c.name))
+            EXPECT_FALSE(r->isImportedDeclaration) << c.src << ": the import is ended";
+    }
+}
+
+// AN IMPORTED OBJECT'S ADDRESS IS NO ADDRESS CONSTANT — where the import holds AT THAT POINT
+// of the unit. ✔MEASURED (lane `cs` probes di3, di4, di5, di6; cl 19.51 and mingw-w64 gcc
+// 13.2.0): both refuse `&x` of an imported `x` in a file-scope initializer (C2099;
+// "initializer element is not constant") and in a block `static`'s, of a file-scope or a
+// block-scope import, and refuse it also when a LATER definition ends the import; both
+// take an imported FUNCTION's address there (its thunk), with `&` or without, and an
+// imported object's address taken at run time. CONTROLS: those, a plain `extern`'s
+// address, and the address of an object whose import a definition ended before the
+// initializer.
+//
+// RED-ON-DISABLE: drop the import arm of the static-initializer judge and the refused cells
+// compile; make it read the end-of-unit flag instead of the history and the ordering cell
+// compiles; drop its function test and the function cells are refused.
+TEST(AttributeSecondSpelling, AnImportedObjectsAddressIsNoAddressConstant) {
+    struct Case {
+        char const* what;
+        char const* src;
+        bool        refused;
+    };
+    for (Case const c : {
+             Case{"a file-scope initializer", "__declspec(dllimport) int x;\nint *p = &x;\n", true},
+             Case{"a block static's",
+                  "__declspec(dllimport) int x;\n"
+                  "int *g(void) { static int *p = &x; return p; }\n",
+                  true},
+             Case{"a block static's, of a block import",
+                  "int *g(void) { __declspec(dllimport) int x; static int *p = &x; return p; }\n",
+                  true},
+             Case{"the GNU spelling", "__attribute__((dllimport)) int x;\nint *p = &x;\n", true},
+             Case{"a later definition ends the import after the use",
+                  "__declspec(dllimport) int x;\nint *p = &x;\nint x = 5;\n", true},
+             Case{"CONTROL: an imported function",
+                  "__declspec(dllimport) int f(void);\nint (*p)(void) = f;\n", false},
+             Case{"CONTROL: an imported function, with `&`",
+                  "__declspec(dllimport) int f(void);\nint (*p)(void) = &f;\n", false},
+             Case{"CONTROL: at run time",
+                  "__declspec(dllimport) int x;\nint *g(void) { return &x; }\n", false},
+             Case{"CONTROL: a plain `extern`", "extern int x;\nint *p = &x;\n", false},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto m = analyzePe({c.src});
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_StaticInitializerNotConstant,
+                              "which another image defines"),
+                  c.refused ? 1u : 0u)
+            << c.src << everyDiagnostic(m);
+        if (c.refused) {
+            EXPECT_TRUE(m.hasErrors()) << c.src << everyDiagnostic(m);
+        } else {
+            EXPECT_FALSE(m.hasErrors()) << c.src << everyDiagnostic(m);
+            EXPECT_TRUE(m.diagnostics().all().empty()) << c.src << everyDiagnostic(m);
+        }
+    }
+    // The import ENDED before the initializer: the address is a constant (the merge's
+    // warning is the only diagnostic).
+    auto ended = analyzePe({"__declspec(dllimport) int x;\nint x = 5;\nint *p = &x;\n"});
+    EXPECT_FALSE(ended.hasErrors()) << everyDiagnostic(ended);
+    EXPECT_EQ(countCode(ended.diagnostics(), DiagnosticCode::S_StaticInitializerNotConstant), 0u)
+        << everyDiagnostic(ended);
 }

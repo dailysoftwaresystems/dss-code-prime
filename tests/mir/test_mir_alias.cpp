@@ -148,8 +148,12 @@ TEST(MirAlias, TheVerifierRefusesAnAliasOfNoDefinitionAndANameDefinedTwice) {
     };
     for (Case const c : {
              Case{"a target the module does not define", SymbolId{3}, SymbolId{9}, "its target is no function or global"},
-             Case{"a name the module defines as a function", SymbolId{1}, SymbolId{2}, "also a function or a global"},
-             Case{"a name the module defines as a global", SymbolId{2}, SymbolId{1}, "also a function or a global"},
+             // The name defined by something else is the one-definition rule's, said for
+             // every kind of definition (MirVerifier::checkSymbolIdsDefinedOnce).
+             Case{"a name the module defines as a function", SymbolId{1}, SymbolId{2},
+                  "symbol %1 is defined twice in this module, as its function and as its alias"},
+             Case{"a name the module defines as a global", SymbolId{2}, SymbolId{1},
+                  "symbol %2 is defined twice in this module, as its global and as its alias"},
          }) {
         SCOPED_TRACE(c.what);
         TypeInterner in{CompilationUnitId{1}};

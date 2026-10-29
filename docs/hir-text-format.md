@@ -413,7 +413,8 @@ the lowering states them (declaration order), and an alias's two symbols take th
 after every symbol a node names.
 
 Refused, each by name: an item that is not `alias`; a handle `symbols` does not declare; a word no
-binding or visibility table names, a binding or a visibility stated twice, an argument on a binding
+binding or visibility table names; `global` or `default` spelled out (the default is stated by leaving it
+out, so that an alias has one text); a binding or a visibility stated twice, an argument on a binding
 that is not `weak`, a kind that is neither of the two, and `weak` with no kind; an alias that names
 itself; one name stated twice; a target no `function` or `global` of the module defines; and an alias
 whose own name a `function` or `global` defines.

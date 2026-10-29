@@ -142,7 +142,8 @@ cDocumentWithTheRule(std::optional<std::string_view> spelling) {
 // One translation unit taken from source to verified HIR under `schema`. Owns
 // the model, because the HIR's TypeIds and the function names both live in it.
 struct Lowered {
-    explicit Lowered(SemanticModel m) : model(std::move(m)) {}
+    explicit Lowered(SemanticModel m, DiagnosticReporter::Config cfg = {})
+        : model(std::move(m)), reporter(std::move(cfg)) {}
 
     SemanticModel                   model;
     DiagnosticReporter              reporter;
@@ -180,12 +181,13 @@ const Machine kNoLayout{DataModel::Lp64, std::nullopt};
 
 [[nodiscard]] std::unique_ptr<Lowered>
 lowerUnder(std::shared_ptr<GrammarSchema const> schema, std::string src,
-           Machine const& machine = kLp64) {
+           Machine const& machine = kLp64, DiagnosticReporter::Config lowering = {}) {
     UnitBuilder builder{std::move(schema), DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto out = std::make_unique<Lowered>(analyze(cu, DiagnosticBudget::libraryDefault(),
-                                                 machine.dataModel, machine.layout));
+                                                 machine.dataModel, machine.layout),
+                                         std::move(lowering));
     EXPECT_FALSE(out->model.hasErrors())
         << "the front end must be clean, or the lowering verdict below is about "
            "something else:" << dump(out->model.diagnostics());
@@ -193,8 +195,10 @@ lowerUnder(std::shared_ptr<GrammarSchema const> schema, std::string src,
     return out;
 }
 
-[[nodiscard]] std::unique_ptr<Lowered> lowerC(std::string src, Machine const& machine = kLp64) {
-    return lowerUnder(dss::test_support::shippedSchemaOrThrow("c"), std::move(src), machine);
+[[nodiscard]] std::unique_ptr<Lowered> lowerC(std::string src, Machine const& machine = kLp64,
+                                              DiagnosticReporter::Config lowering = {}) {
+    return lowerUnder(dss::test_support::shippedSchemaOrThrow("c"), std::move(src), machine,
+                      std::move(lowering));
 }
 
 // The offset of the LAST character of `fragment`'s first occurrence, in the text
@@ -250,9 +254,10 @@ lowerUnder(std::shared_ptr<GrammarSchema const> schema, std::string src,
 //
 // THE MUTATION is the arm
 // `hir-the-relaxed-rule-is-never-applied_non-void-function-end-reached` of
-// `dssharness check-mutations` (WRITTEN, NOT READ — no sweep has read it yet):
-// `maybeCompleteReachableNonVoidEnd` returns `body` at once, so that `f` would be
-// refused by the verifier (`ok` false, H_VerifierFailure, no warning).
+// `dssharness check-mutations`, READ `passed` in the sweep of checkpoint 30
+// (macos-arm64-debug, run 20261020-074548-f64b0dde): `maybeCompleteReachableNonVoidEnd`
+// returns `body` at once, so that `f` is refused by the verifier (`ok` false,
+// H_VerifierFailure, no warning).
 TEST(NonVoidFunctionEndReached, TheBodyIsCompletedAndTheFunctionReportedOnce) {
     std::string const src =
         "int f(int x) { if (x) return 5; }\n"
@@ -286,6 +291,40 @@ TEST(NonVoidFunctionEndReached, TheBodyIsCompletedAndTheFunctionReportedOnce) {
     HirNodeId const m = l->function("main");
     ASSERT_TRUE(m.valid());
     EXPECT_FALSE(has(l->hir().flags(l->hir().functionBody(m)), HirFlags::Synthetic));
+}
+
+// THE REPORT IS SAID, NOT BUILT: a user who suppresses the warning
+// (`--suppress=H_NonVoidFunctionEndReachable`) gets the same completed bodies and
+// no diagnostic at all. The completion is the lowering's whatever its reporter keeps.
+//
+// The case is also what tells three arms apart on this binary, each by what it
+// asks — the shape, never the warning — over bodies that all reach their end
+// (none terminates):
+//   hir-the-relaxed-rule-is-never-applied_non-void-function-end-reached: RED — no
+//     completion, and the verifier refuses `f` and `g`;
+//   hir-a-reached-end-is-completed-in-silence_non-void-function-end-reached: GREEN
+//     — the warning is not emitted at all, and the bodies are completed as here
+//     (this is its neighbour that runs the line it mutates);
+//   hir-a-body-that-terminates-is-completed-too_non-void-function-end-reached:
+//     GREEN — no body here terminates, so taking the termination check out
+//     changes nothing (its neighbour that runs the line it mutates).
+TEST(NonVoidFunctionEndReached, ASuppressedReportStillCompletesTheBody) {
+    DiagnosticReporter::Config quiet;
+    quiet.policy.suppress.insert(kReached);
+    auto const l = lowerC("int f(int x) { if (x) return 5; }\n"
+                          "double g(void) { }\n",
+                          kLp64, quiet);
+    ASSERT_TRUE(l->result->ok) << dump(l->reporter);
+    EXPECT_TRUE(l->reporter.all().empty())
+        << "the suppressed warning is the only thing the lowering says here:" << dump(l->reporter);
+    auto const& interner = l->model.lattice().interner();
+    for (std::string_view const name : {"f", "g"}) {
+        HirNodeId const fn = l->function(name);
+        ASSERT_TRUE(fn.valid()) << name;
+        TypeId const local = completionLocalType(*l, fn);
+        ASSERT_TRUE(local.valid()) << name << ": the body must be completed though nothing is said";
+        EXPECT_EQ(local, interner.fnResult(l->hir().functionSignature(fn))) << name;
+    }
 }
 
 // Every result class gets a local of ITS OWN type — no zero form, no per-class
@@ -364,11 +403,12 @@ TEST(NonVoidFunctionEndReached, OneWarningPerFunctionAtItsOwnClosingBrace) {
 // FIRST: it gets `return 0`, not the unspecified value, and it is not reported.
 //
 // THE MUTATION is the arm
-// `hir-completion-precedes-the-implicit-return-zero_non-void-function-end-reached`
-// (WRITTEN, NOT READ): `maybeCompleteReachableNonVoidEnd` called BEFORE
-// `maybeAppendImplicitReturnZero`, so that `main` would be completed with the local
-// and warned about — a program whose exit status C defines as 0 would then exit
-// with whatever the result register held.
+// `hir-completion-precedes-the-implicit-return-zero_non-void-function-end-reached`,
+// READ `passed` in the coordinator's sweep from main (macos-arm64-debug, run
+// 20261020-074548-f64b0dde): `maybeCompleteReachableNonVoidEnd` called BEFORE
+// `maybeAppendImplicitReturnZero`, so that `main` is completed with the local and
+// warned about — a program whose exit status C defines as 0 would then exit with
+// whatever the result register held.
 TEST(NonVoidFunctionEndReached, MainKeepsItsImplicitReturnZeroAndIsNotReported) {
     auto const l = lowerC(
         "int helper(void) { }\n"
@@ -454,24 +494,30 @@ namespace {
 // completion alone it would have warned on all of them.
 //
 // THE MUTATIONS, one per family, are arms of `dssharness check-mutations`
-// (tests/mutations/arms.registry) — every one WRITTEN, NOT READ: no sweep has read
-// any of them yet, and each line says what its arm declares, nothing more.
+// (tests/mutations/arms.registry), each READ `passed` in the coordinator's sweep
+// from main (macos-arm64-debug; the run beside each):
 //   hir-a-do-body-that-terminates-is-not-seen       `doBodyNeverReachesItsCondition`
-//                                                   answering false (the `do` rows)
+//                                                   answering false (the `do` rows;
+//                                                   run 20261020-051429-b76b4e1a)
 //   hir-an-if-on-a-constant-is-never-a-terminator   `ifNeverCompletes` answering false
-//                                                   (the `if` rows)
+//                                                   (the `if` rows; run
+//                                                   20261020-074548-f64b0dde)
 //   hir-only-a-direct-noreturn-call-ends-a-statement_non-void-function-end-reached
 //                                                   the chokepoint asking
 //                                                   `isDirectNoreturnCall` again instead
 //                                                   of `expressionNeverCompletes` (the
-//                                                   conditional, comma and cast rows)
+//                                                   conditional, comma and cast rows;
+//                                                   run 20261020-074548-f64b0dde)
 //   hir-a-comma-expression-is-never-a-terminator    a comma expression holding a call
 //                                                   that does not return, taken to complete
+//                                                   (run 20261020-051429-b76b4e1a)
 // and one per HOOK of the lowering tier's constant evaluator, for the rows whose
 // condition is a constant only through the machine's layout or through an answer
 // the semantic tier recorded. These five claim their cases in
-// program/test_compile_pipeline, NOT here — whether a row of this case reddens under
-// one is what that arm's first sweep says:
+// program/test_compile_pipeline, NOT here, and are arms of that binary alone — each
+// READ `passed` there (runs 20261020-074548-f64b0dde for the first two,
+// 20261020-051429-b76b4e1a for the other three); whether a row of THIS case reddens
+// under one is not measured:
 //   hir-sizeof-is-not-a-constant-to-the-lowering            `resolveSizeof`
 //   hir-alignof-is-not-a-constant-to-the-lowering           `resolveAlignof`
 //   hir-a-member-offset-is-not-a-constant-to-the-lowering   `resolveFieldOffset`
@@ -644,6 +690,12 @@ TEST(NonVoidFunctionEndReached, TheNeverContinuesClaimIsMadeOnlyWhereItHolds) {
                   false},
              Case{"a conditional with one arm that returns",
                   "{ x ? die() : live(); return 5; }",
+                  false},
+             // …and with the arm that returns written FIRST: the conditional completes
+             // whatever the second arm does, so the walk stops at the first arm's verdict
+             // and never takes the second's.
+             Case{"a conditional whose FIRST arm returns",
+                  "{ x ? live() : die(); return 5; }",
                   false}}) {
         std::string src = "_Noreturn void die(void);\nvoid live(void);\nint f(int x) ";
         src += c.body;
@@ -696,10 +748,10 @@ TEST(NonVoidFunctionEndReached, NoreturnOnOneDeclarationAmongSeveralStillTermina
 // reached would be a false one.
 //
 // THE MUTATION is the arm `analysis-noreturn-is-not-merged-across-declarations` of
-// `dssharness check-mutations` (WRITTEN, NOT READ — no sweep has read it yet): the
-// record no longer merged across the declarations, so that the leaf would answer by
-// the declaration a call resolves to, report these bodies and wrap none. Which of
-// two prototypes that record is, the arm's first sweep says: its claim is this case.
+// `dssharness check-mutations`, READ `passed` in the coordinator's sweep from main
+// (macos-arm64-debug, run 20261020-044339-b5ee1170): the record no longer merged
+// across the declarations, so that the leaf answers by the declaration a call
+// resolves to, reports these bodies and wraps none. Its claim is this case.
 TEST(NonVoidFunctionEndReached, ACallBeforeTheDeclarationThatAddsNoreturnIsATerminator) {
     for (std::string_view const body :
          {"{ (void)x; end(); }",           // the plain call
@@ -769,8 +821,9 @@ TEST(NonVoidFunctionEndReached, ALayoutConstantIsTheAnalysisMachinesOwn) {
 // condition that needs no layout is still a constant without one.
 //
 // THE MUTATION (the carried member) is the arm
-// `analysis-the-model-carries-no-layout-parameters_non-void-function-end-reached`
-// (WRITTEN, NOT READ): the analyzer hands its model no layout parameters, so that
+// `analysis-the-model-carries-no-layout-parameters_non-void-function-end-reached`,
+// READ `passed` in the coordinator's sweep from main (macos-arm64-debug, run
+// 20261020-044339-b5ee1170): the analyzer hands its model no layout parameters, so that
 // every layout row of `ShapesNoExecutionLeavesAreNotReported` would read as these
 // do. Its claim is that case; this one is its neighbour, which must stay green —
 // a model with no parameters is what it builds already.
@@ -888,10 +941,10 @@ TEST(NonVoidFunctionEndReached, ADocumentThatDoesNotStateTheRuleKeepsTheRefusal)
 //     func f -> int (x : int) { … }     the positional one — `funcTail` is the
 //                                       parameters and the body, and decides the kind
 // Nothing else of the language moves, so the two routes are measured on the same
-// statements. WHICH route a document takes is not asserted by these cases, and
-// nothing has read it yet: the four arms named beside the cases below each take
-// the completion out of ONE route, or ahead of the list on it, and declare that
-// route's case red — WRITTEN, NOT READ, all four.
+// statements. WHICH route a document takes is not asserted by these cases: the four
+// arms named beside the cases below each take the completion out of ONE route, or
+// ahead of the list on it, and redden that route's case — each READ `passed` (the
+// run beside its case).
 namespace {
 
 enum class ToyRoute { StatesItsKind, KindByChild };
@@ -1109,17 +1162,19 @@ void expectMainKeepsItsReturnZero(ToyRoute route) {
 
 }  // namespace
 
-// THE MUTATION is the arm `hir-a-row-that-states-its-kind-is-not-completed` (WRITTEN,
-// NOT READ): the completion taken out of `lowerFunctionDecl`, so that `f` and `h`
-// would be refused by the verifier under the relaxed rule.
+// THE MUTATION is the arm `hir-a-row-that-states-its-kind-is-not-completed` (READ
+// `passed`, macos-arm64-debug, run 20261020-074548-f64b0dde): the completion taken
+// out of `lowerFunctionDecl`, so that `f` and `h` are refused by the verifier under
+// the relaxed rule.
 TEST(NonVoidFunctionEndReached, ARowThatStatesItsKindIsCompletedOnItsOwnRoute) {
     expectTheRouteCompletesAReachedEnd(ToyRoute::StatesItsKind);
 }
 
 // THE MUTATION is the arm
-// `hir-main-on-a-row-that-states-its-kind-loses-its-return-zero` (WRITTEN, NOT READ):
-// the completion called BEFORE the list in `lowerFunctionDecl`, so that `main`
-// would be completed with the local and warned about.
+// `hir-main-on-a-row-that-states-its-kind-loses-its-return-zero` (READ `passed`,
+// macos-arm64-debug, run 20261015-141946-b305403f): the completion called BEFORE the
+// list in `lowerFunctionDecl`, so that `main` is completed with the local and warned
+// about.
 TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnTheRouteOfARowThatStatesItsKind) {
     expectMainKeepsItsReturnZero(ToyRoute::StatesItsKind);
 }
@@ -1127,15 +1182,17 @@ TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnTheRouteOfARowThatStates
 // The positional child-kind route — reached by no shipped document, so this
 // in-memory rewrite of the toy one is the only thing that lowers a function there.
 //
-// THE MUTATION is the arm `hir-a-positional-child-kind-row-is-not-completed` (WRITTEN,
-// NOT READ): the completion taken out of `lowerFunction`.
+// THE MUTATION is the arm `hir-a-positional-child-kind-row-is-not-completed` (READ
+// `passed`, macos-arm64-debug, run 20261020-051429-b76b4e1a): the completion taken out
+// of `lowerFunction`.
 TEST(NonVoidFunctionEndReached, APositionalChildKindRowIsCompletedOnItsOwnRoute) {
     expectTheRouteCompletesAReachedEnd(ToyRoute::KindByChild);
 }
 
 // THE MUTATION is the arm
-// `hir-main-on-a-positional-child-kind-row-loses-its-return-zero` (WRITTEN, NOT READ):
-// the completion called BEFORE the list in `lowerFunction`.
+// `hir-main-on-a-positional-child-kind-row-loses-its-return-zero` (READ `passed`,
+// macos-arm64-debug, run 20261015-141946-b305403f): the completion called BEFORE the
+// list in `lowerFunction`.
 TEST(NonVoidFunctionEndReached, MainKeepsItsReturnZeroOnThePositionalChildKindRoute) {
     expectMainKeepsItsReturnZero(ToyRoute::KindByChild);
 }

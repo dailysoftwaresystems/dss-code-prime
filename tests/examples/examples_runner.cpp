@@ -80,6 +80,9 @@
 // every declared target, including the ones this host can never spawn, and its
 // header states why that half is the only witness a cross-host spec has.
 #include "coverage_boundary.hpp"
+// The judgement of `forbidDiagnostics` — ONE home, shared with the CLI-subprocess
+// sibling; this runner hands it what a reporter said (`diagnosticCodesSaid`).
+#include "forbidden_diagnostics.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -947,19 +950,16 @@ parseForbiddenDiagnostics(nlohmann::json const& arr, fs::path const& path,
     return true;
 }
 
-// THE JUDGEMENT, pure so the corpus path and its self-test ask the same thing:
-// which of the `forbidden` codes did this compile emit? In declaration order,
-// each named once however many times it was emitted, at ANY severity.
-[[nodiscard]] std::vector<std::string>
-forbiddenDiagnosticsEmitted(std::vector<std::string> const& forbidden,
-                            DiagnosticReporter const& rep) {
-    std::vector<std::string> hit;
-    for (auto const& name : forbidden) {
-        for (auto const& d : rep.all()) {
-            if (diagnosticCodeName(d.code) == name) { hit.push_back(name); break; }
-        }
-    }
-    return hit;
+// WHAT A COMPILE SAID, as the judgement of `forbidDiagnostics` reads it: every
+// diagnostic's code NAME, in report order, repeats kept, at ANY severity. The
+// judgement itself is the one both runners ask (tests/test_support/
+// forbidden_diagnostics.hpp); this is the in-process runner's half of handing it
+// what a reporter holds, as `diagnosticCodesInCliLog` is the CLI sibling's.
+[[nodiscard]] std::vector<std::string> diagnosticCodesSaid(DiagnosticReporter const& rep) {
+    std::vector<std::string> codes;
+    codes.reserve(rep.all().size());
+    for (auto const& d : rep.all()) codes.emplace_back(diagnosticCodeName(d.code));
+    return codes;
 }
 
 [[nodiscard]] ExampleManifest readManifest(fs::path const& path) {
@@ -2219,9 +2219,10 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
 // durable witness is `DependsOnArtifact::mustDifferFromBaseline`, which makes
 // the prerequisite its own subject.
 //
-// `forbidDiagnostics` is the manifest's own list (empty when the key is absent):
-// a prerequisite this arm BUILDS FROM SOURCE is part of the example's compile,
-// so its reporter is judged by the same list — see the ★ note where it is read.
+// `compilesSaid` (null when the manifest forbids nothing) is where this build
+// RECORDS what its reporter said: a prerequisite this arm BUILDS FROM SOURCE is
+// part of the example's compile, so the arm judges it with its own compile, by
+// the one list — see the ★ note where it is recorded.
 [[nodiscard]] std::optional<fs::path>
 buildDependencyArtifact(DependsOnArtifact const& dep,
                         fs::path const&          scratchPath,
@@ -2230,7 +2231,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
                         std::string const&       language,
                         ::dss::opt::OptPipeline const* pipelineOverride,
                         CompileConfig const*           configOverride,
-                        std::vector<std::string> const& forbidDiagnostics,
+                        std::vector<CompileSaid>* compilesSaid,
                         std::map<std::string, std::string>* capturedImages) {
     // Nested prerequisites FIRST (order-correct): each nested artifact must
     // exist on disk before this dep's own build resolves against it.
@@ -2241,7 +2242,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
                                                   exampleDir, language,
                                                   pipelineOverride,
                                                   configOverride,
-                                                  forbidDiagnostics,
+                                                  compilesSaid,
                                                   capturedImages);
         if (!nestedPath.has_value()) return std::nullopt;  // already reported
         nestedLibs.push_back(std::move(*nestedPath));
@@ -2299,23 +2300,14 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
     // ★ `forbidDiagnostics` REACHES THE PREREQUISITE. The key says what the
     // example's compile must not report, and a library this arm builds from the
     // example's own sources is that compile — a function in `lib.c` is as much
-    // the example's as one in `main.c`. Its build has its own reporter, so it is
-    // judged here, by the same pure judgement the arm applies to its own.
-    if (auto const emitted = forbiddenDiagnosticsEmitted(forbidDiagnostics, depRep);
-        !emitted.empty()) {
-        std::string names;
-        for (auto const& n : emitted) { names += names.empty() ? "" : ", "; names += n; }
-        std::ostringstream depDump;
-        for (auto const& d : depRep.all()) {
-            depDump << "\n  " << diagnosticCodeName(d.code)
-                    << " (severity=" << static_cast<int>(d.severity)
-                    << "): " << d.actual;
-        }
-        ADD_FAILURE() << "FORBIDDEN DIAGNOSTIC: example " << exampleDir.generic_string()
-                      << " declares `forbidDiagnostics` and the build of its dependsOn"
-                         " artifact " << dep.artifact << " (spec=" << dep.spec
-                      << ") emitted " << names << ". All diagnostics:" << depDump.str();
-        return std::nullopt;
+    // the example's as one in `main.c`. Its build has its own reporter, so what it
+    // said is RECORDED here, and the arm judges it beside its own compile, in ONE
+    // verdict (`forbiddenDiagnosticsOfAnArm`, tests/test_support/
+    // forbidden_diagnostics.hpp) — a prerequisite's report never hides the arm's.
+    if (compilesSaid != nullptr) {
+        compilesSaid->push_back(CompileSaid{"the build of its dependsOn artifact " + dep.artifact
+                                                + " (spec=" + dep.spec + ")",
+                                            diagnosticCodesSaid(depRep)});
     }
     auto const depArtifact = outDir / dep.artifact;
     if (!fs::exists(depArtifact)) {
@@ -2576,12 +2568,16 @@ compileAndRunArm(fs::path const& exampleDir,
         }
         resolveLibs.push_back(std::move(*resolved));
     }
+    // EVERY compile of this arm, as `forbidDiagnostics` judges it: each prerequisite
+    // recorded as it is built, this arm's own compile LAST (the forbid block below).
+    std::vector<CompileSaid> compilesSaid;
     for (auto const& dep : t.dependsOn) {
         auto depArtifact = buildDependencyArtifact(dep, scratch.path(), outDir,
                                                    exampleDir, m.language,
                                                    pipelineOverride,
                                                    configOverride,
-                                                   m.forbidDiagnostics,
+                                                   m.forbidDiagnostics.empty()
+                                                       ? nullptr : &compilesSaid,
                                                    &armResult.dependencyBytes);
         if (!depArtifact.has_value()) {
             armResult.verdict = ArmVerdict::Poisoned;
@@ -2655,19 +2651,20 @@ compileAndRunArm(fs::path const& exampleDir,
     // pipeline's lowering produces is still a warning the entry forbade.
     // SEVERITY IS NOT READ: the key names a code that must not appear at all.
     // (An Error would already have reddened the arm above; a Warning, an Info
-    // and a Hint are what reach this line.) The build of a `dependsOn` artifact
-    // has its own reporter and is judged by the same list where it is built
-    // (`buildDependencyArtifact`) — it is the example's compile too.
+    // and a Hint are what reach this line.) Each `dependsOn` artifact this arm
+    // built was recorded where it was built (`buildDependencyArtifact`) — it is
+    // the example's compile too — and this arm's own compile is recorded LAST:
+    // ONE verdict, the one both runners ask (tests/test_support/
+    // forbidden_diagnostics.hpp), naming every compile that said a forbidden code.
     if (!m.forbidDiagnostics.empty()) {
-        auto const emitted = forbiddenDiagnosticsEmitted(m.forbidDiagnostics, rep);
-        std::string names;
-        for (auto const& n : emitted) { names += names.empty() ? "" : ", "; names += n; }
-        EXPECT_TRUE(emitted.empty())
+        compilesSaid.push_back(CompileSaid{"the compile", diagnosticCodesSaid(rep)});
+        auto const forbidden = forbiddenDiagnosticsOfAnArm(m.forbidDiagnostics, compilesSaid);
+        EXPECT_TRUE(forbidden.empty())
             << "FORBIDDEN DIAGNOSTIC: example " << exampleDir.generic_string()
             << " spec=" << t.spec << " arm=" << armLabel
-            << " declares `forbidDiagnostics` and the compile emitted " << names
-            << ". All diagnostics:" << diagDump.str();
-        if (!emitted.empty()) {
+            << " declares `forbidDiagnostics` and " << describeForbiddenSaid(forbidden)
+            << ". All diagnostics of its own compile:" << diagDump.str();
+        if (!forbidden.empty()) {
             armResult.verdict = ArmVerdict::Poisoned;
             return armResult;
         }
@@ -5040,8 +5037,10 @@ TEST(ExamplesCorpusLint, BuildOnlyTargetsOptimizedArmIsCompiledAndJudged) {
 //   1. the PARSE refuses every declaration that could only pass by saying
 //      nothing — an unknown code name above all (an absence is satisfied by
 //      nothing happening, so a misspelt code would be green forever);
-//   2. the JUDGEMENT is pure and is asked over a REAL compile's reporter, in
-//      both directions (the forbidden code found; another code not found);
+//   2. the READING of a reporter — every report, in order, at every severity —
+//      is what this runner hands the judgement both runners share (tests/
+//      test_support/forbidden_diagnostics.hpp, pinned by its own self-test,
+//      test_support/test_forbidden_diagnostics), asked in both directions;
 //   3. the ARM goes RED: `runOneTarget` on a fixture whose compile emits the
 //      code its manifest forbids produces exactly one failure, saying so — and
 //      the SAME fixture forbidding a code the compile does not emit produces
@@ -5186,8 +5185,9 @@ TEST(ExamplesCorpusLint, ForbidDiagnosticsIsParsedJudgedAndRedsTheArm) {
     // The function that reaches its end is in the LIBRARY the arm builds from the
     // example's own `forbid_lib.c`; `main.c` is clean. The key must see it: a
     // manifest that forbids a code speaks for every source the arm compiles, and
-    // the prerequisite has its own reporter the arm never reads. Red, then the
-    // same fixture forbidding a code nothing emits — built, linked, run.
+    // the prerequisite has its own reporter, which the arm RECORDS beside its own
+    // compile and judges with it. Red, then the same fixture forbidding a code
+    // nothing emits — built, linked, run.
     {
         ScratchDir depSandbox{Location::Temp, "forbid-diagnostics-dep-pin"};
         auto const depDir  = depSandbox.path();
@@ -5249,11 +5249,15 @@ TEST(ExamplesCorpusLint, ForbidDiagnosticsIsParsedJudgedAndRedsTheArm) {
         }
     }
 
-    // ── 2. THE JUDGEMENT — pure, so it is pinned exactly ─────────────────────
+    // ── 2. THE READING — what a reporter said, as the judgement is handed it ──
     //
     // A reporter built by hand: the forbidden code TWICE (it is named once),
     // at Warning and at Info severity (severity is not read), beside a code
-    // nobody forbade.
+    // nobody forbade. The reading keeps every report, in order; the shared
+    // judgement over it names the forbidden code once. The two reports of the
+    // code say different things: the reporter drops an identical one as a recent
+    // duplicate (and says so, `P_DiagnosticsElided`), which is not this reading's
+    // question.
     {
         DiagnosticReporter rep;
         for (DiagnosticSeverity const sev :
@@ -5261,6 +5265,8 @@ TEST(ExamplesCorpusLint, ForbidDiagnosticsIsParsedJudgedAndRedsTheArm) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::H_NonVoidFunctionEndReachable;
             d.severity = sev;
+            d.actual   = sev == DiagnosticSeverity::Warning ? "the first report"
+                                                            : "the second report";
             rep.report(d);
         }
         {
@@ -5269,11 +5275,14 @@ TEST(ExamplesCorpusLint, ForbidDiagnosticsIsParsedJudgedAndRedsTheArm) {
             d.severity = DiagnosticSeverity::Warning;
             rep.report(d);
         }
-        EXPECT_EQ(forbiddenDiagnosticsEmitted({kNotSaid, kWarned}, rep),
+        EXPECT_EQ(diagnosticCodesSaid(rep),
+                  (std::vector<std::string>{kWarned, kWarned, "S_UnknownAttribute"}))
+            << "every report is read, in order, at every severity";
+        EXPECT_EQ(forbiddenCodesSaid({kNotSaid, kWarned}, diagnosticCodesSaid(rep)),
                   (std::vector<std::string>{kWarned}))
             << "the emitted code is named, once; the other is not";
-        EXPECT_TRUE(forbiddenDiagnosticsEmitted({kNotSaid}, rep).empty());
-        EXPECT_TRUE(forbiddenDiagnosticsEmitted({}, rep).empty());
+        EXPECT_TRUE(forbiddenCodesSaid({kNotSaid}, diagnosticCodesSaid(rep)).empty());
+        EXPECT_TRUE(forbiddenCodesSaid({}, diagnosticCodesSaid(rep)).empty());
     }
 }
 

@@ -71,7 +71,11 @@ struct DSS_EXPORT HirToMirResult {
 // the statement the lowered module's symbol-id end is made from
 // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE). It is one of two things, and
 // each caller says which; there is no value that means "nobody said".
-struct MirSymbolIdSpace {
+// Made ONLY by its two factories (P69, lane `cs`, fold f26b): the constructor is
+// private, so `{}`, `{n}` and `optional::emplace()` cannot state an end without saying
+// which of the two statements it is.
+class MirSymbolIdSpace {
+public:
     // The unit was analysed against a NAME TABLE that ends at `tableEnd` — the driver's
     // case (`model.symbols().size()`). Every id the module mints is past it, so none is
     // a record of the table: the table holds typedefs, tags, fields, locals and injected
@@ -90,7 +94,11 @@ struct MirSymbolIdSpace {
     }
     // The end to state: the table's, or 0 where the unit's own symbols are all there is
     // (the builder's end is never below a symbol the module holds or was kept clear of).
-    std::uint32_t statedEnd = 0;
+    [[nodiscard]] constexpr std::uint32_t statedEnd() const noexcept { return statedEnd_; }
+
+private:
+    explicit constexpr MirSymbolIdSpace(std::uint32_t end) noexcept : statedEnd_{end} {}
+    std::uint32_t statedEnd_;
 };
 
 struct DSS_EXPORT MirLoweringConfig {

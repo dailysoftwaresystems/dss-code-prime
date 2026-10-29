@@ -659,7 +659,9 @@ round's close; each checkpoint's commit message says what was and was not run on
   on cl and MinGW); a Unit-stage optimize no longer warns of a fixpoint cap the Program stage resumes — the warning
   belongs to a module's LAST stage, which the driver tells the engine, and a test seam judges that every production
   route lowers a module only after its Program stage. 3 rows applied:
-  `D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES` CLOSED;
+  `D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES` CLOSED, and REOPENED the same day by the
+  review of H4b (its F3, READ: the thin-LTO import stage optimizes each unit at the Program stage and still reports a
+  truncation the whole-program merge resumes), closed again in the harness lane's H5;
   `D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK` amended, open until main's sweep of its 13 Windows arms;
   `D-HARNESS-SCRIPTS-INDEX-CENSUS-CANNOT-RESOLVE-A-CALL-IT-HANDS-A-PATH-VALUE` NEW, 🔵 DISCLOSED (P3; on its measured
   size, the next cycle's first harness item). ✔MEASURED by the lane on ITS bytes — checkpoint 31 plus checkpoint 32's
@@ -667,9 +669,29 @@ round's close; each checkpoint's commit message says what was and was not run on
   windows-x86_64-release 2878 of 2878, linux-arm64-debug and macos-arm64-debug 2855 of 2855; its 48
   macos-arm64-debug arms passed (36 in 20261022-060751-f40e1a01, the 12 re-declared in 20261028-184000-8db67903).
   The three paths L2a also changed merged three-way (compile_pipeline.hpp, program.cpp, tests/core/CMakeLists.txt),
-  the arm registry by arm (1132 arms, re-sorted); the MERGED tree was not run before this commit — its five-leg suite
-  and main's sweep of the 13 Windows arms follow it. Plan 30's §0, §1.1 and §8 are re-derived here (679 open rows;
-  PR #59 holds 93).
+  the arm registry by arm (1132 arms, re-sorted). The MERGED tree, read after the commit: 2877 of 2877 on all five
+  legs (run 20261028-202355-b6a9233b; one binary moved into the `repo-guard` label, which read 24 of 24 before the
+  commit, run 20261028-195308-2c3589bc). Its review: SEND BACK, 17 findings (1 MAJOR, the row above), answered in H5.
+- **Checkpoint 35 (2026-10-28) = the C front end lane's fold f26b**: a tentative `__declspec(dllimport) int x;` is a
+  REFERENCE to `__imp_x`, as both references make it (it was a common DEFINITION, and at block scope an automatic local
+  read uninitialised — SILENT, P0 class), and `dllimport` on a definition is refused by name; a weak alias of a
+  select-any copy that loses is a weak definition of its OWN name, never withdrawn with its copy (one predicate,
+  `carriedNameGoesWithItsCarrier`, src/link/common_yield.hpp; the format documents' `weakDefinitionBesideWeak`); a
+  visibility the format cannot write is written as its document states (`visibilityWrittenAs` on every Mach-O and PE
+  document) and warned (H_VisibilityWrittenAsAnother 0xF01F), where it was dropped; a block-scope function declaration
+  hides nothing in its block, and a call that takes an out-of-scope declaration is said (S_OutOfScopeDeclarationUsed
+  0xE09D); a PE DLL's export directory names its DLL; the examples runners' `forbidDiagnostics` judgement has ONE home
+  (tests/test_support/forbidden_diagnostics.hpp). 14 rows applied: 4 CLOSED (2 born this round), 5 NEW (3 DISCLOSED
+  and open: D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE P0, a merge blocker and f26c's first item;
+  D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION P1;
+  D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS P2, the link lane's 3e). ✔MEASURED by the
+  lane on its final bytes (checkpoint 33 + f26b; finals run 20261028-211006-ebd439c9, no filter): macos-arm64-debug
+  and linux-x86_64-debug 2894 of 2894; windows-x86_64-debug and windows-x86_64-release 2916 of 2917, the one red
+  anchor_citations_guard citing a new row this fold applies; its last 8 arms passed on macos-arm64-debug (host run
+  20261028-203400-06f46391); 142 arms changed only in a case count are main's to sweep; one arm SURVIVED (an imported
+  function's address, INFERRED an unreachable guard) — f26c's. Settled by main: four text paths merged against
+  checkpoint 33 (each result byte-identical to the lane's copy) and the arm registry by arm (1197 arms). The MERGED
+  tree's five-leg suite follows the commit. Plan 30 is re-derived here (681 open rows; PR #59 holds 95).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -732,8 +754,9 @@ round's close; each checkpoint's commit message says what was and was not run on
   fold f26c); DSS takes "the first copy" and a weak tie by CREATION order — every compiled unit before every named
   object — never the command line's order every reference uses (a select-any or weak value from the wrong input; P0,
   the link lane's 3d); `-r` writes a PE weak alias as a second external inside its COMDAT, so link.exe reads the
-  discarded copy (P0, 3d); a tentative `__declspec(dllimport) int x;` made a DEFINITION where the references import
-  (f26b). LOUD — the PE platform runtime has no `__chkstk` and no `/GS` family (H5); no attribute may lead a
+  discarded copy (P0, 3d); an OBJECT's `main` on PE is called with garbage arguments on the all-object route (P0, 3d).
+  IN MAIN SINCE CHECKPOINT 35 (the C front end lane's f26b): the tentative `__declspec(dllimport) int x;` made a
+  DEFINITION. LOUD — the PE platform runtime has no `__chkstk` and no `/GS` family (H5); no attribute may lead a
   block-scope `extern`; a shared library holding only data
   (DLL, `.so`, `.dylib`) refused as "an exec with no instructions" on all three formats (the link lane's 3d); a call
   to an undeclared function (C89's implicit declaration, which every reference still compiles) — f26c.

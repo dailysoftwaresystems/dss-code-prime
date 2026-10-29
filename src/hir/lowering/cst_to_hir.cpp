@@ -683,12 +683,17 @@ struct Lowerer {
         // carry the field's `Ptr<FnSig>` TYPE so the `ConstructAggregate` verifier's
         // strict child==field equality holds. Emit a synthetic `Cast` (MIR
         // `mapCast` lowers FnSig→Ptr as a representation-free Bitcast over the
-        // GlobalAddr). A SIGNATURE MISMATCH (`operands(target)[0] != child.type`)
-        // is NOT decayed here → it stays a loud mismatch at both tiers.
+        // GlobalAddr). The signature test is the semantic tier's own
+        // (`decayedFunctionReachesPointee`: a COMPATIBLE function type, C
+        // 6.7.6.3p15 — P69 fold f26b, lane `cs`), so a designator returning
+        // `int (*)[]` reaches an `int (*(*)(void))[3]` slot as the decay it was
+        // admitted as. An INCOMPATIBLE signature is NOT decayed here → it stays a
+        // loud mismatch at both tiers.
         if (ck == TypeKind::FnSig && tk == TypeKind::Ptr) {
             auto const ptrElem = interner.operands(target);
             bool const sameSig =
-                !ptrElem.empty() && ptrElem[0] == child.type;
+                !ptrElem.empty()
+                && decayedFunctionReachesPointee(interner, ptrElem[0], child.type);
             // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): a bare function DESIGNATOR
             // (FnSig) -> `void*` (the gcc/POSIX dlsym / Tcl ClientData idiom),
             // gated on the single authoritative `allowVoidPtrFnConvert` flag —
@@ -15022,8 +15027,8 @@ struct Lowerer {
             // exactly the same way (MEASURED at the pre-TF-C73 HEAD).
             // The node needs NO param children (the FnSig carries the
             // param types — the shipped-descriptor synthesis precedent). A
-            // BLOCK-scope proto (re-homed to file scope per
-            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE) routes to the MODULE decls via
+            // BLOCK-scope proto (bound in its block, D-CSUBSET-BLOCK-SCOPE-PROTOTYPE,
+            // and absorbed by a file-scope declaration where there is one) routes to the MODULE decls via
             // `moduleDecls_` (the static-local accumulator pattern) so the
             // HIR→MIR extern pre-pass sees it; flag-off (or a legacy language
             // without the row) keeps the documented pre-c86 shape: the proto
@@ -15146,6 +15151,49 @@ struct Lowerer {
                             "module-decls accumulator (outside a module "
                             "tree walk)"), d);
                     }
+                }
+                continue;
+            }
+            // ★★ P69 (lane `cs`, fold f26b) — A DECLARATOR AN ATTRIBUTE MADE AN IMPORT
+            // (`SymbolRecord::isImportedDeclaration`: `__declspec(dllimport)`, or on pe
+            // `__attribute__((dllimport))`, at one of its positions, no initializer). It
+            // declares a name ANOTHER IMAGE defines, so it lowers as the reference it is —
+            // the ExternGlobal an `extern` declaration lowers to, its row written through
+            // the extern producers' one realization seam (`recordExternRow`) — and never
+            // as storage of this unit: not the tentative definition the same file-scope
+            // declaration without the attribute is, not the automatic object a block one
+            // is. ✔MEASURED (lane `cs` probes di2, di4, di5; cl 19.51 and mingw-w64 gcc
+            // 13.2.0): both write `__imp_x` and no `x` for each such declaration, and
+            // `int a, * __declspec(dllimport) p;` defines `a` and imports `p` — hence PER
+            // DECLARATOR, here, rather than per declaration. An imported FUNCTION is a
+            // prototype and the arm above lowers it. An imported object has static
+            // storage and is never variably modified, so this arm and the VLA capture
+            // below never meet. The linkage: the declarator's own fold — at file scope
+            // its caller has already merged it into the entity's accumulation; inside a
+            // body it is merged here, as a block `extern`'s is, so it reaches the
+            // file-scope entity (C 6.2.2p4).
+            if (auto const* ir = model.recordFor(sym);
+                ir != nullptr && ir->isImportedDeclaration && ir->isExternDeclaration
+                && !ir->aliasTarget.valid()) {
+                LinkageAttr const importLinkage =
+                    asGlobal
+                        ? declaratorLinkage(
+                              linkageFrom(linkagePrefixRoots(node, *decl), *decl),
+                              *decl, d)
+                        : mergeDeclaredLinkage(
+                              sym, d, declaratorLinkage(staticLinkage, *decl, d));
+                HirNodeId const ref =
+                    track(builder.makeExternGlobal(reprOf(ir->type), sym.v), d);
+                recordExternRow(ref, sym, importLinkage, /*libraryOverride=*/{});
+                if (asGlobal) {
+                    pushOut(ref, d);
+                } else if (moduleDecls_ != nullptr) {
+                    moduleDecls_->push_back(ref);
+                } else {
+                    // The block-extern guard's twin: never a silent drop of the row.
+                    pushOut(reportedError(d,
+                        "block-scope import synthesized with no module-decls "
+                        "accumulator (outside a module tree walk)"), d);
                 }
                 continue;
             }
@@ -16562,6 +16610,78 @@ struct Lowerer {
         return fn_;
     }
 
+    // ★ THE IMPORT ROW OF ONE EXTERN NODE — the realization seam of the `extern`
+    // producers (`lowerExternDeclInto`'s, and since P69 fold f26b the import arm of
+    // `lowerVarLikeInto`, whose declarator an attribute made a declaration of another
+    // image's definition). `libraryOverride` is the declaration's SOURCE library
+    // override (empty where the declaration states none); the precedence it obeys —
+    // the source override, then the platform's realization, then UNBOUND — is stated
+    // at `lowerExternDeclInto`. (UCRT-P4 Decision 1: the declaration syntax has no
+    // authority over realization, so no producer may realize a name differently.)
+    void recordExternRow(HirNodeId h, SymbolId sym, LinkageAttr const& mergedLinkage,
+                         std::unordered_map<std::string, std::string> const&
+                             libraryOverride) {
+        // D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION: an
+        // `extern` declaration is a declaration of the same entity a later
+        // definition defines, so its facets join the accumulation —
+        // `extern int x __attribute__((visibility("hidden"))); int x = 8;`
+        // is `OBJECT GLOBAL HIDDEN` in gcc AND clang and was `DEFAULT` here.
+        // ⚠ THE FOLD IS THE CALLER'S, AND IS HANDED IN. It used to re-fold
+        // the declarator its caller had folded moments earlier, on the
+        // reasoning that a repeat is a no-op — it is not: the accumulation
+        // is a WRITE that can DIAGNOSE, and under the after-the-definition
+        // rule a second fold reports a declaration as following itself. It
+        // is passed EXPLICITLY rather than by handing `recordLinkage` the
+        // symbol for the separate reason that that parameter also switches
+        // on the record's static-initializer schedule and its 6.2.2p4 arm,
+        // which are answers about the DEFINING declaration and have no
+        // business being re-asked at an import row.
+        recordLinkage(h, mergedLinkage);
+        auto const* rec = model.recordFor(sym);
+        // A SOURCE override present ⇒ the user STATED the image; the platform
+        // row is not consulted at all (precedence 1).
+        auto const* shipped =
+            (rec != nullptr && libraryOverride.empty())
+                ? model.suppressedShippedSymbolFor(rec->name)
+                : nullptr;
+        HirExternRecord row{
+            h, rec ? rec->name : std::string{},
+            shipped != nullptr ? shipped->library : libraryOverride,
+            // Nothing to bind ⇒ UNBOUND, and say so explicitly rather than
+            // leaving an empty library to be interpreted downstream. ★ P69: a
+            // shipped-SOURCE realization binds nothing either — its body is
+            // linked from DSS's runtime archive (the bare-prototype arm's rule).
+            /*noLibraryBinding=*/(shipped == nullptr && libraryOverride.empty())
+                || (shipped != nullptr && !shipped->shippedSourcePath.empty()),
+            shipped != nullptr ? shipped->version : std::string{}};
+        // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
+        // DECLARATOR by
+        // Pass-1 and lives on the SymbolRecord, so this producer just carries
+        // it — no second parse, no chance of the two tiers disagreeing about
+        // which declarator owns which label. Empty for every extern declared
+        // without one, which makes the import rail byte-identical there.
+        if (rec != nullptr) row.asmName = rec->asmName;
+        // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): carry the
+        // record's per-target link base name too, for the SAME reason and by
+        // the same one-line copy. A source-declared `extern` normally has
+        // none (the field is EMPTY on every user-written declaration, so this
+        // producer's rows are byte-identical to pre-TF-C121); reading it off
+        // the SymbolRecord — rather than deciding here that it cannot exist —
+        // is what keeps this producer honest if a future path stamps one.
+        if (rec != nullptr) row.linkName = rec->linkName;
+        // UCRT-P4: and the PLATFORM's per-target link base name outranks the
+        // (normally empty) record copy — the descriptor is the authority on
+        // which name the library exports for this C identifier on this target.
+        // Without this an `extern int fstat(int, struct stat*);` written by hand
+        // re-imports Darwin-x86_64's LEGACY 32-bit-inode `_fstat` instead of
+        // `_fstat$INODE64`, which is a SILENT wrong-ABI bind, not a link error.
+        // The user's own `__asm` label (`asmName`, above) still outranks both
+        // inside `ffi::linkNameFor`.
+        if (shipped != nullptr && !shipped->linkName.empty())
+            row.linkName = shipped->linkName;
+        externDecls.push_back(std::move(row));
+    }
+
     // c23 D-CSUBSET-EXTERN-MULTI-DECLARATOR (2026-07-18): lower an extern
     // declaration to N ExternGlobal/ExternFunction nodes — ONE per NAMED declarator
     // (`extern int a, b;` → two ExternGlobals; `extern int f(int), g;` → an
@@ -16742,67 +16862,11 @@ struct Lowerer {
         // AGNOSTIC: every input is DATA on a descriptor row, already per-format
         // selected by the shared availability predicate. No format / arch / language
         // identity test, and no symbol name is special-cased.
+        // P69 (lane `cs`, fold f26b): the producer is the member `recordExternRow`, so
+        // the import arm of `lowerVarLikeInto` writes its rows through the same seam.
         auto recordExtern = [&](HirNodeId h, SymbolId sym,
                                 LinkageAttr mergedLinkage) {
-            // D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION: an
-            // `extern` declaration is a declaration of the same entity a later
-            // definition defines, so its facets join the accumulation —
-            // `extern int x __attribute__((visibility("hidden"))); int x = 8;`
-            // is `OBJECT GLOBAL HIDDEN` in gcc AND clang and was `DEFAULT` here.
-            // ⚠ THE FOLD IS THE CALLER'S, AND IS HANDED IN. It used to re-fold
-            // the declarator its caller had folded moments earlier, on the
-            // reasoning that a repeat is a no-op — it is not: the accumulation
-            // is a WRITE that can DIAGNOSE, and under the after-the-definition
-            // rule a second fold reports a declaration as following itself. It
-            // is passed EXPLICITLY rather than by handing `recordLinkage` the
-            // symbol for the separate reason that that parameter also switches
-            // on the record's static-initializer schedule and its 6.2.2p4 arm,
-            // which are answers about the DEFINING declaration and have no
-            // business being re-asked at an import row.
-            recordLinkage(h, mergedLinkage);
-            auto const* rec = model.recordFor(sym);
-            // A SOURCE override present ⇒ the user STATED the image; the platform
-            // row is not consulted at all (precedence 1 above).
-            auto const* shipped =
-                (rec != nullptr && libraryOverride.empty())
-                    ? model.suppressedShippedSymbolFor(rec->name)
-                    : nullptr;
-            HirExternRecord row{
-                h, rec ? rec->name : std::string{},
-                shipped != nullptr ? shipped->library : libraryOverride,
-                // Nothing to bind ⇒ UNBOUND, and say so explicitly rather than
-                // leaving an empty library to be interpreted downstream. ★ P69: a
-                // shipped-SOURCE realization binds nothing either — its body is
-                // linked from DSS's runtime archive (the bare-prototype arm's rule).
-                /*noLibraryBinding=*/(shipped == nullptr && libraryOverride.empty())
-                    || (shipped != nullptr && !shipped->shippedSourcePath.empty()),
-                shipped != nullptr ? shipped->version : std::string{}};
-            // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
-            // DECLARATOR by
-            // Pass-1 and lives on the SymbolRecord, so this producer just carries
-            // it — no second parse, no chance of the two tiers disagreeing about
-            // which declarator owns which label. Empty for every extern declared
-            // without one, which makes the import rail byte-identical there.
-            if (rec != nullptr) row.asmName = rec->asmName;
-            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): carry the
-            // record's per-target link base name too, for the SAME reason and by
-            // the same one-line copy. A source-declared `extern` normally has
-            // none (the field is EMPTY on every user-written declaration, so this
-            // producer's rows are byte-identical to pre-TF-C121); reading it off
-            // the SymbolRecord — rather than deciding here that it cannot exist —
-            // is what keeps this producer honest if a future path stamps one.
-            if (rec != nullptr) row.linkName = rec->linkName;
-            // UCRT-P4: and the PLATFORM's per-target link base name outranks the
-            // (normally empty) record copy — the descriptor is the authority on
-            // which name the library exports for this C identifier on this target.
-            // Without this an `extern int fstat(int, struct stat*);` written by hand
-            // re-imports Darwin-x86_64's LEGACY 32-bit-inode `_fstat` instead of
-            // `_fstat$INODE64`, which is a SILENT wrong-ABI bind, not a link error.
-            // The user's own `__asm` label (`asmName`, above) still outranks both
-            // inside `ffi::linkNameFor`.
-            if (shipped != nullptr && !shipped->linkName.empty())
-                row.linkName = shipped->linkName;
-            externDecls.push_back(std::move(row));
+            recordExternRow(h, sym, mergedLinkage, libraryOverride);
         };
         for (NodeId d : declarators) {
             NodeId const nameNode = declaratorNameNode(tree(), d, dc);

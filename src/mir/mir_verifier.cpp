@@ -344,6 +344,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkStoreValueTypes(reporter);
     checkLinkageRecords(reporter);
     checkAliases(reporter);
+    checkSymbolIdsDefinedOnce(reporter);
     checkSymbolIdsBelowTheStatedEnd(reporter);
     if (reporter.hitCap()) return false;
     // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT, AND-ed with the reporter's
@@ -1899,7 +1900,6 @@ void MirVerifier::checkAliases(DiagnosticReporter& reporter) const {
         defined.insert(mir_.funcSymbol(mir_.funcAt(fi)).v);
     for (std::uint32_t gi = 0; gi < mir_.moduleGlobalCount(); ++gi)
         defined.insert(mir_.globalSymbol(mir_.globalAt(gi)).v);
-    std::unordered_set<std::uint32_t> stated;
     for (MirAlias const& a : mir_.aliases()) {
         auto const say = [&](std::string_view why) {
             report(reporter, DiagnosticCode::I_VerifierFailure,
@@ -1909,13 +1909,10 @@ void MirVerifier::checkAliases(DiagnosticReporter& reporter) const {
             say("its target is no function or global this module defines — an alias "
                 "is one more name on a definition, and there is none to name");
         }
-        if (defined.contains(a.alias.v)) {
-            say("the name is also a function or a global this module defines — one "
-                "name, two definitions");
-        }
-        if (!stated.insert(a.alias.v).second) {
-            say("the name is stated as an alias twice");
-        }
+        // Its NAME defined by something else here — a function, a global, another
+        // alias, a block export — is `checkSymbolIdsDefinedOnce`'s, said once for every
+        // kind of definition (P69 fold f26b; it was said here for a function and a
+        // global only).
         if (a.linkage.tentative) {
             say("it is marked as a tentative definition — an alias has no storage of "
                 "its own");
@@ -1925,6 +1922,18 @@ void MirVerifier::checkAliases(DiagnosticReporter& reporter) const {
                              /*hasInitializer=*/false, /*isThreadLocal=*/false);
         if (!a.linkage.tentative && !defect.empty()) {
             say(std::format("its linkage is not well formed: {}", defect));
+        }
+    }
+}
+
+void MirVerifier::checkSymbolIdsDefinedOnce(DiagnosticReporter& reporter) const {
+    for (MirSymbolDefinedTwice const& twice : symbolIdsDefinedTwice(mir_)) {
+        std::string detail = symbolDefinedTwiceSentence(twice);
+        if (twice.inst.valid()) {
+            reportInst(reporter, DiagnosticCode::I_VerifierFailure, twice.inst, std::move(detail));
+        } else {
+            report(reporter, DiagnosticCode::I_VerifierFailure,
+                   std::format("mir module: {}", detail));
         }
     }
 }

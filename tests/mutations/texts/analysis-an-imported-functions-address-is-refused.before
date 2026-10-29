@@ -1,0 +1,1 @@
+                bool const isFunction = rec.type.valid() && in.kind(rec.type) == TypeKind::FnSig;
