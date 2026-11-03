@@ -82,6 +82,27 @@ static int castsAndLiterals(int n, int m) {
     return 42;
 }
 
+/* 27-29 (P69 L2a2): a bound inside a FUNCTION'S RETURN type is evaluated where the cast or the
+ * compound literal evaluates the type name; one inside its PARAMETER list has function
+ * prototype scope and is evaluated nowhere (C 6.7.6.2p5). */
+static int store[8];
+static int (*g(int (*q)[]))[] {
+    (void)q;
+    return (int (*)[])store;
+}
+static int functionTypes(void) {
+    int k = 0, j = 0;
+    (void)(int (*(*)(int (*)[]))[k++ + 1])g;
+    if (k != 1) return 27;
+    k = 0;
+    int (*(*p)(int (*)[]))[] = (int (*(*)(int (*)[]))[k++ + 1]){ g };
+    if (k != 1 || p != g) return 28;
+    k = 0;
+    (void)(int (*(*)(int (*)[j++ + 1]))[k++ + 1])g;
+    if (k != 1 || j != 0) return 29;
+    return 42;
+}
+
 /* 17-26: NOT a variable-length array type - NOT evaluated; and the bare object's size. */
 static int unevaluated(int n, int m) {
     int k = 0;
@@ -110,5 +131,6 @@ int main(void) {
     if ((r = typeNames(4, 3)) != 42) return r;
     if ((r = castsAndLiterals(4, 3)) != 42) return r;
     if ((r = unevaluated(4, 3)) != 42) return r;
+    if ((r = functionTypes()) != 42) return r;
     return 42;
 }

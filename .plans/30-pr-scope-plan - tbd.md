@@ -11,15 +11,15 @@
 > The decisions in §4 are the orchestrator's, under the operator's order of 2026-09-21 (*"you do everything"*),
 > and each one is veto-able.
 
-## 0. Where we are (MEASURED 2026-10-28, main `8f67c636` = checkpoint 34, plus fold f26b = checkpoint 35)
+## 0. Where we are (MEASURED 2026-11-03, checkpoint 36 = fold L2a2 on `95253dc2`)
 
 **681 open rows.**
 
 | band | OPEN | DISCLOSED | GATED | total |
 |---|---|---|---|---|
 | P0 | 2 | 23 | — | 25 |
-| P1 | 44 | 49 | 1 | 94 |
-| P2 | 139 | 55 | 22 | 216 |
+| P1 | 44 | 48 | 1 | 93 |
+| P2 | 139 | 56 | 22 | 217 |
 | P3 | 221 | 7 | 103 | 331 |
 | P4 | 8 | — | 3 | 11 |
 | P5 | 4 | — | — | 4 |
@@ -40,7 +40,7 @@
   - weeks 33–36: 161, 147, 197, 127;
   - weeks 37–41: 40, 44, 163, 54, 32;
   - week 43 so far: 13.
-- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **29 closed and 90 opened (3 created, 87 disclosed): counted −26, REAL net +61** (2026-10-28, at checkpoint 35's tree). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
+- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 89 opened (3 created, 86 disclosed): counted −25, REAL net +61** (2026-11-03, at checkpoint 36). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
 - (read 2026-10-22) **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
 
 ## 1. PR #59 — the exit scope
@@ -56,13 +56,13 @@ The merge is the operator's.
 
 ### 1.1 Folds, in order
 
-`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2 → H5 → 3d → f26c → L2b → 3e`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
+`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ H5 → 3d → f26c → L2b → 3e → f26d`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
 
 | lane | rows (§8 A.1) | what it is |
 |---|---|---|
-| `lm` | 34 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement; then the try/except P0 pair and the `#if` truth P0; L2a's new rows, open until main's sweep of their arms (L2a2), and arithmetic on a pointer to a VLA (L2b) |
-| `cs` | 26 | f26b folded (attributes, weak/select-any, declarations and type rules, visibility, `dllimport` as an import); f26c: the name-used-before-its-declaration P0 (its typedef form included), the implicit declaration, the pointer-to-array composite, a VM type name in a cast, the out-of-scope survivor arm |
-| `xa` | 25 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; the all-object link's order and its client object's imports (3d), a library datum, data symbols and a shared library's initializers (3e) |
+| `lm` | 33 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement; then the try/except P0 pair and the `#if` truth P0; L2a2 folded (checkpoint 36; its class records held two closings open, each decided at two sites); L2b: the ONE home of "is this type variably modified" first, then the comma fold rule's and the tag/member name-space predicate's consolidations, the scope check's second implementation, and L2b's own rows |
+| `cs` | 25 | f26b folded (attributes, weak/select-any, declarations and type rules, visibility, `dllimport` as an import); f26c: the name-used-before-its-declaration P0 (its typedef form included), the implicit declaration, the pointer-to-array composite, a VM type name in a cast, the out-of-scope survivor arm |
+| `xa` | 27 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; the all-object link's order and its client object's imports (3d); 3e opens with two home audits — the link-side select-any / weak / alias election with the `-r` writer (cs's review finding F3 moved here) and the foreign unwind carry (the reopened chained-unwind row) — then a library datum, data symbols and a shared library's initializers |
 | `hm` | 7 | the PE platform runtime (H5: the stack probes, the /GS family and its startup seeding, `__main`, the gcc SEH personality and `_Unwind_Resume`), the census row it opened, P68's two audit rows, the fixpoint-cap row reopened by the review of H4b (the thin-LTO stage), and the filesystem substrate's row until main's sweep of its arms |
 | first lane to free | 2 | the shipped-constants P0, and the SysV memory-class ABI P0 |
 | round-close sweep | 2 | fixed rows whose arms have not been read |
@@ -215,7 +215,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 
 ### A.1 PR #59 (current)
 
-#### cs (f26c) — 25
+#### cs (f26c, f26d) — 25
 
 - [[D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE]] (P0)
 - [[D-C-AN-ATTRIBUTE-AFTER-A-REFERRED-TAG-NAMES-ANOTHER-TAG-AND-ONE-IN-A-TYPE-NAME-IS-REFUSED]] (P0)
@@ -223,6 +223,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-C-WEAK-ON-AN-INFERRED-TYPE-OBJECT-IS-SILENTLY-DROPPED]] (P0)
 - [[D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME]] (P0)
 - [[D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE]] (P0)
+- [[D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET]] (P0)
 - [[D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION]] (P1)
 - [[D-C-A-CALLING-CONVENTION-ATTRIBUTE-NAMING-ANOTHER-CONVENTION-IS-REFUSED-NOT-EMITTED]] (P1)
 - [[D-C-A-CONSTANTS-MEMBER-NAME-IS-RESOLVED-BY-A-SCOPE-WALK]] (P1)
@@ -240,12 +241,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-CSUBSET-COMPOSITE-ALIGNED-HIR-TEXT]] (P2)
 - [[D-CSUBSET-WEAK-PROTO-NO-SAME-TU-PROPAGATION]] (P2)
 - [[D-DSSHIR-NATIVE-SIDE-TABLES-HAVE-NO-TEXT-FORM]] (P2)
-- [[D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS]] (P2)
 - [[D-LK3-EXEC-EXPORT-SCOPE-NOT-CONFIG-DRIVEN]] (P3)
-
-#### cs or lm, whichever frees first — 1
-
-- [[D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET]] (P0)
 
 #### hm (H5) — 7
 
@@ -257,7 +253,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-AUDIT-P68-ROUND-12-MINOR-FINDINGS]] (P3)
 - [[D-AUDIT-P68-ROUND-13-MINOR-FINDINGS]] (P3)
 
-#### lm (L2a2, L2b) — 34
+#### lm (L2a2, L2b) — 33
 
 - [[D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT]] (P0)
 - [[D-C-A-DECLARATORS-NAME-IS-BOUND-AT-THE-END-OF-ITS-DECLARATION]] (P0)
@@ -284,7 +280,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-C-NEITHER-CONSTANT-EVALUATOR-HOLDS-A-COMPLEX-VALUE]] (P1)
 - [[D-C-SIZEOF-OF-A-VLA-TYPED-OPERAND-SKIPS-THE-OPERANDS-SIDE-EFFECTS]] (P1)
 - [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]] (P1)
-- [[D-CORE-A-LEFT-RECURSIVE-SHAPE-LOADS-THOUGH-THE-SPEC-DOCUMENTS-ITS-REFUSAL]] (P1)
 - [[D-HIR-BRACE-PEEL-TAKES-AN-OPERATORS-OPERAND-FOR-THE-ELEMENT]] (P1)
 - [[D-HIR-CST-CONST-EVAL-RECURSES-PER-CONDITIONAL-AND-LOGICAL-LEVEL]] (P1)
 - [[D-HIR-WHOLE-STRUCTURE-BRACE-ELEMENT-IS-PLACED-BY-TYPE-STAMPS]] (P1)
@@ -303,7 +298,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY]] (P2)
 - [[D-PLAN00-D14-FC4-DECLARATOR-SUBSTRATE-SCOPE-DESIGN-CHOSEN]] (P3)
 
-#### xa (3d, 3e) — 25
+#### xa (3d, 3e) — 27
 
 - [[D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE]] (P0)
 - [[D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN]] (P0)
@@ -322,7 +317,9 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED]] (P2)
 - [[D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] (P2)
 - [[D-LINK-MACHO-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] (P2)
+- [[D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS]] (P2)
 - [[D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION]] (P2)
+- [[D-LK-COFF-FOREIGN-UNWIND-DROP]] (P2)
 - [[D-LK-PE-DLL-EXPORTS-AN-OVERRIDABLE-WEAK-NAME]] (P2)
 - [[D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE]] (P2)
 - [[D-LK-SHARED-LIBRARY-RUNS-NO-STATIC-INITIALIZERS]] (P2)

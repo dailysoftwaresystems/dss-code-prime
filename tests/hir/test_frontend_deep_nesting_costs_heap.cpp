@@ -693,8 +693,14 @@ TEST(FrontendDeepNesting, ScalarBraceLevelsCostHeap) {
 // `_Generic`, `__builtin_expect`, the lowering's `if` over a conditional or an AND chain, and
 // `return ({ ({ … 5; }) … });`). Each is a frame of its driver now; these cases hold them there.
 // The selections, the builtin and the statement expression nest at 2000 (2x the measured death
-// floor): their PARSE is quadratic in the nesting (✔MEASURED the same run: `({` 445 ms at 1e3,
-// over 30 s at 1e4) — a finding of the parser's tier, recorded in the row.
+// floor), chosen when their PARSE was quadratic in the nesting (✔MEASURED the same run: `({` 445 ms
+// at 1e3, over 30 s at 1e4). That was the tree builder's: it read its whole scope stack for every
+// token, and c opens a scope at every `(` `{` `[`. It asks whether a scope of a kind is open now
+// (P69 L2a2, lane `lm`;
+// D-PARSE-A-PARENTHESISED-CHAIN-COSTS-PARSE-WORK-EXPONENTIAL-IN-ITS-DEPTH): ✔MEASURED 2026-10-28
+// (windows-x86_64-debug, MinGW GCC Debug, the parse alone) `({` 60 ms at 1e3 and 208 ms at 4e3,
+// against 632 and 9762 ms before; test_parser_speculation_refusal_cost.cpp pins it linear by the
+// builder's own scope-work counter.
 // ★ IN A CHILD PROCESS, the analysis on a worker of the bounded stack's size
 // (`test::boundedStackBytes()`, 256 KiB) and the lowering on `runOnBoundedStack`: a recursion
 // restored exhausts a stack and the child dies — this case's red, with the child's status.

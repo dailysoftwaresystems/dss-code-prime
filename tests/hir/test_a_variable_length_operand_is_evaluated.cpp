@@ -352,6 +352,79 @@ TEST(VariableLengthEvaluation, ACompoundLiteralsVariablyModifiedTypeNameRuns) {
         << "the literal's object is initialized by the bound's run, then its value";
 }
 
+// P69 L2a2 (review N5): a run-time bound inside a FUNCTION'S RETURN type is part of the type
+// name's variably modified type and runs where the cast or the literal evaluates it; one inside
+// its PARAMETER list has function prototype scope and runs nowhere (C 6.7.6.2p5). ✔MEASURED
+// 2026-10-28 (WSL gcc 13.3.0 / clang 18.1.3, gnu2x and c2x -pedantic-errors, built and run): the
+// cast and the literal leave k == 1, the parameter's bound leaves it 0, and both at once give
+// 10 * k + j == 10 on all four.
+namespace {
+constexpr char const* kVmReturningFunction =
+    "static int store[8];\n"
+    "static int (*g(int (*q)[]))[] { (void)q; return (int (*)[])store; }\n";
+
+// The SeqExprs whose statements reach `k` and whose value reaches `g`.
+[[nodiscard]] std::size_t runsReachingBoth(Hir const& h, std::uint32_t k, std::uint32_t g) {
+    std::size_t n = 0;
+    std::uint32_t const tag = h.id().v;
+    for (std::uint32_t i = 1; i < h.nodeCount(); ++i) {
+        HirNodeId const id{i, tag};
+        if (h.kind(id) != HirKind::SeqExpr) continue;
+        if (refsInStatements(h, id, k) >= 1u && refsUnder(h, h.seqExprResult(id), g) >= 1u) ++n;
+    }
+    return n;
+}
+}  // namespace
+
+TEST(VariableLengthEvaluation, ACastWhoseFunctionReturnsAVariablyModifiedTypeRunsItsBound) {
+    auto l = lower(std::string{kVmReturningFunction}
+                   + "int f(void) { int k = 0; (void)(int (*(*)(int (*)[]))[k++ + 1])g; "
+                     "return k; }\n");
+    ASSERT_NE(l->result, nullptr);
+    EXPECT_EQ(l->reporter.errorCount(), 0u) << dump(l->reporter);
+    Hir const& h = l->result->hir;
+    EXPECT_EQ(runsReachingBoth(h, symbolNamed(l->model, "k"), symbolNamed(l->model, "g")), 1u)
+        << "the return type's bound runs before the cast's operand, once";
+}
+
+TEST(VariableLengthEvaluation, ACompoundLiteralWhoseFunctionReturnsAVariablyModifiedTypeRunsItsBound) {
+    auto l = lower(std::string{kVmReturningFunction}
+                   + "int f(void) { int k = 0; "
+                     "int (*(*p)(int (*)[]))[] = (int (*(*)(int (*)[]))[k++ + 1]){ g }; "
+                     "(void)p; return k; }\n");
+    ASSERT_NE(l->result, nullptr);
+    EXPECT_EQ(l->reporter.errorCount(), 0u) << dump(l->reporter);
+    Hir const& h = l->result->hir;
+    std::uint32_t const k = symbolNamed(l->model, "k");
+    std::size_t evaluated = 0;
+    std::uint32_t const tag = h.id().v;
+    for (std::uint32_t i = 1; i < h.nodeCount(); ++i) {
+        HirNodeId const id{i, tag};
+        if (h.kind(id) != HirKind::UnnamedObject) continue;
+        auto const kids = h.children(id);
+        if (kids.size() == 1u && h.kind(kids[0]) == HirKind::SeqExpr
+            && refsInStatements(h, kids[0], k) >= 1u)
+            ++evaluated;
+    }
+    EXPECT_EQ(evaluated, 1u)
+        << "the literal's object is initialized by the return type's bound's run, then g";
+}
+
+// THE CONTROL, as hard as the positives: with the return type's bound run, the PARAMETER
+// list's bound is written by nothing — `j` is referenced nowhere in the module.
+TEST(VariableLengthEvaluation, AFunctionTypesParameterBoundIsNotEvaluated) {
+    auto l = lower(std::string{kVmReturningFunction}
+                   + "int f(void) { int k = 0, j = 0; "
+                     "(void)(int (*(*)(int (*)[j++ + 1]))[k++ + 1])g; return k; }\n");
+    ASSERT_NE(l->result, nullptr);
+    EXPECT_EQ(l->reporter.errorCount(), 0u) << dump(l->reporter);
+    Hir const& h = l->result->hir;
+    EXPECT_EQ(runsReachingBoth(h, symbolNamed(l->model, "k"), symbolNamed(l->model, "g")), 1u)
+        << "the return type's bound runs";
+    EXPECT_EQ(refsInModule(h, symbolNamed(l->model, "j")), 0u)
+        << "a parameter's bound has function prototype scope: it runs nowhere";
+}
+
 // ── NOT a variable-length array type: NOT evaluated ───────────────────────────────────────
 
 TEST(VariableLengthEvaluation, AFixedArraysRowIsNotEvaluated) {

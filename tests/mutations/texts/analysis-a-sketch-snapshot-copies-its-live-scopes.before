@@ -1,0 +1,1 @@
+    std::size_t const copied = 0;   // entries this snapshot copies: none, it marks

@@ -1400,6 +1400,14 @@ public:
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,
                                            std::span<ScopeKind const> stack) const noexcept;
+    // The same question asked of a PRESENCE oracle — `open(ctx, kind)`: is a scope of that kind
+    // open? — instead of a stack: one question per scope kind that carries a rule forbidding
+    // `tok`, never the stack's depth, and none for a grammar that declares no scope rules. The
+    // answer equals the stack walk's on the stack the oracle describes (P69 L2a2: the walk, once
+    // per token, made a parse cost Θ(tokens × nesting)).
+    using ScopeOpenFn = bool (*)(void const* ctx, ScopeKind kind) noexcept;
+    [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
+                                           void const* ctx) const noexcept;
 
     // ── Termination ──
     [[nodiscard]] bool canEndSource(SchemaCursor cur) const noexcept;

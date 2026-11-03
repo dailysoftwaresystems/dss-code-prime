@@ -1,0 +1,1 @@
+        return schema.isTokenValidInScope(m.id, &askScopeOpen, &sv)

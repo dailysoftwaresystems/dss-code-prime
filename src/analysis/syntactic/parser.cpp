@@ -3,6 +3,7 @@
 #include "analysis/syntactic/pratt_walker.hpp"
 #include "core/types/compiled_shape.hpp"
 #include "core/types/declarator_walk.hpp"
+#include "core/types/prototype_param_scope.hpp"   // P69 L2a2: one prototype-scope question
 #include "core/types/operator_table.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/schema_walker.hpp"
@@ -239,6 +240,12 @@ struct Parser::Impl {
     // `expr.wrapperRules.{binary,unary,postfix}` — names are
     // config-sourced, none of these wrapper rules have compiled bodies).
     std::vector<RuleId>                 frameRules;
+    // P69 L2a2 (lane `lm`): parallel to `frameRules` — for each frame, the index (into
+    // `frameRules`) of the nearest frame at or below it that is a binder row or a sketch scope,
+    // or `kNoFrameAnchor`. Pushed and popped with `frameRules`, so the definition-body test
+    // (`bindDefinitionParamsAtItsBody_`) reads it in O(1) instead of walking the frames.
+    static constexpr std::uint32_t      kNoFrameAnchor = ~std::uint32_t{0};
+    std::vector<std::uint32_t>          frameAnchors;
 
     // Parser-side walker. The builder embeds its own; the two are
     // driven lock-step by the dispatch loop. Divergence is a load-
@@ -542,13 +549,21 @@ struct Parser::Impl {
     // answers it here — a failure that met no ceiling where the room it used is left (its
     // attempted peaks folded into the enclosing probe's, as the run would have reached them), or a
     // ceiling refutation under this exact room. Under any sketch first, then the current version.
+    // P69 L2a2 (lane `lm`): a record found under the CURRENT version answers from what the sketch
+    // holds — the run it stands for asked the sketch — so its replay is a sketch question too
+    // (`askedTheSketch`, counted by the replay site): an enclosing probe whose only sketch
+    // dependence is a replayed nested failure is then keyed by its sketch version, as the run
+    // would have keyed it, never by `kAnySketchVersion` (which would refute it under ANY later
+    // sketch, where the nested failure might not recur).
     struct RecordedFailure {
         std::optional<AmbiguousTypeNameCandidate> candidate;
         std::optional<SpeculationCapHit>          hit;
+        bool                                      askedTheSketch = false;
     };
     [[nodiscard]] std::optional<RecordedFailure> recordedFailure_(RuleId branch) {
         std::size_t const budget = probeBudgetNow_();
         for (std::uint64_t const version : {kAnySketchVersion, sketch.version()}) {
+            bool const keyedBySketch = version != kAnySketchVersion;
             FailedProbeKey const key{branch.v, tokens.position(), walker.isDesynced(), version};
             if (auto const it = failedProbes_.find(key); it != failedProbes_.end()) {
                 FailedProbe const& f = it->second;
@@ -559,13 +574,13 @@ struct Parser::Impl {
                                                        speculationDepth + f.relSpeculationPeak);
                     peakExpressionAttempt_  = std::max(peakExpressionAttempt_,
                                                        expressionDepth + f.relExpressionPeak);
-                    return RecordedFailure{f.candidate, std::nullopt};
+                    return RecordedFailure{f.candidate, std::nullopt, keyedBySketch};
                 }
             }
             if (auto const it = ceilingRefuted_.find(
                     CeilingRefutedKey{key, speculationDepth, expressionDepth, budget});
                 it != ceilingRefuted_.end())
-                return RecordedFailure{it->second.candidate, it->second.hit};
+                return RecordedFailure{it->second.candidate, it->second.hit, keyedBySketch};
         }
         return std::nullopt;
     }
@@ -1095,10 +1110,23 @@ struct Parser::Impl {
         walker.leaveRule(SourceSpan::empty(0), rule);
         frames.back().close();
         frames.pop_back();
-        if (!frameRules.empty()) frameRules.pop_back();
+        if (!frameRules.empty()) {
+            frameRules.pop_back();
+            frameAnchors.pop_back();
+        }
         if (sketch.enabled()) {
             recordAtDeclaratorEnd_(rule);
-            if (sketch.isScopeRule(rule)) sketch.closeScope();
+            if (sketch.isScopeRule(rule)) {
+                std::uint32_t const closedScope = sketch.closeScope();
+                // P69 L2a2 (lane `lm`): a parameter list's prototype scope, noted with its
+                // node so the declarator's end can keep a definition's own (see BinderSketch).
+                if (sketch.isPrototypeParamScopeRule(rule)) {
+                    NodeId const closedNode = newestVisiblePendingChild_();
+                    if (closedNode.valid() && builder->nodeKind(closedNode) == NodeKind::Internal
+                        && builder->nodeRule(closedNode).v == rule.v)
+                        sketch.notePrototypeParamScope(closedScope, closedNode);
+                }
+            }
             for (auto& bn : binderNames) {
                 if (declaratorMode && !liftToEnclosingScope) {
                     sketch.recordUnlessBoundAtItsDeclarator(std::move(bn.name),
@@ -1108,6 +1136,9 @@ struct Parser::Impl {
                 sketch.record(std::move(bn.name), bn.isType, bn.span,
                               liftToEnclosingScope);
             }
+            // P69 L2a2: a declarator-mode row's close ends whatever its declarators kept —
+            // a definition's body has opened and bound them by now, or there is none.
+            if (declaratorMode) sketch.dropDefinitionParams();
         }
     }
 
@@ -1124,6 +1155,16 @@ struct Parser::Impl {
     // triage read T as the typedef inside the very declaration that had hidden it.
     // The row is found by structure, never by distance: up through the slot
     // wrappers and lists, the next frame must be a declarator-mode row.
+    // The newest visible child staged in the current frame — read from the back: a scan from the
+    // front cost each declarator of a long list the whole list (P69 L2a2, lane `lm`).
+    [[nodiscard]] NodeId newestVisiblePendingChild_() const {
+        std::span<NodeId const> const pending = builder->currentFramePendingChildren();
+        for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+            if (!isEmptySpace(builder->nodeFlags(*it))) return *it;
+        }
+        return NodeId{};
+    }
+
     void recordAtDeclaratorEnd_(RuleId closed) {
         auto const& dcOpt = schema->semantics().declarators;
         if (!dcOpt.has_value() || closed != dcOpt->declaratorRule || frameRules.empty())
@@ -1144,15 +1185,18 @@ struct Parser::Impl {
         RuleId const rowRule = *it;
         // The declarator that just closed: the newest visible child staged in the
         // frame it closed into.
-        NodeId closedNode{};
-        for (NodeId c : builder->currentFramePendingChildren()) {
-            if (!isEmptySpace(builder->nodeFlags(c))) closedNode = c;
-        }
+        NodeId const closedNode = newestVisiblePendingChild_();
         if (!closedNode.valid() || builder->nodeKind(closedNode) != NodeKind::Internal
             || builder->nodeRule(closedNode).v != closed.v) {
             return;
         }
         BuilderDeclaratorView const view{*builder};
+        // P69 L2a2 (lane `lm`, the L2a review's N9): of the parameter lists closed inside this
+        // declarator, keep the one whose suffix declares its NAME a function — the only one a
+        // definition's body may see — by the predicate the analyzer asks
+        // (core/types/prototype_param_scope.hpp); every other list's names died with its scope.
+        sketch.keepDefinitionParamsOf(
+            prototypeParamListOf(view, nameDeclaringFnSuffix(view, closedNode, dc), dc));
         NodeId const nameNode = declaratorNameNode(view, closedNode, dc);
         if (!nameNode.valid()) return;   // abstract — no binding
         SourceSpan const nameSpan = builder->nodeSpan(nameNode);
@@ -1489,7 +1533,7 @@ struct Parser::Impl {
         // Rules 2 + 3 — the sketch knows the name.
         const SourceSpan nameSpan = builder->nodeSpan(typeLeaves[0]);
         const std::string_view name = src->slice(nameSpan);
-        ++sketchLookups_;   // a probe that asked this is not memoised (`failedProbes_`)
+        ++sketchLookups_;   // the failed-probe memo keys this probe by the sketch version
         switch (sketch.lookup(name)) {
         case BinderSketch::NameKind::Type:    return true;
         case BinderSketch::NameKind::Value:   return false;
@@ -1968,6 +2012,7 @@ struct Parser::Impl {
                     impl_.frames.pop_back();
                     if (!impl_.frameRules.empty()) {
                         impl_.frameRules.pop_back();
+                        impl_.frameAnchors.pop_back();
                     }
                 }
                 // SF-2: truncate the expression work-stack back to its pre-
@@ -2307,14 +2352,38 @@ struct Parser::Impl {
     void pushFrameBookkeeping_(TreeBuilder::OpenScope&& guard, RuleId rule) {
         frames.push_back(std::move(guard));
         frameRules.push_back(rule);
+        frameAnchors.push_back(
+            sketch.enabled() && (sketch.binderFor(rule) != nullptr || sketch.isScopeRule(rule))
+                ? static_cast<std::uint32_t>(frameRules.size() - 1)
+                : (frameAnchors.empty() ? kNoFrameAnchor : frameAnchors.back()));
         walker.enterRule(rule);
         // FC2 binder sketch: a `semantics.scopes` rule's frame is a
         // lexical scope — the SAME rule-driven scope model the semantic
         // analyzer builds, mirrored parser-side. (Probe rollback pops
         // frames without closeFrameOnce; the sketch snapshot restore
         // covers those opens wholesale.)
+        if (sketch.enabled()) bindDefinitionParamsAtItsBody_(rule);
         if (sketch.enabled() && sketch.isScopeRule(rule)) {
             sketch.openScope(rule);
+        }
+    }
+
+    // P69 L2a2 (lane `lm`, the L2a review's N9): a function DEFINITION's own parameters — kept
+    // at its declarator's end (`recordAtDeclaratorEnd_`) after their prototype scope closed —
+    // are bound when the definition's BODY opens: a frame of the row's `definitionBodyRule`
+    // (its `kindByChild` discriminator) whose nearest enclosing row or scope frame is that row.
+    // A body nested in another scope (a statement expression in an initializer, a block inside
+    // the body) is no definition body. The nearest such frame is read from `frameAnchors`, O(1):
+    // a walk down the frames per push cost Θ(D²) on a chain of D frames with neither between
+    // them (✔MEASURED: test_parser_speculation_ceilings 22.69 s at L2a, a timeout at 494 s with
+    // the walk, windows-x86_64-debug).
+    void bindDefinitionParamsAtItsBody_(RuleId opening) {
+        if (!sketch.isDefinitionBodyRule(opening) || frameAnchors.size() < 2) return;
+        std::uint32_t const anchor = frameAnchors[frameAnchors.size() - 2];   // below the new frame
+        if (anchor == kNoFrameAnchor) return;
+        if (BinderSketch::BinderDecl const* row = sketch.binderFor(frameRules[anchor])) {
+            if (row->definitionBodyRule.valid() && row->definitionBodyRule == opening)
+                sketch.bindDefinitionParams();
         }
     }
 
@@ -2438,6 +2507,7 @@ struct Parser::Impl {
             // again (the hit replayed); and a failure that met none answers only where the room it
             // used is left (`recordedFailure_`).
             if (std::optional<RecordedFailure> const rec = recordedFailure_(branch)) {
+                if (rec->askedTheSketch) ++sketchLookups_;   // the replay asks what the run asked
                 if (rec->hit.has_value()) replayCeilingHit_(*rec->hit);
                 if (rec->candidate.has_value()) sketch.recordCandidate(*rec->candidate);
                 if (finalCandidateDirectDescent_()) return true;
@@ -3459,12 +3529,16 @@ ParseResult Parser::parse() && {
     // c108: capture the total token-work BEFORE moving the builder (the stream is
     // untouched by finish()) — the deterministic O(N)-work proxy for the perf pin.
     std::uint64_t const accesses = I.tokens.accessCount();
+    std::uint64_t const sketchWork = I.sketch.workCount();   // P69 L2a2: the sketch's own
+    std::uint64_t const scopeWork  = I.builder->scopeWork();  // and the builder's scope work
     return ParseResult{
         .tree               = std::move(*I.builder).finish(),
         .typeNameCandidates = I.sketch.takeCandidates(),
         .globalTypeNames    = I.sketch.globalTypeNames(),
         .globalTypeBindings = I.sketch.globalTypeBindings(),
         .tokenAccessCount   = accesses,
+        .sketchWorkCount    = sketchWork,
+        .scopeWorkCount     = scopeWork,
     };
 }
 

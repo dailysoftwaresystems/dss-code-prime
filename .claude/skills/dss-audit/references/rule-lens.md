@@ -64,4 +64,14 @@ This is where the auditor earns its keep. Each entry: the **class**, its **tell*
    anchor's *stated scope* and confirm the work satisfies all of it; otherwise it is a **partial**
    close with the remainder re-anchored — not a strike.
 
+9. **Instance closure — the class left open.** A fix correct for the reported case, made where it was seen,
+   while the same decision is taken at other sites. *Tell:* the diff touches one site and the closing names a
+   case (one format, one target, one form) rather than a universe; the same theme appears in earlier commit
+   subjects of the round; a path edited five or more times in the round; the pin lists the reported case by
+   hand. *Disproof:* search the DATA (the kind, the schema key, the diagnostic) across every tier, format and
+   target and compare with the lane's site list; pick two cells of the universe the pin does not name, plus the
+   optimized form of the same source, and measure them on DSS and on each reference. A site left deciding the
+   same thing, or a neighbour that fails, is green-but-rule-breaking. The lane's class-closure record must exist
+   and be searched by data (`dss-cycle` `references/class-closure.md`).
+
 ---

@@ -692,6 +692,28 @@ round's close; each checkpoint's commit message says what was and was not run on
   function's address, INFERRED an unreachable guard) — f26c's. Settled by main: four text paths merged against
   checkpoint 33 (each result byte-identical to the lane's copy) and the arm registry by arm (1197 arms). The MERGED
   tree's five-leg suite follows the commit. Plan 30 is re-derived here (681 open rows; PR #59 holds 95).
+- **Checkpoint 36 (2026-11-03) = the library lane's fold L2a2**, its answer to the review of L2a: the binder sketch
+  opens a function prototype's scope at its parameter list and re-binds a definition's own parameters at its body (one
+  structural predicate, src/core/types/prototype_param_scope.hpp); a replayed speculation failure counts as a sketch
+  question; a nest of statement expressions, parentheses or blocks parses in work LINEAR in its depth — the tree
+  builder no longer walks its whole scope stack for every token (per-kind presence counts; a 4000-deep `({` nest
+  9762 → 208 ms on windows-x86_64-debug), pinned by two deterministic work counters, never by wall time; a variably
+  modified type in a cast's or compound literal's function RESULT runs its bound, its parameters never (as gcc and
+  clang run it); the deep-nesting runner's time budget follows the slower of its two finals. **The first fold under
+  the operator's class-closure rule** (2026-11-03, `.claude/skills/dss-cycle/references/class-closure.md`, in this
+  commit with its skill edits): of the three closings the lane brought, its class records held TWO open — the comma
+  operator's constant-fold rule is decided by two evaluators (`cst_const_eval.cpp`, `const_eval.cpp`), and the name
+  space a declared name enters by the sketch and the analyzer separately — each row kept open with its second site
+  named and its consolidation the lane's next fold L2b; and they found that "is this type variably modified" (C
+  6.7.6p3) has NO home (three definitions, about forty sites) — L2b's first item. 18 rows applied: 1 CLOSED
+  (`D-CORE-A-LEFT-RECURSIVE-SHAPE-LOADS-THOUGH-THE-SPEC-DOCUMENTS-ITS-REFUSAL`), none new. ✔MEASURED by the lane on its
+  final bytes (checkpoint 33 + L2a2; finals run 20261028-232113-09de98e8, no filter): macos-arm64-debug and
+  linux-x86_64-debug 2877, windows-x86_64-debug and windows-x86_64-release 2899 of 2899; its 27 arms on
+  macos-arm64-debug: 26 `passed`, 1 violated that is not L2a2's (its red set is main's re-aimed declaration). Merged
+  three-way: `cst_to_hir.cpp` (clean) and the arm registry by arm (1205 arms). The orchestrator's: the arm registry's
+  header states the encoding the tool reads (UTF-8, LF), where it claimed ASCII; the C front end lane is two folds now
+  (f26c after 3d, f26d after 3e); the review of f26b's finding F3 (the PE weak pair in a relocatable link) moved to the
+  link lane's 3e, inside its home audit of the link-side election. The MERGED tree's five-leg suite follows the commit.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

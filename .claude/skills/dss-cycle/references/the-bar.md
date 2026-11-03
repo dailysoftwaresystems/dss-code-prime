@@ -279,7 +279,10 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      assert the stub matches what the real path produces. ★ And prefer assertions on **CONTENT**
      over **COUNT**: "eight tokens" was satisfied by eight corrupted tokens; "the tokens are clean"
      was not.
-   - **Multi-site / multi-form contracts** — the "apply X at every site/form of class C"
+   - **Multi-site / multi-form contracts** — ★★★★ since 2026-11-03 this is a GATE at plan, hand-back and review,
+     not only a test shape: the full procedure (invariant, one home, site list, universe, neighbour sweep, the
+     class-closure record, the home audit) is [class-closure.md](class-closure.md). The "apply X at every
+     site/form of class C"
      class (e.g. "strip the specifier prefix at every positional decl resolution"). A green
      suite over a SUBSET of the sites/forms is NOT proof: latent misses at the unexercised
      sites survive review *and* green. (Cycle-13 audit case: a 4th missed strip site — the

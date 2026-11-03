@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -242,6 +243,11 @@ public:
     void popScope();    // emits P_BuilderInvariant on underflow
     [[nodiscard]] ScopeKind                   currentScope() const noexcept;
     [[nodiscard]] std::span<ScopeKind const>  scopeStack()   const noexcept;
+    // The builder's own scope work, counted (P69 L2a2, lane `lm`): one unit per token
+    // resolution and one per scope-presence question it asks — a deterministic proxy, as the
+    // parser's token accesses are for what it reads. Linear in the input for a correct
+    // resolution; a check that read the scope stack per token would make it Θ(tokens × nesting).
+    [[nodiscard]] std::uint64_t               scopeWork()    const noexcept { return scopeWork_; }
 
     // ── frame introspection (used by parsers driving recovery) ──
     // Returns InvalidRule if no frame is currently open. Reading from a
@@ -386,6 +392,7 @@ private:
         TrailedStack<NodeId>::Mark        pendingChildren;
         TrailedStack<Frame>::Mark         openFrames;
         TrailedStack<ScopeKind>::Mark     scopes;
+        TrailedStack<std::uint32_t>::Mark scopeKindCounts;
         TrailedSet<std::uint32_t>::Mark   closedCookies;
         TrailedWriteLog<NodeId,
                         detail::Node>::Mark nodeWrites;
@@ -491,6 +498,20 @@ private:
 
     TrailedStack<Frame>                    open_;        // LIFO open-frame stack
     TrailedStack<ScopeKind>                scopes_;      // current scope stack
+    // P69 L2a2 (lane `lm`): how many scopes of each kind `scopes_` holds — indexed densely, by
+    // the order in which the grammar's kinds are first opened (`scopeKindSlot_`) — so a token's
+    // scope check asks PRESENCE in O(1) instead of reading the stack. Trailed with `scopes_`:
+    // marked and rewound with every checkpoint, retired with the other trails. A slot first
+    // assigned inside a rolled-back branch is re-extended with 0 when next asked for (its count
+    // was 0 at every mark before it existed).
+    TrailedStack<std::uint32_t>            scopeKindCounts_;
+    std::unordered_map<std::uint16_t, std::uint32_t> scopeKindSlots_;
+    std::uint64_t                          scopeWork_ = 0;
+    [[nodiscard]] std::uint32_t scopeKindSlot_(ScopeKind kind);
+    void pushScopeEntry_(ScopeKind kind);
+    void popScopeEntry_();
+    [[nodiscard]] bool scopeKindOpen_(ScopeKind kind) const noexcept;
+    static bool scopeKindOpenThunk_(void const* builder, ScopeKind kind) noexcept;
 
     // Schema-cursor state machine mirroring `open_`. Walked through
     // enterRule on open(), leaveRule on close, and advance on

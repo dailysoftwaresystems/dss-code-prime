@@ -1,0 +1,1 @@
+    std::size_t const copied = std::vector<LiveScope>(liveScopes_.begin(), liveScopes_.end()).size();

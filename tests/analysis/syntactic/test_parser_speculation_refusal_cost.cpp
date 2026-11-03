@@ -93,15 +93,19 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
+#include "core/types/tree_node.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1057,4 +1061,278 @@ TEST(ParserSpeculationRefusalCost, AChainPastTheSpeculationCeilingCostsWorkLinea
             << "x the work of " << kSpanFrom << " past (" << atSpanFrom << " -> " << last
             << "); linear is ~" << depths << "x";
     }
+}
+
+// ── P69 L2a2 (lane `lm`, the L2a review's N3): A REPLAYED FAILURE IS A SKETCH QUESTION ──────
+//
+// The failed-probe memo keys a failure by the sketch version when its probe asked the binder
+// sketch, and under ANY sketch when it asked nothing. A probe whose only sketch dependence is a
+// NESTED failure answered from the memo asked the sketch as surely as the run it replays did: the
+// nested failure was recorded under a version and holds only there. Keyed under any sketch
+// instead, the probe is refuted at the same (rule, token) under a sketch where the nested failure
+// does not recur, and a program parses by what the parser happened to try before it.
+//
+// A synthetic grammar (rule names non-shipped; shipped grammars untouched) puts ONE (rule, token)
+// - `x2` at the `(` of `(T) - (1) ;` - under two sketch states. `pairA` binds `T` as a VALUE
+// (`let T;`, a declaration) and tries `tail` there; `pairB` reads the same `let T ;` as bare
+// tokens, so `T` is still `alias T;`'s TYPE when `tail` is tried at the same token. Under the
+// value, `x1` runs the cast probe and the triage refuses it (recorded under that version); `x2`'s
+// cast is then a REPLAY and `x2` fails at `-` (its operand is the parenthesis `(T)`); `x3` takes
+// the line, and `pairA` fails for want of `!`. Under the type, the cast `(T) - (1)` holds and
+// `x2` takes the line.
+//   * the value alone (`... ; !`, so `pairA` holds): `x3`, no `x2` - the states disagree at x2;
+//   * the type alone (no `pairA` in the alternation): `x2`, no `x3` - the parse from scratch;
+//   * the value, then the type, at the same (x2, token): `x2`, no `x3` - the replay agrees with
+//     the parse from scratch.
+// RED-ON-DISABLE: a replay that counts no sketch question records `x2`'s failure under `pairA`
+// for ANY sketch; `pairB`'s `x2` is refuted by it and `x3` takes the line (the third reading).
+namespace {
+
+[[nodiscard]] std::string replaySchema(std::string_view stmtAlternatives) {
+    return std::format(R"JSON({{
+  "dssSchemaVersion": 4,
+  "language": {{ "name": "ReplaySynth", "version": "0.0.1", "fileExtensions": [".rsyn"] }},
+  "tokens": {{
+    " ":  [{{ "kind": "Whitespace", "flags": ["EmptySpace"] }}],
+    "\n": [{{ "kind": "Newline",    "flags": ["EmptySpace"] }}],
+    "-":  [{{ "kind": "Minus" }}],
+    ";":  [{{ "kind": "Semi" }}],
+    "!":  [{{ "kind": "Bang" }}],
+    "(":  [{{ "kind": "ParenOpen" }}],
+    ")":  [{{ "kind": "ParenClose" }}]
+  }},
+  "numberStyle": {{ "decimal": true, "emitKind": {{ "integer": "IntLiteral" }} }},
+  "keywords": [
+    {{ "word": "let",   "kind": "LetKw" }},
+    {{ "word": "alias", "kind": "AliasKw" }},
+    {{ "word": "base",  "kind": "BaseKw" }}
+  ],
+  "operators": {{
+    "groups": [
+      {{ "precedence": 65, "associativity": "left", "operators": ["-"] }},
+      {{ "precedence": 90, "associativity": "right", "arity": "prefix", "operators": ["-"] }}
+    ]
+  }},
+  "syncTokens": [ "Semi" ],
+  "shapes": {{
+    "root":      {{ "sequence": [ {{ "repeat": "stmt" }} ] }},
+    "stmt":      {{ "alt": [ {} ], "speculative": true, "lookahead": 32 }},
+    "vardecl":   {{ "sequence": [ "LetKw", "Identifier", "Semi" ] }},
+    "aliasdecl": {{ "sequence": [ "AliasKw", "Identifier", "Semi" ] }},
+    "pairA":     {{ "sequence": [ "vardecl", "tail", "Bang" ] }},
+    "pairB":     {{ "sequence": [ "LetKw", "Identifier", "Semi", "tail" ] }},
+    "tail":      {{ "alt": [ "x1", "x2", "x3" ], "speculative": true, "lookahead": 32 }},
+    "x1":        {{ "sequence": [ "expression", "Bang" ] }},
+    "x2":        {{ "sequence": [ "operand", "Semi" ] }},
+    "x3":        {{ "sequence": [ "expression", "Semi" ] }},
+    "expression": {{ "expr": {{ "atom": "operand",
+        "wrapperRules": {{ "binary": "binaryExpr", "unary": "unaryExpr",
+                           "postfix": "postfixExpr" }} }} }},
+    "operand": {{
+      "alt": [ "castish", "parenish", "Identifier", "IntLiteral" ],
+      "speculative": true,
+      "lookahead": 16
+    }},
+    "castish": {{
+      "sequence": [ "ParenOpen", "typePos", "ParenClose", "castOperand" ],
+      "commitRequiresTypeName": {{ "rule": "typePos", "polarity": "preferType" }}
+    }},
+    "typePos":  {{ "alt": [ "BaseKw", "Identifier" ] }},
+    "parenish": {{ "sequence": [ "ParenOpen", "expression", "ParenClose" ] }},
+    "castOperand": {{ "expr": {{ "atom": "operand", "minPrecedence": 90,
+        "wrapperRules": {{ "binary": "binaryExpr", "unary": "unaryExpr",
+                           "postfix": "postfixExpr" }} }} }}
+  }},
+  "semantics": {{
+    "identifierToken": "Identifier",
+    "declarations": [
+      {{ "rule": "vardecl",   "name": 1, "kind": "variable" }},
+      {{ "rule": "aliasdecl", "name": 1, "kind": "type" }}
+    ]
+  }}
+}})JSON", stmtAlternatives);
+}
+
+[[nodiscard]] ParseResult parseReplay(std::string_view stmtAlternatives, std::string source) {
+    auto loaded = GrammarSchema::loadFromText(replaySchema(stmtAlternatives), "<replay-synth>");
+    if (!loaded) {
+        // Thrown, never abort(): GoogleTest reports a throw as a failure of this ONE test.
+        throw std::runtime_error("the synthetic replay schema failed to load");
+    }
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    auto src = SourceBuffer::fromString(std::move(source), "<replay-src>");
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{std::move(src), std::move(schema), std::move(stream),
+             DiagnosticBudget::libraryDefault(), ParserConfig{}, std::move(lexDiags)};
+    return std::move(p).parse();
+}
+
+[[nodiscard]] bool treeHasRule(Tree const& t, std::string_view ruleName) {
+    if (!t.hasSchema() || !t.root().valid()) return false;
+    RuleId const ruleId = t.schema().rules().find(ruleName);
+    if (!ruleId.valid()) return false;
+    for (std::uint32_t i = 1; i < static_cast<std::uint32_t>(t.nodeCount()); ++i) {
+        NodeId const id{i, t.root().arenaTag};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == ruleId.v) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(ParserSpeculationRefusalCost, AReplayedNestedFailureKeysItsProbeByTheSketchVersion) {
+    struct Reading {
+        char const*      what;
+        std::string_view alternatives;
+        char const*      src;
+        char const*      taken;     // the pair the statement must take
+        char const*      tailRule;  // the `tail` alternative that must take the line
+        char const*      absent;    // the one that must not
+        bool             cast;      // whether the line holds the cast
+    };
+    for (Reading const& r : {
+             Reading{"T a VALUE alone (pairA holds)", R"("aliasdecl", "pairA", "pairB")",
+                     "alias T; let T; (T) - (1) ; !", "pairA", "x3", "x2", false},
+             Reading{"T a TYPE alone (no pairA): the parse from scratch", R"("aliasdecl", "pairB")",
+                     "alias T; let T; (T) - (1) ;", "pairB", "x2", "x3", true},
+             Reading{"T a VALUE, then a TYPE, at the same (x2, token): the replay agrees",
+                     R"("aliasdecl", "pairA", "pairB")", "alias T; let T; (T) - (1) ;", "pairB",
+                     "x2", "x3", true},
+         }) {
+        ParseResult const res = parseReplay(r.alternatives, r.src);
+        EXPECT_FALSE(res.tree.diagnostics().hasErrors()) << r.what << ": " << allCodes(res.tree);
+        EXPECT_TRUE(treeHasRule(res.tree, r.taken)) << r.what << ": the statement is " << r.taken;
+        EXPECT_TRUE(treeHasRule(res.tree, r.tailRule))
+            << r.what << ": `" << r.tailRule << "` must take `(T) - (1) ;`";
+        EXPECT_FALSE(treeHasRule(res.tree, r.absent))
+            << r.what << ": `" << r.absent << "` took the line - the replay disagrees";
+        EXPECT_EQ(treeHasRule(res.tree, "castish"), r.cast) << r.what;
+    }
+}
+
+// ── P69 L2a2 (lane `lm`, the L2a review's N10): A NEST COSTS THE PARSER WORK LINEAR IN ITS DEPTH ──
+//
+// ★ THE PARSER'S TOKEN ACCESSES WERE BLIND HERE, AND THAT IS THE FINDING. Every other cost pin in
+// this file reads `tokenAccessCount`, the parser's deterministic work proxy, and a nest of
+// brackets cost parse TIME quadratic in its depth while its token accesses stayed linear.
+// ✔MEASURED 2026-10-28 (windows-x86_64-debug, MinGW GCC 13.2 Debug, the parse alone), 1000 → 4000
+// levels: `int v = ({ ({ … 5; }) … });` 632 → 9762 ms, `((((5))))` 110 → 1452 ms, `{ { { 5; } } }`
+// 192 → 2717 ms (×13–15 for ×4) against token accesses ×4 — and none of those nests opens a
+// speculation probe. The cost was the TREE BUILDER'S: every token it resolved walked the whole
+// scope stack (`isTokenValidInScope`, once per entry, for a grammar with no scope rule at all), and
+// c opens a scope at every `(` `{` `[`. It asks presence now (per-kind counts, trailed with the
+// stack), and COUNTS its scope work (`ParseResult::scopeWorkCount`: one unit per token resolution
+// and one per presence question). The binder sketch's snapshot COPIED its live-scope stack once
+// per probe — a second cost of the same shape where a nest DOES probe at every level; it marks two
+// trailed stacks now and counts its work too (`ParseResult::sketchWorkCount`). Both counters are
+// deterministic, as the token count is; the wall-time figures are the row's measurement, never a
+// pin's assertion.
+//
+// THE PINS: 4000 levels against 500 must cost each counter, and the token stream, under three times
+// the linear 8× (the file's margin).
+namespace {
+
+struct NestReading {
+    std::uint64_t tokens = 0;
+    std::uint64_t scope  = 0;
+    std::uint64_t sketch = 0;
+};
+
+[[nodiscard]] NestReading readNest(std::shared_ptr<GrammarSchema const> const& schema,
+                                   std::string const& src, int depth) {
+    ParserConfig cfg = shippedCConfig(*schema);
+    cfg.maxExpressionDepth = 4 * static_cast<std::size_t>(depth) + 1024;
+    ParseResult const r = parseCFull(schema, src, std::move(cfg));
+    EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << depth << " levels: " << allCodes(r.tree);
+    return NestReading{r.tokenAccessCount, r.scopeWorkCount, r.sketchWorkCount};
+}
+
+[[nodiscard]] std::string repeatText(char const* s, int n) {
+    std::string o;
+    for (int i = 0; i < n; ++i) o += s;
+    return o;
+}
+
+constexpr int kNestShallow = 500;
+constexpr int kNestDeep    = 4000;
+
+[[nodiscard]] double nestRatio(std::uint64_t deep, std::uint64_t shallow) {
+    return static_cast<double>(deep) / static_cast<double>(std::max<std::uint64_t>(shallow, 1));
+}
+
+}  // namespace
+
+// RED-ON-DISABLE: a token's scope check that reads the scope stack again — each entry it reads
+// counted — makes the scope work Θ(tokens × nesting).
+TEST(ParserSpeculationRefusalCost, NestedBracketsCostTheBuilderScopeWorkLinearInTheirDepth) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    struct Shape {
+        char const* name;
+        std::string (*src)(int);
+    };
+    Shape const shapes[] = {
+        {"statement expressions", [](int d) {
+             return "int f(void) { int v = " + repeatText("({ ", d) + "5" + repeatText("; })", d)
+                  + "; return v; }\n";
+         }},
+        {"parentheses", [](int d) {
+             return "int f(void) { int v = " + repeatText("(", d) + "5" + repeatText(")", d)
+                  + "; return v; }\n";
+         }},
+        {"blocks", [](int d) {
+             return "int f(void) { " + repeatText("{ ", d) + "5;" + repeatText(" }", d)
+                  + " return 0; }\n";
+         }},
+    };
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    for (Shape const& s : shapes) {
+        NestReading const shallow = readNest(schema, s.src(kNestShallow), kNestShallow);
+        NestReading const deep    = readNest(schema, s.src(kNestDeep), kNestDeep);
+        double const scope  = nestRatio(deep.scope, shallow.scope);
+        double const tokens = nestRatio(deep.tokens, shallow.tokens);
+        std::printf("%s: %d levels scope work %llu tokens %llu; %d levels scope work %llu tokens "
+                    "%llu; scope x%.2f, tokens x%.2f (linear x%.0f)\n",
+                    s.name, kNestShallow, static_cast<unsigned long long>(shallow.scope),
+                    static_cast<unsigned long long>(shallow.tokens), kNestDeep,
+                    static_cast<unsigned long long>(deep.scope),
+                    static_cast<unsigned long long>(deep.tokens), scope, tokens, linear);
+        EXPECT_GT(shallow.scope, 0u) << s.name << ": the builder counted no scope work";
+        EXPECT_LT(tokens, 3.0 * linear) << s.name << ": the token work is super-linear";
+        EXPECT_LT(scope, 3.0 * linear)
+            << s.name << ": " << kNestDeep << " levels cost the builder's scope work x" << scope
+            << " that of " << kNestShallow << " (linear x" << linear
+            << "): a token's scope check reads the nesting";
+    }
+}
+
+// A probe at every level: `(T)(1)` is a cast-or-call the triage decides, inside a nest of
+// statement expressions that keeps ~2 scopes live per level.
+// RED-ON-DISABLE: a snapshot that copies the live-scope stack again — its count is the copy's size.
+TEST(ParserSpeculationRefusalCost, AProbeAtEveryNestedLevelCostsTheSketchWorkLinearInTheDepth) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    auto src = [](int d) {
+        return "typedef int T;\nint f(void) { int v = " + repeatText("({ (T)(1); ", d) + "5"
+             + repeatText("; })", d) + "; return v; }\n";
+    };
+    NestReading const shallow = readNest(schema, src(kNestShallow), kNestShallow);
+    NestReading const deep    = readNest(schema, src(kNestDeep), kNestDeep);
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    double const sketch = nestRatio(deep.sketch, shallow.sketch);
+    double const tokens = nestRatio(deep.tokens, shallow.tokens);
+    std::printf("a probe per level: %d levels sketch work %llu tokens %llu; %d levels sketch work "
+                "%llu tokens %llu; sketch x%.2f, tokens x%.2f (linear x%.0f)\n",
+                kNestShallow, static_cast<unsigned long long>(shallow.sketch),
+                static_cast<unsigned long long>(shallow.tokens), kNestDeep,
+                static_cast<unsigned long long>(deep.sketch),
+                static_cast<unsigned long long>(deep.tokens), sketch, tokens, linear);
+    ASSERT_GE(shallow.sketch, static_cast<std::uint64_t>(2 * kNestShallow))
+        << "the nest took no snapshot per level: the shape no longer probes, and this pin reads "
+           "nothing";
+    EXPECT_LT(tokens, 3.0 * linear) << "the token work is super-linear";
+    EXPECT_LT(sketch, 3.0 * linear)
+        << kNestDeep << " levels cost the binder sketch x" << sketch << " the work of "
+        << kNestShallow << " (linear x" << linear << "): a probe's snapshot reads the nesting";
 }

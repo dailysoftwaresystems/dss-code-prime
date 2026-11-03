@@ -1,0 +1,1 @@
+        return [&] { for (ScopeKind const k : sv.stack) { (void)k; ++*sv.work; } return schema.isTokenValidInScope(m.id, sv.stack); }()

@@ -46,6 +46,17 @@ struct q1 { int a[sizeof (q1)(2)]; };
 /* 13: a parameter hides the typedef in the body. */
 static int l1(int L1) { return (L1) - 2; }
 
+/* 18-23 (P69 L2a2): a parameter of a function declarator that is NOT a definition's own has
+ * function prototype scope (C 6.2.1p4) — past its declarator the typedef it shadowed is a
+ * type again and `(R1)(x)` is a cast: a function pointer's, a block-scope prototype's, a
+ * typedef's and a cast's parameter (18-21), a file-scope prototype's in the next declarator
+ * (22), and the parameter of a definition's RETURNED function type in that definition's body
+ * (23) — where only the definition's own parameter `a` is in scope. */
+typedef int R1;
+int f22(int R1), y22 = sizeof((R1)(1));
+static int r1h(int t) { return t; }
+static int (*r1g(int a))(int R1) { return (a == (R1)(a)) ? r1h : 0; }
+
 int main(void) {
     { A1 x = 40; struct A1 s = { 2 }; if ((A1)(x) + s.a != 42) return 1; }
     { B1 x = 40; struct B1 s = { 2 }; if ((B1)(x) + s.a != 42) return 2; }
@@ -72,5 +83,11 @@ int main(void) {
     { struct N2 n = { 1, 41 }; if (n.N1 + n.x != 42) return 15; }
     if (sizeof(((struct P2 *)0)->a) != 42) return 16;
     if (sizeof(((struct q1 *)0)->a) != sizeof(int) * sizeof(int) || q1(2) != 42) return 17;
+    { int (*fp)(int R1) = 0; int x = 42; (void)fp; if ((R1)(x) != 42) return 18; }
+    { int f19(int R1); int x = 42; if ((R1)(x) != 42) return 19; }
+    { typedef int (*F20)(int R1); F20 f = 0; int x = 42; (void)f; if ((R1)(x) != 42) return 20; }
+    { (void)(int (*)(int R1))0; int x = 42; if ((R1)(x) != 42) return 21; }
+    if (y22 != (int)sizeof(int)) return 22;
+    if (r1g(42)(42) != 42) return 23;
     return 42;
 }

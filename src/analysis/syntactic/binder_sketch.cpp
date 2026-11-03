@@ -54,6 +54,13 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
         if (decl.specifierPrefixRule.has_value()) {
             row.specifierPrefixRule = *decl.specifierPrefixRule;
         }
+        // P69 L2a2 (lane `lm`): the body that makes the row a function definition — the
+        // analyzer's own discriminator (`declNodeIsFunctionDefinition`).
+        if (decl.kindByChild.has_value()
+            && decl.kindByChild->whenKind == DeclarationKind::Function) {
+            row.definitionBodyRule = decl.kindByChild->whenRule;
+            if (row.definitionBodyRule.valid()) definitionBodyRules_.insert(row.definitionBodyRule.v);
+        }
         byRule_.emplace(decl.rule.v, row);
     }
     // P68 round 9 (lane `cs`): a field row whose composite LIFTS its names into
@@ -87,6 +94,13 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
     for (auto const& sc : sem.scopes) {
         if (sc.rule.valid()) scopeRules_.insert(sc.rule.v);
     }
+    // P69 L2a2 (lane `lm`): a parameter list is a scope — function prototype scope (C
+    // 6.2.1p4) — exactly where the analyzer opens one (`prototypeParamScopeRule`).
+    if (sem.declarators.has_value() && sem.declarators->prototypeParamScopeRule.has_value()
+        && sem.declarators->prototypeParamScopeRule->valid()) {
+        protoParamScopeRule_ = *sem.declarators->prototypeParamScopeRule;
+        scopeRules_.insert(protoParamScopeRule_.v);
+    }
     // A scope rule that ALSO carries a non-Type `declarations` row opens a
     // DECLARATOR-DOMINATOR scope (e.g. c's topLevelDecl — a variable/
     // function declaration that opens a scope only to dominate its params).
@@ -102,9 +116,8 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
             compositeScopeRules_.insert(rv);   // a composite BODY scope
         }
     }
-    liveScopes_.push_back(0);   // the global scope, id 0, never popped
-    liveScopeIsDominator_.push_back(false);   // global is a namespace scope
-    liveScopeIsComposite_.push_back(false);
+    // The global scope, id 0, never popped; a namespace scope.
+    liveScopes_.push(LiveScope{.id = 0, .dominator = false, .composite = false});
     // P68 round 9 (lane `cs`): the language's PREDEFINED identifiers — C 6.4.2.2's
     // `__func__` and the GNU `__FUNCTION__` alias, from the config's
     // `semantics.predefinedFunctionNames` — are ORDINARY identifiers the source
@@ -135,12 +148,16 @@ bool BinderSketch::isScopeRule(RuleId rule) const noexcept {
 }
 
 void BinderSketch::openScope(RuleId rule) {
-    liveScopes_.push_back(nextScopeId_++);
-    liveScopeIsDominator_.push_back(dominatorScopeRules_.contains(rule.v));
-    liveScopeIsComposite_.push_back(compositeScopeRules_.contains(rule.v));
+    std::uint32_t const id = nextScopeId_++;
+    if (liveScopes_.back().id >= id) {   // the ascending order `lookup` reads (see liveScopes_)
+        bsFatal("openScope: a scope id at or below a live one - the live stack's order broke");
+    }
+    liveScopes_.push(LiveScope{.id        = id,
+                               .dominator = dominatorScopeRules_.contains(rule.v),
+                               .composite = compositeScopeRules_.contains(rule.v)});
 }
 
-void BinderSketch::closeScope() {
+std::uint32_t BinderSketch::closeScope() {
     // The global scope (slot 0) must never pop — scope events come from
     // the parser's frame open/close of `semantics.scopes` rules, which
     // are balanced by construction; underflow means the caller's event
@@ -148,10 +165,55 @@ void BinderSketch::closeScope() {
     if (liveScopes_.size() <= 1) {
         bsFatal("closeScope underflow — scope events out of balance");
     }
-    liveScopes_.pop_back();
-    liveScopeIsDominator_.pop_back();
-    liveScopeIsComposite_.pop_back();
+    std::uint32_t const closed = liveScopes_.back().id;
+    liveScopes_.pop();
     version_ = ++versionSource_;   // the bindings it held are hidden now
+    return closed;
+}
+
+bool BinderSketch::isPrototypeParamScopeRule(RuleId rule) const noexcept {
+    return protoParamScopeRule_.valid() && rule == protoParamScopeRule_;
+}
+
+bool BinderSketch::isDefinitionBodyRule(RuleId rule) const noexcept {
+    return definitionBodyRules_.contains(rule.v);
+}
+
+void BinderSketch::notePrototypeParamScope(std::uint32_t scope, NodeId paramList) {
+    closedParamScopes_.push(ClosedParamScope{.scope = scope, .list = paramList});
+}
+
+void BinderSketch::keepDefinitionParamsOf(NodeId paramList) {
+    definitionParamScope_ = 0;
+    if (paramList.valid()) {
+        for (ClosedParamScope const c : closedParamScopes_) {
+            if (c.list.v == paramList.v) definitionParamScope_ = c.scope;
+        }
+    }
+    closedParamScopes_.truncate(0);
+}
+
+void BinderSketch::bindDefinitionParams() {
+    std::uint32_t const from = std::exchange(definitionParamScope_, 0);
+    if (from == 0) return;
+    // Its names, in their order, into the innermost live scope — where a definition's
+    // parameters were always bound (c's topLevelDecl scope, which the body is inside). The
+    // bindings are appended, never moved, so a restore's truncation stays exact.
+    std::size_t const n = bindings_.size();
+    bool any = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (bindings_[i].scope != from) continue;
+        Binding copy = bindings_[i];
+        copy.scope = liveScopes_.back().id;
+        bindings_.push_back(std::move(copy));
+        any = true;
+    }
+    if (any) version_ = ++versionSource_;
+}
+
+void BinderSketch::dropDefinitionParams() noexcept {
+    definitionParamScope_ = 0;
+    closedParamScopes_.truncate(0);
 }
 
 void BinderSketch::record(std::string name, bool isType, SourceSpan span,
@@ -164,10 +226,11 @@ void BinderSketch::record(std::string name, bool isType, SourceSpan span,
     // block or the file, as the analyzer's republication does. The global scope
     // (slot 0) is neither, so the search always lands.
     if (liftToEnclosingScope) {
-        std::uint32_t target = liveScopes_.front();
+        std::uint32_t target = liveScopes_[0].id;
         for (std::size_t i = liveScopes_.size(); i-- > 0;) {
-            if (!liveScopeIsDominator_[i] && !liveScopeIsComposite_[i]) {
-                target = liveScopes_[i];
+            LiveScope const sc = liveScopes_[i];
+            if (!sc.dominator && !sc.composite) {
+                target = sc.id;
                 break;
             }
         }
@@ -189,10 +252,10 @@ void BinderSketch::record(std::string name, bool isType, SourceSpan span,
     // globalTypeNames). Float TYPE bindings past dominator scopes; VALUE
     // bindings (params, locals) stay in the live scope. Mirrors the analyzer's
     // floatToNamespaceScope.
-    std::uint32_t scope = liveScopes_.back();
+    std::uint32_t scope = liveScopes_.back().id;
     if (isType) {
         for (std::size_t i = liveScopes_.size(); i-- > 0;) {
-            if (!liveScopeIsDominator_[i]) { scope = liveScopes_[i]; break; }
+            if (!liveScopes_[i].dominator) { scope = liveScopes_[i].id; break; }
         }
     }
     bindings_.push_back(Binding{
@@ -217,10 +280,10 @@ void BinderSketch::recordAtDeclaratorEnd(std::string name, bool isType, SourceSp
     }
     // Then as `record` places a name: a TYPE floats past declarator-dominator
     // scopes, a VALUE stays where it is.
-    std::uint32_t scope = liveScopes_[from];
+    std::uint32_t scope = liveScopes_[from].id;
     if (isType) {
         for (std::size_t i = from + 1; i-- > 0;) {
-            if (!liveScopeIsDominator_[i]) { scope = liveScopes_[i]; break; }
+            if (!liveScopes_[i].dominator) { scope = liveScopes_[i].id; break; }
         }
     }
     bindings_.push_back(Binding{
@@ -254,8 +317,9 @@ BinderSketch::NameKind BinderSketch::lookup(std::string_view name) const noexcep
     // recorded (C 6.2.3), so a tag of the same spelling, however new, is never the
     // answer: `int g(int); struct g {…}; (g)(2)` stays a call.
     for (auto it = bindings_.rbegin(); it != bindings_.rend(); ++it) {
+        ++work_;   // a binding visited
         if (it->name != name) continue;
-        if (std::ranges::find(liveScopes_, it->scope) == liveScopes_.end()) {
+        if (!scopeIsLive_(it->scope)) {
             continue;   // out-of-scope binding — dead, skip
         }
         return it->isType ? NameKind::Type : NameKind::Value;
@@ -302,19 +366,70 @@ std::vector<AmbiguousTypeNameCandidate> BinderSketch::takeCandidates() {
     return std::exchange(candidates_, {});
 }
 
-BinderSketch::Snapshot BinderSketch::snapshot() const {
-    return Snapshot{
-        .bindingCount       = bindings_.size(),
-        .candidateCount     = candidates_.size(),
-        .liveScopes         = liveScopes_,
-        .liveScopeDominator = liveScopeIsDominator_,
-        .liveScopeComposite = liveScopeIsComposite_,
-        .nextScopeId        = nextScopeId_,
-        .version            = version_,
-    };
+// P69 L2a2 (lane `lm`, the L2a review's N10): ids ascend from the bottom of the live stack (see
+// `liveScopes_`), so liveness is a binary search - not a scan of the stack for every binding a
+// lookup passes, which a deep nest of scopes would pay per binding.
+bool BinderSketch::scopeIsLive_(std::uint32_t id) const noexcept {
+    std::span<LiveScope const> const live = liveScopes_.span();
+    std::size_t lo = 0;
+    std::size_t hi = live.size();
+    while (lo < hi) {   // the first entry whose id is not below `id`
+        ++work_;        // a live-scope entry visited
+        std::size_t const mid = lo + (hi - lo) / 2;
+        if (live[mid].id < id) lo = mid + 1;
+        else                   hi = mid;
+    }
+    return lo < live.size() && live[lo].id == id;
+}
+
+BinderSketch::Snapshot BinderSketch::snapshot() {
+    Snapshot s;
+    s.owner_         = this;
+    std::size_t const copied = 0;   // entries this snapshot copies: none, it marks
+    work_ += 2 + copied;            // one per stack marked, and what it copies
+    s.bindingCount   = bindings_.size();
+    s.candidateCount = candidates_.size();
+    TrailedStack<LiveScope>::Mark const live = liveScopes_.mark();
+    s.liveScopesMarkSize    = live.size;
+    s.liveScopesMarkJournal = live.journal;
+    TrailedStack<ClosedParamScope>::Mark const closed = closedParamScopes_.mark();
+    s.closedParamsMarkSize    = closed.size;
+    s.closedParamsMarkJournal = closed.journal;
+    s.nextScopeId          = nextScopeId_;
+    s.version              = version_;
+    s.definitionParamScope = definitionParamScope_;
+    ++liveMarks_;
+    return s;
+}
+
+BinderSketch::Snapshot::Snapshot(Snapshot&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr))
+    , bindingCount(other.bindingCount)
+    , candidateCount(other.candidateCount)
+    , liveScopesMarkSize(other.liveScopesMarkSize)
+    , liveScopesMarkJournal(other.liveScopesMarkJournal)
+    , closedParamsMarkSize(other.closedParamsMarkSize)
+    , closedParamsMarkJournal(other.closedParamsMarkJournal)
+    , nextScopeId(other.nextScopeId)
+    , version(other.version)
+    , definitionParamScope(other.definitionParamScope) {}
+
+BinderSketch::Snapshot::~Snapshot() {
+    if (owner_ != nullptr) owner_->releaseMark_();
+}
+
+void BinderSketch::releaseMark_() noexcept {
+    if (liveMarks_ == 0) bsFatal("a snapshot released more often than taken");
+    if (--liveMarks_ == 0) {
+        liveScopes_.discardJournal();
+        closedParamScopes_.discardJournal();
+    }
 }
 
 void BinderSketch::restore(Snapshot&& s) {
+    if (s.owner_ != this) {
+        bsFatal("restore with a snapshot of another sketch, or one moved from");
+    }
     // Bindings/candidates are append-only between snapshot and restore
     // (closeScope never truncates), so truncate-to-count is exact.
     if (s.bindingCount > bindings_.size()
@@ -328,11 +443,17 @@ void BinderSketch::restore(Snapshot&& s) {
     candidates_.erase(
         candidates_.begin() + static_cast<std::ptrdiff_t>(s.candidateCount),
         candidates_.end());
-    liveScopes_           = std::move(s.liveScopes);
-    liveScopeIsDominator_ = std::move(s.liveScopeDominator);
-    liveScopeIsComposite_ = std::move(s.liveScopeComposite);
+    // The restore's work: the journal records it replays, and one.
+    work_ += 1 + (liveScopes_.journalSize() - std::min(liveScopes_.journalSize(), s.liveScopesMarkJournal))
+           + (closedParamScopes_.journalSize()
+              - std::min(closedParamScopes_.journalSize(), s.closedParamsMarkJournal));
+    liveScopes_.rewindTo(TrailedStack<LiveScope>::Mark{.size    = s.liveScopesMarkSize,
+                                                        .journal = s.liveScopesMarkJournal});
+    closedParamScopes_.rewindTo(TrailedStack<ClosedParamScope>::Mark{
+        .size = s.closedParamsMarkSize, .journal = s.closedParamsMarkJournal});
     nextScopeId_          = s.nextScopeId;
     version_              = s.version;   // `versionSource_` stays: a number is never given twice
+    definitionParamScope_ = s.definitionParamScope;
 }
 
 } // namespace dss

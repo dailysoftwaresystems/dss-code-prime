@@ -1,1 +1,1 @@
-            recordAtDeclaratorEnd_(rule);
+        sketch.recordAtDeclaratorEnd(std::string{src->slice(nameSpan)}, row->isType,

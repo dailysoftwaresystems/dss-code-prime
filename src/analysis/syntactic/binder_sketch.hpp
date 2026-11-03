@@ -5,6 +5,7 @@
 #include "core/types/rule_id.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/source_span.hpp"
+#include "core/types/speculation_trail.hpp"
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
@@ -118,6 +119,10 @@ public:
         // struct or union member, never an enumeration constant): the name it
         // declares is a MEMBER, never recorded.
         bool          namesAMember = false;
+        // P69 L2a2 (lane `lm`): the rule of the BODY that makes this row a function
+        // DEFINITION (its `kindByChild` discriminator, when that names a Function) —
+        // invalid for a row that can never be one. See `bindDefinitionParams`.
+        RuleId        definitionBodyRule{};
     };
 
     // ★ P69 L2 (lane `lm`): THE SKETCH RECORDS ORDINARY IDENTIFIERS ONLY — the one
@@ -162,7 +167,27 @@ public:
     // to the enclosing namespace at `record` time (C11 6.2.1) — mirrors the
     // analyzer's `floatToNamespaceScope`.
     void openScope(RuleId rule);
-    void closeScope();   // aborts on global-scope underflow (caller bug)
+    // Returns the id of the scope it closed. Aborts on global-scope underflow (caller bug).
+    std::uint32_t closeScope();
+
+    // ── ★ P69 L2a2 (lane `lm`, the L2a review's N9): FUNCTION PROTOTYPE SCOPE ──
+    // A parameter list (`declarators.prototypeParamScopeRule`) is a scope of its own (C
+    // 6.2.1p4): its parameters are recorded into it and die with it, so a parameter of a
+    // nested function declarator — a function pointer, a block-scope prototype, a typedef, a
+    // cast's type name — no longer hides a typedef of its spelling for the rest of the block.
+    // The list that declares a function DEFINITION's own name gives its names to the body:
+    // the parser notes each closed list (`notePrototypeParamScope`), keeps the one the shared
+    // structural predicate names at the declarator's end (`keepDefinitionParamsOf`,
+    // core/types/prototype_param_scope.hpp, the analyzer's own question), and binds its names
+    // into the scope live when the row's definition body opens (`bindDefinitionParams`), where
+    // they were bound before. The row's close drops what was kept (`dropDefinitionParams`).
+    [[nodiscard]] bool isPrototypeParamScopeRule(RuleId rule) const noexcept;
+    // Whether `rule` is some row's `definitionBodyRule` — the parser asks only then.
+    [[nodiscard]] bool isDefinitionBodyRule(RuleId rule) const noexcept;
+    void notePrototypeParamScope(std::uint32_t scope, NodeId paramList);
+    void keepDefinitionParamsOf(NodeId paramList);   // invalid ⇒ keeps none
+    void bindDefinitionParams();
+    void dropDefinitionParams() noexcept;
 
     // ── bindings ──
     // `span` is the source span of the declaring name-token — carried so the
@@ -223,20 +248,54 @@ public:
     // ── speculation safety ──
     // Captured/restored exactly like the parser's other four state
     // machines (SpeculationProbe): bindings + candidates are
-    // append-only between snapshots so restore is truncate-to-count;
-    // the live-scope stack is small (lexical depth) so a full copy is
-    // cheap.
-    struct Snapshot {
-        std::size_t                bindingCount   = 0;
-        std::size_t                candidateCount = 0;
-        std::vector<std::uint32_t> liveScopes;
-        std::vector<bool>          liveScopeDominator;   // parallel to liveScopes
-        std::vector<bool>          liveScopeComposite;   // parallel to liveScopes
-        std::uint32_t              nextScopeId    = 1;
-        std::uint64_t              version        = 0;
+    // append-only between snapshots so restore is truncate-to-count.
+    // ★ P69 L2a2 (lane `lm`, the L2a review's N10): AND A SNAPSHOT IS O(1) IN THE LEXICAL
+    // DEPTH. It used to COPY the live-scope stack (three vectors) — "small (lexical depth) so
+    // a full copy is cheap" — once per probe, so a nest of D statement expressions, a probe or
+    // more at every level with ~2 scopes per level live, cost Θ(D²) and the parse's token-
+    // access count, the parser's work proxy, never saw it (it counts tokens, not copies).
+    // ✔MEASURED 2026-10-28 (windows-x86_64-debug, MinGW GCC 13.2 Debug, the parse alone):
+    // `int v = ({ ({ … 5; }) … });` 605 / 2385 / 9335 / 39652 ms at 1000 / 2000 / 4000 /
+    // 10000 levels (×3.9 per doubling) while its token accesses went 61257 / 122257 / 244257
+    // / 610257 (linear). The two stacks a probe can change are TRAILED now
+    // (core/types/speculation_trail.hpp, the builder's and the walker's own primitive): a
+    // snapshot is two marks and a restore costs the pops since its mark. The journal is armed
+    // by a snapshot and retired when the last live one is released (`Snapshot`'s destructor),
+    // so it never outgrows the probes that can still rewind to it.
+    class Snapshot {
+    public:
+        Snapshot(Snapshot&& other) noexcept;
+        Snapshot(Snapshot const&)            = delete;
+        Snapshot& operator=(Snapshot const&) = delete;
+        Snapshot& operator=(Snapshot&&)      = delete;
+        ~Snapshot();
+
+    private:
+        friend class BinderSketch;
+        Snapshot() = default;
+        BinderSketch*                 owner_          = nullptr;   // null once moved from
+        std::size_t                   bindingCount    = 0;
+        std::size_t                   candidateCount  = 0;
+        std::size_t                   liveScopesMarkSize    = 0;
+        std::size_t                   liveScopesMarkJournal = 0;
+        std::size_t                   closedParamsMarkSize    = 0;   // P69 L2a2
+        std::size_t                   closedParamsMarkJournal = 0;
+        std::uint32_t                 nextScopeId     = 1;
+        std::uint64_t                 version         = 0;
+        std::uint32_t                 definitionParamScope = 0;   // 0 ⇒ none kept
     };
-    [[nodiscard]] Snapshot snapshot() const;
+    [[nodiscard]] Snapshot snapshot();
     void restore(Snapshot&& s);
+
+    // ── the sketch's own work, counted (P69 L2a2, lane `lm`, the L2a review's N10) ──
+    // A DETERMINISTIC proxy for what the sketch does, as the parser's token accesses are for
+    // what it reads: the live-scope and parameter-list entries a snapshot copies (none: it
+    // marks each stack, one unit apiece), the journal records a restore replays (one unit
+    // more), and the bindings and live-scope entries a `lookup` visits. The token accesses
+    // cannot see any of it; this can, so a cost the sketch adds per probe or per lookup in
+    // proportion to the nesting is super-linear HERE (the parser reports it as
+    // `ParseResult::sketchWorkCount`).
+    [[nodiscard]] std::uint64_t workCount() const noexcept { return work_; }
 
     // ── the lookup state's identity (cycle P69 L2, lane `lm`) ──
     // Two moments with the same version answer every `lookup` alike. A binding and
@@ -272,15 +331,26 @@ private:
     // Chronological, append-only between snapshot/restore pairs. Closed
     // scopes do NOT truncate (liveness is scope-id-based) — see class doc.
     std::vector<Binding>                          bindings_;
-    // Stack of live scope ids; [0] is the global scope (id 0), never popped.
-    std::vector<std::uint32_t>                    liveScopes_;
-    // Parallel to liveScopes_: true iff that scope is a declarator-dominator
-    // (a TYPE tag recorded while it is live floats past it to the namespace).
-    std::vector<bool>                             liveScopeIsDominator_;
-    // Parallel to liveScopes_: true iff that scope is a composite BODY (a lifted
-    // field name recorded while it is live floats past it to the namespace).
-    std::vector<bool>                             liveScopeIsComposite_;
+    // One live scope. `dominator`: a declarator-dominator (a TYPE tag recorded while it is live
+    // floats past it to the namespace). `composite`: a composite BODY (a lifted field name
+    // recorded while it is live floats past it to the namespace).
+    struct LiveScope {
+        std::uint32_t id        = 0;
+        bool          dominator = false;
+        bool          composite = false;
+    };
+    // Stack of live scopes; [0] is the global scope (id 0), never popped. Its ids STRICTLY
+    // ASCEND from the bottom (a scope opens with `nextScopeId_++`, above every live id, and a
+    // restore brings back a stack and the `nextScopeId_` that was above it), which `lookup`'s
+    // binary search reads and `openScope` checks. Trailed (see `Snapshot`).
+    TrailedStack<LiveScope>                       liveScopes_;
     std::uint32_t                                 nextScopeId_ = 1;
+    [[nodiscard]] bool scopeIsLive_(std::uint32_t id) const noexcept;
+    // The snapshots not yet released; the journals retire when it reaches 0.
+    std::size_t                                   liveMarks_ = 0;
+    // `workCount()`; mutable because a `lookup`, which reads, counts what it visits.
+    mutable std::uint64_t                         work_ = 0;
+    void releaseMark_() noexcept;
 
     std::vector<AmbiguousTypeNameCandidate>       candidates_;
 
@@ -288,6 +358,19 @@ private:
     // (never restored, so a number is never given twice).
     std::uint64_t                                 version_       = 0;
     std::uint64_t                                 versionSource_ = 0;
+
+    // P69 L2a2 (lane `lm`): function prototype scope (see `isPrototypeParamScopeRule`).
+    // `closedParamScopes_`: each parameter list closed since the last declarator end, with
+    // its node; `definitionParamScope_`: the one kept for a definition's body (0 ⇒ none — the
+    // global scope's id is never a parameter list's).
+    struct ClosedParamScope {
+        std::uint32_t scope = 0;
+        NodeId        list{};
+    };
+    RuleId                                        protoParamScopeRule_{};
+    std::unordered_set<std::uint32_t>             definitionBodyRules_;
+    TrailedStack<ClosedParamScope>                closedParamScopes_;   // trailed, as liveScopes_
+    std::uint32_t                                 definitionParamScope_ = 0;
 };
 
 } // namespace dss

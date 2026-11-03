@@ -11207,16 +11207,22 @@ struct Lowerer {
     // `(void)(int (*)[k++ + 1]){ (void *)x };` left k == 0, where gcc 13.3.0 and clang 18.1.3
     // (gnu2x and c2x -pedantic-errors) leave k == 1.
     //
-    // `typeIsVariablyModified`: some level of `t`, through pointers and arrays, has a run-time
-    // length (a pointer to a function returning one is not followed).
+    // `typeIsVariablyModified`: some level of `t`, through pointers, arrays and a function type's
+    // RETURN type, has a run-time length — never through a function type's parameters, whose
+    // bounds have function prototype scope and are evaluated nowhere (C 6.7.6.2p5: treated as
+    // `*`). P69 L2a2 (lane `lm`, review N5): the return type was not followed, so a cast's or a
+    // compound literal's bound inside it ran as nothing. ✔MEASURED 2026-10-28 (WSL gcc 13.3.0 /
+    // clang 18.1.3, gnu2x and c2x -pedantic-errors, built and run): `(void)(int
+    // (*(*)(void))[k++ + 1])g;` and `(int (*(*)(void))[k++ + 1]){ g }` leave k == 1 on all
+    // four; a bound in the parameter list, `(void)(int (*)(int (*)[k++ + 1]))h;`, leaves k == 0.
     [[nodiscard]] bool typeIsVariablyModified(TypeId t) const {
         while (t.valid()) {
             if (interner.isVlaArray(t)) return true;
             TypeKind const k = interner.kind(t);
-            if (k != TypeKind::Ptr && k != TypeKind::Array) return false;
+            if (k != TypeKind::Ptr && k != TypeKind::Array && k != TypeKind::FnSig) return false;
             auto const ops = interner.operands(t);
             if (ops.empty()) return false;
-            t = ops[0];
+            t = ops[0];   // the pointee, the element, or a signature's result (operand 0)
         }
         return false;
     }
@@ -11240,7 +11246,10 @@ struct Lowerer {
             stack.pop_back();
             if (tree().kind(c) != NodeKind::Internal) continue;
             std::uint32_t const r = tree().rule(c).v;
-            if (dc.fnSuffixRule.valid() && r == dc.fnSuffixRule.v) continue;
+            // A function suffix — at the base or after it (`isFnSuffixRule`, both forms) — holds
+            // the parameters: never evaluated (P69 L2a2: the post-base form was walked; it was
+            // reached only once the gate above followed a return type).
+            if (isFnSuffixRule(tree().rule(c), dc)) continue;
             if (r == dc.arraySuffixRule.v) {
                 NodeId const bound =
                     arraySuffixBoundNode(tree(), c, dc.arraySuffixModifierTokens)

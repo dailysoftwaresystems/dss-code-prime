@@ -41,10 +41,10 @@ Cycle <id>:
 - [ ] 0  Orient — handoff, git status, plan-00 §0.1, the WORKING registry only, green baseline, READ CI
 - [ ] 1  Pick the next priority — §0.1 top-to-bottom; candidates come from the PRODUCTION registry
 - [ ] 2  Clear blockers FIRST — the highest-priority blocker before the priority itself
-- [ ] 3  Plan it — delegated; the orchestrator judges the plan
-- [ ] 4  Design-audit the plan before lock — an INDEPENDENT subagent applies the dss-audit bar
-- [ ] 5  Implement — lanes by disjoint FILE sets, at most four reasoning agents live
-- [ ] 6  Review and fold — re-review to a fixed point; passes that never converge → pause, do not grind
+- [ ] 3  Plan it — delegated; the plan names each defect's invariant, its ONE home, the site list and the universe
+- [ ] 4  Design-audit the plan before lock — an INDEPENDENT subagent applies the dss-audit bar and searches for sites the plan missed
+- [ ] 5  Implement — lanes by disjoint FILE sets, at most four reasoning agents live; one home decides, a pin covers the universe, the neighbours are swept BEFORE the hand-back
+- [ ] 6  Review and fold — the review judges the class-closure record first; a second send-back on one class → home audit, not another patch
 - [ ] 7  Fail-loud gate — full battery + the mutation sweep + anchor balance; a red you cannot self-repair → STOP, never push
 - [ ] 8  Pin every deferral — a row closes by MOVING (`set-anchor`)
 - [ ] 9  Cross-plan update — including the rewrite of `.plans/_handoff.md`, same commit as the code
@@ -61,14 +61,14 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 | 0 | the handoff is the previous cycle's claim, not ground truth; orient from `_deferred-anchor-registry-production.md` (`dssharness read-anchors --pending`), never the `-done.md` archive; a red baseline with no WIP-repair context is decided and reported veto-able, never silently (AMENDED 2026-09-21); READ CI (`dssharness check-ci-legs`): a red leg is a HARD STOP on picking work, and repairing it is a FIX; `dssharness list-orchestrator`: an open agent is a lane in flight | `workflow-steps.md`, `round-gate-and-ci.md`, `orchestration.md` |
 | 1 | an explicit argument overrides the auto-pick, never the bar, the pause gate or the hard stops; a dry §0.1 promotes an ELIGIBLE anchor (unconditional, or its trigger fired); a harness row never enters on its own ticket | `workflow-steps.md`, `registry-and-priority.md` |
 | 2 | blockers come from §0.1's "Blocked by" column, the registry, and any "requires deferrals" note | `workflow-steps.md` |
-| 3 | delegate the plan (`/feature-dev:feature-dev`, a `Plan` or `code-architect` agent) | `delegation.md` |
-| 4 | independence is the point; a new engine mechanism also gets a decision brief to the user, veto-able | `workflow-steps.md`, `full-procedure.md` |
-| 5 | each lane's owned and forbidden PATHS named; each lane its own agent (`dssharness create-agent`: its worktree, the build tree going inside it, and its work, plans and rows directories), its subagent aimed at that worktree (`-C`, absolute paths); a new `D-*` cited in `src/` registered in the same commit | `orchestration.md`, `delegation.md`, `lane-discipline.md`, `build-layout.md` |
-| 6 | `/pr-review-toolkit:review-pr`, the agnosticism pass and the CI-hazard screen | `workflow-steps.md`, `full-procedure.md` |
+| 3 | delegate the plan (`/feature-dev:feature-dev`, a `Plan` or `code-architect` agent); per defect the plan states the invariant, its ONE home, every site that decides it today (searched by the DATA, across every tier, format and target) and the universe it ranges over | `delegation.md`, `class-closure.md` |
+| 4 | independence is the point; a new engine mechanism also gets a decision brief to the user, veto-able; a plan that patches one site of several, or whose site list is short, is a finding | `workflow-steps.md`, `full-procedure.md`, `class-closure.md` |
+| 5 | every brief carries the class-closure paragraph and every hand-back the class-closure record per row; each lane's owned and forbidden PATHS named; each lane its own agent (`dssharness create-agent`: its worktree, the build tree going inside it, and its work, plans and rows directories), its subagent aimed at that worktree (`-C`, absolute paths); a new `D-*` cited in `src/` registered in the same commit | `orchestration.md`, `delegation.md`, `lane-discipline.md`, `build-layout.md` |
+| 6 | `/pr-review-toolkit:review-pr`, the agnosticism pass and the CI-hazard screen; the reviewer is handed the class-closure record and judges the site list and the universe BEFORE the diff; a finding is routed by its class (`class-closure.md`) | `workflow-steps.md`, `full-procedure.md` |
 | 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs AND the sweep of every mutation arm on the leg it names (`dssharness check-mutations`), every arm `passed` | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `mutation-arms.md`, `no-follow-ups.md` |
 | 8 | `dssharness set-anchor <ANCHOR> --status closed --closing '...'`; a new row is `dssharness write-anchor`; both WRITE unless given `--anchor-dry-run` | `anchors-and-deferrals.md`, `registry-and-priority.md` |
 | 9 | plans updated in the SAME commit as the code; the handoff answers its five questions | `gate-and-cross-plan.md` |
-| 10 | the `dss-audit` rule-lens and guardrails on the complete, gate-passed cycle | `workflow-steps.md`, `full-procedure.md` |
+| 10 | the `dss-audit` rule-lens (the class-closure lens included) and guardrails on the complete, gate-passed cycle | `workflow-steps.md`, `full-procedure.md` |
 | 11 | subject `Cycle <id>: <concise summary>`; the `Co-authored-by:` trailer from the session, never hardcoded; pushing does NOT start CI; open the PR if absent; create the next lane set's agents only after this step, the finished set's deleted after their last review; at the cycle's end, `delete-orchestrator` | `workflow-steps.md`, `lane-sets-and-folding.md`, `orchestration.md` |
 | 12 | the anchor line carries numbers; `next:` matches the handoff's top NEXT entry | `output-contract.md` |
 
@@ -84,6 +84,16 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   `tests/mutations/arms.registry`; a pin is proven only when its arm reads `passed`, and a row closes only
   on arms that passed on the bytes it closes on; the tool mutates a worker copy, never a tree →
   `references/mutation-arms.md`.
+- ★★★★ **Close the CLASS, at its ONE HOME** (2026-11-03): a defect is an instance of an invariant; before any
+  edit the plan names the invariant, the one home that decides it and every site that decides it today
+  (searched by the data, not by the file the defect was seen in); more than one site → CONSOLIDATE, never patch
+  N−1 of N; the pin is table-driven over the universe (formats × targets × tiers × pipelines × forms ×
+  both directions), not the reported case; the neighbours — the optimized form of the same source included —
+  are measured on DSS and on each reference BEFORE the hand-back and every failure is fixed in the same wave;
+  the closing claim states the universe; a home touched a second time in a round gets a HOME AUDIT before the
+  next edit; a review finding that is another instance of a class a lane closed sends the lane back for the
+  WHOLE class, and a pre-existing defect of another class in code the diff does not touch does not hold the
+  fold → `references/class-closure.md`.
 - ★★★ **The goal is to WORK** (2026-08-19): if ANY reference (gcc, clang, MSVC) compiles and runs a
   correct construct, DSS must too; a reference's failure is never evidence against DSS; probe each
   reference separately → `references/reference-compilers.md`.
@@ -283,6 +293,9 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 
 - Read `references/the-bar.md` **at the start of every cycle** — the seven non-negotiables in full,
   with the worked cases behind each. This is the standard everything else here serves.
+- Read `references/class-closure.md` before steps 3–6 and whenever a review finding or a recurring theme
+  appears — the invariant, the one home, the site list, the universe, the record a hand-back carries, the home
+  audit, and how a finding is routed by its class.
 - Read `references/delegation.md` before steps 3–5 — what to delegate, how to split by disjoint file
   sets, and what the orchestrator keeps.
 - Read `references/gate-and-cross-plan.md` at steps 7 and 9 — the full fail-loud gate battery and the
@@ -336,6 +349,10 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 - **Guessing past a decision.** A real fork is DECIDED — by measurement and the references' own
   documentation, written into the row, reported veto-able — never guessed; an unfired trigger is
   skipped and reported; the decision gate's pause cases are a pause — not a default, not a pivot to other work.
+- **Closing the instance and leaving the class.** A fix correct for the reported case, made at the site where
+  it was seen, while the same decision is taken in other places: the neighbour comes back as the next finding,
+  and the round never converges (✔MEASURED P69 round 1: 12 of 35 checkpoint subjects on one theme). The fix goes
+  at the one home, the pin covers the universe, the neighbours are swept before the hand-back.
 - **Inventing a fork to avoid the hard part.** If you cannot state a second defensible design, the
   hard part lands this cycle.
 - **Breaking agnosticism** by branching the engine on language, arch, or format identity instead of

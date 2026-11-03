@@ -1,0 +1,1 @@
+                if (rec->askedTheSketch) ++sketchLookups_;   // the replay asks what the run asked

@@ -65,6 +65,9 @@ If an item could not be verified, say **"unverified"** explicitly. Never round i
    its run records, and CI's verdicts read with `dssharness check-ci-legs`.
 7. **No un-anchored issue** — everything the cycle came across is anchored AND handled; a workaround
    that hides an issue, or a row for work the cycle could have done, breaks it.
+8. **The class is closed, at its one home** — a fix names an invariant, one home and every site that decides
+   it, the pin covers the universe, and the neighbours were measured; an instance closure (one site patched, a
+   case named instead of a universe) is green-but-rule-breaking (rule-lens 9).
 
 ## Workflow
 

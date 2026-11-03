@@ -935,6 +935,15 @@ bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
     return true;
 }
 
+bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
+                                        void const* ctx) const noexcept {
+    // `false` iff some open scope forbids `tok` — the walk's answer, asked per rule.
+    for (auto const& [scopeV, forbid] : d_.scopeForbid) {
+        if (forbid.contains(tok.v) && open(ctx, static_cast<ScopeKind>(scopeV))) return false;
+    }
+    return true;
+}
+
 bool GrammarSchema::canEndSource(SchemaCursor cur) const noexcept {
     if (cur.rule().v != d_.rootRule.v) return false;
     auto const* p = lookupPos(ruleRow(cur.rule().v), cur);

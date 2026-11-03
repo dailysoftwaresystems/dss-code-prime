@@ -47,6 +47,13 @@ struct DSS_EXPORT ParseResult {
     // total-work proxy that replaced a flaky wall-clock O(N²) guard. O(N) for a
     // correct parse; a backtracking blowup makes it super-linear.
     std::uint64_t                           tokenAccessCount = 0;
+    // The binder sketch's own work (`BinderSketch::workCount`), which `tokenAccessCount`
+    // does not see: the scope entries its snapshots copy or mark, the journal records its
+    // restores replay, and the bindings and live-scope entries its lookups visit.
+    std::uint64_t                           sketchWorkCount = 0;
+    // The tree builder's own scope work (`TreeBuilder::scopeWork`): one unit per token
+    // resolution and one per scope-presence question it asks.
+    std::uint64_t                           scopeWorkCount = 0;
 };
 
 // How the dispatch loop's recovery sites behave when they see an

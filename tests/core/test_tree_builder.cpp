@@ -1325,3 +1325,183 @@ TEST(TreeBuilderIngest, EmptySpanDiagnosticReachesTheTree) {
     EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_IllegalChar), 1u)
         << "ingested diagnostic must reach the Tree's reporter";
 }
+
+// ── P69 L2a2 (lane `lm`): A TOKEN'S SCOPE CHECK ASKS PRESENCE, NOT THE STACK ────────────────────
+//
+// Every token the builder resolved walked the WHOLE scope stack — `isTokenValidInScope` once per
+// entry, and a meaning's `scopeRequire` forbid / anyOf likewise — so a parse cost Θ(tokens ×
+// nesting) even for a grammar that declares no scope rule at all. ✔MEASURED 2026-10-28
+// (windows-x86_64-debug, MinGW GCC 13.2 Debug, c, the parse alone): `((((5))))` 110 → 1452 ms,
+// `{ { { 5; } } }` 192 → 2717 ms, `({ ({ … 5; }) })` 632 → 9762 ms from 1000 to 4000 levels (×13–15
+// for ×4) while the token accesses went ×4. The builder now keeps how many scopes of each kind are
+// open (trailed with the stack: marked and rewound with every checkpoint) and asks PRESENCE. The
+// two TESTs below pin what that must never change: the answer the stack walk gave, on a grammar
+// that DOES declare scope rules (no shipped language declares one, so the grammar is built here),
+// and the counts across a rollback.
+namespace {
+
+constexpr std::string_view kScopePresenceConfig = R"JSON({
+  "dssSchemaVersion": 1,
+  "language": { "name": "ScopePresence", "version": "0.1.0" },
+  "tokens": {
+    "{": [{ "kind": "BlockOpen",    "opensScope": "Block" }],
+    "}": [{ "kind": "BlockClose",   "closesScope": true }],
+    "(": [{ "kind": "ParenOpen",    "opensScope": "Paren" }],
+    ")": [{ "kind": "ParenClose",   "closesScope": true }],
+    "[": [{ "kind": "BracketOpen",  "opensScope": "Bracket" }],
+    "]": [{ "kind": "BracketClose", "closesScope": true }],
+    "%": [
+      { "kind": "PctBlockNotBracket", "priority": 5,
+        "scopeRequire": { "anyOf": ["Block"], "forbid": ["Bracket"] } },
+      { "kind": "PctTopParen",        "priority": 10, "scopeRequire": { "topMustBe": "Paren" } },
+      { "kind": "PctOuterBlock",      "priority": 20, "scopeRequire": { "outermost": "Block" } },
+      { "kind": "PctAnywhere",        "priority": 30 }
+    ],
+    "#": [{ "kind": "Hash" }],
+    "!": [{ "kind": "Bang" }]
+  },
+  "scopes": {
+    "validity": [
+      { "scope": "Paren",   "forbid": ["Hash", "PctAnywhere"] },
+      { "scope": "Bracket", "forbid": ["Bang"] }
+    ]
+  },
+  "shapes": { "root": { "sequence": ["Identifier"] } }
+})JSON";
+
+// THE ORACLE: the resolution the stack walk gave — the schema's span overload, and a meaning's
+// `scopeRequire` read off the stack itself. The first allowed meaning in priority order wins.
+[[nodiscard]] SchemaTokenId walkResolution(GrammarSchema const& schema, std::string_view lexeme,
+                                           std::span<ScopeKind const> stack) {
+    auto const has = [&](ScopeKind k) { return std::ranges::find(stack, k) != stack.end(); };
+    for (LexemeMeaning const& m : schema.lookupLexeme(lexeme)) {
+        if (!schema.isTokenValidInScope(m.id, stack)) continue;
+        auto const& sr = m.scopeRequire;
+        if (std::ranges::any_of(sr.forbid, has)) continue;
+        if (sr.topMustBe && (stack.empty() || stack.back() != *sr.topMustBe)) continue;
+        if (sr.outermost && (stack.empty() || stack.front() != *sr.outermost)) continue;
+        if (!sr.anyOf.empty() && !std::ranges::any_of(sr.anyOf, has)) continue;
+        return m.id;
+    }
+    return InvalidSchemaToken;
+}
+
+// What the builder resolves `lexeme` to under `stack` (InvalidSchemaToken: refused).
+[[nodiscard]] SchemaTokenId builderResolution(ToyHarness const& h, std::string_view lexeme,
+                                              std::vector<ScopeKind> const& stack) {
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto root = b.open(h.schema->rules().find("root"));
+    for (ScopeKind const k : stack) b.pushScope(k);
+    b.pushToken(h.tok(lexeme));
+    for (std::size_t i = 0; i < stack.size(); ++i) b.popScope();
+    root.close();
+    Tree t = std::move(b).finish();
+    auto const kids = t.children(t.root());
+    if (kids.size() != 1u) {
+        ADD_FAILURE() << "one leaf expected for '" << lexeme << "', got " << kids.size();
+        return InvalidSchemaToken;
+    }
+    return t.kind(kids[0]) == NodeKind::Token ? t.tokenKind(kids[0]) : InvalidSchemaToken;
+}
+
+[[nodiscard]] std::string spell(std::vector<ScopeKind> const& stack) {
+    std::string s = "[";
+    for (ScopeKind const k : stack) {
+        s += k == ScopeKind::Block ? "Block " : k == ScopeKind::Paren ? "Paren " : "Bracket ";
+    }
+    return s + "]";
+}
+
+} // namespace
+
+TEST(TreeBuilder, AScopeCheckByPresenceAnswersAsTheStackWalkOnAGrammarWithScopeRules) {
+    auto h = ToyHarness::make("%#!", kScopePresenceConfig);
+    ASSERT_NE(h.schema, nullptr);
+    ScopeKind const kinds[] = {ScopeKind::Block, ScopeKind::Paren, ScopeKind::Bracket};
+    std::vector<std::vector<ScopeKind>> stacks{{}};
+    for (std::size_t from = 0, len = 0; len < 4; ++len) {   // every stack of 0..4 scopes
+        std::size_t const to = stacks.size();
+        for (std::size_t i = from; i < to; ++i) {
+            for (ScopeKind const k : kinds) {
+                std::vector<ScopeKind> s = stacks[i];
+                s.push_back(k);
+                stacks.push_back(std::move(s));
+            }
+        }
+        from = to;
+    }
+    // and deep ones: a kind under or over two hundred of another, and an interleaving
+    stacks.push_back(std::vector<ScopeKind>(200, ScopeKind::Block));
+    stacks.back().push_back(ScopeKind::Paren);
+    stacks.push_back({ScopeKind::Paren});
+    stacks.back().insert(stacks.back().end(), 200, ScopeKind::Block);
+    stacks.emplace_back();
+    for (int i = 0; i < 150; ++i) stacks.back().push_back(kinds[i % 3]);
+    std::size_t refused = 0;
+    std::size_t accepted = 0;
+    for (auto const& stack : stacks) {
+        for (std::string_view const lexeme : {"%", "#", "!"}) {
+            SchemaTokenId const want = walkResolution(*h.schema, lexeme, stack);
+            SchemaTokenId const got  = builderResolution(h, lexeme, stack);
+            EXPECT_EQ(got, want) << "'" << lexeme << "' under " << spell(stack)
+                                 << ": the presence check answered otherwise than the stack walk";
+            (want.valid() ? accepted : refused) += 1;
+        }
+    }
+    // The grammar reaches both answers, every `%` meaning among them.
+    EXPECT_GT(refused, 0u);
+    EXPECT_GT(accepted, 0u);
+    for (std::string_view const kind :
+         {"PctBlockNotBracket", "PctTopParen", "PctOuterBlock", "PctAnywhere"}) {
+        SchemaTokenId const id = h.schema->schemaTokens().find(kind);
+        EXPECT_TRUE(std::ranges::any_of(stacks, [&](auto const& s) {
+            return walkResolution(*h.schema, "%", s) == id;
+        })) << kind << " is never the walk's answer: the grammar does not reach it";
+    }
+}
+
+TEST(TreeBuilder, ARollbackAcrossAPushedAndPoppedScopeRestoresTheScopeKindCounts) {
+    auto h = ToyHarness::make("#!#!#!#!#!", kScopePresenceConfig);
+    ASSERT_NE(h.schema, nullptr);
+    SchemaTokenId const hash = h.schema->schemaTokens().find("Hash");
+    SchemaTokenId const bang = h.schema->schemaTokens().find("Bang");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto root = b.open(h.schema->rules().find("root"));
+    b.pushScope(ScopeKind::Block);
+    b.pushToken(h.tok("#", 0, CoreTokenKind::Operator));          // Hash: no Paren open
+    {
+        auto cp = b.checkpoint();
+        b.pushScope(ScopeKind::Paren);
+        b.popScope();
+        b.pushScope(ScopeKind::Paren);
+        b.pushScope(ScopeKind::Bracket);   // a kind first seen inside the rolled-back branch
+        b.rollback(std::move(cp));
+    }
+    EXPECT_EQ(std::vector<ScopeKind>(b.scopeStack().begin(), b.scopeStack().end()),
+              std::vector<ScopeKind>{ScopeKind::Block});
+    b.pushToken(h.tok("#", 2, CoreTokenKind::Operator));          // Hash: Paren closed again
+    b.pushToken(h.tok("!", 3, CoreTokenKind::Operator));          // Bang: Bracket closed again
+    b.pushScope(ScopeKind::Paren);
+    b.pushToken(h.tok("#", 4, CoreTokenKind::Operator));          // refused: Paren open
+    b.popScope();
+    b.pushToken(h.tok("#", 6, CoreTokenKind::Operator));          // Hash
+    b.pushScope(ScopeKind::Bracket);
+    b.pushToken(h.tok("!", 7, CoreTokenKind::Operator));          // refused: Bracket open
+    b.popScope();
+    b.pushToken(h.tok("!", 9, CoreTokenKind::Operator));          // Bang
+    b.popScope();
+    root.close();
+    Tree t = std::move(b).finish();
+    std::vector<SchemaTokenId> got;
+    for (NodeId const c : t.children(t.root())) {
+        got.push_back(t.kind(c) == NodeKind::Token ? t.tokenKind(c) : InvalidSchemaToken);
+    }
+    std::vector<SchemaTokenId> const want{hash, hash, bang, InvalidSchemaToken, hash,
+                                          InvalidSchemaToken, bang};
+    ASSERT_EQ(got.size(), want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        EXPECT_EQ(got[i], want[i])
+            << "leaf " << i << ": a rollback restores the scope kinds' counts as it restores the "
+               "stack, or a token resolves under a scope the stack no longer holds";
+    }
+}

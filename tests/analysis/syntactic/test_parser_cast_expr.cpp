@@ -493,9 +493,11 @@ TEST(ParserCastExpr, LocalValueShadowsFileScopeTypedef) {
     EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
 }
 
-// Param shadowing: a parameter binds into the FUNCTION's scope
-// (funcDefTail opens one scope over params + body), so a param named T
-// shadows the file-scope typedef INSIDE the body.
+// Param shadowing: a parameter binds into its parameter list's prototype
+// scope, and a DEFINITION's own parameters are carried into the scope its
+// declaration opens (c's topLevelDecl / externDecl) when its body opens
+// (P69 L2a2), so a param named T shadows the file-scope typedef INSIDE the
+// body.
 TEST(ParserCastExpr, ParamShadowsFileScopeTypedefInsideBody) {
     auto r = parseC(
         "typedef int T;\n"
@@ -637,6 +639,44 @@ TEST(ParserCastExpr, ADeclaratorsNameIsInScopeFromTheEndOfItsDeclarator) {
         EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
         EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
         EXPECT_EQ(countNodesWithRule(r.tree, "sizeofType"), row.sizeofTypes) << row.what;
+    }
+}
+
+// P69 L2a2 (the L2a review's N9): a PARAMETER of a function declarator that is not a
+// definition's own has function prototype scope (C 6.2.1p4); past its declarator the typedef
+// it shadowed is a type again, so `(T)(x)` is a cast. The sketch bound such a parameter into
+// the enclosing block, and `(T)(x)` parsed as a call. A definition's own parameter reaches its
+// body (the control rows). ✔MEASURED 2026-10-28 (WSL gcc 13.3.0 / clang 18.1.3, gnu2x and c2x
+// -pedantic-errors): every cast row's program exits 42; the own-parameter call is refused.
+TEST(ParserCastExpr, APrototypeParametersScopeEndsWithItsDeclarator) {
+    struct Row { char const* what; char const* src; std::size_t casts; };
+    Row const rows[] = {
+        {"a function-pointer object's parameter",
+         "typedef int T;\nint main(void) { int (*fp)(int T) = 0; int x = 42; (void)fp; "
+         "return (T)(x); }\n", 2},
+        {"a block-scope prototype's parameter",
+         "typedef int T;\nint main(void) { int f(int T); int x = 42; return (T)(x); }\n", 1},
+        {"a block-scope typedef's parameter",
+         "typedef int T;\nint main(void) { typedef int (*F)(int T); F f = 0; int x = 42; "
+         "(void)f; return (T)(x); }\n", 2},
+        {"a cast's type name's parameter",
+         "typedef int T;\nint main(void) { (void)(int (*)(int T))0; int x = 42; "
+         "return (T)(x); }\n", 3},
+        {"a file-scope prototype's parameter, in the next declarator",
+         "typedef int T;\nint f(int T), y = sizeof((T)(1));\n", 1},
+        {"a definition's RETURNED function type's parameter, in its body",
+         "typedef int T;\nstatic int h(int t) { return t; }\n"
+         "static int (*g(int a))(int T) { return (a == (T)(a)) ? h : 0; }\n", 1},
+        // CONTROLS: a definition's OWN parameter reaches its body, in either spelling.
+        {"a definition's own parameter, in its body",
+         "typedef int T;\nint f(int T, int x) { return (T)(x); }\n", 0},
+        {"a parenthesised definition's own parameter, in its body",
+         "typedef int T;\nint (f)(int T, int x) { return (T)(x); }\n", 0},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
     }
 }
 

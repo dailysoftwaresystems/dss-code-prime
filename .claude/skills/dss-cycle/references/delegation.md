@@ -210,6 +210,21 @@ not at fault — the brief asked for anchors and got anchors. Put this in every 
 > — and I rule. The default answer is "close it now". Close the disclosed rows that name a file
 > or a mechanism you are touching, in the same wave.
 
+★★★★ **AND EVERY BRIEF MUST CARRY THE CLASS-CLOSURE PARAGRAPH** — a lane told only to fix the defect fixes the
+instance, at the site where it was seen, and the neighbour comes back as the next review finding (the procedure
+and its measurement are in `class-closure.md`). Put this in every brief, verbatim:
+
+> For every defect, before you edit: write the **invariant** ("X is decided by Y for every Z"), the **one home**
+> that should decide it, and the **site list** — every place that decides it today, found by searching the DATA
+> (the kind, the schema key, the diagnostic) across every tier, format and target, not the file you saw it in.
+> More than one site means you **consolidate**: one home decides, the others read it, the duplicates are deleted
+> in this wave. Your pin is table-driven over the **universe** (formats × targets × tiers × pipelines × forms ×
+> both directions), and your arm mutates the home. Before the hand-back, **sweep the neighbours** — the same
+> invariant at the other cells, the opposite direction, the optimized form of the same source — on DSS and on each
+> reference, and fix every failure in this wave. Your hand-back carries, per row: invariant, home, site list
+> (before and after), universe covered, neighbours measured. The closing names the universe, not the case. The
+> fold refuses a row without the record.
+
 Then CHECK the returned rows before you write them. An agent reporting "anchored 6 findings" is
 reporting six unfinished jobs unless every one says CLOSED.
 

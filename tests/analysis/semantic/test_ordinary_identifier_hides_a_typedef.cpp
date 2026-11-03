@@ -123,3 +123,35 @@ TEST(OrdinaryIdentifierHidesATypedef, ATagAloneIsNoOrdinaryIdentifier) {
          "int main(void) { return (int)sizeof((T *)0); }\n", false},
     }, DiagnosticCode::S_UndeclaredIdentifier);
 }
+
+// ── P69 L2a2 (the L2a review's N9): a PARAMETER of a function declarator that is not a
+// definition's own has function prototype scope (C 6.2.1p4) — it ends with that declarator,
+// and the typedef it shadowed is a type again: `(T)(x)` is a cast. The parser's sketch kept the
+// parameter visible for the rest of the block, so `(T)(x)` parsed as a call and was refused
+// S_NotCallable. ✔MEASURED 2026-10-28 (WSL gcc 13.3.0 / clang 18.1.3, gnu2x and c2x
+// -pedantic-errors, built and run): every accepted case below exits 42; the CONTROL (a
+// definition's OWN parameter, which its body sees) is refused by both ("called object type
+// 'int' is not a function or function pointer").
+TEST(OrdinaryIdentifierHidesATypedef, APrototypeParameterHidesNothingPastItsDeclarator) {
+    expectVerdicts({
+        {"a function-pointer object's parameter",
+         "typedef int T;\nint main(void) { int (*fp)(int T) = 0; int x = 42; (void)fp; "
+         "return (T)(x); }\n", false},
+        {"a block-scope prototype's parameter",
+         "typedef int T;\nint main(void) { int f(int T); int x = 42; return (T)(x); }\n", false},
+        {"a block-scope typedef's parameter",
+         "typedef int T;\nint main(void) { typedef int (*F)(int T); F f = 0; int x = 42; "
+         "(void)f; return (T)(x); }\n", false},
+        {"a cast's type name's parameter",
+         "typedef int T;\nint main(void) { (void)(int (*)(int T))0; int x = 42; "
+         "return (T)(x); }\n", false},
+        {"a definition's RETURNED function type's parameter, in the definition's body",
+         "typedef int T;\nstatic int h(int t) { return t; }\n"
+         "static int (*g(int a))(int T) { return (a == (T)(a)) ? h : 0; }\n"
+         "int main(void) { return g(42)(42); }\n", false},
+        // THE CONTROL: a definition's OWN parameter is in scope in its body and hides it.
+        {"a definition's own parameter, in its body",
+         "typedef int T;\nstatic int f(int T, int x) { return (T)(x); }\n"
+         "int main(void) { return f(1, 42); }\n", true},
+    }, DiagnosticCode::S_NotCallable);
+}

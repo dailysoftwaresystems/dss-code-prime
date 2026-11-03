@@ -86,9 +86,13 @@ hand-typing every edit or reading every subsystem.
    harness defect you FACE is fixed in this cycle, never filed for later. See the ruling above. [→ registry-and-priority.md](registry-and-priority.md)
 2. **Clear blockers FIRST** — from the §0.1 "Blocked by" column *and* the registry *and* any
    "requires deferrals" note. Highest-priority blocker first, before the priority itself.
-3. **Plan it** — delegate to `/feature-dev:feature-dev` or a `Plan` / `code-architect` agent.
+3. **Plan it** — delegate to `/feature-dev:feature-dev` or a `Plan` / `code-architect` agent. For each
+   defect the plan states the invariant, the ONE home that decides it, the site list (every place that
+   decides it today, searched by the data across every tier, format and target) and the universe it ranges
+   over; where the list has more than one entry the plan consolidates them [→ class-closure.md](class-closure.md).
 4. **Design-audit the plan before lock** — an **independent** subagent applies the `dss-audit` bar to
-   the *plan*. An agnosticism break, a tight slice, a speculative build, or a weak-test plan caught
+   the *plan*, and searches the data itself for sites the plan's list missed: a plan that patches one site
+   of several is a finding. An agnosticism break, a tight slice, a speculative build, or a weak-test plan caught
    here is far cheaper than after the diff lands. Scale the rigor: trivial mechanical cycle → quick
    self-check; new engine mechanism → full independent review **and** a §B pause to the user. AMENDED 2026-09-21 by the decision gate — a decision brief reported veto-able, not a pause (see SKILL.md)
 5. **Implement** — delegate in parallel by **disjoint file sets** (engine `.cpp/.hpp` vs
@@ -105,7 +109,10 @@ hand-typing every edit or reading every subsystem.
    [→ the rest of step 5 — the lane rules — is in lane-discipline.md](lane-discipline.md)
 
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
-   screen. ⓘ There is no twin parity to review any more: a program under
+   screen. The reviewer is handed each row's class-closure record and judges the site list and the universe
+   before the diff; each finding is routed by its class (send back for a defect the diff introduced or another
+   instance of a class it claims to close; a pre-existing defect of another class in untouched code does not hold
+   the fold) [→ class-closure.md](class-closure.md). ⓘ There is no twin parity to review any more: a program under
    `.harness-config/runner/actions` is ONE `.py`, and `scripts_index_guard` refuses a `.sh` or `.ps1`
    there (see the layout section below) [→ actions.md, its last section](actions.md). **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.

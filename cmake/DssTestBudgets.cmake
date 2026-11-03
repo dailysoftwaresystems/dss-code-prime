@@ -137,7 +137,20 @@ set(_DSS_TB_NAMED
     #   program/test_project_config 37.8 s -- debug.
     # No sanitized figure was measured (only CI builds that class): every row keeps its own.
     "program/test_emit_hir_round_trips_every_example|1536|436|774"
-    "hir/test_frontend_deep_nesting_costs_heap|1501|36|200"
+    # ★ hir/test_frontend_deep_nesting_costs_heap: RELEASE AND DEBUG RE-DERIVED 2026-10-28 (cycle P69,
+    # lane lm's L2a2), when the entry's own cost FELL: the parse of a nest stopped reading the tree
+    # builder's whole scope stack for every token (111.02 s MinGW Debug at L2a's finals). Not a shave:
+    # each cell is the slowest healthy run of the binary as it now is, rounded up. ✔MEASURED in two
+    # whole-suite runs of the lane's bytes under the round's load, the entry passing in each leg of both
+    # (run 20261028-204341-d9832850, then run 20261028-232113-09de98e8):
+    #   macos-arm64 Debug (AppleClang)      52.44 s, 48.39 s;
+    #   windows-x86_64 Debug (MinGW GCC)    42.35 s, 63.90 s  -- the debug cell;
+    #   linux-x86_64 Debug (GCC)            40.75 s, 40.09 s;
+    #   windows-x86_64 Release (MSVC)       10.19 s, 15.91 s  -- the release cell, under the release unit
+    #     ceiling, so the entry's release budget is the unit's (a named entry is never below it).
+    # Not measured: the arm64 VPS Debug leg and CI's release legs.
+    # Sanitized is NOT re-measured -- the round close's sanitized run re-derives it -- and keeps its 1501.
+    "hir/test_frontend_deep_nesting_costs_heap|1501|16|64"
     "mir/test_deep_nesting_costs_heap|904|22|146"
     "conformance/test_reference_conformance|607|108|310"
     "analysis/preprocess/test_preprocessor_shuffled|354|163|489"
