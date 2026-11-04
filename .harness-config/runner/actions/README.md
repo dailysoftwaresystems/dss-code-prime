@@ -61,6 +61,7 @@ dssharness run check-scripts-index-write
 | **`anchors`** | `anchors.py` | the library the anchors family shares -- the registry row reader, its vocabulary and the one launcher of the door that writes rows, dssharness write-anchor and set-anchor. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`check-anchor-registry`** | `check-anchor-registry.py` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
+| **`check-arms-registry`** | `check-arms-registry.py` | check what the mutation arms registry promises that `dssharness check-mutations` does not: every row stands in the tree, each section is in order, one case count per (runner, leg), and a sweep's reds and diagnostics against its rows. |
 | **`check-conflict-markers`** | `check-conflict-markers.py` | refuse a line that is a merge-conflict marker git writes -- seven `<`, seven vertical bars or seven `>` at its start, and seven `=` alone between an opener and its closer -- in any text file of the tree git tracks or would add. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-doc-census`** | `check-doc-census.py`, `source-census.py` | refuse a documented figure a census refutes, or an unpinned quantified claim about the corpus in config prose, and repair figures in place. |

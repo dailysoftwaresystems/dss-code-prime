@@ -52,7 +52,10 @@ namespace {
       "configure: an interpreter named by hand inside the App Execution Alias directory is refused by name") \
     X(AnInterpreterNamedInsideTheAliasDirectoryInAnotherCaseIsRefusedByName,                                \
       "configure: an interpreter named inside the App Execution Alias directory in another case is refused " \
-      "by name")
+      "by name")                                                                                           \
+    X(APathEntryInsideTheAliasDirectoryAfterAnEntryEndingInASeparatorIsLeftOut,                            \
+      "configure: a PATH entry inside the App Execution Alias directory is left out of the search after an " \
+      "entry ending in a separator")
 #else
 #define DSS_PYTHON_SELFTEST_ALIAS_ARMS(X)
 #endif

@@ -37,7 +37,8 @@
 #   directories -- and proves what it chooses: on a clean configure (and that the search there was told to
 #   ask the PATH before the registry and the frameworks), on a floor no interpreter meets, and, on a Windows
 #   host, on a cache that already names an App Execution Alias (the cache a build configured before this rule
-#   holds), on an alias named by hand, and on one named in another case. Each proof is an ARM and prints one verdict line;
+#   holds), on an alias named by hand, on one named in another case, and on a PATH entry inside the alias
+#   directory that follows an entry ending in a separator. Each proof is an ARM and prints one verdict line;
 #   the test binary reads each into a case of its own (tests/program/test_python_interpreter.cpp).
 
 # The floor `config` states (tools -> python3 -> minVersion) -> `out_var`; a FATAL_ERROR naming what is
@@ -116,6 +117,24 @@ function(_dss_python_in_aliases aliases path out_var)
     set(${out_var} ${_in} PARENT_SCOPE)
 endfunction()
 
+# Drop FindPython3's cached choice of interpreter, WHOLE: the interpreter, its debug sibling, the signature its
+# validity is checked by, and the PROPERTIES FindPython3 reports of it (its version parts, stdlib and
+# site-packages). FindPython3 drops these four together when it drops a cached interpreter itself, and it reports
+# the interpreter it finds next with whatever properties are still cached -- the dropped one's (P69 H5).
+function(_dss_python_forget_the_cached_choice)
+    foreach(_dss_python_cached IN ITEMS _Python3_EXECUTABLE _Python3_EXECUTABLE_DEBUG
+                                        _Python3_INTERPRETER_SIGNATURE _Python3_INTERPRETER_PROPERTIES)
+        unset(${_dss_python_cached} CACHE)
+    endforeach()
+endfunction()
+
+# THE LEG'S PATH FIRST (above), stated ONCE: the CMake code that sets the search parameters FindPython3 is asked
+# with. The module's search runs it, and the self-test's configure before the rule -- a project that does not
+# include this module (case 3) -- is written with it: FindPython3 keeps a cached choice only under the signature
+# it was made with, and these parameters are part of that signature (cmake 4.3.2 FindPython/Support.cmake), so
+# the two configures are asked alike by construction, never by a second copy of the parameters (P69 H5).
+set(_dss_python_search_order "set(Python3_FIND_REGISTRY LAST)\nset(Python3_FIND_FRAMEWORK LAST)\n")
+
 if(DEFINED DSS_PYTHON_MODE)
     # ═══ THE SELF-TEST ═══
     if(NOT DSS_PYTHON_MODE STREQUAL "selftest")
@@ -130,10 +149,10 @@ if(DEFINED DSS_PYTHON_MODE)
     _dss_python_read_floor("${DSS_PYTHON_SOURCE_DIR}/.harness-config/config.json" _dss_py_t_floor)
     file(READ "${DSS_PYTHON_SOURCE_DIR}/.harness-config/config.json" _dss_py_t_config)
     _dss_python_alias_directory(_dss_py_t_aliases)
-    # The ratchet: three arms on every host, three more where App Execution Aliases exist.
+    # The ratchet: three arms on every host, four more where App Execution Aliases exist.
     set(_DSS_PY_SELFTEST_ARMS 3)
     if(_dss_py_t_aliases)
-        set(_DSS_PY_SELFTEST_ARMS 6)
+        set(_DSS_PY_SELFTEST_ARMS 7)
     endif()
     set(_dss_py_t_ran 0)
     set(_dss_py_t_failed 0)
@@ -190,12 +209,14 @@ if(DEFINED DSS_PYTHON_MODE)
     _dss_py_t_configure(clean "${_dss_py_t_config}" _rc _o _chosen)
     list(LENGTH _chosen _n)
     set(_ok FALSE)
+    set(_dss_py_t_clean_exe "")
     if(_rc EQUAL 0 AND _n EQUAL 2)
         list(GET _chosen 0 _exe)
         list(GET _chosen 1 _ver)
         _dss_py_t_in_aliases("${_exe}" _in)
         if(_ver VERSION_GREATER_EQUAL _dss_py_t_floor AND NOT _in)
             set(_ok TRUE)
+            set(_dss_py_t_clean_exe "${_exe}")
         endif()
     endif()
     _dss_py_t_arm("configure: a clean configure chooses an interpreter at or above the floor config.json states"
@@ -231,22 +252,133 @@ if(DEFINED DSS_PYTHON_MODE)
                   ${_ok} "rc ${_rc}: ${_o}")
 
     if(_dss_py_t_aliases)
-        # (3) A cache that ALREADY names an App Execution Alias -- what a build configured before this rule
-        #     holds -- is searched again, and the interpreter chosen lies outside the alias directory.
-        _dss_py_t_configure(cached-alias "${_dss_py_t_config}" _rc _o _chosen
-                            "-D_Python3_EXECUTABLE:INTERNAL=${_dss_py_t_aliases}/python3.exe")
-        list(LENGTH _chosen _n)
+        # THE FIXTURE'S OWN ALIAS DIRECTORY, holding an interpreter that STARTS. Whether the host's alias starts
+        # one is the host's business (a Store stub, an install manager, a removed runtime), and a case that asks
+        # the module's rule must not hang on it: the fixture points `LOCALAPPDATA` into the scratch and makes a
+        # virtual environment there, with the interpreter the clean configure chose. Its PATH names that
+        # environment's interpreter first and leaves the host's alias directory out -- the fixture asks about its
+        # own alias directory alone. Cases (3) and (6) configure under it.
+        set(_dss_py_t_lad "${DSS_PYTHON_SCRATCH}/alias-fixture/localappdata")
+        set(_dss_py_t_fixture_aliases "${_dss_py_t_lad}/Microsoft/WindowsApps")
+        set(_dss_py_t_fixture_exe "${_dss_py_t_fixture_aliases}/Scripts/python.exe")
+        set(_dss_py_t_fixture_why "")
+        if(_dss_py_t_clean_exe STREQUAL "")
+            set(_dss_py_t_fixture_why "the clean configure chose no interpreter to make the fixture's alias directory with")
+        else()
+            execute_process(COMMAND "${_dss_py_t_clean_exe}" -m venv --without-pip "${_dss_py_t_fixture_aliases}"
+                            RESULT_VARIABLE _venv_rc OUTPUT_VARIABLE _venv_out ERROR_VARIABLE _venv_err)
+            if(NOT _venv_rc EQUAL 0 OR NOT EXISTS "${_dss_py_t_fixture_exe}")
+                set(_dss_py_t_fixture_why "the fixture's alias directory was not made: `${_dss_py_t_clean_exe} -m venv` "
+                                          "answered ${_venv_rc}: ${_venv_out}${_venv_err}")
+            endif()
+        endif()
+        # The leg's PATH, read as the SEARCH PATH it is (an entry ending in a separator does not swallow the next),
+        # without the host's alias directory.
+        file(TO_CMAKE_PATH "$ENV{PATH}" _dss_py_t_leg_path)
+        set(_dss_py_t_leg_rest "")
+        foreach(_entry IN LISTS _dss_py_t_leg_path)
+            if(NOT _entry STREQUAL "")
+                _dss_py_t_in_aliases("${_entry}" _in)
+                if(NOT _in)
+                    file(TO_NATIVE_PATH "${_entry}" _entry)
+                    list(APPEND _dss_py_t_leg_rest "${_entry}")
+                endif()
+            endif()
+        endforeach()
+        file(TO_NATIVE_PATH "${_dss_py_t_lad}" _dss_py_t_lad_native)
+        file(TO_NATIVE_PATH "${_dss_py_t_fixture_aliases}/Scripts" _dss_py_t_fixture_scripts)
+
+        # Configures the fixture project `case` under the fixture's alias directory and the PATH `path` (a list),
+        # twice when `before` is TRUE: first a project WITHOUT this module -- the search parameters this module
+        # sets (`_dss_python_search_order`, their one statement), nothing of its rule -- whose configure
+        # FindPython3 caches its choice in, then the same build with
+        # this module. -> the exit code, the text, the choice (as `_dss_py_t_configure` gives them), and what the
+        # configure before the rule chose.
+        function(_dss_py_t_configure_under_fixture case path before out_rc out_text out_chosen out_before)
+            set(_root "${DSS_PYTHON_SCRATCH}/${case}")
+            file(REMOVE_RECURSE "${_root}")
+            set(_gen -G "${DSS_PYTHON_GENERATOR}")
+            if(DSS_PYTHON_MAKE_PROGRAM)
+                list(APPEND _gen "-DCMAKE_MAKE_PROGRAM=${DSS_PYTHON_MAKE_PROGRAM}")
+            endif()
+            set(_chosen_before "")
+            if(before)
+                file(WRITE "${_root}/tree/CMakeLists.txt"
+                     "cmake_minimum_required(VERSION 4.0)\nproject(pythonfixture NONE)\n"
+                     "${_dss_python_search_order}"
+                     "find_package(Python3 COMPONENTS Interpreter REQUIRED)\n"
+                     "file(WRITE \"\${CMAKE_BINARY_DIR}/before.txt\" \"\${Python3_EXECUTABLE}\\n\")\n")
+                execute_process(
+                    COMMAND "${CMAKE_COMMAND}" -E env "LOCALAPPDATA=${_dss_py_t_lad_native}" "PATH=${path}"
+                            "${CMAKE_COMMAND}" -S "${_root}/tree" -B "${_root}/build" ${_gen}
+                    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+                if(_rc EQUAL 0 AND EXISTS "${_root}/build/before.txt")
+                    file(STRINGS "${_root}/build/before.txt" _chosen_before)
+                endif()
+            endif()
+            file(WRITE "${_root}/tree/.harness-config/config.json" "${_dss_py_t_config}")
+            file(WRITE "${_root}/tree/CMakeLists.txt"
+                 "cmake_minimum_required(VERSION 4.0)\nproject(pythonfixture NONE)\n"
+                 "include(\"${_dss_py_t_module}\")\n"
+                 "file(WRITE \"\${CMAKE_BINARY_DIR}/chosen.txt\" \"\${Python3_EXECUTABLE}\\n\${Python3_VERSION}\\n\${Python3_SITELIB}\\n\")\n")
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -E env "LOCALAPPDATA=${_dss_py_t_lad_native}" "PATH=${path}"
+                        "${CMAKE_COMMAND}" -S "${_root}/tree" -B "${_root}/build" ${_gen}
+                RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+            string(REGEX REPLACE "[ \t\r\n]+" " " _text "${_out}${_err}")
+            set(_chosen "")
+            if(_rc EQUAL 0 AND EXISTS "${_root}/build/chosen.txt")
+                file(STRINGS "${_root}/build/chosen.txt" _chosen)
+            endif()
+            set(${out_rc} "${_rc}" PARENT_SCOPE)
+            set(${out_text} "${_text}" PARENT_SCOPE)
+            set(${out_chosen} "${_chosen}" PARENT_SCOPE)
+            set(${out_before} "${_chosen_before}" PARENT_SCOPE)
+        endfunction()
+
+        # Whether the configure chose an interpreter outside BOTH alias directories, the fixture's and the host's,
+        # and FindPython3 reports it as itself: its site-packages lie outside them too (an interpreter reported
+        # with a dropped choice's cached properties carries the dropped one's).
+        function(_dss_py_t_chose_outside rc chosen out_var)
+            set(_ok FALSE)
+            list(LENGTH chosen _n)
+            if(rc EQUAL 0 AND _n EQUAL 3)
+                list(GET chosen 0 _exe)
+                list(GET chosen 2 _site)
+                _dss_python_in_aliases("${_dss_py_t_fixture_aliases}" "${_exe}" _in_fixture)
+                _dss_py_t_in_aliases("${_exe}" _in_host)
+                _dss_python_in_aliases("${_dss_py_t_fixture_aliases}" "${_site}" _site_in_fixture)
+                if(NOT _exe STREQUAL "" AND NOT _site STREQUAL "" AND NOT _in_fixture AND NOT _in_host
+                   AND NOT _site_in_fixture)
+                    set(_ok TRUE)
+                endif()
+            endif()
+            set(${out_var} ${_ok} PARENT_SCOPE)
+        endfunction()
+
+        # (3) A cache that ALREADY names an interpreter inside the alias directory -- what a build configured
+        #     before this rule holds -- is searched again, and the interpreter chosen lies outside it. THE CACHE IS
+        #     MADE AS SUCH A BUILD MADE IT, BY FINDPYTHON3: a cached `_Python3_EXECUTABLE` that its own
+        #     `_Python3_INTERPRETER_SIGNATURE` does not match is discarded by FindPython3 before this module's rule
+        #     decides anything (READ, cmake 4.3.2's FindPython/Support.cmake), so a `-D` of the cache alone never
+        #     reached the rule: ✔MEASURED 2026-11-03, with the rule's `unset` removed that fixture stayed green
+        #     (check-mutations run 20261103-181938-fd251bd3, windows-x86_64-release). The configure before the rule
+        #     must have chosen the fixture's alias, or the cache this case asks about was never made.
         set(_ok FALSE)
-        set(_exe "")
-        if(_rc EQUAL 0 AND _n EQUAL 2)
-            list(GET _chosen 0 _exe)
-            _dss_py_t_in_aliases("${_exe}" _in)
-            if(NOT _in AND NOT _exe STREQUAL "")
-                set(_ok TRUE)
+        set(_detail "${_dss_py_t_fixture_why}")
+        if(_dss_py_t_fixture_why STREQUAL "")
+            set(_path "${_dss_py_t_fixture_scripts}" ${_dss_py_t_leg_rest})
+            _dss_py_t_configure_under_fixture(cached-alias "${_path}" TRUE _rc _o _chosen _before)
+            _dss_python_in_aliases("${_dss_py_t_fixture_aliases}" "${_before}" _cached)
+            if(NOT _cached)
+                set(_detail "the configure before the rule chose [${_before}], not the fixture's alias: no cache to ask about")
+            else()
+                _dss_py_t_chose_outside("${_rc}" "${_chosen}" _ok)
+                set(_detail "rc ${_rc}, chose [${_chosen}] over the cached [${_before}]: ${_o}")
             endif()
         endif()
         _dss_py_t_arm("configure: a cache naming an App Execution Alias is searched again, and the interpreter chosen lies outside the alias directory"
-                      ${_ok} "rc ${_rc}, chose [${_chosen}]: ${_o}")
+                      ${_ok} "${_detail}")
 
         # (4) An interpreter named BY HAND inside the alias directory is refused, by name.
         _dss_py_t_configure(named-alias "${_dss_py_t_config}" _rc _o _chosen
@@ -268,6 +400,24 @@ if(DEFINED DSS_PYTHON_MODE)
         endif()
         _dss_py_t_arm("configure: an interpreter named inside the App Execution Alias directory in another case is refused by name"
                       ${_ok} "rc ${_rc}, chose [${_chosen}]: ${_o}")
+
+        # (6) A PATH entry inside the alias directory is left out of the search when the entry before it ENDS IN A
+        #     SEPARATOR. The PATH is a native search path, not a CMake list: read as a list, `C:\a\;C:\b` is ONE
+        #     element (`\;` does not divide one, cmake-language "Lists"), so the entry after a `\` was never
+        #     compared. ✔MEASURED 2026-11-03, this host's PATH: 14 of its 61 entries end in `\`. The fixture's PATH
+        #     is one such entry (the scratch directory, which exists), then the fixture's alias interpreter, then
+        #     the leg's PATH; no cache.
+        set(_ok FALSE)
+        set(_detail "${_dss_py_t_fixture_why}")
+        if(_dss_py_t_fixture_why STREQUAL "")
+            file(TO_NATIVE_PATH "${DSS_PYTHON_SCRATCH}/" _dss_py_t_ends_in_separator)
+            set(_path "${_dss_py_t_ends_in_separator}" "${_dss_py_t_fixture_scripts}" ${_dss_py_t_leg_rest})
+            _dss_py_t_configure_under_fixture(after-a-separator "${_path}" FALSE _rc _o _chosen _before)
+            _dss_py_t_chose_outside("${_rc}" "${_chosen}" _ok)
+            set(_detail "rc ${_rc}, chose [${_chosen}]: ${_o}")
+        endif()
+        _dss_py_t_arm("configure: a PATH entry inside the App Execution Alias directory is left out of the search after an entry ending in a separator"
+                      ${_ok} "${_detail}")
     endif()
 
     file(REMOVE_RECURSE "${DSS_PYTHON_SCRATCH}")
@@ -290,7 +440,7 @@ _dss_python_read_floor("${_dss_python_config}" DSS_PYTHON_FLOOR)
 #   the old floor whenever it also meets the new one, and the interpreter is to be the first that meets
 #   the floor stated now, on every configure alike.
 if(DEFINED CACHE{DSS_PYTHON_FLOOR_SEARCHED} AND NOT DSS_PYTHON_FLOOR_SEARCHED STREQUAL DSS_PYTHON_FLOOR)
-    unset(_Python3_EXECUTABLE CACHE)
+    _dss_python_forget_the_cached_choice()
 endif()
 set(DSS_PYTHON_FLOOR_SEARCHED "${DSS_PYTHON_FLOOR}" CACHE INTERNAL
     "the Python floor (config.json tools python3 minVersion) the interpreter was searched for under")
@@ -302,7 +452,7 @@ if(_dss_python_aliases)
             file(TO_CMAKE_PATH "${${_dss_python_var}}" _dss_python_named)
             _dss_python_in_aliases("${_dss_python_aliases}" "${_dss_python_named}" _dss_python_in_aliases)
             if(_dss_python_in_aliases AND _dss_python_var STREQUAL "_Python3_EXECUTABLE")
-                unset(_Python3_EXECUTABLE CACHE)
+                _dss_python_forget_the_cached_choice()
             elseif(_dss_python_in_aliases)
                 message(FATAL_ERROR "DssPython: Python3_EXECUTABLE names ${_dss_python_named}, an App "
                                     "Execution Alias: a reparse point the process loader resolves and a spawner "
@@ -312,9 +462,10 @@ if(_dss_python_aliases)
     endforeach()
     # The search leaves the alias directory out under EVERY spelling the leg's PATH gives it: CMAKE_IGNORE_PATH
     # compares spellings, and a PATH entry naming the directory in another case or its short form would pass.
-    # (Aliases exist on Windows alone, whose PATH is `;`-separated: a CMake list as it stands.)
+    # The PATH is read as the native SEARCH PATH it is: read as a CMake list, an entry ending in `\` escapes the
+    # `;` after it and swallows the next entry, which was then never compared (P69 H5).
     set(_dss_python_ignored "${_dss_python_aliases}")
-    set(_dss_python_path "$ENV{PATH}")
+    file(TO_CMAKE_PATH "$ENV{PATH}" _dss_python_path)
     foreach(_dss_python_entry IN LISTS _dss_python_path)
         if(NOT _dss_python_entry STREQUAL "")
             _dss_python_in_aliases("${_dss_python_aliases}" "${_dss_python_entry}" _dss_python_in_aliases)
@@ -327,8 +478,7 @@ if(_dss_python_aliases)
     list(REMOVE_DUPLICATES _dss_python_ignored)
     list(APPEND CMAKE_IGNORE_PATH ${_dss_python_ignored})
 endif()
-set(Python3_FIND_REGISTRY LAST)
-set(Python3_FIND_FRAMEWORK LAST)
+cmake_language(EVAL CODE "${_dss_python_search_order}")
 find_package(Python3 ${DSS_PYTHON_FLOOR} COMPONENTS Interpreter REQUIRED)
 if(_dss_python_aliases)
     list(REMOVE_ITEM CMAKE_IGNORE_PATH ${_dss_python_ignored})

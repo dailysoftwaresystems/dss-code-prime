@@ -1,1 +1,1 @@
-    for (char const* top : {"src", "integrated_tests", "tests/test_support"}) {
+    for (char const* top : {"src", "integrated_tests", "tests/examples", "tests/test_support"}) {

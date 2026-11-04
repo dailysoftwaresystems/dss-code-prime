@@ -740,7 +740,35 @@ round's close; each checkpoint's commit message says what was and was not run on
   (MSVC 19.51), windows-x86_64-debug (GNU 13.2.0), linux-x86_64-debug (GNU 13.3.0) and macos-arm64-debug (AppleClang
   21.0.0); the read count costs nothing measurable (DSS's release compile of sqlite3.c, parse phase 1.01–1.12 s with
   it, 1.09–1.10 s without). Folded with no conflict. The MERGED tree's five-leg suite, repo-guard and the sweep of the
-  fold's 41 arms follow the commit.
+  fold's 41 arms follow checkpoint 38 (one reading for both folds: their changed test binaries are disjoint).
+- **Checkpoint 38 (2026-11-04) = the harness lane's fold H5, the PE platform runtime**: every stack probe and stack
+  cookie routine a reference toolchain's runtime gives its objects is DEFINED in a pe64 image DSS links — cl/clang-cl
+  `__chkstk` and the /GS family (`__security_check_cookie`, `__GSHandlerCheck`, `__GSHandlerCheck_SEH`, `_fltused`;
+  a moved cookie ends in ONE fast fail 0xC0000409, a meaning fork decided where libssp traps), mingw gcc
+  `___chkstk_ms`, gcc's stack protector (`__stack_chk_guard` / `__stack_chk_fail`), `__main`, `__gcc_personality_seh0`
+  and `_Unwind_Resume` (a foreign exception passes over a gcc cleanup frame; libgcc's own protocol is refused loud) —
+  shipped as the documents' `compilerSupport` role (src/dss-config/runtime/platform/src/pe_compiler_support.c,
+  pe_compiler_support_x86_64.s, pe_gcc_unwind.c); every unit of a `container: archive` build, whatever tier built it,
+  is packaged as an archive MEMBER through ONE step (`packageUnitsAsStaticArchive` in program.cpp — the assembly
+  tier wrote a bare object under the archive's name, merged eagerly into every link, the cause of 21 tests' symbol
+  redefinitions), and the runtime archives reach an IMAGE build alone (a relocatable object defined them —
+  ✔MEASURED, fixed); a Win32 walk-up reaches a volume's ROOT directory, never its device; the configure's Python search
+  states its parameters once, drops a cached choice whole and reads PATH as a search path; H4b's four non-passed arms
+  rewritten from main's records (its survived arm a test gap, closed). 7 rows applied: 2 NEW DISCLOSED (the gcc
+  main-hook row, P1, born this round for debt the round found; the x86_64 AT&T census row, the next PR's), and NONE
+  closed at the fold — the stack-probe, /GS and main-hook rows close after the link lane's 3d (their 16 arms run in a
+  binary red at H5 until 3d's all-object client bind), the fixpoint-cap row after main's sweep of its four arms.
+  ✔MEASURED by the lane on its final bytes, every changed test binary run whole (runs h5z-run2 and h5z-run3; ruling
+  468): green on windows-x86_64-debug, windows-x86_64-release, linux-x86_64-debug and macos-arm64-debug but the two
+  anchor guards on the main-hook citation (green once this commit applies its row) and
+  `link/test_pe_compiler_support_runtime`'s gcc cases (owed to 3d, by name); the CLI's `dsscp <x>.s` static-library
+  route measured through the built binary (one member, its own name). Folded onto checkpoint 37 with the arm registry
+  settled by arm against its true base (41 arms from L2b1, 152 from H5, 1 retired; 1305 arms). The MERGED tree's
+  five-leg suite, repo-guard and the sweep of both folds' arms follow the commit.
+- **KNOWN RED ON CHECKPOINT 38, owed to 3d by name:** `link/test_pe_compiler_support_runtime` —
+  `PeCompilerSupportRuntime.AGccObjectsMainHookProbeAndUnwinderEntriesAreDefined` (every leg) and
+  `PeCompilerSupportRuntimeNative.AGccProgramPassesOverAForeignExceptionAndRefusesGccsOwn` (Windows),
+  `K_SymbolUndefined '__imp_RaiseException'`, until the link lane's all-object client bind folds.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

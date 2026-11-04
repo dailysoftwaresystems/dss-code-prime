@@ -1,0 +1,1 @@
+                        if (shaped && false) sources.push_back(list[k].get<std::string>());

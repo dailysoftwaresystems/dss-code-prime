@@ -943,6 +943,14 @@
       ],
       "action": "check-anchor-registry/check-anchor-registry.yml"
     },
+    "check-arms-registry": {
+      "description": "Check what the mutation arms registry promises that `dssharness check-mutations` does not: every row stands in the tree, each section is in order, one case count per runner and leg, and a sweep's reds and diagnostics against its rows.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-arms-registry/check-arms-registry.yml"
+    },
     "check-conflict-markers": {
       "description": "Refuse a merge-conflict marker line in any text file of the tree git tracks or would add: seven `<`, `|` or `>` at a line's start, and seven `=` alone between an opener and its closer.",
       "legs": [

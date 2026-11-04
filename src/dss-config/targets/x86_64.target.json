@@ -2463,6 +2463,29 @@
       }
     },
     {
+      "$comment": "P69 fold H5 (lane hm): a direct branch to a SYMBOL -- out of the function, the way gas assembles `jmp ext`: E9 + a 4-byte PC-relative displacement the linker patches through the rel32 relocation, the call row's own wire. A TAIL BRANCH: control leaves this function for the symbol's code and never comes back to it, so it is a terminator of kind `return` (no successor) whose operand is the symbol, not a block. The asm route elects it for a direct branch whose target is no block of the open function (a function entry, or a name the unit does not define); a target that declares none keeps refusing that branch.",
+      "mnemonic":      "jmp_tail",
+      "result":        "none",
+      "terminatorKind": "return",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["symbol"] },
+            "template": { "opcode": [233] },
+            "wires":    [
+              { "index": 0, "slotKind": "disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-COMPUTED-GOTO: indirect branch `jmp r/m64` — 0xFF /4 (jmp rax = FF E0). Mirrors `call`'s 0xFF /2 indirect form: NO REX.W (FF /4 defaults to 64-bit in long mode); REX.B derives from the register's high ordinal bit. Operand[0] is the target-address register; successors = all address-taken blocks (terminatorKind indirect-br, variadic successors). The MIR IndirectBr lowers to this; the address register is materialized from a preceding `lea` of the target block's synthetic symbol (BlockAddress).",
       "mnemonic":      "jmp_indirect",
       "result":        "none",

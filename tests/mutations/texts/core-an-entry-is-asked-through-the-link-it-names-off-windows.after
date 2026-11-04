@@ -1,0 +1,1 @@
+        if (::stat(p.c_str(), &st) == 0) return true;

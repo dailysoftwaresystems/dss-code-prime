@@ -315,7 +315,12 @@ familyImageFor(Flavours const& flavours, std::string const& kind,
         EXPECT_FALSE(row->image.empty())
             << who << ": role '" << runtimeLibraryRoleName(role)
             << "' is REALIZED from a shipped source on flavour '"
-            << flavour->name() << "' (" << row->source
+            << flavour->name() << "' (" << [row] {
+                   std::string units;
+                   for (auto const& unit : row->sources)
+                       units += (units.empty() ? "'" : ", '") + unit + "'";
+                   return units;
+               }()
             << "); a descriptor imports from an IMAGE, so this reference cannot "
                "be honoured — declare the body under `realization` instead";
         if (row->image.empty()) return std::nullopt;

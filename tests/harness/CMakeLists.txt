@@ -127,3 +127,12 @@ dss_use_script_selftest(dss_harness_line_endings_selftest line_endings)
 dss_add_test(NAME harness/conflict_markers_selftest
              SOURCES test_conflict_markers_selftest.cpp)
 dss_use_script_selftest(dss_harness_conflict_markers_selftest conflict_markers)
+
+# THE ARMS REGISTRY CHECK'S OWN SELF-TEST, ONE CASE PER ARM — the ctest entry `harness/arms_registry_selftest`.
+# `check-arms-registry.py --self-test` proves each check it makes of tests/mutations/arms.registry -- what
+# `dssharness check-mutations` does not check itself -- against a synthesized negative beside a control; this binary
+# reads each verdict into a case. The entry `arms_registry_guard` (top-level CMakeLists) judges the tree. ⓘ No label:
+# a self-test, on every leg.
+dss_add_test(NAME harness/arms_registry_selftest
+             SOURCES test_arms_registry_selftest.cpp)
+dss_use_script_selftest(dss_harness_arms_registry_selftest arms_registry)

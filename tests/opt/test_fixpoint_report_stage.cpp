@@ -49,6 +49,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -146,7 +147,7 @@ TEST(FixpointReportStage, AProgramStageFixpointCappedLowStillWarnsAndTheUnitStag
     CompileOptions         opts{DiagnosticBudget::libraryDefault()};
     opts.pipelineOverride = &pipe;
     std::map<PipelineStage, std::size_t> warned;
-    for (PipelineStage const stage : {PipelineStage::Unit, PipelineStage::Program}) {
+    for (PipelineStage const stage : {PipelineStage::Unit, PipelineStage::ThinImport, PipelineStage::Program}) {
         TypeInterner       interner{CompilationUnitId{1}};
         Mir                mir = repeatedCallModule(interner);
         DiagnosticReporter rep;
@@ -155,7 +156,57 @@ TEST(FixpointReportStage, AProgramStageFixpointCappedLowStillWarnsAndTheUnitStag
         warned[stage] = countCode(rep, DiagnosticCode::X_OptFixpointTruncated);
     }
     EXPECT_EQ(warned[PipelineStage::Unit], 0u) << "the Unit stage, which the Program stage resumes, warned";
+    EXPECT_EQ(warned[PipelineStage::ThinImport], 0u)
+        << "the thin-LTO import stage, which the merged module's Program stage resumes, warned";
     EXPECT_EQ(warned[PipelineStage::Program], 1u) << "the Program stage, the last, did not report its truncation";
+}
+
+// THE THIN-LTO ROUTE, through the driver: the per-unit import stage is resumed by the merged module's Program
+// stage, so a fixpoint capped low there says nothing and the merged module -- the last stage -- warns once. Three
+// units chain `main -> a -> b` across unit boundaries; the override caps every stage at one Inlining traversal and
+// admits each small callee, so the import stage inlines a callee into `main` and into `a` (one level: its import
+// depth is the schedule's count, 1), and the merged module still has `main`'s call to `b` to inline.
+TEST(FixpointReportStage, AThinLtoImportStageCappedLowIsSilentAndTheMergedModuleWarnsOnce) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "fixpoint-thin-route"};
+    scratch.useAsCwd();
+    auto const write = [&](char const* name, char const* text) {
+        fs::path const p = scratch.path() / name;
+        std::ofstream{p, std::ios::binary} << text;
+        return p.generic_string();
+    };
+    std::vector<std::string> const sources = {
+        write("b.c", "int b(int x) { return x * 2; }\n"),
+        write("a.c", "int b(int x);\nint a(int x) { return b(x) + 1; }\n"),
+        write("main.c", "int a(int x);\nint main(void) { return a(20); }\n")};
+    opt::OptPipeline pipe = capOnePipeline();
+    pipe.inlineThreshold  = 64;   // every callee here is admitted: the cap, not the size, ends the run
+    Program prog;
+    prog.setOptimizerPipelineOverride(pipe);
+    prog.setLtoMode(LtoModeArg::Thin);
+    std::map<int, std::size_t> optimizedAt;   // optimize events per stage ordinal
+    pipeline_testing::setStageObserver([&](StageEvent const& e) {
+        if (e.kind == StageEvent::Kind::Optimized) ++optimizedAt[static_cast<int>(e.stage)];
+    });
+    // EVERY REPORT KEPT: the default reporter drops a warning identical to a recent one, and the import stage's
+    // truncations ARE identical -- ✔MEASURED 2026-10-28 on the pre-fix bytes: three reported, one kept, "2 dropped as
+    // recent duplicates" -- so a count read through it said 1 where the code made 3.
+    DiagnosticReporter::Config every;
+    every.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+    every.maxPerCode     = std::numeric_limits<std::size_t>::max();
+    every.dedupWindow    = 0;
+    DiagnosticReporter rep{every};
+    int const          rc = prog.compileUnits(sources, "c", {"x86_64:elf64-x86_64-linux"}, rep);
+    pipeline_testing::setStageObserver({});
+    ASSERT_EQ(rc, 0) << "errorCount=" << rep.errorCount();
+    std::string said;
+    for (auto const& d : rep.all())
+        if (d.code == DiagnosticCode::X_OptFixpointTruncated) said += "\n  " + d.actual;
+    std::string stages;
+    for (auto const& [stage, n] : optimizedAt) stages += " stage " + std::to_string(stage) + " x" + std::to_string(n);
+    EXPECT_GE(optimizedAt.size(), 3u) << "the route did not run a Unit, an import and a merged optimize:" << stages;
+    EXPECT_EQ(countCode(rep, DiagnosticCode::X_OptFixpointTruncated), 1u)
+        << "--lto=thin with a cap-1 override must warn ONCE, from the merged module; stage events:" << stages
+        << "; the warnings:" << said;
 }
 
 // THE MEASUREMENT'S FOUR EXAMPLES, through both stages under `release`, on two targets: no truncation reported.
@@ -203,7 +254,10 @@ TEST(FixpointReportStage, TheFourExamplesCompileUnderReleaseWithNoTruncationRepo
 namespace {
 
 // What one route recorded, judged: empty when every lowered module's last optimize at its address was
-// Program-stage and the route recorded a Unit-stage optimize and a lowering (not vacuous).
+// Program-stage, every Program-stage optimize -- the one stage that REPORTS a truncation -- was its module's last
+// before that module was lowered (a later optimize of the same module, or a module never lowered because a later
+// stage's module took its place, means a later stage resumed a run that reported), and the route recorded a
+// Unit-stage optimize and a lowering (not vacuous).
 [[nodiscard]] std::string judged(std::vector<StageEvent> const& events) {
     std::map<void const*, PipelineStage> lastAt;
     bool                                 sawUnit = false;
@@ -211,6 +265,9 @@ namespace {
     std::string                          problems;
     for (auto const& e : events) {
         if (e.kind == StageEvent::Kind::Optimized) {
+            auto const before = lastAt.find(e.module);
+            if (before != lastAt.end() && before->second == PipelineStage::Program)
+                problems += " a Program-stage optimize, which reports, was resumed by a later optimize of its module;";
             lastAt[e.module] = e.stage;
             sawUnit          = sawUnit || e.stage == PipelineStage::Unit;
             continue;
@@ -222,6 +279,10 @@ namespace {
             problems += " a module was lowered after a Unit-stage optimize, with no Program stage after it;";
         if (it != lastAt.end()) lastAt.erase(it);
     }
+    for (auto const& [module, stage] : lastAt)
+        if (stage == PipelineStage::Program)
+            problems += " a Program-stage optimize, which reports, ran on a module never lowered: a later stage's "
+                        "module resumed it;";
     if (!sawUnit) problems += " no Unit-stage optimize was recorded (the route proves nothing);";
     if (lowered == 0) problems += " no module was lowered (the route proves nothing);";
     return problems;
@@ -334,4 +395,21 @@ TEST(FixpointReportStage, TheJudgeRefusesALoweringAfterAUnitOnlyOptimize) {
     EXPECT_NE(judged({{K::Optimized, PipelineStage::Program, &a}, {K::Lowered, PipelineStage::Program, &a}}), "")
         << "a route that records no Unit stage proves nothing";
     EXPECT_NE(judged({}), "");
+    // A REPORTING (Program-stage) optimize that a later stage resumes: the thin-LTO shape with its import stage
+    // spelled as a Program stage -- each unit optimized at the Program stage, then a merged module that takes their
+    // place -- and the same module optimized twice at the Program stage before its lowering.
+    int m = 0;
+    EXPECT_NE(judged({{K::Optimized, PipelineStage::Unit, &a}, {K::Optimized, PipelineStage::Unit, &b},
+                      {K::Optimized, PipelineStage::Program, &a}, {K::Optimized, PipelineStage::Program, &m},
+                      {K::Lowered, PipelineStage::Program, &m}}),
+              "")
+        << "a Program-stage optimize of a unit the merged module resumed reports a truncation the merge resumes";
+    EXPECT_NE(judged({{K::Optimized, PipelineStage::Unit, &a}, {K::Optimized, PipelineStage::Program, &a},
+                      {K::Optimized, PipelineStage::Program, &a}, {K::Lowered, PipelineStage::Program, &a}}),
+              "")
+        << "a Program-stage optimize resumed by a second one of the same module";
+    EXPECT_EQ(judged({{K::Optimized, PipelineStage::Unit, &a}, {K::Optimized, PipelineStage::Unit, &b},
+                      {K::Optimized, PipelineStage::Program, &m}, {K::Lowered, PipelineStage::Program, &m}}),
+              "")
+        << "the merged route's own shape (units resumed by the merged module's Program stage) is green";
 }

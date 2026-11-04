@@ -29,6 +29,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>        // kUnreadPipeBytes: the width an unopened pipe is handed as
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -1539,17 +1540,33 @@ std::atomic<std::uint64_t>& preScanHitCount() {
 }
 
 // Look the file up, or read + splice + tokenize it and publish the result.
-// Returns null EXACTLY when `SourceBuffer::fromFile` would have — the callers'
-// unreadable-include diagnostics are unchanged.
+// Returns null when the file cannot be read, `unreadable` then saying why in the
+// read's own words (the path and the OS's reason): the callers' unreadable-
+// include diagnostic.
+//
+// ★ IT NEVER THROWS, AND THAT IS THE FIX. `SourceBuffer::fromFile` throws for a
+// file it cannot read and never returns null, so the callers' diagnostic was dead
+// code and a header found but unreadable -- mode 0, a pipe that errs, a file past
+// what a buffer can address -- escaped the preprocessor as a C++ exception
+// (✔MEASURED on the Mac, run 20261029-002544-d3909fed: an angle include found as
+// a directory), where gcc and clang give a fatal error naming it with the OS's
+// reason (✔MEASURED, linux-x86_64-debug, run 20261028-211717-91ff7388, gcc 13.3.0
+// and clang 18.1.3). The read is the checked one, under the bound `fromFile`
+// passes: a device or a named pipe is read as those compilers read one.
 [[nodiscard]] std::shared_ptr<PreScannedFile const>
 preScanIncludeFile(fs::path const& path,
-                   std::shared_ptr<GrammarSchema const> const& schema) {
+                   std::shared_ptr<GrammarSchema const> const& schema,
+                   std::string& unreadable) {
     // ⚠ THE READ COMES FIRST, AND IT HAS TO. The key's second term is the
     // digest of the bytes, so there is nothing to look up until the bytes are
     // in hand. A lookup that could be answered without reading would be a
     // lookup answered by a heuristic — the defect this shape exists to remove.
-    auto buf = SourceBuffer::fromFile(path);
-    if (!buf) return nullptr;   // caller emits the unreadable-include diagnostic
+    auto text = core::readFileChecked(path, std::numeric_limits<std::uint32_t>::max());
+    if (!text) {
+        unreadable = std::move(text).error().message;
+        return nullptr;   // caller emits the unreadable-include diagnostic
+    }
+    auto buf = SourceBuffer::fromString(*std::move(text), path.string());
     PreScanKey key{core::PathIdentity::of(path),
                    crypto::sha256OfText(buf->text())};
     {
@@ -1887,10 +1904,9 @@ struct SynthBuilder {
     // FC15c shared funnel; it now routes every candidate through the shared
     // `resolveInDir`, so the pre-scan can never disagree with the authoritative
     // pass about which file a name denotes -- including on the CASE question
-    // (D-PP-HEADER-CASE-INSENSITIVE-PE). What stays local is only the
-    // `is_regular_file` filter and the resulting "keep searching the next dir"
-    // behaviour, which the shared `resolveIncludePath` deliberately does not
-    // have (it stops at the first existing entry, directory or not).
+    // (D-PP-HEADER-CASE-INSENSITIVE-PE) and on what a header may be: the search
+    // itself passes over a directory and takes anything else (`descend`), so
+    // nothing here filters what it found.
     //
     // ★ RETURNS THE TRI-STATE, NOT AN OPTIONAL, AND THE REASON IS A BLOCKER
     // THIS FUNCTION ONCE SHIPPED. It used to flatten `AmbiguousCase` to
@@ -1913,25 +1929,20 @@ struct SynthBuilder {
     HeaderSearchResult resolveQuote(std::string_view filename,
                                     fs::path const& includingDir) const {
         // An empty include target names nothing -- fail loud (the caller
-        // emits P_PreprocessorIncludeError). Only a REGULAR file is a valid
-        // include target; `is_regular_file` excludes a directory (so
-        // `#include ""` cannot resolve to the including dir itself, which
-        // would later throw in SourceBuffer::fromFile).
+        // emits P_PreprocessorIncludeError).
         if (filename.empty()) return HeaderSearchResult::notFound();
-        std::error_code ec;
-        // Per candidate dir: the shared policy-aware atom, then the local
-        // `is_regular_file` filter. A COLLISION is returned as-is and STOPS the
-        // search -- the same rule `resolveIncludePath` states in its header
-        // comment ("continuing to a later dir would make the answer depend on
-        // whether the host could even represent the collision"). The earlier
-        // cut of this function continued to the next dir here, quietly
-        // disagreeing with the shared resolver about the same question.
+        // Per candidate dir: the shared policy-aware atom, which passes over a
+        // directory (so `#include "."` cannot resolve to the including dir
+        // itself) and takes a device or a named pipe, as gcc and clang do
+        // (`descend`). A COLLISION is returned as-is and STOPS the search -- the
+        // same rule `resolveIncludePath` states in its header comment
+        // ("continuing to a later dir would make the answer depend on whether the
+        // host could even represent the collision"). ★ A HIT WHOSE REACH CANNOT BE
+        // EXAMINED (a looping link, a refusal) is no absence: it ENDS the search,
+        // named (`HeaderSearchStatus::Unexaminable` -- gcc and clang both stop
+        // there, fatal, ✔MEASURED 2026-10-28).
         auto const tryDir = [&](fs::path const& dir) -> HeaderSearchResult {
-            HeaderSearchResult r =
-                resolveInDir(dir, filename, headerNameMatching, headerSearch);
-            if (r.status != HeaderSearchStatus::Found) return r;
-            if (core::reachedKind(r.path, ec) != core::EntryKind::File) return HeaderSearchResult::notFound();
-            return r;
+            return resolveInDir(dir, filename, headerNameMatching, headerSearch);
         };
         // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `isRootedPath`, the
         // ONE exported predicate, never a second bare `is_absolute()`. ✔MEASURED
@@ -3466,6 +3477,19 @@ struct SynthBuilder {
                     normalizeComputedAngleLine(toks[i].tok.span.start());
                     continue;   // left verbatim; the macro pass elides it
                 }
+                // The same ownership for an -I candidate nobody could examine: the
+                // import resolver never re-resolves the source half, so THIS tier
+                // reports it (an unexaminable DESCRIPTOR flows the verbatim path
+                // below, and the import resolver reports it).
+                if (angleRes.kind == AngleIncludeKind::UnexaminableSource
+                    && includeResolvable()) {
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"system include "} + angleName + ": "
+                               + describeUnexaminable(angleRes.unexaminable));
+                    normalizeComputedAngleLine(toks[i].tok.span.start());
+                    continue;   // left verbatim; the macro pass elides it
+                }
 
                 // SOURCE fallback: a no-descriptor angle header that IS a real source
                 // file on the -I path — splice it TEXTUALLY and DROP the directive,
@@ -3497,13 +3521,14 @@ struct SynthBuilder {
                     // was readable when it was pushed.
                     // The load now goes through the shared per-file pre-scan, so
                     // the read + splice + tokenize happen once per FILE rather
-                    // than once per OCCURRENCE; a null return means exactly what
-                    // a null `SourceBuffer::fromFile` meant.
-                    auto headerPre = preScanIncludeFile(angleRes.path, schema);
+                    // than once per OCCURRENCE; a null return is a header that
+                    // could not be read, `unreadable` saying why.
+                    std::string unreadable;
+                    auto        headerPre = preScanIncludeFile(angleRes.path, schema, unreadable);
                     if (!headerPre) {
                         emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                                BufferId{}, SourceSpan::empty(0),
-                               std::string{"system include unreadable: "} + angleName);
+                               std::string{"system include unreadable: "} + angleName + ": " + unreadable);
                         normalizeComputedAngleLine(dStart);
                         continue;
                     }
@@ -3661,6 +3686,10 @@ struct SynthBuilder {
             // with the unsuppressable `F_HeaderNameCaseAmbiguous`, and must NOT
             // be allowed to fall through to the quote->angle fallback and out
             // the suppressable `P_PreprocessorIncludeError` exit below.
+            // A candidate nobody could EXAMINE (a looping link, a refusal) is the
+            // same kind of stop: the search ended at it, so the quote->angle
+            // fallback below is never tried past it -- gcc and clang end the
+            // search there with a fatal error naming it (✔MEASURED 2026-10-28).
             bool quoteCollision = false;
             auto resolved = takeFound(
                 resolveQuote(filename, includingDir),
@@ -3669,6 +3698,13 @@ struct SynthBuilder {
                     reportHeaderCaseAmbiguity(rep, BufferId{},
                                               SourceSpan::empty(0), filename,
                                               candidates);
+                },
+                [&](HeaderSearchResult const& unexaminable) {
+                    quoteCollision = true;
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"quote include "} + filename + ": "
+                               + describeUnexaminable(unexaminable));
                 });
             if (quoteCollision) {
                 // Sole reporter (the TF-C60 Finding-5 discipline): DROP the
@@ -3740,13 +3776,14 @@ struct SynthBuilder {
             // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
             // the header's own text) — see the angle arm's note. Routed through
             // the shared per-file pre-scan for the same reason it is there.
-            auto headerPre = preScanIncludeFile(*resolved, schema);
+            std::string unreadable;
+            auto        headerPre = preScanIncludeFile(*resolved, schema, unreadable);
             std::shared_ptr<SourceBuffer> const headerBuf =
                 headerPre ? headerPre->source : nullptr;
             if (!headerBuf) {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
-                       std::string{"quote include unreadable: "} + filename);
+                       std::string{"quote include unreadable: "} + filename + ": " + unreadable);
                 copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
                 copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
@@ -5953,6 +5990,18 @@ private:
                         return true;
                     case AngleIncludeKind::NotFound:
                         return false;
+                    case AngleIncludeKind::UnexaminableDescriptor:
+                    case AngleIncludeKind::UnexaminableSource:
+                        // A candidate nobody could examine ends the search, and the
+                        // operator REFUSES it -- gcc and clang answer
+                        // `__has_include` of one with a fatal error naming it
+                        // (✔MEASURED 2026-10-28), never with 0. Both halves report
+                        // here, as for a collision: no later tier sees this operand.
+                        emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"__has_include(<"} + std::string{filename} + ">): "
+                                   + describeUnexaminable(ar.unexaminable));
+                        return false;
                     case AngleIncludeKind::AmbiguousDescriptor:
                     case AngleIncludeKind::AmbiguousSource:
                         // D-PP-HEADER-CASE-INSENSITIVE-PE: this is the
@@ -5977,6 +6026,13 @@ private:
             if (q.status == HeaderSearchStatus::AmbiguousCase) {
                 reportHeaderCaseAmbiguity(rep_, BufferId{}, SourceSpan::empty(0),
                                           filename, q.ambiguousCandidates);
+                return false;
+            }
+            if (q.status == HeaderSearchStatus::Unexaminable) {   // refused, as the angle form is
+                emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"__has_include(\""} + std::string{filename} + "\"): "
+                           + describeUnexaminable(q));
                 return false;
             }
             return q.status == HeaderSearchStatus::Found;
@@ -6007,11 +6063,28 @@ private:
                                           filename, r.ambiguousCandidates);
                 return std::nullopt;
             }
+            if (r.status == HeaderSearchStatus::Unexaminable) {   // the search ended: refused, never "not found"
+                emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"__has_embed of "} + std::string{filename} + ": "
+                           + describeUnexaminable(r));
+                return std::nullopt;
+            }
             if (r.status != HeaderSearchStatus::Found) return std::nullopt;
-            // The SAME measurement the directive takes (`resourceByteCount`:
-            // regular-file check + `file_size`), so "how big is this resource"
-            // has one owner and the operator cannot drift from the splice.
-            return resourceByteCount(r.path);
+            // The SAME measurement the directive takes (`resourceSize`), so "how
+            // big is this resource" has one owner and the operator cannot drift
+            // from the splice -- except where no one can know it unread: a NAMED
+            // PIPE answers FOUND (and EMPTY under `limit(0)`, which empties any
+            // resource) WITHOUT being opened, its bytes left for the directive.
+            // ⚠ A STATED DIVERGENCE, ✔MEASURED 2026-10-28 (macos-arm64-debug, run
+            // 20261029-004015-0104a8a8, Apple clang 21.0.0): clang answers EMPTY (2)
+            // for every pipe, unopened -- a fed pipe, an empty one, one nobody
+            // writes -- and its own `#embed` then embeds the fed pipe's bytes. DSS
+            // keeps its operator agreeing with its directive: 2 would make
+            // `#if __has_embed(p) == __STDC_EMBED_FOUND__` skip a pipe that has bytes.
+            auto const size = resourceSize(r.path);
+            if (!size) return std::nullopt;
+            return size->pipe ? kUnreadPipeBytes : size->bytes;
         };
         // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the revocation oracle. THIS
         // expander's set, so the `#if` fold and `#ifdef` cannot disagree about
@@ -6151,17 +6224,30 @@ private:
 
     // FC17.9(h): the resource's byte COUNT (its implementation resource width in
     // octets, C23 6.10.4.1p1), measured from the FILESYSTEM rather than from a
-    // buffer. nullopt when the path is not a readable regular file -> the
-    // caller's loud unreadable diagnostic.
+    // buffer -- or, for a NAMED PIPE, the fact that it is one: a pipe has no
+    // width until it is read (`pipe`, `bytes` 0). nullopt when the path is
+    // neither a readable regular file nor a pipe -> the caller's loud
+    // unreadable diagnostic.
     //
     // ★ IT IS A SEPARATE STEP FROM THE READ BECAUSE THE SIZE DECIDES WHETHER
     // THE READ MAY HAPPEN AT ALL: `limit` narrows it (6.10.4.2p4) and the splice
     // budget gates it, and both must be answerable BEFORE the bytes are in RAM.
-    static std::optional<std::uint64_t> resourceByteCount(fs::path const& path) {
-        // The shared `resolveIncludePath` matches any directory ENTRY, so it can
-        // hand back a DIRECTORY. Require a regular file (nullopt -> the caller's
-        // loud unreadable diagnostic) so a directory-named resource fails LOUD,
-        // never reads as a silently-empty embed.
+    // A pipe answers them by being read at most that far (`readResourceBytes`).
+    struct ResourceSize {
+        std::uint64_t bytes = 0;       // a regular file's size
+        bool          pipe  = false;   // a named pipe: its width is what reading it gives
+    };
+    // What `__has_embed` is handed for a pipe it does not open: "as wide as any
+    // `limit`", so the ONE width formula answers FOUND, and EMPTY at `limit(0)`.
+    static constexpr std::uint64_t kUnreadPipeBytes = std::numeric_limits<std::uint64_t>::max();
+    static std::optional<ResourceSize> resourceSize(fs::path const& path) {
+        // The shared search passes over a DIRECTORY (`descend`) and hands back a
+        // device or a named pipe. A pipe is read (Apple clang embeds a fed one); a
+        // DEVICE stays refused -- nullopt, the caller's loud unreadable diagnostic
+        // -- as Apple clang refuses one ("device files are not yet supported by
+        // '#embed' directive", ✔MEASURED 2026-10-28, macos-arm64-debug, run
+        // 20261029-002044-5101633a, Apple clang 21.0.0; gcc 13.3 and clang 18.1.3,
+        // the Linux leg's, have no #embed): no working reference embeds one.
         //
         // ★ THE SUBSTRATE IS ASKED, NEVER THE LIBRARY: a resource reached through a link is the bytes
         // the link reaches, and a dangling one is none. libstdc++ on Windows sizes a file link by the
@@ -6170,8 +6256,10 @@ private:
         // ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]).
         std::error_code ec;
         auto const size = core::reachedFileSize(path, ec);
-        if (!size || ec) return std::nullopt;
-        return static_cast<std::uint64_t>(*size);
+        if (ec) return std::nullopt;
+        if (size) return ResourceSize{static_cast<std::uint64_t>(*size), false};
+        if (core::reachedPipe(path, ec) && !ec) return ResourceSize{0, true};
+        return std::nullopt;
     }
 
     // FC17.9(h): read AT MOST `maxBytes` of `path` BINARY-exact into a string,
@@ -6188,11 +6276,26 @@ private:
     // with `limit(0)`). Reading the whole file and then discarding the tail
     // would make `limit` a formatting option instead of the resource bound the
     // standard designed it as.
+    //
+    // ★ A NAMED PIPE (`pipe`) is read ONCE, at most `maxBytes`, its end -- the
+    // writer closing -- ending the read early: the bytes it gave ARE its width.
+    // Nothing past `maxBytes` is ever read, so `limit(513)` over an endless
+    // stream reads 513 bytes (6.10.4.2 EXAMPLE 4).
     static std::optional<std::string> readResourceBytes(fs::path const& path,
-                                                        std::uint64_t maxBytes) {
-        auto const size = resourceByteCount(path);
-        if (!size) return std::nullopt;
-        if (maxBytes >= *size) {
+                                                        std::uint64_t maxBytes,
+                                                        bool pipe = false) {
+        if (pipe) {
+            std::ifstream in(path, std::ios::binary);
+            if (!in) return std::nullopt;
+            std::string out(static_cast<std::size_t>(maxBytes), '\0');
+            in.read(out.data(), static_cast<std::streamsize>(maxBytes));
+            if (in.bad()) return std::nullopt;
+            out.resize(static_cast<std::size_t>(in.gcount()));
+            return out;
+        }
+        auto const size = resourceSize(path);
+        if (!size || size->pipe) return std::nullopt;
+        if (maxBytes >= size->bytes) {
             // A mid-stream IO error (disk/share failure) can silently truncate
             // the read, and a truncated `#embed` is a SILENT MISCOMPILE — the
             // program gets fewer bytes than the resource holds and nothing says
@@ -6522,6 +6625,11 @@ private:
                                       rr.ambiguousCandidates);
             return;
         }
+        if (rr.status == HeaderSearchStatus::Unexaminable) {   // the search ended there: no later directory is asked
+            failAt(dirSpan, std::string{"#embed resource "} + filename + ": "
+                                + describeUnexaminable(rr));
+            return;
+        }
         if (rr.status != HeaderSearchStatus::Found) {
             failAt(dirSpan,
                    std::string{"#embed resource not found: "} + filename
@@ -6535,17 +6643,39 @@ private:
         auto const* resolved = &rr.path;
 
         // ── 6.10.4.1p1: the IMPLEMENTATION RESOURCE WIDTH, measured from the
-        // filesystem so nothing is in RAM yet. ──
-        auto const fileBytes = resourceByteCount(*resolved);
-        if (!fileBytes) {
+        // filesystem so nothing is in RAM yet -- except a NAMED PIPE's, which only
+        // reading it tells: it is read here, ONCE, at most one byte past what the
+        // directive may splice (`limit`, else the splice budget), so the gate
+        // below still answers before anything past the budget is held. ──
+        auto const size = resourceSize(*resolved);
+        if (!size) {
             failAt(dirSpan, std::string{"#embed resource could not be read: "}
                                 + resolved->string());
             return;
         }
+        std::optional<std::string> piped;   // a pipe's bytes, read before its width is known
+        if (size->pipe) {
+            std::uint64_t const budget = static_cast<std::uint64_t>(kEmbedMaxResourceBytes);
+            piped = readResourceBytes(*resolved, limit ? std::min(*limit, budget + 1) : budget + 1,
+                                      /*pipe=*/true);
+            if (!piped) {
+                failAt(dirSpan, std::string{"#embed resource could not be read: "}
+                                    + resolved->string());
+                return;
+            }
+            if (piped->size() > kEmbedMaxResourceBytes) {
+                failAt(dirSpan, std::string{"#embed resource "} + resolved->string()
+                                    + " is a named pipe that gave more than "
+                                    + std::to_string(kEmbedMaxResourceBytes)
+                                    + " bytes, the cycle-1 splice budget; bound it with limit(...)");
+                return;
+            }
+        }
 
         // ── 6.10.4.1p1/p5 + 6.10.4.2p4: the resource WIDTH -- the directive's
         // and `__has_embed`'s ONE formula, so the two agree on emptiness. ──
-        std::uint64_t const width = embedResourceWidthBytes(*fileBytes, limit);
+        std::uint64_t const width =
+            embedResourceWidthBytes(size->pipe ? piped->size() : size->bytes, limit);
 
         // ── (D-PP-EMBED-STREAMING, the splice boundary): gate the byte count
         // this directive will MATERIALIZE through the pure size helper -- a
@@ -6594,8 +6724,9 @@ private:
         }
 
         // ── Read the bytes BINARY-exact (CRLF/SUB/NUL/0xFF preserved), bounded
-        // by the resource width so nothing past the `limit` is ever read. ──
-        auto bytes = readResourceBytes(*resolved, width);
+        // by the resource width so nothing past the `limit` is ever read (a
+        // pipe's were read above, no further than that). ──
+        auto bytes = size->pipe ? std::move(piped) : readResourceBytes(*resolved, width);
         if (!bytes || bytes->size() < static_cast<std::size_t>(width)) {
             // A short read is a SILENT MISCOMPILE if accepted: the program would
             // get fewer bytes than the resource holds. Loud, always -- including

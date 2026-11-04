@@ -116,7 +116,7 @@ private:
     t.bindings.push_back({RuntimeLibraryRole::CLibrary, std::move(cLibrary), {}});
     t.bindings.push_back({RuntimeLibraryRole::SystemPrimitives, "kernel32.dll", {}});
     t.bindings.push_back({RuntimeLibraryRole::AtomicsRuntime, {},
-                          "runtime/platform/src/atomic.c"});
+                          {"runtime/platform/src/atomic.c"}});
     return t;
 }
 

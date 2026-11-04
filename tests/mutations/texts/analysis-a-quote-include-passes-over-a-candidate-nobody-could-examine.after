@@ -1,0 +1,1 @@
+                    static_cast<void>(unexaminable);   // the mutant: passed over, as a miss

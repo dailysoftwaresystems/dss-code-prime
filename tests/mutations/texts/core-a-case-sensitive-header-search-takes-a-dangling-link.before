@@ -1,1 +1,1 @@
-        if (!existsOnce(cache, candidate)) return HeaderSearchResult::notFound();
+        if (reaches == core::EntryKind::Absent) return HeaderSearchResult::notFound();

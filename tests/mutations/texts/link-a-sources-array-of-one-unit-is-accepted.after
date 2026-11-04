@@ -1,0 +1,1 @@
+                    bool shaped = list.is_array() && list.size() >= 1;

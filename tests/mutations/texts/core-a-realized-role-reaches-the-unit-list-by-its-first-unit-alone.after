@@ -1,0 +1,1 @@
+            if (!b.sources.empty()) out.push_back(b.sources.front());

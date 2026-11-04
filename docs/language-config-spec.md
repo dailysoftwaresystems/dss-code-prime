@@ -836,7 +836,7 @@ A `library` value may name a **runtime role** rather than an image:
 "library": { "pe": { "role": "cLibrary" }, "elf": "libm.so.6" }
 ```
 
-The role is the closed `runtimeLibraries` role vocabulary of the **object format** documents (`cLibrary`, `unwindPersonality`, `systemPrimitives`, `atomicsRuntime`; the `none` sentinel is refused). It resolves **at descriptor decode** to the image that format's role table declares, and lands in the decoded map as a plain image string — every consumer downstream reads exactly what it read before and none learns a role was involved.
+The role is the closed `runtimeLibraries` role vocabulary of the **object format** documents (`cLibrary`, `unwindPersonality`, `systemPrimitives`, `atomicsRuntime`, `compilerSupport`; the `none` sentinel is refused). It resolves **at descriptor decode** to the image that format's role table declares, and lands in the decoded map as a plain image string — every consumer downstream reads exactly what it read before and none learns a role was involved.
 
 **Why it exists.** ✔MEASURED before this form: **67** of the **69** `(descriptor, format)` entries in the shipped corpus restated an image a format document's role table already owned — one fact with two owners, in two documents, and a repoint of the `cLibrary` row moved the format's own `exit` import while leaving every descriptor's `puts` on the old image, at rc=0, ending in a load failure. The literal form STAYS for an image that plays no role: `libm.so.6` is the corpus's only true non-role literal.
 

@@ -1,0 +1,1 @@
+    Handle const reached = reachedHandle(p, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, ec);

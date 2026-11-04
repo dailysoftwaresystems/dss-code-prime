@@ -623,6 +623,18 @@ public:
     resolveCallee(std::string const& symbol, NodeId at,
                   std::string_view mnemonic) = 0;
 
+    // ── does a branch to this name LEAVE the function? (P69 fold H5) ────────
+    // A direct branch whose target is no block of the open function -- a
+    // function entry of this unit, or a name the unit does not define -- is a
+    // TAIL BRANCH: control leaves for that symbol's code, as gas assembles `jmp
+    // ext` (a branch relocated against `ext`). Asked only of a row whose target
+    // declares a tail-branch opcode; true means the engine resolves the name
+    // through `resolveCallee` and builds a no-successor terminator. false, with
+    // NO diagnostic, for a block of this function and for every name the host
+    // keeps refusing as a branch target (`resolveBranchTarget` says why).
+    [[nodiscard]] virtual bool
+    branchLeavesTheFunction(std::string const& symbol, NodeId at) const = 0;
+
     // Every ADDRESS-TAKEN block of the open function — an indirect branch's
     // successor set. Empty is a refusal, never an assumption.
     [[nodiscard]] virtual std::vector<LirBlockId>

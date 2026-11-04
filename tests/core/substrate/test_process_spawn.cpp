@@ -1163,8 +1163,11 @@ TEST(ResolveExecutableOnPath, ANameHoldingAWindowsWildcardIsNoProgram) {
     EXPECT_TRUE(resolveExecutableOnPath("tool.exe").has_value()) << "the alias record itself is no program: the "
                                                                    "case cannot tell a wildcard from a miss";
     // Each spelled with an extension, so the search tries it as given (a name without one is tried with PATHEXT
-    // appended, a spelling no record matches).
-    for (char const* spelled : {"tool.ex>", "tool.ex?", "tool.e*"}) {
+    // appended, a spelling no record matches). ONE SPELLING PER WILDCARD THE OS READS -- `>` (DOS_QM), `?`, `*`,
+    // `<` (DOS_STAR) and a trailing `"` (DOS_DOT, which also matches nothing at a name's end) -- each of which,
+    // asked of FindFirstFileW, finds `tool.exe` (the shapes the substrate's comment measured: "a<" and "abc\""
+    // found abc), so a set missing any one of them lets that one through.
+    for (char const* spelled : {"tool.ex>", "tool.ex?", "tool.e*", "tool.ex<", "tool.exe\""}) {
         auto const hit = resolveExecutableOnPath(spelled);
         EXPECT_FALSE(hit.has_value()) << "`" << spelled << "` resolved to " << (hit ? hit->string() : std::string{})
                                       << ": a wildcard found a program it does not name";

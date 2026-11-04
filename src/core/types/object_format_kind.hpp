@@ -8,6 +8,7 @@
 #include <cstdio>    // selectableObjectFormat's refusal (stderr)
 #include <cstdlib>   // selectableObjectFormat's refusal (abort)
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -952,14 +953,31 @@ enum class RuntimeLibraryRole : std::uint8_t {
     // runtime-sized entries dispatch through libatomic's lock table. Declaring
     // the names per format (below) is what keeps that choice in config.
     AtomicsRuntime    = 4,
+    // The routines a REFERENCE toolchain's own static runtime defines for the
+    // objects it compiles, which a FOREIGN object therefore names by name and
+    // no platform image exports to it: on pe, cl's and clang-cl's stack probe
+    // `__chkstk` and the /GS family (`__security_cookie`,
+    // `__security_check_cookie`, `__GSHandlerCheck`, `__GSHandlerCheck_SEH`,
+    // `__report_rangecheckfailure`), cl's `_fltused`, and mingw-w64 gcc's
+    // `___chkstk_ms`, `__main`, unwinder entry points
+    // (`__gcc_personality_seh0`, `_Unwind_Resume`) and stack protector
+    // (`__stack_chk_guard`, `__stack_chk_fail`: gcc's own link imports the
+    // reporter from libssp-0.dll, an image a plain Windows does not have,
+    // ✔MEASURED 2026-11-03). ✔MEASURED 2026-10-28 (nm
+    // over 31 reference objects; GetProcAddress on the in-box images): none of
+    // ucrtbase, vcruntime140, kernel32 or ntdll exports `___chkstk_ms` or the
+    // /GS family, so DSS ships the bodies -- a `sources` row, several units
+    // (one register contract no C function keeps is written in assembly).
+    CompilerSupport   = 5,
 };
 
-inline constexpr EnumNameTable<RuntimeLibraryRole, 5> kRuntimeLibraryRoleTable{{{
+inline constexpr EnumNameTable<RuntimeLibraryRole, 6> kRuntimeLibraryRoleTable{{{
     { RuntimeLibraryRole::None,              "none"              },
     { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
     { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
     { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
     { RuntimeLibraryRole::AtomicsRuntime,    "atomicsRuntime"    },
+    { RuntimeLibraryRole::CompilerSupport,   "compilerSupport"   },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -998,7 +1016,7 @@ isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
 // `core/types/target_schema.hpp`
 // (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
 inline constexpr auto kSelectableRuntimeLibraryRoleNames =
-    namesWhere<4>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
+    namesWhere<5>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
 static_assert(kRuntimeLibraryRoleTable.rows.size()
                   == kSelectableRuntimeLibraryRoleNames.size() + 1,
               "kRuntimeLibraryRoleTable must have exactly ONE unselectable row "
@@ -1094,10 +1112,23 @@ static_assert(kRuntimeLibraryRoleTable.rows.size()
 // `EveryFlavourOfAFormatKindNamesOneProviderPerRole` refuses two flavours of one
 // kind naming different providers for a role, so the repetition cannot become a
 // disagreement even though it cannot become a single line.
+//
+// ★ A BODY OF SEVERAL UNITS IS ONE ROW
+// (D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED, P69 H5). The `compilerSupport` role is played by three
+// shipped units -- a C one, an assembly one (a register contract no C function
+// keeps), and gcc's unwinder entry points -- and a role names exactly ONE
+// provider: the loader refuses a second row of one role ("one role names exactly
+// one image; two rows would make the resolution order the answer"), and the
+// flavour family's agreement is asked per role. So the row's provider is the
+// LIST of units, written `sources` (two or more); a body of one unit keeps the
+// `source` spelling every shipped row and descriptor already uses (78 sites
+// across 22 documents), and the loader refuses the other spelling of each shape
+// -- `sources` holding one unit, both keys, or neither beside `image` -- so each
+// shape has exactly one way to be written.
 struct DSS_EXPORT RuntimeLibraryBinding {
-    RuntimeLibraryRole role = RuntimeLibraryRole::None;
-    std::string        image;   // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
-    std::string        source;  // "runtime/platform/src/atomic.c"
+    RuntimeLibraryRole       role = RuntimeLibraryRole::None;
+    std::string              image;    // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
+    std::vector<std::string> sources;  // {"runtime/platform/src/atomic.c"}: EMPTY = played by `image`
 };
 
 // The format's whole role table. A VECTOR of rows rather than a fixed struct of
@@ -1129,13 +1160,13 @@ struct DSS_EXPORT RuntimeLibraryTable {
         return std::nullopt;
     }
 
-    // The shipped source realizing `role`, or nullopt when this format either
-    // declares no such row or fills it from an image.
-    [[nodiscard]] std::optional<std::string_view>
-    sourceForRole(RuntimeLibraryRole role) const noexcept {
+    // The shipped units realizing `role`, in declaration order -- EMPTY when
+    // this format either declares no such row or fills it from an image.
+    [[nodiscard]] std::span<std::string const>
+    sourcesForRole(RuntimeLibraryRole role) const noexcept {
         auto const* b = rowForRole(role);
-        if (b == nullptr || b->source.empty()) return std::nullopt;
-        return std::string_view{b->source};
+        if (b == nullptr) return {};
+        return b->sources;
     }
 
     // Every shipped source this table realizes, in declaration order. The driver
@@ -1144,7 +1175,7 @@ struct DSS_EXPORT RuntimeLibraryTable {
     [[nodiscard]] std::vector<std::string> realizedSources() const {
         std::vector<std::string> out;
         for (auto const& b : bindings) {
-            if (!b.source.empty()) out.push_back(b.source);
+            out.insert(out.end(), b.sources.begin(), b.sources.end());
         }
         return out;
     }
@@ -1283,6 +1314,24 @@ struct DSS_EXPORT AtomicsRuntime {
     // that refuses BY NAME at compile time — it never lowers half of the pair and
     // faults later. Empty = not declared.
     std::string compareExchangeMangledName;  // "__atomic_compare_exchange" / "___…"
+};
+
+// ── D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED (P69 H5): the
+//    compiler-support declaration ──────────────────────────────────────────
+//
+// The format's `compilerSupport` block: the role whose row realizes the
+// routines a reference toolchain's own static runtime defines for its objects
+// (`RuntimeLibraryRole::CompilerSupport`), and the ONE of them DSS's own PE
+// startup must CALL -- the routine that seeds the /GS cookie, which every
+// reference C runtime runs before any initializer and before the entry, so a
+// guarded frame never compares against the value the runtime's object ships.
+// Populated from JSON with `role` resolved against `runtimeLibraries` AT LOAD,
+// exactly like `AtomicsRuntime`; `libraryPath` is therefore the empty
+// "no library binding" shape of a realized role.
+struct DSS_EXPORT CompilerSupport {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string libraryPath;                          // DERIVED: resolved from `role` at load
+    std::string securityCookieInitializerMangledName; // "__security_init_cookie"
 };
 
 // The format's shipped-library synthesis block (`"librarySynthesis"` in

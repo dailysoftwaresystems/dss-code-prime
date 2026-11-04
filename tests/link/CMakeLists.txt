@@ -390,6 +390,14 @@ dss_add_test(NAME link/test_runtime_library_roles
 target_link_libraries(dss_link_test_runtime_library_roles
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# P69 fold H5 (lane `hm`) — [[D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED]],
+# [[D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED]] and [[D-LK-PE-FOREIGN-OBJECT-GCC-MAIN-HOOK-UNDEFINED]]: the
+# routines a reference toolchain's own static runtime defines for its objects, defined by the pe formats'
+# `compilerSupport` runtime -- a cl and a mingw-w64 gcc object (`tests/link/data/pe_compiler_support*`,
+# `pe_gcc_runtime*`) linked by DSS on every leg, and run on Windows x86_64 to the exits their own toolchains give.
+dss_add_test(NAME link/test_pe_compiler_support_runtime
+             SOURCES test_pe_compiler_support_runtime.cpp)
+
 # D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE — the
 # CROSS-TIER half of the role table: the `shippedLibs/*.json` descriptors spell
 # the SAME images as literals, and nothing forced the two tiers to agree. Lives

@@ -1,0 +1,1 @@
+    return !ec && type != fs::file_type::regular && type != fs::file_type::directory;

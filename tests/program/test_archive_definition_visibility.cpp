@@ -39,6 +39,7 @@
 #include "link/object_format_schema.hpp"
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
+#include "program/compile_pipeline.hpp"   // extractStaticArchiveMembers, readObjectInputModules: the readers a link uses
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -355,5 +356,182 @@ TEST(ShippedRuntimeVisibility, ADllExportsItsOwnFunctionAloneOnPe) {
     for (char const* body : {"memalignment", "strfromd"}) {
         EXPECT_EQ(std::count(imported.begin(), imported.end(), std::string{body}), 0)
             << body << " must be the DLL's own body, never an import";
+    }
+}
+
+// ══ ONE PACKAGING PATH FOR EVERY UNIT (P69 fold H5) ═══════════════════════════════════════════════════════════════
+//
+// A `container: archive` build packages EVERY unit it compiles as a member -- a unit lowered from MIR (C) and a unit
+// assembled from text (the target's assembly dialect, the `encode` tier) alike -- and the archive-wide visibility is
+// stated on each. Before H5 the `encode` tier returned through the image/object writer whatever the container:
+// ✔MEASURED 2026-11-03, the shipped pe runtime's assembly unit was cached as a bare COFF object (`d\x86`, 476 bytes)
+// under an archive's name, every pe link took it as an eagerly-merged object input, a relocatable object of a unit
+// that names nothing defined `__chkstk`, and a DSS DLL exported it. THE TABLE IS THE UNIVERSE: every shipped static-
+// archive document (x86_64 and arm64; ELF, PE, Mach-O) x every tier a unit can be built by. A document added later
+// is a row of `kArchiveDocuments`.
+namespace {
+
+struct ArchiveDocument {
+    char const* arch;       // the target
+    char const* format;     // the `container: archive` document
+    char const* assembly;   // the target's assembly dialect (`defaultAssemblyLanguage`)
+    char const* asmBody;    // one leaf in that dialect, returning 1
+    char const* marker;     // the dialect's function-type marker (`.type <name>, <marker>`)
+};
+constexpr ArchiveDocument kArchiveDocuments[] = {
+    {"x86_64", "elf64-x86_64-linux-staticlib", "asm-x86_64-att", "\tmovl\t$1, %eax\n\tret\n", "@function"},
+    {"x86_64", "pe64-x86_64-windows-staticlib", "asm-x86_64-att", "\tmovl\t$1, %eax\n\tret\n", "@function"},
+    {"x86_64", "macho64-x86_64-darwin-staticlib", "asm-x86_64-att", "\tmovl\t$1, %eax\n\tret\n", "@function"},
+    {"arm64", "elf64-aarch64-linux-staticlib", "asm-arm64-gas", "\tmov\tw0, #1\n\tret\n", "%function"},
+    {"arm64", "macho64-arm64-darwin-staticlib", "asm-arm64-gas", "\tmov\tw0, #1\n\tret\n", "%function"},
+};
+
+// The unit, in C or in the document's assembly dialect: two external functions, `unit_api` and `unit_helper`.
+[[nodiscard]] std::pair<std::string, std::string> unitOf(ArchiveDocument const& d, bool assembly) {
+    if (!assembly) return {"unit.c", "int unit_api(void) { return 1; }\nint unit_helper(void) { return 1; }\n"};
+    std::string s = "\t.text\n";
+    for (char const* name : {"unit_api", "unit_helper"}) {
+        s += std::string{"\t.globl\t"} + name + "\n\t.type\t" + name + ", " + d.marker + "\n" + name + ":\n"
+             + d.asmBody;
+    }
+    return {"unit.s", s};
+}
+
+}  // namespace
+
+TEST(ArchivePackaging, EveryTierPackagesItsUnitAsAMemberWithTheArchivesVisibility) {
+    for (ArchiveDocument const& d : kArchiveDocuments) {
+        for (bool const assembly : {false, true}) {
+            for (std::optional<SymbolVisibility> const declared :
+                 {std::optional<SymbolVisibility>{SymbolVisibility::Hidden}, std::optional<SymbolVisibility>{}}) {
+                SCOPED_TRACE(std::string{d.format} + (assembly ? " / assembly" : " / C")
+                             + (declared ? " / declared hidden" : " / no declaration"));
+                ScratchDir scratch{Location::InsideRepo, "archive-packaging"};
+                auto const [file, text] = unitOf(d, assembly);
+                writeText(scratch.path() / file, text);
+                Program p;
+                p.setOutputDir(scratch.path());
+                p.setArchiveDefinitionVisibility(declared);
+                DiagnosticReporter rep;
+                ASSERT_EQ(p.compileFiles({(scratch.path() / file).string()}, assembly ? d.assembly : "c",
+                                         {std::string{d.arch} + ":" + d.format}, rep),
+                          0)
+                    << "errors=" << rep.errorCount();
+                ASSERT_EQ(p.artifactPaths().size(), 1u);
+                ASSERT_TRUE(p.artifactPaths().front().has_value());
+                fs::path const artifact = *p.artifactPaths().front();
+                auto const bytes = readFileBytes(artifact);
+                ASSERT_GE(bytes.size(), 8u);
+                EXPECT_EQ(std::string(bytes.begin(), bytes.begin() + 8), std::string{"!<arch>\n"})
+                    << "a static-archive document writes an `ar` archive, never a bare object under its name";
+                auto const target = TargetSchema::loadShipped(d.arch);
+                auto const format = ObjectFormatSchema::loadShipped(d.format);
+                ASSERT_TRUE(target.has_value() && format.has_value());
+                DiagnosticReporter readRep;
+                auto const members = extractStaticArchiveMembers(std::span<fs::path const>{&artifact, 1}, **target,
+                                                                 **format, readRep);
+                ASSERT_TRUE(members.has_value()) << "the archive did not read back; errors=" << readRep.errorCount();
+                ASSERT_EQ(members->modules.size(), 1u) << "one unit, one member";
+                EXPECT_EQ(members->names.front(), "unit" + std::string{(*format)->archiveMemberExtension()})
+                    << "the member is named after the unit's own source";
+                std::size_t defined = 0;
+                for (auto const& ms : members->modules.front().symbols) {
+                    if (ms.binding == SymbolBinding::Local) continue;
+                    bool const ours = ms.name.ends_with("unit_api") || ms.name.ends_with("unit_helper");
+                    if (!ours) continue;
+                    ++defined;
+                    EXPECT_EQ(ms.visibility, declared.value_or(SymbolVisibility::Default))
+                        << ms.name << ": the archive-wide visibility is stated on every unit's definitions";
+                }
+                EXPECT_EQ(defined, 2u) << "the member defines the unit's two functions (a read that found none read "
+                                          "nothing)";
+            }
+        }
+    }
+}
+
+// A RELOCATABLE object of a unit that names no runtime routine carries no runtime body: its external definitions
+// are the unit's own, on every shipped relocatable document. ✔MEASURED before H5 (compile-and-keep run
+// 20261104-012600-85de7399): the pe object of `int plain_api(int x)` defined `__chkstk`, `__security_cookie`,
+// `__main` and every other routine of the pe `compilerSupport` role, and two such objects linked together redefined
+// them all.
+TEST(ArchivePackaging, ARelocatableObjectOfAUnitThatNamesNoRoutineDefinesItsOwnNamesAlone) {
+    struct Relocatable { char const* arch; char const* format; };
+    for (Relocatable const& r : {Relocatable{"x86_64", "elf64-x86_64-linux"}, Relocatable{"x86_64", "pe64-x86_64-windows"},
+                                 Relocatable{"x86_64", "macho64-x86_64-darwin"}, Relocatable{"arm64", "elf64-aarch64-linux"},
+                                 Relocatable{"arm64", "macho64-arm64-darwin"}}) {
+        SCOPED_TRACE(r.format);
+        ScratchDir scratch{Location::InsideRepo, "archive-packaging-relocatable"};
+        writeText(scratch.path() / "plain.c", "int plain_api(int x) { return x + 42; }\n");
+        Program p;
+        p.setOutputDir(scratch.path());
+        DiagnosticReporter rep;
+        ASSERT_EQ(p.compileFiles({(scratch.path() / "plain.c").string()}, "c", {std::string{r.arch} + ":" + r.format},
+                                 rep),
+                  0)
+            << "errors=" << rep.errorCount();
+        ASSERT_EQ(p.artifactPaths().size(), 1u);
+        ASSERT_TRUE(p.artifactPaths().front().has_value());
+        fs::path const object = *p.artifactPaths().front();
+        auto const target = TargetSchema::loadShipped(r.arch);
+        auto const format = ObjectFormatSchema::loadShipped(r.format);
+        ASSERT_TRUE(target.has_value() && format.has_value());
+        DiagnosticReporter readRep;
+        auto const modules = readObjectInputModules(std::span<fs::path const>{&object, 1}, **target, **format, readRep);
+        ASSERT_TRUE(modules.has_value() && modules->size() == 1u) << "errors=" << readRep.errorCount();
+        std::vector<std::string> defined;
+        for (auto const& ms : modules->front().symbols) {
+            if (ms.binding != SymbolBinding::Local) defined.push_back(ms.name);
+        }
+        std::string named;
+        for (std::string const& d : defined) named += " " + d;
+        ASSERT_EQ(defined.size(), 1u) << "the object defines its unit's one function and nothing a runtime ships; it "
+                                         "defines" << named;
+        EXPECT_TRUE(defined.front().ends_with("plain_api")) << defined.front();
+    }
+}
+
+// A RELOCATABLE object of a unit that CALLS a routine the shipped runtime defines leaves the routine a REFERENCE, as
+// gcc's and clang's `-c` leave `memalignment` and cl's `/c` its `__chkstk`: a relocatable artifact defers "who owns
+// this name" to the later link (`allowsUndefinedImports`), and that link -- an image build -- supplies the runtime. A
+// body pulled into the object would be defined again by every other object that calls it, and by the image's own pull
+// (K_SymbolRedefinedAcrossUnits). THE TABLE IS THE UNIVERSE: every shipped relocatable document.
+TEST(ArchivePackaging, ARelocatableObjectOfAUnitThatCallsARuntimeRoutineLeavesItAReference) {
+    struct Relocatable { char const* arch; char const* format; };
+    for (Relocatable const& r : {Relocatable{"x86_64", "elf64-x86_64-linux"}, Relocatable{"x86_64", "pe64-x86_64-windows"},
+                                 Relocatable{"x86_64", "macho64-x86_64-darwin"}, Relocatable{"arm64", "elf64-aarch64-linux"},
+                                 Relocatable{"arm64", "macho64-arm64-darwin"}}) {
+        SCOPED_TRACE(r.format);
+        ScratchDir scratch{Location::InsideRepo, "archive-packaging-runtime-reference"};
+        writeText(scratch.path() / "calls.c",
+                  "#include <stdlib.h>\nsize_t uses_runtime(void *p) { return memalignment(p); }\n");
+        Program p;
+        p.setOutputDir(scratch.path());
+        DiagnosticReporter rep;
+        ASSERT_EQ(p.compileFiles({(scratch.path() / "calls.c").string()}, "c", {std::string{r.arch} + ":" + r.format},
+                                 rep),
+                  0)
+            << "errors=" << rep.errorCount();
+        ASSERT_EQ(p.artifactPaths().size(), 1u);
+        ASSERT_TRUE(p.artifactPaths().front().has_value());
+        fs::path const object = *p.artifactPaths().front();
+        auto const target = TargetSchema::loadShipped(r.arch);
+        auto const format = ObjectFormatSchema::loadShipped(r.format);
+        ASSERT_TRUE(target.has_value() && format.has_value());
+        DiagnosticReporter readRep;
+        auto const modules = readObjectInputModules(std::span<fs::path const>{&object, 1}, **target, **format, readRep);
+        ASSERT_TRUE(modules.has_value() && modules->size() == 1u) << "errors=" << readRep.errorCount();
+        std::vector<std::string> defined;
+        for (auto const& ms : modules->front().symbols) {
+            if (ms.binding != SymbolBinding::Local) defined.push_back(ms.name);
+        }
+        bool const referenced = std::any_of(modules->front().externImports.begin(), modules->front().externImports.end(),
+                                            [](auto const& e) { return e.mangledName.ends_with("memalignment"); });
+        EXPECT_TRUE(referenced) << "the object does not name `memalignment` as a reference";
+        std::string named;
+        for (std::string const& d : defined) named += " " + d;
+        ASSERT_EQ(defined.size(), 1u) << "a relocatable object defines its unit's function alone, never a runtime body "
+                                         "it calls; it defines" << named;
+        EXPECT_TRUE(defined.front().ends_with("uses_runtime")) << defined.front();
     }
 }

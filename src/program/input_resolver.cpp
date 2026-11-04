@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <system_error>
 
 namespace dss {
@@ -41,8 +42,17 @@ bool InputResolver::resolveDirectory(
         Mode                           mode,
         std::vector<std::string>&      out,
         DiagnosticReporter&            reporter) {
-    std::error_code ec;
-    if (core::reachedKind(directoryPath, ec) != core::EntryKind::Directory) {
+    std::error_code       ec;
+    core::EntryKind const root = core::reachedKind(directoryPath, ec);
+    // What the directory REACHES cannot be examined (a looping link, a refusal): that is no
+    // absence, and saying "does not exist" would send the reader after the wrong cause.
+    if (ec) {
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             "InputResolver: what '" + core::genericSpelling(directoryPath)
+             + "' reaches cannot be examined: " + ec.message());
+        return false;
+    }
+    if (root != core::EntryKind::Directory) {
         emit(reporter, DiagnosticCode::D_FileNotFound,
              "InputResolver: '" + core::genericSpelling(directoryPath)
              + "' does not exist or is not a directory.");
@@ -60,10 +70,22 @@ bool InputResolver::resolveDirectory(
     // did not, and took a dangling file link for a regular file — one directory,
     // two input lists. A link is an input by what it REACHES: a link to a regular
     // file is that file under its name here; a dangling one is no input.
-    std::vector<std::string> matched;
+    // ★ A LINK WHOSE REACH CANNOT BE EXAMINED (a loop, a refusal) is handed out by the walk and
+    // asked about ONLY when its name is an input's (the configured extensions): an unrelated one
+    // (`docs/self`) leaves the scan whole, as bash, Python's glob and CMake's GLOB_RECURSE list
+    // such a tree; one NAMED like a source is an input nobody can read, refused naming it --
+    // what gcc and clang answer for a candidate they cannot open (✔MEASURED 2026-10-28, a
+    // looping include candidate: both fatal, naming it).
+    std::vector<std::string>       matched;
+    std::optional<core::TreeEntry> unreadable;
     auto const walk = core::walkTree(directoryPath, [&](core::TreeEntry const& entry) {
         if (entry.kind == core::EntryKind::Directory)
             return mode == Mode::Recursive ? core::WalkStep::Continue : core::WalkStep::Prune;
+        if (entry.reachError) {
+            if (!extensionMatches(entry.path, fileExtensions)) return core::WalkStep::Continue;
+            unreadable = entry;
+            return core::WalkStep::Stop;
+        }
         if (entry.reaches != core::EntryKind::File) return core::WalkStep::Continue;
         if (extensionMatches(entry.path, fileExtensions)) {
             // Not a message — the INPUT LIST the compiler goes on to open.
@@ -72,7 +94,14 @@ bool InputResolver::resolveDirectory(
             matched.push_back(core::genericSpelling(entry.path));
         }
         return core::WalkStep::Continue;
-    });
+    }, core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (unreadable) {
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             "InputResolver: '" + core::genericSpelling(unreadable->path)
+             + "' is named like an input of '" + core::genericSpelling(directoryPath)
+             + "', and what it reaches cannot be examined: " + unreadable->reachError.message());
+        return false;
+    }
     if (walk.error) {
         // The directory itself, or one under it: the two remediations differ, so
         // the two messages do.
@@ -212,14 +241,17 @@ bool InputResolver::checkSearchDirectoriesUsable(
             // Present, a directory, and STILL not enumerable — permission
             // denied, an I/O error, an unreachable network authority. This
             // is the arm the row was filed for, and the one whose cause is
-            // invisible from a missing-header message.
+            // invisible from a missing-header message. ★ It is NOT passed
+            // over by the search: a header search that reaches it ENDS there,
+            // naming it (the search reads a listing to answer the case
+            // question, and a listing it cannot read is no absence) -- as gcc
+            // and clang end theirs at a candidate they cannot open.
             warn(reporter, DiagnosticCode::D_DirectoryScanFailed,
                  "InputResolver: " + opt + " names '" + dir
                  + "', which cannot be enumerated: " + ec.message()
-                 + ". It contributes no header to the search path and is "
-                   "IGNORED; a header that was meant to be found through it "
-                   "will be reported as missing at its `#include` rather "
-                   "than here.");
+                 + ". A header search that reaches it ends there and is "
+                   "refused, naming it; a header found in an earlier "
+                   "directory never asks it.");
         }
         allOk = false;
     }

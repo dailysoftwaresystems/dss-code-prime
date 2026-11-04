@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <span>
 
 namespace dss {
@@ -166,9 +167,14 @@ bool globMatch(std::string_view pattern, std::string_view path) {
 
 bool expandGlob(std::string_view pattern,
                 std::vector<std::string>& out,
-                std::error_code& ec,
+                GlobError& error,
                 fs::path const& baseDir) {
-    ec.clear();
+    error = GlobError{};
+    // The refusal: the path that could not be read, and why.
+    auto const refuse = [&](fs::path const& at, std::error_code const& why) {
+        error = GlobError{why, at};
+        return false;
+    };
 
     // AP6 M4/B.3 — RE-BASE A RELATIVE PATTERN, AND ONLY A RELATIVE ONE. An
     // ABSOLUTE base already states where it starts, so `baseDir` must not touch
@@ -207,7 +213,11 @@ bool expandGlob(std::string_view pattern,
         // the one place a `baseDir` build silently probes the wrong tree.
         std::error_code fec;
         auto const lit = rebase(fs::path{std::string{pattern}});
-        if (core::reachedKind(lit, fec) != core::EntryKind::Absent && !fec) {
+        // A literal whose reach cannot be EXAMINED (a looping link, a refusal) is not
+        // known to be absent: it is refused, named -- never read as "no match".
+        core::EntryKind const litReaches = core::reachedKind(lit, fec);
+        if (fec) return refuse(lit, fec);
+        if (litReaches != core::EntryKind::Absent) {
             // `core::genericSpelling` and NOT `lit.generic_string()`: what this
             // pushes is not a message, it is the SOURCE PATH the compiler will
             // open. `rebase` above is careful to leave a multi-separator
@@ -236,18 +246,8 @@ bool expandGlob(std::string_view pattern,
     // the probe (e.g. permission on a parent) IS an I/O error → fail loud.
     std::error_code probeEc;
     core::EntryKind const baseReaches = core::reachedKind(base, probeEc);
-    bool const baseExists = baseReaches != core::EntryKind::Absent;
-    if (probeEc) {
-        ec = probeEc;
-        return false;
-    }
-    if (!baseExists) return true;
-    bool const baseIsDir = baseReaches == core::EntryKind::Directory;
-    if (probeEc) {
-        ec = probeEc;
-        return false;
-    }
-    if (!baseIsDir) return true;
+    if (probeEc) return refuse(base, probeEc);
+    if (baseReaches != core::EntryKind::Directory) return true;   // absent, or no directory: no match
 
     // `**` anywhere in the tail ⇒ unbounded match depth (recursive walk). Without
     // it the depth is fixed at the tail's segment count, so the walk is PRUNED at
@@ -258,6 +258,7 @@ bool expandGlob(std::string_view pattern,
         1 + static_cast<std::size_t>(std::count(tail.begin(), tail.end(), '/'));
 
     std::vector<std::string> matched;
+    std::optional<core::TreeEntry> unreadable;   // the first MATCHED entry whose reach cannot be examined
     // THE SUBSTRATE'S WALK (`core::walkTree`), never `recursive_directory_iterator`: it never
     // descends a LINK, on every build. ✔MEASURED 2026-10-20 (the substrate's header): libstdc++ on
     // Windows cannot tell a link from what it reaches, so the MinGW build's iterator DESCENDED a
@@ -270,11 +271,21 @@ bool expandGlob(std::string_view pattern,
             return (!recursive && entry.depth + 1 >= tailSegs) ? core::WalkStep::Prune
                                                                 : core::WalkStep::Continue;
         }
-        // DELIBERATE asymmetry vs the fatal open / listing errors below: an entry that reaches
-        // no regular file (a broken symlink, an entry that vanished mid-walk) is SKIPPED, never
-        // raised — such an entry is unrelated to the pattern and must not fail the whole glob
-        // (that would break globbing on any tree holding an unrelated broken symlink). Only
-        // losing visibility of a whole SUBTREE (a directory that cannot be listed) is fatal.
+        std::string const rel = entry.path.lexically_relative(base).generic_string();
+        // DELIBERATE asymmetry vs the fatal listing errors below: an entry that reaches no
+        // regular file (a dangling link, an entry that vanished mid-walk) is SKIPPED, never
+        // raised -- it matches no source, and must not fail the whole glob. A link whose reach
+        // cannot be EXAMINED (a loop, a refusal) is handed out by the walk (the option below)
+        // and asked about ONLY when the pattern matches its name: an unrelated one is skipped
+        // like a dangling one (failing on it would break globbing on any tree holding an
+        // unrelated looping link), and one the pattern names is a source nobody can read --
+        // refused, named. Losing visibility of a whole SUBTREE (a directory that cannot be
+        // listed) is fatal too.
+        if (entry.reachError) {
+            if (!globMatch(tail, rel)) return core::WalkStep::Continue;
+            unreadable = entry;
+            return core::WalkStep::Stop;
+        }
         if (entry.reaches != core::EntryKind::File) return core::WalkStep::Continue;
         // ⚠ THE TWO RENDERINGS BELOW ARE DELIBERATELY DIFFERENT, AND THE
         // ASYMMETRY IS THE MEASUREMENT. `lexically_relative` yields a path with
@@ -286,17 +297,15 @@ bool expandGlob(std::string_view pattern,
         // measured on that same base, `lexically_normal()` alone already
         // returned `\localhost\C$\…\leaf.c`. A glob over a share would have
         // yielded a whole source list naming a local drive that has none of it.
-        std::string const rel = entry.path.lexically_relative(base).generic_string();
         if (globMatch(tail, rel)) {
             matched.push_back(
                 core::genericSpelling(core::normalizeKeepingRoot(entry.path)));
         }
         return core::WalkStep::Continue;
-    });
-    if (walk.error) {  // the base, or a directory under it, could not be listed ⇒ fail loud
-        ec = walk.error;
-        return false;
-    }
+    }, core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (unreadable) return refuse(unreadable->path, unreadable->reachError);
+    // The base, or a directory under it, could not be listed ⇒ fail loud.
+    if (walk.error) return refuse(walk.where, walk.error);
 
     // Deterministic order for reproducible CU ordering; dedup as cheap insurance
     // against a double-yielding iterator (observed on Windows symlink edges — see

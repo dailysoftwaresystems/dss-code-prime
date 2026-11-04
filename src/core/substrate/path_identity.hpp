@@ -277,6 +277,13 @@ enum class EntryKind : std::uint8_t {
 // and the answer is then `Absent`: nothing usable is reached.
 [[nodiscard]] DSS_EXPORT EntryKind reachedKind(std::filesystem::path const& p, std::error_code& ec);
 
+// Whether `p` REACHES a NAMED PIPE (a FIFO), every link on the way followed: the one `Other` a reader takes for an
+// `#embed` resource, a device staying refused there (Apple clang 21.0.0 refuses one, "device files are not yet
+// supported by '#embed' directive", and embeds a fed pipe -- ✔MEASURED 2026-10-28, macos-arm64-debug, run
+// 20261029-002044-5101633a; gcc 13.3 and clang 18.1.3 have no #embed). `false`, `ec` clear, for anything else and
+// on Windows, whose directories record no FIFO kind. `ec` is set only when what `p` reaches cannot be examined.
+[[nodiscard]] DSS_EXPORT bool reachedPipe(std::filesystem::path const& p, std::error_code& ec);
+
 // The size in bytes of the regular file `p` REACHES, every link on the way followed -- or nothing,
 // when it reaches no regular file (nothing there, a dangling link, a directory, a special file). `ec`
 // is set only when what it reaches cannot be examined, and the answer is then nothing.
@@ -293,6 +300,13 @@ enum class EntryKind : std::uint8_t {
 // no link -- its `weakly_canonical` and `canonical` hand a link back unchanged -- so where a link
 // leads is asked here, never of the library. `ec` is set when the resolution fails, and the answer
 // is then empty.
+// ★ A VOLUME WITH NO DOS NAME (no drive letter, no folder it is mounted in) is reached through its NT
+// name, `\?\GLOBALROOT\Device\...` -- MS STL's `canonical` answer there. ✔MEASURED 2026-10-28 (one
+// probe, both Windows libraries, a host with two such volumes): the final path's DOS name is refused
+// (ERROR_PATH_NOT_FOUND) and its NT name given; MS STL's `canonical` answers the GLOBALROOT spelling,
+// while its own `weakly_canonical` REFUSES a tail that does not exist there (error 1), and MinGW's
+// library re-roots such a path onto the C: drive. So this answers where MS STL's `weakly_canonical`
+// does not: the existing part as `canonical` spells it, the rest appended as written.
 [[nodiscard]] DSS_EXPORT std::filesystem::path reachedPath(std::filesystem::path const& p, std::error_code& ec);
 
 // The path `p` REACHES, spelled relative to the path `base` REACHES -- every link on either side resolved
@@ -333,6 +347,45 @@ reachedWriteTime(std::filesystem::path const& p, std::error_code& ec);
 DSS_EXPORT void addReachedPermissions(std::filesystem::path const& p, std::filesystem::perms add,
                                       std::error_code& ec);
 
+// ════ AN ENTRY'S STORED NAME AND A DIRECTORY'S CASE RULE, ASKED WITHOUT THE DIRECTORY'S LISTING ════
+//
+// A directory may grant a lookup by name and refuse its LISTING (POSIX search permission without read, mode 0300; a
+// Windows ACL denying FILE_LIST_DIRECTORY). gcc and clang take a header there by name, so a search that verifies the
+// case of a name asks the ENTRIES instead of the listing. ✔MEASURED 2026-10-28 (probe-reference-cc, the listing
+// refused, `x.h`, a directory `Sub` and a file link `L.h` on disk, each looked up under the other case):
+//     host                       the entry's stored name                       the directory's own case rule
+//     Windows: cl 19.51 and      GetFinalPathNameByHandleW of a handle to the  FileCaseSensitiveInfo: 0 (folds); 1
+//       MinGW-w64 g++ 13.2       entry itself: x.h, Sub, L.h -- DOS and NT     once a user made the directory
+//                                volume names alike                            case-sensitive (A.H then not found)
+//     macOS: AppleClang 21       getattrlist(ATTR_CMN_NAME, FSOPT_NOFOLLOW):   pathconf(_PC_CASE_SENSITIVE): 0
+//                                x.h, Sub, L.h -- and z.h and Shut for a
+//                                mode-0 file and a mode-0300 directory, whose
+//                                OPEN is refused (F_GETPATH, which needs a
+//                                descriptor, fails there)
+//     Linux: gcc 13.3            no call tells it: /proc/self/fd and realpath  no call short of reading the
+//                                answer the name asked for                     directory, which it refuses
+// (runs 20261029-001355-a0213885, 20261029-003341-e5d4743a, 20261029-003600-81043948, 20261029-003902-59348b54,
+// 20261029-003836-60f9e5a7, 20261029-001147-d875516c, 20261029-003230-414c4aaf, 20261029-001240-d119f0ff,
+// 20261029-003249-5ebd90b8.) On Linux every other-case spelling measured was not found: its directories keep case.
+// ⚠ A HOST-OS BRANCH, like the rest of this file: it reads the host's filesystem, never what is being compiled.
+
+// Whether `a` and `b` name ONE directory entry -- the entry itself, a link there NOT followed: two spellings of one
+// name in a directory that folds case. Something absent on either side is no entry: `false`, `ec` clear. `ec` is set
+// only when either cannot be examined.
+[[nodiscard]] DSS_EXPORT bool sameEntry(std::filesystem::path const& a, std::filesystem::path const& b,
+                                        std::error_code& ec);
+
+// The name the entry AT `p` -- its last component, a link there NOT followed -- is STORED under in its directory, asked
+// of the entry and never of a listing (the table above). Nothing, `ec` clear, when nothing is there and on a host that
+// has no such question (Linux). `ec` is set when the entry cannot be examined.
+[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path::string_type>
+storedEntryName(std::filesystem::path const& p, std::error_code& ec);
+
+// Whether the directory `dir` reaches folds the case of the names it is asked for -- its own rule, asked of the
+// directory and never of an entry in it (the table above). Nothing, `ec` clear, on a host that has no such question
+// (Linux). `ec` is set when the directory cannot be examined.
+[[nodiscard]] DSS_EXPORT std::optional<bool> directoryFoldsCase(std::filesystem::path const& dir, std::error_code& ec);
+
 // One entry a walk yields.
 struct TreeEntry {
     std::filesystem::path path;     // the walked root joined with the entry's names, as listed
@@ -348,10 +401,9 @@ struct TreeEntry {
 // go on WITHOUT descending it, or end the walk.
 enum class WalkStep : std::uint8_t { Continue, Prune, Stop };
 
+// ★ THERE IS NO OPTION TO PASS OVER A DIRECTORY THE WALK CANNOT LIST: a walk that skipped one in silence
+// answered for a tree it did not read (the knob `skip_permission_denied` was, and no caller keeps it).
 struct TreeWalkOptions {
-    // A directory the walk may not list is passed over in silence instead of ending the walk --
-    // `std::filesystem::directory_options::skip_permission_denied`, for the walks that took it.
-    bool skipPermissionDenied = false;
     // A link whose reach cannot be examined is handed to the visitor with its `reachError` set, instead
     // of ending the walk -- for a visitor that answers it itself. Off by default: a walk that cannot
     // tell what a link reaches did not read the tree it was asked about, and says so.
@@ -369,8 +421,8 @@ struct TreeWalk {
 // next sibling of that directory, descending only a `Directory` the visitor did not prune -- NEVER
 // a link. Iterative: the work is an explicit stack of listed directories on the heap, so a deep
 // tree costs memory, never call stack. The first directory it cannot list ends the walk (`error`,
-// `where`) unless the options pass it over, and so does a link whose reach it cannot examine unless
-// the options hand it out; the order within a directory is the filesystem's.
+// `where`), and so does a link whose reach it cannot examine unless the options hand it out; the
+// order within a directory is the filesystem's.
 [[nodiscard]] DSS_EXPORT TreeWalk walkTree(std::filesystem::path const&                  root,
                                            std::function<WalkStep(TreeEntry const&)> const& visit,
                                            TreeWalkOptions                               options = {});
@@ -402,7 +454,23 @@ struct TreeRemoval {
 // removal alone is refused, ACCESS_DENIED), every entry deleted through its own handle. MS STL's
 // `remove_all` (READ, its <filesystem>) recurses BY PATH, and MinGW's libstdc++ cannot see a link at
 // all, so neither library is asked.
-[[nodiscard]] DSS_EXPORT TreeRemoval removeTree(std::filesystem::path const& target);
+//
+// ★ A DIRECTORY ANOTHER HOLDER KEEPS OPEN WITHOUT DELETE SHARING (Windows; a process's current directory
+// is one) is LEFT WHOLE -- nothing under it is removed -- and is the failure named. That is MS STL's
+// answer: ✔MEASURED 2026-10-28 (MSVC 14.51's STL; a directory held by a handle sharing read|write only, and
+// one that is a child process's current directory) `remove_all` removes nothing under it and fails with
+// ERROR_SHARING_VIOLATION. The removal opens a directory once to list and delete it, so the same refusal
+// ends the same subtree.
+//
+// `options.lastEntry` (one component; empty, the default, names nothing): an entry of the TARGET
+// directory removed only after every other entry of it was, and only when every one of those was -- else
+// the removal ends with it, and so the target, in place. A marker that keeps a half-removed tree
+// recognisable (a kept root's `run-info.txt`) is that entry. A target that is a link or no directory has
+// no entries: it is removed as itself, whatever the options say.
+struct RemovalOptions {
+    std::filesystem::path lastEntry;
+};
+[[nodiscard]] DSS_EXPORT TreeRemoval removeTree(std::filesystem::path const& target, RemovalOptions const& options = {});
 
 // THE TEST SEAM of `removeTree`: called with each entry's path after its directory was listed and
 // before the entry is opened -- the window a swap would use. Empty (the default) in every build; a test

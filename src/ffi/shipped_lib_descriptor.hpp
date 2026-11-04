@@ -921,8 +921,9 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
 // THAN DERIVED FOR A LAYERING REASON, NOT A CONVENIENCE ONE
 // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64). A shipped-lib descriptor is no longer
 // the only document that can name a file in this tree: an object format's
-// `runtimeLibraries[].source` names one too, for a role whose entries the
-// COMPILER MINTS and which therefore has no descriptor row to hang off. Reading
+// `runtimeLibraries[].source` (one unit) or `.sources` (several) names one
+// too, for a role whose entries the COMPILER MINTS and which therefore has no
+// descriptor row to hang off. Reading
 // `.format.json` here would put the object-format schema inside `ffi`, so the
 // caller hands over the sources it found. ⚠ A CALLER THAT READS THE KEY ITSELF
 // RATHER THAN LOADING THE FORMAT BECOMES A SECOND READER OF A CONFIG KEY, which

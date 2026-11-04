@@ -1,1 +1,1 @@
-        /*laterStageResumes=*/stage == PipelineStage::Unit);
+        /*laterStageResumes=*/stage != PipelineStage::Program);

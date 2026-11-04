@@ -8,6 +8,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,10 +41,28 @@ struct HeaderSearchCache::Impl {
         std::unordered_set<NativeString>                               exact;
         // …and grouped by their ASCII fold, for the CaseInsensitive one.
         std::unordered_map<NativeString, std::vector<std::size_t>>     folded;
+        // Why the listing failed, when `dir` IS a directory (or what it reaches
+        // cannot be examined) and still could not be listed whole: a listing the
+        // case question cannot be answered from. Clear when the listing was read
+        // whole, and when `dir` is absent or no directory -- nothing to search.
+        std::error_code                                                error;
+    };
+    // What one candidate REACHES, asked once: an entry, nothing, or -- `error` set --
+    // a reach that cannot be examined.
+    struct Probe {
+        core::EntryKind kind = core::EntryKind::Absent;   // `Absent` too when `error` is set
+        std::error_code error;
+    };
+    // The verdict on a name in a directory that REFUSED ITS LISTING (`unlistedMatch`), by policy and candidate: what
+    // it took to learn it is asked once per compile, like a listing.
+    struct Unlisted {
+        HeaderSearchResult result;
+        core::EntryKind    reached = core::EntryKind::Absent;   // what a Found entry reaches
     };
     std::mutex                                  mutex;
     std::unordered_map<NativeString, Listing>   listings;   // by directory
-    std::unordered_map<NativeString, bool>      probes;     // by candidate
+    std::unordered_map<NativeString, Probe>     probes;     // by candidate
+    std::unordered_map<NativeString, Unlisted>  unlisted;   // by policy and candidate
 };
 
 struct HeaderSearchTally::Impl {
@@ -98,6 +117,16 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     for (fs::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
         l.names.push_back(it->path().filename().native());
     }
+    // A failed listing is ABSENCE only when there is no directory there to list (the
+    // substrate's answer: nothing, or no directory). A directory -- or a `dir` whose
+    // reach cannot be examined -- that could not be listed whole is a listing the
+    // search cannot answer from, and it says so (`matchComponent`).
+    if (ec) {
+        std::error_code       kec;
+        core::EntryKind const there = core::reachedKind(dir, kec);
+        if (kec) l.error = kec;
+        else if (there == core::EntryKind::Directory) l.error = ec;
+    }
     l.exact.reserve(l.names.size());
     for (std::size_t i = 0; i < l.names.size(); ++i) {
         l.exact.insert(l.names[i]);
@@ -107,20 +136,25 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     return c.listings.emplace(std::move(key), std::move(l)).first->second;
 }
 
-// Does `dir` LIST an entry whose name is `name`, byte for byte?
+// Does `dir` LIST an entry whose name is `name`, byte for byte? `listingError` is
+// set when the listing could not be read whole (and the answer then means nothing).
 [[nodiscard]] bool listsExactly(HeaderSearchCache& cache, fs::path const& dir,
-                                NativeString const& name) {
-    HeaderSearchCache::Impl& c = cache.impl();
-    std::lock_guard<std::mutex> lock{c.mutex};
-    return listingOf(c, dir).exact.contains(name);
-}
-
-// Every entry of `dir` whose ASCII fold is `folded`, in enumeration order.
-[[nodiscard]] std::vector<NativeString> foldMatches(HeaderSearchCache& cache, fs::path const& dir,
-                                                    NativeString const& folded) {
+                                NativeString const& name, std::error_code& listingError) {
     HeaderSearchCache::Impl& c = cache.impl();
     std::lock_guard<std::mutex> lock{c.mutex};
     auto const& l = listingOf(c, dir);
+    listingError  = l.error;
+    return l.exact.contains(name);
+}
+
+// Every entry of `dir` whose ASCII fold is `folded`, in enumeration order.
+// `listingError` is set when the listing could not be read whole.
+[[nodiscard]] std::vector<NativeString> foldMatches(HeaderSearchCache& cache, fs::path const& dir,
+                                                    NativeString const& folded, std::error_code& listingError) {
+    HeaderSearchCache::Impl& c = cache.impl();
+    std::lock_guard<std::mutex> lock{c.mutex};
+    auto const& l = listingOf(c, dir);
+    listingError  = l.error;
     std::vector<NativeString> out;
     if (auto const hit = l.folded.find(folded); hit != l.folded.end()) {
         out.reserve(hit->second.size());
@@ -129,9 +163,14 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     return out;
 }
 
-// Does `candidate` REACH an entry — every link on the way followed — asked ONCE
-// per candidate per compile? An error reads as "no", exactly as the uncached
-// probe did. `matchComponent` asks it of EVERY candidate, under both policies.
+// What does `candidate` REACH — every link on the way followed — asked ONCE
+// per candidate per compile? `error` is set when what it reaches cannot be
+// EXAMINED (a looping link, a refusal), and the answer is then no answer
+// (`Absent` with the reason): never "nothing" (see
+// `HeaderSearchStatus::Unexaminable`). `matchComponent` asks it of EVERY
+// candidate, under both policies, and `descend` of a name whose tail no
+// candidate named; `descend` decides from that one answer what the search may
+// take (no directory), so no caller asks the path again.
 //
 // ★★ A DANGLING LINK IS NO HEADER, UNDER EITHER POLICY — THE ONE STATEMENT OF IT
 // ([[D-PP-HEADER-CASE-DANGLING-SYMLINK-ASYMMETRY]]). ✔MEASURED 2026-10-20: a
@@ -145,16 +184,119 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
 // `fs::exists`: libstdc++ on Windows reads a dangling link's OWN attributes and
 // calls it `regular` (✔MEASURED 2026-10-20, path_identity.hpp), so the MinGW
 // build found the link under BOTH policies.
-[[nodiscard]] bool existsOnce(HeaderSearchCache& cache, fs::path const& candidate) {
+[[nodiscard]] core::EntryKind reachedOnce(HeaderSearchCache& cache, fs::path const& candidate,
+                                          std::error_code& error) {
     HeaderSearchCache::Impl& c = cache.impl();
     std::lock_guard<std::mutex> lock{c.mutex};
     NativeString key = cacheKeyOf(candidate);
-    if (auto const hit = c.probes.find(key); hit != c.probes.end()) return hit->second;
-    std::error_code ec;
-    bool const exists = core::reachedKind(candidate, ec) != core::EntryKind::Absent && !ec;
+    if (auto const hit = c.probes.find(key); hit != c.probes.end()) {
+        error = hit->second.error;
+        return hit->second.kind;
+    }
+    HeaderSearchCache::Impl::Probe probe;
+    probe.kind = core::reachedKind(candidate, probe.error);
+    if (probe.error) probe.kind = core::EntryKind::Absent;
     tallyRecord(key, /*listing=*/false);
-    c.probes.emplace(std::move(key), exists);
-    return exists;
+    error = probe.error;
+    c.probes.emplace(std::move(key), probe);
+    return probe.kind;
+}
+
+// The other ASCII case of every letter in `name`: the one spelling whose answer tells, where a directory's listing
+// cannot be read, how the directory compares case for this name (`decideUnlisted`). One body for every character
+// type, as the fold is (`ascii_case.hpp`): `A`-`Z` and `a`-`z` are the same code points in each.
+[[nodiscard]] NativeString otherAsciiCase(NativeString const& name) {
+    NativeString out = name;
+    for (NativeChar& c : out) {
+        if (c >= NativeChar{'a'} && c <= NativeChar{'z'}) {
+            c = static_cast<NativeChar>(c - (NativeChar{'a'} - NativeChar{'A'}));
+        } else if (c >= NativeChar{'A'} && c <= NativeChar{'Z'}) {
+            c = static_cast<NativeChar>(c + (NativeChar{'a'} - NativeChar{'A'}));
+        }
+    }
+    return out;
+}
+
+// ── A DIRECTORY THAT REFUSES ITS LISTING IS SEARCHED BY NAME, AND THE CASE IS VERIFIED BY NAME ──────────────────
+//
+// ✔MEASURED 2026-10-28 (probe-reference-cc, linux-x86_64-debug, run 20261029-000115-ff8a36d9, gcc 13.3.0 and clang
+// 18.1.3, euid 1000): with `u` searched first holding x.h at mode 0300 (search without read) and a `b/x.h` later, both
+// take u/x.h by name. The construct works, so the search takes it too; the case question the listing would have
+// answered is asked of the entries instead (the substrate measures what each host tells, path_identity.hpp):
+//   * nothing answers to the exact name: the case-sensitive policy has its answer, NotFound -- the host's lookup is
+//     never stricter than the policy; the case-insensitive one asks the directory's own case rule -- a folding
+//     directory holds no other spelling (NotFound), any other may hold a fold-match only the listing could show;
+//   * the name has no letter: it has one spelling, and the lookup is the answer;
+//   * the other-case spelling is ANOTHER entry, or none: the directory keeps case, and the lookup of the exact name IS
+//     the exact-case answer -- the case-sensitive policy takes it; for the case-insensitive one another entry is a
+//     second fold-match (AmbiguousCase), and none leaves a mixed-case one only the listing could rule out;
+//   * the other-case spelling is the SAME entry: the directory folds -- the case-sensitive policy takes the entry only
+//     when its STORED name is the requested spelling byte for byte, else NotFound; the case-insensitive one takes the
+//     one fold-match a folding directory can hold, spelled as it is stored.
+// A question this host cannot answer -- the stored name in a folding directory, a directory's own case rule (Linux
+// tells neither) -- ends the search there, `Unexaminable`, naming the directory with the reason its listing was
+// refused: never a guess, and never "not here". The checkpoint-34 bytes read such a listing as holding NOTHING and
+// went on: `-I u -I b` compiled b/x.h, the header of the wrong directory, in silence.
+[[nodiscard]] HeaderSearchCache::Impl::Unlisted
+decideUnlisted(fs::path const& dir, fs::path const& name, HeaderNameMatching matching, HeaderSearchCache& cache,
+               std::error_code const& listingError) {
+    bool const            caseSensitive = matching == HeaderNameMatching::CaseSensitive;
+    fs::path const        candidate     = dir / name;
+    std::error_code       ec;
+    core::EntryKind const reaches = reachedOnce(cache, candidate, ec);
+    if (ec) return {HeaderSearchResult::unexaminable(candidate, ec)};
+    NativeString const other   = otherAsciiCase(name.native());
+    bool const         letters = other != name.native();
+    if (reaches == core::EntryKind::Absent) {
+        if (caseSensitive || !letters) return {HeaderSearchResult::notFound()};
+        std::optional<bool> const folds = core::directoryFoldsCase(dir, ec);
+        if (ec) return {HeaderSearchResult::unexaminable(dir, ec)};
+        if (folds.value_or(false)) return {HeaderSearchResult::notFound()};
+        return {HeaderSearchResult::unexaminable(dir, listingError)};
+    }
+    if (!letters) return {HeaderSearchResult::found(candidate), reaches};
+    fs::path const otherSpelling = dir / fs::path{other};
+    bool const     folds         = core::sameEntry(candidate, otherSpelling, ec);
+    if (ec) return {HeaderSearchResult::unexaminable(otherSpelling, ec)};
+    if (!folds) {
+        if (caseSensitive) return {HeaderSearchResult::found(candidate), reaches};
+        core::EntryKind const second = reachedOnce(cache, otherSpelling, ec);
+        if (ec) return {HeaderSearchResult::unexaminable(otherSpelling, ec)};
+        if (second == core::EntryKind::Absent) return {HeaderSearchResult::unexaminable(dir, listingError)};
+        std::vector<fs::path> both{candidate, otherSpelling};
+        std::sort(both.begin(), both.end(),
+                  [](fs::path const& a, fs::path const& b) { return a.native() < b.native(); });
+        return {HeaderSearchResult::ambiguous(std::move(both))};
+    }
+    std::optional<NativeString> const stored = core::storedEntryName(candidate, ec);
+    if (ec) return {HeaderSearchResult::unexaminable(candidate, ec)};
+    if (!stored) return {HeaderSearchResult::unexaminable(dir, listingError)};
+    if (caseSensitive) {
+        if (*stored != name.native()) return {HeaderSearchResult::notFound()};
+        return {HeaderSearchResult::found(candidate), reaches};
+    }
+    if (asciiToLower(*stored) != asciiToLower(name.native())) return {HeaderSearchResult::notFound()};
+    return {HeaderSearchResult::found(dir / fs::path{*stored}), reaches};
+}
+
+// `decideUnlisted`, asked once per policy and candidate per compile. `reached` is what a Found entry reaches.
+[[nodiscard]] HeaderSearchResult unlistedMatch(fs::path const& dir, fs::path const& name, HeaderNameMatching matching,
+                                               HeaderSearchCache& cache, std::error_code const& listingError,
+                                               core::EntryKind& reached) {
+    HeaderSearchCache::Impl& c   = cache.impl();
+    NativeString             key = cacheKeyOf(dir / name);
+    key.insert(key.begin(), matching == HeaderNameMatching::CaseSensitive ? NativeChar{'S'} : NativeChar{'I'});
+    {
+        std::lock_guard<std::mutex> lock{c.mutex};
+        if (auto const hit = c.unlisted.find(key); hit != c.unlisted.end()) {
+            reached = hit->second.reached;
+            return hit->second.result;
+        }
+    }
+    HeaderSearchCache::Impl::Unlisted verdict = decideUnlisted(dir, name, matching, cache, listingError);
+    reached                                   = verdict.reached;
+    std::lock_guard<std::mutex> lock{c.mutex};
+    return c.unlisted.emplace(std::move(key), std::move(verdict)).first->second.result;
 }
 
 // `.` is in C's basic character set, so `NativeChar{'.'}` is the SAME code
@@ -200,29 +342,38 @@ constexpr NativeChar kDotChar = NativeChar{'.'};
 // requested (source-text) name, and only its `native()` is ever compared.
 //
 // ★★ BOTH ARMS READ `dir` THROUGH THE COMPILE'S CACHE (`listsExactly`,
-// `foldMatches`, `existsOnce` above): the listing and the `exists` probe happen
+// `foldMatches`, `reachedOnce` above): the listing and the `exists` probe happen
 // once per compile, and every later lookup compares against what they returned.
 // The comparisons themselves are unchanged, name for name.
+// `reached` is what a Found entry REACHES, from the search's own examination of it -- for `descend`, which decides
+// from it what the search may take.
 HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
                                   HeaderNameMatching matching,
-                                  HeaderSearchCache& cache) {
+                                  HeaderSearchCache& cache, core::EntryKind& reached) {
+    reached = core::EntryKind::Absent;
     if (matching == HeaderNameMatching::CaseSensitive) {
         // Cheap DEFINITIVE reject first. If no entry answers to these exact
         // bytes even under the host's own (possibly folding) rules, then no
         // byte-exact entry can exist either — the probe is only ever MORE
         // permissive than we are, never less, so a false here is trustworthy.
-        // It is also where a dangling link is no header (`existsOnce`).
+        // It is also where a dangling link is no header (`reachedOnce`).
         fs::path const candidate = dir / name;
-        if (!existsOnce(cache, candidate)) return HeaderSearchResult::notFound();
+        std::error_code       probeError;
+        core::EntryKind const reaches = reachedOnce(cache, candidate, probeError);
+        if (probeError) return HeaderSearchResult::unexaminable(candidate, probeError);
+        if (reaches == core::EntryKind::Absent) return HeaderSearchResult::notFound();
         // The probe said yes — but a case-INSENSITIVE host may have FOLDED to
         // get there. Verify the REAL on-disk spelling ourselves; this is the
         // arm that stops `#include <Stdio.h>` from silently compiling for an
-        // elf target on a Windows/macOS host. A directory we cannot enumerate
-        // fails CLOSED (NotFound): unable to verify is not permission to
-        // assume, and the caller's miss diagnostic is loud.
-        if (listsExactly(cache, dir, name.native()))
-            return HeaderSearchResult::found(candidate);
-        return HeaderSearchResult::notFound();
+        // elf target on a Windows/macOS host. A directory that refuses its
+        // LISTING is verified by NAME instead (`unlistedMatch`): unable to list
+        // is no permission to assume, and no absence either.
+        std::error_code listingError;
+        bool const      spelled = listsExactly(cache, dir, name.native(), listingError);
+        if (listingError) return unlistedMatch(dir, name, matching, cache, listingError, reached);
+        if (!spelled) return HeaderSearchResult::notFound();
+        reached = reaches;
+        return HeaderSearchResult::found(candidate);
     }
 
     // CaseInsensitive. ALWAYS enumerate — there is no correct `exists()` fast
@@ -232,14 +383,29 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
     // fold-match is collected and >= 2 is a LOUD failure, never a pick.
     // A hit is spelled `dir / <entry>` — the path the listing's iterator yields.
     // A listed entry that REACHES nothing — a dangling link — is no hit: the same
-    // probe, and so the same rule, as the case-sensitive arm above (`existsOnce`).
+    // probe, and so the same rule, as the case-sensitive arm above (`reachedOnce`).
+    // A listing that could not be read whole is verified by NAME (`unlistedMatch`);
+    // a fold-match whose reach cannot be examined ENDS the search (`Unexaminable`,
+    // named): it is no absence.
     std::vector<fs::path> hits;
-    for (NativeString const& entry : foldMatches(cache, dir, asciiToLower(name.native()))) {
-        fs::path hit = dir / fs::path{entry};
-        if (existsOnce(cache, hit)) hits.push_back(std::move(hit));
+    core::EntryKind       hitReaches = core::EntryKind::Absent;   // what the hit reaches, when there is one
+    std::error_code       listingError;
+    auto const            matches = foldMatches(cache, dir, asciiToLower(name.native()), listingError);
+    if (listingError) return unlistedMatch(dir, name, matching, cache, listingError, reached);
+    for (NativeString const& entry : matches) {
+        fs::path              hit = dir / fs::path{entry};
+        std::error_code       probeError;
+        core::EntryKind const reaches = reachedOnce(cache, hit, probeError);
+        if (probeError) return HeaderSearchResult::unexaminable(std::move(hit), probeError);
+        if (reaches == core::EntryKind::Absent) continue;
+        hitReaches = reaches;
+        hits.push_back(std::move(hit));
     }
     if (hits.empty()) return HeaderSearchResult::notFound();
-    if (hits.size() == 1) return HeaderSearchResult::found(std::move(hits.front()));
+    if (hits.size() == 1) {
+        reached = hitReaches;
+        return HeaderSearchResult::found(std::move(hits.front()));
+    }
     // Deterministic order, so the collision diagnostic reads the same run to
     // run. Ordered on the NATIVE string for the same reason the matching is:
     // `generic_string()` here would throw on precisely the names a collision
@@ -254,8 +420,24 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
 
 // Walk `base` down every component of `rel` under `matching`. `rel` must be
 // relative; the caller splits an absolute name into (root_path, remainder).
+//
+// ★★ WHAT A SEARCH MAY TAKE IS DECIDED HERE, ONCE, FOR EVERY CALLER: whatever the name REACHES except a DIRECTORY.
+// A directory named like the header is no header, and the search goes on past it -- ✔MEASURED 2026-10-28
+// (probe-reference-cc, linux-x86_64-debug, run 20261029-000351-99219a41, gcc 13.3.0 and clang 18.1.3): a directory
+// `u/x.h` searched first and a header `b/x.h` later -- both take b/x.h, `#include <x.h>`, `#include "x.h"` on -I and
+// in the includer's own directory alike; the directory alone -- both say not found. A DEVICE or a NAMED PIPE is
+// taken: ✔MEASURED (run 20261029-000903-6a85024c, the same two; run 20261029-002044-5101633a, Apple clang 21.0.0)
+// `#include "/dev/null"` compiles in all three and `__has_include` of it is 1; a pipe fed by a writer is read by both
+// clangs, and clang takes such a pipe named x.h before a later x.h (gcc opens it too, and waits on it). So no caller
+// filters a Found -- the quote pre-scan, the angle search, the import resolver and `#embed` read one answer. The bytes
+// before this handed a directory back as Found: the quote pre-scan passed over it with a second look of its own, and
+// the angle form THREW out of the preprocessor (`SourceBuffer::fromFile`: "is not a regular file", ✔MEASURED on the
+// Mac, run 20261029-002544-d3909fed).
 HeaderSearchResult descend(fs::path base, fs::path const& rel,
                            HeaderNameMatching matching, HeaderSearchCache& cache) {
+    // What `base` reaches, as the search examined it: known once a component is matched (its probe's
+    // answer), unknown at the start and after a `..` -- a path no probe named.
+    std::optional<core::EntryKind> reaches;
     for (fs::path const& comp : rel) {
         // NATIVE, not `comp.string()`: the requested name is already a path,
         // and narrowing it back would reintroduce the throw/lossy conversion
@@ -271,11 +453,26 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
         // miss. Append it and let the OS resolve it exactly as the pre-policy
         // `dir / rel` did — the case rule still applies to every component that
         // actually names a file.
-        if (isDotDotComponent(name)) { base /= comp; continue; }
-        HeaderSearchResult step = matchComponent(base, comp, matching, cache);
+        if (isDotDotComponent(name)) { base /= comp; reaches.reset(); continue; }
+        core::EntryKind    reached = core::EntryKind::Absent;
+        HeaderSearchResult step    = matchComponent(base, comp, matching, cache, reached);
         if (step.status != HeaderSearchStatus::Found) return step;
-        base = std::move(step.path);
+        base    = std::move(step.path);
+        reaches = reached;
     }
+    // A name that ends where no probe looked -- in `..`, or in nothing but `.`s -- is examined ONCE
+    // here, through the compile's cache. A reach that cannot be examined ends the search, named, like any
+    // candidate's: `d/sub/..` through a `sub` with no search permission is no answer (gcc and clang open it
+    // and fail with the OS's reason). The checkpoint-34 bytes handed such a path back as Found, unexamined.
+    if (!reaches) {
+        std::error_code error;
+        reaches = reachedOnce(cache, base, error);
+        if (error) return HeaderSearchResult::unexaminable(base, error);
+        // Nothing reached -- a `..` through a FILE (`x.h/..`) -- is no header, and the search goes on.
+        if (*reaches == core::EntryKind::Absent) return HeaderSearchResult::notFound();
+    }
+    // A matched component always reaches something (`matchComponent`); a directory is no header.
+    if (*reaches == core::EntryKind::Directory) return HeaderSearchResult::notFound();
     return HeaderSearchResult::found(std::move(base));
 }
 
@@ -376,7 +573,11 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
 [[nodiscard]] bool isListedInItsParent(fs::path const& p, HeaderSearchCache& cache) {
     NativeString const want = p.filename().native();
     if (want.empty()) return false;
-    return listsExactly(cache, p.parent_path(), want);
+    // The root-prefix question is "does any listing CONTAIN it", and a listing that
+    // cannot be read contains nothing -- by design: that is how a server's root,
+    // which no one can list, joins the prefix (`rootPrefixOf`). So its error is not asked.
+    std::error_code unread;
+    return listsExactly(cache, p.parent_path(), want, unread);
 }
 
 [[nodiscard]] fs::path rootPrefixOf(fs::path const& full, fs::path& below,
@@ -609,13 +810,17 @@ AngleIncludeResolution resolveAngleInclude(std::string_view          filename,
         resolveSystemDescriptor(filename, systemDirs, matching, cache);
     switch (desc.status) {
         case HeaderSearchStatus::Found:
-            return {AngleIncludeKind::Descriptor, std::move(desc.path), {}};
+            return {AngleIncludeKind::Descriptor, std::move(desc.path), {}, {}};
         case HeaderSearchStatus::AmbiguousCase:
             // The import resolver re-resolves the descriptor half and owns its
             // loud report; keeping this arm DISTINCT is what lets the caller
             // stay silent here without the collision going unreported.
             return {AngleIncludeKind::AmbiguousDescriptor, {},
-                    std::move(desc.ambiguousCandidates)};
+                    std::move(desc.ambiguousCandidates), {}};
+        case HeaderSearchStatus::Unexaminable:
+            // The search ENDS here: the source half is never asked. The import
+            // resolver re-resolves the descriptor half and reports it.
+            return {AngleIncludeKind::UnexaminableDescriptor, desc.path, {}, desc};
         case HeaderSearchStatus::NotFound:
             break;
     }
@@ -626,18 +831,25 @@ AngleIncludeResolution resolveAngleInclude(std::string_view          filename,
     HeaderSearchResult src = findInDirs(filename, includeDirs, matching, cache);
     switch (src.status) {
         case HeaderSearchStatus::Found:
-            return {AngleIncludeKind::Source, std::move(src.path), {}};
+            return {AngleIncludeKind::Source, std::move(src.path), {}, {}};
         case HeaderSearchStatus::AmbiguousCase:
             // NOTHING downstream re-resolves the `-I` source half — the import
             // resolver's angle arm calls `resolveSystemDescriptor` alone — so
             // the caller of THIS function is the only tier that can report it.
             return {AngleIncludeKind::AmbiguousSource, {},
-                    std::move(src.ambiguousCandidates)};
+                    std::move(src.ambiguousCandidates), {}};
+        case HeaderSearchStatus::Unexaminable:
+            // The same ownership as the collision above: the PP alone reports it.
+            return {AngleIncludeKind::UnexaminableSource, src.path, {}, src};
         case HeaderSearchStatus::NotFound:
             break;
     }
     // 3. Total miss — the caller fails loud (F_ShippedHeaderNotFound).
-    return {AngleIncludeKind::NotFound, {}, {}};
+    return {AngleIncludeKind::NotFound, {}, {}, {}};
+}
+
+std::string describeUnexaminable(HeaderSearchResult const& r) {
+    return "'" + core::genericSpelling(r.path) + "' cannot be examined (" + r.error.message() + ")";
 }
 
 } // namespace dss

@@ -1,1 +1,2 @@
+            if(_dss_python_in_aliases AND _dss_python_var STREQUAL "_Python3_EXECUTABLE")
                 set(_dss_python_kept "${_dss_python_named}")

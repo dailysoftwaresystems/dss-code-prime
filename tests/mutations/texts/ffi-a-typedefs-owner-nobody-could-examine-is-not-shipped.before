@@ -1,0 +1,1 @@
+    if (found.status == HeaderSearchStatus::Unexaminable) {   // not "no such descriptor": nobody could tell

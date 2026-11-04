@@ -1,0 +1,1 @@
+    auto text = std::expected<std::string, core::FileReadError>{std::string{SourceBuffer::fromFile(path)->text()}};

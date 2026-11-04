@@ -1082,18 +1082,24 @@ buildCuHir(CompilationUnit const&         cu,
 // Program site, and both fall out of the config — never a driver `if` on
 // stage content.
 //
-// ★★ THE UNIT STAGE IS NEVER A MODULE'S LAST: a module is lowered only after a
-// PROGRAM-stage optimize has run on it. `optimizeModule` relies on it -- a
-// fixpoint the Unit stage truncates is resumed by the Program stage, so only
-// the Program stage reports a truncation
-// (D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES) --
-// and `tests/opt/test_fixpoint_report_stage.cpp` holds every production route
-// to it through `pipeline_testing::setStageObserver`: a route that lowers a module whose
-// last optimize was not Program-stage is red there. A NEW lowering route is
-// added to that test's table.
+// ★★ ONLY THE PROGRAM STAGE IS EVER A MODULE'S LAST: a module is lowered only
+// after a PROGRAM-stage optimize has run on it, and nothing optimizes it after
+// that. `optimizeModule` relies on it -- a fixpoint a Unit-stage or ThinImport-stage
+// run truncates is resumed by a later stage, so only the Program stage reports a
+// truncation (D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES).
+// The STAGE names the call site, so the rule stays one rule: the thin-LTO import
+// stage (`runThinLtoImportStage`) optimizes each unit with what it imported, and
+// the merged module's Program stage then runs over all of it, so the import
+// stage is never a module's last either -- it runs the config's own document,
+// as the Program stage does, and says nothing of a truncation.
+// `tests/opt/test_fixpoint_report_stage.cpp` holds every production route to it
+// through `pipeline_testing::setStageObserver`: a route that lowers a module whose
+// last optimize was not Program-stage, or that optimizes a module again after a
+// Program-stage run, is red there. A NEW lowering route is added to that test's table.
 enum class PipelineStage : std::uint8_t {
-    Unit = 0,     // per-CU build (buildCuMir)
-    Program = 1,  // final module pre-lower (merged / N==1 / archive member)
+    Unit = 0,        // per-CU build (buildCuMir)
+    Program = 1,     // final module pre-lower (merged / N==1 / archive member)
+    ThinImport = 2,  // thin-LTO import stage: a unit with its imports, before the merge (runThinLtoImportStage)
 };
 
 // One event of the stage topology, for its test seam: a module optimized at a

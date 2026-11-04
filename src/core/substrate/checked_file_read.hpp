@@ -73,10 +73,11 @@ namespace dss::core {
 // failed without re-deriving it from the message text.
 enum class FileReadFailure : std::uint8_t {
     OpenFailed,       // the open itself failed (missing, permissions, sharing)
-    NotARegularFile,  // opened, but it is a directory / device / fifo
+    NotARegularFile,  // opened, but it is a directory -- or, read with no bound, a device / fifo
     InputError,       // a genuine mid-read failure: the stream went bad
     TornRead,         // the bytes obtained disagree with the size measured
     OutputError,      // allocation failure building the result (output side)
+    TooLarge,         // more than the caller's bound: a file refused before it is read, a stream once it passes it
 };
 
 struct DSS_EXPORT FileReadError {
@@ -87,9 +88,23 @@ struct DSS_EXPORT FileReadError {
     std::string     message;
 };
 
-// Read `path` whole, or say precisely why not. Never returns a partial prefix.
+// Read `path` whole, or say precisely why not. Never returns a partial prefix. A regular file only: anything else
+// is NotARegularFile -- a STREAM has no size to bound it, so it is read only by the bounded form below.
 [[nodiscard]] DSS_EXPORT std::expected<std::string, FileReadError>
 readFileChecked(std::filesystem::path const& path);
+
+// Read `path` whole -- a regular file, or a STREAM: a device or a named pipe, an entry that is neither a regular file
+// nor a directory -- holding at most `maxBytes`, or say precisely why not. A regular file over the bound is refused
+// BEFORE it is read; a stream, which has no size to measure, is read to its end in chunks and refused (TooLarge) the
+// moment it passes the bound, never held past `maxBytes + 1` bytes -- so `/dev/zero` is a loud refusal, not an
+// exhausted machine. A directory stays NotARegularFile. The torn-read check is the regular file's: a stream's end IS
+// its end of file.
+// ✔MEASURED 2026-10-28 (probe-reference-cc): gcc 13.3.0 and clang 18.1.3 (linux-x86_64-debug, run
+// 20261029-000903-6a85024c) and Apple clang 21.0.0 (macos-arm64-debug, run 20261029-002044-5101633a) read
+// `#include "/dev/null"` and a header that is a named pipe fed by a writer (gcc opens the pipe too, and waits on it):
+// a header reader passes its bound and reads them.
+[[nodiscard]] DSS_EXPORT std::expected<std::string, FileReadError>
+readFileChecked(std::filesystem::path const& path, std::uintmax_t maxBytes);
 
 // The SEAM the pins drive. `expectedBytes` is the size the caller measured for
 // this exact stream; `label` names the thing being read in the diagnostic.

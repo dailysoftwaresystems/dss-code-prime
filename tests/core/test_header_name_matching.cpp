@@ -50,6 +50,12 @@
 #include <system_error>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>   // geteuid: a permission case means nothing to root
+#else
+#include <aclapi.h>   // an ACL entry denying this user a directory's listing (ListingDenied)
+#endif
+
 namespace fs = std::filesystem;
 using namespace dss;
 using dss::test_support::Location;
@@ -532,6 +538,9 @@ namespace {
                u8Bytes(r.path.filename().u8string());
     case HeaderSearchStatus::NotFound: return "nothing";
     case HeaderSearchStatus::AmbiguousCase: return "an ambiguity";
+    case HeaderSearchStatus::Unexaminable:
+        return "unexaminable " + u8Bytes(r.path.parent_path().filename().u8string()) + "/" +
+               u8Bytes(r.path.filename().u8string()) + (r.error ? "" : " (with no reason)");
     }
     return "an unknown status";
 }
@@ -563,6 +572,262 @@ TEST(HeaderNameMatching, ADanglingLinkIsNoHeaderUnderTheCaseSensitivePolicy) {
 
 TEST(HeaderNameMatching, ADanglingLinkIsNoHeaderUnderTheCaseInsensitivePolicy) {
     expectADanglingLinkIsNoHeader(HeaderNameMatching::CaseInsensitive, "header_dangling_ci");
+}
+
+// A CANDIDATE WHOSE REACH CANNOT BE EXAMINED ENDS THE SEARCH, NAMED: a link in an earlier directory that loops is
+// no absence, so the search never goes on to a later directory. ✔MEASURED 2026-10-28 (probe-reference-cc,
+// linux-x86_64-debug): `-Ia -Ib` with `a/x.h` a looping link -- gcc 13.3 "fatal error: a/x.h: Too many levels of
+// symbolic links", clang "fatal error: cannot open file 'a/x.h': Too many levels of symbolic links", each exit 1;
+// a DANGLING `a/x.h` (absence, the case above) goes on to `b/x.h` in both. One case per policy arm; the link is made
+// by the OS and names itself, which loops on every host.
+namespace {
+
+void expectALoopingLinkEndsTheSearch(HeaderNameMatching matching, char const* scratchName) {
+    ScratchDir scratch{Location::Temp, scratchName};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first);
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(first / "x.h", first / "x.h",
+                                                             dss::test_support::LinkTo::File));
+
+    HeaderSearchCache cache;
+    std::vector<fs::path> const dirs{first, later};
+    std::string const took = tookWhat(findInDirs("x.h", dirs, matching, cache));
+    EXPECT_EQ(took, "unexaminable first/x.h")
+        << "the search took " << took << " -- a looping link was read as no header and the search went on, where "
+           "gcc and clang both stop at it, naming it";
+}
+
+} // namespace
+
+TEST(HeaderNameMatching, ALoopingLinkEndsTheSearchUnderTheCaseSensitivePolicy) {
+    expectALoopingLinkEndsTheSearch(HeaderNameMatching::CaseSensitive, "header_loop_cs");
+}
+
+TEST(HeaderNameMatching, ALoopingLinkEndsTheSearchUnderTheCaseInsensitivePolicy) {
+    expectALoopingLinkEndsTheSearch(HeaderNameMatching::CaseInsensitive, "header_loop_ci");
+}
+
+// A SEARCH DIRECTORY THAT REFUSES ITS LISTING IS SEARCHED BY NAME, AND THE CASE IS VERIFIED BY NAME, under both
+// policies. ✔MEASURED 2026-10-28 (probe-reference-cc, linux-x86_64-debug, run 20261029-000115-ff8a36d9, gcc 13.3.0 and
+// clang 18.1.3): `first` holding x.h with its search bit and not its read bit, searched before `later` -- both take
+// first/x.h by name. The case question the listing would answer is asked of the entries (`decideUnlisted`; what each
+// host tells is path_identity.hpp's table): the exact spelling is taken under both policies; the other case is no
+// header under the case-sensitive policy -- on a folding host because the entry's STORED name is x.h, on one that keeps
+// case because nothing answers to it; under the case-insensitive policy a folding directory gives its one fold-match,
+// spelled as stored, and a name it does not hold goes on to `later`, while a directory that keeps case cannot rule out
+// a fold-match only its listing could show, and ends the search there, named (Linux tells no directory's case rule)
+// -- except where the other-case spelling is itself a second entry: an ambiguity. The checkpoint-34 bytes read the
+// refused listing as holding nothing and took later/x.h, the header of the wrong directory, in silence. POSIX as a user
+// the permission binds; Windows with this user's FILE_LIST_DIRECTORY denied by an ACL entry of its own.
+namespace {
+
+#if defined(_WIN32)
+// This user's FILE_LIST_DIRECTORY on `dir` denied for the scope by an ACL entry of its own, the directory's ACL put back
+// after. ✔MEASURED (h5's probe, windows-x86_64-release, run 20261029-003341-e5d4743a): FindFirstFileW is then refused
+// (error 5) and an entry in the directory is still opened by name.
+class ListingDenied {
+public:
+    explicit ListingDenied(fs::path dir) : dir_(std::move(dir)) {
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return;
+        DWORD size = 0;
+        ::GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        user_.resize(size);
+        BOOL const got = ::GetTokenInformation(token, TokenUser, user_.data(), size, &size);
+        ::CloseHandle(token);
+        if (!got) return;
+        if (::GetNamedSecurityInfoW(dir_.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &old_,
+                                    nullptr, &descriptor_) != ERROR_SUCCESS)
+            return;
+        EXPLICIT_ACCESSW deny{};
+        deny.grfAccessPermissions = FILE_LIST_DIRECTORY;
+        deny.grfAccessMode        = DENY_ACCESS;
+        deny.grfInheritance       = NO_INHERITANCE;
+        deny.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+        deny.Trustee.TrusteeType  = TRUSTEE_IS_USER;
+        deny.Trustee.ptstrName    = static_cast<LPWSTR>(reinterpret_cast<TOKEN_USER*>(user_.data())->User.Sid);
+        PACL denied = nullptr;
+        if (::SetEntriesInAclW(1, &deny, old_, &denied) != ERROR_SUCCESS) return;
+        held_ = ::SetNamedSecurityInfoW(const_cast<wchar_t*>(dir_.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                        nullptr, nullptr, denied, nullptr)
+             == ERROR_SUCCESS;
+        ::LocalFree(denied);
+    }
+    ~ListingDenied() {
+        if (held_)
+            ::SetNamedSecurityInfoW(const_cast<wchar_t*>(dir_.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                    nullptr, nullptr, old_, nullptr);
+        if (descriptor_ != nullptr) ::LocalFree(descriptor_);
+    }
+    ListingDenied(ListingDenied const&)            = delete;
+    ListingDenied& operator=(ListingDenied const&) = delete;
+    [[nodiscard]] bool held() const { return held_; }
+
+private:
+    fs::path             dir_;
+    std::vector<BYTE>    user_;
+    PACL                 old_        = nullptr;   // points into `descriptor_`
+    PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+    bool                 held_       = false;
+};
+#else
+// `dir`'s read bit taken for the scope -- its search bit kept, mode 0300 -- and its mode put back after.
+class ListingDenied {
+public:
+    explicit ListingDenied(fs::path dir) : dir_(std::move(dir)) {
+        std::error_code ec;
+        fs::permissions(dir_, fs::perms::owner_write | fs::perms::owner_exec, fs::perm_options::replace, ec);
+        held_ = !ec;
+    }
+    ~ListingDenied() {
+        std::error_code ec;
+        if (held_) fs::permissions(dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
+    }
+    ListingDenied(ListingDenied const&)            = delete;
+    ListingDenied& operator=(ListingDenied const&) = delete;
+    [[nodiscard]] bool held() const { return held_; }
+
+private:
+    fs::path dir_;
+    bool     held_ = false;
+};
+#endif
+
+void expectAnUnlistableDirectoryIsSearchedByName(HeaderNameMatching matching, char const* scratchName) {
+#if !defined(_WIN32)
+    if (::geteuid() == 0) GTEST_SKIP() << "root lists a directory whatever its mode: nothing is refused to it";
+#endif
+    ScratchDir     scratch{Location::Temp, scratchName};
+    fs::path const first = scratch.path() / "first";
+    fs::path const pair  = scratch.path() / "pair";
+    fs::path const later = scratch.path() / "later";
+    writeFile(first / "x.h", "#define FROM_FIRST 1\n");
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    writeFile(later / "y.h", "#define FROM_LATER 1\n");
+    writeFile(pair / "x.h", "#define LOWER 1\n");
+    // Whether this host's scratch directory folds case: the host's own lookup of the other spelling, asked once.
+    bool const folds = fs::exists(first / "X.H");
+    if (!folds) writeFile(pair / "X.H", "#define UPPER 1\n");   // a second entry only a case-keeping host can hold
+    bool const caseSensitive = matching == HeaderNameMatching::CaseSensitive;
+    std::vector<fs::path> const dirs{first, later};
+    std::vector<fs::path> const pairOnly{pair};
+    std::map<std::string, std::string> took;
+    {
+        ListingDenied const deniedFirst{first};
+        ListingDenied const deniedPair{pair};
+        ASSERT_TRUE(deniedFirst.held() && deniedPair.held()) << "this host would not refuse the listings";
+        std::error_code listing;
+        fs::directory_iterator const tried{first, listing};
+        ASSERT_TRUE(listing) << "the listing of `first` was not refused: this case would ask nothing";
+        HeaderSearchCache cache;
+        auto const answer = [&](HeaderSearchResult const& r) -> std::string {
+            if (r.status == HeaderSearchStatus::Unexaminable && (r.path == first || r.path == pair))
+                return std::string{"refused at "} + (r.path == first ? "first" : "pair") + (r.error ? "" : " (no reason)");
+            return tookWhat(r);
+        };
+        for (char const* name : {"x.h", "X.h", "y.h"}) took[name] = answer(findInDirs(name, dirs, matching, cache));
+        took["pair"] = answer(findInDirs("x.h", pairOnly, matching, cache));
+    }
+    SCOPED_TRACE(folds ? "this host folds case" : "this host keeps case");
+    EXPECT_EQ(took["x.h"], caseSensitive || folds ? "first/x.h" : "refused at first")
+        << "the exact spelling in a directory whose listing is refused";
+    EXPECT_EQ(took["X.h"], caseSensitive ? "nothing" : folds ? "first/x.h" : "refused at first")
+        << "the other case: no header under the case-sensitive policy, the stored spelling under the other";
+    EXPECT_EQ(took["y.h"], !caseSensitive && !folds ? "refused at first" : "later/y.h")
+        << "a name the first directory does not hold";
+    EXPECT_EQ(took["pair"], caseSensitive ? "pair/x.h" : folds ? "pair/x.h" : "an ambiguity")
+        << "x.h beside X.H, where only a case-keeping host holds both";
+}
+
+} // namespace
+
+TEST(HeaderNameMatching, AnUnlistableSearchDirectoryIsSearchedByNameUnderTheCaseSensitivePolicy) {
+    expectAnUnlistableDirectoryIsSearchedByName(HeaderNameMatching::CaseSensitive, "header_unlistable_cs");
+}
+
+TEST(HeaderNameMatching, AnUnlistableSearchDirectoryIsSearchedByNameUnderTheCaseInsensitivePolicy) {
+    expectAnUnlistableDirectoryIsSearchedByName(HeaderNameMatching::CaseInsensitive, "header_unlistable_ci");
+}
+
+// A NAME ENDING IN `..` IS EXAMINED ONCE, BY THE SEARCH ITSELF. No candidate probe names such a tail (`..` is
+// navigation, appended as written), so the search examines the path it ends at, through the compile's cache: a reach
+// it cannot examine ends the search, named, and what it can examine decides what the search may take (a directory:
+// nothing, and the search goes on). `first/d/sub`
+// keeps no search bit, so `first/d/sub/..` cannot be reached, though `first/d/sub` itself can (its parent is
+// searchable). The checkpoint-34 bytes handed that path back as Found, unexamined. POSIX, as a user the permission
+// binds.
+TEST(HeaderNameMatching, ANameEndingInADotDotIsExaminedOnceAndARefusalThereEndsTheSearch) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows grants traversal by ACL, which this case does not set; the POSIX legs ask it";
+#else
+    if (::geteuid() == 0) GTEST_SKIP() << "root traverses a directory whatever its mode: nothing is refused to it";
+    ScratchDir scratch{Location::Temp, "header_dot_dot_tail"};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first / "d" / "sub");
+    fs::create_directories(later / "d" / "sub");
+    std::vector<fs::path> const dirs{first, later};
+    fs::permissions(first / "d" / "sub", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+    for (HeaderNameMatching const matching : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(matching));
+        HeaderSearchCache        cache;
+        HeaderSearchResult const r = findInDirs("d/sub/..", dirs, matching, cache);
+        EXPECT_EQ(r.status, HeaderSearchStatus::Unexaminable)
+            << "the search took " << tookWhat(r) << " -- a path it never examined was handed back";
+        EXPECT_EQ(r.path, first / "d" / "sub" / "..") << "the refusal named " << r.path.generic_string();
+    }
+    fs::permissions(first / "d" / "sub", fs::perms::owner_all, fs::perm_options::replace);
+    // The control: the same tail through a searchable `sub` is examined, and reaches a directory -- no header -- in
+    // both directories, so the search answers nothing: the refusal above is the unexaminable reach, not the tail.
+    HeaderSearchCache cache;
+    EXPECT_EQ(tookWhat(findInDirs("d/sub/..", dirs, HeaderNameMatching::CaseSensitive, cache)), "nothing");
+    // A `..` through a FILE reaches nothing (the host answers "not a directory"): no header, in either directory.
+    // A FRESH cache per policy: the compile's cache keeps each listing as first read, and the one above was read
+    // before `f.h` existed -- through it the search stops at `f.h` itself and never meets the tail (✔MEASURED: the
+    // arm that drops this refusal SURVIVED on such a cache, sweep run 20261029-040147-5f53414c, macos-arm64-debug).
+    // So the same cache must first FIND `first/f.h`: the walk reaches the file, and the tail is what is judged.
+    writeFile(first / "f.h", "int f;\n");
+    writeFile(later / "f.h", "int f;\n");
+    for (HeaderNameMatching const matching : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(matching));
+        HeaderSearchCache fileCache;
+        ASSERT_EQ(tookWhat(findInDirs("f.h", dirs, matching, fileCache)), "first/f.h")
+            << "the search does not reach the file, so the tail through it would be judged on nothing";
+        EXPECT_EQ(tookWhat(findInDirs("f.h/..", dirs, matching, fileCache)), "nothing")
+            << "a dot-dot tail through a file was handed back";
+    }
+#endif
+}
+
+// A DIRECTORY NAMED LIKE THE HEADER IS NO HEADER, AND THE SEARCH GOES ON -- under both policies and for every search
+// the tiers share: the -I search (`findInDirs`), the quote form's (`resolveIncludePath`, its includer's directory
+// first) and the descriptor's (`resolveSystemDescriptor`). ✔MEASURED 2026-10-28 (probe-reference-cc,
+// linux-x86_64-debug, run 20261029-000351-99219a41, gcc 13.3.0 and clang): with a directory `u/x.h` searched first and
+// a header `b/x.h` later, both take b/x.h -- `#include <x.h>`, `#include "x.h"` on -I and in the includer's own
+// directory alike; with the directory alone both say not found.
+TEST(HeaderNameMatching, ADirectoryNamedLikeTheHeaderIsNoHeaderAndTheSearchGoesOn) {
+    ScratchDir     scratch{Location::Temp, "header_directory_hit"};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first / "x.h");
+    fs::create_directories(first / "x.json");
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    writeFile(later / "x.json", "{}\n");
+    std::vector<fs::path> const dirs{first, later};
+    std::vector<fs::path> const laterOnly{later};
+    std::vector<fs::path> const firstOnly{first};
+    for (HeaderNameMatching const matching : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(matching));
+        HeaderSearchCache cache;
+        EXPECT_EQ(tookWhat(findInDirs("x.h", dirs, matching, cache)), "later/x.h") << "the -I search";
+        EXPECT_EQ(tookWhat(resolveIncludePath("x.h", first, laterOnly, matching, cache)), "later/x.h")
+            << "the quote search, its includer's directory first";
+        EXPECT_EQ(tookWhat(resolveSystemDescriptor("x.h", dirs, matching, cache)), "later/x.json")
+            << "the descriptor search";
+        EXPECT_EQ(tookWhat(findInDirs("x.h", firstOnly, matching, cache)), "nothing") << "the directory alone";
+    }
 }
 
 // ── [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]] ────────

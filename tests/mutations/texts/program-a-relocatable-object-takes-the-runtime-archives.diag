@@ -1,0 +1,1 @@
+a relocatable object defines its unit's function alone, never a runtime body it calls

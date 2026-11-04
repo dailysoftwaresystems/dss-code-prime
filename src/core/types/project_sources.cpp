@@ -101,13 +101,14 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
             expanded.push_back(resolveManifestPathSpelling(baseDir, entry));
             continue;
         }
-        std::error_code ec;
+        GlobError ec;
         std::size_t const before = expanded.size();
         if (!expandGlob(entry, expanded, ec, baseDir)) {
             emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                        "project sources: filesystem error expanding glob pattern '"
                        + entry + "' (relative to " + baseLabel(baseDir)
-                       + "): " + ec.message());
+                       + "): '" + core::genericSpelling(ec.where) + "' could not be read: "
+                       + ec.message());
             return std::nullopt;
         }
         if (expanded.size() == before) {

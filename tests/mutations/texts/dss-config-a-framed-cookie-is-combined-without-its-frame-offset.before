@@ -1,0 +1,1 @@
+    if ((unwind[3] & 0x0Fu) != 0) combinedWith += (ULONG_PTR)(unwind[3] >> 4) * 16u;

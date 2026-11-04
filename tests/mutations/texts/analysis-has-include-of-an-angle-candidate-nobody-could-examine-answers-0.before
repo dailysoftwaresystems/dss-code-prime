@@ -1,0 +1,3 @@
+                        emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"__has_include(<"}

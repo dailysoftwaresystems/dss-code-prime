@@ -1350,8 +1350,15 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                 emitMalformed(reporter, "shipped-lib descriptor " + at
                     + " names runtime-library role '" + roleText
                     + "', which object-format family '" + kv.key()
-                    + "' REALIZES from the shipped source '" + row->source
-                    + "' rather than importing from an image; a 'library' entry "
+                    + "' REALIZES from the " + [row] {
+                          std::string units;
+                          for (auto const& unit : row->sources)
+                              units += (units.empty() ? "'" : ", '") + unit + "'";
+                          return (row->sources.size() == 1 ? "shipped source "
+                                                           : "shipped sources ")
+                              + units;
+                      }()
+                    + " rather than importing from an image; a 'library' entry "
                       "names an image to IMPORT from, so a body DSS ships belongs "
                       "under 'realization', never here");
                 continue;
@@ -1637,9 +1644,10 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         // both are refused HERE rather than at the filesystem.
         // ★★ THE PREDICATE MOVED TO `core::shippedConfigRelativePathEscapes`
         // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) when an object format document's
-        // `runtimeLibraries[].source` became a second declarer of a path into
-        // the SAME tree. The reasoning below is PRESERVED here because it is the
-        // measurement that produced the predicate, and the header carries the
+        // `runtimeLibraries[].source` / `.sources` (one unit / several, P69 H5)
+        // became a second declarer of a path into the SAME tree. The reasoning
+        // below is PRESERVED here because it is the measurement that produced
+        // the predicate, and the header carries the
         // rule; what changed is that there is now exactly one implementation.
         bool const escapes = shippedConfigRelativePathEscapes(src);
             // ★★★ `isRootedPath`, NOT `is_absolute() || has_root_name()` —
@@ -2281,6 +2289,12 @@ locateTypedefReferenceOwner(json const& ref, std::string const& ctx, std::string
     std::array<std::filesystem::path, 1> const dirs{*root};
     HeaderSearchResult const found =
         resolveSystemDescriptor(ownerHeader, dirs, kDefaultHeaderNameMatching, cache);
+    if (found.status == HeaderSearchStatus::Unexaminable) {   // not "no such descriptor": nobody could tell
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname + "' names '"
+                                    + ownerHeader + "' as its owner, and that header's descriptor "
+                                    + describeUnexaminable(found));
+        return std::nullopt;
+    }
     if (found.status != HeaderSearchStatus::Found) {
         emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
                                     + "' names '" + ownerHeader + "' as its owner, and no shipped "
@@ -4038,7 +4052,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
                 (void)rejectUnknownKeys(reporter, sdef,
                                         "structs[" + std::to_string(sidx - 1) + "]",
-                                        {"name", "fields", "variants"});
+                                        {"name", "fields", "variants", "alignment"});
                 if (!sdef.contains("name") || !sdef.at("name").is_string()
                     || sdef.at("name").get<std::string>().empty()) {
                     emitMalformed(reporter, "shipped-lib descriptor " + at
@@ -4046,6 +4060,28 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     continue;
                 }
                 std::string const sname = sdef.at("name").get<std::string>();
+
+                // `alignment`: the whole-composite byte alignment the header gives the tag
+                // (`_Alignas`/`aligned(N)`) -- needed for a type a reference OVER-ALIGNS (Windows
+                // CONTEXT, M128A and XMM_SAVE_AREA32 are 16-aligned). A positive power of two, else
+                // refused here; passed to the interner as the composite's explicit alignment, which
+                // RAISES the natural one and never lowers it (the `_Alignas` rule). Absent => the
+                // ordinary natural-alignment struct, unchanged.
+                std::uint32_t structAlign = 0;
+                if (sdef.contains("alignment")) {
+                    if (!sdef.at("alignment").is_number_unsigned()
+                        || sdef.at("alignment").get<std::uint64_t>() == 0
+                        || (sdef.at("alignment").get<std::uint64_t>()
+                            & (sdef.at("alignment").get<std::uint64_t>() - 1)) != 0
+                        || sdef.at("alignment").get<std::uint64_t>()
+                               > std::numeric_limits<std::uint32_t>::max()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'alignment' must be a positive power of two");
+                        continue;
+                    }
+                    structAlign = static_cast<std::uint32_t>(
+                        sdef.at("alignment").get<std::uint64_t>());
+                }
 
                 // (3.struct.pre) THE BY-NAME DEPENDENCY GATE — see the note above the
                 // loop. Evaluated BEFORE `sname` joins `declaredEarlier`, so a
@@ -4299,8 +4335,18 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     std::vector<std::uint64_t> offsets;
                     offsets.reserve(sst.fields.size());
                     for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
-                    std::span<std::int64_t const> const noWidths{};
-                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
+                    std::span<std::int64_t const> const  noWidths{};
+                    std::span<std::uint32_t const> const noAligns{};
+                    sst.typeId = structAlign != 0
+                                     ? interner.structType(sname, fieldTypes, noWidths, offsets,
+                                                           noAligns, structAlign)
+                                     : interner.structType(sname, fieldTypes, noWidths, offsets);
+                } else if (structAlign != 0) {
+                    std::span<std::int64_t const> const  noWidths{};
+                    std::span<std::uint64_t const> const noOffsets{};
+                    std::span<std::uint32_t const> const noAligns{};
+                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, noOffsets,
+                                                     noAligns, structAlign);
                 } else {
                     sst.typeId = interner.structType(sname, fieldTypes);
                 }
@@ -5205,6 +5251,12 @@ readShippedHeaderTypedefs(std::string_view                header,
     HeaderSearchCache cache;
     HeaderSearchResult const desc =
         resolveSystemDescriptor(header, dirs, kDefaultHeaderNameMatching, cache);
+    // A descriptor nobody could examine is no "not shipped": it could not be READ.
+    if (desc.status == HeaderSearchStatus::Unexaminable) {
+        out.status = ShippedHeaderTypedefsStatus::Unreadable;
+        out.error  = "the descriptor of '" + std::string{header} + "' " + describeUnexaminable(desc);
+        return out;
+    }
     if (desc.status != HeaderSearchStatus::Found) {
         out.status = ShippedHeaderTypedefsStatus::NotShipped;
         return out;
@@ -6472,8 +6524,9 @@ namespace {
 // ⚠ `format` IS EMPTY FOR A DECLARER THAT IS NOT FORMAT-KEYED, and R1 reads that
 // emptiness rather than a sentinel. A descriptor's `realization` map is keyed BY
 // object format, so a broken entry there can name the format left without a
-// body; an object format's own `runtimeLibraries[].source` row IS that format,
-// so there is no second name to quote and quoting one produced the sentence
+// body; an object format's own `runtimeLibraries[].source` / `.sources` row
+// IS that format, so there is no second name to quote and quoting one
+// produced the sentence
 // `the object format '(object format)' would be left with…`. Naming the empty
 // case is what makes the two readings distinguishable instead of one of them
 // rendering a placeholder as data.
@@ -6702,8 +6755,9 @@ bool validateShippedSourceTree(
     std::size_t const errBefore = reporter.errorCount();
     auto              claims    = claimedShippedSources(descriptorDir, reporter);
     // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: an object format's
-    // `runtimeLibraries[].source` is a SECOND kind of declarer, and R1/R2 must
-    // see it or the sweep would refuse a file the format legitimately names.
+    // `runtimeLibraries[].source` / `.sources` is a SECOND kind of declarer,
+    // and R1/R2 must see it or the sweep would refuse a file the format
+    // legitimately names.
     // Folding it into the same claim list rather than testing it separately is
     // deliberate: both rules then read ONE list, so neither can learn about a
     // declarer the other has not.
@@ -6749,8 +6803,9 @@ bool validateShippedSourceTree(
     //
     // ⚠ THAT SENTENCE USED TO READ "…named by some descriptor's `realization`
     // map", AND D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 FALSIFIED IT WITHOUT
-    // CHANGING IT. An object format's `runtimeLibraries[].source` is a second
-    // declarer — `runtime/platform/src/atomic.c` is named by four `.format.json`
+    // CHANGING IT. An object format's `runtimeLibraries[].source` / `.sources`
+    // is a second declarer — `runtime/platform/src/atomic.c` is named by four
+    // `.format.json`
     // documents and by NO descriptor (✔MEASURED over the shipped corpus) — so
     // the rule as written was false of a file this very function accepts, and
     // the acceptance came from the `foreignDeclarations` span rather than from
@@ -6848,7 +6903,7 @@ bool validateShippedSourceTree(
                 + "' is named by NO DECLARER — neither a 'realization' map of a "
                   "shipped-lib descriptor under '"
                 + core::genericSpelling(descriptorDir)
-                + "' nor an object format's runtimeLibraries[].source — so "
+                + "' nor an object format's runtimeLibraries[].source / .sources — so "
                   "nothing can ever add it to a build "
                   "graph. Only files a declarer names may live under '"
                 + core::genericSpelling(authored)
@@ -6869,6 +6924,9 @@ namespace {
 struct ClosureSurfaceOnFormat {
     std::vector<std::string> names;             // union over every closure member
     std::vector<std::string> unresolvedEdges;   // header names resolving to nothing
+    // Header names whose descriptor nobody could examine (a looping link, a directory that cannot be read), each
+    // with `describeUnexaminable`'s account: neither present nor absent, so no claim about the closure is made.
+    std::vector<std::pair<std::string, std::string>> unexaminableEdges;
     std::vector<std::string> unavailableEdges;  // ACTIVE edge, child absent on fmt
     std::vector<std::string> undecodable;       // members whose surface would not decode
 };
@@ -6899,7 +6957,11 @@ closureSurfaceOnFormat(std::filesystem::path const&           startPath,
             }
             for (auto& n : *names) outS.names.push_back(std::move(n));
         },
-        [&](std::string const& headerName, HeaderSearchResult const&) {
+        [&](std::string const& headerName, HeaderSearchResult const& result) {
+            if (result.status == HeaderSearchStatus::Unexaminable) {
+                outS.unexaminableEdges.emplace_back(headerName, describeUnexaminable(result));
+                return;
+            }
             outS.unresolvedEdges.push_back(headerName);
         },
         [&](std::string const& headerName, std::filesystem::path const&) {
@@ -7062,6 +7124,14 @@ bool validateShippedIncludeClosure(
                     "format '" + fmtName + "', but that header resolves to no "
                     "descriptor at all");
             }
+            for (auto const& [h, why] : cs.unexaminableEdges) {
+                emitCorpusInvariant(reporter,
+                    "shipped-lib corpus invariant (i): '" + rel + "' declares an "
+                    "'includes' edge to '" + h + "' that is ACTIVE on object "
+                    "format '" + fmtName + "', but its descriptor " + why
+                    + ": whether the edge lands cannot be told, and an unevaluated "
+                      "invariant is reported, never assumed");
+            }
             for (std::string const& h : cs.unavailableEdges) {
                 emitCorpusInvariant(reporter,
                     "shipped-lib corpus invariant (i): '" + rel + "' is available "
@@ -7083,7 +7153,7 @@ bool validateShippedIncludeClosure(
 
             // (ii) — the surface must not be empty on a format this descriptor
             // claims to serve.
-            if (cs.names.empty() && cs.undecodable.empty()) {
+            if (cs.names.empty() && cs.undecodable.empty() && cs.unexaminableEdges.empty()) {
                 emitCorpusInvariant(reporter,
                     "shipped-lib corpus invariant (ii): '" + rel + "' is available "
                     "on object format '" + fmtName + "' but contributes NO name "
@@ -7200,6 +7270,14 @@ bool validateShippedSurfaceRequirements(
                 // cross-format question.
                 HeaderSearchResult const hit = resolveSystemDescriptor(
                     claim.header, systemDirs, kDefaultHeaderNameMatching, cache);
+                if (hit.status == HeaderSearchStatus::Unexaminable) {   // nobody could tell: say so
+                    emitUnbackedPredefine(reporter,
+                        std::string{"predefined macro '"} + pm.name + "' ("
+                        + where(pm) + ") requires shipped header '" + claim.header
+                        + "' on object format '" + fmtName + "', and its descriptor "
+                        + describeUnexaminable(hit));
+                    continue;
+                }
                 if (hit.status != HeaderSearchStatus::Found) {
                     emitUnbackedPredefine(reporter,
                         std::string{"predefined macro '"} + pm.name + "' ("

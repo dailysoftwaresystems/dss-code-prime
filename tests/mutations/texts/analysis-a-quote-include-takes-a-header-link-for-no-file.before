@@ -1,1 +1,0 @@
-            if (core::reachedKind(r.path, ec) != core::EntryKind::File) return HeaderSearchResult::notFound();

@@ -14,6 +14,7 @@
 
 #include "core/types/aggregate_layout.hpp"           // AggregateLayoutParams (variant-layout pins)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/grammar_schema.hpp"                // the c language: its system directories
 #include "core/types/object_format_kind.hpp"          // ObjectFormatKind (variant selector)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"               // TargetSchema (crux re-verify, gate 2)
@@ -24,6 +25,8 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "scoped_env.hpp"                             // DSS_CONFIG_ROOT: a scratch config root
+#include "os_link.hpp"                            // links made by the OS: MinGW's library makes none
 #include "shipped_read_pairs.hpp"                 // the real pairs a REAL descriptor is read on
 
 #include <gtest/gtest.h>
@@ -150,6 +153,58 @@ TEST(ShippedLibDescriptor, RealizationSourceNamingARootedPathIsRefused) {
     static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
     EXPECT_TRUE(sawContainmentRefusal(rep))
         << "a root-relative realization source escaped the config root";
+}
+
+// A struct row's `alignment` OVER-ALIGNS the tag, as a reference does for Windows
+// CONTEXT (16-aligned). The lattice already carried it (`structType`'s explicitAlign);
+// this pin holds the DESCRIPTOR pass-through: the declared alignment reaches the
+// interned type's layout, and a non-power-of-two is refused at load.
+// Red-on-disable: drop the `alignment` thread in `readShippedLibDescriptor` and the
+// alignof assertion reds (the struct falls back to its natural 8). The shipped
+// CONTEXT / M128A / XMM_SAVE_AREA32 rows are asserted against both references'
+// measured numbers by the PE-runtime pin that adds them to windows.json.
+TEST(ShippedLibDescriptor, AStructRowsDeclaredAlignmentReachesTheInternedType) {
+    ScratchDir dir{Location::Temp, "shipped-lib-align"};
+    auto const path = writeTemp(dir, "aligned.json", R"({
+        "header": "aligned.h",
+        "structs": [
+            { "name": "over_aligned", "alignment": 16,
+              "fields": [ { "name": "a", "type": "u64 \"unsigned long long\"" } ] }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto const desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value()) << "a struct with a power-of-two alignment did not read";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(desc->structs.size(), 1u);
+    constexpr AggregateLayoutParams kParams{ScalarAlignmentRule::Natural, 16,
+                                            BitFieldStrategy::GnuPacked,
+                                            UnnamedBitFieldAlignment::Ignored};
+    auto const layout = computeLayout(desc->structs[0].typeId, interner, kParams, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->align.bytes(), 16u)
+        << "the declared alignment 16 did not reach the type (natural would be 8)";
+    EXPECT_EQ(layout->size, 16u) << "sizeof rounds up to the over-alignment";
+}
+
+// The refusal: a non-power-of-two alignment is rejected at load, naming the row.
+TEST(ShippedLibDescriptor, AStructAlignmentThatIsNotAPowerOfTwoIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-align-bad"};
+    auto const path = writeTemp(dir, "bad.json", R"({
+        "header": "bad.h",
+        "structs": [
+            { "name": "weird", "alignment": 12,
+              "fields": [ { "name": "a", "type": "u32 \"unsigned int\"" } ] }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    static_cast<void>(readShippedLibDescriptor(path, interner, typeReg, rep));
+    EXPECT_TRUE(anyDiagMentions(rep, "'alignment' must be a positive power of two"))
+        << "a non-power-of-two struct alignment was accepted";
 }
 
 // The CONTROL, chosen to be INERT: an ordinary relative source with no root at
@@ -2225,6 +2280,108 @@ TEST(ShippedLibDescriptor, CorpusSweepAcceptsAGatedEdgeToAFormatLimitedChild) {
            "weaken it";
     EXPECT_EQ(dss::test_support::countCode(
                   rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// Invariant (i), AN EDGE WHOSE DESCRIPTOR CANNOT BE EXAMINED: `a` includes a header whose descriptor is a link that
+// loops (the OS names it itself, which loops on every host). Nobody can tell whether that descriptor exists, so the
+// sweep refuses the edge NAMING THE HEADER AND WHY -- never "resolves to no descriptor at all", the absence it is
+// not. The descriptor sits beside the swept directory (`../outside/b.h`), so the sweep's own walk -- which refuses
+// a link it cannot examine, and would end there -- never meets it, and the closure is what reports it.
+TEST(ShippedLibDescriptor, CorpusSweepNamesAnEdgeWhoseDescriptorCannotBeExaminedAndWhy) {
+    ScratchDir dir{Location::Temp, "shipped-lib-unexaminable"};
+    fs::path const corpus  = dir.path() / "corpus";
+    fs::path const outside = dir.path() / "outside";
+    fs::create_directories(corpus);
+    fs::create_directories(outside);
+    {
+        std::ofstream(corpus / "a.json", std::ios::binary) << R"JSON({
+        "header": "a.h", "includes": ["../outside/b.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON";
+    }
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(outside / "b.json", outside / "b.json",
+                                                             dss::test_support::LinkTo::File));
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const served{ObjectFormatKind::Elf};
+    EXPECT_FALSE(validateShippedIncludeClosure(corpus, served, rep))
+        << "an edge whose descriptor nobody could examine passed the sweep";
+    std::string diags;
+    for (auto const& d : rep.all()) diags += "\n  " + d.actual;
+    EXPECT_EQ(dss::test_support::countCode(rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 1u) << diags;
+    EXPECT_TRUE(anyDiagMentions(rep, "'includes' edge to '../outside/b.h'")) << diags;
+    EXPECT_TRUE(anyDiagMentions(rep, "b.json' cannot be examined (")) << diags;
+    EXPECT_FALSE(anyDiagMentions(rep, "resolves to no descriptor at all"))
+        << "the edge was reported as an absence, which nobody could tell it is:" << diags;
+}
+
+// THE OTHER THREE SEARCHES OF A DESCRIPTOR THIS FILE MAKES, OF ONE NOBODY CAN EXAMINE: a typedef's named OWNER, a
+// predefine's claimed SURFACE, and the typedefs a predefine reads. Each refuses it NAMING it and why -- never "no
+// shipped descriptor" / "not shipped", the absence nobody could tell it is. The descriptor is a link that names
+// itself, which loops on every host. The checkpoint-34 bytes reported each as that absence.
+TEST(ShippedLibDescriptor, ATypedefsOwnerWhoseDescriptorCannotBeExaminedIsRefusedNamingIt) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-unexaminable"};
+    auto const ref = writeTemp(dir, "ref.json", R"JSON({ "header": "ref.h",
+        "typedefs": [ { "name": "sz", "shippedTypedef": { "header": "loop.h" } } ] })JSON");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir.path() / "loop.json", dir.path() / "loop.json",
+                                                             dss::test_support::LinkTo::File));
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    std::string  diags;
+    EXPECT_FALSE(readOnPair(ref, interner, typeReg, DataModel::Lp64, "x86_64", ObjectFormatKind::Elf, diags).has_value())
+        << "a typedef whose owner nobody could examine was read";
+    EXPECT_NE(diags.find("names 'loop.h' as its owner, and that header's descriptor '"), std::string::npos) << diags;
+    EXPECT_NE(diags.find("loop.json' cannot be examined ("), std::string::npos) << diags;
+}
+
+TEST(ShippedLibDescriptor, APredefinedMacroClaimingAHeaderWhoseDescriptorCannotBeExaminedIsRefusedNamingIt) {
+    ScratchDir dir{Location::Temp, "shipped-lib-surface-unexaminable"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir.path() / "loop.json", dir.path() / "loop.json",
+                                                             dss::test_support::LinkTo::File));
+    PredefinedMacroDef m;
+    m.name       = "__PROBE_IDENTITY__";
+    m.value      = "1";
+    m.declaredAt = "/preprocess/predefinedMacros/0";
+    ShippedSurfaceClaim claim;
+    claim.header = "loop.h";
+    claim.names  = {"af"};
+    ImpliedSurface surface;
+    surface.kind     = ImpliedSurfaceKind::Surface;
+    surface.headers  = {claim};
+    m.impliedSurface = surface;
+    DiagnosticReporter                    rep;
+    std::vector<fs::path> const           systemDirs{dir.path()};
+    std::vector<PredefinedMacroDef> const macros{m};
+    EXPECT_FALSE(validateShippedSurfaceRequirements(macros, "probe.lang.json /preprocess/predefinedMacros",
+                                                    systemDirs, ObjectFormatKind::Elf, rep))
+        << "a macro claiming a header whose descriptor nobody could examine was accepted";
+    std::string diags;
+    for (auto const& d : rep.all()) diags += "\n  " + d.actual;
+    EXPECT_GT(dss::test_support::countCode(rep, DiagnosticCode::C_UnbackedPredefinedMacro), 0u) << diags;
+    EXPECT_TRUE(anyDiagMentions(rep, "loop.json' cannot be examined (")) << diags;
+}
+
+TEST(ShippedLibDescriptor, TheTypedefsOfAHeaderWhoseDescriptorCannotBeExaminedAreUnreadableNamingIt) {
+    auto loaded = GrammarSchema::loadShipped("c");
+    ASSERT_TRUE(loaded.has_value()) << "the shipped c language does not load";
+    std::shared_ptr<GrammarSchema const> const c = *loaded;
+    ASSERT_FALSE(c->semantics().shippedLibDirs.empty()) << "the c language names no system directory";
+    ScratchDir     dir{Location::Temp, "shipped-lib-typedefs-unexaminable"};
+    fs::path const libs = dir.path() / "src" / "dss-config" / c->semantics().shippedLibDirs.front();
+    fs::create_directories(libs);
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(libs / "loop.json", libs / "loop.json",
+                                                             dss::test_support::LinkTo::File));
+    dss::test_support::ScopedEnv const env{"DSS_CONFIG_ROOT", dir.path().string()};
+    ShippedPairFacts pair;
+    pair.language       = c.get();
+    pair.dataModel      = DataModel::Lp64;
+    pair.charIsUnsigned = false;
+    ShippedHeaderTypedefs const got =
+        readShippedHeaderTypedefs("loop.h", std::string_view{"x86_64"}, ObjectFormatKind::Elf, pair);
+    EXPECT_EQ(got.status, ShippedHeaderTypedefsStatus::Unreadable)
+        << "status " << static_cast<int>(got.status) << " (NotShipped is " << static_cast<int>(ShippedHeaderTypedefsStatus::NotShipped)
+        << "): " << got.error;
+    EXPECT_NE(got.error.find("loop.json' cannot be examined ("), std::string::npos) << got.error;
 }
 
 // ── THE `impliedSurface` SATISFACTION HALF ─────────────────────────────────

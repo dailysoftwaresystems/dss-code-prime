@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <optional>
@@ -27,6 +28,9 @@
     #include <fcntl.h>
     #include <sys/stat.h>
     #include <unistd.h>
+    #ifdef __APPLE__
+        #include <sys/attr.h>   // getattrlist: an entry's stored name, asked of the entry (storedEntryName)
+    #endif
 #endif
 
 namespace dss::core {
@@ -324,11 +328,6 @@ namespace {
     return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? EntryKind::Directory : EntryKind::File;
 }
 
-[[nodiscard]] bool isPermissionDenied(std::error_code const& ec) {
-    return ec == std::errc::permission_denied
-        || (ec.category() == std::system_category() && ec.value() == static_cast<int>(ERROR_ACCESS_DENIED));
-}
-
 // Every entry of `dir` but `.` and `..`, each classified from its own find record -- the record
 // carries the attributes AND a reparse point's tag, so no entry costs a second call.
 void listEntries(fs::path const& dir, std::size_t depth, std::vector<TreeEntry>& out, std::error_code& ec) {
@@ -405,19 +404,10 @@ struct NtCalls {
     return calls;
 }
 
-// The NT open options (winternl.h's names, spelled here because not every SDK this builds with defines
-// them all): never follow a reparse point, open for backup intent (a directory too), synchronous I/O, and
-// the open's own demand on what it finds -- a directory, or anything but one.
-constexpr ULONG kNtOpenReparsePoint     = 0x00200000;
-constexpr ULONG kNtOpenForBackupIntent  = 0x00004000;
-constexpr ULONG kNtSynchronousIo        = 0x00000020;
-constexpr ULONG kNtDirectoryFile        = 0x00000001;
-constexpr ULONG kNtNonDirectoryFile     = 0x00000040;
-constexpr ULONG kNtObjCaseInsensitive   = 0x00000040;
-
 // Open the entry `name` (one component) RELATIVE to the directory handle `dir`, NEVER following a link
-// -- the entry itself is what is opened -- demanding `demand` of it (`kNtDirectoryFile`, which a link to a
-// directory meets as the link, or `kNtNonDirectoryFile`). Not opened: `error` says why -- ERROR_DIRECTORY
+// -- the entry itself is what is opened -- demanding `demand` of it (`FILE_DIRECTORY_FILE`, which a link to a
+// directory meets as the link, or `FILE_NON_DIRECTORY_FILE`). The open never follows a reparse point, opens
+// for backup intent (a directory too) and is synchronous. Not opened: `error` says why -- ERROR_DIRECTORY
 // when the entry is not a directory a directory open demanded.
 [[nodiscard]] Handle openEntryRelative(HANDLE dir, std::wstring const& name, ACCESS_MASK access, ULONG demand,
                                        DWORD& error) {
@@ -434,12 +424,13 @@ constexpr ULONG kNtObjCaseInsensitive   = 0x00000040;
     oa.Length        = sizeof oa;
     oa.RootDirectory = dir;
     oa.ObjectName    = &us;
-    oa.Attributes    = kNtObjCaseInsensitive;   // as every Win32 open names a file
+    oa.Attributes    = OBJ_CASE_INSENSITIVE;   // as every Win32 open names a file
     IO_STATUS_BLOCK io{};
     HANDLE          h = nullptr;
     LONG const status = nt.openFile(&h, access | SYNCHRONIZE, &oa, &io,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                    kNtOpenReparsePoint | kNtOpenForBackupIntent | kNtSynchronousIo | demand);
+                                    FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT
+                                        | FILE_SYNCHRONOUS_IO_NONALERT | demand);
     if (status < 0) {
         error = nt.toWin32(status);
         return {};
@@ -448,13 +439,25 @@ constexpr ULONG kNtObjCaseInsensitive   = 0x00000040;
 }
 
 // The kind of what the handle OPENED (opened without following a link, so a link is a Link).
+//
+// ⚠ A FILE SYSTEM THAT KEEPS NO REPARSE POINT REFUSES THE QUESTION OF ITS TAG: FAT32 answers
+// FileAttributeTagInfo with ERROR_INVALID_PARAMETER (✔MEASURED 2026-11-03 on this host's FAT32 volume's root,
+// probe-reference-cc run 20261104-021850-b279d3e9, where its attributes answer), and a removal that took that refusal
+// for the entry's left every entry of such a volume in place. Its attributes then decide, when they state no
+// reparse point -- an entry with none has no tag to ask.
 [[nodiscard]] EntryKind kindOfHandle(HANDLE h, DWORD& error) {
     FILE_ATTRIBUTE_TAG_INFO info{};
-    if (!::GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof info)) {
-        error = ::GetLastError();
-        return EntryKind::Other;
+    if (::GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof info)) {
+        return kindOfAttributes(info.FileAttributes, info.ReparseTag);
     }
-    return kindOfAttributes(info.FileAttributes, info.ReparseTag);
+    DWORD const                refused = ::GetLastError();
+    BY_HANDLE_FILE_INFORMATION basic{};
+    if (refused == ERROR_INVALID_PARAMETER && ::GetFileInformationByHandle(h, &basic)
+        && (basic.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+        return kindOfAttributes(basic.dwFileAttributes, 0);
+    }
+    error = refused;
+    return EntryKind::Other;
 }
 
 // Every name the directory `dir` holds but `.` and `..`, listed THROUGH its handle -- the one handle the
@@ -484,17 +487,24 @@ constexpr ULONG kNtObjCaseInsensitive   = 0x00000040;
     }
 }
 
+// `FileDispositionInfoEx` (Windows 10 RS1), SPELLED BY VALUE because MinGW-w64's FILE_INFO_BY_HANDLE_CLASS
+// ends before it at every version: ✔MEASURED 2026-10-28, MinGW-w64 13.2 at _WIN32_WINNT 0x0601, 0x0A00 and 0x0A00
+// with NTDDI_VERSION RS5 (probe-reference-cc run 20261028-215651-aa544959). The Windows SDK's headers declare it
+// (MSVC 19.51, run 20261028-215632-ef25bfcc), and there the value is the header's, by the assert. Its record and
+// its flags are the headers' own on both.
+constexpr auto kFileDispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);
+#ifndef __MINGW32__
+static_assert(FileDispositionInfoEx == kFileDispositionInfoEx);
+#endif
+
 // Delete the entry the handle opened, through the handle (it must carry DELETE). POSIX semantics where
 // the OS has them (the name goes at once) and a read-only file deleted as MS STL's `remove` deletes one;
 // otherwise the classic disposition, the read-only attribute cleared first. 0, or why it was refused.
 [[nodiscard]] DWORD deleteThrough(HANDLE h) {
-    struct DispositionEx {
-        DWORD Flags;
-    };
-    constexpr DWORD kDelete = 0x1, kPosixSemantics = 0x2, kIgnoreReadOnly = 0x10;
-    constexpr auto  kDispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);   // FileDispositionInfoEx
-    DispositionEx ex{kDelete | kPosixSemantics | kIgnoreReadOnly};
-    if (::SetFileInformationByHandle(h, kDispositionInfoEx, &ex, sizeof ex)) return ERROR_SUCCESS;
+    FILE_DISPOSITION_INFO_EX ex{};
+    ex.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+             | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+    if (::SetFileInformationByHandle(h, kFileDispositionInfoEx, &ex, sizeof ex)) return ERROR_SUCCESS;
     DWORD const e = ::GetLastError();
     // An OS or a file system without the extended disposition answers one of these; anything else is
     // the deletion's own refusal (a directory not empty, a file in use, access denied).
@@ -556,6 +566,51 @@ template <class Clock>
     return Handle{reached};
 }
 
+// A handle to the entry AT `p` itself -- a link there is NOT followed -- or none: nothing there is no handle with
+// `ec` clear.
+[[nodiscard]] Handle entryHandle(fs::path const& p, DWORD access, std::error_code& ec) {
+    HANDLE const entry = ::CreateFileW(p.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                       nullptr);
+    if (entry == INVALID_HANDLE_VALUE) {
+        DWORD const e = ::GetLastError();
+        if (!winNotFound(e)) ec = winError(e);
+        return {};
+    }
+    return Handle{entry};
+}
+
+// Whether two open handles are one file. The 128-bit identity first (ReFS needs it), the 64-bit one where the file
+// system has no other. An OS without the class (before Windows 8) refuses the call, and the 64-bit identity answers.
+[[nodiscard]] bool sameIdentity(Handle const& first, Handle const& second, std::error_code& ec) {
+    FILE_ID_INFO idA{}, idB{};
+    if (::GetFileInformationByHandleEx(first.get(), FileIdInfo, &idA, sizeof idA)
+        && ::GetFileInformationByHandleEx(second.get(), FileIdInfo, &idB, sizeof idB)) {
+        return idA.VolumeSerialNumber == idB.VolumeSerialNumber
+            && std::equal(std::begin(idA.FileId.Identifier), std::end(idA.FileId.Identifier),
+                          std::begin(idB.FileId.Identifier));
+    }
+    BY_HANDLE_FILE_INFORMATION infoA{}, infoB{};
+    if (!::GetFileInformationByHandle(first.get(), &infoA) || !::GetFileInformationByHandle(second.get(), &infoB)) {
+        ec = winError(::GetLastError());
+        return false;
+    }
+    return infoA.dwVolumeSerialNumber == infoB.dwVolumeSerialNumber && infoA.nFileIndexHigh == infoB.nFileIndexHigh
+        && infoA.nFileIndexLow == infoB.nFileIndexLow;
+}
+
+// `FileCaseSensitiveInfo` (Windows 10 RS4), SPELLED BY VALUE because MinGW-w64's header gives the enumerator ANOTHER
+// class's number: ✔MEASURED 2026-10-28 (probe-reference-cc, -D_WIN32_WINNT=0x0A00): MinGW-w64 g++ 13.2.0 declares it
+// 21 -- the Windows SDK's FileDispositionInfoEx, which with flag 1 asks FILE_DISPOSITION_FLAG_DELETE -- and refuses
+// it as a query with error 87 (run 20261029-003600-81043948); cl 19.51's SDK declares 23 (run
+// 20261029-003902-59348b54), and through 23 both toolchains answer 0 for a new directory and 1 once it is made
+// case-sensitive (runs 20261029-003836-60f9e5a7 and 20261029-003902-59348b54). Its record and flag are the headers' own on both (4 bytes;
+// FILE_CS_FLAG_CASE_SENSITIVE_DIR 1).
+constexpr auto kFileCaseSensitiveInfo = static_cast<FILE_INFO_BY_HANDLE_CLASS>(23);
+#ifndef __MINGW32__
+static_assert(FileCaseSensitiveInfo == kFileCaseSensitiveInfo);
+#endif
+
 #else
 
 [[nodiscard]] EntryKind kindOfStatus(fs::file_type type) {
@@ -566,10 +621,6 @@ template <class Clock>
         case fs::file_type::regular: return EntryKind::File;
         default: return EntryKind::Other;
     }
-}
-
-[[nodiscard]] bool isPermissionDenied(std::error_code const& ec) {
-    return ec == std::errc::permission_denied;
 }
 
 // Every entry of `dir`, each classified by its own `symlink_status` (the listing's cached type
@@ -731,6 +782,21 @@ EntryKind reachedKind(fs::path const& p, std::error_code& ec) {
 #endif
 }
 
+bool reachedPipe(fs::path const& p, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    static_cast<void>(p);
+    return false;
+#else
+    auto const type = fs::status(p, ec).type();
+    if (type == fs::file_type::not_found) {
+        ec.clear();
+        return false;
+    }
+    return !ec && type == fs::file_type::fifo;
+#endif
+}
+
 std::optional<std::uintmax_t> reachedFileSize(fs::path const& p, std::error_code& ec) {
     ec.clear();
 #ifdef _WIN32
@@ -760,6 +826,7 @@ fs::path reachedPath(fs::path const& p, std::error_code& ec) {
     // The longest leading part that exists, resolved by the OS; what follows it is appended as written.
     fs::path head = whole;
     fs::path rest;
+    bool     rootOfTheDevice = false;   // the walk reached a volume's device and asked its root instead, once
     for (;;) {
         HANDLE const reached = ::CreateFileW(head.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
@@ -772,15 +839,44 @@ fs::path reachedPath(fs::path const& p, std::error_code& ec) {
                 n = ::GetFinalPathNameByHandleW(reached, resolved.data(), static_cast<DWORD>(resolved.size()),
                                                 FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
             }
-            DWORD const e = n == 0 ? ::GetLastError() : ERROR_SUCCESS;
+            DWORD e = n == 0 ? ::GetLastError() : ERROR_SUCCESS;
+            // ★ THE WALK STEPPED UP ONTO A VOLUME'S DEVICE (P69 H5). The library's parent of a path in the
+            // Win32 file namespace -- `\\?\Volume{G}\x`, `\\?\C:\x`, `\\?\GLOBALROOT\Device\HarddiskVolumeN\x` --
+            // is the volume WITHOUT its separator, which the OS opens as the volume's DEVICE: a handle with no
+            // file information and no final path, ERROR_INVALID_FUNCTION (✔MEASURED 2026-11-03, probe-reference-cc
+            // run 20261104-021850-b279d3e9, MinGW's library and MS STL's alike; MS STL's own `weakly_canonical`
+            // fails there the same way). The directory the walk means is the volume's root -- the same name WITH
+            // its separator -- asked once; a path asked AS the device, with nothing walked, stays refused.
+            if (n == 0 && e == ERROR_INVALID_FUNCTION && !rest.empty() && !rootOfTheDevice) {
+                ::CloseHandle(reached);
+                rootOfTheDevice = true;
+                head            = fs::path{head.native() + fs::path::preferred_separator};
+                continue;
+            }
+            // A volume with NO DOS name refuses its DOS spelling: its NT name, as MS STL's `canonical`
+            // answers it (the header measures both libraries), `\\?\GLOBALROOT` making it a Win32 path.
+            bool const ntName = n == 0 && e == ERROR_PATH_NOT_FOUND;
+            if (ntName) {
+                resolved.assign(MAX_PATH, L'\0');
+                n = ::GetFinalPathNameByHandleW(reached, resolved.data(), static_cast<DWORD>(resolved.size()),
+                                                FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+                if (n >= resolved.size()) {
+                    resolved.resize(n);
+                    n = ::GetFinalPathNameByHandleW(reached, resolved.data(), static_cast<DWORD>(resolved.size()),
+                                                    FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+                }
+                e = n == 0 ? ::GetLastError() : ERROR_SUCCESS;
+            }
             ::CloseHandle(reached);
             if (n == 0 || n >= resolved.size()) {
                 ec = winError(n == 0 ? e : ERROR_INSUFFICIENT_BUFFER);
                 return {};
             }
             resolved.resize(n);
-            // The final path is spelled in the OS's own long form: `\\?\C:\...` or `\\?\UNC\server\share\...`.
-            if (resolved.starts_with(L"\\\\?\\UNC\\")) resolved = L"\\\\" + resolved.substr(8);
+            // The final path is spelled in the OS's own long form: `\\?\C:\...` or `\\?\UNC\server\share\...`
+            // -- or, by NT name, `\Device\...`.
+            if (ntName) resolved = L"\\\\?\\GLOBALROOT" + resolved;
+            else if (resolved.starts_with(L"\\\\?\\UNC\\")) resolved = L"\\\\" + resolved.substr(8);
             else if (resolved.starts_with(L"\\\\?\\")) resolved = resolved.substr(4);
             fs::path out{resolved};
             if (!rest.empty()) out /= rest;
@@ -836,28 +932,7 @@ bool reachedSameFile(fs::path const& a, fs::path const& b, std::error_code& ec) 
     if (!first) return false;
     Handle const second = reachedHandle(b, FILE_READ_ATTRIBUTES, ec);
     if (!second) return false;
-    // The 128-bit identity first (ReFS needs it), the 64-bit one where the file system has no other. The
-    // record and its class are winbase.h's FILE_ID_INFO / FileIdInfo (Windows 8 on), spelled here because
-    // MinGW-w64's headers declare them only for a _WIN32_WINNT this build does not set; an OS without the
-    // class refuses the call, and the 64-bit identity answers.
-    struct FileIdRecord {
-        ULONGLONG VolumeSerialNumber;
-        BYTE      Identifier[16];
-    };
-    constexpr auto kFileIdInfo = static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);   // FileIdInfo
-    FileIdRecord idA{}, idB{};
-    if (::GetFileInformationByHandleEx(first.get(), kFileIdInfo, &idA, sizeof idA)
-        && ::GetFileInformationByHandleEx(second.get(), kFileIdInfo, &idB, sizeof idB)) {
-        return idA.VolumeSerialNumber == idB.VolumeSerialNumber
-            && std::equal(std::begin(idA.Identifier), std::end(idA.Identifier), std::begin(idB.Identifier));
-    }
-    BY_HANDLE_FILE_INFORMATION infoA{}, infoB{};
-    if (!::GetFileInformationByHandle(first.get(), &infoA) || !::GetFileInformationByHandle(second.get(), &infoB)) {
-        ec = winError(::GetLastError());
-        return false;
-    }
-    return infoA.dwVolumeSerialNumber == infoB.dwVolumeSerialNumber && infoA.nFileIndexHigh == infoB.nFileIndexHigh
-        && infoA.nFileIndexLow == infoB.nFileIndexLow;
+    return sameIdentity(first, second, ec);
 #else
     for (fs::path const* side : {&a, &b}) {
         auto const reached = fs::status(*side, ec).type();
@@ -898,6 +973,107 @@ void addReachedPermissions(fs::path const& p, fs::perms add, std::error_code& ec
 #endif
 }
 
+bool sameEntry(fs::path const& a, fs::path const& b, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    Handle const first = entryHandle(a, FILE_READ_ATTRIBUTES, ec);
+    if (!first) return false;
+    Handle const second = entryHandle(b, FILE_READ_ATTRIBUTES, ec);
+    if (!second) return false;
+    return sameIdentity(first, second, ec);
+#else
+    // `lstat`: the entry itself. Nothing there (or a component that is no directory) is no entry.
+    auto const look = [&ec](fs::path const& p, struct stat& st) {
+        if (::lstat(p.c_str(), &st) == 0) return true;
+        int const e = errno;
+        if (e != ENOENT && e != ENOTDIR) ec = std::error_code{e, std::generic_category()};
+        return false;
+    };
+    struct stat sa{};
+    struct stat sb{};
+    if (!look(a, sa) || !look(b, sb)) return false;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+#endif
+}
+
+std::optional<fs::path::string_type> storedEntryName(fs::path const& p, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    Handle const entry = entryHandle(p, FILE_READ_ATTRIBUTES, ec);
+    if (!entry) return std::nullopt;
+    // By the NT volume name: only the last component is read, and a volume with no DOS name refuses its DOS
+    // spelling (`reachedPath`).
+    std::wstring name(MAX_PATH, L'\0');
+    DWORD        n = ::GetFinalPathNameByHandleW(entry.get(), name.data(), static_cast<DWORD>(name.size()),
+                                                 FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+    if (n >= name.size()) {
+        name.resize(n);
+        n = ::GetFinalPathNameByHandleW(entry.get(), name.data(), static_cast<DWORD>(name.size()),
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+    }
+    if (n == 0 || n >= name.size()) {
+        ec = winError(n == 0 ? ::GetLastError() : ERROR_INSUFFICIENT_BUFFER);
+        return std::nullopt;
+    }
+    name.resize(n);
+    std::size_t const cut = name.find_last_of(L'\\');
+    return cut == std::wstring::npos ? name : name.substr(cut + 1);
+#elif defined(__APPLE__)
+    // Asked of the PATH, the last component not followed -- no descriptor, so an entry whose open is refused still
+    // answers (the header's table). The reply: its length, the name's reference (its offset counted from the
+    // reference itself), then the name, NUL-terminated UTF-8 of at most NAME_MAX characters of up to three bytes.
+    struct attrlist request{};
+    request.bitmapcount = ATTR_BIT_MAP_COUNT;
+    request.commonattr  = ATTR_CMN_NAME;
+    alignas(4) char reply[sizeof(std::uint32_t) + sizeof(attrreference_t) + NAME_MAX * 3 + 1] = {};
+    if (::getattrlist(p.c_str(), &request, reply, sizeof reply, FSOPT_NOFOLLOW) != 0) {
+        int const e = errno;
+        if (e != ENOENT && e != ENOTDIR) ec = std::error_code{e, std::generic_category()};
+        return std::nullopt;
+    }
+    attrreference_t ref{};
+    std::memcpy(&ref, reply + sizeof(std::uint32_t), sizeof ref);
+    std::size_t const at = sizeof(std::uint32_t) + static_cast<std::size_t>(ref.attr_dataoffset);
+    if (ref.attr_dataoffset < 0 || at >= sizeof reply) {
+        ec = std::make_error_code(std::errc::bad_message);
+        return std::nullopt;
+    }
+    char const* const name = reply + at;
+    return std::string{name, ::strnlen(name, sizeof reply - at)};
+#else
+    static_cast<void>(p);
+    return std::nullopt;
+#endif
+}
+
+std::optional<bool> directoryFoldsCase(fs::path const& dir, std::error_code& ec) {
+    ec.clear();
+#ifdef _WIN32
+    Handle const reached = reachedHandle(dir, FILE_READ_ATTRIBUTES, ec);
+    if (!reached) {
+        if (!ec) ec = winError(ERROR_PATH_NOT_FOUND);
+        return std::nullopt;
+    }
+    FILE_CASE_SENSITIVE_INFO info{};
+    if (!::GetFileInformationByHandleEx(reached.get(), kFileCaseSensitiveInfo, &info, sizeof info)) {
+        ec = winError(::GetLastError());
+        return std::nullopt;
+    }
+    return (info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR) == 0;
+#elif defined(__APPLE__)
+    errno = 0;
+    long const sensitive = ::pathconf(dir.c_str(), _PC_CASE_SENSITIVE);
+    if (sensitive < 0) {
+        if (errno != 0) ec = std::error_code{errno, std::generic_category()};
+        return std::nullopt;
+    }
+    return sensitive == 0;
+#else
+    static_cast<void>(dir);
+    return std::nullopt;
+#endif
+}
+
 TreeWalk walkTree(fs::path const& root, std::function<WalkStep(TreeEntry const&)> const& visit,
                   TreeWalkOptions options) {
     TreeWalk walk;
@@ -913,7 +1089,6 @@ TreeWalk walkTree(fs::path const& root, std::function<WalkStep(TreeEntry const&)
         std::error_code ec;
         listEntries(dir, depth, listed.entries, ec);
         if (ec) {
-            if (options.skipPermissionDenied && isPermissionDenied(ec)) return true;
             walk.error = ec;
             walk.where = dir;
             return false;
@@ -952,8 +1127,17 @@ TreeWalk walkTree(fs::path const& root, std::function<WalkStep(TreeEntry const&)
     return walk;
 }
 
-TreeRemoval removeTree(fs::path const& target) {
+TreeRemoval removeTree(fs::path const& target, RemovalOptions const& options) {
     TreeRemoval out;
+    // The options' last entry (the header): moved to the end of the TARGET's listing, and handled only
+    // when every entry before it was removed -- otherwise the removal ends, leaving it and the target.
+    auto const isLastEntry = [&options](fs::path::string_type const& name) {
+        return !options.lastEntry.empty() && name == options.lastEntry.native();
+    };
+    auto const moveLastEntryLast = [&isLastEntry](std::vector<fs::path::string_type>& names) {
+        auto const at = std::find_if(names.begin(), names.end(), isLastEntry);
+        if (at != names.end()) std::rotate(at, at + 1, names.end());
+    };
     // A failure on an entry that is now GONE was beaten to the outcome wanted: it is no failure.
     auto const note = [&out](fs::path const& p, std::error_code const& ec) {
         std::error_code gec;
@@ -1022,6 +1206,7 @@ TreeRemoval removeTree(fs::path const& target) {
             DWORD listError = ERROR_SUCCESS;
             top.names       = namesThrough(top.dir.get(), listError);
             if (listError != ERROR_SUCCESS) note(top.path, winError(listError));
+            if (work.size() == 1) moveLastEntryLast(top.names);   // the target's own listing
             continue;
         }
         if (top.next == top.names.size()) {
@@ -1033,15 +1218,16 @@ TreeRemoval removeTree(fs::path const& target) {
             continue;
         }
         std::wstring const name  = top.names[top.next++];
+        if (work.size() == 1 && out.failures != 0 && isLastEntry(name)) return out;   // it stays, and the target
         fs::path const     entry = top.path / name;
         if (hook) hook(entry);
         // A directory is opened ONCE for its listing and its deletion (a link to a directory meets that open
         // as the link, and is judged a link below); an entry that is no directory refuses it, and is opened
         // for its deletion alone.
         DWORD  openError = ERROR_SUCCESS;
-        Handle opened    = openEntryRelative(top.dir.get(), name, kDirectoryRemovalAccess, kNtDirectoryFile, openError);
+        Handle opened    = openEntryRelative(top.dir.get(), name, kDirectoryRemovalAccess, FILE_DIRECTORY_FILE, openError);
         if (!opened && openError == ERROR_DIRECTORY)
-            opened = openEntryRelative(top.dir.get(), name, kRemovalAccess, kNtNonDirectoryFile, openError);
+            opened = openEntryRelative(top.dir.get(), name, kRemovalAccess, FILE_NON_DIRECTORY_FILE, openError);
         if (!opened) {
             if (!winNotFound(openError)) note(entry, winError(openError));   // gone already is no failure
             continue;
@@ -1089,6 +1275,7 @@ TreeRemoval removeTree(fs::path const& target) {
             int listError = 0;
             top.names     = namesThrough(top.dir.get(), listError);
             if (listError != 0) note(top.path, posixError(listError));
+            if (work.size() == 1) moveLastEntryLast(top.names);   // the target's own listing
             continue;
         }
         if (top.next == top.names.size()) {
@@ -1102,6 +1289,7 @@ TreeRemoval removeTree(fs::path const& target) {
             continue;
         }
         std::string const name  = top.names[top.next++];
+        if (work.size() == 1 && out.failures != 0 && isLastEntry(name)) return out;   // it stays, and the target
         fs::path const    entry = top.path / name;
         if (hook) hook(entry);
         int const opened = ::openat(top.dir.get(), name.c_str(), kOpenDirectoryOnly);

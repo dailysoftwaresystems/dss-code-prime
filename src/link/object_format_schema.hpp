@@ -2939,6 +2939,17 @@ struct DSS_EXPORT ObjectFormatData {
     // choice where no runtime image exists, MEASURED: pe64 has none).
     std::optional<AtomicsRuntime> atomicsRuntime;
 
+    // ── P69 H5: the compiler-support declaration ───────────────────────────
+    //
+    // OPTIONAL top-level `"compilerSupport"` block (`{"role": …,
+    // "securityCookieInitializer": …}`): the role whose row's units define the
+    // routines a reference toolchain's own static runtime defines for the
+    // objects it compiles (a FOREIGN object names them by name), and the one
+    // of them DSS's PE startup calls to seed the /GS cookie. `std::nullopt` =
+    // this format realizes no such routine, and a foreign object naming one is
+    // refused undefined at the link, by name. See `CompilerSupport`.
+    std::optional<CompilerSupport> compilerSupport;
+
     // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the REALIZED
     //    ENTRY-VERB set ─────────────────────────────────────────────
     //
@@ -4180,6 +4191,11 @@ public:
     // `traps` target reaching a nullopt fails loud naming this key.
     [[nodiscard]] std::optional<AtomicsRuntime> const&
     atomicsRuntime() const noexcept { return d_.atomicsRuntime; }
+    // P69 H5: the format's compiler-support declaration, or nullopt if it
+    // realizes none -- the routine DSS's PE startup calls to seed the /GS
+    // cookie is its `securityCookieInitializerMangledName`.
+    [[nodiscard]] std::optional<CompilerSupport> const&
+    compilerSupport() const noexcept { return d_.compilerSupport; }
     // The program-entry materialization VERBS this format realizes. Non-empty on
     // every exec-flavored format, empty on every other (both directions
     // load-enforced), so EMPTY is the engine's "this build needs no program

@@ -359,9 +359,10 @@ public:
         if (hit.kind == LabelLookup::NotALabel) {
             sink_.fail(at,
                  std::format("'{}' branches to '{}', which this file defines no "
-                             "label for — a branch out of the translation unit "
-                             "is a relocation this build does not reach from "
-                             "assembly yet{}", mnemonic, symbol,
+                             "label for — a branch out of the function is a "
+                             "TAIL branch to that symbol, and this target "
+                             "declares no opcode this spelling names that "
+                             "branches to a symbol{}", mnemonic, symbol,
                              sink_.pairSuffix()));
             return std::nullopt;
         }
@@ -376,6 +377,20 @@ public:
             return std::nullopt;
         }
         return L.block;
+    }
+
+    // ★ A BRANCH LEAVES THE FUNCTION when its target is a function ENTRY of
+    // this file (another function's, or this one's own) or a name the file does
+    // not define -- the two targets gas relocates a `jmp` against. A block of
+    // the open function stays a branch; a local reference that resolves to
+    // nothing, a data label and a block of ANOTHER function are no ways out,
+    // and `resolveBranchTarget` keeps refusing each by name.
+    [[nodiscard]] bool branchLeavesTheFunction(std::string const& symbol,
+                                               NodeId at) const override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind == LabelLookup::NotALabel) return true;
+        if (hit.kind != LabelLookup::Found) return false;
+        return labels_[hit.index].isEntry;
     }
 
     [[nodiscard]] std::optional<LirOperand>

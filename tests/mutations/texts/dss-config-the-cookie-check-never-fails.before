@@ -1,0 +1,3 @@
+	cmpq	%r10, %rcx
+	jne	1f
+	ret

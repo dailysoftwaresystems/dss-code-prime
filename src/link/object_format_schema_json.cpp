@@ -451,7 +451,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // `visibilityWrittenAs`, the visibility a format writes for each one it
     // cannot (`VisibilityStandIn`). OPTIONAL: stated by the four PE and the eight
     // Mach-O documents; absent, every visibility is written as itself.
-    static constexpr std::array<std::string_view, 59> kFormatDocumentKeys{
+    // 59 -> 60 (P69 fold H5, lane `hm`): `compilerSupport`, the role whose row
+    // realizes what a reference toolchain's own static runtime defines for its
+    // objects, and the /GS cookie seeder DSS's PE startup calls. OPTIONAL:
+    // stated by the four PE documents.
+    static constexpr std::array<std::string_view, 60> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -543,6 +547,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // wrong-IMAGE bind, i.e. the eager-import 0xC0000139 class on pe and an
         // undefined symbol elsewhere — never a silent fallback.
         "runtimeLibraries", "sehPersonality", "atomicsRuntime",
+        // the routines a reference toolchain's own static runtime defines for
+        // its objects, and the cookie seeder DSS's PE startup calls (P69 H5)
+        "compilerSupport",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // where an image records its library search path (DT_RUNPATH /
@@ -2122,8 +2129,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // in both directions: neither is an unfilled role, both are two owners for
     // one body (the refusal `shippedLibs`' own `library`/`realization` pair has
     // made since D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF).
-    static constexpr std::array<std::string_view, 3>
-        kRuntimeLibraryRowKeys{"role", "image", "source"};
+    //
+    // ★ `sources` (P69 H5): a body of SEVERAL shipped units -- two or more --
+    // is ONE row, because a role names one provider (the duplicate-role refusal
+    // below). A body of one unit keeps `source`; `sources` holding one unit is
+    // refused, naming `source`, so each shape has exactly one spelling.
+    static constexpr std::array<std::string_view, 4>
+        kRuntimeLibraryRowKeys{"role", "image", "source", "sources"};
     DSS_CHECK_KEY_VOCABULARY(kRuntimeLibraryRowKeys);
     if (doc.contains("runtimeLibraries")) {
         if (!doc.at("runtimeLibraries").is_array()) {
@@ -2178,41 +2190,85 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     };
                 auto const image  = nonEmptyString("image");
                 auto const source = nonEmptyString("source");
-                if (image.has_value() == source.has_value()) {
+                bool const listed = row.contains("sources");
+                int const providers = (image.has_value() ? 1 : 0)
+                                    + (source.has_value() ? 1 : 0)
+                                    + (listed ? 1 : 0);
+                if (providers != 1) {
                     coll.emit(DiagnosticCode::C_MissingField, path,
-                              image.has_value()
-                                  ? "declares BOTH a non-empty 'image' and a "
-                                    "non-empty 'source' — a role has exactly "
-                                    "ONE provider, and two owners for one body "
-                                    "is the defect this pair exists to refuse. "
+                              providers > 1
+                                  ? "declares more than one of a non-empty "
+                                    "'image', a non-empty 'source' and "
+                                    "'sources' — a role has exactly ONE "
+                                    "provider, and two owners for one body is "
+                                    "the defect this pair exists to refuse. "
                                     "Name the platform image the entries are "
-                                    "IMPORTED from, or the shipped source DSS "
-                                    "COMPILES to define them, never both."
+                                    "IMPORTED from, or the shipped source(s) "
+                                    "DSS COMPILES to define them, never both."
                                   : "requires exactly one of a non-empty "
                                     "'image' (the DLL / shared-object / dylib "
-                                    "identity the entries are IMPORTED from) or "
+                                    "identity the entries are IMPORTED from), "
                                     "a non-empty 'source' (a path under "
                                     "`runtime/<tier>/src/`, relative to "
                                     "src/dss-config/, whose compiled body "
-                                    "DEFINES them). A row with neither is an "
-                                    "unfilled role.");
+                                    "DEFINES them), or 'sources' (two or more "
+                                    "such paths, one body of several units). "
+                                    "A row with none is an unfilled role.");
                     continue;
                 }
-                if (source.has_value()
-                 && shippedConfigRelativePathEscapes(*source)) {
-                    coll.emit(DiagnosticCode::C_MalformedJson, path + "/source",
-                              std::format(
-                                  "'source' must be a path RELATIVE to "
-                                  "src/dss-config/, spelled with forward "
-                                  "slashes and no '.'/'..' components, got "
-                                  "'{}' — the same shape a shipped-lib "
-                                  "descriptor's `realization.<format>.source` "
-                                  "takes, because it names a file in the same "
-                                  "tree and is compiled by the same driver "
-                                  "seam.",
-                                  *source));
-                    continue;
+                std::vector<std::string> sources;
+                if (source.has_value()) sources.push_back(*source);
+                if (listed) {
+                    auto const& list = row.at("sources");
+                    bool shaped = list.is_array() && list.size() >= 2;
+                    for (std::size_t k = 0; shaped && k < list.size(); ++k) {
+                        shaped = list[k].is_string()
+                              && !list[k].get<std::string>().empty();
+                        if (shaped) sources.push_back(list[k].get<std::string>());
+                    }
+                    if (!shaped) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  path + "/sources",
+                                  "'sources' must be an ARRAY of TWO OR MORE "
+                                  "non-empty paths — the units of ONE body a "
+                                  "role is played by. A body of one unit is "
+                                  "written 'source', so each shape has one "
+                                  "spelling.");
+                        continue;
+                    }
                 }
+                bool sourcesOk = true;
+                for (std::size_t k = 0; k < sources.size(); ++k) {
+                    std::string const at = listed
+                        ? std::format("{}/sources/{}", path, k) : path + "/source";
+                    if (shippedConfigRelativePathEscapes(sources[k])) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, at,
+                                  std::format(
+                                      "a shipped source must be a path RELATIVE "
+                                      "to src/dss-config/, spelled with forward "
+                                      "slashes and no '.'/'..' components, got "
+                                      "'{}' — the same shape a shipped-lib "
+                                      "descriptor's `realization.<format>.source` "
+                                      "takes, because it names a file in the "
+                                      "same tree and is compiled by the same "
+                                      "driver seam.",
+                                      sources[k]));
+                        sourcesOk = false;
+                    } else if (std::find(sources.begin(), sources.begin()
+                                             + static_cast<std::ptrdiff_t>(k),
+                                         sources[k])
+                               != sources.begin() + static_cast<std::ptrdiff_t>(k)) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, at,
+                                  std::format(
+                                      "names the unit '{}' twice — one body's "
+                                      "units are a SET of paths, and a unit "
+                                      "named twice would be built twice into "
+                                      "one archive",
+                                      sources[k]));
+                        sourcesOk = false;
+                    }
+                }
+                if (!sourcesOk) continue;
                 if (data.runtimeLibraries.rowForRole(*role) != nullptr) {
                     coll.emit(DiagnosticCode::C_MalformedJson, path + "/role",
                               std::format(
@@ -2225,7 +2281,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 data.runtimeLibraries.bindings.push_back(
                     RuntimeLibraryBinding{*role,
                                           image.value_or(std::string{}),
-                                          source.value_or(std::string{})});
+                                          std::move(sources)});
             }
         }
     }
@@ -2280,9 +2336,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     if (!declared.empty()) declared += ", ";
                     declared += runtimeLibraryRoleName(b.role);
                     declared += " -> ";
-                    declared += b.source.empty() ? b.image
-                                                 : ("(shipped source) "
-                                                    + b.source);
+                    if (b.sources.empty()) {
+                        declared += b.image;
+                    } else {
+                        declared += "(shipped source) ";
+                        for (std::size_t k = 0; k < b.sources.size(); ++k) {
+                            if (k != 0) declared += " + ";
+                            declared += b.sources[k];
+                        }
+                    }
                 }
                 if (declared.empty()) declared = "<none>";
                 coll.emit(DiagnosticCode::C_MissingField, rolePath,
@@ -2440,6 +2502,60 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
             }
             if (ok) data.atomicsRuntime = std::move(out);
+        }
+    }
+
+    // ── P69 H5: `compilerSupport` ──────────────────────────────────────────
+    //
+    // `{"role": <runtimeLibraries role>, "securityCookieInitializer":
+    //   <non-empty>}`. BOTH halves REQUIRED when the block is present: the role
+    // names the row whose units define what a reference toolchain's own static
+    // runtime defines for its objects
+    // (D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED,
+    // D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED),
+    // and the initializer is the ONE of them DSS's PE startup calls before any
+    // initializer and before the entry, so a /GS frame never compares against
+    // the cookie the runtime's object ships. A block with no initializer would
+    // define the cookie and leave it at the value every attacker knows.
+    //
+    // OPTIONAL as a block: a format that declares none realizes no such routine,
+    // and a foreign object naming one is refused at the link, undefined, by name.
+    static constexpr std::array<std::string_view, 2>
+        kCompilerSupportKeys{"role", "securityCookieInitializer"};
+    DSS_CHECK_KEY_VOCABULARY(kCompilerSupportKeys);
+    if (doc.contains("compilerSupport")) {
+        if (!doc.at("compilerSupport").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/compilerSupport",
+                      std::format("'compilerSupport' must be an object with "
+                                  "the keys {}",
+                                  allowedList(kCompilerSupportKeys, ", ")));
+        } else {
+            auto const& cs = doc.at("compilerSupport");
+            rejectUnknownKeys(cs, kCompilerSupportKeys, "/compilerSupport",
+                              "the 'compilerSupport' block", coll);
+            CompilerSupport out;
+            bool ok = resolveRuntimeRole(cs, "/compilerSupport", out.libraryPath);
+            if (ok) {
+                out.role = *runtimeLibraryRoleFromName(
+                    cs.at("role").get<std::string>());
+            }
+            char const* const kInitKey = "securityCookieInitializer";
+            if (!cs.contains(kInitKey) || !cs.at(kInitKey).is_string()
+             || cs.at(kInitKey).get<std::string>().empty()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::string{"/compilerSupport/"} + kInitKey,
+                          "requires a non-empty 'securityCookieInitializer' — "
+                          "the routine DSS's PE startup calls before any "
+                          "initializer and the entry to seed the /GS cookie "
+                          "(pe: \"__security_init_cookie\"). Without it a "
+                          "guarded frame compares against the value the "
+                          "runtime's object ships.");
+                ok = false;
+            } else {
+                out.securityCookieInitializerMangledName =
+                    cs.at(kInitKey).get<std::string>();
+            }
+            if (ok) data.compilerSupport = std::move(out);
         }
     }
 
@@ -3860,7 +3976,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         std::vector<RuntimeLibraryRole> named;
         for (char const* blockKey : {"processExit", "processArgs",
                                      "sehPersonality", "librarySynthesis",
-                                     "atomicsRuntime"}) {
+                                     "atomicsRuntime", "compilerSupport"}) {
             if (!doc.contains(blockKey) || !doc.at(blockKey).is_object()) continue;
             auto const& blk = doc.at(blockKey);
             if (!blk.contains("role") || !blk.at("role").is_string()) continue;
@@ -3883,7 +3999,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                           "reading it and therefore nothing contradicting it. "
                           "Remove the row, or name it from the block that needs "
                           "it. (D-FFI-PE-CRT-UCRT-MIGRATION.)",
-                          runtimeLibraryRoleName(b.role), b.image));
+                          runtimeLibraryRoleName(b.role),
+                          b.sources.empty() ? b.image
+                                            : "(shipped source) " + b.sources.front()));
         }
     }
 

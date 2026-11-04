@@ -96,6 +96,7 @@
 // follow a link", shared with the compiler. This runner links no DSS library: the
 // one substrate unit is compiled into it (integrated_tests/CMakeLists.txt).
 #include "core/substrate/path_identity.hpp"
+#include "reached_path.hpp"  // what a path REACHES -- the one copy both runners ask
 #include "host_translations.hpp"
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. Its header states the boundary as a sentence;
@@ -113,6 +114,8 @@
 // ONE definition, shared with tests/examples/examples_runner.cpp (it lives
 // beside that runner for now; see its header note for why and where it goes).
 #include "loader_search_path.hpp"
+// The OS's own links (a directory link, a junction): the linked-kept-root pin plants them.
+#include "os_link.hpp"
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scoped_env.hpp"  // the declared loader variable is set for ONE spawn
@@ -390,45 +393,13 @@ struct FsAnswer {
     std::string why;  // empty iff ok
 };
 
-// ★ EVERY QUESTION THIS RUNNER ASKS OF A PATH IS ASKED OF THE SUBSTRATE
-// (src/core/substrate/path_identity.hpp, compiled into this runner), never of
-// the library: libstdc++ on Windows answers a link from the LINK's own
-// attributes -- a link to a file is 0 bytes long and was written when the link
-// was made, a dangling link is a regular file (✔MEASURED 2026-10-20 and
-// 2026-10-21, the substrate's header) -- so the MinGW build of this runner read
-// another file than the one it named. These keep the library's `error_code`
-// contract: a size or a time of a path that reaches no file is an ERROR, named.
-[[nodiscard]] bool reachesSomething(fs::path const& p, std::error_code& ec) {
-    return dss::core::reachedKind(p, ec) != dss::core::EntryKind::Absent;
-}
-
-[[nodiscard]] bool reachesKind(fs::path const& p, dss::core::EntryKind kind, std::error_code& ec) {
-    return dss::core::reachedKind(p, ec) == kind && !ec;
-}
-
-// Why `p` has no size or time to give, when the substrate answered "nothing".
-[[nodiscard]] std::error_code whyNoFile(fs::path const& p) {
-    std::error_code kec;
-    auto const      kind = dss::core::reachedKind(p, kec);
-    if (kec) return kec;
-    if (kind == dss::core::EntryKind::Absent) return std::make_error_code(std::errc::no_such_file_or_directory);
-    if (kind == dss::core::EntryKind::Directory) return std::make_error_code(std::errc::is_a_directory);
-    return std::make_error_code(std::errc::not_supported);
-}
-
-// The size of the regular file `p` reaches; `ec` set (and 0) when it reaches none.
-[[nodiscard]] std::uintmax_t reachedSize(fs::path const& p, std::error_code& ec) {
-    auto const size = dss::core::reachedFileSize(p, ec);
-    if (!size && !ec) ec = whyNoFile(p);
-    return size.value_or(0);
-}
-
-// When the file `p` reaches was last written; `ec` set when it reaches nothing.
-[[nodiscard]] fs::file_time_type writtenAt(fs::path const& p, std::error_code& ec) {
-    auto const when = dss::core::reachedWriteTime(p, ec);
-    if (!when && !ec) ec = whyNoFile(p);
-    return when.value_or(fs::file_time_type{});
-}
+// ★ EVERY QUESTION THIS RUNNER ASKS OF A PATH IS ASKED OF THE SUBSTRATE, through the primitives the two corpus
+// runners share (tests/test_support/reached_path.hpp, hoisted from here in P69 fold H5 so the in-process runner
+// asks the same questions; it says why the library is never asked).
+using ::dss::test_support::reachedSize;
+using ::dss::test_support::reachesKind;
+using ::dss::test_support::reachesSomething;
+using ::dss::test_support::writtenAt;
 
 // `exists` with the failure kept SEPARATE from the answer. An unreadable path
 // is not an absent one — ELOOP on a self-referential symlink, EACCES on a
@@ -6411,22 +6382,21 @@ void releaseRemovalClaim(fs::path const& claim) {
 // once the dead claim is swept (`sweepStaleRemovalClaims`); the other order would
 // leak a half-deleted tree that nothing recognises, forever. For the same reason
 // `run-info.txt` STAYS if anything else could not be removed.
+// ★ ONE REMOVAL OF THE ROOT, NEVER A LISTING OF IT BY PATH. A prune selects a root
+// by what it REACHES, so a directory link or a junction standing in the base with a
+// kept root's shape behind it is selected like one; listing it by path lists its
+// TARGET (every library does), and removing each `root/<name>` emptied the target
+// while only the link went last. The substrate's removal opens the root as the entry
+// it is -- a link is removed as itself, nothing it reaches is listed -- and its
+// `lastEntry` keeps `run-info.txt` for the end, removed only when everything else was.
 [[nodiscard]] ScratchRemoval removeClaimedRoot(fs::path const& root) {
+    auto const removal = dss::core::removeTree(root, dss::core::RemovalOptions{fs::path{kRunInfoName}});
     ScratchRemoval out;
-    std::vector<fs::path> entries;
-    std::error_code ec;
-    fs::directory_iterator it(root, ec);
-    for (fs::directory_iterator const end; !ec && it != end; it.increment(ec)) {
-        if (it->path().filename() != kRunInfoName) entries.push_back(it->path());
+    out.failures = removal.failures;
+    if (removal.failures != 0) {
+        out.first = "'" + removal.firstPath.generic_string() + "': " + removal.firstError.message();
     }
-    if (ec) noteScratchFailure(out, root, ec);
-    for (auto const& entry : entries) {
-        auto const part = removeScratchTree(entry);
-        if (part.failures != 0 && out.failures == 0) out.first = part.first;
-        out.failures += part.failures;
-    }
-    if (out.failures != 0) return out;
-    return removeScratchTree(root);  // `run-info.txt`, then the root itself
+    return out;
 }
 
 // A claim is held for milliseconds, so one older than `kRunningStaleAfter` was left
@@ -7009,6 +6979,72 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
     std::cout << "\n";
 }
 
+// ── Harness self-test: a kept root that is a LINK is removed as the link ────
+//
+// UNNUMBERED for the reason its neighbours give. A prune selects a kept root by
+// what it REACHES (a directory holding `run-info.txt`), so a directory link -- or
+// a junction -- standing in the scratch base with a kept root's shape behind it is
+// selected like one. Removing it must remove THE LINK and never empty what it
+// reaches: the claimed root was once listed BY PATH (a link lists its target under
+// every library) and each `root/<name>` removed by path, through the link, so the
+// target was emptied and only the link went last. Driven through the REAL
+// `reclaimKeptRoot` -- the call the prune makes for every root it selected -- with
+// the link planted by the OS; a host that makes no junction says so and is not asked.
+void runLinkedKeptRootPin(fs::path const& scratch) {
+    std::cout << "[Harness self-test] a kept root that is a link (a directory link, a junction) is removed as the"
+                 " link, and what it reaches stays whole\n";
+    struct Kind {
+        char const* name;
+        char const* tag;
+        std::error_code (*make)(fs::path const&, fs::path const&);   // a captureless lambda
+    };
+    std::vector<Kind> const kinds{
+        {"directory link", "dirlink",
+         [](fs::path const& target, fs::path const& link) {
+             return dss::test_support::makeSymbolicLink(target, link, dss::test_support::LinkTo::Directory);
+         }},
+        {"junction", "junction",
+         [](fs::path const& target, fs::path const& link) { return dss::test_support::makeJunction(target, link); }},
+    };
+    for (Kind const& kind : kinds) {
+        std::string const what   = std::string{kind.name} + " as a kept root";
+        fs::path const    base   = scratch / (std::string{"linked-"} + kind.tag);
+        fs::path const    target = scratch / (std::string{"target-"} + kind.tag);
+        fs::path const    link   = base / "old-root";
+        std::error_code   ec;
+        fs::create_directories(base, ec);
+        if (!ec) fs::create_directories(target / "sub", ec);
+        std::ofstream((target / kRunInfoName).string()) << "a kept root's marker, reached through a link\n";
+        std::ofstream((target / "keep.txt").string()) << "the link's target keeps this\n";
+        std::ofstream((target / "sub" / "inner.txt").string()) << "and this\n";
+        std::error_code const made = ec ? ec : kind.make(target, link);
+        if (made == std::errc::function_not_supported) {
+            std::cout << "  [NOTE] " << kind.name << ": this host makes none (" << made.message()
+                      << "), so it is not asked here\n";
+            continue;
+        }
+        check(what + ": the link was planted", !made, made ? made.message() : std::string{});
+        if (made) continue;
+        std::error_code tec;
+        auto const      scanned = writtenAt(link, tec);
+        check(what + ": its write time was read through it", !tec, tec ? tec.message() : std::string{});
+        if (tec) continue;
+        auto const  outcome = reclaimKeptRoot(link, scanned, fs::file_time_type::clock::now());
+        std::string lost;
+        for (fs::path const& kept : {target / kRunInfoName, target / "keep.txt", target / "sub" / "inner.txt"}) {
+            std::error_code kec;
+            if (!reachesSomething(kept, kec) || kec) lost += " " + kept.lexically_relative(scratch).generic_string();
+        }
+        check(what + ": the prune's removal left what the link reaches whole", lost.empty(),
+              "removed through the link:" + lost);
+        std::error_code lec;
+        bool const      linkGone = dss::core::entryKind(link, lec) == dss::core::EntryKind::Absent && !lec;
+        check(what + ": the link itself was removed", outcome == Reclaim::Removed && linkGone,
+              linkGone ? "the reclaim did not report a removal" : "the link is still there");
+    }
+    std::cout << "\n";
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -7296,6 +7332,9 @@ int main(int argc, char* argv[]) {
     // of its housekeeping, not of any example, so it runs with the CLI surface
     // rather than in 600 per-example entries.
     runConcurrentScratchRemovalPin(outputBase / "harness-concurrent-removal");
+    // UNNUMBERED for the same reason: a kept root that is a link is removed as the
+    // link, never through it -- housekeeping, like the pin above.
+    runLinkedKeptRootPin(outputBase / "harness-linked-kept-root");
 
     }  // wantCliSurface
 

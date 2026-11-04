@@ -1,0 +1,2 @@
+                    structAlign = static_cast<std::uint32_t>(
+                        sdef.at("alignment").get<std::uint64_t>());

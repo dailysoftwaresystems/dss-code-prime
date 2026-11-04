@@ -165,6 +165,19 @@ void setStageObserver(std::function<void(StageEvent const&)> observer) {
 }
 }  // namespace pipeline_testing
 
+
+namespace {
+// The name a trace gives a stage: one switch over the enum, so a new stage cannot
+// be traced as another.
+[[nodiscard]] constexpr char const* pipelineStageName(PipelineStage stage) noexcept {
+    switch (stage) {
+        case PipelineStage::Unit: return "unit";
+        case PipelineStage::Program: return "program";
+        case PipelineStage::ThinImport: return "thin-import";
+    }
+    return "?";
+}
+}  // namespace
 bool optimizeModule(Mir&                  mir,
                     TargetSchema const&   target,
                     TypeInterner const&   interner,
@@ -271,8 +284,7 @@ bool optimizeModule(Mir&                  mir,
         // Stage attribution under the SAME env gate as the per-pass trace
         // (DSS_OPT_TRACE) — the A/B instrument keys on these lines.
         if (std::getenv("DSS_OPT_TRACE") != nullptr) {
-            std::fprintf(stderr, "opt: stage=%s pipeline=%s\n",
-                         stage == PipelineStage::Unit ? "unit" : "program",
+            std::fprintf(stderr, "opt: stage=%s pipeline=%s\n", pipelineStageName(stage),
                          loadedPipeline.name.c_str());
             std::fflush(stderr);
         }
@@ -289,13 +301,14 @@ bool optimizeModule(Mir&                  mir,
         // to the Dce leaf's root predicate (the declaration says why).
         extent, entryRoots,
         // D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES:
-        // the UNIT stage is never the last a module receives -- every route
-        // that builds a CU lowers it only after a PROGRAM-stage optimize (the
-        // N>1 merged module, the N==1 sole CU, each archive member: the
-        // topology `PipelineStage` states) -- so a fixpoint truncated here is
-        // resumed, whatever schedule ran: the `unitPipeline` document, the
-        // config's own when it names none, or an override.
-        /*laterStageResumes=*/stage == PipelineStage::Unit);
+        // only the PROGRAM stage is ever the last a module receives -- every
+        // route that builds a CU lowers it only after a PROGRAM-stage optimize
+        // (the N>1 merged module, the N==1 sole CU, each archive member), and
+        // the thin-LTO import stage is followed by the merged module's (the
+        // topology `PipelineStage` states) -- so a fixpoint truncated at any
+        // other stage is resumed, whatever schedule ran: the `unitPipeline`
+        // document, the config's own, or an override.
+        /*laterStageResumes=*/stage != PipelineStage::Program);
     bool const optimized = optResult.ok && tierClean(reporter, optEntry);
     if (optimized) reportStage({StageEvent::Kind::Optimized, stage, &mir});
     return optimized;
@@ -5366,8 +5379,10 @@ bool runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
                 std::span<ExternImport const> ex) {
                 // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
                 // a thin unit is optimized ALONE and linked with its siblings.
+                // Its stage is the IMPORT stage: the merged module's Program
+                // stage runs after it, so a truncation here is resumed there.
                 return optimizeModule(m, target, in, opts,
-                                      PipelineStage::Program,
+                                      PipelineStage::ThinImport,
                                       opt::ModuleExtent::LinkInput, {},
                                       scratch[i], ex);
             },

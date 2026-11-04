@@ -334,13 +334,13 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
                 // dependency AND leave the archive member unpulled.
                 EXPECT_EQ(ar->libraryPath, "") << flavour.name;
                 auto const src =
-                    table.sourceForRole(RuntimeLibraryRole::AtomicsRuntime);
-                ASSERT_TRUE(src.has_value())
+                    table.sourcesForRole(RuntimeLibraryRole::AtomicsRuntime);
+                ASSERT_EQ(src.size(), 1u)
                     << flavour.name
-                    << ": the atomicsRuntime role must be REALIZED from a shipped "
+                    << ": the atomicsRuntime role must be REALIZED from ONE shipped "
                        "source on every pe flavour — an `image` here is the "
                        "external-DLL dependency P54 removed.";
-                EXPECT_EQ(*src, "runtime/platform/src/atomic.c") << flavour.name;
+                EXPECT_EQ(src[0], "runtime/platform/src/atomic.c") << flavour.name;
                 // Undecorated: this format's `cSymbolDecoration` is `none`.
                 EXPECT_EQ(ar->loadMangledName, "__atomic_load") << flavour.name;
                 EXPECT_EQ(ar->storeMangledName, "__atomic_store") << flavour.name;
@@ -978,10 +978,10 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
         EXPECT_EQ(ar->libraryPath, "")
             << name << ": the atomicsRuntime role is REALIZED here, so its "
                        "resolved image must be EMPTY.";
-        auto const src = (*loaded)->runtimeLibraries().sourceForRole(
+        auto const src = (*loaded)->runtimeLibraries().sourcesForRole(
             RuntimeLibraryRole::AtomicsRuntime);
-        ASSERT_TRUE(src.has_value()) << name;
-        EXPECT_EQ(*src, "runtime/platform/src/atomic.c") << name;
+        ASSERT_EQ(src.size(), 1u) << name;
+        EXPECT_EQ(src[0], "runtime/platform/src/atomic.c") << name;
     }
 }
 
@@ -989,7 +989,7 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
 //
 // ★★ THE LOADER AND THE RAW KEY MUST AGREE, ACROSS EVERY SHIPPED FORMAT. The
 // shipped-source SWEEP in `tests/ffi/test_shipped_source_realization.cpp` reads
-// `runtimeLibraries[].source` as raw JSON, because `ffi` cannot depend on the
+// `runtimeLibraries[].source` / `.sources` as raw JSON, because `ffi` cannot depend on the
 // object-format schema without inverting the layering. That makes it a SECOND
 // READER of a config key, which is how a sweep and a loader come to disagree
 // about what a document says — so the two are pinned against each other here,
@@ -1021,9 +1021,13 @@ TEST(RuntimeLibraryRoles, EveryRealizedRoleSourceMatchesTheRawKey) {
         if (doc.contains("runtimeLibraries")
             && doc.at("runtimeLibraries").is_array()) {
             for (auto const& row : doc.at("runtimeLibraries")) {
-                if (!row.is_object() || !row.contains("source")) continue;
-                if (!row.at("source").is_string()) continue;
-                raw.push_back(row.at("source").get<std::string>());
+                if (!row.is_object()) continue;
+                if (row.contains("source") && row.at("source").is_string())
+                    raw.push_back(row.at("source").get<std::string>());
+                // P69 H5: a body of several units, `sources`, read the same way.
+                if (row.contains("sources") && row.at("sources").is_array())
+                    for (auto const& s : row.at("sources"))
+                        if (s.is_string()) raw.push_back(s.get<std::string>());
             }
         }
 
@@ -1033,7 +1037,7 @@ TEST(RuntimeLibraryRoles, EveryRealizedRoleSourceMatchesTheRawKey) {
         EXPECT_EQ(seen, raw)
             << name
             << ": the loader's realized-source list and the raw "
-               "`runtimeLibraries[].source` key disagree. The shipped-source "
+               "`runtimeLibraries[].source` / `.sources` keys disagree. The shipped-source "
                "sweep in tests/ffi reads the RAW key, so a disagreement here "
                "means that sweep is guarding a document the compiler does not "
                "see.";
@@ -1116,9 +1120,8 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
             // The provider spelling carries its KIND as well as its value, so a
             // format naming an IMAGE called exactly what a sibling names as a
             // SOURCE cannot collapse into agreement.
-            std::string const provider =
-                b.source.empty() ? ("image " + b.image)
-                                 : ("shipped source " + b.source);
+            std::string provider = b.sources.empty() ? ("image " + b.image) : "shipped sources";
+            for (auto const& s : b.sources) provider += " " + s;
             byFamily[{kind, std::string{runtimeLibraryRoleName(b.role)}}]
                     [provider].push_back(name);
         }
@@ -1230,5 +1233,126 @@ TEST(RuntimeLibraryRoles, ARuntimeLibraryRowDeclaringBothAProviderKindIsRefused)
                "`operator/` with a rooted right operand REPLACES rather than "
                "appends, so the document would name a file outside the config "
                "root";
+    }
+}
+
+// ══ P69 H5: THE `compilerSupport` ROLE — a body of several shipped units ═══════════════════════════════════════
+//
+// D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED, D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED,
+// D-LK-PE-FOREIGN-OBJECT-GCC-MAIN-HOOK-UNDEFINED: the routines a reference toolchain's own static runtime defines for
+// its objects are DSS's to define on pe, from three units. Every pe flavour declares the role (who plays a role is
+// the format FAMILY's fact), realized -- an empty library path -- from exactly the three units, and the block names
+// the cookie seeder DSS's PE startup calls.
+TEST(RuntimeLibraryRoles, EveryPeFlavourRealizesCompilerSupportFromItsThreeUnits) {
+    std::vector<std::string> const units{"runtime/platform/src/pe_compiler_support.c",
+                                         "runtime/platform/src/pe_compiler_support_x86_64.s",
+                                         "runtime/platform/src/pe_gcc_unwind.c"};
+    std::size_t seen = 0;
+    for (auto const& flavour : kPeFlavours) {
+        SCOPED_TRACE(flavour.name);
+        auto r = ObjectFormatSchema::loadShipped(flavour.name);
+        ASSERT_TRUE(r.has_value()) << "must load";
+        auto const src = (*r)->runtimeLibraries().sourcesForRole(RuntimeLibraryRole::CompilerSupport);
+        EXPECT_EQ(std::vector<std::string>(src.begin(), src.end()), units)
+            << "the compilerSupport row must be realized from exactly the three units, in that order";
+        auto const& cs = (*r)->compilerSupport();
+        ASSERT_TRUE(cs.has_value()) << "every pe flavour declares the compilerSupport block";
+        EXPECT_EQ(cs->role, RuntimeLibraryRole::CompilerSupport);
+        EXPECT_EQ(cs->libraryPath, "") << "a REALIZED role resolves to no image";
+        EXPECT_EQ(cs->securityCookieInitializerMangledName, "__security_init_cookie");
+        auto const realized = (*r)->runtimeLibraries().realizedSources();
+        for (auto const& u : units) {
+            EXPECT_NE(std::find(realized.begin(), realized.end(), u), realized.end())
+                << u << " must reach the shipped-runtime unit list";
+        }
+        ++seen;
+    }
+    EXPECT_EQ(seen, std::size(kPeFlavours));
+}
+
+// Each shape of a row's provider has exactly ONE spelling, and the loader refuses the other: a body of one unit is
+// `source` (so `sources` holding one is refused), and a row names one provider (so `source` beside `sources`, or an
+// image beside them, is refused); a unit is a non-empty path inside the config root, named once.
+TEST(RuntimeLibraryRoles, ARowOfSeveralUnitsHasOneSpellingAndTheOthersAreRefused) {
+    std::string const text = readShippedFormatText("pe64-x86_64-windows-exec");
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value())
+        << "the UNMUTATED shipped text must load clean, or the mutants prove nothing";
+    constexpr std::string_view kRow =
+        R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s", "runtime/platform/src/pe_gcc_unwind.c"] })";
+    ASSERT_NE(text.find(kRow), std::string::npos) << "the mutation anchor must still exist";
+    struct Mutant { char const* what; char const* row; char const* at; };
+    Mutant const mutants[] = {
+        {"`sources` holding ONE unit (a body of one unit is written `source`)",
+         R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c"] })", "/sources"},
+        {"`source` beside `sources`",
+         R"({ "role": "compilerSupport", "source": "runtime/platform/src/pe_gcc_unwind.c", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s"] })",
+         "/runtimeLibraries/"},
+        {"an `image` beside `sources`",
+         R"({ "role": "compilerSupport", "image": "ucrtbase.dll", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s"] })",
+         "/runtimeLibraries/"},
+        {"an EMPTY unit", R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", ""] })",
+         "/sources"},
+        {"`sources` that is not an array", R"({ "role": "compilerSupport", "sources": "runtime/platform/src/pe_compiler_support.c" })",
+         "/sources"},
+        {"a unit named TWICE",
+         R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support.c"] })",
+         "/sources/1"},
+        {"an ESCAPING unit",
+         R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "//host/share/evil.s"] })",
+         "/sources/1"},
+    };
+    for (auto const& m : mutants) {
+        SCOPED_TRACE(m.what);
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(mutant, kRow, m.row));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<sources>");
+        ASSERT_FALSE(bad.has_value()) << "must be refused at load";
+        std::string said;
+        bool        atTheRow = false;
+        for (auto const& d : bad.error()) {
+            said += "\n  " + d.path + ": " + d.message;
+            if (d.path.find("/runtimeLibraries/") != std::string::npos && d.path.find(m.at) != std::string::npos)
+                atTheRow = true;
+        }
+        EXPECT_TRUE(atTheRow) << "the refusal must name the row's own path (" << m.at << "):" << said;
+    }
+}
+
+// The block's two halves are both required: a compilerSupport block with no cookie initializer would define the
+// cookie and leave it at the value the runtime's object ships. And the other direction of the role table's rule:
+// with the block gone, the row is named by nothing and the format is refused.
+TEST(RuntimeLibraryRoles, ACompilerSupportBlockNeedsItsInitializerAndItsRowNeedsTheBlock) {
+    std::string const text = readShippedFormatText("pe64-x86_64-windows-exec");
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value());
+    constexpr std::string_view kInit = "    \"securityCookieInitializer\": \"__security_init_cookie\"\n";
+    {
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(mutant, "    \"role\": \"compilerSupport\",\n",
+                                   "    \"role\": \"compilerSupport\"\n"));
+        ASSERT_TRUE(substituteOnce(mutant, kInit, ""));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<no-initializer>");
+        ASSERT_FALSE(bad.has_value()) << "a compilerSupport block with no initializer must be refused";
+        bool named = false;
+        for (auto const& d : bad.error())
+            if (d.path == "/compilerSupport/securityCookieInitializer") named = true;
+        EXPECT_TRUE(named) << "the refusal must name the missing key";
+    }
+    {
+        std::size_t const blockAt = text.find(R"("compilerSupport": {)");
+        ASSERT_NE(blockAt, std::string::npos);
+        std::size_t const closeAt = text.find("\n  },\n", blockAt);
+        ASSERT_NE(closeAt, std::string::npos);
+        std::string mutant = text;
+        mutant.erase(blockAt, (closeAt + 6) - blockAt);
+        ASSERT_EQ(mutant.find(R"("compilerSupport": {)"), std::string::npos);
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<no-block>");
+        ASSERT_FALSE(bad.has_value()) << "the compilerSupport row named by NO block is inert config";
+        bool namedTheTable = false;
+        for (auto const& d : bad.error())
+            if (d.path == "/runtimeLibraries" && d.message.find("compilerSupport") != std::string::npos)
+                namedTheTable = true;
+        EXPECT_TRUE(namedTheTable) << "the refusal must name the table and the role";
     }
 }

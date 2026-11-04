@@ -211,8 +211,10 @@ ObjectFormatSchema::loadShipped(std::string_view name) {
 namespace {
 
 [[nodiscard]] std::string providerSpelling(RuntimeLibraryBinding const& row) {
-    return row.source.empty() ? ("image '" + row.image + "'")
-                              : ("shipped source '" + row.source + "'");
+    if (row.sources.empty()) return "image '" + row.image + "'";
+    std::string units;
+    for (auto const& s : row.sources) units += (units.empty() ? "'" : ", '") + s + "'";
+    return (row.sources.size() == 1 ? "shipped source " : "shipped sources ") + units;
 }
 
 } // namespace
@@ -285,7 +287,7 @@ ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
                 declaredBy.push_back(std::string{candidate.name()});
                 continue;
             }
-            if (existing->image == row.image && existing->source == row.source) {
+            if (existing->image == row.image && existing->sources == row.sources) {
                 continue;
             }
             auto const at = static_cast<std::size_t>(

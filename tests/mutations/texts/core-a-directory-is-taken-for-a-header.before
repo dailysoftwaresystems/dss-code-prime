@@ -1,0 +1,1 @@
+    if (*reaches == core::EntryKind::Directory) return HeaderSearchResult::notFound();

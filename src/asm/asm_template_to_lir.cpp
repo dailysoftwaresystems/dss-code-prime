@@ -205,6 +205,23 @@ enum class CfClass : std::uint8_t {
     return false;
 }
 
+// ★★ DOES A VARIANT OF THIS OPCODE TAKE A SYMBOL OPERAND (P69 fold H5)? On a RETURN-class opcode -- a terminator
+// with no successor -- that is the target's statement of a branch OUT of the function: a tail branch to the
+// symbol's code, relocated against it, the way gas assembles `jmp ext`. It is how a direct branch whose target is
+// no block of the open function is built (`ResolvedRow::tailBranch`). A return that takes no symbol is a return.
+[[nodiscard]] bool takesASymbolOperand(TargetOpcodeInfo const& info) noexcept {
+    for (auto const& v : info.encoding.variants) {
+        for (auto const k : v.operandKinds) {
+            if (k == OperandKindFilter::SymbolRef) return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool isTailBranchOpcode(TargetOpcodeInfo const& info) noexcept {
+    return cfClassOf(info) == CfClass::Return && takesASymbolOperand(info);
+}
+
 [[nodiscard]] constexpr std::string_view cfClassName(CfClass c) noexcept {
     switch (c) {
     case CfClass::Plain:       return "a plain instruction";
@@ -267,6 +284,13 @@ struct ResolvedRow {
     // unwired block operand is the binding marker of an interior label's
     // address (`[symbol, blockref]`), not this.
     bool                          addressesBlocks = false;
+    // ★★ THE DIRECT BRANCH'S WAY OUT OF ITS FUNCTION (P69 fold H5). A row whose direct class is a branch MAY also
+    // name a RETURN-class opcode that takes a SYMBOL -- the target's tail branch (`isTailBranchOpcode`). It is no
+    // third class: a direct branch whose target the host says LEAVES the function (`branchLeavesTheFunction`: a
+    // function entry, or a name the unit does not define) is built as that terminator, relocated against the
+    // symbol, with no successor; every other target stays a block of this function. A row that names none keeps
+    // refusing such a branch, by name.
+    bool                          tailBranch = false;
 
     [[nodiscard]] bool anyClass() const noexcept {
         return directClass.has_value() || indirectClass.has_value();
@@ -427,6 +451,7 @@ struct AsmInstructionLowering::Impl {
             std::array<std::optional<CfClass>, 2> cls{};
             std::array<std::string_view, 2>       clsFrom{};
             bool                                  mixed = false;
+            std::string_view                      tailFrom;   // the row's tail branch, if it names one
             // Condition-consumption, tracked alongside the class for the same
             // reason: it must be UNANIMOUS across the candidates or the row's
             // `cond` would be honoured for one election and silently dropped
@@ -461,6 +486,12 @@ struct AsmInstructionLowering::Impl {
                     mixed = true;
                     break;
                 }
+                // The tail branch is no class of its own: it is the direct branch's way out of the function,
+                // decided per instruction by where its target is (`ResolvedRow::tailBranch`).
+                if (isTailBranchOpcode(*info)) {
+                    tailFrom = name;
+                    continue;
+                }
                 CfClass const     here = cfClassOf(*info);
                 std::size_t const arm  = isIndirectClass(here) ? 1u : 0u;
                 if (!cls[arm].has_value()) {
@@ -488,6 +519,18 @@ struct AsmInstructionLowering::Impl {
                 }
             }
             if (mixed) continue;
+            if (!tailFrom.empty()) {
+                if (cls[0] != CfClass::Br) {
+                    sink_.fail(NodeId{},
+                         std::format("mnemonic '{}' lists '{}', a return that takes a symbol -- a branch's way "
+                                     "out of its function -- beside no unconditional branch: a tail branch is "
+                                     "the out-of-function arm of a branch spelling, elected when the branch's "
+                                     "target is no block of the function{}",
+                                     row.spelling, tailFrom, sink_.pairSuffix()));
+                    continue;
+                }
+                out.tailBranch = true;
+            }
             out.directClass   = cls[0];
             out.indirectClass = cls[1];
             // ⚠ A KIND-SPLIT ROW IS ONLY DECIDABLE IF THE DIALECT CAN WRITE THE
@@ -3308,7 +3351,10 @@ struct AsmInstructionLowering::Impl {
 
         switch (*cfClass) {
         case CfClass::Return:      buildReturn(ins, armNames, payload, flags); return;
-        case CfClass::Br:          buildBr(ins, armNames, payload, flags); return;
+        case CfClass::Br:
+            buildBr(ins, armNames, resolved.tailBranch ? tailCandidates(row) : std::vector<std::string>{},
+                    payload, flags);
+            return;
         case CfClass::CondBr:      buildCondBr(ins, armNames, payload, flags); return;
         case CfClass::Call:        buildCall(ins, armNames, payload, flags, widthBits); return;
         case CfClass::IndirectBr:  buildIndirectBr(ins, armNames, payload, flags, widthBits); return;
@@ -4055,7 +4101,22 @@ struct AsmInstructionLowering::Impl {
             auto const* info = target_.opcodeInfo(*ordinal);
             if (info == nullptr) continue;
             if (cfClassOf(*info) != cls) continue;
+            if (isTailBranchOpcode(*info)) continue;   // the branch's way out, never a return of its own
             out.push_back(name);
+        }
+        return out;
+    }
+
+    // The candidate opcodes of `row` that are its direct branch's way out of the function -- RETURN-class
+    // opcodes that take a symbol (`ResolvedRow::tailBranch`) -- in the dialect's order, the elector's tie-break.
+    [[nodiscard]] std::vector<std::string> tailCandidates(AsmInstructionSpelling const& row) const {
+        std::vector<std::string> out;
+        for (auto const& name : row.opcodeNames) {
+            auto const ordinal = target_.opcodeByMnemonic(name);
+            if (!ordinal) continue;
+            auto const* info = target_.opcodeInfo(*ordinal);
+            if (info == nullptr) continue;
+            if (isTailBranchOpcode(*info)) out.push_back(name);
         }
         return out;
     }
@@ -4337,13 +4398,24 @@ struct AsmInstructionLowering::Impl {
     }
 
     void buildBr(AsmDecodedInstruction const& ins,
-                 std::vector<std::string> const& names, std::uint32_t payload,
+                 std::vector<std::string> const& names,
+                 std::vector<std::string> const& tailNames, std::uint32_t payload,
                  std::uint8_t flags) {
         if (ins.operands.size() != 1) {
             sink_.fail(ins.node,
                  std::format("'{}' is an unconditional branch and takes exactly "
                              "one target; {} were written{}", ins.mnemonic,
                              ins.operands.size(), sink_.pairSuffix()));
+            return;
+        }
+        // ★★ A BRANCH OUT OF THE FUNCTION IS A TAIL BRANCH, where the target declares one
+        // (`ResolvedRow::tailBranch`): `jmp ext` and `jmp other_fn` leave this function for the symbol's code,
+        // as gas relocates them. The HOST says whether the name leaves -- it owns the label model; every other
+        // target is a block of this function, or is refused by name in `branchTarget`.
+        AsmDecodedOperand const& to = ins.operands[0];
+        if (!tailNames.empty() && !to.indirect && !to.isMemory && !to.symbol.empty()
+            && host_.branchLeavesTheFunction(to.symbol, to.node)) {
+            buildTailBranch(ins, tailNames, payload, flags);
             return;
         }
         auto const target = branchTarget(ins.operands[0], ins.mnemonic);
@@ -4357,6 +4429,33 @@ struct AsmInstructionLowering::Impl {
             return;
         }
         builder_.addBr(elected->opcode, *target, payload, flags);
+        host_.onTerminatorEmitted();
+        host_.onInstructionEmitted();
+    }
+
+    // A direct branch to a SYMBOL (P69 fold H5): a no-successor terminator whose operand is the symbol
+    // `resolveCallee` names -- a function this unit defines, or an import minted for a name it does not (a
+    // branch states CODE, as a call does). ⚠ A constant past the symbol is refused: the branch relocation names
+    // the symbol alone, and `jmp f+4` would enter a function past its first instruction.
+    void buildTailBranch(AsmDecodedInstruction const& ins, std::vector<std::string> const& names,
+                         std::uint32_t payload, std::uint8_t flags) {
+        AsmDecodedOperand const& to = ins.operands[0];
+        if (to.symbolAddend != 0) {
+            sink_.fail(to.node,
+                 std::format("'{}' branches to '{}{:+}', an address a constant past a symbol, and this "
+                             "build's branch relocation names the symbol alone{}", ins.mnemonic, to.symbol,
+                             to.symbolAddend, sink_.pairSuffix()));
+            return;
+        }
+        auto const target = host_.resolveCallee(to.symbol, to.node, ins.mnemonic);
+        if (!target.has_value()) return;
+        OperandList ops;
+        ops.push(*target);
+        auto const elected = electAmong(names, ops, lirInstWidthBits(flags), false, ins);
+        if (!elected.has_value()) return;
+        if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) return;
+        LirOperand const operand = *target;
+        builder_.addReturn(elected->opcode, std::span<LirOperand const>{&operand, 1}, payload, flags);
         host_.onTerminatorEmitted();
         host_.onInstructionEmitted();
     }
@@ -5099,6 +5198,13 @@ public:
     // defines is a BLOCK of the statement's own body and an `asm goto` label is
     // a branch target: neither is a function, and calling one would enter a
     // frame whose prologue never ran — refused by name, never imported.
+    // ★ AN ASSEMBLY TEMPLATE'S BRANCH NEVER LEAVES THE FUNCTION: a jump out of an asm statement goes only
+    // through its `asm goto` labels (GCC manual, Extended Asm -- Goto Labels), so `resolveBranchTarget` answers
+    // every target a template writes, and refuses the rest by that rule.
+    [[nodiscard]] bool branchLeavesTheFunction(std::string const&, NodeId) const override {
+        return false;
+    }
+
     [[nodiscard]] std::optional<LirOperand>
     resolveCallee(std::string const& symbol, NodeId at,
                   std::string_view mnemonic) override {

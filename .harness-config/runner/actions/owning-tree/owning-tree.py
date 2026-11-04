@@ -2437,16 +2437,39 @@ def self_test():
         pin("L19 the walk and the question about one path give one answer on every path", w19)
 
         def w20():
-            tree = owning_tree(__file__)
-            p = run_git(["ls-files", "-z"], cwd=tree, capture_output=True)
-            if p.returncode != 0:
-                return False, "git ls-files exited %d: %s" % (
-                    p.returncode, p.stderr.decode("utf-8", "replace").strip()[:120])
-            tracked = [t for t in p.stdout.decode("utf-8", "surrogateescape").split("\0") if t]
-            ti = TreeIgnores(tree)
-            out = [(t, ti.leaves_out(t, False)) for t in tracked]
-            out = [o for o in out if o[1]]
-            return len(tracked) > 100 and not out, "%d tracked, left out: %r" % (len(tracked), out[:5])
+            # Two trees, one rule: every file git tracks is walked. The FIXTURE half makes the red its own -- a
+            # repository this case builds, whose `.gitignore` holds a directory-only rule and which tracks a FILE
+            # that rule's pattern names -- so a mutant that lets a directory-only rule match a file reds here
+            # whatever the live tree tracks and whatever the worker's index holds. The LIVE half asks this tree.
+            def left_out_of(tree):
+                p = run_git(["ls-files", "-z"], cwd=tree, capture_output=True)
+                if p.returncode != 0:
+                    return None, "git ls-files exited %d: %s" % (
+                        p.returncode, p.stderr.decode("utf-8", "replace").strip()[:120])
+                tracked = [t for t in p.stdout.decode("utf-8", "surrogateescape").split("\0") if t]
+                ti = TreeIgnores(tree)
+                out = [(t, ti.leaves_out(t, False)) for t in tracked]
+                return tracked, [o for o in out if o[1]]
+            fixture = os.path.join(box, "w20")
+            _touch(os.path.join(fixture, ".gitignore"), "build-*/\n")
+            _touch(os.path.join(fixture, "notes", "build-layout.md"), "a file the directory rule's pattern names\n")
+            _touch(os.path.join(fixture, "build-out", "left.o"), "a directory the rule leaves out\n")
+            made = run_git(["init", "-q"], cwd=fixture, capture_output=True)
+            added = run_git(["add", "-A"], cwd=fixture, capture_output=True) if made.returncode == 0 else made
+            if added.returncode != 0:
+                return False, "the fixture repository could not be made: %s" % (
+                    added.stderr.decode("utf-8", "replace").strip()[:120])
+            f_tracked, f_out = left_out_of(fixture)
+            if f_tracked is None:
+                return False, "fixture: " + f_out
+            if "notes/build-layout.md" not in f_tracked or "build-out/left.o" in f_tracked:
+                return False, "the fixture tracks %r: git did not read its rule as the case needs" % (f_tracked,)
+            tracked, out = left_out_of(owning_tree(__file__))
+            if tracked is None:
+                return False, "live: " + out
+            return (len(tracked) > 100 and not out and not f_out,
+                    "fixture: %d tracked, left out: %r; live: %d tracked, left out: %r" % (
+                        len(f_tracked), f_out, len(tracked), out[:5]))
         pin("L20 LIVE: no file git tracks in this tree is left out of a walk -- a rule of its .gitignore "
             "cannot silence a tracked file", w20)
 

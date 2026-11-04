@@ -178,7 +178,7 @@ void forEachDescriptor(std::function<void(fs::path const&, json const&)> const& 
 // ── THE SECOND KIND OF DECLARER ──────────────────────────────────────────────
 //
 // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: an object format's
-// `runtimeLibraries[].source` names a file in this SAME tree, for a runtime role
+// `runtimeLibraries[].source` / `.sources` names a file in this SAME tree, for a runtime role
 // whose entry points the COMPILER MINTS — so there is no descriptor row to hang
 // the realization off, and R1/R2 must see the format documents or the sweep
 // refuses a file the config legitimately names.
@@ -204,6 +204,41 @@ void forEachDescriptor(std::function<void(fs::path const&, json const&)> const& 
 // pe64 flavours (✔MEASURED), and folding them to one entry would have made a
 // refusal name one arbitrary document while the other three went unmentioned.
 // R1 resolving the same path four times is four `is_regular_file` calls.
+// P69 H5: a row's units in the LOADER's shapes (src/link/object_format_schema_json.cpp, `runtimeLibraries`): one
+// unit is `source`; a body of several is `sources`, an array of TWO OR MORE non-empty paths; never both. A row in
+// another shape is one the loader refuses, so the reader says why (`refusal`) instead of reading it some way of its
+// own -- a second reader that accepted more than the first is how the sweep would come to guard a document the
+// compiler refuses.
+[[nodiscard]] std::vector<std::string> formatRowUnits(nlohmann::json const& row, std::string& refusal) {
+    std::vector<std::string> units;
+    if (!row.is_object()) return units;
+    bool const one  = row.contains("source");
+    bool const many = row.contains("sources");
+    if (one && many) {
+        refusal = "names both `source` and `sources`";
+        return {};
+    }
+    if (one) {
+        if (row.at("source").is_string() && !row.at("source").get<std::string>().empty())
+            units.push_back(row.at("source").get<std::string>());
+        return units;
+    }
+    if (!many) return units;
+    auto const& list = row.at("sources");
+    if (!list.is_array() || list.size() < 2) {
+        refusal = "`sources` must be an array of two or more units (one unit is `source`)";
+        return {};
+    }
+    for (auto const& s : list) {
+        if (!s.is_string() || s.get<std::string>().empty()) {
+            refusal = "`sources` holds a unit that is not a non-empty path";
+            return {};
+        }
+        units.push_back(s.get<std::string>());
+    }
+    return units;
+}
+
 [[nodiscard]] std::vector<dss::ffi::ShippedSourceDeclaration>
 formatRealizedSources() {
     std::vector<dss::ffi::ShippedSourceDeclaration> out;
@@ -227,17 +262,22 @@ formatRealizedSources() {
         if (!doc.at("runtimeLibraries").is_array()) continue;
         std::string const document = it->path().filename().generic_string();
         for (auto const& row : doc.at("runtimeLibraries")) {
-            if (!row.is_object() || !row.contains("source")) continue;
-            if (!row.at("source").is_string()) continue;
-            auto src = row.at("source").get<std::string>();
-            if (src.empty()) continue;
+            std::string refusal;
+            auto units = formatRowUnits(row, refusal);
+            if (!refusal.empty()) {
+                ADD_FAILURE() << "object format document '" << document << "': a runtimeLibraries row " << refusal
+                              << " -- the loader refuses that shape, so no reader may take it";
+                continue;
+            }
             std::string role = "<no role>";
             if (row.contains("role") && row.at("role").is_string())
                 role = row.at("role").get<std::string>();
-            out.push_back(dss::ffi::ShippedSourceDeclaration{
-                "object format document '" + document
-                    + "' runtimeLibraries[" + role + "]",
-                std::move(src)});
+            for (auto& src : units) {
+                out.push_back(dss::ffi::ShippedSourceDeclaration{
+                    "object format document '" + document
+                        + "' runtimeLibraries[" + role + "]",
+                    std::move(src)});
+            }
         }
     }
     std::sort(out.begin(), out.end(),
@@ -330,8 +370,8 @@ TEST(ShippedSourceRealization, EveryRuntimeFileIsNamedByADescriptor) {
         std::string const p = it->path().lexically_normal().generic_string();
         EXPECT_NE(std::find(claimed.begin(), claimed.end(), p), claimed.end())
             << "R2/R4: '" << p << "' is named by NO descriptor's 'realization' "
-               "map and by no object format's runtimeLibraries[].source, "
-               "map, so nothing can ever add it to a build graph. In particular "
+               "map and by no object format's runtimeLibraries[].source / .sources, "
+               "so nothing can ever add it to a build graph. In particular "
                "a HEADER here would sit at an INCLUDE PATH and silently shadow "
                "the descriptor a unit exists to consume.";
     }
@@ -526,4 +566,52 @@ TEST(ShippedSourceRealization, FastReaderAgreesWithTheDeclaredClaims) {
                 << ": the driver's fast reader disagrees with the descriptor.";
         }
     });
+}
+
+// ── P69 H5: A BODY OF SEVERAL UNITS ─────────────────────────────────────────
+//
+// The reader takes a row's units in the loader's shapes and no other: `source` (one), `sources` (two or more), never
+// both. Each refused shape is the loader's own refusal (tests/link/test_runtime_library_roles.cpp,
+// `RuntimeLibraryRoles.ARowOfSeveralUnitsHasOneSpellingAndTheOthersAreRefused`), so the sweep cannot guard a row the
+// compiler would never load.
+TEST(ShippedSourceRealization, AFormatRowsUnitsAreReadInTheLoadersShapesOnly) {
+    struct Case { char const* row; std::vector<std::string> units; bool refused; };
+    Case const cases[] = {
+        {R"({"role": "atomicsRuntime", "source": "runtime/platform/src/atomic.c"})",
+         {"runtime/platform/src/atomic.c"}, false},
+        {R"({"role": "compilerSupport", "sources": ["a.c", "b.s"]})", {"a.c", "b.s"}, false},
+        {R"({"role": "cLibrary", "image": "ucrtbase.dll"})", {}, false},
+        {R"({"role": "compilerSupport", "sources": ["a.c"]})", {}, true},
+        {R"({"role": "compilerSupport", "sources": "a.c"})", {}, true},
+        {R"({"role": "compilerSupport", "sources": ["a.c", ""]})", {}, true},
+        {R"({"role": "compilerSupport", "source": "a.c", "sources": ["b.c", "c.s"]})", {}, true},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(c.row);
+        std::string refusal;
+        auto const units = formatRowUnits(nlohmann::json::parse(c.row), refusal);
+        EXPECT_EQ(units, c.units);
+        EXPECT_EQ(!refusal.empty(), c.refused) << refusal;
+    }
+}
+
+// The three units of the pe `compilerSupport` row are named by NO `source` key and by no descriptor -- only by the
+// four pe64 documents' `sources` arrays -- and each is a declaration of each document, so the R2/R4 sweep sees them.
+TEST(ShippedSourceRealization, AUnitNamedOnlyInASourcesArrayIsDeclaredByEachPeDocument) {
+    std::vector<std::string> const units{"runtime/platform/src/pe_compiler_support.c",
+                                         "runtime/platform/src/pe_compiler_support_x86_64.s",
+                                         "runtime/platform/src/pe_gcc_unwind.c"};
+    auto const declared = formatRealizedSources();
+    for (auto const& unit : units) {
+        SCOPED_TRACE(unit);
+        std::size_t documents = 0;
+        for (auto const& d : declared) {
+            if (d.source != unit) continue;
+            EXPECT_NE(d.declarer.find("runtimeLibraries[compilerSupport]"), std::string::npos) << d.declarer;
+            EXPECT_NE(d.declarer.find("pe64-x86_64-windows"), std::string::npos) << d.declarer;
+            ++documents;
+        }
+        EXPECT_EQ(documents, 4u) << "each of the four pe64 documents declares the unit";
+        for (auto const& c : allClaims()) EXPECT_NE(c.source, unit) << "no descriptor names it: " << c.descriptor;
+    }
 }

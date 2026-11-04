@@ -26,13 +26,16 @@
 #include "test_support/os_link.hpp"      // links made by the OS: MinGW's library makes none
 #include "test_support/repo_root.hpp"     // the ONE repo/config-root resolver
 #include "test_support/scratch_dir.hpp"   // the per-run scratch root (see ppScratchRoot)
+#include "test_support/test_wait_budget.hpp"   // kWaitBudget: how long a pipe's writer waits for its reader
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cerrno>        // the unreadable-header pin: EACCES
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <exception>     // the unreadable-header pin: an escaping exception is the red
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -41,9 +44,21 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <system_error>  // the unreadable-header pin: the OS's reason, spelled
 #include <tuple>         // the D-PP-EMBED-MACRO-ARG `__has_embed` case table
 #include <type_traits>   // TF-C91: the cSubset() return-shape static_assert
 #include <vector>
+
+#if !defined(_WIN32)
+#include <fcntl.h>      // a named pipe's writer: the device / pipe header pin
+#include <sys/stat.h>   // mkfifo
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <string_view>
+#include <thread>
+#endif
 
 namespace {
 
@@ -8126,6 +8141,283 @@ TEST(Preprocessor, FC179EmbedOfADanglingLinkIsNotFound) {
         std::string const said = msg.substr(0, msg.find(':'));
         EXPECT_EQ(said, "#embed resource not found") << "the embed of the dangling link said: " << said;
     }
+}
+
+// A CANDIDATE NOBODY CAN EXAMINE ENDS EVERY SEARCH OF THIS TIER THAT REACHES IT, NAMED: `#include "..."`, `#include
+// <...>` on the -I path (no descriptor), and `__has_include` of both forms. `first/dss_loop_x.h` is a link that names
+// itself -- a loop on every host -- and `later/dss_loop_x.h` is a real header. ✔MEASURED 2026-10-28
+// (probe-reference-cc, linux-x86_64-debug, gcc 13.3.0 and clang): `-Ifirst -Ilater` with such a candidate is a FATAL
+// error naming it in both, for `#include` and `__has_include` alike; only absence goes on to the later directory.
+// The checkpoint-34 bytes spliced later's header (and answered `__has_include` 1), in silence.
+TEST(Preprocessor, AnIncludeCandidateWhoseReachCannotBeExaminedEndsTheSearchNamingIt) {
+    test_support::ScratchDir   scratch{test_support::Location::Temp, "pp_include_unexaminable"};
+    std::filesystem::path const first = scratch.path() / "first";
+    std::filesystem::path const later = scratch.path() / "later";
+    std::filesystem::create_directories(first);
+    std::filesystem::create_directories(later);
+    { std::ofstream{later / "dss_loop_x.h", std::ios::binary} << "int from_later;\n"; }
+    DSS_ASSERT_LINK_MADE(test_support::makeSymbolicLink(first / "dss_loop_x.h", first / "dss_loop_x.h",
+                                                        test_support::LinkTo::File));
+    std::string const named = "'" + core::genericSpelling(first / "dss_loop_x.h") + "' cannot be examined (";
+    struct Form {
+        char const* text;
+        char const* said;
+    };
+    for (Form const form : {Form{"#include \"dss_loop_x.h\"\nint main_x;\n", "quote include dss_loop_x.h: "},
+                            Form{"#include <dss_loop_x.h>\nint main_x;\n", "system include dss_loop_x.h: "},
+                            Form{"#if __has_include(\"dss_loop_x.h\")\nint yes;\n#endif\nint main_x;\n",
+                                 "__has_include(\"dss_loop_x.h\"): "},
+                            Form{"#if __has_include(<dss_loop_x.h>)\nint yes;\n#endif\nint main_x;\n",
+                                 "__has_include(<dss_loop_x.h>): "}}) {
+        SCOPED_TRACE(form.text);
+        PreprocessResult r;
+        auto const       lexs = ppLexemesWithDirs(form.text, r, {first, later}, {});
+        std::size_t      refusals = 0;
+        std::string      said;
+        for (auto const& d : r.diagnostics->all()) {
+            said += "\n  " + d.actual;
+            if (d.code == DiagnosticCode::P_PreprocessorIncludeError && d.actual.starts_with(form.said)
+                && d.actual.find(named) != std::string::npos)
+                ++refusals;
+        }
+        EXPECT_EQ(refusals, 1u) << "the search was not refused naming the candidate, as \"" << form.said << "...\":"
+                                << said;
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "from_later"), 0) << "the later directory's header was spliced";
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "yes"), 0) << "__has_include answered 1";
+    }
+}
+
+// THE SAME FOR A RESOURCE: `#embed` and `__has_embed` of a resource whose reach cannot be examined end the search
+// there, naming it -- never "not found" and never the later directory's bytes.
+TEST(Preprocessor, AnEmbedResourceWhoseReachCannotBeExaminedEndsTheSearchNamingIt) {
+    test_support::ScratchDir   scratch{test_support::Location::Temp, "pp_embed_unexaminable"};
+    std::filesystem::path const first = scratch.path() / "first";
+    std::filesystem::path const later = scratch.path() / "later";
+    std::filesystem::create_directories(first);
+    std::filesystem::create_directories(later);
+    { std::ofstream{later / "dss_loop_r.bin", std::ios::binary} << "ABC"; }
+    DSS_ASSERT_LINK_MADE(test_support::makeSymbolicLink(first / "dss_loop_r.bin", first / "dss_loop_r.bin",
+                                                        test_support::LinkTo::File));
+    std::string const named = "'" + core::genericSpelling(first / "dss_loop_r.bin") + "' cannot be examined (";
+    {
+        PreprocessResult r;
+        auto const       inner = embedInner(embedInit("#embed \"dss_loop_r.bin\""), r, {first, later});
+        std::string const msg  = firstEmbedMsg(r);
+        EXPECT_TRUE(msg.starts_with("#embed resource dss_loop_r.bin: ") && msg.find(named) != std::string::npos)
+            << "the embed said: " << msg;
+        EXPECT_EQ(joined(inner), "") << "the later directory's bytes were embedded: " << joined(inner);
+    }
+    {
+        PreprocessResult r;
+        auto const       lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"dss_loop_r.bin\") == __STDC_EMBED_NOT_FOUND__\nint notfound;\n"
+            "#else\nint answered;\n#endif\n",
+            r, {first, later}, {});
+        std::size_t refusals = 0;
+        std::string said;
+        for (auto const& d : r.diagnostics->all()) {
+            said += "\n  " + d.actual;
+            if (d.code == DiagnosticCode::P_PreprocessorIncludeError
+                && d.actual.starts_with("__has_embed of dss_loop_r.bin: ") && d.actual.find(named) != std::string::npos)
+                ++refusals;
+        }
+        EXPECT_EQ(refusals, 1u) << "__has_embed was not refused naming the resource:" << said;
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "answered"), 0) << "__has_embed answered found or empty";
+    }
+}
+
+// A CANDIDATE THAT IS A DIRECTORY IS NO HEADER, AND EVERY FORM OF THIS TIER GOES ON PAST IT. ✔MEASURED 2026-10-28
+// (probe-reference-cc, linux-x86_64-debug, run 20261029-000351-99219a41, gcc 13.3.0 and clang): a directory named like
+// the header in the first -I directory is passed over and the later directory's header taken, angle and quote forms
+// alike.
+TEST(Preprocessor, AnIncludeCandidateThatIsADirectoryIsPassedOverInEveryForm) {
+    test_support::ScratchDir    scratch{test_support::Location::Temp, "pp_include_directory_hit"};
+    std::filesystem::path const first = scratch.path() / "first";
+    std::filesystem::path const later = scratch.path() / "later";
+    std::filesystem::create_directories(first / "dss_dir_x.h");
+    std::filesystem::create_directories(later);
+    { std::ofstream{later / "dss_dir_x.h", std::ios::binary} << "int from_later;\n"; }
+    struct Form {
+        char const* text;
+        char const* want;
+    };
+    for (Form const form : {Form{"#include \"dss_dir_x.h\"\n", "from_later"},
+                            Form{"#include <dss_dir_x.h>\n", "from_later"},
+                            Form{"#if __has_include(\"dss_dir_x.h\")\nint yes;\n#endif\n", "yes"},
+                            Form{"#if __has_include(<dss_dir_x.h>)\nint yes;\n#endif\n", "yes"}}) {
+        SCOPED_TRACE(form.text);
+        PreprocessResult r;
+        auto const       lexs = ppLexemesWithDirs(form.text, r, {first, later}, {});
+        std::string      said;
+        for (auto const& d : r.diagnostics->all()) said += "\n  " + d.actual;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "a directory named like the header was refused:" << said;
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), form.want), 1)
+            << "the later directory's header was not what the form found:" << said;
+    }
+}
+
+// A HEADER THAT IS A DEVICE OR A PIPE IS OPENED AND READ -- only a DIRECTORY is passed over. ✔MEASURED 2026-10-28
+// (probe-reference-cc, linux-x86_64-debug, run 20261029-000903-6a85024c, gcc 13.3.0 and clang): `#include
+// "/dev/null"` compiles in both and `__has_include("/dev/null")` is 1 in both; a named pipe fed by a writer is read
+// by clang, which takes such a pipe named x.h before a later x.h (gcc opens it too, and waits on it). The writer
+// below feeds every open of the pipe until the preprocessor returns or the shared wait budget (`kWaitBudget`) passes, so a reader that never opens
+// it ends the case and one blocked in its open is fed, never hung; a reader that closes before the write would raise
+// SIGPIPE, so the case ignores that signal while it runs. POSIX: Windows makes neither in a directory a search can
+// name.
+TEST(Preprocessor, AHeaderThatIsADeviceOrAPipeIsOpenedAndRead) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows makes no device or pipe a header search can name; the POSIX legs ask this";
+#else
+    {
+        PreprocessResult r;
+        auto const       lexs = ppLexemesWithDirs(
+            "#include \"/dev/null\"\nint after;\n#if __has_include(\"/dev/null\")\nint yes;\n#endif\n", r, {}, {});
+        std::string said;
+        for (auto const& d : r.diagnostics->all()) said += "\n  " + d.actual;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "a character device as the header was refused:" << said;
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "after"), 1) << said;
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "yes"), 1) << "__has_include of a device answered 0:" << said;
+    }
+    test_support::ScratchDir    scratch{test_support::Location::Temp, "pp_include_fifo"};
+    std::filesystem::path const pipe = scratch.path() / "dss_fifo.h";
+    ASSERT_EQ(::mkfifo(pipe.c_str(), 0600), 0) << "this host made no named pipe";
+    auto const        priorPipeHandler = std::signal(SIGPIPE, SIG_IGN);
+    std::atomic<bool> done{false};
+    std::atomic<int>  feeds{0};
+    std::thread       writer{[&pipe, &done, &feeds] {
+        auto const deadline = std::chrono::steady_clock::now() + test_support::kWaitBudget;
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            int const fd = ::open(pipe.c_str(), O_WRONLY | O_NONBLOCK);   // succeeds only while a reader holds it
+            if (fd >= 0) {
+                std::string_view const text  = "int from_fifo;\n";
+                ssize_t const          wrote = ::write(fd, text.data(), text.size());
+                static_cast<void>(wrote);
+                ::close(fd);
+                ++feeds;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+    }};
+    PreprocessResult r;
+    auto const       lexs = ppLexemesWithDirs("#include \"" + pipe.generic_string() + "\"\nint after;\n", r, {}, {});
+    done.store(true);
+    writer.join();
+    std::signal(SIGPIPE, priorPipeHandler);
+    std::string said;
+    for (auto const& d : r.diagnostics->all()) said += "\n  " + d.actual;
+    EXPECT_FALSE(r.diagnostics->hasErrors()) << "a named pipe as the header was refused:" << said;
+    EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "from_fifo"), 1)
+        << "the pipe's text was not read once (" << feeds.load() << " feed(s)):" << said;
+    EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "after"), 1) << said;
+#endif
+}
+
+// A NAMED PIPE IS AN #embed RESOURCE, READ ONCE; A DEVICE IS NONE. ✔MEASURED 2026-10-28 (probe-reference-cc,
+// macos-arm64-debug, runs 20261029-002044-5101633a and 20261029-004015-0104a8a8, Apple clang 21.0.0; gcc 13.3 and
+// clang 18.1.3 have no #embed): `#embed` of a pipe fed by a writer embeds its bytes, the writer opened once; `#embed
+// "/dev/null"` and `#embed "/dev/urandom" limit(4)` are refused. `__has_embed` of a pipe: clang answers 2 for every
+// pipe, unopened, and then embeds the fed one's bytes -- DSS answers 1, unopened (EMPTY under `limit(0)`), so its
+// operator and its directive agree (the row records the divergence). Each directive reads the pipe once; `limit(1)`
+// splices its first byte.
+TEST(Preprocessor, ANamedPipeIsAnEmbedResourceReadOnceAndADeviceIsNone) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows makes no named pipe or device in a directory a search can name; the POSIX legs ask this";
+#else
+    test_support::ScratchDir    scratch{test_support::Location::Temp, "pp_embed_fifo"};
+    std::filesystem::path const pipe = scratch.path() / "dss_fifo.bin";
+    ASSERT_EQ(::mkfifo(pipe.c_str(), 0600), 0) << "this host made no named pipe";
+    auto const        priorPipeHandler = std::signal(SIGPIPE, SIG_IGN);
+    std::atomic<bool> done{false};
+    std::atomic<int>  feeds{0};
+    std::thread       writer{[&pipe, &done, &feeds] {
+        auto const deadline = std::chrono::steady_clock::now() + test_support::kWaitBudget;
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            int const fd = ::open(pipe.c_str(), O_WRONLY | O_NONBLOCK);   // succeeds only while a reader holds it
+            if (fd >= 0) {
+                std::string_view const text  = "AB";
+                ssize_t const          wrote = ::write(fd, text.data(), text.size());
+                static_cast<void>(wrote);
+                ::close(fd);
+                ++feeds;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+    }};
+    std::string const name = pipe.generic_string();
+    PreprocessResult  r;
+    auto const        lexs = ppLexemesWithDirs(
+        "#if __has_embed(\"" + name + "\") == 1\nint found;\n#endif\n"
+        "#if __has_embed(\"" + name + "\" limit(0)) == 2\nint empty_at_zero;\n#endif\n"
+        "int a[] = {\n#embed \"" + name + "\"\n};\n"
+        "int b[] = {\n#embed \"" + name + "\" limit(1)\n};\n",
+        r, {}, {});
+    done.store(true);
+    writer.join();
+    std::signal(SIGPIPE, priorPipeHandler);
+    std::string said;
+    for (auto const& d : r.diagnostics->all()) said += "\n  " + d.actual;
+    EXPECT_FALSE(r.diagnostics->hasErrors()) << "a named pipe as the resource was refused:" << said;
+    EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "found"), 1) << "__has_embed of a pipe was not FOUND:" << said;
+    EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "empty_at_zero"), 1) << "limit(0) did not empty it:" << said;
+    EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "65"), 2) << "the pipe's 'A' was not embedded twice:" << said;
+    EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "66"), 1)
+        << "the pipe's 'B' was not embedded once, by the directive with no limit:" << said;
+    EXPECT_EQ(feeds.load(), 2) << "the pipe was opened " << feeds.load()
+                               << " time(s), where the two directives alone read it";
+    {
+        PreprocessResult d;
+        static_cast<void>(ppLexemesWithDirs("int z[] = {\n#embed \"/dev/null\" if_empty(7)\n};\n", d, {}, {}));
+        std::string dsaid;
+        for (auto const& x : d.diagnostics->all()) dsaid += "\n  " + x.actual;
+        EXPECT_TRUE(d.diagnostics->hasErrors()) << "a device was embedded, where no reference embeds one:" << dsaid;
+        EXPECT_NE(dsaid.find("could not be read"), std::string::npos) << dsaid;
+    }
+#endif
+}
+
+// A HEADER THAT IS FOUND BUT CANNOT BE READ IS REFUSED, NAMING IT AND WHY, in both forms -- never an exception out of
+// the preprocessor. ✔MEASURED 2026-10-28 (probe-reference-cc, linux-x86_64-debug, run 20261028-211717-91ff7388, gcc
+// 13.3.0 and clang 18.1.3): an unreadable header is a FATAL error in both, naming it with the OS's reason. The bytes
+// before this threw `SourceBuffer::fromFile`'s exception out of the preprocessor, past the callers' "unreadable"
+// diagnostic, which nothing could reach (✔MEASURED on the Mac, run 20261029-002544-d3909fed, for an angle include
+// found as a directory). POSIX, as a user the permission binds.
+TEST(Preprocessor, AnIncludeThatCannotBeReadIsRefusedNamingItAndWhy) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows grants a read by ACL, which this case does not set; the POSIX legs ask it";
+#else
+    if (::geteuid() == 0) GTEST_SKIP() << "root reads a file whatever its mode: nothing is refused to it";
+    test_support::ScratchDir    scratch{test_support::Location::Temp, "pp_include_unreadable"};
+    std::filesystem::path const dir    = scratch.path() / "inc";
+    std::filesystem::path const header = dir / "dss_noread.h";
+    std::filesystem::create_directories(dir);
+    { std::ofstream{header, std::ios::binary} << "int never;\n"; }
+    std::filesystem::permissions(header, std::filesystem::perms::none, std::filesystem::perm_options::replace);
+    std::string const denied = std::generic_category().message(EACCES);
+    for (char const* text : {"#include \"dss_noread.h\"\nint after;\n", "#include <dss_noread.h>\nint after;\n"}) {
+        SCOPED_TRACE(text);
+        PreprocessResult         r;
+        std::vector<std::string> lexs;
+        std::string              thrown;
+        try {
+            lexs = ppLexemesWithDirs(text, r, {dir}, {});
+        } catch (std::exception const& e) {
+            thrown = e.what();
+        }
+        EXPECT_EQ(thrown, "") << "the unreadable header escaped the preprocessor as an exception";
+        if (!thrown.empty()) continue;
+        std::string said;
+        std::size_t refusals = 0;
+        for (auto const& d : r.diagnostics->all()) {
+            said += "\n  " + d.actual;
+            if (d.code == DiagnosticCode::P_PreprocessorIncludeError && d.actual.find("dss_noread.h") != std::string::npos
+                && d.actual.find(denied) != std::string::npos)
+                ++refusals;
+        }
+        EXPECT_EQ(refusals, 1u) << "the include was not refused naming the header and the OS's reason:" << said;
+        EXPECT_EQ(std::count(lexs.begin(), lexs.end(), "never"), 0) << said;
+    }
+    std::filesystem::permissions(header, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+#endif
 }
 
 // ══ D-PP-EMBED-PARAMS (C23 6.10.4.2–6.10.4.5), closed P60 ═══════════════════

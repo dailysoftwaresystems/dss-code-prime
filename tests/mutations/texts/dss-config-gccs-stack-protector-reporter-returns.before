@@ -1,0 +1,3 @@
+void __stack_chk_fail(void) {
+    failFast(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE);
+}

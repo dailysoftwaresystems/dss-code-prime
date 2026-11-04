@@ -25,6 +25,8 @@
 #if !defined(_WIN32)
 #include <sys/stat.h>   // mkfifo: the special file a POSIX host can make
 #endif
+#include <optional>
+#include <system_error>
 
 namespace fs = std::filesystem;
 using dss::core::EntryKind;
@@ -85,6 +87,24 @@ void writeFile(fs::path const& p, std::string const& text = "x\n") {
     });
     EXPECT_FALSE(walk.error) << walk.where.generic_string() << ": " << walk.error.message();
     return out;
+}
+
+// Every write bit: what a read-only entry has none of.
+constexpr fs::perms kAllWrite = fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write;
+
+// 2001-09-09 00:00:00 UTC, to the second, on the library's file clock: a date every file system a leg's temp
+// directory may sit on can store -- FAT's from 1980, and the 32-bit times of ext4's small inodes, XFS without
+// bigtime and HFS+, which end in 2038 and 2040. Never the file clock's own epoch: that is 1601 under MS STL and
+// 2174 under libstdc++, and a file system without the range fails the set, or clamps it, with no defect to see.
+// Reached from NOW on both clocks -- the distance back to that date on the system clock, taken from the file
+// clock's now -- because the three libraries share no conversion: libstdc++'s file clock has `from_sys`, MS STL's
+// only `from_utc`, and libc++'s (AppleClang 21) neither.
+[[nodiscard]] fs::file_time_type storableDate() {
+    using FileTicks = fs::file_time_type::duration;
+    auto const back =
+        std::chrono::system_clock::now() - std::chrono::sys_days{std::chrono::year{2001} / 9 / 9};
+    auto const dated = fs::file_time_type::clock::now() - std::chrono::duration_cast<FileTicks>(back);
+    return std::chrono::time_point_cast<FileTicks>(std::chrono::floor<std::chrono::seconds>(dated));
 }
 
 } // namespace
@@ -300,15 +320,114 @@ TEST(DirectoryTree, TheRemovalTakesALinkAsItselfAndNeverEmptiesItsTarget) {
 // The plainest tree a removal meets: a root holding a file and a directory that holds one. Every directory is
 // opened ONCE for both its listing and its deletion -- on Windows a listing handle reopened from one opened for
 // the deletion alone is refused, which left every such root listed as nothing and never emptied.
+// ★ AND READ-ONLY ENTRIES, which a git checkout leaves (its pack files): a read-only file and a read-only
+// directory are removed as MS STL's `remove` removes them -- on Windows the read-only attribute does not stop the
+// deletion (the extended disposition that ignores it, or the attribute cleared first), and on POSIX a file's own
+// write bit was never asked. (On POSIX the read-only directory is EMPTY: an entry of a directory without its write
+// bit cannot be unlinked by anyone but root, the same refusal every library's `remove_all` meets. On Windows the
+// read-only directory also holds a read-only file.)
 TEST(DirectoryTree, TheRemovalDeletesARootHoldingAFileAndADirectory) {
     ScratchDir     scratch{Location::Temp, "directory_tree_remove_plain"};
     fs::path const root = scratch.path() / "root";
     writeFile(root / "file.json");
     writeFile(root / "sub" / "inner.json");
+    writeFile(root / "read-only.json");
+    fs::create_directories(root / "read-only-dir");
+#if defined(_WIN32)
+    writeFile(root / "read-only-dir" / "read-only-inner.json");
+    fs::permissions(root / "read-only-dir" / "read-only-inner.json", kAllWrite, fs::perm_options::remove);
+#endif
+    for (fs::path const& readOnly : {root / "read-only.json", root / "read-only-dir"}) {
+        std::error_code pec;
+        fs::permissions(readOnly, kAllWrite, fs::perm_options::remove, pec);
+        ASSERT_FALSE(pec) << readOnly.generic_string() << ": " << pec.message();
+        ASSERT_EQ(fs::status(readOnly).permissions() & fs::perms::owner_write, fs::perms::none)
+            << readOnly.generic_string() << " is still writable: the case asks nothing about a read-only entry";
+    }
     auto const removal = dss::core::removeTree(root);
     EXPECT_EQ(removal.failures, 0u) << "the removal failed " << removal.failures << " time(s), the first at "
                                     << removal.firstPath.generic_string() << ": " << removal.firstError.message();
     EXPECT_EQ(kindOf(root), "absent") << "the removal left the root holding a file and a directory";
+}
+
+// A DIRECTORY ANOTHER HOLDER KEEPS OPEN WITHOUT DELETE SHARING -- a child process's current directory is one --
+// is left WHOLE, and the removal names it with the OS's refusal. ✔MEASURED 2026-10-28 (MSVC 14.51's STL, one
+// probe: a directory held by a handle sharing read|write only, and one that is a child process's current
+// directory): `std::filesystem::remove_all` removes NOTHING under it and fails with ERROR_SHARING_VIOLATION. The
+// removal opens the directory once to list and delete it, so the same refusal leaves the same tree.
+TEST(DirectoryTree, TheRemovalLeavesADirectoryHeldWithoutDeleteSharingWholeAndNamesIt) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX directory has no sharing mode: an open one is removed; the Windows legs ask this";
+#else
+    ScratchDir     scratch{Location::Temp, "directory_tree_remove_held"};
+    fs::path const held = scratch.path() / "held";
+    writeFile(held / "a.json");
+    writeFile(held / "sub" / "b.json");
+    HANDLE const holder = ::CreateFileW(held.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    ASSERT_NE(holder, INVALID_HANDLE_VALUE) << "the directory could not be held: " << ::GetLastError();
+    auto const removal = dss::core::removeTree(held);
+    ::CloseHandle(holder);
+    EXPECT_EQ(removal.failures, 1u) << "the held directory is one failure (" << removal.failures << ", the first "
+                                    << removal.firstPath.generic_string() << ": " << removal.firstError.message()
+                                    << ")";
+    EXPECT_EQ(removal.firstPath, held) << "the failure named " << removal.firstPath.generic_string();
+    EXPECT_EQ(removal.firstError.value(), static_cast<int>(ERROR_SHARING_VIOLATION))
+        << "the refusal was " << removal.firstError.message();
+    for (char const* rel : {"a.json", "sub/b.json"}) {
+        EXPECT_EQ(kindOf(held / rel), "file") << rel << " is " << kindOf(held / rel)
+                                              << ": MS STL leaves a held directory whole, and so does the removal";
+    }
+#endif
+}
+
+// `lastEntry`, THE MARKER OF A HALF-REMOVED TREE: the entry the options name goes LAST, after every other entry of
+// the target -- and when another entry could not be removed it STAYS, and with it the target, so a tree the removal
+// could not finish is still recognisable by its marker (a kept root's `run-info.txt`). Twenty-one entries beside the
+// marker, so a listing that hands the marker out anywhere but last is seen whatever order the file system lists in.
+// The entry that stays is made by the substrate's seam: a file added to `stuck` after its listing, so `stuck` is not
+// empty when its turn comes -- the same on every host, whoever runs the test.
+TEST(DirectoryTree, TheRemovalTakesTheLastEntryLastAndKeepsItWhenAnotherEntryStays) {
+    ScratchDir     scratch{Location::Temp, "directory_tree_remove_last_entry"};
+    fs::path const whole = scratch.path() / "whole";
+    for (int i = 0; i < 20; ++i) writeFile(whole / ("e" + std::to_string(100 + i) + ".json"));
+    writeFile(whole / "run-info.txt", "marker\n");
+    writeFile(whole / "zz" / "inner.json");
+    std::vector<std::string> reached;
+    dss::core::substrate_testing::setRemoveTreeEntryHook([&](fs::path const& entry) {
+        if (entry.parent_path() == whole) reached.push_back(entry.filename().generic_string());
+    });
+    auto const removal = dss::core::removeTree(whole, dss::core::RemovalOptions{fs::path{"run-info.txt"}});
+    dss::core::substrate_testing::setRemoveTreeEntryHook({});
+    std::string order;
+    for (auto const& name : reached) order += " " + name;
+    EXPECT_EQ(removal.failures, 0u) << removal.firstPath.generic_string() << ": " << removal.firstError.message();
+    ASSERT_EQ(reached.size(), 22u) << "the removal reached:" << order;
+    EXPECT_EQ(reached.back(), "run-info.txt") << "the marker was not the last entry the removal reached:" << order;
+    EXPECT_EQ(kindOf(whole), "absent") << "a removal with nothing left over leaves the target " << kindOf(whole);
+
+    fs::path const half  = scratch.path() / "half";
+    fs::path const stuck = half / "stuck";
+    writeFile(half / "run-info.txt", "marker\n");
+    writeFile(stuck / "a.json");
+    for (int i = 0; i < 20; ++i) writeFile(half / ("e" + std::to_string(100 + i) + ".json"));
+    bool added = false;
+    dss::core::substrate_testing::setRemoveTreeEntryHook([&](fs::path const& entry) {
+        if (entry != stuck / "a.json" || added) return;
+        writeFile(stuck / "late.json");   // not in the listing the removal holds: `stuck` stays
+        added = true;
+    });
+    auto const kept = dss::core::removeTree(half, dss::core::RemovalOptions{fs::path{"run-info.txt"}});
+    dss::core::substrate_testing::setRemoveTreeEntryHook({});
+    ASSERT_TRUE(added) << "the seam never saw stuck/a.json";
+    EXPECT_EQ(kept.failures, 1u) << "the one entry that stays is `stuck` (" << kept.failures << " failure(s), the first "
+                                 << kept.firstPath.generic_string() << ": " << kept.firstError.message() << ")";
+    EXPECT_EQ(kept.firstPath, stuck) << "the failure named " << kept.firstPath.generic_string();
+    EXPECT_EQ(kindOf(half / "run-info.txt"), "file")
+        << "the marker is " << kindOf(half / "run-info.txt") << ": a tree the removal could not finish lost the entry "
+           "that says what it is";
+    EXPECT_EQ(kindOf(stuck / "late.json"), "file");
+    EXPECT_EQ(kindOf(half / "e100.json"), "absent") << "every other entry still goes";
 }
 
 // THE RACE, MADE DETERMINISTIC: a directory the removal LISTED as a directory is swapped for a link to a tree
@@ -378,15 +497,14 @@ TEST(DirectoryTree, AnUnreadableLinkEndsTheWalkNamingItUnlessHandedOut) {
 }
 
 // When a file was written is asked of what a path REACHES: a link to a file answers the file's time, never the
-// link's own; a dangling link and nothing at all answer nothing. The file is dated one tick past the library's
-// file clock's own epoch (1601 under MS STL, 2174 under libstdc++, 1970 under libc++ -- not the epoch itself: a
-// FILETIME of zero tells SetFileTime to change nothing), centuries from the link's own time, the moment the case
-// makes it: a value of the file clock's own, with no duration written and no wall clock read.
+// link's own; a dangling link and nothing at all answer nothing. The file is dated 2001-09-09 (`storableDate`: a
+// date every file system a leg's temp directory may sit on can store), decades from the link's own time, the
+// moment the case makes it -- no duration written, the distance read off the clocks themselves.
 TEST(DirectoryTree, AFileLinkWasWrittenWhenItsFileWas) {
     ScratchDir     scratch{Location::Temp, "directory_tree_write_time"};
     fs::path const dir = scratch.path();
     writeFile(dir / "old.bin", "OLD");
-    fs::file_time_type const dated{fs::file_time_type::duration{1}};
+    fs::file_time_type const dated = storableDate();
     std::error_code          set;
     fs::last_write_time(dir / "old.bin", dated, set);
     ASSERT_FALSE(set) << set.message();
@@ -410,6 +528,114 @@ TEST(DirectoryTree, AFileLinkWasWrittenWhenItsFileWas) {
                                                  << ": the link's own time, not its file's";
     EXPECT_EQ(written(dir / "dangling"), "nothing") << "the dangling link was written " << written(dir / "dangling");
     EXPECT_EQ(written(dir / "nothing-here"), "nothing");
+}
+
+// A PATH ON A VOLUME WITH NO DOS NAME -- no drive letter, no folder it is mounted in -- is reached through the
+// volume's NT name, as MS STL's `canonical` reaches it. ✔MEASURED 2026-10-28 (one probe, both Windows libraries,
+// this host's two such volumes): `GetFinalPathNameByHandleW` answers such a path's DOS name with
+// ERROR_PATH_NOT_FOUND and its NT name with `\Device\HarddiskVolumeN\...`; MS STL's `canonical` answers
+// `\\?\GLOBALROOT\Device\HarddiskVolumeN\...` (and its own `weakly_canonical` refuses a tail that does not exist
+// there); MinGW's library re-roots the path onto the C: drive. A host with no such volume, or one this process
+// may not open, has nothing to ask and says so.
+TEST(DirectoryTree, APathOnAVolumeWithNoDosNameIsReachedThroughItsNtName) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "every POSIX path has one spelling from its root; the Windows legs ask this";
+#else
+    std::wstring volume;
+    {
+        std::wstring name(MAX_PATH, L'\0');
+        HANDLE const find = ::FindFirstVolumeW(name.data(), MAX_PATH);
+        ASSERT_NE(find, INVALID_HANDLE_VALUE) << "the volumes could not be listed: " << ::GetLastError();
+        do {
+            std::wstring const candidate = name.c_str();
+            wchar_t            mounts[2048]{};
+            DWORD              length = 0;
+            if (!::GetVolumePathNamesForVolumeNameW(candidate.c_str(), mounts, 2048, &length) || mounts[0] != L'\0')
+                continue;
+            HANDLE const root = ::CreateFileW(candidate.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (root == INVALID_HANDLE_VALUE) continue;
+            ::CloseHandle(root);
+            volume = candidate;
+            break;
+        } while (::FindNextVolumeW(find, name.data(), MAX_PATH));
+        ::FindVolumeClose(find);
+    }
+    if (volume.empty()) GTEST_SKIP() << "this host has no volume without a DOS name that this process may open";
+    for (std::wstring const& tail : {std::wstring{}, std::wstring{L"not-there.txt"}}) {
+        fs::path const  asked = fs::path{volume} / tail;
+        std::error_code ec;
+        fs::path const  reached = dss::core::reachedPath(asked, ec);
+        std::string const what  = tail.empty() ? "the volume's root" : "a name the volume's root does not hold";
+        ASSERT_FALSE(ec) << what << ": reachedPath refused it -- " << ec.message();
+        std::wstring const spelled = reached.wstring();
+        EXPECT_TRUE(spelled.starts_with(L"\\\\?\\GLOBALROOT\\Device\\"))
+            << what << " was reached as " << reached.string() << ", not through the volume's NT name";
+        if (!tail.empty()) {
+            EXPECT_EQ(reached.filename(), fs::path{tail}) << "the name that does not exist was not appended as written";
+        } else {
+            // The answer is a path the OS opens, and it reaches itself: the volume's root again.
+            std::error_code again;
+            fs::path const  twice = dss::core::reachedPath(reached, again);
+            EXPECT_FALSE(again) << "the answer " << reached.string() << " is no path the OS opens: " << again.message();
+            EXPECT_EQ(twice, reached) << "the answer " << reached.string() << " reaches " << twice.string();
+        }
+    }
+#endif
+}
+
+// THE WALK UP OF A PATH THAT DOES NOT EXIST STOPS AT A DIRECTORY, WHATEVER WIN32 SPELLING NAMES THE VOLUME (P69 H5).
+// ✔MEASURED 2026-11-03 (probe-reference-cc run 20261104-021850-b279d3e9, both Windows legs, MinGW's library and
+// MS STL's): the library's `parent_path()` of `\\?\Volume{G}\x`, `\\?\C:\x` and
+// `\\?\GLOBALROOT\Device\HarddiskVolumeN\x` is
+// the volume WITHOUT its separator -- the name the OS opens as the volume's DEVICE, whose handle has no file
+// information and no final path (ERROR_INVALID_FUNCTION) -- and the same name WITH its separator is the volume's root
+// directory. THE TABLE IS THE UNIVERSE of the file namespace's spellings of one volume -- its drive, `\\?\` and its
+// drive, its GUID name, its NT name -- on the volume this test's scratch lies on: for a name its root does not hold,
+// each reaches where the drive spelling does. (`\\.\` is the DEVICE namespace, no spelling of a file path.)
+TEST(DirectoryTree, EverySpellingOfAVolumeWalksUpToItsRootDirectory) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX path has one spelling of its root; the Windows legs ask this";
+#else
+    ScratchDir     scratch{Location::Temp, "directory_tree_volume_spellings"};
+    fs::path const root = scratch.path().root_path();
+    if (root.native().size() != 3u || root.native()[1] != L':')
+        GTEST_SKIP() << "this host's scratch lies on no drive letter (" << root.string() << "): no spelling to compare";
+    std::wstring const absent = L"dss-absent-" + std::to_wstring(::GetCurrentProcessId());
+    ASSERT_FALSE(fs::exists(root / absent)) << "the name this case asks for is held by the volume's root";
+    std::error_code ec;
+    fs::path const  expected = dss::core::reachedPath(root / absent / L"x.txt", ec);
+    ASSERT_FALSE(ec) << "the drive spelling was refused: " << ec.message();
+    ASSERT_EQ(expected.parent_path().parent_path(), dss::core::reachedPath(root, ec)) << "the drive spelling walked "
+                                                                                          "up to no root";
+    wchar_t guid[MAX_PATH]{};
+    ASSERT_TRUE(::GetVolumeNameForVolumeMountPointW(root.c_str(), guid, MAX_PATH)) << "no GUID name: "
+                                                                                  << ::GetLastError();
+    std::wstring nt(1024, L'\0');
+    {
+        HANDLE const h = ::CreateFileW(root.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        ASSERT_NE(h, INVALID_HANDLE_VALUE) << "the root did not open: " << ::GetLastError();
+        DWORD const n = ::GetFinalPathNameByHandleW(h, nt.data(), static_cast<DWORD>(nt.size()),
+                                                    FILE_NAME_NORMALIZED | VOLUME_NAME_NT);
+        ::CloseHandle(h);
+        ASSERT_NE(n, 0u) << "the root's NT name was not given: " << ::GetLastError();
+        nt.resize(n);
+    }
+    std::wstring const drive = root.native().substr(0, 2);
+    struct Spelling { char const* what; std::wstring rootSpelled; };
+    for (Spelling const& s : {Spelling{"\\\\?\\ and the drive", L"\\\\?\\" + drive + L"\\"},
+                              Spelling{"the GUID name", std::wstring{guid}},
+                              Spelling{"the NT name", L"\\\\?\\GLOBALROOT" + nt}}) {
+        SCOPED_TRACE(s.what);
+        fs::path const asked = fs::path{s.rootSpelled + absent + L"\\x.txt"};
+        std::error_code askedEc;
+        fs::path const  reached = dss::core::reachedPath(asked, askedEc);
+        ASSERT_FALSE(askedEc) << "refused -- " << askedEc.message() << " (the walk stopped at the volume's device)";
+        EXPECT_EQ(reached, expected) << "reached " << reached.string() << ", where the drive spelling reaches "
+                                     << expected.string();
+    }
+#endif
 }
 
 // Two paths reach ONE file when a link, a hard link or a second spelling leads to it; a dangling link reaches
@@ -509,5 +735,100 @@ TEST(DirectoryTree, AFifoIsOtherNeverAFile) {
     auto const seen = walked(dir);
     ASSERT_EQ(seen.count("pipe"), 1u) << "the walk did not hand the FIFO out";
     EXPECT_EQ(seen.at("pipe"), "other/other") << "the walk handed the FIFO out as " << seen.at("pipe");
+#endif
+}
+
+// AN ENTRY IS ASKED AS ITSELF: ITS IDENTITY, ITS STORED NAME AND ITS DIRECTORY'S CASE RULE, WITH NO LISTING
+// (path_identity.hpp's table). `sameEntry` never follows a link -- a link and what it reaches are two entries -- and
+// a folding directory's two spellings of one name are one; `storedEntryName` answers the link's OWN name, never its
+// target's, and on a folding host the stored case of a name asked under the other -- on the Mac also for an entry
+// whose open is refused (mode 0); `directoryFoldsCase` answers the directory's own rule where the host has the
+// question; `reachedPipe` tells a named pipe from every other kind. The header search asks these where a listing is
+// refused (test_header_name_matching.cpp).
+TEST(DirectoryTree, AnEntrysIdentityStoredNameAndCaseRuleAreAskedOfTheEntry) {
+    ScratchDir     scratch{Location::Temp, "directory_tree_stored_name"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / "x.h");
+    writeFile(dir / "z.h");
+    fs::create_directories(dir / "Sub");
+    DSS_ASSERT_LINK_MADE(makeSymbolicLink(dir / "x.h", dir / "L.h", LinkTo::File));
+    bool const folds = fs::exists(dir / "X.H");   // the host's own lookup of the other spelling, asked once
+    SCOPED_TRACE(folds ? "this host folds case" : "this host keeps case");
+    std::error_code ec;
+    EXPECT_FALSE(dss::core::sameEntry(dir / "L.h", dir / "x.h", ec)) << "a link was followed to what it reaches";
+    EXPECT_FALSE(ec) << ec.message();
+    EXPECT_TRUE(dss::core::sameEntry(dir / "x.h", dir / "x.h", ec));
+    EXPECT_EQ(dss::core::sameEntry(dir / "x.h", dir / "X.H", ec), folds) << "the other case of one name";
+    EXPECT_FALSE(dss::core::sameEntry(dir / "x.h", dir / "absent.h", ec));
+    EXPECT_FALSE(ec) << "an absent entry was an error: " << ec.message();
+    auto const stored = [&](char const* name) -> std::string {
+        std::optional<fs::path::string_type> const s = dss::core::storedEntryName(dir / name, ec);
+        if (ec) return "error: " + ec.message();
+        return s ? fs::path{*s}.generic_string() : "nothing";
+    };
+#if defined(_WIN32) || defined(__APPLE__)
+    EXPECT_EQ(stored("x.h"), "x.h");
+    EXPECT_EQ(stored("L.h"), "L.h") << "the link's own name";
+    EXPECT_EQ(stored("absent.h"), "nothing");
+    if (folds) {
+        EXPECT_EQ(stored("X.H"), "x.h");
+        EXPECT_EQ(stored("SUB"), "Sub");
+        EXPECT_EQ(stored("l.H"), "L.h") << "the link itself, never what it reaches";
+    }
+#if defined(__APPLE__)
+    // No descriptor is asked for (getattrlist): an entry whose open is refused still answers.
+    fs::permissions(dir / "z.h", fs::perms::none, fs::perm_options::replace);
+    EXPECT_EQ(stored(folds ? "Z.H" : "z.h"), "z.h") << "a mode-0 file";
+    fs::permissions(dir / "z.h", fs::perms::owner_all, fs::perm_options::replace);
+#endif
+#else
+    EXPECT_EQ(stored("x.h"), "nothing") << "this host tells no stored name (path_identity.hpp)";
+#endif
+    std::optional<bool> const rule = dss::core::directoryFoldsCase(dir, ec);
+#if defined(_WIN32) || defined(__APPLE__)
+    ASSERT_FALSE(ec) << "the directory's own case rule was refused: " << ec.message();
+    ASSERT_TRUE(rule.has_value()) << "no case rule on a host that has the question";
+    EXPECT_EQ(*rule, folds) << "the directory's own rule disagrees with its lookup";
+#else
+    EXPECT_FALSE(rule.has_value()) << "a case rule on a host that has no such question";
+    EXPECT_FALSE(ec) << ec.message();
+#endif
+    EXPECT_FALSE(dss::core::reachedPipe(dir / "x.h", ec)) << "a file read as a pipe";
+    EXPECT_FALSE(dss::core::reachedPipe(dir / "Sub", ec)) << "a directory read as a pipe";
+#if !defined(_WIN32)
+    ASSERT_EQ(::mkfifo((dir / "pipe").c_str(), 0600), 0) << "this host made no FIFO";
+    EXPECT_TRUE(dss::core::reachedPipe(dir / "pipe", ec)) << "a FIFO not read as a pipe";
+    EXPECT_FALSE(dss::core::reachedPipe("/dev/null", ec)) << "a device read as a pipe";
+#endif
+}
+
+// A DIRECTORY A USER MADE CASE-SENSITIVE SAYS SO (Windows). ✔MEASURED 2026-10-28 (probe-reference-cc, -D_WIN32_WINNT
+// =0x0A00): through the documented class (23) both Windows toolchains let a user make a directory case-sensitive and
+// then answer 1 for it; MinGW-w64 13.2's header enumerator is 21, another class, which a query refuses (error 87) --
+// the reason the substrate spells the class by value.
+TEST(DirectoryTree, ADirectoryMadeCaseSensitiveAnswersThatItKeepsCase) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a per-directory case rule a user sets is Windows'; the Mac's is its volume's";
+#else
+    ScratchDir     scratch{Location::Temp, "directory_tree_case_sensitive"};
+    fs::path const dir = scratch.path() / "cs";
+    fs::create_directories(dir);
+    HANDLE const h = ::CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    ASSERT_NE(h, INVALID_HANDLE_VALUE) << "the directory could not be opened: error " << ::GetLastError();
+    FILE_CASE_SENSITIVE_INFO on{};
+    on.Flags        = FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+    BOOL const  set = ::SetFileInformationByHandle(h, static_cast<FILE_INFO_BY_HANDLE_CLASS>(23), &on, sizeof on);
+    DWORD const why = set ? 0 : ::GetLastError();
+    ::CloseHandle(h);
+    if (!set) GTEST_SKIP() << "this host will not let a user make a directory case-sensitive (error " << why << ")";
+    std::error_code           ec;
+    std::optional<bool> const rule = dss::core::directoryFoldsCase(dir, ec);
+    ASSERT_FALSE(ec) << "the directory's own case rule was refused: " << ec.message();
+    ASSERT_TRUE(rule.has_value());
+    EXPECT_FALSE(*rule) << "a case-sensitive directory answered that it folds";
+    std::error_code eca;
+    EXPECT_TRUE(dss::core::directoryFoldsCase(scratch.path(), eca).value_or(false)) << "its parent still folds";
 #endif
 }

@@ -69,7 +69,13 @@
     { "name": "EXCEPTION_RECORD", "type": "struct \"EXCEPTION_RECORD\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u32 \"unsigned long\", arr<u64 \"unsigned long long\", 15> }" },
     { "name": "EXCEPTION_POINTERS", "type": "struct \"EXCEPTION_POINTERS\" { ptr<struct \"EXCEPTION_RECORD\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u32 \"unsigned long\", arr<u64 \"unsigned long long\", 15> }>, ptr<void> }" },
     { "name": "PEXCEPTION_POINTERS", "type": "ptr<void>" },
-    { "name": "LPEXCEPTION_POINTERS", "type": "ptr<void>" }
+    { "name": "LPEXCEPTION_POINTERS", "type": "ptr<void>" },
+    { "name": "DWORD64", "type": "u64 \"unsigned long long\"" },
+    { "name": "EXCEPTION_DISPOSITION", "type": "i32" },
+    { "name": "RUNTIME_FUNCTION", "type": "struct \"RUNTIME_FUNCTION\" { u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\" }" },
+    { "name": "PRUNTIME_FUNCTION", "type": "ptr<RUNTIME_FUNCTION>" },
+    { "name": "DISPATCHER_CONTEXT", "type": "struct \"DISPATCHER_CONTEXT\" { u64 \"unsigned long long\", u64 \"unsigned long long\", ptr<struct \"RUNTIME_FUNCTION\" { u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\" }>, u64 \"unsigned long long\", u64 \"unsigned long long\", ptr<void>, ptr<void>, ptr<void>, ptr<void>, u32 \"unsigned long\", u32 \"unsigned long\" }" },
+    { "name": "PDISPATCHER_CONTEXT", "type": "ptr<DISPATCHER_CONTEXT>" }
   ],
   "structs": [
     {
@@ -223,6 +229,30 @@
         { "name": "ExceptionRecord", "type": "ptr<struct \"EXCEPTION_RECORD\" { u32 \"unsigned long\", u32 \"unsigned long\", ptr<void>, ptr<void>, u32 \"unsigned long\", arr<u64 \"unsigned long long\", 15> }>" },
         { "name": "ContextRecord", "type": "ptr<void>" }
       ]
+    },
+    {
+      "name": "RUNTIME_FUNCTION",
+      "fields": [
+        { "name": "BeginAddress", "type": "u32 \"unsigned long\"" },
+        { "name": "EndAddress", "type": "u32 \"unsigned long\"" },
+        { "name": "UnwindData", "type": "u32 \"unsigned long\"" }
+      ]
+    },
+    {
+      "name": "DISPATCHER_CONTEXT",
+      "fields": [
+        { "name": "ControlPc", "type": "u64 \"unsigned long long\"" },
+        { "name": "ImageBase", "type": "u64 \"unsigned long long\"" },
+        { "name": "FunctionEntry", "type": "ptr<struct \"RUNTIME_FUNCTION\" { u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\" }>" },
+        { "name": "EstablisherFrame", "type": "u64 \"unsigned long long\"" },
+        { "name": "TargetIp", "type": "u64 \"unsigned long long\"" },
+        { "name": "ContextRecord", "type": "ptr<void>" },
+        { "name": "LanguageHandler", "type": "ptr<void>" },
+        { "name": "HandlerData", "type": "ptr<void>" },
+        { "name": "HistoryTable", "type": "ptr<void>" },
+        { "name": "ScopeIndex", "type": "u32 \"unsigned long\"" },
+        { "name": "Fill0", "type": "u32 \"unsigned long\"" }
+      ]
     }
   ],
   "symbols": [
@@ -340,7 +370,9 @@
     { "name": "SetEvent", "signature": "fn(ptr<void>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "LockFile", "signature": "fn(ptr<void>, u32, u32, u32, u32) -> i32", "kind": "function", "linkage": "external" },
     { "name": "UnlockFile", "signature": "fn(ptr<void>, u32, u32, u32, u32) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "GetDriveTypeW", "signature": "fn(ptr<u16>) -> u32", "kind": "function", "linkage": "external" }
+    { "name": "GetDriveTypeW", "signature": "fn(ptr<u16>) -> u32", "kind": "function", "linkage": "external" },
+    { "name": "RaiseFailFastException", "signature": "fn(ptr<EXCEPTION_RECORD>, ptr<void>, u32) -> void", "kind": "function", "linkage": "external" },
+    { "name": "__C_specific_handler", "signature": "fn(ptr<EXCEPTION_RECORD>, ptr<void>, ptr<void>, ptr<DISPATCHER_CONTEXT>) -> i32", "kind": "function", "linkage": "external" }
   ],
   "macros": [
     { "name": "INVALID_HANDLE_VALUE", "replacement": "((HANDLE)-1)" },
@@ -469,6 +501,18 @@
     { "name": "DRIVE_FIXED", "value": 3, "type": "i32" },
     { "name": "DRIVE_REMOTE", "value": 4, "type": "i32" },
     { "name": "DRIVE_CDROM", "value": 5, "type": "i32" },
-    { "name": "DRIVE_RAMDISK", "value": 6, "type": "i32" }
+    { "name": "DRIVE_RAMDISK", "value": 6, "type": "i32" },
+    { "name": "ExceptionContinueExecution", "value": 0, "type": "i32", "preprocessorVisible": false },
+    { "name": "ExceptionContinueSearch", "value": 1, "type": "i32", "preprocessorVisible": false },
+    { "name": "ExceptionNestedException", "value": 2, "type": "i32", "preprocessorVisible": false },
+    { "name": "ExceptionCollidedUnwind", "value": 3, "type": "i32", "preprocessorVisible": false },
+    { "name": "EXCEPTION_UNWINDING", "value": 2, "type": "i32" },
+    { "name": "EXCEPTION_EXIT_UNWIND", "value": 4, "type": "i32" },
+    { "name": "EXCEPTION_TARGET_UNWIND", "value": 32, "type": "i32" },
+    { "name": "EXCEPTION_COLLIDED_UNWIND", "value": 64, "type": "i32" },
+    { "name": "EXCEPTION_UNWIND", "value": 102, "type": "i32" },
+    { "name": "STATUS_STACK_BUFFER_OVERRUN", "value": 3221226505, "type": "u32 \"unsigned long\"" },
+    { "name": "FAST_FAIL_STACK_COOKIE_CHECK_FAILURE", "value": 2, "type": "i32" },
+    { "name": "FAST_FAIL_RANGE_CHECK_FAILURE", "value": 8, "type": "i32" }
   ]
 }

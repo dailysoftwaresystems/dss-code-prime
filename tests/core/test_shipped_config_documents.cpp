@@ -140,3 +140,25 @@ TEST(ShippedConfigDocuments, ALinkIsADocumentByWhatItReachesAndADanglingLinkIsNo
     EXPECT_EQ(stemsOf(*got), (std::vector<std::string>{"c", "via-link"}))
         << "the listing took " << got->size() << " documents:" << took;
 }
+
+// A DOCUMENT WHOSE REACH CANNOT BE EXAMINED IS REFUSED BY NAME, never skipped as "no document": a looping link
+// named like a document is a document nobody can read, so which documents the directory holds cannot be told --
+// what gcc and clang answer for an include candidate that loops (✔MEASURED 2026-10-28, gcc 13.3 and clang on
+// linux-x86_64-debug: a fatal error naming the path, "Too many levels of symbolic links"). Absence (a dangling
+// link, the case above) stays absence. The link is made by the OS; a link to itself loops on every host.
+TEST(ShippedConfigDocuments, ADocumentWhoseReachCannotBeExaminedIsRefusedNamingIt) {
+    ScratchDir const scratch{Location::Temp, "shipped-config-documents"};
+    fs::path const dir = scratch.path() / "sources";
+    plant(dir / "c.lang.json");
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "loop.lang.json", dir / "loop.lang.json",
+                                                             LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "other.json", dir / "other.json", LinkTo::File));
+
+    auto const got = shippedConfigDocuments(dir, ".lang.json");
+    ASSERT_FALSE(got.has_value()) << "a document that loops was skipped: the listing answered " << got->size()
+                                  << " document(s)";
+    EXPECT_NE(got.error().find("loop.lang.json"), std::string::npos) << got.error();
+    EXPECT_EQ(got.error().find("other.json"), std::string::npos)
+        << "an entry not named as a document of the kind was asked about: " << got.error();
+}

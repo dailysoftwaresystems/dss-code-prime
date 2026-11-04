@@ -500,43 +500,21 @@ namespace {
 
 #ifdef _WIN32
 
-// `FileRenameInfoEx` and its two flags are SPELLED HERE because both
-// toolchains' headers declare them only when a build targets Windows 10 RS1 or
-// later, and this tree names no target version: MinGW-w64's `_mingw.h`
-// defaults `_WIN32_WINNT` to 0x0601, which hides the enumerator. ✔MEASURED
-// which checks below are live: MSVC 14.51 (SDK 10.0.26100) declares all three,
-// so all three asserts run; MinGW-w64 13.2 declares the two flag macros — only
-// because their gate names `_WIN32_WINNT_WIN10_RS1`, which it never defines and
-// the preprocessor reads as 0 — so the flag asserts run there too. The values
-// are the documented ABI either way.
-constexpr auto  kFileRenameInfoEx          = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
-constexpr DWORD kRenameFlagReplaceIfExists = 0x00000001;
-constexpr DWORD kRenameFlagPosixSemantics  = 0x00000002;
-#ifdef FILE_RENAME_FLAG_POSIX_SEMANTICS
-static_assert(FILE_RENAME_FLAG_REPLACE_IF_EXISTS == kRenameFlagReplaceIfExists);
-static_assert(FILE_RENAME_FLAG_POSIX_SEMANTICS == kRenameFlagPosixSemantics);
-#endif
-#if defined(NTDDI_VERSION) && defined(NTDDI_WIN10_RS1)
-#if NTDDI_VERSION >= NTDDI_WIN10_RS1
+// `FileRenameInfoEx` (Windows 10 RS1) is SPELLED BY VALUE because MinGW-w64's
+// FILE_INFO_BY_HANDLE_CLASS ends before it at every version: ✔MEASURED
+// 2026-10-28, MinGW-w64 13.2 at _WIN32_WINNT 0x0601, 0x0A00 and 0x0A00 with
+// NTDDI_VERSION RS5 (probe-reference-cc run 20261028-215651-aa544959). The
+// Windows SDK's headers declare it (MSVC 19.51, run 20261028-215632-ef25bfcc),
+// and there the value is the header's, by the assert. Everything else the
+// rename hands over is the headers' own on both toolchains at the version the
+// build declares (the top-level CMakeLists): FILE_RENAME_INFO with its RS1
+// `Flags` member (the union with the classic class's `ReplaceIfExists`) and the
+// FILE_RENAME_FLAG_* flags (runs 20261028-220157-d478c33e and
+// 20261028-220208-b3938c42).
+constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+#ifndef __MINGW32__
 static_assert(FileRenameInfoEx == kFileRenameInfoEx);
 #endif
-#endif
-
-// `FILE_RENAME_INFO` as the RS1 headers declare it — the first member is the
-// union of the classic class's `BOOLEAN ReplaceIfExists` and the Ex class's
-// `DWORD Flags` — spelled here for the same reason, and held to the header's
-// own layout.
-struct RenameInfo {
-    DWORD  Flags;
-    HANDLE RootDirectory;
-    DWORD  FileNameLength;  // in bytes, without the terminator
-    WCHAR  FileName[1];
-};
-static_assert(offsetof(RenameInfo, RootDirectory)
-              == offsetof(FILE_RENAME_INFO, RootDirectory));
-static_assert(offsetof(RenameInfo, FileNameLength)
-              == offsetof(FILE_RENAME_INFO, FileNameLength));
-static_assert(offsetof(RenameInfo, FileName) == offsetof(FILE_RENAME_INFO, FileName));
 
 // The Win32 error BY NUMBER first: the text is localized (this workstation's is
 // Portuguese) and the number is what a report can be searched on — the same
@@ -557,13 +535,13 @@ static_assert(offsetof(RenameInfo, FileName) == offsetof(FILE_RENAME_INFO, FileN
                                    bool                         posix) {
     std::wstring const& name  = target.native();
     std::size_t const   bytes =
-        offsetof(RenameInfo, FileName) + (name.size() + 1) * sizeof(WCHAR);
+        offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(WCHAR);
     // `std::uint64_t` storage so the HANDLE member is aligned whatever the size.
     std::vector<std::uint64_t> storage(
         (bytes + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t), 0);
-    auto* const info = reinterpret_cast<RenameInfo*>(storage.data());
+    auto* const info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
     // The classic class reads byte 0 as `ReplaceIfExists`, so TRUE lands there.
-    info->Flags = posix ? (kRenameFlagReplaceIfExists | kRenameFlagPosixSemantics)
+    info->Flags = posix ? DWORD{FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS}
                         : DWORD{TRUE};
     info->RootDirectory  = nullptr;
     info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(WCHAR));

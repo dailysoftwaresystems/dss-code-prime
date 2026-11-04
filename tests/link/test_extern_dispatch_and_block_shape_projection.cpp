@@ -384,7 +384,8 @@ TEST(LinkVocabularyProjection, RuntimeLibraryRowShapeNamesEveryKey) {
     // half of that: it must be restated whenever the row's key set moves, so a
     // key added to the loader without being added here reds rather than passing
     // quietly, and a message quoting a key the loader does not accept reds too.
-    static constexpr std::string_view kKeys[] = {"role", "image", "source"};
+    // P69 H5: `sources`, a body of two or more shipped units (one unit stays `source`).
+    static constexpr std::string_view kKeys[] = {"role", "image", "source", "sources"};
     constexpr char const* kIgnore[] = {"runtimeLibraries"};
     // The ROW arm: a non-object entry inside a well-formed array.
     auto doc = shippedFormatDoc(kElfExecFormat);
@@ -427,6 +428,20 @@ TEST(LinkVocabularyProjection, SehPersonalityShapeNamesEveryKey) {
     ASSERT_FALSE(messages.empty())
         << "a non-object sehPersonality must be REFUSED";
     expectNamesExactly(messages, kKeys, kIgnore, "sehPersonality shape");
+}
+
+// P69 H5: the `compilerSupport` block's refusal names its whole key set and no other.
+TEST(LinkVocabularyProjection, CompilerSupportShapeNamesEveryKey) {
+    static constexpr std::string_view kKeys[] = {"role", "securityCookieInitializer"};
+    constexpr char const* kIgnore[] = {"compilerSupport"};
+    auto doc = shippedFormatDoc(kPeExecFormat);
+    ASSERT_TRUE(doc.is_object());
+    ASSERT_TRUE(doc.contains("compilerSupport")) << "the pe exec document declares the block";
+    doc["compilerSupport"] = kBadSpelling;
+    auto const messages = refusalMessages(doc, "compilerSupport-shape");
+    ASSERT_FALSE(messages.empty())
+        << "a non-object compilerSupport must be REFUSED";
+    expectNamesExactly(messages, kKeys, kIgnore, "compilerSupport shape");
 }
 
 TEST(LinkVocabularyProjection, LibrarySynthesisShapeNamesEveryKeyAndVehicle) {

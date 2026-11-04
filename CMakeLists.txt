@@ -176,6 +176,17 @@ endif()
 # belt for that one critical generated TU.
 add_compile_options("$<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Windows>>:-Wa,-mbig-obj>")
 
+# ── THE WINDOWS VERSION THIS BUILD TARGETS: Windows 10 (_WIN32_WINNT / WINVER 0x0A00) ──
+# Declared, so every Windows toolchain's headers answer the same question. ✔MEASURED 2026-10-28 (probe-reference-cc,
+# both Windows legs): MSVC 19.51's SDK already defaults to 0x0A00 with NTDDI_VERSION 0x0A000010, and this definition
+# lowers neither; MinGW-w64 13.2 defaults to 0x0601 (NTDDI 0x06010000), which hides FILE_ID_INFO / FileIdInfo, and
+# at 0x0A00 declares them. No NTDDI_VERSION is declared: MSVC keeps its latest, and the two RS1 enumerators MinGW-w64
+# lacks (FileDispositionInfoEx, FileRenameInfoEx) it lacks at EVERY version measured, NTDDI RS5 included -- the
+# substrate and the writer spell those two by value and say so where they do.
+if(WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+
 # ── Exhaustive-switch enforcement, PROJECT-WIDE ──
 # The closing half of the finding "clang-only warnings are invisible to the MSVC and GCC legs".
 #
@@ -1021,6 +1032,21 @@ if(DSS_BUILD_TESTS)
         SCRIPTS
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-conflict-markers/check-conflict-markers.py"
             "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
+    # THE ARMS REGISTRY CHECK'S OWN SELF-TEST: `check-arms-registry.py --self-test` proves each of its checks -- a
+    # row that stands, a section in order, one case count per runner and leg, a sweep's reds and diagnostics against
+    # the rows -- against a synthesized negative beside a control, one verdict line per arm; tests/harness/
+    # CMakeLists.txt registers it, one case per arm. The tree itself is judged by the entry `arms_registry_guard`
+    # below. `owning-tree.py` is a script of the entry: the program loads it by path for the kind of every value
+    # its command line names.
+    dss_declare_script_selftest(arms_registry ARGC 3
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-arms-registry/check-arms-registry.py"
+            "--self-test"
+        SCRIPTS
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-arms-registry/check-arms-registry.py"
+            "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py")
     # THE SQLITE LEG RESOLVER'S INTERPRETER: `harness/test_sqlite_harness_legs` starts `harness_legs.py` with many
     # command lines of its own, and every one of them with THIS interpreter -- the one find_package chose at or
     # above the repository's floor (cmake/DssPython.cmake) -- never the first `python3` of the PATH ctest runs
@@ -1081,6 +1107,16 @@ if(DSS_BUILD_TESTS)
         NAME conflict_markers_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-conflict-markers/check-conflict-markers.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # `arms_registry_guard`: what the mutation arms registry promises that `dssharness check-mutations` does not
+    # check itself holds of the tree -- every A and M row's before-text stands exactly once in its site, each
+    # area's section is in order, the arms of one runner on one leg state one case count -- then the same
+    # self-test `harness/arms_registry_selftest` reads case by case. Its verdict is the repository's state, the
+    # same bytes on every leg. (2026-10-28: its first run found ten arms whose site a fix had moved.)
+    add_test(
+        NAME arms_registry_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-arms-registry/check-arms-registry.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # ── The sqlite harness driver checks its own logic (2026-09-21, lane mig, part 4) ──
@@ -2022,27 +2058,38 @@ endif()
 # labels, wherever and however `repo-guard` was given, and an entry whose command line asks a program
 # for its self-test (a `--self-test` or `--selftest` word) and carries no `self-test` label. A test
 # binary's command line shows no flag; its label comes from the helper it cannot build without.
-get_property(_dss_all_tests DIRECTORY PROPERTY TESTS)
+# ★ EVERY DIRECTORY'S TESTS, NOT THE TOP DIRECTORY'S ALONE: a guard registered in a subdirectory (tests/program,
+# tests/core, tests/lir) is labelled by this one rule, where until 2026-10-28 the scan read only the entries this
+# file registered and a subdirectory's guard needed its label set by hand beside it -- or silently had none. A test's
+# properties are read and set in the directory that registered it (CMake 4.0, the minimum above). The directories
+# are walked as a work list, never by recursion.
+set(_dss_dirs "${CMAKE_CURRENT_SOURCE_DIR}")
 set(_dss_guard_tests "")
 set(_dss_self_tests "")
-foreach(_t IN LISTS _dss_all_tests)
-    if(_t MATCHES "guard$")
-        get_test_property(${_t} LABELS _dss_labels)
-        if("self-test" IN_LIST _dss_labels)
-            list(APPEND _dss_self_tests "${_t}")
-        else()
-            list(APPEND _dss_guard_tests "${_t}")
+while(_dss_dirs)
+    list(POP_FRONT _dss_dirs _dss_dir)
+    get_property(_dss_subdirs DIRECTORY "${_dss_dir}" PROPERTY SUBDIRECTORIES)
+    list(APPEND _dss_dirs ${_dss_subdirs})
+    get_property(_dss_dir_tests DIRECTORY "${_dss_dir}" PROPERTY TESTS)
+    foreach(_t IN LISTS _dss_dir_tests)
+        if(_t MATCHES "guard$")
+            get_test_property(${_t} LABELS DIRECTORY "${_dss_dir}" _dss_labels)
+            if("self-test" IN_LIST _dss_labels)
+                list(APPEND _dss_self_tests "${_t}")
+            else()
+                set_property(TEST ${_t} DIRECTORY "${_dss_dir}" APPEND PROPERTY LABELS "repo-guard")
+                list(APPEND _dss_guard_tests "${_t}")
+            endif()
         endif()
-    endif()
-endforeach()
+    endforeach()
+endwhile()
 if(_dss_self_tests)
     list(LENGTH _dss_self_tests _dss_self_count)
     message(STATUS "repo-guard label NOT applied to ${_dss_self_count} self-test(s) whose name ends in guard: ${_dss_self_tests}")
 endif()
 if(_dss_guard_tests)
-    set_property(TEST ${_dss_guard_tests} APPEND PROPERTY LABELS "repo-guard")
     list(LENGTH _dss_guard_tests _dss_guard_count)
-    message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s)")
+    message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s): ${_dss_guard_tests}")
 endif()
 
 # ── The install set ──

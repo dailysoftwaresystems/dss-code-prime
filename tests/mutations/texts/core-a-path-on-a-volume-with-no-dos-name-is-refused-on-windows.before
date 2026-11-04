@@ -1,0 +1,1 @@
+            bool const ntName = n == 0 && e == ERROR_PATH_NOT_FOUND;

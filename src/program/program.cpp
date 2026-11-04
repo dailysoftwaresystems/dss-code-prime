@@ -1438,6 +1438,164 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                              "failing tier must say why.");
         }
     };
+    // ── D-FF1-AR-STATICLIB-DRIVER-WIRING: THE ONE STATIC-ARCHIVE PACKAGING STEP ──────────
+    //
+    // ★★ EVERY UNIT A `container: archive` BUILD PACKAGES ENTERS HERE, WHATEVER TIER BUILT IT (P69 H5).
+    // `unitModules[i]` is the module of `cus[i]` -- lowered from MIR by the static-archive branch below, or
+    // assembled from text by the `encode` route. The `encode` route used to return through
+    // `linkAndWriteWithStaticArchives` whatever the format's container, so a `.s` built for a static-archive
+    // format came out a bare OBJECT under the archive's name, its definitions at default visibility.
+    // ✔MEASURED 2026-11-03: the shipped PE runtime's assembly unit was cached as a COFF object (`d\x86`,
+    // 476 bytes) where its C units are `!<arch>` archives; a link dispatches an input by its magic, so the
+    // unit joined EVERY pe link as an eagerly-merged object input -- a relocatable `-c` object of
+    // `int f(int x)` defined `__chkstk`, two such objects redefined it, and a DSS DLL exported it. One step,
+    // so the archive-wide visibility, the member names, the input archives' members and the object inputs
+    // are answered once for every tier.
+    auto const packageUnitsAsStaticArchive =
+        [&](std::vector<AssembledModule> unitModules) -> std::optional<std::filesystem::path> {
+        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this line READ
+        // `kind() == ObjectFormatKind::Pe ? ".obj" : ".o"`. The member
+        // extension is a NAMING fact about the ecosystem this archive belongs
+        // to, so the archive format declares it (`archiveMemberExtension`,
+        // presence-paired with `container: archive` and refused on any format
+        // that packages no members).
+        std::string const memberExt{(*formatR)->archiveMemberExtension()};
+        std::vector<AssembledModule> members;
+        std::vector<std::string>     memberNames;
+        members.reserve(unitModules.size());
+        memberNames.reserve(unitModules.size());
+        // ── D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE ──────────
+        //
+        // ★★ A MEMBER IS NAMED AFTER THE SOURCE THAT PRODUCED IT, AND UNTIL
+        // NOW NONE OF THEM WAS. Every CU-derived member took the DRIVER'S
+        // `sourceStem` — `fs::path{sourceFiles.front()}.stem()`, the FIRST file
+        // of the whole command — plus its index, so ✔MEASURED before this
+        // change: `--compile u1.c u2.c --target …-staticlib` emitted `u1_0.obj`
+        // and `u1_1.obj`, and `u2.c`'s member was named after `u1`. The armap
+        // indexes members BY POSITION, so selection was never wrong; what was
+        // wrong is everything a HUMAN reads — an `ar t` listing, and every
+        // member-read refusal, which names the member and so pointed at a file
+        // that did not produce it. A diagnostic that misdirects is worse than
+        // one that says nothing.
+        //
+        // ★ THE NAME COMES FROM THE CU, NOT FROM A STEM LIST THREADED BESIDE
+        // IT. `CompilationUnit::primarySourceName()` answers from the unit's
+        // own first tree; a parallel `std::vector<std::string>` would be a
+        // second owner of that fact, and an index-parallel side list is exactly
+        // what desynchronizes without reddening anything. See the accessor.
+        //
+        // ⓘ The FALLBACK is the old behaviour and is not dead: a CU with no
+        // trees (or a hand-built one with no source buffer) can name nothing,
+        // and `sourceStem` is still the best available answer there.
+        //
+        // ⓘ UNIQUENESS is now earned rather than assumed. The old `_<i>`
+        // suffix made every multi-CU name distinct by construction; real stems
+        // do not (`a/u.c` and `b/u.c` share one), so the suffix is applied ONLY
+        // where a name would otherwise repeat — a two-source archive of
+        // DIFFERENT stems now reads `u1.obj` / `u2.obj`, and one of the SAME
+        // stem reads `u.obj` / `u_1.obj`. Applied to the CU-derived names
+        // alone: an extracted archive member and a `--compile`d object input
+        // carry the name their INPUT gave them, and renaming those would
+        // misdirect in the other direction.
+        auto const uniqueMemberName = [&memberNames](std::string base,
+                                                     std::string const& ext) {
+            auto taken = [&memberNames](std::string const& n) {
+                for (auto const& m : memberNames) if (m == n) return true;
+                return false;
+            };
+            if (!taken(base + ext)) return base + ext;
+            for (std::size_t n = 1;; ++n) {
+                std::string cand = base + "_" + std::to_string(n) + ext;
+                if (!taken(cand)) return cand;
+            }
+        };
+        for (std::size_t i = 0; i < unitModules.size(); ++i) {
+            std::optional<AssembledModule> mod{std::move(unitModules[i])};
+            // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the build's
+            // archive-wide visibility, restated on every external definition of
+            // the LOWERED member — after the optimizer, whose DCE would otherwise
+            // delete a hidden definition nothing in its own unit calls
+            // (`CompileOptions::archiveDefinitionVisibility`;
+            // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS). Each
+            // format's member writer spells it in its own vocabulary, and each
+            // image's export gate reads it back through `isExternallyVisible`.
+            if (compileOpts.archiveDefinitionVisibility.has_value()) {
+                for (ModuleSymbol& ms : mod->symbols) {
+                    if (ms.binding == SymbolBinding::Local) continue;
+                    ms.visibility = *compileOpts.archiveDefinitionVisibility;
+                }
+            }
+            members.push_back(std::move(*mod));
+            // Member file name: THIS CU's own source stem (see the block above),
+            // uniquified only where two sources share one stem.
+            std::string_view const own =
+                i < cus.size() ? cus[i].primarySourceName() : std::string_view{};
+            std::string stem = own.empty()
+                ? std::string{sourceStem}
+                : fs::path{own}.stem().string();
+            if (stem.empty()) stem = std::string{sourceStem};
+            memberNames.push_back(uniqueMemberName(std::move(stem), memberExt));
+        }
+        // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
+        // When this static-library build is also handed INPUT `--resolve-library`
+        // static archives, bundle EVERY member of each INTO this library (a
+        // merged/"fat" archive, à la `libtool -static`). A static library
+        // PACKAGES objects, so all members are carried — NOT the lazy
+        // referenced-subset the exe/final-link path pulls — because a DOWNSTREAM
+        // link against this library must be able to pull any of them (dropping an
+        // unreferenced member would silently ship an incomplete library). Dynamic
+        // `--resolve-library` libraries stay on the per-CU FFI path (a member may
+        // reference libc externs, resolved at the FINAL link against this
+        // library). Fails loud on any open / parse / member-read error (never a
+        // silent member omission). CU-derived members lead; the input archives'
+        // members follow.
+        if (!staticArchives.empty()) {
+            auto extracted = extractStaticArchiveMembers(
+                std::span<std::filesystem::path const>{staticArchives},
+                **targetR, **formatR, reporter);
+            if (!extracted) return std::nullopt;  // fail-loud already reported
+            members.reserve(members.size() + extracted->modules.size());
+            memberNames.reserve(memberNames.size() + extracted->names.size());
+            for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
+                members.push_back(std::move(extracted->modules[i]));
+                memberNames.push_back(std::move(extracted->names[i]));
+            }
+        }
+        // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION:
+        // pre-assembled OBJECT inputs become
+        //    MEMBERS of this library ─────────────────────────────────────────
+        //
+        // ⚠ THIS ARM EXISTS BECAUSE ITS ABSENCE WAS A SILENT DROP. `objectInputs`
+        // is consumed by `linkAndWriteWithStaticArchives`, and a `container:
+        // archive` build never reaches that composition — it routes here. So an
+        // object named on a static-library build would have been accepted,
+        // ignored, and the library shipped without it: rc 0, no diagnostic, a
+        // member the operator asked for simply absent. That is the exact shape
+        // the fat-archive arm above was written to avoid, and it is the reason
+        // an object input has to be answered on EVERY route that produces an
+        // artifact rather than only on the one it was first needed for.
+        //
+        // Packaged, never merged: an archive bundles objects, so each object
+        // input becomes its own member under its own file name, exactly as an
+        // extracted archive member does. CU-derived members lead, then the input
+        // archives' members, then these.
+        if (!perCuOpts.objectInputs.empty()) {
+            auto objects = readObjectInputModules(
+                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+                **targetR, **formatR, reporter);
+            if (!objects) return std::nullopt;  // fail-loud already reported
+            members.reserve(members.size() + objects->size());
+            memberNames.reserve(memberNames.size() + objects->size());
+            for (std::size_t i = 0; i < objects->size(); ++i) {
+                members.push_back(std::move((*objects)[i]));
+                memberNames.push_back(
+                    perCuOpts.objectInputs[i].filename().string());
+            }
+        }
+        return reported(linkAndWriteStaticArchive(members, memberNames,
+                                                  **targetR, **formatR, outPath,
+                                                  reporter, imageRequest));
+    };
     // ── plan 29 P4: THE `encode` PIPELINE ENTRY ────────────────────────────
     //
     // ★★★ THE ONE PLACE THE TIER FACET IS READ, AND IT IS READ OFF THE ROOT
@@ -1505,6 +1663,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // diagnostic it produced is reported; the LINK is what must not
             // happen for a knowingly-incomplete program.
             if (analysisOnly) return std::nullopt;
+            // A static-archive format packages this unit as a member, by the one step every unit enters
+            // (`packageUnitsAsStaticArchive`): never a bare object under the archive's name.
+            if ((*formatR)->isStaticArchive()) {
+                std::vector<AssembledModule> units;
+                units.push_back(std::move(*mod));
+                return packageUnitsAsStaticArchive(std::move(units));
+            }
             // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER, the STATIC
             // half: this route used to call `linkAndWrite` directly, so a `.a` /
             // `.lib` named on `--resolve-library` was partitioned out of the
@@ -1671,62 +1836,8 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // arm) and `enforceArtifactProfileFormat` already validated the project's
     // `staticlib` profile against this format's served set.
     if ((*formatR)->isStaticArchive()) {
-        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this line READ
-        // `kind() == ObjectFormatKind::Pe ? ".obj" : ".o"`. The member
-        // extension is a NAMING fact about the ecosystem this archive belongs
-        // to, so the archive format declares it (`archiveMemberExtension`,
-        // presence-paired with `container: archive` and refused on any format
-        // that packages no members).
-        std::string const memberExt{(*formatR)->archiveMemberExtension()};
-        std::vector<AssembledModule> members;
-        std::vector<std::string>     memberNames;
-        members.reserve(cuMirs.size());
-        memberNames.reserve(cuMirs.size());
-        // ── D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE ──────────
-        //
-        // ★★ A MEMBER IS NAMED AFTER THE SOURCE THAT PRODUCED IT, AND UNTIL
-        // NOW NONE OF THEM WAS. Every CU-derived member took the DRIVER'S
-        // `sourceStem` — `fs::path{sourceFiles.front()}.stem()`, the FIRST file
-        // of the whole command — plus its index, so ✔MEASURED before this
-        // change: `--compile u1.c u2.c --target …-staticlib` emitted `u1_0.obj`
-        // and `u1_1.obj`, and `u2.c`'s member was named after `u1`. The armap
-        // indexes members BY POSITION, so selection was never wrong; what was
-        // wrong is everything a HUMAN reads — an `ar t` listing, and every
-        // member-read refusal, which names the member and so pointed at a file
-        // that did not produce it. A diagnostic that misdirects is worse than
-        // one that says nothing.
-        //
-        // ★ THE NAME COMES FROM THE CU, NOT FROM A STEM LIST THREADED BESIDE
-        // IT. `CompilationUnit::primarySourceName()` answers from the unit's
-        // own first tree; a parallel `std::vector<std::string>` would be a
-        // second owner of that fact, and an index-parallel side list is exactly
-        // what desynchronizes without reddening anything. See the accessor.
-        //
-        // ⓘ The FALLBACK is the old behaviour and is not dead: a CU with no
-        // trees (or a hand-built one with no source buffer) can name nothing,
-        // and `sourceStem` is still the best available answer there.
-        //
-        // ⓘ UNIQUENESS is now earned rather than assumed. The old `_<i>`
-        // suffix made every multi-CU name distinct by construction; real stems
-        // do not (`a/u.c` and `b/u.c` share one), so the suffix is applied ONLY
-        // where a name would otherwise repeat — a two-source archive of
-        // DIFFERENT stems now reads `u1.obj` / `u2.obj`, and one of the SAME
-        // stem reads `u.obj` / `u_1.obj`. Applied to the CU-derived names
-        // alone: an extracted archive member and a `--compile`d object input
-        // carry the name their INPUT gave them, and renaming those would
-        // misdirect in the other direction.
-        auto const uniqueMemberName = [&memberNames](std::string base,
-                                                     std::string const& ext) {
-            auto taken = [&memberNames](std::string const& n) {
-                for (auto const& m : memberNames) if (m == n) return true;
-                return false;
-            };
-            if (!taken(base + ext)) return base + ext;
-            for (std::size_t n = 1;; ++n) {
-                std::string cand = base + "_" + std::to_string(n) + ext;
-                if (!taken(cand)) return cand;
-            }
-        };
+        std::vector<AssembledModule> units;
+        units.reserve(cuMirs.size());
         for (std::size_t i = 0; i < cuMirs.size(); ++i) {
             // P10: a static-archive member is the FINAL module of its own
             // artifact (nothing downstream merges it — the foreign linker
@@ -1760,90 +1871,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // block, read off the schema here exactly as sehPersonality is.
                 (*formatR)->atomicsRuntime());
             if (!mod) return std::nullopt;  // back-half tier failure already reported
-            // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the build's
-            // archive-wide visibility, restated on every external definition of
-            // the LOWERED member — after the optimizer, whose DCE would otherwise
-            // delete a hidden definition nothing in its own unit calls
-            // (`CompileOptions::archiveDefinitionVisibility`;
-            // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS). Each
-            // format's member writer spells it in its own vocabulary, and each
-            // image's export gate reads it back through `isExternallyVisible`.
-            if (compileOpts.archiveDefinitionVisibility.has_value()) {
-                for (ModuleSymbol& ms : mod->symbols) {
-                    if (ms.binding == SymbolBinding::Local) continue;
-                    ms.visibility = *compileOpts.archiveDefinitionVisibility;
-                }
-            }
-            members.push_back(std::move(*mod));
-            // Member file name: THIS CU's own source stem (see the block above),
-            // uniquified only where two sources share one stem.
-            std::string_view const own =
-                i < cus.size() ? cus[i].primarySourceName() : std::string_view{};
-            std::string stem = own.empty()
-                ? std::string{sourceStem}
-                : fs::path{own}.stem().string();
-            if (stem.empty()) stem = std::string{sourceStem};
-            memberNames.push_back(uniqueMemberName(std::move(stem), memberExt));
+            units.push_back(std::move(*mod));
         }
-        // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
-        // When this static-library build is also handed INPUT `--resolve-library`
-        // static archives, bundle EVERY member of each INTO this library (a
-        // merged/"fat" archive, à la `libtool -static`). A static library
-        // PACKAGES objects, so all members are carried — NOT the lazy
-        // referenced-subset the exe/final-link path pulls — because a DOWNSTREAM
-        // link against this library must be able to pull any of them (dropping an
-        // unreferenced member would silently ship an incomplete library). Dynamic
-        // `--resolve-library` libraries stay on the per-CU FFI path (a member may
-        // reference libc externs, resolved at the FINAL link against this
-        // library). Fails loud on any open / parse / member-read error (never a
-        // silent member omission). CU-derived members lead; the input archives'
-        // members follow.
-        if (!staticArchives.empty()) {
-            auto extracted = extractStaticArchiveMembers(
-                std::span<std::filesystem::path const>{staticArchives},
-                **targetR, **formatR, reporter);
-            if (!extracted) return std::nullopt;  // fail-loud already reported
-            members.reserve(members.size() + extracted->modules.size());
-            memberNames.reserve(memberNames.size() + extracted->names.size());
-            for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
-                members.push_back(std::move(extracted->modules[i]));
-                memberNames.push_back(std::move(extracted->names[i]));
-            }
-        }
-        // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION:
-        // pre-assembled OBJECT inputs become
-        //    MEMBERS of this library ─────────────────────────────────────────
-        //
-        // ⚠ THIS ARM EXISTS BECAUSE ITS ABSENCE WAS A SILENT DROP. `objectInputs`
-        // is consumed by `linkAndWriteWithStaticArchives`, and a `container:
-        // archive` build never reaches that composition — it routes here. So an
-        // object named on a static-library build would have been accepted,
-        // ignored, and the library shipped without it: rc 0, no diagnostic, a
-        // member the operator asked for simply absent. That is the exact shape
-        // the fat-archive arm above was written to avoid, and it is the reason
-        // an object input has to be answered on EVERY route that produces an
-        // artifact rather than only on the one it was first needed for.
-        //
-        // Packaged, never merged: an archive bundles objects, so each object
-        // input becomes its own member under its own file name, exactly as an
-        // extracted archive member does. CU-derived members lead, then the input
-        // archives' members, then these.
-        if (!perCuOpts.objectInputs.empty()) {
-            auto objects = readObjectInputModules(
-                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
-                **targetR, **formatR, reporter);
-            if (!objects) return std::nullopt;  // fail-loud already reported
-            members.reserve(members.size() + objects->size());
-            memberNames.reserve(memberNames.size() + objects->size());
-            for (std::size_t i = 0; i < objects->size(); ++i) {
-                members.push_back(std::move((*objects)[i]));
-                memberNames.push_back(
-                    perCuOpts.objectInputs[i].filename().string());
-            }
-        }
-        return reported(linkAndWriteStaticArchive(members, memberNames,
-                                                  **targetR, **formatR, outPath,
-                                                  reporter, imageRequest));
+        // The members are packaged by the one step every unit enters (`packageUnitsAsStaticArchive`,
+        // above the `encode` route): the archive-wide visibility, the names, the input archives and objects.
+        return packageUnitsAsStaticArchive(std::move(units));
     }
 
     // ── D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: THE ALL-OBJECT LINK ─────────
@@ -3085,14 +3117,16 @@ struct ShippedSourceLanguageCache {
 // every run and never written to a side file: a generated index is a second
 // owner too, and this repository treats staleness as a defect class.
 //
-// ⚠ ZERO claimants and TWO claimants both fail LOUD, and the second is not
-// hypothetical: `.s`/`.S` is claimed by BOTH shipped asm dialects, so a
-// hand-written assembly runtime unit — soft-float helpers, setjmp/longjmp
-// bodies, the classic contents of this tier — is genuinely ambiguous by
-// extension. It would need the ARCH to disambiguate, not the language, and the
-// realization key is FORMAT-keyed, so it is a different shape than anything
-// here. Refusing is correct today; building the arch axis now would be the
-// speculative structure the bar rules out.
+// ★ TWO CLAIMANTS ARE DECIDED BY THE TARGET, AND BY NOTHING ELSE. `.s`/`.S` is
+// claimed by EVERY shipped assembly dialect, so a hand-written assembly runtime
+// unit (the PE stack probes and the cookie check a reference compiler's objects
+// call, whose register contract no C function keeps) is ambiguous by extension
+// alone. The unit is compiled FOR A TARGET, and the target declares, by name, the
+// dialect that spells its assembly (`defaultAssemblyLanguage`) -- the very name
+// `resolveGrammarForTarget` reads for a user's `.s`. When that name is one of
+// the claimants it is the answer; otherwise -- no declared dialect, or one that
+// does not claim the extension -- the unit is refused naming every claimant and
+// the target's declaration, exactly as before. Zero claimants are refused too.
 //
 // ⚠ ONE BEHAVIOUR MOVED, DELIBERATELY. "Health is the loader's own business"
 // still holds for every document this resolution does NOT choose — they are no
@@ -3155,6 +3189,7 @@ struct ShippedSourceLanguage {
 
 [[nodiscard]] ShippedSourceLanguage resolveShippedSourceGrammar(
     fs::path const&             path,
+    TargetSchema const&         target,
     ShippedSourceLanguageCache& cache,
     DiagnosticReporter&         rep) {
     std::string const ext = asciiLowerCopy(path.extension().generic_string());
@@ -3203,8 +3238,19 @@ struct ShippedSourceLanguage {
     auto const& claimants =
         found == cache.claimantsByExtension.end() ? kNoClaimants : found->second;
 
+    // The one claimant, or -- among several -- the one the target declares.
+    std::string const declaredDialect{target.defaultAssemblyLanguage()};
+    std::string       chosen;
     if (claimants.size() == 1) {
-        std::string const& name = claimants.front().stem;
+        chosen = claimants.front().stem;
+    } else if (claimants.size() > 1 && !declaredDialect.empty()) {
+        for (auto const& claimant : claimants) {
+            if (claimant.stem == declaredDialect) chosen = claimant.stem;
+        }
+    }
+
+    if (!chosen.empty()) {
+        std::string const& name = chosen;
         auto               got  = cache.grammarByName.find(name);
         if (got == cache.grammarByName.end()) {
             auto loaded = GrammarSchema::loadShipped(name);
@@ -3212,7 +3258,7 @@ struct ShippedSourceLanguage {
                 forwardConfigDiagnostics(loaded.error(), rep);
                 emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                            "shipped-source realization: shipped language '" + name
-                           + "' is the only one that claims the extension '" + ext
+                           + "' is the one that claims the extension '" + ext
                            + "' of '" + core::genericSpelling(path)
                            + "', but it could not be loaded — the reason is in the "
                              "configuration diagnostic(s) above (config: "
@@ -3242,9 +3288,14 @@ struct ShippedSourceLanguage {
                    : "shipped-source realization: " + std::to_string(claimants.size())
                          + " shipped languages claim the extension '" + ext
                          + "' of '" + core::genericSpelling(path) + "' ("
-                         + claimantDocuments(claimants)
-                         + "), so the extension alone cannot name one — refusing "
-                           "rather than guessing which front end owns this file");
+                         + claimantDocuments(claimants) + "), and target '"
+                         + std::string{target.name()}
+                         + (declaredDialect.empty()
+                                ? std::string{"' declares no 'defaultAssemblyLanguage'"}
+                                : "' declares 'defaultAssemblyLanguage' '" + declaredDialect
+                                      + "', which is none of them")
+                         + ", so nothing names one — refusing rather than guessing "
+                           "which front end owns this file");
     return {};
 }
 
@@ -4151,7 +4202,7 @@ buildDependencyArtifactKey(
         // the claim index is memoized in `grammarCache`, so the common case —
         // a `.c` user file — costs a map lookup.
         auto const unitGrammar =
-            resolveShippedSourceGrammar(resolved.path, grammarCache, rep);
+            resolveShippedSourceGrammar(resolved.path, target, grammarCache, rep);
         if (!unitGrammar) continue;   // already diagnosed
 
         dss::runtime::RuntimeObjectRequest request;
@@ -5212,7 +5263,8 @@ int runCusToTargets(
         // units — that is the ruling, and it is what keeps a broken runtime unit
         // caught by every build of its target rather than by the one program
         // that still uses it. What reaches an ARTIFACT is a separate question,
-        // and a STATIC ARCHIVE answers it differently from an image:
+        // and ONLY AN IMAGE takes the runtime: a static archive and a
+        // relocatable object both answer it differently from an image.
         //
         // ⚠ A LIBRARY BUILD CARRIES EVERY MEMBER OF EVERY INPUT ARCHIVE, never
         // the referenced subset — `extractStaticArchiveMembers`, deliberately,
@@ -5224,9 +5276,13 @@ int runCusToTargets(
         // that it DEFERS "who owns this name" to a later link
         // (`allowsUndefinedImports()`), and that later link is an IMAGE build —
         // which supplies the runtime right here.
-        // ⚠ READ OFF THE FORMAT'S DECLARED `container`, never off its name or
-        // kind: the same predicate the driver's own static-archive arm is
-        // dispatched on.
+        // ⚠ A RELOCATABLE OBJECT IS THE SAME CONTRACT, and it was not withheld
+        // (P69 H5): the lazy member pull put the body of every runtime routine
+        // its unit calls INTO the object, as a reference compiler's `-c` never
+        // does -- every other object calling it, and the image's own pull,
+        // then defined it again (K_SymbolRedefinedAcrossUnits).
+        // ⚠ READ OFF THE FORMAT'S DECLARED FLAVOR (`isImageFlavor`), never off
+        // its name or kind: the predicate the linker writes an image by.
         //
         // ★★ APPENDED AFTER THE OPERATOR'S OWN `--resolve-library` ARCHIVES,
         // BECAUSE THE OPERATOR OUTRANKS THE PLATFORM DEFAULT. That is the same
@@ -5239,8 +5295,8 @@ int runCusToTargets(
         // dispatched by MAGIC BYTES like every other input: the archive goes to
         // the static merge, and the demand-driven member pull is what keeps a
         // `hello.c` free of directory-walking code it never calls.
-        if (!formatByName.at(TargetSpec::parse(spec)->formatName)
-                 ->isStaticArchive()) {
+        if (formatByName.at(TargetSpec::parse(spec)->formatName)
+                ->isImageFlavor()) {
             // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: each
             // one is recorded as the shipped runtime's in the SAME statement
             // that adds it, so `compileOneTarget` can tell it from an

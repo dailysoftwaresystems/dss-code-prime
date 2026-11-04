@@ -42,16 +42,33 @@ program reads is refused, because this program owns those paths: gnu's `-o`, its
 its deprecated `/o` (either prefix, `/` or `-`), and a linker `/OUT:`. MSVC's `/FA` (capital A, a
 listing's TYPE) places nothing and is allowed, as are `/openmp` and `/options:strict`. An msvc `/link`
 tail is moved AFTER the source and the output paths, where MSVC's /link reference requires it. The program's
-own options are never abbreviated (`--o=` is not `--out`).
+own options are never abbreviated (`--o=` is not `--out`). A flag may name the PROBE'S OWN DIRECTORY, made per probe
+under a temp name, as `{probe}` -- so an object can be built recording no host path (`/pathmap:{probe}=X:\\fixture`,
+which cl honours only beside `/experimental:deterministic`, and `-ffile-prefix-map={probe}=.`), which a kept fixture
+must (✔ADDED 2026-10-28, P69 lane hm).
 
 DUMP (object, link and run modes): `--dump`, a comma-separated argv, percent-decoded like the flags, whose
 first item is one of DUMP_TOOLS; the PRODUCT's path is appended as its last argument -- the object in object
 mode, the LINKED IMAGE in link and run modes (after the run, in run mode). ✔ADDED 2026-09-24: lane xa had to
 measure Apple ld's output with probes that read their own image, because only an object could be dumped.
 
+KEEP (object, link and run modes): `--keep=yes` (a batch item's `"keep": "yes"`) keeps the PRODUCT -- the object in
+object mode, the linked image in link and run modes -- as the compiler wrote it, at `kept/<item>/<its name>` under
+`--step-dir` (the step's own directory; a single probe's item is `probe`), and the report gives its size and md5. The
+`kept` directory is the step's declared output, so `persist` keeps it, and it always holds a copy of the report:
+`sync --pull` carries FILES, each named, so when anything was kept the line before the last one IS the command that
+brings every kept file back for the leg it ran on (`--leg`, and `--kept-at`, where this leg's kept outputs of the
+step go, are what it is written from); the run's `--json` names the same files as keptOutputs. A product is kept
+only when its compile exited 0, and copied before the program runs, so the image kept is the image that ran. ✔ADDED
+2026-10-28 (P69 lane hm, main's ruling): a reference toolchain's object is a TEST FIXTURE, and a fixture built by a
+private script is a build outside the harness; through this mode it is built twice, and the two reports' md5s say
+whether the bytes are reproducible.
+
 REFUSED by name, exit 2, before anything is compiled: an undecodable source, an EMPTY one outside stdout
 mode, a decoded source over MAX_SOURCE_BYTES, a compiler or dump tool spelled as a path, a dump tool
-outside DUMP_TOOLS, a `--dump` in asm or stdout mode (there is no product to dump), an option placing a
+outside DUMP_TOOLS, a `--dump` in asm or stdout mode (there is no product to dump), a `--keep` other than `yes`
+or empty, a `--keep` in asm or stdout mode (there is no product to keep) or with no `--step-dir` to keep it in, a
+batch item keeping under a name that is not one entry of the kept directory, an option placing a
 product among the flags, an unknown mode, extension or dialect, and an assembly source (`s`, `S`) for the
 msvc dialect (cl does not assemble). ★ AN EMPTY SOURCE IS A PROBE IN STDOUT MODE: an empty translation unit under
 `-dM,-E` prints exactly the compiler's predefined macros. A single probe cannot carry one -- an empty
@@ -79,8 +96,8 @@ compiler's identity, each command with its exit code and output, then the witnes
 which the runner keeps, so `dssharness sync --pull` brings it back.
 
 A BATCH (`--batch-b64`, in place of `--src-b64`): the base64 of a UTF-8 JSON array of up to MAX_BATCH
-objects, each `{"name", "src"}` plus any of `ext`, `cc`, `flags`, `mode`, `dump`, `dialect` (strings, the same
-rules as the options). Every item runs in turn inside ONE run, so ONE sync and ONE pull serve them all
+objects, each `{"name", "src"}` plus any of `ext`, `cc`, `flags`, `mode`, `dump`, `dialect`, `keep` (strings, the
+same rules as the options). Every item runs in turn inside ONE run, so ONE sync and ONE pull serve them all
 -- MEASURED 2026-09-23: the Mac fell asleep between two single-probe runs a minute apart, and its
 keep-awake lives only as long as a run. Each item's report follows a `=== probe <name>` line; an item
 refused for a malformed field is reported there and the batch goes on; a malformed BATCH (not base64,
@@ -110,6 +127,7 @@ import argparse
 import base64
 import binascii
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -135,6 +153,10 @@ EXTENSIONS = ("c", "s", "S", "cpp")
 DUMP_TOOLS = ("objdump", "llvm-objdump", "otool", "nm", "llvm-nm", "readelf", "llvm-readelf", "size", "llvm-size",
               "dumpbin")
 DUMP_MODES = ("object", "link", "run")   # the modes that leave a product to dump: an object, or the linked image
+KEEP_MODES = DUMP_MODES                   # ... and the modes whose product can be KEPT
+KEEP_WORDS = ("", "yes")
+KEPT = "kept"                             # the step's declared output: the kept products and a copy of the report
+REPORT = "probe-reference-cc.txt"
 # The command-line dialect each compiler speaks: MSVC's for these names, gcc's for every other.
 DIALECTS = ("gnu", "msvc")
 DIALECT_OF = {"cl": "msvc", "clang-cl": "msvc"}
@@ -156,8 +178,9 @@ COMPILE_SECONDS = 180
 RUN_SECONDS = 60
 MAX_BATCH = 32
 MAX_BATCH_B64 = 24000
+NL_CHAR = chr(10)
 ITEM_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-ITEM_KEYS = ("name", "src", "ext", "cc", "flags", "mode", "dump", "dialect", "src_ref")
+ITEM_KEYS = ("name", "src", "ext", "cc", "flags", "mode", "dump", "dialect", "keep", "src_ref")
 
 
 class Refusal(Exception):
@@ -277,6 +300,14 @@ def identity_argv(cc, cc_path):
     return [cc_path] if program_key(cc) in BANNER_ONLY else [cc_path, "--version"]
 
 
+PROBE_DIR_TOKEN = "{probe}"
+
+
+def placed(flags, scratch):
+    """The flags with every `{probe}` replaced by the probe's own directory (THE FLAGS, in the header)."""
+    return [f.replace(PROBE_DIR_TOKEN, scratch) for f in flags]
+
+
 def split_link(flags):
     """msvc: (the compiler's flags, the `/link` tail). MSVC's `/link` "and its linker options must appear after
     any file names and CL options" (MSVC's /link reference), so the tail goes LAST, after the source and the
@@ -354,6 +385,67 @@ def kept_listing(product):
             + kept[:5000]), None
 
 
+def kept_child(parent, name, what):
+    """`parent/name`, refused unless it is ONE entry directly inside `parent` under its own spelling: `..`, `.`, an
+    empty name, a separator or an absolute path resolve under ANOTHER name, and an entry that is a link resolves
+    somewhere else (the rule compile-and-keep's `child` holds for every path it writes)."""
+    path = os.path.join(parent, name)
+    real = os.path.realpath(path)
+    if os.path.dirname(real) != os.path.realpath(parent) or os.path.basename(real) != name:
+        raise Refusal("%s %r does not name one entry directly inside the kept directory" % (what, name))
+    return path
+
+
+def keep_product(product, keep_dir, item):
+    """(report lines, the witness mark) for keeping `product` at `keep_dir/<item>/<its name>`: its size and md5, or
+    that the compiler exited 0 and wrote no such file (`kept=absent`, a measurement, as `asm=absent` is)."""
+    name = os.path.basename(product)
+    if not os.path.isfile(product):
+        return ["== kept: the compiler exited 0 and wrote no %s" % name], "kept=absent"
+    where = kept_child(keep_dir, item, "the kept item")
+    os.makedirs(where, exist_ok=True)
+    target = os.path.join(where, name)
+    shutil.copy2(product, target)  # its mode too: a kept image must still run where it was linked
+    with io.open(target, "rb") as f:
+        data = f.read()
+    return ["== kept %s/%s: %d byte(s), md5 %s" % (item, name, len(data), hashlib.md5(data).hexdigest())], "kept=1"
+
+
+def object_magic(data):
+    """The object format whose leading bytes `data` starts with -- ELF, Mach-O (64-bit, either byte order) or an
+    x86-64 / arm64 COFF object's machine field -- or None. The self-test's witness that a kept file IS an object."""
+    if data[:4] == b"\x7fELF":
+        return "elf"
+    if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+        return "macho"
+    if data[:2] in (b"\x64\x86", b"\x64\xaa"):
+        return "coff"
+    return None
+
+
+def bring_back(tree, leg, kept_at, keep_dir):
+    """The ONE line that brings every kept file back, or None when nothing was kept or the run does not say where its
+    kept files go. `kept_at` is where this leg's kept outputs of the step go; `sync --pull` takes each FILE by its path
+    relative to the tree. Kept files outside the tree are said, never named by a path --pull would refuse."""
+    if not (leg and kept_at and keep_dir and os.path.isdir(keep_dir)):
+        return None
+    names = sorted("%s/%s" % (item, f) for item in os.listdir(keep_dir)
+                   if os.path.isdir(os.path.join(keep_dir, item))
+                   for f in os.listdir(os.path.join(keep_dir, item)))
+    if not names:
+        return None
+    try:
+        base = os.path.relpath(os.path.join(kept_at, KEPT), tree).replace(os.sep, "/")
+    except ValueError:                      # another drive
+        base = "../"
+    if base == ".." or base.startswith("../"):
+        return ("probe-reference-cc: the kept files go to %s, which is not inside the tree, so no `sync --pull` can "
+                "name them" % kept_at)
+    names = [REPORT] + names
+    return ("probe-reference-cc: bring these %d file(s) back with: dssharness sync --legs %s %s"
+            % (len(names), leg, " ".join("--pull %s/%s" % (base, n) for n in names)))
+
+
 def block(lines, title, rc, out, err):
     lines.append("== %s: exit %s" % (title, rc))
     for name, body in (("stdout", out), ("stderr", err)):
@@ -363,10 +455,11 @@ def block(lines, title, rc, out, err):
 
 
 def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=None, dialect_value="",
-          shared=None):
+          shared=None, keep_value="", keep_dir=None, item="probe"):
     """Return (exit code, report lines). A refusal is exit 2 with one explanatory line. `shared` is a batch's
     (redactor, directory) (`run_batch`): the batch built the one redactor ONCE, so the account is known nameable,
-    and the probe runs in `directory`, which it creates and removes."""
+    and the probe runs in `directory`, which it creates and removes. `keep_value` `yes` keeps the product at
+    `keep_dir/<item>/` (KEEP, in the header)."""
     try:
         if mode not in MODES:
             raise Refusal("--mode %r is not one of %s" % (mode, ", ".join(MODES)))
@@ -384,6 +477,14 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
             raise Refusal("--dump applies to --mode %s: an object or a linked image" % ", ".join(DUMP_MODES))
         if dump and dump[0] not in DUMP_TOOLS:
             raise Refusal("--dump tool %r is not one of %s" % (dump[0], ", ".join(DUMP_TOOLS)))
+        if keep_value not in KEEP_WORDS:
+            raise Refusal("--keep %r is not `yes` or empty" % keep_value)
+        if keep_value and mode not in KEEP_MODES:
+            raise Refusal("--keep applies to --mode %s: the object or the linked image" % ", ".join(KEEP_MODES))
+        if keep_value and not keep_dir:
+            raise Refusal("--keep needs --step-dir: the step's own directory, where its kept outputs are written")
+        if keep_value:
+            kept_child(keep_dir, item, "the kept item")
         cc_path = find_tool(cc, "--cc")
         dump_path = find_tool(dump[0], "--dump tool") if dump else None
         # An account nobody can name is refused BEFORE the compiler is looked for: nothing this probe says may print
@@ -423,10 +524,14 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
     lines.append("source: probe.%s, %d byte(s)" % (ext, len(data)))
 
     witness = ["mode=" + mode]
-    argv, shown, product = compile_argv(dialect, cc, cc_path, mode, flags, src, scratch)
+    argv, shown, product = compile_argv(dialect, cc, cc_path, mode, placed(flags, scratch), src, scratch)
     c_rc, out, err = run_cmd(argv, scratch, COMPILE_SECONDS)
     block(lines, "compile " + " ".join(shown), c_rc, out, err)
     witness.append("compile=%s" % c_rc)
+    if c_rc == 0 and keep_value:
+        kept_lines, mark = keep_product(product, keep_dir, item)
+        lines.extend(kept_lines)
+        witness.append(mark)
     if mode != "stdout":
         if c_rc == 0 and mode == "asm":
             listing, mark = kept_listing(product)
@@ -512,7 +617,7 @@ def decode_batch(b64):
     return items
 
 
-def run_batch(tree, batch_b64, scratch_parent=None):
+def run_batch(tree, batch_b64, scratch_parent=None, keep_dir=None):
     """Every item in turn, each under its `=== probe <name>` line. Return (exit code, report lines).
     The batch builds THE ONE REDACTOR once, before its first item, over one scratch directory in which item `i`
     runs in the subdirectory `%03d` % i. An account nobody can name is a fact about the HOST, so it refuses the
@@ -535,7 +640,8 @@ def run_batch(tree, batch_b64, scratch_parent=None):
             rc, item_lines = probe(tree, _b64(item["src"]), item.get("ext", "c"), item.get("cc", "cc"),
                                    item.get("flags", ""), item.get("mode", "run"), item.get("dump", ""),
                                    dialect_value=item.get("dialect", ""),
-                                   shared=(red, os.path.join(scratch, "%03d" % index)))
+                                   shared=(red, os.path.join(scratch, "%03d" % index)),
+                                   keep_value=item.get("keep", ""), keep_dir=keep_dir, item=item["name"])
             lines.append("=== probe %s" % item["name"])
             lines.extend(item_lines)
             # An absent compiler is a measurement of the HOST, never of a compile: counted apart (the audit's PR-1).
@@ -553,19 +659,26 @@ def run(a):
     if bool(a.src_b64) == bool(a.batch_b64):
         return 2, ["probe-reference-cc: REFUSED - give exactly one of --src-b64 (one probe) and --batch-b64 "
                    "(a batch)"]
+    keep_dir = os.path.join(a.step_dir, KEPT) if a.step_dir else None
     if a.batch_b64:
-        return run_batch(a.tree, a.batch_b64)
-    return probe(a.tree, a.src_b64, a.ext, a.cc, a.flags, a.mode, a.dump, dialect_value=a.dialect)
+        rc, lines = run_batch(a.tree, a.batch_b64, keep_dir=keep_dir)
+    else:
+        rc, lines = probe(a.tree, a.src_b64, a.ext, a.cc, a.flags, a.mode, a.dump, dialect_value=a.dialect,
+                          keep_value=a.keep, keep_dir=keep_dir)
+    back = bring_back(a.tree, a.leg, a.kept_at, keep_dir) if rc == 0 else None
+    if back:
+        lines = lines[:-1] + [back] + lines[-1:]
+    return rc, lines
 
 
 # ★ AN EXACT RATCHET PER BLOCK: the arms each block runs, counted where they are judged. Which blocks run depends
 # on the host (a reference compiler, a dump tool, a Visual Studio developer environment), so the expected total is
 # derived from the blocks that ran -- and a block that silently stopped running, or an arm lost from one, is a
 # failure, never a smaller green.
-EXPECTED_FIXED = 72
-EXPECTED_CC = 6
+EXPECTED_FIXED = 79
+EXPECTED_CC = 11
 EXPECTED_DUMPER = 1
-EXPECTED_CL = 11
+EXPECTED_CL = 13
 EXPECTED_NO_CL = 1
 
 
@@ -604,6 +717,14 @@ def selftest(expect_cl=False):
             ("dump in stdout mode refused", dict(mode="stdout", dump_value="nm"), "applies to --mode object, link"),
             ("an empty source outside stdout mode refused", dict(src_b64="", mode="link"), "is empty"),
             ("unlisted dump tool refused", dict(mode="object", dump_value="rm,-rf"), "is not one of"),
+            ("a keep word other than yes refused", dict(keep_value="always", keep_dir="k"), "is not `yes`"),
+            ("keep in asm mode refused", dict(mode="asm", keep_value="yes", keep_dir="k"),
+             "applies to --mode object, link"),
+            ("keep in stdout mode refused", dict(mode="stdout", keep_value="yes", keep_dir="k"),
+             "applies to --mode object, link"),
+            ("keep with no step directory refused", dict(keep_value="yes"), "needs --step-dir"),
+            ("a kept item named '..' refused", dict(keep_value="yes", keep_dir="k", item=".."),
+             "does not name one entry"),
         ]
         for name, over, want in refusals:
             kw = dict(tree=tree, src_b64=good, ext="c", cc="cc", flags_value="", mode="run", dump_value="")
@@ -680,6 +801,9 @@ def selftest(expect_cl=False):
             "\n".join(lines))
         arm("flags are percent-decoded", split_list("-Wl%2C-z%2Cnoexecstack,-DX=a%20b,,-O2")
             == ["-Wl,-z,noexecstack", "-DX=a b", "-O2"])
+        arm("a flag's {probe} is the probe's own directory",
+            placed(["-ffile-prefix-map={probe}=.", "/pathmap:{probe}=X:" + chr(92) + "f", "-O2"], "/s/p")
+            == ["-ffile-prefix-map=/s/p=.", "/pathmap:/s/p=X:" + chr(92) + "f", "-O2"])
         arm("a listing never written is asm=absent, not a crash",
             kept_listing(os.path.join(tree, "never-written.s"))
             == (["== never-written.s: the compiler exited 0 and wrote no such file"], "asm=absent"))
@@ -772,6 +896,50 @@ def selftest(expect_cl=False):
                 scratch_parent=tree)
             arm("a real compile is measured, an absent compiler absent", rc == 0
                 and lines[-1] == "probe-reference-cc: OK batch=2 measured=1 absent=1 refused=0", "\n".join(lines))
+            # ── THE KEEP, RED IF DISABLED: the kept file is the product, whole -- its md5 is the report's, and the
+            # kept IMAGE runs to the program's own exit code; a probe that does not ask keeps nothing.
+            keep_dir = os.path.join(tree, "kept-arms")
+            rc, lines = probe(tree, good, "c", cc, "", "run", "", scratch_parent=tree, keep_value="yes",
+                              keep_dir=keep_dir, item="img")
+            image = next((os.path.join(keep_dir, "img", n) for n in (os.listdir(os.path.join(keep_dir, "img"))
+                                                                     if os.path.isdir(os.path.join(keep_dir, "img"))
+                                                                     else [])), None)
+            said = next((ln for ln in lines if ln.startswith("== kept img/")), "")
+            digest = hashlib.md5(open(image, "rb").read()).hexdigest() if image else None
+            ran_kept = run_cmd([image], tree, RUN_SECONDS)[0] if image else None
+            arm("run mode KEEPS the linked image, whole", rc == 0 and "kept=1" in lines[-1] and digest is not None
+                and said.endswith("md5 " + digest) and ran_kept == 42, "%s\nkept image ran: %r" % ("\n".join(lines),
+                                                                                                 ran_kept))
+            rc, lines = probe(tree, good, "c", cc, "", "object", "", scratch_parent=tree, keep_value="yes",
+                              keep_dir=keep_dir, item="obj")
+            kept_obj = os.path.join(keep_dir, "obj", "probe.o")
+            said = next((ln for ln in lines if ln.startswith("== kept obj/probe.o: ")), "")
+            obj_bytes = open(kept_obj, "rb").read() if os.path.isfile(kept_obj) else b""
+            arm("object mode KEEPS the object, its md5 in the report", rc == 0 and object_magic(obj_bytes) is not None
+                and said.endswith("md5 " + hashlib.md5(obj_bytes).hexdigest()), "\n".join(lines))
+            listed = lambda d: sorted(os.listdir(d)) if os.path.isdir(d) else []  # a keep that wrote nothing
+            before_keep = listed(keep_dir)
+            rc, lines = probe(tree, good, "c", cc, "", "object", "", scratch_parent=tree, keep_dir=keep_dir,
+                              item="unasked")
+            arm("a probe that does not ask keeps nothing", rc == 0 and "kept=" not in lines[-1]
+                and listed(keep_dir) == before_keep, "\n".join(lines))
+            # ★ A KEPT FIXTURE IS REPRODUCIBLE: built twice, in two probe directories, with the directory mapped
+            # away, the two objects are the same bytes (what a fixture's two builds are compared by).
+            twice = []
+            for item in ("twice-a", "twice-b"):
+                rc, lines = probe(tree, _b64("int fixture(int x) { return x * 3; }" + NL_CHAR), "c", cc,
+                                  "-O2,-ffile-prefix-map={probe}=.", "object", "", scratch_parent=tree, keep_value="yes",
+                                  keep_dir=keep_dir, item=item)
+                said = next((ln for ln in lines if ln.startswith("== kept %s/" % item)), "")
+                twice.append(said.rsplit("md5 ", 1)[-1] if "md5 " in said else None)
+            arm("an object built twice, its directory mapped away, is the same bytes", None not in twice
+                and twice[0] == twice[1], repr(twice))
+            rc, lines = run_batch(tree, b64json([
+                {"name": "kept-in-batch", "src": "int main(void) { return 42; }\n", "cc": cc, "mode": "link",
+                 "keep": "yes"}]), scratch_parent=tree, keep_dir=keep_dir)
+            arm("a batch item keeps under its own name", rc == 0
+                and os.path.isdir(os.path.join(keep_dir, "kept-in-batch"))
+                and any(ln.startswith("== kept kept-in-batch/") for ln in lines), "\n".join(lines))
             dumper = next((d for d in ("nm", "llvm-nm") if shutil.which(d)), None)
         current[0] = "fixed"
         arm("a dump tool is on this host's PATH", cc is None or dumper is not None,
@@ -821,6 +989,26 @@ def selftest(expect_cl=False):
             rc, lines = probe(tree, good, "c", "cl", "", "link", "dumpbin,/HEADERS", scratch_parent=tree)
             arm("real cl link, the IMAGE dumped", rc == 0 and "dump=0" in lines[-1] and "run=" not in lines[-1]
                 and any("EXECUTABLE IMAGE" in ln for ln in lines), "\n".join(lines[-20:]))
+            keep_dir = os.path.join(tree, "kept-cl")
+            rc, lines = probe(tree, good, "c", "cl", "", "object", "", scratch_parent=tree, keep_value="yes",
+                              keep_dir=keep_dir, item="clobj")
+            kept_obj = os.path.join(keep_dir, "clobj", "probe.obj")
+            said = next((ln for ln in lines if ln.startswith("== kept clobj/probe.obj: ")), "")
+            obj_bytes = open(kept_obj, "rb").read() if os.path.isfile(kept_obj) else b""
+            arm("real cl: object mode KEEPS the object", rc == 0 and object_magic(obj_bytes) == "coff"
+                and said.endswith("md5 " + hashlib.md5(obj_bytes).hexdigest()), "\n".join(lines))
+            twice = []
+            for item in ("cl-twice-a", "cl-twice-b"):
+                rc, lines = probe(tree, _b64("int fixture(int x) { return x * 3; }" + NL_CHAR), "c", "cl",
+                                  "/O2,/Brepro,/experimental:deterministic,/pathmap:{probe}=X:" + chr(92)
+                                  + "dss-fixture", "object", "",
+                                  scratch_parent=tree, keep_value="yes", keep_dir=keep_dir, item=item)
+                said = next((ln for ln in lines if ln.startswith("== kept %s/" % item)), "")
+                twice.append(said.rsplit("md5 ", 1)[-1] if "md5 " in said else None)
+            # cl ignores /pathmap without /experimental:deterministic (its warning D9007), and the object then records
+            # each probe's own directory: two builds differ (MEASURED, self-test run 20261029-031618-bf15dd54).
+            arm("real cl: an object built twice, /pathmap'd and /Brepro, is the same bytes", None not in twice
+                and twice[0] == twice[1], repr(twice))
             rc, lines = probe(tree, good, "c", "cl", "/O2", "asm", "", scratch_parent=tree)
             arm("real cl assembly listing", rc == 0 and any(re.match(r"main\s+PROC\b", ln) for ln in lines),
                 "\n".join(lines))
@@ -898,6 +1086,18 @@ def selftest(expect_cl=False):
     except SystemExit:
         abbreviated = False
     arm("an abbreviated option is refused, not bound", not abbreviated)
+    # THE BRING-BACK LINE names the report and every kept file under the leg's kept place, relative to the tree, and
+    # nothing when nothing was kept (a SYNTHETIC tree: it is computed, not written).
+    with tempfile.TemporaryDirectory() as bb:
+        os.makedirs(os.path.join(bb, "k", "obj"))
+        io.open(os.path.join(bb, "k", "obj", "probe.o"), "wb").close()
+        back = bring_back(bb, "leg-x", os.path.join(bb, "art", "probe"), os.path.join(bb, "k"))
+        os.makedirs(os.path.join(bb, "empty"))
+        none = bring_back(bb, "leg-x", os.path.join(bb, "art", "probe"), os.path.join(bb, "empty"))
+    arm("the bring-back line names the report and each kept file", back == (
+        "probe-reference-cc: bring these 2 file(s) back with: dssharness sync --legs leg-x "
+        "--pull art/probe/kept/probe-reference-cc.txt --pull art/probe/kept/obj/probe.o") and none is None,
+        repr((back, none)))
     with contextlib.redirect_stdout(io.StringIO()) as said:
         usage_rc = main(["probe-reference-cc.py", "--selftest", "--expect-cl"])
     arm("--selftest takes --expect-cl=yes or =no, nothing else", usage_rc == 2 and "USAGE" in said.getvalue()
@@ -942,6 +1142,11 @@ def build_parser():
     ap.add_argument("--dump", default="", type=_path_types().command_words_arg("--dump"))
     ap.add_argument("--dialect", default="", type=_path_types().text_arg("--dialect"))
     ap.add_argument("--out", required=True, type=_path_types().written_path_arg("--out"))
+    ap.add_argument("--keep", default="", type=_path_types().text_arg("--keep"))
+    # No default STRING: argparse passes a string default through `type`, and a written path refuses the empty one.
+    ap.add_argument("--step-dir", default=None, type=_path_types().written_path_arg("--step-dir"))
+    ap.add_argument("--leg", default="", type=_path_types().text_arg("--leg"))
+    ap.add_argument("--kept-at", default="", type=_path_types().text_arg("--kept-at"))
     return ap
 
 
@@ -989,6 +1194,12 @@ def main(argv):
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with io.open(a.out, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
+        # The step's declared `kept` output always exists and always holds the report: a declared output that is
+        # not there when the step exits zero makes the leg unwitnessed.
+        if a.step_dir:
+            os.makedirs(os.path.join(a.step_dir, KEPT), exist_ok=True)
+            with io.open(os.path.join(a.step_dir, KEPT, REPORT), "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
     return rc
 
 

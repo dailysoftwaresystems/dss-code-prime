@@ -1,0 +1,1 @@
+    RaiseFailFastException(&record, NULL, 0);

@@ -682,17 +682,31 @@ shippedConfigDocuments(std::filesystem::path const& directory, std::string_view 
     }
     for (fs::directory_iterator const end; it != end; it.increment(ec)) {
         if (ec) break;
+        std::string const leaf = it->path().filename().generic_string();
+        // EXACT: the name ENDS with the suffix and something precedes it. A name that
+        // merely CONTAINS it (`c.lang.json.orig`) is not a document of the kind, and
+        // neither is the bare suffix. Asked FIRST, so only an entry NAMED as a document
+        // is examined: an unrelated entry is nothing this listing has to answer for.
+        if (leaf.size() <= suffix.size() || !std::string_view{leaf}.ends_with(suffix)) continue;
         // A dedicated error code: `ec` carries the ITERATION's status, and a probe
         // failure written into it would masquerade as a listing failure. A document
         // is an entry by what it REACHES (the substrate's answer, never the
         // library's: libstdc++ on Windows calls a dangling link a regular file).
-        std::error_code typeEc;
-        if (core::reachedKind(it->path(), typeEc) != core::EntryKind::File || typeEc) continue;
-        std::string const leaf = it->path().filename().generic_string();
-        // EXACT: the name ENDS with the suffix and something precedes it. A name that
-        // merely CONTAINS it (`c.lang.json.orig`) is not a document of the kind, and
-        // neither is the bare suffix.
-        if (leaf.size() <= suffix.size() || !std::string_view{leaf}.ends_with(suffix)) continue;
+        // ★ ONLY ABSENCE IS "NOT A DOCUMENT". A document named like one whose reach
+        // cannot be EXAMINED (a looping link, a refusal) is not known to be absent:
+        // skipping it would drop a language, target or format the tree declares, in
+        // silence -- the same answer as "no such document" for a question nobody could
+        // answer. It is refused, named, as the interrupted listing below is.
+        std::error_code      typeEc;
+        core::EntryKind const reached = core::reachedKind(it->path(), typeEc);
+        if (typeEc) {
+            return std::unexpected(std::format(
+                "the config document '{}' cannot be examined ({}): what it reaches is "
+                "unknown, so whether config directory '{}' holds a '*{}' document "
+                "there cannot be told, and the listing is refused",
+                it->path().generic_string(), typeEc.message(), directory.generic_string(), suffix));
+        }
+        if (reached != core::EntryKind::File) continue;
         out.push_back(ShippedConfigDocument{leaf.substr(0, leaf.size() - suffix.size()),
                                             it->path()});
     }

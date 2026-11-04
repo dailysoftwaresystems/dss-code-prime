@@ -44,6 +44,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -54,29 +55,51 @@ namespace dss {
 // `status`, because a caller that treated `AmbiguousCase` as "not found"
 // would silently reinstate the host-dependent resolution this type exists to
 // expose. Making the third state un-ignorable at COMPILE time is the point.
+//
+// ★★ `Unexaminable` IS NO ABSENCE, AND THE SEARCH ENDS AT IT. A candidate whose
+// reach cannot be examined (a looping link, a refusal) -- or a search directory
+// whose listing is refused where the case question cannot be answered by name
+// (`matchComponent`, include_path_resolve.cpp) -- is not known to hold no header: going on to a later directory would compile whichever header
+// that one holds, in silence. ✔MEASURED 2026-10-28 (probe-reference-cc,
+// linux-x86_64-debug, gcc 13.3.0 and clang): `-Ia -Ib` with `a/x.h` a LOOPING link
+// or an UNREADABLE file, and the quote form's own directory holding a looping
+// `x.h` -- `#include` and `__has_include` alike -- is a FATAL error in both,
+// naming the candidate with the OS's reason; a DANGLING `a/x.h` (absence) goes on
+// to `b/x.h` in both. Only absence (`NotFound`) continues a search.
 enum class HeaderSearchStatus : std::uint8_t {
     Found,          // exactly one on-disk entry matches under the policy
     NotFound,       // no entry matches under the policy
     AmbiguousCase,  // >= 2 DISTINCT entries fold-match — fail loud, never pick
+    Unexaminable,   // an entry the search must ask about cannot be examined — fail loud, never pass over
 };
 
 struct DSS_EXPORT HeaderSearchResult {
     HeaderSearchStatus                 status = HeaderSearchStatus::NotFound;
-    // Set iff `status == Found`.
+    // Set iff `status == Found`; iff `status == Unexaminable`, the entry that could
+    // not be examined (a candidate, or the search directory whose listing failed).
     std::filesystem::path              path;
     // Set iff `status == AmbiguousCase`: every colliding on-disk path, sorted
     // by generic string so the diagnostic is reproducible run to run.
     std::vector<std::filesystem::path> ambiguousCandidates;
+    // Set iff `status == Unexaminable`: the OS's reason.
+    std::error_code                    error{};
 
     [[nodiscard]] static HeaderSearchResult found(std::filesystem::path p) {
-        return {HeaderSearchStatus::Found, std::move(p), {}};
+        return {HeaderSearchStatus::Found, std::move(p), {}, {}};
     }
     [[nodiscard]] static HeaderSearchResult notFound() { return {}; }
     [[nodiscard]] static HeaderSearchResult
     ambiguous(std::vector<std::filesystem::path> candidates) {
-        return {HeaderSearchStatus::AmbiguousCase, {}, std::move(candidates)};
+        return {HeaderSearchStatus::AmbiguousCase, {}, std::move(candidates), {}};
+    }
+    [[nodiscard]] static HeaderSearchResult unexaminable(std::filesystem::path p, std::error_code why) {
+        return {HeaderSearchStatus::Unexaminable, std::move(p), {}, why};
     }
 };
+
+// THE ONE SPELLING of an `Unexaminable` result for a diagnostic: "'<path>' cannot
+// be examined (<the OS's reason>)". Every site that refuses one names it so.
+[[nodiscard]] DSS_EXPORT std::string describeUnexaminable(HeaderSearchResult const& r);
 
 // ★ THE ONE SANCTIONED COLLAPSE of this tri-state into an `optional<path>`.
 //
@@ -92,15 +115,17 @@ struct DSS_EXPORT HeaderSearchResult {
 // header.
 //
 // So the collapse is available in exactly one place and it takes the
-// ambiguity handler as a REQUIRED argument: you cannot reach the optional
-// without having written, at the call site, what happens on a collision. A
-// site that genuinely must stay quiet (a speculative pre-scan, where C 6.10p1
-// dead-branch inertness forbids reporting) has to say so out loud with a
-// lambda a reviewer can see and `grep` can find — it cannot happen by
-// omission. `[[nodiscard]]` on the result closes the other half.
-template <class OnAmbiguous>
+// ambiguity handler AND the unexaminable handler as REQUIRED arguments: you
+// cannot reach the optional without having written, at the call site, what
+// happens on a collision and on a candidate nobody could examine -- the second
+// is the same lossy collapse (an `Unexaminable` read as "not found" goes on to
+// the next answer). A site that genuinely must stay quiet (a speculative
+// pre-scan, where C 6.10p1 dead-branch inertness forbids reporting) has to say
+// so out loud with a lambda a reviewer can see and `grep` can find — it cannot
+// happen by omission. `[[nodiscard]]` on the result closes the other half.
+template <class OnAmbiguous, class OnUnexaminable>
 [[nodiscard]] std::optional<std::filesystem::path>
-takeFound(HeaderSearchResult const& r, OnAmbiguous&& onAmbiguous) {
+takeFound(HeaderSearchResult const& r, OnAmbiguous&& onAmbiguous, OnUnexaminable&& onUnexaminable) {
     switch (r.status) {
         case HeaderSearchStatus::Found:
             return r.path;
@@ -108,6 +133,9 @@ takeFound(HeaderSearchResult const& r, OnAmbiguous&& onAmbiguous) {
             return std::nullopt;
         case HeaderSearchStatus::AmbiguousCase:
             std::forward<OnAmbiguous>(onAmbiguous)(r.ambiguousCandidates);
+            return std::nullopt;
+        case HeaderSearchStatus::Unexaminable:
+            std::forward<OnUnexaminable>(onUnexaminable)(r);
             return std::nullopt;
     }
     return std::nullopt;   // unreachable — every status handled above
@@ -234,8 +262,9 @@ private:
 //
 // ★★ ONE PREDICATE, TWO DECLARERS, AND THAT IS WHY IT LIVES HERE. A shipped-lib
 // descriptor's `realization.<format>.source` and an object format's
-// `runtimeLibraries[].source` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) name files
-// in the SAME tree, compiled by the SAME driver seam, and a second copy of a
+// `runtimeLibraries[].source` / `.sources` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64)
+// name files in the SAME tree, compiled by the SAME driver seam, and a second
+// copy of a
 // SECURITY check is the shape that rots: this exact check already lost its
 // UNC hole once —
 // [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]]
@@ -365,20 +394,28 @@ resolveSystemDescriptor(std::string_view                       filename,
 // the result was a source-half collision surfacing as
 // `F_ShippedHeaderNotFound` — loud, but naming the wrong defect, while the
 // diagnostic whose entire purpose is to list the colliding paths never fired.
+// The two UNEXAMINABLE arms are separate for the same reason: the descriptor
+// half is re-resolved, and reported, by the import resolver; the source half
+// only by the preprocessor.
 enum class AngleIncludeKind {
-    Descriptor,           // a shipped `<stem>.json` on systemDirs (the DSS neutral model)
-    Source,               // NO descriptor, but a REAL source header on the -I includeDirs
-    NotFound,             // neither — a fatal miss (fail-loud F_ShippedHeaderNotFound)
-    AmbiguousDescriptor,  // >=2 fold-matching `<stem>.json` — import resolver reports
-    AmbiguousSource,      // >=2 fold-matching -I headers — the PP is the only reporter
+    Descriptor,              // a shipped `<stem>.json` on systemDirs (the DSS neutral model)
+    Source,                  // NO descriptor, but a REAL source header on the -I includeDirs
+    NotFound,                // neither — a fatal miss (fail-loud F_ShippedHeaderNotFound)
+    AmbiguousDescriptor,     // >=2 fold-matching `<stem>.json` — import resolver reports
+    AmbiguousSource,         // >=2 fold-matching -I headers — the PP is the only reporter
+    UnexaminableDescriptor,  // a `<stem>.json` candidate that cannot be examined — import resolver reports
+    UnexaminableSource,      // an -I candidate that cannot be examined — the PP is the only reporter
 };
 
 struct AngleIncludeResolution {
     AngleIncludeKind      kind;
-    std::filesystem::path path;  // resolved descriptor/source path; empty otherwise
+    std::filesystem::path path;  // resolved descriptor/source path; the unexaminable entry; empty otherwise
     // Set iff kind is one of the Ambiguous* arms (see
     // HeaderSearchResult::ambiguousCandidates).
     std::vector<std::filesystem::path> ambiguousCandidates;
+    // Set iff kind is one of the Unexaminable* arms: the search's own result, for
+    // `describeUnexaminable`.
+    HeaderSearchResult unexaminable{};
 };
 
 // The ONE angle-include resolver funnel (FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK).
@@ -401,6 +438,9 @@ struct AngleIncludeResolution {
 //   4. AmbiguousDescriptor / AmbiguousSource — a fold collision at step 1 or
 //      step 2. Reported, never resolved; kept DISTINCT because different tiers
 //      own the report (see the enum's note).
+//   5. UnexaminableDescriptor / UnexaminableSource — a candidate at step 1 or
+//      step 2 whose reach cannot be examined. The search ENDS there (a later step
+//      is never asked), reported by the tier that owns that half.
 [[nodiscard]] DSS_EXPORT AngleIncludeResolution
 resolveAngleInclude(std::string_view                       filename,
                     std::span<std::filesystem::path const> systemDirs,

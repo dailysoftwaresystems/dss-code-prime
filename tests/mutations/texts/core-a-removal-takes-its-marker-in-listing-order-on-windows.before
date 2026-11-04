@@ -1,0 +1,2 @@
+            if (listError != ERROR_SUCCESS) note(top.path, winError(listError));
+            if (work.size() == 1) moveLastEntryLast(top.names);   // the target's own listing
