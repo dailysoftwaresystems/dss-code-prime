@@ -1115,16 +1115,26 @@ struct Parser::Impl {
             frameAnchors.pop_back();
         }
         if (sketch.enabled()) {
+            // The node this frame closed into, when it is one (a frame of an error shape may
+            // leave none): a parameter list's and a declarator-mode row's own start below.
+            NodeId closedNode{};
+            if (declaratorMode || sketch.isPrototypeParamScopeRule(rule)) {
+                closedNode = newestVisiblePendingChild_();
+                if (closedNode.valid() && (builder->nodeKind(closedNode) != NodeKind::Internal
+                                           || builder->nodeRule(closedNode).v != rule.v))
+                    closedNode = NodeId{};
+            }
             recordAtDeclaratorEnd_(rule);
             if (sketch.isScopeRule(rule)) {
-                std::uint32_t const closedScope = sketch.closeScope();
+                BinderSketch::ClosedScope const closedScope = sketch.closeScope();
                 // P69 L2a2 (lane `lm`): a parameter list's prototype scope, noted with its
-                // node so the declarator's end can keep a definition's own (see BinderSketch).
-                if (sketch.isPrototypeParamScopeRule(rule)) {
-                    NodeId const closedNode = newestVisiblePendingChild_();
-                    if (closedNode.valid() && builder->nodeKind(closedNode) == NodeKind::Internal
-                        && builder->nodeRule(closedNode).v == rule.v)
-                        sketch.notePrototypeParamScope(closedScope, closedNode);
+                // node so the declarator's end can keep a definition's own (see BinderSketch);
+                // P69 L2b1: and with where it starts, which says which declarator and which row
+                // it closed inside. A list with no token declares no name and is not noted.
+                if (sketch.isPrototypeParamScopeRule(rule) && closedNode.valid()) {
+                    SourceSpan const listSpan = builder->nodeSpan(closedNode);
+                    if (!listSpan.isEmpty())
+                        sketch.notePrototypeParamScope(closedScope, closedNode, listSpan.start());
                 }
             }
             for (auto& bn : binderNames) {
@@ -1138,7 +1148,19 @@ struct Parser::Impl {
             }
             // P69 L2a2: a declarator-mode row's close ends whatever its declarators kept —
             // a definition's body has opened and bound them by now, or there is none.
-            if (declaratorMode) sketch.dropDefinitionParams();
+            // P69 L2b1 (lane `lm`, the L2a2 review's A1): only what the row itself holds — the
+            // lists that start at or after the row does. A `param` row of a definition's RETURNED
+            // function type closes after the definition's own list closed and before its body
+            // opens; it ended that list too. A row with no token holds no list; a row whose node
+            // the frame did not leave drops everything, as every row did before.
+            if (declaratorMode) {
+                if (!closedNode.valid()) {
+                    sketch.dropDefinitionParams(0);
+                } else if (SourceSpan const rowSpan = builder->nodeSpan(closedNode);
+                           !rowSpan.isEmpty()) {
+                    sketch.dropDefinitionParams(rowSpan.start());
+                }
+            }
         }
     }
 
@@ -1195,8 +1217,15 @@ struct Parser::Impl {
         // declarator, keep the one whose suffix declares its NAME a function — the only one a
         // definition's body may see — by the predicate the analyzer asks
         // (core/types/prototype_param_scope.hpp); every other list's names died with its scope.
-        sketch.keepDefinitionParamsOf(
-            prototypeParamListOf(view, nameDeclaringFnSuffix(view, closedNode, dc), dc));
+        // P69 L2b1 (lane `lm`, the L2a2 review's A1 and A3): the lists this declarator consumes are
+        // those closed inside it (they start at or after it), and the suffix is the declarator
+        // walk's one answer (`declaratorFnSuffixOf`, the analyzer's and the lowering's question).
+        // A declarator with no token (an abstract parameter's) closed no list inside it.
+        if (SourceSpan const declaratorSpan = builder->nodeSpan(closedNode); !declaratorSpan.isEmpty()) {
+            sketch.keepDefinitionParamsOf(
+                prototypeParamListOf(view, declaratorFnSuffixOf(view, closedNode, dc), dc),
+                declaratorSpan.start());
+        }
         NodeId const nameNode = declaratorNameNode(view, closedNode, dc);
         if (!nameNode.valid()) return;   // abstract — no binding
         SourceSpan const nameSpan = builder->nodeSpan(nameNode);

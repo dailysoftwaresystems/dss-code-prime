@@ -1,1 +1,1 @@
-        return [&] { for (ScopeKind const k : sv.stack) { (void)k; ++*sv.work; } return schema.isTokenValidInScope(m.id, sv.stack); }()
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : [&] { ScopeKind t = ScopeKind::None; for (ScopeKind const k : scopes_) t = k; return t; }(),

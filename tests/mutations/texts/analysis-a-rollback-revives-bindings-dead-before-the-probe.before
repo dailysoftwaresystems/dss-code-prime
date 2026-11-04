@@ -1,0 +1,1 @@
+    return index < stableBindingCount_ && b.scope < closedAt_.size()

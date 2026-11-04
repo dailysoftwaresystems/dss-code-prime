@@ -318,6 +318,19 @@ public:
     // The `typeContainsFlexibleArray` mirror, on the interner (callable from
     // semantic + hir_to_mir + mir_verifier). An invalid id is not a VLA container.
     [[nodiscard]] bool typeContainsVla(TypeId id) const;
+    // ★ P69 L2b1 (lane `lm`, the L2a2 review's B2): IS `id` VARIABLY MODIFIED — C 6.7.6p3: some
+    // declarator in the nested sequence that builds it specifies a variable length array. The
+    // walk follows every derivation a declarator nests — a pointer's pointee, an array's element,
+    // a function type's RESULT (operand 0) — testing `isVlaArray` at each level, and never a
+    // function type's PARAMETERS: their bounds have function prototype scope and are evaluated
+    // nowhere (C 6.7.6.2p5, treated as `*`), so `int (*)(int (*)[n])` is not variably modified.
+    // ONE question with one home, where there were five answers each a different meaning — this
+    // interner's `typeContainsVla` (the array spine: a VLA OBJECT's storage or stride, not
+    // variable modification), the HIR lowering's `typeIsVariablyModified` (this walk), and three
+    // that added one pointer level and stopped. A qualifier skin is seen through (`kind` and
+    // `operands` are transparent); a nominal composite ends the walk (its members are their own
+    // declarations). An invalid id is not variably modified.
+    [[nodiscard]] bool isVariablyModified(TypeId id) const;
     // tuple: operands=[elements...].
     TypeId tuple(std::span<TypeId const> elements);
 

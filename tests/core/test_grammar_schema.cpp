@@ -140,15 +140,26 @@ TEST(GrammarSchema, EmptySpaceFlagDetection) {
     EXPECT_FALSE(schema->isEmptySpace(plus[0].id));
 }
 
+// P69 L2b1 (lane `lm`, the L2a2 review's A4): the schema answers through a PRESENCE oracle only
+// (the stack-walk overload is deleted); this one says a kind is open when the given stack holds it.
+namespace {
+bool stackHoldsKind(void const* ctx, ScopeKind kind) noexcept {
+    auto const& stack = *static_cast<std::span<ScopeKind const> const*>(ctx);
+    return std::ranges::find(stack, kind) != stack.end();
+}
+}  // namespace
+
 TEST(GrammarSchema, ScopeForbidRejectsInsideScope) {
     auto schema = *GrammarSchema::loadFromText(kHappyConfig);
     auto lt = schema->lookupLexeme("<")[1].id;     // LtOperator
     // Outside Generic — valid.
     ScopeKind stackOutside[] = { ScopeKind::Root };
-    EXPECT_TRUE(schema->isTokenValidInScope(lt, stackOutside));
+    std::span<ScopeKind const> const outside{stackOutside};
+    EXPECT_TRUE(schema->isTokenValidInScope(lt, &stackHoldsKind, &outside));
     // Inside Generic — forbidden.
     ScopeKind stackInside[] = { ScopeKind::Root, ScopeKind::Generic };
-    EXPECT_FALSE(schema->isTokenValidInScope(lt, stackInside));
+    std::span<ScopeKind const> const inside{stackInside};
+    EXPECT_FALSE(schema->isTokenValidInScope(lt, &stackHoldsKind, &inside));
 }
 
 TEST(GrammarSchema, RulesAndTokensInternersFrozenPostLoad) {

@@ -247,7 +247,12 @@ public:
     // resolution and one per scope-presence question it asks — a deterministic proxy, as the
     // parser's token accesses are for what it reads. Linear in the input for a correct
     // resolution; a check that read the scope stack per token would make it Θ(tokens × nesting).
-    [[nodiscard]] std::uint64_t               scopeWork()    const noexcept { return scopeWork_; }
+    // P69 L2b1 (lane `lm`, the L2a2 review's A4): plus every entry the scope stack and its
+    // per-kind counts hand out (`TrailedStack::reads`), so a read of the stack is counted where it
+    // happens, not only where an author added to the counter.
+    [[nodiscard]] std::uint64_t scopeWork() const noexcept {
+        return scopeWork_ + scopes_.reads() + scopeKindCounts_.reads();
+    }
 
     // ── frame introspection (used by parsers driving recovery) ──
     // Returns InvalidRule if no frame is currently open. Reading from a

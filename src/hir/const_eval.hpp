@@ -6,10 +6,12 @@
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/hir_literal_pool.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <span>
+#include <utility>
 
 // Shared constants-evaluation engine (plan 12.5 CE1). Computes the compile-
 // time value of a HIR expression by walking the tree bottom-up. The engine
@@ -281,6 +283,41 @@ struct ConstEvalResult {
     std::optional<HirLiteralValue> value;
     ConstEvalFailure               failure   = ConstEvalFailure::None;
     HirNodeId                      blamedNode{};  // for diagnostic anchoring
+};
+
+// ── ★ P69 L2b1 (lane `lm`, the L2a2 review's B3): THE COMMA'S ONE RULE ──────────────────────────
+// A SEQUENCE — the comma operator's `(e1, e2)`, a GNU statement expression `({ s…; v; })` —
+// DISCARDS every operand but its last and has the last one's value. C 6.6p3 keeps the comma out of
+// a constant expression (outside an unevaluated subexpression) and 6.6p10 lets a language admit it
+// as another form, per position: the `commaOperator` form (`constant_form.hpp`). Every evaluator
+// that folds one asks THIS rule and decides nothing of its own: the CST tier's integer constant
+// expressions (its binary comma), this tier's static initializers (a SeqExpr), and — through the
+// same position vocabulary — the preprocessor's `#if` and the analyzer's static-initializer walk.
+// They were four deciders, two of them refusing what the rule admits. Its parts:
+//   * `discards()`  — the sequence discards an operand: it USES the form (a position that admits
+//                     it reports it, as the references warn), and `({ 42; })` does not;
+//   * `refused()`   — it discards one where the position does not admit the form: refused AT the
+//                     sequence, before any operand folds;
+//   * `isDiscarded(i)` — operand `i` is discarded: it must FOLD (all references refuse `(y, 42)`
+//                     for a non-constant `y`, ✔MEASURED P69 L2), and the first that does not is
+//                     the sequence's result; the last operand's fold is the value.
+struct DiscardedOperandSequence {
+    std::size_t   operandCount = 0;
+    ConstantForms admitted{};
+
+    [[nodiscard]] constexpr bool discards() const noexcept { return operandCount > 1; }
+    [[nodiscard]] constexpr bool refused() const noexcept {
+        return discards() && !admitted.admits(ConstantForm::CommaOperator);
+    }
+    [[nodiscard]] constexpr bool isDiscarded(std::size_t i) const noexcept {
+        return i + 1 < operandCount;
+    }
+    // The sequence's result after a DISCARDED operand's fold: that fold when it failed, else the
+    // fold of what follows it.
+    [[nodiscard]] static ConstEvalResult afterDiscarded(ConstEvalResult discarded,
+                                                        ConstEvalResult rest) {
+        return discarded.value.has_value() ? std::move(rest) : std::move(discarded);
+    }
 };
 
 // Evaluate `expr` to a compile-time `HirLiteralValue`. Pure function;

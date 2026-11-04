@@ -672,6 +672,8 @@ round's close; each checkpoint's commit message says what was and was not run on
   the arm registry by arm (1132 arms, re-sorted). The MERGED tree, read after the commit: 2877 of 2877 on all five
   legs (run 20261028-202355-b6a9233b; one binary moved into the `repo-guard` label, which read 24 of 24 before the
   commit, run 20261028-195308-2c3589bc). Its review: SEND BACK, 17 findings (1 MAJOR, the row above), answered in H5.
+  Main's sweep of its 13 Windows arms (run 20261103-181938-fd251bd3): 9 `passed`, 1 survived
+  (`tests-python-keeps-a-cached-app-execution-alias`, a test gap), 3 violated — back with the harness lane in H5.
 - **Checkpoint 35 (2026-10-28) = the C front end lane's fold f26b**: a tentative `__declspec(dllimport) int x;` is a
   REFERENCE to `__imp_x`, as both references make it (it was a common DEFINITION, and at block scope an automatic local
   read uninitialised — SILENT, P0 class), and `dllimport` on a definition is refused by name; a weak alias of a
@@ -691,11 +693,14 @@ round's close; each checkpoint's commit message says what was and was not run on
   20261028-203400-06f46391); 142 arms changed only in a case count are main's to sweep; one arm SURVIVED (an imported
   function's address, INFERRED an unreachable guard) — f26c's. Settled by main: four text paths merged against
   checkpoint 33 (each result byte-identical to the lane's copy) and the arm registry by arm (1197 arms). The MERGED
-  tree's five-leg suite follows the commit. Plan 30 is re-derived here (681 open rows; PR #59 holds 95).
+  tree, read after the commit: 2894 of 2894 on all five legs (run 20261103-181938-27da3a67 for the three local legs).
+  Plan 30 is re-derived here (681 open rows; PR #59 holds 95).
 - **Checkpoint 36 (2026-11-03) = the library lane's fold L2a2**, its answer to the review of L2a: the binder sketch
   opens a function prototype's scope at its parameter list and re-binds a definition's own parameters at its body (one
   structural predicate, src/core/types/prototype_param_scope.hpp); a replayed speculation failure counts as a sketch
-  question; a nest of statement expressions, parentheses or blocks parses in work LINEAR in its depth — the tree
+  question; a nest of statement expressions, parentheses or blocks parses in work linear in its depth for the shapes
+  pinned here (the review of L2a2 found one more — a declaration plus a probe per level, quadratic in the sketch's
+  lookup — made linear by checkpoint 37) — the tree
   builder no longer walks its whole scope stack for every token (per-kind presence counts; a 4000-deep `({` nest
   9762 → 208 ms on windows-x86_64-debug), pinned by two deterministic work counters, never by wall time; a variably
   modified type in a cast's or compound literal's function RESULT runs its bound, its parameters never (as gcc and
@@ -713,7 +718,29 @@ round's close; each checkpoint's commit message says what was and was not run on
   three-way: `cst_to_hir.cpp` (clean) and the arm registry by arm (1205 arms). The orchestrator's: the arm registry's
   header states the encoding the tool reads (UTF-8, LF), where it claimed ASCII; the C front end lane is two folds now
   (f26c after 3d, f26d after 3e); the review of f26b's finding F3 (the PE weak pair in a relocatable link) moved to the
-  link lane's 3e, inside its home audit of the link-side election. The MERGED tree's five-leg suite follows the commit.
+  link lane's 3e, inside its home audit of the link-side election. The MERGED tree, read after the commit: 2894 of
+  2894 on all five legs (run 20261103-232259-8d510a09 for the three local legs, at `a419efc1`); its repo-guard label
+  24 of 24 (run 20261103-211812-e39d8512). Main's sweep of 115 of its arms on macos-arm64-debug (leg run
+  20261103-193507-d097a125): 105 `passed`, 10 violated (each a red set its rows did not declare, or a diagnostic not
+  said) — 9 to the library lane's L2b1, 1 to the C front end lane's f26c. Its review: SEND BACK, 10 findings (1
+  MAJOR: a definition of a function RETURNING a function pointer lost its own parameters in the sketch, a regression
+  of this fold), answered in L2b1 and L2b2.
+- **Checkpoint 37 (2026-11-04) = the library lane's fold L2b1**, folded ahead of H5, 3d and f26c (it was ready and
+  depends on none of them), its first answer to the review of L2a2: a definition's own parameters survive whatever
+  parameter lists its returned type closes (`(T) - 1` under `typedef int T` in `int (*g(int T))(int)` runs 42 as gcc,
+  clang and cl do — the regression fixed); a HOME AUDIT of the binder sketch's binding store (its third touch this
+  round) made its invariants structural: one declarator walk (src/core/types/declarator_walk.hpp, the second copy
+  deleted), a per-name binding index whose lookup passes each dead binding once across every probe and rollback, a
+  definition's parameters re-bound from its own list's mark, every stack read counted where it is handed out (the
+  span-walk overload of the scope check deleted); the ONE home of "is this type variably modified" (C 6.7.6p3,
+  `TypeInterner::isVariablyModified`) and of the comma's constant-fold rule (`DiscardedOperandSequence`, asked by both
+  constant evaluators) are built — their other askers move in L2b2, so the four rows stay open with their
+  class-closure records stating the sites left. 4 rows amended, none closed, none new. ✔MEASURED by the lane on its
+  final bytes, every changed test binary run whole (run 20261104-190117-e19be98e): 12 of 12 on windows-x86_64-release
+  (MSVC 19.51), windows-x86_64-debug (GNU 13.2.0), linux-x86_64-debug (GNU 13.3.0) and macos-arm64-debug (AppleClang
+  21.0.0); the read count costs nothing measurable (DSS's release compile of sqlite3.c, parse phase 1.01–1.12 s with
+  it, 1.09–1.10 s without). Folded with no conflict. The MERGED tree's five-leg suite, repo-guard and the sweep of the
+  fold's 41 arms follow the commit.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

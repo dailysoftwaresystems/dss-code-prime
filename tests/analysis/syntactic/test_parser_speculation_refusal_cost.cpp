@@ -87,6 +87,7 @@
 // re-bless it. `DSS_SP_IDENTITY_DUMP` prints the full rendering when one moves
 // and the hash alone will not say what changed.
 
+#include "analysis/syntactic/binder_sketch.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -105,6 +106,7 @@
 #include <cstdlib>
 #include <format>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1335,4 +1337,215 @@ TEST(ParserSpeculationRefusalCost, AProbeAtEveryNestedLevelCostsTheSketchWorkLin
     EXPECT_LT(sketch, 3.0 * linear)
         << kNestDeep << " levels cost the binder sketch x" << sketch << " the work of "
         << kNestShallow << " (linear x" << linear << "): a probe's snapshot reads the nesting";
+}
+
+// ── P69 L2b1 (lane `lm`, the L2a2 review's B1 and A2): THE SKETCH'S WORK IS LINEAR IN A NEST THAT
+// DECLARES, AND IN A FILE'S LENGTH ──
+//
+// The pin above declares nothing per level, and that is where the sketch's lookup was blind: it
+// scanned every binding ever recorded, newest first and dead ones included, until the name
+// matched, so a lookup cost the bindings recorded since the name's own. A nest that declares a
+// name and probes a typedef at every level made the lookup of `T` at level k pass k dead `a`s —
+// Θ(D²) — and in LENGTH every late lookup of an early typedef walked every parameter and local of
+// every earlier function. And re-binding a definition's own parameters at its body scanned the
+// bindings from the first one of the file, uncounted: Θ(definitions × bindings). A lookup walks its
+// NAME's chain now (a per-name index, dead heads moved past once), and the re-bind starts where
+// the list's scope opened, counted. THE PINS: as above, 4000 against 500 under three times the
+// linear 8x, on the sketch's counter and the token stream.
+
+// RED-ON-DISABLE: a lookup that scans every binding again — each one it passes counted.
+TEST(ParserSpeculationRefusalCost, ADeclarationAndAProbeAtEveryNestedLevelCostTheSketchWorkLinearInTheDepth) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    auto src = [](int d) {
+        return "typedef int T;\nint f(void) { int v = " + repeatText("({ int a = 1; (void)(T)(a); ", d)
+             + "5" + repeatText("; })", d) + "; return v; }\n";
+    };
+    NestReading const shallow = readNest(schema, src(kNestShallow), kNestShallow);
+    NestReading const deep    = readNest(schema, src(kNestDeep), kNestDeep);
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    double const sketch = nestRatio(deep.sketch, shallow.sketch);
+    double const tokens = nestRatio(deep.tokens, shallow.tokens);
+    std::printf("a declaration and a probe per level: %d levels sketch work %llu tokens %llu; %d "
+                "levels sketch work %llu tokens %llu; sketch x%.2f, tokens x%.2f (linear x%.0f)\n",
+                kNestShallow, static_cast<unsigned long long>(shallow.sketch),
+                static_cast<unsigned long long>(shallow.tokens), kNestDeep,
+                static_cast<unsigned long long>(deep.sketch),
+                static_cast<unsigned long long>(deep.tokens), sketch, tokens, linear);
+    ASSERT_GE(shallow.sketch, static_cast<std::uint64_t>(2 * kNestShallow))
+        << "the nest asked the sketch nothing per level: this pin reads nothing";
+    EXPECT_LT(tokens, 3.0 * linear) << "the token work is super-linear";
+    EXPECT_LT(sketch, 3.0 * linear)
+        << kNestDeep << " levels cost the binder sketch x" << sketch << " the work of "
+        << kNestShallow << " (linear x" << linear
+        << "): a lookup passes the bindings of the levels outside it";
+}
+
+// Four files of N definitions: alone (each one's parameters re-bound at its body), then N late
+// lookups of the early typedef `T`, then the same with every definition's parameter named `T` (so
+// T's own chain holds 2N dead bindings before the typedef), then the same chain before a file-scope
+// VARIABLE `T`, used late in parentheses — every `(T)` a cast probe the sketch refutes (`T` is a
+// value), so every lookup of it runs inside a probe that rolls back.
+// RED-ON-DISABLE: the re-bind scanning from the file's first binding (the first shape); a lookup
+// scanning every binding (the last three); a lookup that never moves a dead head (the last two); a
+// rollback that revives the dead bindings a lookup inside the probe moved past, though they died
+// before the probe began (the last).
+TEST(ParserSpeculationRefusalCost, AFileOfDefinitionsCostsTheSketchWorkLinearInItsLength) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    struct Shape {
+        char const* name;
+        char const* fileScopeT;   // the early declaration of `T`
+        char const* param;        // each definition's parameter
+        char const* lateTerm;     // each late use of `T` (none: no late uses)
+    };
+    Shape const shapes[] = {
+        {"definitions alone", "typedef int T;\n", "a", nullptr},
+        {"definitions, then late lookups of the typedef", "typedef int T;\n", "a", "(T)(x) + "},
+        {"definitions whose parameter hides the typedef, then late lookups of it", "typedef int T;\n",
+         "T", "(T)(x) + "},
+        {"definitions whose parameter hides a file-scope variable, then late parenthesised uses of it",
+         "int T;\n", "T", "(T) + "},
+    };
+    auto src = [](Shape const& s, int n) {
+        std::string o = s.fileScopeT;
+        for (int k = 0; k < n; ++k) {
+            o += "static int f" + std::to_string(k) + "(int " + s.param + ") { int b = " + s.param
+               + "; return b; }\n";
+        }
+        if (s.lateTerm != nullptr) {
+            o += "int g(int x) { return ";
+            for (int k = 0; k < n; ++k) o += s.lateTerm;
+            o += "0; }\n";
+        }
+        return o;
+    };
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    for (Shape const& s : shapes) {
+        NestReading const shallow = readNest(schema, src(s, kNestShallow), kNestShallow);
+        NestReading const deep    = readNest(schema, src(s, kNestDeep), kNestDeep);
+        double const sketch = nestRatio(deep.sketch, shallow.sketch);
+        double const tokens = nestRatio(deep.tokens, shallow.tokens);
+        std::printf("%s: %d definitions sketch work %llu tokens %llu; %d definitions sketch work "
+                    "%llu tokens %llu; sketch x%.2f, tokens x%.2f (linear x%.0f)\n",
+                    s.name, kNestShallow, static_cast<unsigned long long>(shallow.sketch),
+                    static_cast<unsigned long long>(shallow.tokens), kNestDeep,
+                    static_cast<unsigned long long>(deep.sketch),
+                    static_cast<unsigned long long>(deep.tokens), sketch, tokens, linear);
+        ASSERT_GE(shallow.sketch, static_cast<std::uint64_t>(kNestShallow))
+            << s.name << ": the file asked the sketch nothing per definition: this pin reads nothing";
+        EXPECT_LT(tokens, 3.0 * linear) << s.name << ": the token work is super-linear";
+        EXPECT_LT(sketch, 3.0 * linear)
+            << s.name << ": " << kNestDeep << " definitions cost the binder sketch x" << sketch
+            << " the work of " << kNestShallow << " (linear x" << linear
+            << "): the sketch's work grows with the bindings recorded before it";
+    }
+}
+
+// THE SKETCH ITSELF, no parser between: a dead binding is walked once, whatever the probes do. Each
+// part first records N bindings of `T` NESTED (each while the one before is live, so no push can
+// pass another), above a typedef `T`.
+// (a) All N die before any probe; then N lookups of the typedef, each inside a snapshot that is
+// restored (a probe the triage refutes): the first lookup passes them for good — no restore can
+// bring them back. (b) One snapshot live throughout (a probe still open): the N die inside it, then
+// N lookups — a restore COULD bring those back, so the first lookup moves the head past them under
+// the journal, and the others start at the typedef. (c) All N die before any probe; then N probes
+// that each declare `T` in a block of their own, close it, look `T` up and roll back: the push that
+// declares it passes the N first, so the head it journals — the one the rollback restores — is
+// already past them. A parse reaches (b) and (c) at these sizes only through more probe budget than
+// a probe has, so they are asked here.
+// RED-ON-DISABLE: a pass made under the journal, or none (a, c); a lookup that never moves its head
+// past the dead bindings it walked (b); a push that links to its name's head unpassed (c) — each
+// makes every lookup walk all N.
+TEST(ParserSpeculationRefusalCost, ALookupWalksADeadBindingOnceAcrossAProbeOrInsideIt) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    SourceSpan const at = SourceSpan::empty(0);
+    auto nestOfT = [&](BinderSketch& sk, int n) {
+        for (int k = 0; k < n; ++k) {
+            sk.openScope(RuleId{});
+            sk.record("T", /*isType=*/false, at);
+        }
+        for (int k = 0; k < n; ++k) (void)sk.closeScope();
+    };
+    enum class Part { DiedBeforeTheProbes, DiedInsideTheProbe, DeclaredAgainInEachProbe };
+    auto run = [&](Part part, int n) -> std::uint64_t {
+        BinderSketch sk(*schema);
+        sk.record("T", /*isType=*/true, at);
+        std::optional<BinderSketch::Snapshot> open;
+        if (part == Part::DiedInsideTheProbe) open.emplace(sk.snapshot());
+        nestOfT(sk, n);
+        std::uint64_t const before = sk.workCount();
+        for (int k = 0; k < n; ++k) {
+            if (part == Part::DiedInsideTheProbe) {
+                EXPECT_EQ(sk.lookup("T"), BinderSketch::NameKind::Type) << "a dead binding answered";
+                continue;
+            }
+            BinderSketch::Snapshot s = sk.snapshot();
+            if (part == Part::DeclaredAgainInEachProbe) {
+                sk.openScope(RuleId{});
+                sk.record("T", /*isType=*/false, at);
+                (void)sk.closeScope();
+            }
+            EXPECT_EQ(sk.lookup("T"), BinderSketch::NameKind::Type) << "a dead binding answered";
+            sk.restore(std::move(s));
+        }
+        return sk.workCount() - before;
+    };
+    struct Case {
+        Part        part;
+        char const* name;
+    };
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    for (Case const c : {Case{Part::DiedBeforeTheProbes, "dead before the probes, looked up in each probe"},
+                         Case{Part::DiedInsideTheProbe, "dead inside a live probe, then looked up in it"},
+                         Case{Part::DeclaredAgainInEachProbe,
+                              "dead before the probes, declared again and looked up in each probe"}}) {
+        std::uint64_t const shallow = run(c.part, kNestShallow);
+        std::uint64_t const deep    = run(c.part, kNestDeep);
+        double const ratio = nestRatio(deep, shallow);
+        std::printf("%s: %d lookups sketch work %llu; %d lookups sketch work %llu; x%.2f (linear "
+                    "x%.0f)\n",
+                    c.name, kNestShallow, static_cast<unsigned long long>(shallow), kNestDeep,
+                    static_cast<unsigned long long>(deep), ratio, linear);
+        ASSERT_GE(shallow, static_cast<std::uint64_t>(kNestShallow))
+            << c.name << ": the lookups counted nothing: this pin reads nothing";
+        EXPECT_LT(ratio, 3.0 * linear)
+            << c.name << ": " << kNestDeep << " lookups cost the binder sketch x" << ratio
+            << " the work of " << kNestShallow << " (linear x" << linear
+            << "): a lookup walks the dead bindings again";
+    }
+}
+
+// The parse of (a) above: a function opens N nested blocks each declaring `T`, closes them, then
+// uses a file-scope VARIABLE `T` N times in parentheses — every `(T)` a cast probe the triage
+// refutes, so every lookup of `T` runs inside a snapshot that is restored, past N bindings that
+// died before it.
+// RED-ON-DISABLE: a lookup that passes nothing while a probe is live (every head move journaled):
+// each rollback undoes the move, and the next probe walks all N again.
+TEST(ParserSpeculationRefusalCost, ANestThatDeclaresANameCostsItsLateRefutedProbesLinearWork) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    auto src = [](int n) {
+        return "int T;\nint g(int x) { " + repeatText("{ int T = 0; ", n) + repeatText("} ", n)
+             + "return " + repeatText("(T) + ", n) + "x; }\n";
+    };
+    NestReading const shallow = readNest(schema, src(kNestShallow), kNestShallow);
+    NestReading const deep    = readNest(schema, src(kNestDeep), kNestDeep);
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    double const sketch = nestRatio(deep.sketch, shallow.sketch);
+    double const tokens = nestRatio(deep.tokens, shallow.tokens);
+    std::printf("a nest declaring T, then late refuted probes of T: %d sketch work %llu tokens %llu; "
+                "%d sketch work %llu tokens %llu; sketch x%.2f, tokens x%.2f (linear x%.0f)\n",
+                kNestShallow, static_cast<unsigned long long>(shallow.sketch),
+                static_cast<unsigned long long>(shallow.tokens), kNestDeep,
+                static_cast<unsigned long long>(deep.sketch),
+                static_cast<unsigned long long>(deep.tokens), sketch, tokens, linear);
+    ASSERT_GE(shallow.sketch, static_cast<std::uint64_t>(kNestShallow))
+        << "the late probes asked the sketch nothing: this pin reads nothing";
+    EXPECT_LT(tokens, 3.0 * linear) << "the token work is super-linear";
+    EXPECT_LT(sketch, 3.0 * linear)
+        << kNestDeep << " nested declarations and late probes cost the binder sketch x" << sketch
+        << " the work of " << kNestShallow << " (linear x" << linear
+        << "): a lookup walks the dead bindings again";
 }

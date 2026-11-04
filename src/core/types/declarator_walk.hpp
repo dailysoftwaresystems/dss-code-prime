@@ -629,16 +629,107 @@ nameAdjacentAttributeSpecifiers(Tree const& tree, SemanticConfig const& cfg,
 // slightly differently from its neighbour. This header already exists to stop exactly
 // that (see its opening note on the name-extraction walk).
 //
-// ⚠ Tree-ONLY, deliberately, where everything above is a template over the node-view
-// adapter. This walk ascends, and the parser's mid-parse `TreeBuilder` adapter has no
-// parent link to ascend through — a node is not yet attached to its frame. Both real
-// consumers hold a frozen `Tree`. Making it a template would mean inventing a
-// `parent()` the parser cannot honestly implement.
+// ★ P69 L2b1 (lane `lm`, the L2a2 review's A3): ONE WALK, TOP-DOWN, SO EVERY TIER ASKS IT. The
+// order above is read from the OUTERMOST declarator down: the walk descends to the name keeping
+// each level it passes (a declarator, its direct declarator, and the base it descended into), then
+// reads those levels innermost first. The parser's binder sketch asks it mid-parse, over the
+// builder's finished nodes, which have no parent link to climb; a frozen `Tree` asks it from a
+// NAME by climbing to the outermost declarator of the name's nest first (`innermostNameDerivation`
+// below), then asking the same walk. There were two copies — this one climbing, and the
+// sketch's own descent in `prototype_param_scope.hpp` — equal only by reading.
 
-// The INNERMOST TYPE DERIVATION applied to `nameNode` — the single grammar node that
-// decides what kind of thing the name is (a function suffix / a pointer layer / an
-// array suffix), or an invalid NodeId when the name carries NO derivation at all
-// (`int x;`, whose type IS the declaration head's) or is not a declarator name.
+// The INNERMOST TYPE DERIVATION of the name `start` declares — the single grammar node that
+// decides what kind of thing the name is (a function suffix / a pointer layer / an array suffix) —
+// or an invalid NodeId when the name carries none (`int x;`, whose type IS the head's), the
+// declarator is abstract, or `start` is outside the declarator shapes. `start` is a per-slot
+// wrapper, a declarator, or a direct declarator (the top of a nest whose direct declarator has no
+// enclosing declarator). When `expectedName` is valid, the name the descent reaches must be it.
+template <class View>
+[[nodiscard]] NodeId innermostDerivationOf(View const& v, NodeId start, DeclaratorConfig const& dc,
+                                           NodeId expectedName = {}) {
+    namespace det = declarator_walk_detail;
+    struct Level {
+        NodeId declarator;   // invalid at a top direct declarator with no enclosing declarator
+        NodeId direct;
+        NodeId base;         // the name token, or the parenthesis group the descent entered
+    };
+    std::vector<Level> levels;
+    NodeId cur = start;
+    NodeId declarator{};
+    for (substrate::WalkSteps steps{v.nodeCount(), "innermostDerivationOf's descent"};;
+         steps.step()) {
+        if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return {};
+        RuleId const r = v.rule(cur);
+        if (isDeclaratorSlotWrapper(r, dc)) {
+            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
+            continue;
+        }
+        if (r == dc.declaratorRule) {
+            declarator = cur;
+            cur        = det::firstChildOfRule(v, cur, dc.directRule);
+            continue;
+        }
+        if (r != dc.directRule) return {};
+        NodeId name{};
+        for (NodeId c : v.children(cur)) {
+            if (v.isVisible(c) && v.kind(c) == NodeKind::Token && v.tokenKind(c) == dc.nameToken) {
+                name = c;
+                break;
+            }
+        }
+        if (name.valid()) {
+            if (expectedName.valid() && name.v != expectedName.v) return {};
+            levels.push_back(Level{declarator, cur, name});
+            break;
+        }
+        NodeId const group = det::firstChildOfRule(v, cur, dc.groupRule);
+        if (!group.valid()) return {};   // abstract — no name to declare
+        levels.push_back(Level{declarator, cur, group});
+        declarator = NodeId{};
+        cur        = det::firstChildOfRule(v, group, dc.declaratorRule);
+        if (!cur.valid()) return {};
+    }
+    for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
+        // (1) A SUFFIX on this level's direct declarator; leftmost = innermost. Declarator
+        //     DECORATIONS (attribute runs, asm labels) annotate a declarator, they never derive
+        //     a type from it, so they are skipped through the shared predicate.
+        for (NodeId c : v.children(it->direct)) {
+            if (!v.isVisible(c) || c.v == it->base.v) continue;
+            if (v.kind(c) != NodeKind::Internal) continue;
+            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
+            return c;
+        }
+        // (2) No suffix ⇒ the enclosing declarator's POINTER LAYERS come next. This is what
+        //     keeps `int (*fp)(int)` a POINTER although the walk sees through parentheses — the
+        //     layer reaches the name before the suffix does. No enclosing declarator ⇒ the name
+        //     reached the top undecorated.
+        if (!it->declarator.valid()) return {};
+        for (NodeId c : v.children(it->declarator)) {
+            if (!v.isVisible(c) || c.v == it->direct.v) continue;
+            if (v.kind(c) != NodeKind::Internal) continue;
+            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
+            return c;
+        }
+        // (3) Neither ⇒ one redundant-parenthesis level OUT, and the same two questions of the
+        //     direct declarator enclosing the group.
+    }
+    return {};   // the name reached the top undecorated — its type IS the head's
+}
+
+// The FUNCTION SUFFIX that declares the name of `declarator` (a declarator or a per-slot wrapper
+// of one) a function — its innermost derivation, when that is a function suffix — or invalid.
+template <class View>
+[[nodiscard]] NodeId declaratorFnSuffixOf(View const& v, NodeId declarator,
+                                          DeclaratorConfig const& dc) {
+    NodeId const der = innermostDerivationOf(v, declarator, dc);
+    if (!der.valid() || v.kind(der) != NodeKind::Internal) return {};
+    return isFnSuffixRule(v.rule(der), dc) ? der : NodeId{};
+}
+
+// The innermost derivation applied to `nameNode`, asked of a frozen `Tree`: the climb finds the
+// OUTERMOST declarator of the name's nest — up through direct declarator, declarator and
+// parenthesis group for as long as the shapes nest — and the one walk above answers from there.
+// Not a declarator name (its parent is no direct declarator) ⇒ invalid.
 [[nodiscard]] inline NodeId
 innermostNameDerivation(Tree const& tree, NodeId nameNode,
                         DeclaratorConfig const& dc) {
@@ -648,53 +739,29 @@ innermostNameDerivation(Tree const& tree, NodeId nameNode,
         || v.rule(direct) != dc.directRule) {
         return {};
     }
-    // The child of `direct` the walk ASCENDED FROM — the name token at the first
-    // level, the parenthesis group at every level above it. It is the BASE of the
-    // direct declarator, never one of its suffixes.
-    NodeId base = nameNode;
+    NodeId top = direct;   // the outermost node of the nest found so far
     for (substrate::WalkSteps steps{tree.nodeCount(), "innermostNameDerivation's climb"};;
          steps.step()) {
-        // (1) A SUFFIX on this direct declarator; leftmost = innermost. Declarator
-        //     DECORATIONS (attribute runs, asm labels) annotate a declarator, they
-        //     never derive a type from it, so they are skipped through the shared
-        //     predicate rather than a second local list.
-        for (NodeId c : v.children(direct)) {
-            if (!v.isVisible(c) || c.v == base.v) continue;
-            if (v.kind(c) != NodeKind::Internal) continue;
-            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
-            return c;
-        }
-        // (2) No suffix ⇒ the enclosing declarator's POINTER LAYERS come next. This
-        //     is what keeps `int (*fp)(int)` a POINTER after the walk learned to see
-        //     through parentheses — the layer reaches the name before the suffix does.
         NodeId const encl = tree.parent(direct);
         if (!encl.valid() || v.kind(encl) != NodeKind::Internal
             || v.rule(encl) != dc.declaratorRule) {
-            return {};
+            break;
         }
-        for (NodeId c : v.children(encl)) {
-            if (!v.isVisible(c) || c.v == direct.v) continue;
-            if (v.kind(c) != NodeKind::Internal) continue;
-            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
-            return c;
-        }
-        // (3) Neither ⇒ step OUT one redundant-parenthesis level and ask the very
-        //     same two questions of the direct declarator enclosing the group.
-        //     Anything else above us (an init-declarator, the declaration row) means
-        //     the name reached the top undecorated — its type IS the head's.
+        top = encl;
         NodeId const group = tree.parent(encl);
         if (!group.valid() || v.kind(group) != NodeKind::Internal
             || v.rule(group) != dc.groupRule) {
-            return {};
+            break;
         }
         NodeId const outer = tree.parent(group);
         if (!outer.valid() || v.kind(outer) != NodeKind::Internal
             || v.rule(outer) != dc.directRule) {
-            return {};
+            break;
         }
-        base   = group;
+        top    = outer;
         direct = outer;
     }
+    return innermostDerivationOf(v, top, dc, nameNode);
 }
 
 // The FUNCTION SUFFIX that declares `nameNode` a function — i.e. its innermost

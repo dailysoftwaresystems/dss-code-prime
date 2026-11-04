@@ -1,0 +1,1 @@
+    [[nodiscard]] auto begin()  const noexcept { return v_.begin(); }

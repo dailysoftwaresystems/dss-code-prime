@@ -680,6 +680,49 @@ TEST(ParserCastExpr, APrototypeParametersScopeEndsWithItsDeclarator) {
     }
 }
 
+// ── P69 L2b1 (lane `lm`, the L2a2 review's A1): A DEFINITION'S OWN PARAMETERS SURVIVE THE
+// PARAMETER LISTS OF THE TYPE IT RETURNS. A function returning a function pointer writes its
+// own list INSIDE its declarator and the returned type's lists AFTER it; each `param` row of a
+// returned list ended its declarator and its row by dropping every list the sketch had noted, the
+// definition's own included, so its body saw none of its parameters and `(T)(x)` there was a cast
+// through the file-scope typedef. ✔MEASURED 2026-11-03 (probe-reference-cc run
+// 20261103-200559-43e50237, gcc 13.3.0 and clang 18.1.3, default and -std=c2x -pedantic-errors,
+// built and run): every shape below with `(T) - 1` in the body exits 42 — the parameter, never the
+// typedef. THE UNIVERSE: the returned list unnamed, named or `(void)` × one or two levels of
+// returned function pointers × a DEFINITION (its own `T` is the body's: `(T)(x)` is a call, no
+// cast) and a DECLARATION (its own list ends with its declarator: `(T)(1)` after it is a cast),
+// and the `signal` shape (a function-pointer PARAMETER beside a returned function pointer).
+TEST(ParserCastExpr, ADefinitionsOwnParametersSurviveTheListsOfTheTypeItReturns) {
+    struct Shape { char const* what; char const* head; char const* tail; };
+    // `head` + "g(int T, int x)" + `tail` is the declarator; the definition's own list is g's.
+    Shape const shapes[] = {
+        {"one level, the returned list unnamed", "int (*", ")(int)"},
+        {"one level, the returned list named", "int (*", ")(int u)"},
+        {"one level, the returned list (void)", "void (*", ")(void)"},
+        {"two levels, unnamed", "int (*(*", ")(int))(int)"},
+        {"two levels, named", "int (*(*", ")(int u))(int v)"},
+        {"two levels, (void)", "void (*(*", ")(void))(void)"},
+    };
+    for (Shape const& s : shapes) {
+        std::string const decl = std::string{s.head} + "g(int T, int x)" + s.tail;
+        std::string const def = "typedef int T;\nstatic " + decl
+                                + " { int y = (T)(x); (void)y; return 0; }\n";
+        auto rd = parseC(def);
+        EXPECT_FALSE(rd.tree.diagnostics().hasErrors()) << "definition, " << s.what;
+        // (void)y is the one cast; `(T)(x)` is a call of the parameter.
+        EXPECT_EQ(countNodesWithRule(rd.tree, "castExpr"), 1u) << "definition, " << s.what << "\n" << def;
+        std::string const dcl = "typedef int T;\nstatic " + decl + ";\nint y = sizeof((T)(1));\n";
+        auto rc = parseC(dcl);
+        EXPECT_FALSE(rc.tree.diagnostics().hasErrors()) << "declaration, " << s.what;
+        EXPECT_EQ(countNodesWithRule(rc.tree, "castExpr"), 1u) << "declaration, " << s.what << "\n" << dcl;
+    }
+    // The `signal` shape: a function-pointer parameter's own list closes inside g's list.
+    auto rs = parseC("typedef int T;\nstatic void (*s(int T, void (*fn)(int), int x))(int) "
+                     "{ int y = (T)(x); (void)y; return fn; }\n");
+    EXPECT_FALSE(rs.tree.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesWithRule(rs.tree, "castExpr"), 1u) << "the signal shape";
+}
+
 // Seeding (the oracle's reparse channel): the SAME ambiguous source that
 // records a candidate above commits the CAST when the name is seeded as
 // a global type — this is the parser half of the A3 cross-file path.

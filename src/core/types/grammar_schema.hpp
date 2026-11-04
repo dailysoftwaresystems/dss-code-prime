@@ -1398,13 +1398,13 @@ public:
     [[nodiscard]] std::span<ConfigDiagnostic const> loadDiagnostics() const noexcept;
 
     // ── Scope rules ──
-    [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,
-                                           std::span<ScopeKind const> stack) const noexcept;
-    // The same question asked of a PRESENCE oracle — `open(ctx, kind)`: is a scope of that kind
-    // open? — instead of a stack: one question per scope kind that carries a rule forbidding
-    // `tok`, never the stack's depth, and none for a grammar that declares no scope rules. The
-    // answer equals the stack walk's on the stack the oracle describes (P69 L2a2: the walk, once
-    // per token, made a parse cost Θ(tokens × nesting)).
+    // Is `tok` valid where the scopes `open(ctx, kind)` says are open — false iff a scope of a
+    // kind whose `scopes.validity` row forbids `tok` is open. Asked of a PRESENCE oracle, one
+    // question per scope kind that forbids anything, in ascending kind order, never the stack's
+    // depth, and none for a grammar that declares no scope rules (P69 L2a2: a walk of the stack,
+    // once per token, made a parse cost Θ(tokens × nesting)). ★ P69 L2b1 (lane `lm`, the L2a2
+    // review's A4): there is no stack form of this question any more — the walk overload is
+    // deleted, so a resolution cannot call it, and its tests ask this one through a stack oracle.
     using ScopeOpenFn = bool (*)(void const* ctx, ScopeKind kind) noexcept;
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
                                            void const* ctx) const noexcept;
@@ -1456,6 +1456,10 @@ private:
     // Written ONLY by `loadFromText` (a static member, so no friend is
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
+
+    // The scope kinds a `scopes.validity` row forbids a token in, ascending (the ctor's sealing
+    // pass; see `isTokenValidInScope`).
+    std::vector<std::uint16_t> scopeForbidOrder_;
 
     detail::GrammarSchemaData d_;
 };

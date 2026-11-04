@@ -2059,17 +2059,20 @@ evalImpl(NodeId                              expr,
                 // references refuse `(y, 1)` for a non-constant `y`, ✔MEASURED); the value is
                 // the RIGHT operand's, a bit-field's promoted as above — clang's comma hands its
                 // right operand's bit-field on. Not admitted: refused AT the comma.
+                // P69 L2b1 (lane `lm`): the comma's one rule decides (`DiscardedOperandSequence`,
+                // hir/const_eval.hpp) — two operands, the left one discarded.
                 if (e->target == "Comma") {
-                    if (!options.admittedForms.admits(ConstantForm::CommaOperator)) {
+                    DiscardedOperandSequence const seq{.operandCount = 2,
+                                                       .admitted     = options.admittedForms};
+                    if (seq.refused()) {
                         result = fail(ConstEvalFailure::NotAConstantExpression, node);
-                    } else if (!lhs.value.has_value()) {
-                        result = std::move(lhs);
                     } else {
-                        if (rhs.value.has_value() && notTheAskedExpression == 0
-                            && env.noteConstantForm) {
+                        if (seq.discards() && lhs.value.has_value() && rhs.value.has_value()
+                            && notTheAskedExpression == 0 && env.noteConstantForm) {
                             env.noteConstantForm(ConstantForm::CommaOperator, node);
                         }
-                        result = std::move(rhs);
+                        result = DiscardedOperandSequence::afterDiscarded(std::move(lhs),
+                                                                          std::move(rhs));
                     }
                     break;
                 }

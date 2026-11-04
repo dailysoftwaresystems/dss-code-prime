@@ -272,6 +272,15 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
             }
         }
     }
+    // P69 L2b1 (lane `lm`, the L2a2 review's A6): the scope kinds that forbid a token, ASCENDING —
+    // the order `isTokenValidInScope` asks its presence questions in. It iterated the hash map
+    // and stopped at the first open forbidding kind, so how many questions it asked (one unit of
+    // the builder's scope work each) depended on the standard library's iteration order.
+    scopeForbidOrder_.reserve(d_.scopeForbid.size());
+    for (auto const& [scopeV, forbid] : d_.scopeForbid) {
+        if (!forbid.empty()) scopeForbidOrder_.push_back(scopeV);
+    }
+    std::sort(scopeForbidOrder_.begin(), scopeForbidOrder_.end());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -921,25 +930,13 @@ GrammarSchema::loadDiagnostics() const noexcept {
     return d_.loadDiagnostics;
 }
 
-bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
-                                       std::span<ScopeKind const> stack) const noexcept {
-    // Walk the scope stack top-down so the innermost scope's rules win —
-    // a `forbid` listed on the innermost frame applies even if an outer
-    // frame allows the token.
-    for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
-        auto scopeIt = d_.scopeForbid.find(static_cast<std::uint16_t>(*it));
-        if (scopeIt != d_.scopeForbid.end() && scopeIt->second.contains(tok.v)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
                                         void const* ctx) const noexcept {
-    // `false` iff some open scope forbids `tok` — the walk's answer, asked per rule.
-    for (auto const& [scopeV, forbid] : d_.scopeForbid) {
-        if (forbid.contains(tok.v) && open(ctx, static_cast<ScopeKind>(scopeV))) return false;
+    // `false` iff some open scope forbids `tok`, asked per kind that forbids anything, in one
+    // order on every standard library (`scopeForbidOrder_`).
+    for (std::uint16_t const scopeV : scopeForbidOrder_) {
+        auto const it = d_.scopeForbid.find(scopeV);
+        if (it->second.contains(tok.v) && open(ctx, static_cast<ScopeKind>(scopeV))) return false;
     }
     return true;
 }

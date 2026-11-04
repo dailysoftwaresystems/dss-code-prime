@@ -1,1 +1,1 @@
-                    } else if ((false)) {
+        return std::move(rest);

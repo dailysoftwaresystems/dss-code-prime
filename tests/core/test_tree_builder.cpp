@@ -1369,13 +1369,21 @@ constexpr std::string_view kScopePresenceConfig = R"JSON({
   "shapes": { "root": { "sequence": ["Identifier"] } }
 })JSON";
 
-// THE ORACLE: the resolution the stack walk gave — the schema's span overload, and a meaning's
-// `scopeRequire` read off the stack itself. The first allowed meaning in priority order wins.
+// THE ORACLE: the resolution the stack walk gave — the schema's scope rules asked of the stack
+// itself, and a meaning's `scopeRequire` read off the stack. The first allowed meaning in priority
+// order wins.
+bool stackHoldsKind(void const* ctx, ScopeKind kind) noexcept {
+    auto const& stack = *static_cast<std::span<ScopeKind const> const*>(ctx);
+    return std::ranges::find(stack, kind) != stack.end();
+}
+
 [[nodiscard]] SchemaTokenId walkResolution(GrammarSchema const& schema, std::string_view lexeme,
                                            std::span<ScopeKind const> stack) {
     auto const has = [&](ScopeKind k) { return std::ranges::find(stack, k) != stack.end(); };
     for (LexemeMeaning const& m : schema.lookupLexeme(lexeme)) {
-        if (!schema.isTokenValidInScope(m.id, stack)) continue;
+        // The schema's own scope rules, asked of an oracle that reads the stack itself (P69 L2b1:
+        // the stack-walk overload is deleted; the builder asks per-kind counts instead).
+        if (!schema.isTokenValidInScope(m.id, &stackHoldsKind, &stack)) continue;
         auto const& sr = m.scopeRequire;
         if (std::ranges::any_of(sr.forbid, has)) continue;
         if (sr.topMustBe && (stack.empty() || stack.back() != *sr.topMustBe)) continue;

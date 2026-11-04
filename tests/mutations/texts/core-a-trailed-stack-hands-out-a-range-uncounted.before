@@ -1,0 +1,1 @@
+    [[nodiscard]] auto begin()  const noexcept { reads_ += v_.size(); return v_.begin(); }

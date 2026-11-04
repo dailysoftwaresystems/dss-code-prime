@@ -57,6 +57,21 @@ int f22(int R1), y22 = sizeof((R1)(1));
 static int r1h(int t) { return t; }
 static int (*r1g(int a))(int R1) { return (a == (R1)(a)) ? r1h : 0; }
 
+/* 24-28 (P69 L2b1): a definition RETURNING a function pointer keeps its OWN parameters in its
+ * body whatever its returned type's parameter lists are — unnamed (24), named (25), (void) (26),
+ * two levels (27), and the `signal` shape with a function-pointer parameter (28): `(S1) - 1` is
+ * the parameter minus one there, never a cast through the typedef. */
+typedef int S1;
+static int s1h(int t) { return t; }
+static void s1v(void) {}
+static int (*s1a(int S1))(int) { return (S1) - 1 ? 0 : s1h; }
+static int (*s1b(int S1))(int u) { return (S1) - 1 ? 0 : s1h; }
+static void (*s1c(int S1))(void) { return (S1) - 1 ? 0 : s1v; }
+static int (*s1d2(int u))(int) { (void)u; return s1h; }
+static int (*(*s1d(int S1))(int))(int) { return (S1) - 1 ? 0 : s1d2; }
+static void s1sig(int x) { (void)x; }
+static void (*s1e(int S1, void (*fn)(int)))(int) { return (S1) - 1 ? 0 : fn; }
+
 int main(void) {
     { A1 x = 40; struct A1 s = { 2 }; if ((A1)(x) + s.a != 42) return 1; }
     { B1 x = 40; struct B1 s = { 2 }; if ((B1)(x) + s.a != 42) return 2; }
@@ -89,5 +104,10 @@ int main(void) {
     { (void)(int (*)(int R1))0; int x = 42; if ((R1)(x) != 42) return 21; }
     if (y22 != (int)sizeof(int)) return 22;
     if (r1g(42)(42) != 42) return 23;
+    if (s1a(1) != s1h || s1a(1)(42) != 42) return 24;
+    if (s1b(1) != s1h || s1b(1)(42) != 42) return 25;
+    if (s1c(1) != s1v) return 26;
+    if (s1d(1) != s1d2 || s1d(1)(0)(42) != 42) return 27;
+    if (s1e(1, s1sig) != s1sig) return 28;
     return 42;
 }

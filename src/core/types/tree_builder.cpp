@@ -566,7 +566,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         //     grammar that splits an opener from its closer across two rules,
         //     or a builder bug — never user input, so it stays an internal
         //     invariant (repaired where it can be, so it is reported once).
-        // `scopes_.pop()`, not `popScope()`: `finish()` closes frames after
+        // `popScopeEntry_()`, not `popScope()`: `finish()` closes frames after
         // `finished_` is set, and `popScope` refuses to run then.
         {
             auto const depth = static_cast<std::size_t>(fr.scopeDepth);
@@ -635,8 +635,13 @@ struct ResolvedMeaning {
 // `topMustBe` / `outermost`) and a PRESENCE oracle (`open`) for every other question, so no
 // check reads the stack's depth: it did, once per token, and a parse cost Θ(tokens × nesting).
 // `work` counts the resolution and every presence question (`TreeBuilder::scopeWork`).
+// P69 L2b1 (lane `lm`, the L2a2 review's A4): the view holds the two ends as VALUES, not the
+// stack — a resolution has no stack to walk — and the stack's own reads count into the same
+// `scopeWork` (`TrailedStack::reads`), so a walk written anywhere in the builder is seen.
 struct ScopeView {
-    std::span<ScopeKind const> stack;
+    ScopeKind                  top     = ScopeKind::None;
+    ScopeKind                  bottom  = ScopeKind::None;
+    bool                       empty   = true;
     GrammarSchema::ScopeOpenFn open    = nullptr;
     void const*                builder = nullptr;
     std::uint64_t*             work    = nullptr;
@@ -658,11 +663,11 @@ bool askScopeOpen(void const* view, ScopeKind kind) noexcept {
     }
     // topMustBe — innermost is the last element (stack grows back).
     if (sr.topMustBe.has_value()) {
-        if (sv.stack.empty() || sv.stack.back() != *sr.topMustBe) return false;
+        if (sv.empty || sv.top != *sr.topMustBe) return false;
     }
     // outermost — bottom-of-stack is the first element.
     if (sr.outermost.has_value()) {
-        if (sv.stack.empty() || sv.stack.front() != *sr.outermost) return false;
+        if (sv.empty || sv.bottom != *sr.outermost) return false;
     }
     // anyOf — at least one of the listed must be active.
     if (!sr.anyOf.empty()) {
@@ -896,7 +901,10 @@ void TreeBuilder::pushToken(Token const& tok) {
     //     resolveMeaning fast-path short-circuits the priority scan.
     //  2. Word fallback to Identifier when the lexeme isn't a keyword.
     //  3. No match at all → Error leaf + P_UnknownToken.
-    ScopeView const scopeView{.stack   = scopes_.span(),
+    bool const noScope = scopes_.empty();
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : scopes_.back(),
+                              .bottom  = noScope ? ScopeKind::None : scopes_[0],
+                              .empty   = noScope,
                               .open    = &TreeBuilder::scopeKindOpenThunk_,
                               .builder = this,
                               .work    = &scopeWork_};

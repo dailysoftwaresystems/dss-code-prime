@@ -1,12 +1,9 @@
 #pragma once
 
-#include "core/substrate/walk_steps.hpp"
 #include "core/types/declarator_walk.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree_node.hpp"
-
-#include <vector>
 
 // ★ P69 L2a2 (lane `lm`, the L2a review's N9): WHICH PARAMETER LIST OPENS A FUNCTION PROTOTYPE
 // SCOPE, asked ONE way by the parser's binder sketch (mid-parse, over the `TreeBuilder`'s finished
@@ -23,76 +20,13 @@
 // typedef `typedef int (*F)(int T);` and a cast `(void)(int (*)(int T))0;`, each followed by
 // `return (T)(x);`, exit 42 on all four.
 //
-// ★ TOP-DOWN, so the parser can ask it. `innermostNameDerivation` (declarator_walk.hpp) answers
-// the same question bottom-up, from the name through parent links, which a mid-parse builder has
-// not got. This walk descends from the declarator to its name, keeping every level it passed, and
-// then reads those levels innermost first in EXACTLY the order the bottom-up walk climbs: the
-// suffixes of the level's direct declarator (leftmost first), then the pointer layers of its
-// declarator, then one parenthesis level out. The first derivation met is what the name is.
+// ★ P69 L2b1 (lane `lm`, the L2a2 review's A3): WHICH SUFFIX DECLARES THE NAME A FUNCTION is the
+// declarator walk's one question (`declaratorFnSuffixOf`, core/types/declarator_walk.hpp, the walk
+// the analyzer and the HIR lowering ask through `declaratorFnSuffixNode`). This header kept a copy
+// of it — a top-down descent written beside the bottom-up climb because a mid-parse builder has no
+// parent link — equal to it only by reading; the walk is top-down now, and this header asks it.
 
 namespace dss {
-
-// The function suffix that makes the NAME declared by `declarator` (a declarator, or a per-slot
-// wrapper of one) a function — its innermost derivation, when that is a function suffix — or an
-// invalid NodeId (an abstract declarator, a name that is a pointer or an array first, or a node
-// outside the declarator shapes).
-template <class View>
-[[nodiscard]] NodeId nameDeclaringFnSuffix(View const& v, NodeId declarator,
-                                           DeclaratorConfig const& dc) {
-    namespace det = declarator_walk_detail;
-    struct Level {
-        NodeId declarator;
-        NodeId direct;
-        NodeId base;   // the name token, or the parenthesis group the walk descended into
-    };
-    std::vector<Level> levels;
-    NodeId cur = declarator;
-    for (substrate::WalkSteps steps{v.nodeCount(), "nameDeclaringFnSuffix's descent"};;
-         steps.step()) {
-        if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return {};
-        RuleId const r = v.rule(cur);
-        if (isDeclaratorSlotWrapper(r, dc)) {
-            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
-            continue;
-        }
-        if (r != dc.declaratorRule) return {};
-        NodeId const direct = det::firstChildOfRule(v, cur, dc.directRule);
-        if (!direct.valid()) return {};
-        NodeId name{};
-        for (NodeId c : v.children(direct)) {
-            if (v.isVisible(c) && v.kind(c) == NodeKind::Token && v.tokenKind(c) == dc.nameToken) {
-                name = c;
-                break;
-            }
-        }
-        if (name.valid()) {
-            levels.push_back(Level{cur, direct, name});
-            break;
-        }
-        NodeId const group = det::firstChildOfRule(v, direct, dc.groupRule);
-        if (!group.valid()) return {};   // abstract — no name to declare
-        levels.push_back(Level{cur, direct, group});
-        cur = det::firstChildOfRule(v, group, dc.declaratorRule);
-    }
-    for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
-        // (1) a suffix of this level's direct declarator, leftmost = innermost;
-        for (NodeId c : v.children(it->direct)) {
-            if (!v.isVisible(c) || c.v == it->base.v) continue;
-            if (v.kind(c) != NodeKind::Internal) continue;
-            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
-            return isFnSuffixRule(v.rule(c), dc) ? c : NodeId{};
-        }
-        // (2) else a pointer layer of its declarator: the name is a pointer;
-        for (NodeId c : v.children(it->declarator)) {
-            if (!v.isVisible(c) || c.v == it->direct.v) continue;
-            if (v.kind(c) != NodeKind::Internal) continue;
-            if (isDeclaratorDecorationRule(dc, v.rule(c))) continue;
-            return {};
-        }
-        // (3) else one parenthesis level out.
-    }
-    return {};   // the name reached the top undecorated
-}
 
 // The parameter list (`prototypeParamScopeRule`) of the function suffix `fnSuffix`, or invalid.
 template <class View>
@@ -109,7 +43,7 @@ template <class View>
 [[nodiscard]] bool paramListOpensPrototypeScope(View const& v, NodeId declarator, NodeId fnSuffix,
                                                 bool isDefinition, DeclaratorConfig const& dc) {
     if (!isDefinition) return true;
-    NodeId const own = nameDeclaringFnSuffix(v, declarator, dc);
+    NodeId const own = declaratorFnSuffixOf(v, declarator, dc);
     return !(own.valid() && own.v == fnSuffix.v);
 }
 

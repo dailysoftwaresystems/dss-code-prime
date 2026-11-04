@@ -2934,6 +2934,52 @@ TEST(ConstEvalAddress, ASequenceDiscardingNothingNeedsNoForm) {
     }
 }
 
+// P69 L2b1 (lane `lm`, the L2a2 review's B3): THE COMMA'S ONE RULE, on its own — every part of
+// it over the operand counts a sequence can have and both admissions; then a discarded operand
+// that does not fold is the sequence's result, through this tier's SeqExpr (`(y, 42)` with `y` no
+// constant: every reference refuses it).
+// RED-ON-DISABLE: `refused()` ignoring the admission, `discards()` counting the value alone, or
+// `afterDiscarded` keeping the value past a failed discarded operand.
+TEST(ConstEvalSequence, TheCommasOneRuleDecidesEveryPartOfASequence) {
+    ConstantForms comma;
+    comma.admit(ConstantForm::CommaOperator);
+    struct Row {
+        std::size_t   operands;
+        ConstantForms admitted;
+        bool          discards;
+        bool          refused;
+    };
+    Row const rows[] = {
+        {0, {}, false, false},    {1, {}, false, false},    {2, {}, true, true},
+        {3, {}, true, true},      {0, comma, false, false}, {1, comma, false, false},
+        {2, comma, true, false},  {3, comma, true, false},
+    };
+    for (Row const& r : rows) {
+        DiscardedOperandSequence const seq{.operandCount = r.operands, .admitted = r.admitted};
+        EXPECT_EQ(seq.discards(), r.discards) << r.operands << " operands";
+        EXPECT_EQ(seq.refused(), r.refused)
+            << r.operands << " operands, comma " << (r.admitted.admits(ConstantForm::CommaOperator)
+                                                         ? "admitted" : "not admitted");
+        for (std::size_t i = 0; i < r.operands; ++i) {
+            EXPECT_EQ(seq.isDiscarded(i), i + 1 < r.operands) << "operand " << i << " of " << r.operands;
+        }
+    }
+    ConstEvalResult folded;
+    folded.value = HirLiteralValue{};
+    ConstEvalResult notFolded;
+    notFolded.failure = ConstEvalFailure::NotAConstantExpression;
+    EXPECT_EQ(DiscardedOperandSequence::afterDiscarded(folded, notFolded).failure,
+              ConstEvalFailure::NotAConstantExpression)
+        << "a folded discarded operand hands on what follows it";
+    EXPECT_FALSE(DiscardedOperandSequence::afterDiscarded(notFolded, folded).value.has_value())
+        << "a discarded operand that did not fold is the sequence's result";
+    // Through the tier: a discarded operand that is no constant refuses the whole sequence.
+    AddrRig r;
+    std::array<HirNodeId, 1> one{r.builder.makeExprStmt(r.ref(kSymLocal, r.intT()))};
+    HirNodeId const e = r.builder.makeSeqExpr(one, r.litInt(42, r.intT()), r.intT());
+    expectRefused(evalAddr(r, e, allForms()));
+}
+
 // [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]], one width up: a
 // 128-bit constant whose VALUE does not fit 64 bits, narrowed by a cast, is the value
 // modulo 2^N (C 6.3.1.3). The CST walker folded it; this walker asked `asIntBits`,

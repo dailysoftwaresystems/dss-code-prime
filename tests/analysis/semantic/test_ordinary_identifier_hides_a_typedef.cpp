@@ -34,6 +34,7 @@
 
 #include <initializer_list>
 #include <string>
+#include <tuple>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -154,4 +155,51 @@ TEST(OrdinaryIdentifierHidesATypedef, APrototypeParameterHidesNothingPastItsDecl
          "typedef int T;\nstatic int f(int T, int x) { return (T)(x); }\n"
          "int main(void) { return f(1, 42); }\n", true},
     }, DiagnosticCode::S_NotCallable);
+}
+
+// ── P69 L2b1 (the L2a2 review's A1): A DEFINITION RETURNING A FUNCTION POINTER keeps its OWN
+// parameters in its body whatever the returned type's parameter lists are — `(T)(x)` there calls
+// the int parameter and is refused S_NotCallable, as both references refuse it ("called object
+// type 'int' is not a function"; the own-parameter control above is the measured form) — and a
+// DECLARATION of one gives its own parameters to nothing after its declarator. The sketch dropped a
+// definition's own list at every `param` row of the returned lists, so the body read `(T)(x)` as a
+// cast. ✔MEASURED 2026-11-03 (probe-reference-cc run 20261103-200559-43e50237, gcc 13.3.0 and clang
+// 18.1.3, built and run): the same shapes with `(T) - 1` in the body all exit 42.
+TEST(OrdinaryIdentifierHidesATypedef, ADefinitionsOwnParameterSurvivesTheListsOfTheTypeItReturns) {
+    struct Shape { char const* what; char const* head; char const* tail; char const* ret; };
+    // `ret` returns a value of the declared type from the helpers below.
+    Shape const shapes[] = {
+        {"one level, the returned list unnamed", "int (*", ")(int)", "h"},
+        {"one level, the returned list named", "int (*", ")(int u)", "h"},
+        {"one level, the returned list (void)", "void (*", ")(void)", "hv"},
+        {"two levels, unnamed", "int (*(*", ")(int))(int)", "h2"},
+        {"two levels, named", "int (*(*", ")(int u))(int v)", "h2"},
+        {"two levels, (void)", "void (*(*", ")(void))(void)", "hv2"},
+    };
+    char const* const helpers =
+        "typedef int T;\nstatic int h(int t) { return t; }\nstatic void hv(void) {}\n"
+        "static int (*h2(int u))(int) { (void)u; return h; }\n"
+        "static void (*hv2(void))(void) { return hv; }\n";
+    for (Shape const& s : shapes) {
+        std::string const decl = std::string{s.head} + "g(int T, int x)" + s.tail;
+        std::string const def = std::string{helpers} + "static " + decl
+                                + " { int y = (T)(x); (void)y; return " + s.ret + "; }\n";
+        std::string const dcl = std::string{helpers} + "static " + decl
+                                + ";\nint main(void) { int x = 42; return (T)(x); }\n";
+        for (auto const& [src, refused, form] :
+             {std::tuple{def, true, "definition"}, std::tuple{dcl, false, "declaration"}}) {
+            auto cu = buildShippedUnit("c", {src});
+            assertNoBuilderErrors(*cu);
+            auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+            EXPECT_EQ(hasCode(model.diagnostics(), DiagnosticCode::S_NotCallable), refused)
+                << form << ", " << s.what << "\n" << src;
+        }
+    }
+    // The `signal` shape: a function-pointer parameter beside a returned function pointer.
+    auto cu = buildShippedUnit(
+        "c", {std::string{"typedef int T;\nstatic void (*s(int T, void (*fn)(int), int x))(int) "
+                          "{ int y = (T)(x); (void)y; return fn; }\n"}});
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    EXPECT_TRUE(hasCode(model.diagnostics(), DiagnosticCode::S_NotCallable)) << "the signal shape";
 }

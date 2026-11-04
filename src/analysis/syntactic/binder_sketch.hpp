@@ -9,9 +9,11 @@
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -50,13 +52,14 @@ struct DSS_EXPORT AmbiguousTypeNameCandidate {
 //     analyzer uses), NOT token-driven: `funcDefTail` opens one scope
 //     covering params + body, so a param shadows a file-scope typedef
 //     inside the body exactly like the analyzer's scope tree.
-//   * Shadowing: lookup walks bindings newest-first and skips entries
-//     whose scope is no longer live — the innermost live binding wins.
+//   * Shadowing: lookup walks its NAME's bindings newest-first (a per-name
+//     chain, P69 L2b1) and skips entries whose scope is no longer live — the
+//     innermost live binding wins.
 //   * Closed-scope bindings are RETAINED (marked dead via scope-id
-//     liveness) rather than truncated, so a Snapshot is four integers +
-//     a depth-sized stack copy and restore is pure truncation — the
-//     speculation-rollback contract (SpeculationProbe) stays O(depth)
-//     per probe.
+//     liveness) rather than truncated, so a Snapshot is a fixed set of
+//     integers (every stack is trailed) and restore is truncation plus the
+//     journal records since the snapshot — the speculation-rollback contract
+//     (SpeculationProbe) costs O(1) per probe and O(changes) per rollback.
 //
 // KNOWN SHALLOWNESS (by design — the sketch only needs to be right
 // about TYPE-vs-VALUE for names it has SEEN; everything else routes to
@@ -167,8 +170,14 @@ public:
     // to the enclosing namespace at `record` time (C11 6.2.1) — mirrors the
     // analyzer's `floatToNamespaceScope`.
     void openScope(RuleId rule);
-    // Returns the id of the scope it closed. Aborts on global-scope underflow (caller bug).
-    std::uint32_t closeScope();
+    // The scope a `closeScope` closed: its id, and where its bindings begin in the record (every
+    // binding a scope holds was recorded after it opened).
+    struct ClosedScope {
+        std::uint32_t id           = 0;
+        std::uint32_t firstBinding = 0;
+    };
+    // Aborts on global-scope underflow (caller bug).
+    ClosedScope closeScope();
 
     // ── ★ P69 L2a2 (lane `lm`, the L2a review's N9): FUNCTION PROTOTYPE SCOPE ──
     // A parameter list (`declarators.prototypeParamScopeRule`) is a scope of its own (C
@@ -181,13 +190,31 @@ public:
     // core/types/prototype_param_scope.hpp, the analyzer's own question), and binds its names
     // into the scope live when the row's definition body opens (`bindDefinitionParams`), where
     // they were bound before. The row's close drops what was kept (`dropDefinitionParams`).
+    //
+    // ★ P69 L2b1 (lane `lm`, the L2a2 review's A1): WHAT A DECLARATOR OR A ROW CONSUMES IS ITS
+    // OWN. Every noted list carries the source offset it starts at. A declarator's end consumes
+    // only the lists that start at or after the declarator's own start, and a row's close only
+    // those at or after the row's start: lists nest with their tokens, so those are exactly the
+    // lists closed inside it, the newest entries. A definition RETURNING a function pointer writes
+    // its own list inside its declarator and the returned type's lists after it; each `param` row
+    // of a returned list used to drop EVERY noted list, the definition's own included, so its body
+    // saw none of its parameters (`static int (*g(int T))(int) { return (T) - 1 ? 0 : h; }` read
+    // `(T) - 1` as a cast through a file-scope typedef). ✔MEASURED 2026-11-03 (probe-reference-cc
+    // run 20261103-200559-43e50237, gcc 13.3.0 and clang 18.1.3, built and run): that program, the
+    // `(void)` and named returned lists, two levels of returned function pointers and the `signal`
+    // shape all exit 42 — the parameter, never the typedef.
     [[nodiscard]] bool isPrototypeParamScopeRule(RuleId rule) const noexcept;
     // Whether `rule` is some row's `definitionBodyRule` — the parser asks only then.
     [[nodiscard]] bool isDefinitionBodyRule(RuleId rule) const noexcept;
-    void notePrototypeParamScope(std::uint32_t scope, NodeId paramList);
-    void keepDefinitionParamsOf(NodeId paramList);   // invalid ⇒ keeps none
+    void notePrototypeParamScope(ClosedScope scope, NodeId paramList, std::uint32_t listStart);
+    // At the end of a declarator that starts at `declaratorStart`: consumes the lists closed
+    // inside it and keeps `paramList`'s for a definition body (invalid ⇒ keeps none; an earlier
+    // kept list of an enclosing declarator stays).
+    void keepDefinitionParamsOf(NodeId paramList, std::uint32_t declaratorStart);
     void bindDefinitionParams();
-    void dropDefinitionParams() noexcept;
+    // At the close of a declarator-mode row that starts at `rowStart`: drops the lists closed
+    // inside it, and the kept list when it is the row's own.
+    void dropDefinitionParams(std::uint32_t rowStart) noexcept;
 
     // ── bindings ──
     // `span` is the source span of the declaring name-token — carried so the
@@ -211,10 +238,30 @@ public:
     // The close-time record of a declarator-mode row: a name already bound at the
     // end of its declarator (same spelling, same declaring token, ordinary) is not
     // bound again; any other is recorded as `record` records it.
+    // P69 L2b1 (lane `lm`): O(1) — the declarator-end binding notes its token
+    // (`boundAtDeclaratorEnd_`) and this record takes the note back. It was a backward scan of
+    // every binding that starts at or after the name, which for a definition is its whole body
+    // and for a nest of initializers holding declarations is every level below: Θ(D²).
     void recordUnlessBoundAtItsDeclarator(std::string name, bool isType,
                                           SourceSpan span);
     // The answer for `name`: an ordinary identifier, the only kind recorded.
-    [[nodiscard]] NameKind lookup(std::string_view name) const noexcept;
+    // ★ P69 L2b1 (lane `lm`, the L2a2 review's B1): A LOOKUP VISITS ONLY ITS NAME'S BINDINGS. It
+    // used to scan every binding ever recorded, newest first and dead ones included, until the
+    // name matched — so a lookup cost the bindings recorded since the name's own: a nest that
+    // declares a name and probes a typedef at every level cost Θ(D²), and a late `(u8)x` in a long
+    // file walked every parameter and local of every earlier function. Now a per-name index holds
+    // each name's newest binding and every binding links its same-name predecessor; a lookup walks
+    // that chain and moves a DEAD head past itself (its scope closed: no lookup can see it again
+    // unless a restore reopens it, and the restore puts the head back), so each binding is passed
+    // dead at most once. Every head change is journaled while a snapshot is live and undone by
+    // `restore` — except a move past bindings that died before the OUTERMOST live snapshot was
+    // taken: they are dead in every state a restore can bring back, so that move is made for good
+    // (`passBindingsDeadForEveryLiveSnapshot_`). Journaled, it was undone by every rolled-back probe
+    // that looked the name up, and the next lookup walked the same dead bindings again: N
+    // definitions whose parameter hides a file-scope variable `T`, then N late `(T)` probes the
+    // sketch refutes, cost Θ(N²) (✔MEASURED, P69 L2b1: x63.8 the work for x8 the file). Not
+    // `const`: the head moves are the lookup's own work.
+    [[nodiscard]] NameKind lookup(std::string_view name) noexcept;
 
     // Seed a TYPE binding into the GLOBAL scope before parsing — the
     // compilation-unit oracle's cross-file typedef channel (FC2 A3).
@@ -262,7 +309,26 @@ public:
     // snapshot is two marks and a restore costs the pops since its mark. The journal is armed
     // by a snapshot and retired when the last live one is released (`Snapshot`'s destructor),
     // so it never outgrows the probes that can still rewind to it.
-    class Snapshot {
+    // ★ P69 L2b1 (lane `lm`, the L2a2 review's A4): O(1) BY CONSTRUCTION, NOT BY A COUNTER. Every
+    // field a snapshot holds is one trivially copyable struct (`Fields`), so it CANNOT hold a copy
+    // of a stack (a container is not trivially copyable: the static_assert below refuses one), and
+    // a copy taken anywhere else is read through the stack's own accessors, which count every entry
+    // they hand out (`TrailedStack::reads`, added into `workCount()`).
+    struct LiveScope {
+        std::uint32_t id           = 0;
+        std::uint32_t firstBinding = 0;   // bindings_.size() when it opened (P69 L2b1)
+        bool          dominator    = false;
+        bool          composite    = false;
+    };
+    struct ClosedParamScope {
+        std::uint32_t scope        = 0;
+        std::uint32_t firstBinding = 0;
+        std::uint32_t listStart    = 0;   // the list's source offset (P69 L2b1)
+        NodeId        list{};
+    };
+    // Exported on its own (a nested class is not covered by its owner's export on a DLL
+    // build): a unit test holds one (P69 L2b1, the cost pins' direct sketch TEST).
+    class DSS_EXPORT Snapshot {
     public:
         Snapshot(Snapshot&& other) noexcept;
         Snapshot(Snapshot const&)            = delete;
@@ -273,16 +339,24 @@ public:
     private:
         friend class BinderSketch;
         Snapshot() = default;
-        BinderSketch*                 owner_          = nullptr;   // null once moved from
-        std::size_t                   bindingCount    = 0;
-        std::size_t                   candidateCount  = 0;
-        std::size_t                   liveScopesMarkSize    = 0;
-        std::size_t                   liveScopesMarkJournal = 0;
-        std::size_t                   closedParamsMarkSize    = 0;   // P69 L2a2
-        std::size_t                   closedParamsMarkJournal = 0;
-        std::uint32_t                 nextScopeId     = 1;
-        std::uint64_t                 version         = 0;
-        std::uint32_t                 definitionParamScope = 0;   // 0 ⇒ none kept
+        struct Fields {
+            std::size_t      bindingCount            = 0;
+            std::size_t      candidateCount          = 0;
+            std::size_t      liveScopesMarkSize      = 0;
+            std::size_t      liveScopesMarkJournal   = 0;
+            std::size_t      closedParamsMarkSize    = 0;   // P69 L2a2
+            std::size_t      closedParamsMarkJournal = 0;
+            std::size_t      headJournalSize         = 0;   // P69 L2b1
+            std::size_t      boundAtEndMark          = 0;   // P69 L2b1
+            std::uint32_t    nextScopeId             = 1;
+            std::uint64_t    version                 = 0;
+            ClosedParamScope definitionParams{};            // scope 0 ⇒ none kept
+        };
+        static_assert(std::is_trivially_copyable_v<Fields>,
+                      "a binder-sketch snapshot holds scalars only: a container member would copy "
+                      "a stack per probe (P69 L2b1, the L2a2 review's A4)");
+        BinderSketch* owner_ = nullptr;   // null once moved from
+        Fields        f{};
     };
     [[nodiscard]] Snapshot snapshot();
     void restore(Snapshot&& s);
@@ -295,7 +369,12 @@ public:
     // cannot see any of it; this can, so a cost the sketch adds per probe or per lookup in
     // proportion to the nesting is super-linear HERE (the parser reports it as
     // `ParseResult::sketchWorkCount`).
-    [[nodiscard]] std::uint64_t workCount() const noexcept { return work_; }
+    // P69 L2b1: the stack entries are counted where they are READ (`TrailedStack::reads`), not
+    // where an author chose to add to a counter; a lookup counts each binding of its name's chain,
+    // a re-bind each binding it copies from, a restore each head change it undoes.
+    [[nodiscard]] std::uint64_t workCount() const noexcept {
+        return work_ + liveScopes_.reads() + closedParamScopes_.reads();
+    }
 
     // ── the lookup state's identity (cycle P69 L2, lane `lm`) ──
     // Two moments with the same version answer every `lookup` alike. A binding and
@@ -308,6 +387,7 @@ public:
     [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
 
 private:
+    static constexpr std::uint32_t kNoBinding = 0xFFFFFFFFu;
     struct Binding {
         std::string   name;
         std::uint32_t scope  = 0;     // owning scope id (0 = global)
@@ -315,7 +395,46 @@ private:
         // Span of the declaring name-token. Empty for oracle-injected seeds
         // (they carry no source token) — see globalTypeBindings.
         SourceSpan    span   = SourceSpan::empty(0);
+        // P69 L2b1: the previous binding of the same name (kNoBinding ⇒ none), set when recorded.
+        std::uint32_t prevSameName = kNoBinding;
     };
+
+    // The per-name index (P69 L2b1, B1): a name's newest binding still linked. Heterogeneous so a
+    // lookup by `string_view` allocates nothing.
+    struct NameHash {
+        using is_transparent = void;
+        [[nodiscard]] std::size_t operator()(std::string_view s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    std::unordered_map<std::string, std::uint32_t, NameHash, std::equal_to<>> heads_;
+    // A head change, undone by `restore`: the binding whose name it was, and the head before.
+    // A head is an element of `heads_`, which is never erased from, so its address is stable.
+    struct HeadChange {
+        std::uint32_t* head = nullptr;
+        std::uint32_t  old  = kNoBinding;
+    };
+    std::vector<HeadChange> headJournal_;   // armed while a snapshot is live (`liveMarks_`)
+    void setHead_(std::uint32_t& head, std::uint32_t to);
+    // Every binding enters through here: appended, linked to its name's chain, made the head.
+    void pushBinding_(Binding b);
+    // A DEAD binding (`b`, at `index`) that died before the outermost live snapshot was taken: its
+    // scope's last close (`closedAt_`) is older than that snapshot (`stableBefore_`) and so is the
+    // binding (`stableBindingCount_`). No restore while that snapshot lives reopens the scope or
+    // drops the binding — a restore goes back to a state after it — so passing it is never undone.
+    // With no snapshot live every dead binding is one.
+    [[nodiscard]] bool diedBeforeEveryLiveSnapshot_(Binding const& b,
+                                                    std::uint32_t index) const noexcept;
+    // Moves `head` past the dead bindings `diedBeforeEveryLiveSnapshot_` answers for, unjournaled,
+    // each counted once: they are never walked again.
+    void passBindingsDeadForEveryLiveSnapshot_(std::uint32_t& head) noexcept;
+    // Per scope id, the number (`versionSource_`'s, never given twice) its latest close was given;
+    // 0 ⇒ never closed. Not trailed: a scope a restore reopens is live, which `lookup` asks first,
+    // and its next close stamps it again. `stableBefore_` / `stableBindingCount_`: `versionSource_`
+    // and the binding count when the outermost live snapshot was taken (read only while one lives).
+    std::vector<std::uint64_t> closedAt_;
+    std::uint64_t              stableBefore_       = 0;
+    std::size_t                stableBindingCount_ = 0;
 
     std::unordered_map<std::uint32_t, BinderDecl> byRule_;
     std::unordered_set<std::uint32_t>             scopeRules_;
@@ -331,18 +450,14 @@ private:
     // Chronological, append-only between snapshot/restore pairs. Closed
     // scopes do NOT truncate (liveness is scope-id-based) — see class doc.
     std::vector<Binding>                          bindings_;
-    // One live scope. `dominator`: a declarator-dominator (a TYPE tag recorded while it is live
-    // floats past it to the namespace). `composite`: a composite BODY (a lifted field name
-    // recorded while it is live floats past it to the namespace).
-    struct LiveScope {
-        std::uint32_t id        = 0;
-        bool          dominator = false;
-        bool          composite = false;
-    };
+    // One live scope (`LiveScope`, above). `dominator`: a declarator-dominator (a TYPE tag
+    // recorded while it is live floats past it to the namespace). `composite`: a composite BODY
+    // (a lifted field name recorded while it is live floats past it to the namespace).
     // Stack of live scopes; [0] is the global scope (id 0), never popped. Its ids STRICTLY
     // ASCEND from the bottom (a scope opens with `nextScopeId_++`, above every live id, and a
     // restore brings back a stack and the `nextScopeId_` that was above it), which `lookup`'s
-    // binary search reads and `openScope` checks. Trailed (see `Snapshot`).
+    // binary search reads and `openScope` checks. Trailed (see `Snapshot`); every entry read
+    // from it counts into `workCount()` (`TrailedStack::reads`).
     TrailedStack<LiveScope>                       liveScopes_;
     std::uint32_t                                 nextScopeId_ = 1;
     [[nodiscard]] bool scopeIsLive_(std::uint32_t id) const noexcept;
@@ -360,17 +475,19 @@ private:
     std::uint64_t                                 versionSource_ = 0;
 
     // P69 L2a2 (lane `lm`): function prototype scope (see `isPrototypeParamScopeRule`).
-    // `closedParamScopes_`: each parameter list closed since the last declarator end, with
-    // its node; `definitionParamScope_`: the one kept for a definition's body (0 ⇒ none — the
-    // global scope's id is never a parameter list's).
-    struct ClosedParamScope {
-        std::uint32_t scope = 0;
-        NodeId        list{};
-    };
+    // `closedParamScopes_`: each parameter list closed and not yet consumed by the declarator or
+    // the row it closed inside (P69 L2b1), with its node and start; `definitionParams_`: the one
+    // kept for a definition's body (scope 0 ⇒ none — the global scope's id is never a list's).
     RuleId                                        protoParamScopeRule_{};
     std::unordered_set<std::uint32_t>             definitionBodyRules_;
     TrailedStack<ClosedParamScope>                closedParamScopes_;   // trailed, as liveScopes_
-    std::uint32_t                                 definitionParamScope_ = 0;
+    ClosedParamScope                              definitionParams_{};
+    // Pops the entries whose list starts at or after `start` (the newest ones, by nesting);
+    // returns the one whose node is `keep`, if any.
+    ClosedParamScope consumeParamScopesFrom_(std::uint32_t start, NodeId keep);
+    // The declaring tokens (their start offsets) of names bound at the end of their declarator
+    // whose row has not closed yet (see `recordUnlessBoundAtItsDeclarator`). Trailed.
+    TrailedSet<std::uint32_t>                     boundAtDeclaratorEnd_;
 };
 
 } // namespace dss

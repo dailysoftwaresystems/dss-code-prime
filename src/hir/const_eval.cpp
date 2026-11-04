@@ -2043,16 +2043,19 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             // non-const `y`, and `({ int t = 42; t; })`); one of its value ALONE, `({ 42; })`,
             // discards nothing and needs no form (gcc, clang and mingw-w64 at -std=c2x fold it)
             // — lane `cs`'s `.temp/probe/sti9`, `sti11`.
+            // P69 L2b1 (lane `lm`): the comma's one rule decides (`DiscardedOperandSequence`).
             HirNodeId const node2 = f.node;
             auto const kids = hir.children(node2);
+            DiscardedOperandSequence const seq{.operandCount = kids.size(),
+                                               .admitted     = options.admittedForms};
             if (f.phase == 0) {
-                if (kids.size() > 1 && !admits(options, ConstantForm::CommaOperator)) {
+                if (seq.refused()) {
                     work.pop_back();
                     result = fail(ConstEvalFailure::NotAConstantExpression, node2);
                     break;
                 }
             } else if (!result.value.has_value()) {
-                work.pop_back();
+                work.pop_back();            // a discarded operand that did not fold is the result
                 break;
             }
             std::size_t const i = f.phase;
@@ -2062,7 +2065,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             }
             f.phase += 1;
             HirNodeId const c = kids[i];
-            if (i + 1 < kids.size()) {
+            if (seq.isDiscarded(i)) {
                 if (hir.kind(c) != HirKind::ExprStmt || hir.children(c).size() != 1) {
                     work.pop_back();
                     result = fail(ConstEvalFailure::NotAConstantExpression, c);

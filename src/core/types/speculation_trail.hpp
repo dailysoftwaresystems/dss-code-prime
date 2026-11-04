@@ -103,20 +103,34 @@ public:
     };
 
     // ── reads (a drop-in for the vector this replaces) ──
+    //
+    // ★ P69 L2b1 (lane `lm`, the L2a2 review's A4): EVERY READ PATH COUNTS THE ENTRIES IT HANDS
+    // OUT — one for an element (`operator[]`, `back`), the whole stack for a range (`span`, `begin`,
+    // `rbegin`, `take`; the matching `end`/`rend` count nothing) — into `reads()`, a plain
+    // increment with no branch. An owner's work counter adds `reads()`, so a walk or a copy of a
+    // stack is seen however it is written: the counters the cost pins read used to count only
+    // where an author chose to add to them, and a copy written without touching the counter
+    // (`std::vector(stack.begin(), stack.end())`) or a call of a stack walk stayed invisible. A
+    // range is counted when it is handed out, whole, whether or not the caller reads to its end:
+    // what it CAN read is what a regression would read. `empty()` and `size()` hand out no entry.
     [[nodiscard]] bool        empty() const noexcept { return v_.empty(); }
     [[nodiscard]] std::size_t size()  const noexcept { return v_.size(); }
-    [[nodiscard]] T operator[](std::size_t i) const noexcept { return v_[i]; }
+    [[nodiscard]] T operator[](std::size_t i) const noexcept { ++reads_; return v_[i]; }
     [[nodiscard]] T back() const noexcept {
         if (v_.empty()) detail::trailFatal("back() on an empty TrailedStack");
+        ++reads_;
         return v_.back();
     }
     [[nodiscard]] std::span<T const> span() const noexcept {
+        reads_ += v_.size();
         return std::span<T const>{v_};
     }
-    [[nodiscard]] auto begin()  const noexcept { return v_.begin(); }
+    [[nodiscard]] auto begin()  const noexcept { reads_ += v_.size(); return v_.begin(); }
     [[nodiscard]] auto end()    const noexcept { return v_.end(); }
-    [[nodiscard]] auto rbegin() const noexcept { return v_.rbegin(); }
+    [[nodiscard]] auto rbegin() const noexcept { reads_ += v_.size(); return v_.rbegin(); }
     [[nodiscard]] auto rend()   const noexcept { return v_.rend(); }
+    // The entries every read path has handed out since construction (see above).
+    [[nodiscard]] std::uint64_t reads() const noexcept { return reads_; }
 
     // ── mutations ──
     //
@@ -170,6 +184,7 @@ public:
     // this type would cost a full copy at hand-off, which is exactly the kind
     // of price that makes a correctness wrapper get skipped.
     [[nodiscard]] std::vector<T> take() && noexcept {
+        reads_ += v_.size();
         journal_.clear();
         armed_ = false;
         return std::move(v_);
@@ -248,6 +263,8 @@ private:
     // to prevent.
     std::size_t         maxSizeSeen_ = 0;
     bool                armed_       = false;
+    // `reads()`; mutable because a read hands out entries without changing the stack.
+    mutable std::uint64_t reads_     = 0;
 };
 
 // A set whose membership can be restored to an earlier mark. Same discipline
