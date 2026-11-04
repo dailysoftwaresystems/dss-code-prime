@@ -176,7 +176,7 @@ already does is USED, never re-built around and never requested upstream. Read i
   from a shell or a wrapper. MSVC is the `windows-x86_64-release` leg, where the harness enters the Visual Studio
   environment itself, once, for `build`, `test` and `run` alike. WSL, the VPS and the Mac are legs too. `test`
   always builds the tree as it stands first.
-- **RED-ON-DISABLE**: `dssharness check-mutations --legs <leg>` (`--arms <ids>` for a fold's own arms) — MANDATORY
+- **RED-ON-DISABLE**: `dssharness check-mutations --pending --legs <leg>` (`--arms <ids>` beside it for a fold's own arms; without `--pending` every arm runs again) — MANDATORY
   (operator, 2026-10-10). A pin is an ARM of `tests/mutations/arms.registry`; the tool mutates a worker copy,
   never a tree, and a pin is proven only when its arm reads `passed` (mutation-arms.md). Never a mutant applied
   by hand where an arm can be declared, and never a loop script: one did not rebuild after restoring a code

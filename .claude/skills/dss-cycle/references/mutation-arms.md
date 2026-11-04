@@ -433,12 +433,17 @@ match; the leg's own run id is the second `run` line of the sweep's output and t
     dssharness check-mutations --arms <arm id> --legs <leg> --json -C <tree>
     # a fold's own arms (the `A` rows `git diff` shows added in the registry), on the legs they name
     dssharness check-mutations --arms <id>,<id>,<id> --legs <leg>,<leg> --json -C <tree>
-    # every arm of a leg
+    # ONLY WHAT IS PENDING on a leg: an arm whose recorded `passed` still holds on the bytes it was judged on is
+    # skipped, every other arm runs. This is the default for every sweep that is not a first one.
+    dssharness check-mutations --pending --legs <leg> --json -C <tree>
+    # a fold's own arms that are pending (the intersection of --arms and --pending)
+    dssharness check-mutations --pending --arms <id>,<id> --legs <leg> --json -C <tree>
+    # every arm of a leg regardless of the record (a first sweep, or a record deleted: then every arm is pending anyway)
     dssharness check-mutations --legs <leg> --json -C <tree>
-    # THE GATE'S STEP, in the main tree at the round's close: each leg's own arms, one command per leg.
+    # THE GATE'S STEP, in the main tree at the round's close: each leg's pending arms, one command per leg.
     # The legs are those the S rows name:
     #     grep '^S | ' tests/mutations/arms.registry | awk -F' [|] ' '{print $3}' | sort -u
-    dssharness check-mutations --legs <leg> --json
+    dssharness check-mutations --pending --legs <leg> --json
     # the tool's own proof that it judges arms rightly with a leg's toolchain (no registry needed)
     dssharness check-mutations --self-test --legs <legs> -C <tree>
 
@@ -449,6 +454,16 @@ of its own on the leg's variant and never holds off a build, test or sync of the
 a time on one tree stays the rule.
 
 ## What a sweep costs, and from which trees it can run
+
+- **Sweep what is PENDING, never a hand-picked list.** The tool records each arm's verdict with a key (a hash of
+  what the arm was judged on: the judge's revision, the arm's rows, the objects its test binary is built from);
+  a recorded `passed` HOLDS while the key is unchanged, every other arm is pending, and `--pending` runs exactly
+  those. A list typed by hand (the arms of the files a fold touched, the new ones, the never-swept) both over-selects
+  and can miss an arm whose key moved through a header; the tool's own computation does neither. Two limits,
+  both the tool's: a change under a large test binary's sources makes every arm that binary runs pending, so a
+  change in a widely included source still costs a whole binary's arms; and a sweep run by hand in a copy the
+  harness synced records nothing, so under `--pending` it holds nothing and sweeps every selected arm — sweep from
+  the main tree, which records. Read the leg line for how many arms were skipped-not-selected and how many ran.
 
 - **A worker is a whole copy of the tree and a whole build**, kept INSIDE the tree as
   `<tree>/.mutations/<key>w-<n>` (the key: the first seven hex digits of the SHA-256 of the leg's variant, as its

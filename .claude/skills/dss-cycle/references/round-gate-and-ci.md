@@ -37,12 +37,13 @@ leg NAME now, and `dssharness legs` lists every one that can run.
 The eight runs prove that every pin's test is GREEN on every leg. They do not prove that any of them can go
 RED — that is the sweep's half, and a round owes both:
 
-- **At the round's close, in the main tree, beside the eight runs: every arm of
-  `tests/mutations/arms.registry`, on the ONE leg its `S` row names** — one `dssharness check-mutations --legs
-  <leg> --json` per leg that an `S` row names. Each is a leg command like any other: in the background, its
+- **At the round's close, in the main tree, beside the eight runs: every PENDING arm of
+  `tests/mutations/arms.registry`, on the ONE leg its `S` row names** — one `dssharness check-mutations --pending
+  --legs <leg> --json` per leg that an `S` row names; an arm whose recorded `passed` still holds on its key is
+  already proven and is not run again. Each is a leg command like any other: in the background, its
   whole output through the redactor; a whole leg in one command, never cut into batches by hand; and a run that
   is not yours is never touched (`dss-harness.md`, STOPPING A RUN).
-- **Per fold, the fold's own arms** (`--arms <ids>`), swept by the orchestrator from the main tree on the bytes
+- **Per fold, the fold's own pending arms** (`--pending --arms <ids>`), swept by the orchestrator from the main tree on the bytes
   the fold landed as. A lane writes its arms and hands back; a fold is never held for their sweep, and an arm
   that does not read `passed` goes back to its lane (who sweeps: `mutation-arms.md`).
 - **Every arm must read `passed`.** A leg is read by its own line — its arms counted by verdict — never by the

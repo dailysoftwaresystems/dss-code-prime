@@ -91,8 +91,9 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   gate is `dssharness test --legs gate`, the eight legs; `--filter <regex>` iterates but never concludes.
 - ★★★★ **THE MUTATION ARMS — `dssharness check-mutations`, every selected arm `passed`** (2026-10-10). A
   green suite says every pin's test passes; only the sweep says each can FAIL. A lane writes its arms with
-  its fold; the orchestrator sweeps the fold's own arms (`--arms <ids>`) from the main tree on the bytes the
-  fold landed as, and at the round's close one `--legs <leg>` per leg an arm's `S` row names (who sweeps:
+  its fold; the orchestrator sweeps the fold's own arms (`--pending --arms <ids>`) from the main tree on the bytes the
+  fold landed as, and at the round's close one `--pending --legs <leg>` per leg an arm's `S` row names — only what
+  is pending, the tool's own record deciding what already holds (who sweeps:
   `mutation-arms.md`). Read each leg by its own line, never by the exit code alone; a leg that did not reach
   its arms is STATED with the tool's reason. A pin with no arm is unproven, and a row that rests on it does
   not close (`mutation-arms.md`, `round-gate-and-ci.md`).

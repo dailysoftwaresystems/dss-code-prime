@@ -65,7 +65,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 | 4 | independence is the point; a new engine mechanism also gets a decision brief to the user, veto-able; a plan that patches one site of several, or whose site list is short, is a finding | `workflow-steps.md`, `full-procedure.md`, `class-closure.md` |
 | 5 | every brief carries the class-closure paragraph and every hand-back the class-closure record per row; each lane's owned and forbidden PATHS named; each lane its own agent (`dssharness create-agent`: its worktree, the build tree going inside it, and its work, plans and rows directories), its subagent aimed at that worktree (`-C`, absolute paths); a new `D-*` cited in `src/` registered in the same commit | `orchestration.md`, `delegation.md`, `lane-discipline.md`, `build-layout.md` |
 | 6 | `/pr-review-toolkit:review-pr`, the agnosticism pass and the CI-hazard screen; the reviewer is handed the class-closure record and judges the site list and the universe BEFORE the diff; a finding is routed by its class (`class-closure.md`) | `workflow-steps.md`, `full-procedure.md` |
-| 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs AND the sweep of every mutation arm on the leg it names (`dssharness check-mutations`), every arm `passed` | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `mutation-arms.md`, `no-follow-ups.md` |
+| 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs AND the sweep of every PENDING mutation arm on the leg it names (`dssharness check-mutations --pending`), every arm `passed` or held by a record | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `mutation-arms.md`, `no-follow-ups.md` |
 | 8 | `dssharness set-anchor <ANCHOR> --status closed --closing '...'`; a new row is `dssharness write-anchor`; both WRITE unless given `--anchor-dry-run` | `anchors-and-deferrals.md`, `registry-and-priority.md` |
 | 9 | plans updated in the SAME commit as the code; the handoff answers its five questions | `gate-and-cross-plan.md` |
 | 10 | the `dss-audit` rule-lens (the class-closure lens included) and guardrails on the complete, gate-passed cycle | `workflow-steps.md`, `full-procedure.md` |
@@ -181,8 +181,11 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 - ★★★★ **The end-of-round gate is `{Debug, Release} × four legs` — EIGHT runs** (2026-09-14), reported
   with the build type beside each number → `references/round-gate-and-ci.md`.
 - ★★★★ **The sweep of the mutation arms is a step of that gate** (2026-10-10): at the round's close, in the
-  main tree, one `dssharness check-mutations --legs <leg>` per leg an arm names; per fold, the fold's own
-  arms on the bytes the fold landed as. A lane WRITES its arms with its fold and the ORCHESTRATOR sweeps them
+  main tree, one `dssharness check-mutations --pending --legs <leg>` per leg an arm names; per fold,
+  `--pending --arms <the fold's own arms>` on the bytes the fold landed as. ★ **Sweep what is PENDING, never a
+  hand-picked list and never the whole registry again**: the tool keeps each arm's verdict with a key of what it
+  was judged on, a recorded `passed` holds while the key is unchanged, and `--pending` runs only the rest
+  (2026-11-03: a hand-typed list over-selects and can miss an arm whose key moved through a header). A lane WRITES its arms with its fold and the ORCHESTRATOR sweeps them
   from the main tree after the fold has landed — a fold is never held for a sweep, and an arm that does not
   read `passed` goes back to its lane. A leg that did not reach its arms is STATED with the tool's reason,
   never skipped, and a sweep is read by its leg line, never by its exit code alone →
