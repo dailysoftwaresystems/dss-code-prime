@@ -135,8 +135,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->35 exported declarations
-// — <!--census:source:program.exportedFunctions-->27 exported functions plus
+//     <!--census:source:program.exportedDecls-->36 exported declarations
+// — <!--census:source:program.exportedFunctions-->28 exported functions plus
 // <!--census:source:program.exportedStructs-->8 exported structs (`CuMirModule`,
 // `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `EntryLinkName`, `ForeignEntryCandidate` -- declared
 // twice, ahead of its first use and where it is defined --, `ResolveLibraryPartition`).
@@ -1232,6 +1232,26 @@ enum class PipelineStage : std::uint8_t {
     Program = 1,     // final module pre-lower (merged / N==1 / archive member)
     ThinImport = 2,  // thin-LTO import stage: a unit with its imports, before the merge (runThinLtoImportStage)
 };
+
+// THE STAGE RULE ABOVE, AS ONE PREDICATE (P69 H6): whether a later stage resumes what a run at `stage` left
+// unconverged -- every stage's but the Program stage's. The pass schedule's fixpoint (`optimizeModule`, relayed to
+// `opt::optimize`), the one bounded optimizing loop whose cap a program CAN reach, reports a truncation through it and
+// through nothing else.
+[[nodiscard]] constexpr bool laterStageResumes(PipelineStage stage) noexcept {
+    return stage != PipelineStage::Program;
+}
+
+// THE THIN-LTO IMPORT FIXPOINT'S BOUND IS AN INVARIANT, NOT A TRUNCATION (P69 H6; the orchestrator's ledgers 500 and
+// 506), and this is its one report. The import closure takes every direct callee a module names, transitively, before
+// the first optimize, and a callee whose address escapes is never importable, so each importing unit's import stage
+// converges in ONE round (`tests/opt/test_thin_import_stage_rounds.cpp` measures it on every cascade it holds).
+// Reaching `mirsum::kMaxImportRounds` -- which `mirsum::lazyImportOptimize` RETURNS, as `demandLeftAtBound`; the MIR
+// tier reports nothing -- therefore means the closure rule is broken: a COMPILER DEFECT, reported for unit `unit` as
+// X_OptImportBoundReached (Error) with the `demandLeft` callees it still had. Returns whether the stage must STOP
+// (`demandLeft != 0`), and the stage stops on that answer alone, never on the reporter: a suppressed Error is still
+// reported, and no policy turns it into a result.
+[[nodiscard]] DSS_EXPORT bool importBoundReached(std::size_t unit, std::uint32_t demandLeft,
+                                                 DiagnosticReporter& reporter);
 
 // One event of the stage topology, for its test seam: a module optimized at a
 // stage, or a module lowered (`stage` is then unused). `module` is the address

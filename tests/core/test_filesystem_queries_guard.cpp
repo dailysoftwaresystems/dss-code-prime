@@ -29,22 +29,18 @@
 //   * a `copy_options` that reads a link (`copy_symlinks`, `skip_symlinks`, `create_symlinks`);
 //   * a using-directive of `std::filesystem` or of an alias of it;
 //   * an UNQUALIFIED call of a refused function -- one argument at least, so argument-dependent lookup can reach
-//     `std::filesystem` -- in a file whose include closure reaches `<filesystem>` (its quoted includes resolved as
-//     the build resolves them: against its own directory, then src/, integrated_tests/ and tests/test_support/).
-//     A C++ LIBRARY header the guard does not read -- an angle include with a C++ header's extension, or a
-//     directory and no extension (`<nlohmann/json.hpp>`, which includes `<filesystem>` under C++17) -- counts as
-//     reaching it: what it includes is not read, so it is not assumed absent. (A `.h` angle include is a C or OS
-//     header, which declares no namespace.)
+//     `std::filesystem` -- WHEREVER it stands. Whether it does depends on the argument's type, which a scan of
+//     text cannot read, and on what every header the file includes declares, which the scan does not read either
+//     (a C++ library spelled `.h`, `<gtest/gtest.h>`, declares namespaces as `<nlohmann/json.hpp>` does). So the
+//     form is keyed on the CALL, never on the include (P69 fold H6, the review of H5's N9 and the ruling on H4b's
+//     N1): a function of the tree's own that shares a refused name is called qualified, or named otherwise.
 // It has no exemption list: the substrate is the one directory left out.
 //
 // SCOPE: every *.cpp and *.hpp under src/ (src/dss-config's C runtime holds no std::filesystem) outside
 // src/core/substrate/, under integrated_tests/ (whose runner compiles the substrate's unit beside it), and under
 // tests/examples/ (the in-process examples runner, the CLI runner's twin: the scope is the RUNNERS, not one of
-// them -- P69 fold H5, the review of H4b's F4). The closure also reads tests/test_support/, which both runners
-// include. Comments and string literals are not
-// code, and are not read. ⓘ One quoted include resolves to nothing the guard reads -- the build stamp header
-// generated at configure (program/dss_build_stamp_generated.hpp, ✔MEASURED 2026-10-21) -- and it includes no
-// `<filesystem>`, so no closure is short for it.
+// them -- P69 fold H5, the review of H4b's F4). The scan also reads tests/test_support/, which both runners
+// include, for the aliases its headers declare. Comments and string literals are not code, and are not read.
 
 #include "core/substrate/path_identity.hpp"   // walkTree: the substrate's own walk, never through a link
 #include "repo_root.hpp"
@@ -116,10 +112,6 @@ std::set<std::string> const kEntryMembers = {
 
 // The `copy_options` that read a link.
 std::set<std::string> const kLinkOptions = {"copy_symlinks", "skip_symlinks", "create_symlinks"};
-
-// The directories a quoted include is resolved against after the including file's own (the build's include roots
-// for the scanned targets).
-char const* const kIncludeRoots[] = {"src", "integrated_tests", "tests/test_support"};
 
 // Whether the `R` at `i` opens a raw string literal: it begins a token, alone or after an encoding prefix.
 [[nodiscard]] bool opensRawLiteral(std::string const& text, std::size_t i) {
@@ -227,59 +219,6 @@ struct Source {
     return aliases;
 }
 
-// Whether an angle include names a C++ LIBRARY header the guard does not read (see the scope note): a C++ header's
-// extension, or a directory and no extension. A standard header has neither; a `.h` one is a C or OS header.
-[[nodiscard]] bool isUnreadLibraryHeader(std::string const& name) {
-    std::string const ext = fs::path{name}.extension().string();
-    if (ext == ".hpp" || ext == ".hh" || ext == ".hxx" || ext == ".h++" || ext == ".ipp" || ext == ".tcc") return true;
-    return ext.empty() && name.find('/') != std::string::npos;
-}
-
-// The sources whose include closure reaches `#include <filesystem>`: those that include it (or a C++ library header
-// the guard does not read), and every source that includes one of them, by a walk over the reversed include graph
-// (a work list, never recursion).
-[[nodiscard]] std::set<std::string> exposedIn(std::vector<Source> const& sources) {
-    std::set<std::string> known;
-    for (auto const& s : sources) known.insert(s.relative);
-    static std::regex const directive{R"(^\s*#\s*include\s*)"};
-    static std::regex const header{R"re(^\s*#\s*include\s*([<"])([^>"]+)[>"])re"};
-    std::map<std::string, std::vector<std::string>> includedBy;
-    std::vector<std::string>                         work;
-    for (auto const& s : sources) {
-        auto const code = linesOf(s.code);
-        auto const text = linesOf(s.text);
-        for (std::size_t n = 0; n < code.size() && n < text.size(); ++n) {
-            // The directive must be CODE (not in a comment or a raw string); its header name, a literal the code
-            // view blanks, is read from the text at the same place.
-            if (!std::regex_search(code[n], directive)) continue;
-            std::smatch m;
-            if (!std::regex_search(text[n], m, header)) continue;
-            std::string const name = m[2].str();
-            if (m[1].str() == "<") {
-                if (name == "filesystem" || isUnreadLibraryHeader(name)) work.push_back(s.relative);
-                continue;
-            }
-            std::vector<std::string> bases{fs::path{s.relative}.parent_path().generic_string()};
-            for (char const* root : kIncludeRoots) bases.emplace_back(root);
-            for (auto const& base : bases) {
-                std::string const candidate = (fs::path{base} / name).lexically_normal().generic_string();
-                if (known.count(candidate) != 0) {
-                    includedBy[candidate].push_back(s.relative);
-                    break;
-                }
-            }
-        }
-    }
-    std::set<std::string> exposed;
-    while (!work.empty()) {
-        std::string const file = work.back();
-        work.pop_back();
-        if (!exposed.insert(file).second) continue;
-        for (auto const& includer : includedBy[file]) work.push_back(includer);
-    }
-    return exposed;
-}
-
 struct Finding {
     std::string where;   // `<file>:<line>`
     std::string call;    // what was written
@@ -312,8 +251,8 @@ struct Scanner {
     std::regex            qualified, member, option, unqualified, directive, projection, macro;
 };
 
-// Every refused form in one source's code; `exposed` says whether its include closure reaches `<filesystem>`.
-[[nodiscard]] std::vector<Finding> refusedIn(Source const& source, Scanner const& scan, bool exposed) {
+// Every refused form in one source's code.
+[[nodiscard]] std::vector<Finding> refusedIn(Source const& source, Scanner const& scan) {
     auto const& aliases     = scan.aliases;
     auto const& names       = scan.names;
     auto const& qualified   = scan.qualified;
@@ -352,7 +291,8 @@ struct Scanner {
         if (std::smatch m; std::regex_search(line, m, macro))
             out.push_back({where, "#define " + m[1].str() + " naming filesystem",
                            "a namespace alias (`namespace x = std::filesystem;`), which the scan follows"});
-        if (!exposed) continue;
+        // Keyed on the CALL, wherever it stands (the scope note): whether argument-dependent lookup reaches
+        // std::filesystem from here is a question of types and of unread headers, which this scan cannot answer.
         for (std::sregex_iterator it{line.begin(), line.end(), unqualified}, end; it != end; ++it) {
             // Qualified or a member: not argument-dependent lookup (a qualified mention is refused above).
             std::string before = line.substr(0, static_cast<std::size_t>(it->position(0)));
@@ -363,7 +303,8 @@ struct Scanner {
             };
             if (endsWith(".") || endsWith("->") || endsWith("::")) continue;
             std::string const name = (*it)[1].str();
-            out.push_back({where, name + " (unqualified, reached by argument-dependent lookup)", kAsk.at(name)});
+            out.push_back(
+                {where, name + " (unqualified: argument-dependent lookup may reach std::filesystem)", kAsk.at(name)});
         }
     }
     return out;
@@ -378,15 +319,13 @@ struct Scanner {
     return relative.rfind("src/", 0) == 0 && relative.rfind("src/core/substrate/", 0) != 0;
 }
 
-// Every finding over a set of sources: the aliases and the closure are the whole set's, the findings the guarded
-// sources' alone.
+// Every finding over a set of sources: the aliases are the whole set's, the findings the guarded sources' alone.
 [[nodiscard]] std::vector<Finding> refusedAcross(std::vector<Source> const& sources) {
     Scanner const        scan{aliasesIn(sources)};
-    auto const           exposed = exposedIn(sources);
     std::vector<Finding> found;
     for (auto const& s : sources) {
         if (!isGuarded(s.relative)) continue;
-        auto more = refusedIn(s, scan, exposed.count(s.relative) != 0);
+        auto more = refusedIn(s, scan);
         found.insert(found.end(), more.begin(), more.end());
     }
     return found;
@@ -491,41 +430,45 @@ TEST(FilesystemQueriesGuard, TheScanRefusesEveryFormItNamesAndNothingElse) {
         " 2=exists 3=file_size 4=is_regular_file 5=is_symlink 6=last_write_time 7=equivalent 8=relative "
         "9=permissions 10=remove_all 11=recursive_directory_iterator 12=is_regular_file 13=last_write_time "
         "14=copy_symlinks 15=exists 16=using namespace filesystem 17=using namespace fsx "
-        "18=exists (unqualified, reached by argument-dependent lookup) 25=is_regular_file "
+        "18=exists (unqualified: argument-dependent lookup may reach std::filesystem) 25=is_regular_file "
         "26=#define FSYS naming filesystem";
     EXPECT_EQ(got, want) << "the scan refused " << found.size() << " form(s):" << got;
 }
 
-// ARGUMENT-DEPENDENT LOOKUP reaches `std::filesystem` only where it is declared: an unqualified call is refused in
-// a file whose include closure reaches `<filesystem>` -- including it itself, through a header that includes it,
-// and through a header that includes that one -- and nowhere else, while a qualified mention is refused everywhere.
-TEST(FilesystemQueriesGuard, AnUnqualifiedCallIsRefusedWhereTheIncludeClosureReachesFilesystem) {
+// AN UNQUALIFIED CALL IS REFUSED WHEREVER IT STANDS (P69 fold H6, the review of H5's N9): whether argument-dependent
+// lookup reaches `std::filesystem` depends on the argument's type and on every header the file includes -- a C++
+// library spelled `.h` among them -- which no scan of text reads. So, unqualified and with an argument, a refused
+// name is refused in every judged file whatever it includes; with no argument, or with a qualifier of its own, it
+// is no argument-dependent lookup of a filesystem function and passes; a qualified mention is refused everywhere.
+TEST(FilesystemQueriesGuard, AnUnqualifiedCallIsRefusedWhereverItStands) {
     std::vector<Source> const sources = {
         sourceOf("src/a/paths.hpp", "#pragma once\n#include <filesystem>\n"),
-        sourceOf("src/b/more.hpp", "#pragma once\n#include \"a/paths.hpp\"\n"),
-        sourceOf("src/c/near.cpp", "#include \"../b/more.hpp\"\nbool f(P const& p) { return exists(p); }\n"),
-        sourceOf("integrated_tests/far.cpp", "#include \"b/more.hpp\"\nauto g(P const& p) { return status(p); }\n"),
+        sourceOf("src/c/near.cpp", "#include \"a/paths.hpp\"\nbool f(P const& p) { return exists(p); }\n"),
+        sourceOf("integrated_tests/far.cpp", "#include <string>\nauto g(P const& p) { return status(p); }\n"),
         sourceOf("src/d/apart.cpp",
                  "#include <string>\n"
                  "bool h(P const& p) { return exists(p) && status(p); }\n"
                  "auto i(P const& p) { return std::filesystem::status(p); }\n"),
-        // In a comment the directive includes nothing.
-        sourceOf("src/e/commented.cpp", "// #include <filesystem>\nbool j(P const& p) { return exists(p); }\n"),
+        // In a comment a call is not code.
+        sourceOf("src/e/commented.cpp", "// bool j(P const& p) { return exists(p); }\nint j2();\n"),
         // No argument, or a qualifier of its own: not argument-dependent lookup of a filesystem function.
         sourceOf("src/f/nullary.cpp", "#include <filesystem>\nint k() { return status() + n::exists(2); }\n"),
-        // The closure's first step: a file that includes `<filesystem>` itself.
-        sourceOf("src/g/direct.cpp", "#include <filesystem>\nbool m(P const& p) { return is_empty(p); }\n"),
-        // A C++ library header the guard does not read reaches it; a C or OS header does not.
-        sourceOf("src/h/library.cpp", "#include <nlohmann/json.hpp>\nbool n(P const& p) { return exists(p); }\n"),
+        // A C++ library spelled `.h`, which declares namespaces: refused as anywhere else.
+        sourceOf("src/h/library.cpp", "#include <gtest/gtest.h>\nbool n(P const& p) { return exists(p); }\n"),
+        // A C or OS header alone: refused the same -- the scan reads no header, so it assumes none.
         sourceOf("src/i/os.cpp", "#include <sys/stat.h>\nbool o(P const& p) { return exists(p); }\n"),
+        // Read for its aliases, never judged.
+        sourceOf("tests/test_support/helper.hpp", "#pragma once\ninline bool q(P const& p) { return exists(p); }\n"),
     };
     std::string const got = spelled(refusedAcross(sources), /*withFile=*/true);
     std::string const want =
-        " src/c/near.cpp line 2=exists (unqualified, reached by argument-dependent lookup)"
-        " integrated_tests/far.cpp line 2=status (unqualified, reached by argument-dependent lookup)"
+        " src/c/near.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " integrated_tests/far.cpp line 2=status (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/d/apart.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/d/apart.cpp line 2=status (unqualified: argument-dependent lookup may reach std::filesystem)"
         " src/d/apart.cpp line 3=status"
-        " src/g/direct.cpp line 2=is_empty (unqualified, reached by argument-dependent lookup)"
-        " src/h/library.cpp line 2=exists (unqualified, reached by argument-dependent lookup)";
+        " src/h/library.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/i/os.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)";
     EXPECT_EQ(got, want);
 }
 
@@ -538,6 +481,6 @@ TEST(FilesystemQueriesGuard, TheSubstrateIsTheOneDirectoryLeftOut) {
     EXPECT_FALSE(isGuarded("src/core/substrate/path_identity.cpp")) << "the substrate is where the OS is asked";
     EXPECT_FALSE(isGuarded("src/dss-config/runtime/platform/src/dirent.c"));
     EXPECT_FALSE(isGuarded("tests/core/test_header_name_matching.cpp"));
-    EXPECT_FALSE(isGuarded("tests/test_support/stage_tree.hpp")) << "read for the closure, not judged";
+    EXPECT_FALSE(isGuarded("tests/test_support/stage_tree.hpp")) << "read for its aliases, not judged";
     EXPECT_TRUE(isGuarded("src/core/substrate_like/x.cpp")) << "only the substrate directory itself is left out";
 }

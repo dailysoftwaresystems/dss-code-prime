@@ -4859,6 +4859,21 @@ enum class DiagnosticCode : std::uint16_t {
     // 103 on sqlite — so it is exactly the repeated-advisory shape the dedup
     // window and per-code cap exist to collapse.
     X_OptFixpointTruncated            = 0x2009,
+    // P69 H6 (D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES; the orchestrator's ledgers 500
+    // and 506): the thin-LTO import fixpoint reached its bound (`mirsum::kMaxImportRounds`) with importable callees
+    // still to take. A COMPILER DEFECT, never a property of the program: the import closure takes every direct callee
+    // a module names, transitively, before the first optimize, and a callee whose address escapes is never importable,
+    // so each importing unit converges in ONE round (measured on every cascade of
+    // tests/opt/test_thin_import_stage_rounds.cpp) -- reaching the bound means that closure rule is broken.
+    //
+    // ⚠ NOT `X_OptFixpointTruncated` (0x2009), and the difference is what the event MEANS: that one is a pipeline the
+    // engine stopped iterating -- the artifact correct, less optimized, a later stage resuming it; this one is an
+    // invariant of the import closure that no program can reach. Its ONE emitter is the import stage
+    // (`importBoundReached`, compile_pipeline.hpp, beside the stage rule).
+    //
+    // SEVERITY Error: the stage stops. NOT a member of `kUnsuppressableCodes`, like X_OptReturnFalseWithoutDiagnostic:
+    // a suppressed Error is still reported and still stops its stage (pinned beside its emitter's other case).
+    X_OptImportBoundReached           = 0x200A,
 
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //

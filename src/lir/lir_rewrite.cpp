@@ -1,5 +1,6 @@
 #include "lir/lir_rewrite.hpp"
 
+#include "core/substrate/path_identity.hpp"   // openFileStream: the env-gated dump opens at any length
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_asm_region.hpp"
@@ -1072,8 +1073,8 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
     auto const minInsts =
         static_cast<std::uint32_t>(std::strtoul(minEnv, nullptr, 10));
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
-    std::FILE* const f =
-        std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a");
+    std::FILE* const f = core::openFileStream(
+        std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a");   // at any length
     if (f == nullptr) return;
     for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
         LirFuncId const fn = lir.funcAt(i);
@@ -1135,8 +1136,8 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
 void dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage) {
     if (std::getenv("DSS_DUMP_LIR_MIN_INSTS") == nullptr) return;
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
-    if (std::FILE* const f =
-            std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a")) {
+    if (std::FILE* const f = core::openFileStream(
+            std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a")) {   // at any length
         auto const c = lir_pass_util::censusIdentityClassMoves(lir, schema);
         std::fprintf(f,
                      "########## STAGE %s ##########"

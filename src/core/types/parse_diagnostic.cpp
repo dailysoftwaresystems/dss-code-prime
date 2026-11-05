@@ -700,6 +700,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "X_OptReturnFalseWithoutDiagnostic";
         case DiagnosticCode::X_InlineMalformedCallSite:      return "X_InlineMalformedCallSite";
         case DiagnosticCode::X_OptFixpointTruncated:         return "X_OptFixpointTruncated";
+        case DiagnosticCode::X_OptImportBoundReached:        return "X_OptImportBoundReached";
     }
     // Not a `default:` arm — the switch above deliberately has none, so
     // `-Werror=switch` forces an arm for every enumerator and this line is

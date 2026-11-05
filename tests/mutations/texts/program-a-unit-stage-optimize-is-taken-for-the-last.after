@@ -1,1 +1,1 @@
-        /*laterStageResumes=*/false);
+    return stage == PipelineStage::ThinImport;

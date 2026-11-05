@@ -227,7 +227,7 @@ readWholeFile(fs::path const& path, std::string_view role) {
             "Anchored: {}.",
             role, core::genericSpelling(path), kAnchor));
     }
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
     if (!in) {
         return std::unexpected(std::format(
             "runtime object cache: could not open the {} '{}' for reading. "
@@ -381,7 +381,7 @@ public:
     ~TempFileGuard() {
         if (!armed_) return;
         std::error_code ec;
-        fs::remove(path_, ec);
+        static_cast<void>(core::removeEntry(path_, ec));
     }
     TempFileGuard(TempFileGuard const&)            = delete;
     TempFileGuard& operator=(TempFileGuard const&) = delete;
@@ -420,6 +420,10 @@ private:
 // file now uses buys ~46 characters of headroom, but headroom is not a proof:
 // a long username, a long unit stem or a deep `DSS_RUNTIME_CACHE_DIR` can still
 // walk into the wall, and when it does the message must say so ITSELF.
+// (P69 H6: every file call here now takes the extended-length spelling --
+// `core::extendedLengthSpelling` -- so Windows' 260 is no wall any more; a NAME
+// over 255 characters still is, and the experiment below still tells a refused
+// name from an unwritable directory.)
 //
 // ⛔ NO `#ifdef _WIN32` AND NO 260 CONSTANT. A compile-time platform branch
 // would make the other host's arm unreachable and therefore untestable from
@@ -455,20 +459,20 @@ private:
         directory / ("." + std::to_string(probeCounter.fetch_add(1u)));
     bool shortNameOpens = false;
     {
-        std::ofstream out(probe, std::ios::binary | std::ios::trunc);
+        std::ofstream out(core::extendedLengthSpelling(probe), std::ios::binary | std::ios::trunc);
         shortNameOpens = static_cast<bool>(out);
     }
     std::error_code removeEc;
-    fs::remove(probe, removeEc);
+    static_cast<void>(core::removeEntry(probe, removeEc));
 
     if (shortNameOpens) {
         note +=
             ". ✔MEASURED just now by this refusal: a SHORT name in the SAME "
             "directory opened successfully, so the directory IS writable and "
             "the LENGTH of the path above is what failed. Point "
-            "DSS_RUNTIME_CACHE_DIR at a SHORT directory (Windows rejects paths "
-            "over 260 characters unless the process is long-path aware, and "
-            "NTFS/ext4 reject any single name over 255)";
+            "DSS_RUNTIME_CACHE_DIR at a SHORT directory (NTFS and ext4 reject "
+            "any single name over 255 characters, and Windows any path over "
+            "32767)";
     } else {
         note +=
             ". ✔MEASURED just now by this refusal: a SHORT name in the SAME "
@@ -549,7 +553,7 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
             core::genericSpelling(documentPath)));
     }
 
-    std::ifstream in(documentPath, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(documentPath), std::ios::binary);
     if (!in) {
         return std::unexpected(std::format(
             "the key document '{}' exists but could not be opened for reading",
@@ -1549,7 +1553,7 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
 
     std::error_code ec;
     if (!directory.empty()) {
-        fs::create_directories(directory, ec);
+        static_cast<void>(core::createDirectories(directory, ec));
         if (std::error_code dirEc; ec && core::reachedKind(directory, dirEc) != core::EntryKind::Directory) {
             // The arm an INSTALLED compiler hits when the resolved root is not
             // writable — a read-only volume, a quota, a path whose parent is

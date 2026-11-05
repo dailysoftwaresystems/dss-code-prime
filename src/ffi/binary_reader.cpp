@@ -150,7 +150,7 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readImports(std::filesystem::path const& libraryPath,
             DiagnosticReporter&          reporter) {
-    std::ifstream in(libraryPath, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(libraryPath), std::ios::binary);
     if (!in) {
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::FileOpenFailed,

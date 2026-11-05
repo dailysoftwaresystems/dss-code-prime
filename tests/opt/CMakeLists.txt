@@ -27,6 +27,9 @@ dss_add_test(NAME opt/test_inline_growth_budget
 # Only the LAST optimization stage a module receives reports a truncated fixpoint, and every production route
 # lowers a module only after its Program stage (the stage topology's seam).
 dss_add_test(NAME opt/test_fixpoint_report_stage SOURCES test_fixpoint_report_stage.cpp)
+# The thin-LTO import stage of a cascade, through the driver: it reports nothing, and each importing unit converges in
+# one round -- the measurement the import fixpoint's bound's reach rests on (P69 H6).
+dss_add_test(NAME opt/test_thin_import_stage_rounds SOURCES test_thin_import_stage_rounds.cpp)
 dss_add_test(NAME opt/test_compile_options SOURCES test_compile_options.cpp)
 dss_add_test(NAME opt/test_mir_alias       SOURCES test_mir_alias.cpp)
 dss_add_test(NAME opt/test_mir_memory_clobbers SOURCES test_mir_memory_clobbers.cpp)

@@ -827,7 +827,25 @@ round's close; each checkpoint's commit message says what was and was not run on
   687 open against 620 at `71648598` (counted −25, REAL net +67). The merged tree's suite, repo-guard and the sweep
   of the fold's arms follow the commit. Fold order now: H6 → f26c2 (the review's answer) → 3e → L2b2 → f26d → H7;
   f26d opens with D-FFI-SHIPPED-CONSTANTS-TYPED-OTHERWISE-THAN-THE-REAL-HEADERS and the shipped `windows.json`'s
-  missing declarations (`GetModuleHandle*`, `GetModuleFileName*`, `VirtualQuery`), one class.
+  missing declarations (`GetModuleHandle*`, `GetModuleFileName*`, `VirtualQuery`), one class. Checkpoint 40's
+  repo-guard: 29 of 29 (run 20261105-043925-aea8021a); its five-leg suite and the sweep of its arms follow.
+- **Checkpoint 41 (2026-11-05) = the harness lane's fold H6, its CODE**: every Win32 file and process call of the
+  compiler takes its path at any length (the extended-length spelling, built on the OS's own `GetFullPathNameW`), one
+  Win32 root parse and one normalization of a plain spelling as the OS resolves it, the file URI's two directions on
+  that parse, the thin-LTO import stage's bound reported only as a compiler defect (`X_OptImportBoundReached`, one
+  emitter) with every truncation reported by the last optimize a module receives, the PE runtime's cookie check in
+  place and gcc's stack-protector reporter as libmingwex's, and an assembly archive build packaging every unit as its
+  own member. 6 rows applied, NONE closed: the lane had born a row for the long-path class, and the review found it a
+  duplicate of D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE (open since 2026-09-24), which now carries
+  the fix and its arms (real net 0). THE REVIEW OF H6 SENT BACK (0 BLOCKER, 5 MINOR, 8 NIT): the walk-up class's THIRD
+  send-back — a step of a walk re-resolved as a whole path takes the OS's last-name trim, and the writer's output-parent
+  check asks the library's `parent_path()` — a DESIGN FAILURE, answered by the lane's H6b with a home audit (a written
+  plan, design-audited before any edit). ✔MEASURED by the lane (run 20261105-012535-932217a7, H6's tests and every
+  guard, four legs): macos-arm64-debug and linux-x86_64-debug 159 of 159, both Windows legs 185 of 187 — the two anchor
+  guards on the dropped row, which resolve on this tree (`check-anchor-citations --current-tree` OK). This fold is owed
+  checkpoint 39's two windows-x86_64-debug reds (the long-path class): the merged tree's suite must read them green.
+  Balance unchanged: 687 open against 620 at `71648598`. Fold order now: f26c2 / H6b (whichever is ready first) → 3e →
+  3f → L2b2 → f26d → H7.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

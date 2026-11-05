@@ -93,7 +93,7 @@ struct CaptureSlot {
     std::error_code ec;
     fs::path const base = fs::temp_directory_path(ec) / "dss-git-rev-parse";
     if (ec) return "the system temporary directory is unknown (" + ec.message() + ")";
-    fs::create_directories(base, ec);
+    static_cast<void>(core::createDirectories(base, ec));   // at any length (`core::createDirectories`)
     if (ec)
         return "'" + core::genericSpelling(base) + "' could not be created (" + ec.message() + ")";
 
@@ -105,7 +105,9 @@ struct CaptureSlot {
             fs::path candidate = base / (std::to_string(stamp) + "-"
                                          + std::to_string(seq.fetch_add(1)));
             std::error_code cec;
-            if (fs::create_directory(candidate, cec)) return candidate;
+            // FALSE for a candidate that already existed (no level made): the uniqueness probe. Its parent `base`
+            // exists, so the candidate is the one level it can make.
+            if (core::createDirectories(candidate, cec) && !cec) return candidate;
             whyNot = "'" + core::genericSpelling(candidate) + "' "
                    + (cec ? "could not be created (" + cec.message() + ")"
                           : std::string{"already exists"});
@@ -294,7 +296,7 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
         "git rev-parse " + rev + " in '" + core::genericSpelling(checkoutDir) + "'");
     if (!out.ok) return out;
 
-    std::ifstream in{slot.file, std::ios::binary};
+    std::ifstream in{core::extendedLengthSpelling(slot.file), std::ios::binary};
     if (!in) {
         out.ok     = false;
         out.detail = "git rev-parse succeeded but its captured output at '"

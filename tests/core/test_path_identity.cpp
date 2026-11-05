@@ -17,6 +17,7 @@
 
 #include "core/substrate/path_identity.hpp"
 
+#include "core/substrate/os_path_spelling.hpp"
 #include "scratch_dir.hpp"
 #include "unc_spelling.hpp"
 
@@ -24,9 +25,11 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <system_error>
 #include <unordered_set>
+#include <vector>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -440,4 +443,312 @@ TEST(PathIdentitySubstrate, AbsoluteStillResolvesSingleSeparatorAndRelative) {
     EXPECT_TRUE(rooted.is_absolute())
         << "a single-separator root must still be made absolute — skipping it "
            "would leave the drive undecided: " << rooted.string();
+}
+
+// ── THE ROOT'S ONE PARSE AND THE ONE NORMALIZATION, AS TEXT, IN BOTH GRAMMARS, ON EVERY LEG (P69 H6) ────────────────
+//
+// The table IS the universe of `rootSpelling`'s header -- every Win32 prefix (none, a drive, drive-relative, rooted, a
+// share, `\\.\`, `//./`, `//?/`, `\\?\`, with `UNC`, `Volume{G}` and `GLOBALROOT` in either case), a `..` that would
+// climb into each root, and the names Win32 trims -- and each expected value is what Win32 itself did with the same
+// spelling (✔MEASURED 2026-11-04, probe-reference-cc runs 20261104-204243-d5c02d5f, 20261104-205708-1394b8a2 and
+// 20261104-210843-61c9329b: GetFullPathNameW and the opened handle; under `\\?\` the handle, which opens the rest
+// literally while GetFullPathNameW collapses it). The two grammars are pure text, so every leg asks both; the POSIX
+// rows hold POSIX's own rules: `//` is kept apart, three or more slashes are one (POSIX 4.13), and nothing is trimmed.
+namespace {
+struct RootRow {
+    std::wstring_view            spelling;
+    dss::core::RootSpelling::Kind kind;
+    std::size_t                  prefix;
+    std::size_t                  volume;
+    bool                         authority;
+    std::wstring_view            normalized;
+};
+using RK = dss::core::RootSpelling::Kind;
+// A table row is ASCII, so each code unit IS its character: shown narrow, one unit at a time.
+[[nodiscard]] std::string ascii(std::wstring_view w) {
+    std::string s;
+    for (wchar_t const c : w) s.push_back(static_cast<char>(c));
+    return s;
+}
+}  // namespace
+
+TEST(PathIdentitySubstrate, EveryWin32RootIsParsedOnceAndNormalizedAsWin32Does) {
+    RootRow const rows[] = {
+        // no root, a drive, drive-relative, rooted: the library's own model agrees on these (MEASURED both)
+        {L"x\\y", RK::Relative, 0, 0, false, L"x\\y"},
+        {L"a\\..\\..\\b", RK::Relative, 0, 0, false, L"..\\b"},
+        {L"C:x", RK::DriveRelative, 2, 2, false, L"C:x"},
+        {L"C:..\\x", RK::DriveRelative, 2, 2, false, L"C:..\\x"},
+        {L"\\x\\..\\..\\y", RK::Rooted, 1, 1, false, L"\\y"},
+        {L"C:\\a\\..\\..\\x", RK::Drive, 3, 3, false, L"C:\\x"},   // the drive holds its `..`
+        {L"c:/a/b", RK::Drive, 3, 3, false, L"c:\\a\\b"},
+        // a share holds its `..` (`\\localhost\C$\..\x` opened `\\localhost\C$\x`)
+        {L"\\\\server\\share\\a\\..\\..\\x", RK::Share, 15, 15, true, L"\\\\server\\share\\x"},
+        {L"//server/share/x", RK::Share, 15, 15, true, L"\\\\server\\share\\x"},
+        {L"\\\\server", RK::Share, 8, 8, true, L"\\\\server"},
+        // a device path is normalized, and its `..` climbs over the volume to the four-character prefix
+        {L"\\\\.\\C:\\a\\..\\..\\x", RK::Device, 4, 7, false, L"\\\\.\\x"},
+        {L"//./C:/x", RK::Device, 4, 7, false, L"\\\\.\\C:\\x"},
+        {L"//?/C:/sub/../x", RK::Device, 4, 7, false, L"\\\\?\\C:\\x"},   // `//?/` is NOT verbatim; its `?` stays
+        {L"//?/C:/x/..", RK::Device, 4, 7, false, L"\\\\?\\C:"},
+        {L"\\\\.\\C:\\d\\..", RK::Device, 4, 7, false, L"\\\\.\\C:"},   // a last `..` leaves no separator
+        {L"\\\\.\\C:\\d\\..\\", RK::Device, 4, 7, false, L"\\\\.\\C:\\"},
+        {L"\\\\.\\GLOBALROOT\\Device\\HarddiskVolume3\\..\\x", RK::Device, 4, 38, false,
+         L"\\\\.\\GLOBALROOT\\Device\\x"},
+        {L"\\\\.\\UNC\\h\\s\\..\\x", RK::Device, 4, 12, true, L"\\\\.\\UNC\\h\\x"},
+        {L"\\\\.\\Volume{G}\\x", RK::Device, 4, 14, false, L"\\\\.\\Volume{G}\\x"},
+        // verbatim: the handle opens the rest literally, so nothing of it is normalized
+        {L"\\\\?\\C:\\a\\..\\x", RK::Verbatim, 7, 7, false, L"\\\\?\\C:\\a\\..\\x"},
+        {L"\\\\?\\C:\\a\\.\\x", RK::Verbatim, 7, 7, false, L"\\\\?\\C:\\a\\.\\x"},
+        {L"\\\\?\\C:/a", RK::Verbatim, 8, 8, false, L"\\\\?\\C:/a"},   // `/` is a character: one segment
+        {L"\\\\?\\C:\\x.txt.", RK::Verbatim, 7, 7, false, L"\\\\?\\C:\\x.txt."},
+        {L"\\\\?\\UNC\\h\\s\\x", RK::Verbatim, 12, 12, true, L"\\\\?\\UNC\\h\\s\\x"},
+        {L"\\\\?\\unc\\h\\s\\x", RK::Verbatim, 12, 12, true, L"\\\\?\\unc\\h\\s\\x"},
+        {L"\\\\?\\Volume{G}\\x", RK::Verbatim, 14, 14, false, L"\\\\?\\Volume{G}\\x"},
+        {L"\\\\?\\volume{g}\\x", RK::Verbatim, 14, 14, false, L"\\\\?\\volume{g}\\x"},
+        {L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\x", RK::Verbatim, 38, 38, false,
+         L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\x"},
+        {L"\\\\?\\globalroot\\Device\\V\\x", RK::Verbatim, 24, 24, false, L"\\\\?\\globalroot\\Device\\V\\x"},
+        // what the normalized namespace trims (run 20261104-210843-61c9329b), and what it keeps
+        {L"C:\\d.\\x.txt", RK::Drive, 3, 3, false, L"C:\\d\\x.txt"},
+        {L"C:\\d..\\x.txt", RK::Drive, 3, 3, false, L"C:\\d..\\x.txt"},
+        {L"C:\\d \\x.txt", RK::Drive, 3, 3, false, L"C:\\d \\x.txt"},
+        {L"C:\\d. \\x.txt", RK::Drive, 3, 3, false, L"C:\\d. \\x.txt"},
+        {L"C:\\d .\\x.txt", RK::Drive, 3, 3, false, L"C:\\d \\x.txt"},
+        {L"C:\\d\\...\\x.txt", RK::Drive, 3, 3, false, L"C:\\d\\...\\x.txt"},
+        {L"C:\\x.txt..", RK::Drive, 3, 3, false, L"C:\\x.txt"},
+        {L"C:\\x.txt. .", RK::Drive, 3, 3, false, L"C:\\x.txt"},
+        {L"C:\\d \\", RK::Drive, 3, 3, false, L"C:\\d \\"},
+        {L"C:\\d.\\", RK::Drive, 3, 3, false, L"C:\\d\\"},
+        {L"C:\\d\\...", RK::Drive, 3, 3, false, L"C:\\d\\"},
+        {L"C:\\d\\   ", RK::Drive, 3, 3, false, L"C:\\d\\"},
+        {L"C:\\sub\\.. \\x.txt", RK::Drive, 3, 3, false, L"C:\\sub\\.. \\x.txt"},
+        {L"C:\\sub\\. \\x.txt", RK::Drive, 3, 3, false, L"C:\\sub\\. \\x.txt"},
+        {L"C:\\d.\\..\\x.txt", RK::Drive, 3, 3, false, L"C:\\x.txt"},
+        {L"\\\\h\\s\\x.txt.", RK::Share, 6, 6, true, L"\\\\h\\s\\x.txt"},
+        {L"\\\\.\\C:\\d.\\x.txt", RK::Device, 4, 7, false, L"\\\\.\\C:\\d\\x.txt"},
+        {L"f3probe\\x.txt.", RK::Relative, 0, 0, false, L"f3probe\\x.txt"},
+        {L"C:f3probe\\x.txt.", RK::DriveRelative, 2, 2, false, L"C:f3probe\\x.txt"},
+        // where a separator ends it: only where the spelling ended in one or in a name the trim removed -- a last `.`
+        // or `..` leaves none, a root its own (runs 20261104-222037-6ef9b98e and 20261104-223135-5f04ee9f)
+        {L"C:\\d\\.", RK::Drive, 3, 3, false, L"C:\\d"},
+        {L"C:\\a\\b\\..", RK::Drive, 3, 3, false, L"C:\\a"},
+        {L"C:\\a\\b\\..\\", RK::Drive, 3, 3, false, L"C:\\a\\"},
+        {L"C:\\a\\.\\.\\", RK::Drive, 3, 3, false, L"C:\\a\\"},
+        {L"C:\\d\\..", RK::Drive, 3, 3, false, L"C:\\"},
+        {L"\\\\server\\share\\..", RK::Share, 15, 15, true, L"\\\\server\\share"},
+        {L"\\\\server\\share\\..\\", RK::Share, 15, 15, true, L"\\\\server\\share\\"},
+        {L"\\\\server\\share\\", RK::Share, 15, 15, true, L"\\\\server\\share\\"},
+        // a last name `NUL`, trimmed of periods, spaces and colons, is the device -- below every root but a share's
+        // and a device path's (the same runs); this release maps no other reserved name, and neither model claims one
+        {L"C:\\d\\NUL", RK::Drive, 3, 3, false, L"\\\\.\\NUL"},
+        {L"C:\\d\\Nul", RK::Drive, 3, 3, false, L"\\\\.\\Nul"},
+        {L"C:\\d\\NUL.:", RK::Drive, 3, 3, false, L"\\\\.\\NUL"},
+        {L"C:\\d\\x\\..\\NUL", RK::Drive, 3, 3, false, L"\\\\.\\NUL"},
+        {L"\\d\\NUL", RK::Rooted, 1, 1, false, L"\\\\.\\NUL"},
+        {L"C:NUL", RK::DriveRelative, 2, 2, false, L"\\\\.\\NUL"},
+        {L"d\\NUL", RK::Relative, 0, 0, false, L"\\\\.\\NUL"},
+        {L"C:\\d\\NUL.txt", RK::Drive, 3, 3, false, L"C:\\d\\NUL.txt"},
+        {L"C:\\d\\NUL:x", RK::Drive, 3, 3, false, L"C:\\d\\NUL:x"},
+        {L"C:\\d\\NUL\\", RK::Drive, 3, 3, false, L"C:\\d\\NUL\\"},
+        {L"C:\\d\\NUL\\x", RK::Drive, 3, 3, false, L"C:\\d\\NUL\\x"},
+        {L"\\\\h\\s\\NUL", RK::Share, 6, 6, true, L"\\\\h\\s\\NUL"},
+        {L"\\\\.\\C:\\d\\NUL", RK::Device, 4, 7, false, L"\\\\.\\C:\\d\\NUL"},
+        {L"C:\\d\\CON", RK::Drive, 3, 3, false, L"C:\\d\\CON"},
+        // what is left of a relative spelling, as the OS leaves it below the directory it resolves against (run
+        // 20261104-223135-5f04ee9f: `a\.` is `<dir>\a`, `..\` is `<parent>\`, `a\..` is `<dir>`)
+        {L"", RK::Relative, 0, 0, false, L""},
+        {L".", RK::Relative, 0, 0, false, L"."},
+        {L"a\\.", RK::Relative, 0, 0, false, L"a"},
+        {L"a\\b\\..", RK::Relative, 0, 0, false, L"a"},
+        {L"a\\b\\..\\", RK::Relative, 0, 0, false, L"a\\"},
+        {L"a\\..", RK::Relative, 0, 0, false, L"."},
+        {L"..\\", RK::Relative, 0, 0, false, L"..\\"},
+        {L"a\\\\b", RK::Relative, 0, 0, false, L"a\\b"},
+    };
+    for (RootRow const& row : rows) {
+        std::string const shown = ascii(row.spelling);
+        SCOPED_TRACE(shown);
+        dss::core::RootSpelling const root = dss::core::rootSpelling(row.spelling, dss::core::PathGrammar::Win32);
+        EXPECT_EQ(root.kind, row.kind);
+        EXPECT_EQ(root.prefix, row.prefix);
+        EXPECT_EQ(root.volume, row.volume);
+        EXPECT_EQ(root.authority, row.authority);
+        std::wstring const normal = dss::core::normalizedSpelling(row.spelling, dss::core::PathGrammar::Win32);
+        EXPECT_EQ(normal, row.normalized) << "normalized as " << ascii(normal);
+    }
+}
+
+TEST(PathIdentitySubstrate, EveryPosixRootIsParsedOnceAndNormalizedAsPosixSays) {
+    struct Row {
+        std::string_view spelling;
+        RK               kind;
+        std::size_t      volume;
+        bool             authority;
+        std::string_view normalized;
+    };
+    Row const rows[] = {
+        {"/a/../../x", RK::Rooted, 1, false, "/x"},
+        {"//x/y/../z", RK::Authority, 2, true, "//x/z"},
+        {"///x", RK::Rooted, 3, false, "/x"},
+        {"a/./b", RK::Relative, 0, false, "a/b"},
+        {"../x/..", RK::Relative, 0, false, ".."},
+        {"x.c.", RK::Relative, 0, false, "x.c."},   // POSIX trims nothing
+        {"a\\b/..", RK::Relative, 0, false, "."},   // a backslash is a name's character
+        {"C:/x", RK::Relative, 0, false, "C:/x"},
+        {"", RK::Relative, 0, false, ""},
+    };
+    for (Row const& row : rows) {
+        SCOPED_TRACE(std::string{row.spelling});
+        dss::core::RootSpelling const root = dss::core::rootSpelling(row.spelling, dss::core::PathGrammar::Posix);
+        EXPECT_EQ(root.kind, row.kind);
+        EXPECT_EQ(root.prefix, row.volume);
+        EXPECT_EQ(root.volume, row.volume);
+        EXPECT_EQ(root.authority, row.authority);
+        EXPECT_EQ(dss::core::normalizedSpelling(row.spelling, dss::core::PathGrammar::Posix), row.normalized);
+    }
+}
+
+// When a verbatim final path may be spelled in the DOS form: exactly when the one normalization leaves its tail as it
+// is and no component is a reserved device's name (taken with any extension, as older Windows takes it).
+TEST(PathIdentitySubstrate, ADosSpellingIsUsedOnlyWhereItNamesTheSameFile) {
+    struct Row { std::wstring_view tail; bool same; };
+    Row const rows[] = {
+        {L"", true},           {L"a\\b", true},     {L"a\\", true},     {L"d \\x", true},
+        {L"d..\\x", true},     {L"COM10", true},    {L"x.", false},     {L"x ", false},
+        {L"d.\\x", false},     {L"a\\\\b", false},  {L".\\a", false},   {L"a\\..", false},
+        {L"a/b", false},       {L"NUL", false},     {L"d\\nul.txt", false}, {L"COM1", false},
+        {L"lpt9\\x", false},
+    };
+    for (Row const& row : rows) {
+        SCOPED_TRACE(ascii(row.tail));
+        EXPECT_EQ(dss::core::dosSpellingNamesTheSameFile(row.tail), row.same);
+    }
+}
+
+// The host's own normalization IS the one above, on a key: the lexical keys of `x.c.` and `x.c` are one key where
+// the host's grammar is Win32's (the OS opens `x.c` for both), and two where it is POSIX's (two names).
+TEST(PathIdentitySubstrate, TheLexicalKeyOfANameWin32TrimsIsTheTrimmedNamesKey) {
+    fs::path const dir = fs::temp_directory_path() / "dss-no-such-dir-ever-h6";
+    ASSERT_FALSE(fs::exists(dir));
+    auto const trimmed  = PathIdentity::of(dir / "x.c");
+    auto const trailing = PathIdentity::of(fs::path{(dir / "x.c").native() + fs::path::string_type(1, '.')});
+    if constexpr (dss::core::kHostPathGrammar == dss::core::PathGrammar::Win32) {
+        EXPECT_EQ(trailing, trimmed) << trailing.string() << " vs " << trimmed.string();
+    } else {
+        EXPECT_NE(trailing, trimmed) << "POSIX names `x.c.` and `x.c` two files";
+    }
+}
+
+// ★ THE SPELLING A FILE CALL TAKES, AT ANY LENGTH (P69 H6, [[D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE]]):
+// every Win32 spelling to the one extended-length spelling that opens what it means -- the OS's full spelling of it
+// (GetFullPathNameW, os_path_spelling.hpp), then `\\?\` / `\\?\UNC\`, a device's `\\.\` replaced. Kept as written: a
+// verbatim spelling and an empty one. POSIX: every spelling as given. A reserved name other than `NUL` is no row: which
+// of them the OS maps is the release's (os_path_spelling.hpp), and the rule follows the OS either way.
+TEST(PathIdentitySubstrate, EverySpellingTakesTheExtendedLengthSpellingThatOpensWhatItMeans) {
+    using dss::core::extendedLengthSpelling;
+#ifdef _WIN32
+    {
+        struct Row { std::wstring_view spelling; std::wstring_view extended; };
+        Row const rows[] = {
+            {L"C:\\d\\x.c", L"\\\\?\\C:\\d\\x.c"},
+            {L"C:/d/x.c", L"\\\\?\\C:\\d\\x.c"},
+            {L"C:\\d\\.\\sub\\..\\x.c. ", L"\\\\?\\C:\\d\\x.c"},          // the trim and the steps, as the OS
+            {L"C:\\d.\\x.c", L"\\\\?\\C:\\d\\x.c"},                         // an intermediate name trims ONE period
+            {L"C:\\", L"\\\\?\\C:\\"},
+            {L"C:\\d\\NUL", L"\\\\?\\NUL"},                                  // the plain spelling names the DEVICE
+            {L"\\\\server\\share\\d\\x.c", L"\\\\?\\UNC\\server\\share\\d\\x.c"},
+            {L"//server/share/d/x.c", L"\\\\?\\UNC\\server\\share\\d\\x.c"},
+            {L"\\\\server\\share\\..\\x.c", L"\\\\?\\UNC\\server\\share\\x.c"},   // a share holds its `..`
+            {L"\\\\server\\share\\NUL", L"\\\\?\\UNC\\server\\share\\NUL"},  // a share's NUL is a name to the OS
+            {L"\\\\?\\C:\\d\\..\\x.c.", L"\\\\?\\C:\\d\\..\\x.c."},          // verbatim: already literal
+            {L"//?/C:/d/sub/../x.c", L"\\\\?\\C:\\d\\x.c"},                  // the OS's answer is verbatim: taken
+            {L"\\\\?\\UNC\\server\\share\\x.c", L"\\\\?\\UNC\\server\\share\\x.c"},
+            {L"\\\\.\\C:\\d\\x.c", L"\\\\?\\C:\\d\\x.c"},
+            {L"\\\\.\\C:\\..\\C:\\d\\x.c.", L"\\\\?\\C:\\d\\x.c"},          // the climb over the volume, as the OS
+            {L"//./C:/d/x.c", L"\\\\?\\C:\\d\\x.c"},
+            {L"\\\\.\\C:\\d\\NUL", L"\\\\?\\C:\\d\\NUL"},                  // a FILE under `\\.\` as under `\\?\`
+            {L"\\\\.\\NUL", L"\\\\?\\NUL"},
+            {L"\\\\.\\pipe\\dss-x", L"\\\\?\\pipe\\dss-x"},
+            {L"\\\\.\\UNC\\h\\s\\x.c", L"\\\\?\\UNC\\h\\s\\x.c"},
+            {L"\\\\.\\GLOBALROOT\\Device\\HarddiskVolume3\\d\\x.c",
+             L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\d\\x.c"},
+            {L"", L""},
+        };
+        for (Row const& row : rows) {
+            SCOPED_TRACE(ascii(row.spelling));
+            std::wstring const got = extendedLengthSpelling(fs::path{std::wstring{row.spelling}}).native();
+            EXPECT_EQ(got, row.extended) << "spelled " << ascii(got);
+        }
+        // A relative and a rooted spelling are made absolute where the call would resolve them, then the same rule.
+        std::wstring const cwd = fs::current_path().native();
+        EXPECT_EQ(extendedLengthSpelling(fs::path{L"sub\\x.c"}).native(), L"\\\\?\\" + cwd + L"\\sub\\x.c");
+        EXPECT_EQ(extendedLengthSpelling(fs::path{L"\\d\\x.c"}).native(),
+                  L"\\\\?\\" + cwd.substr(0, 2) + L"\\d\\x.c");
+        // At any length: a spelling of 300 characters takes the same rule as a short one.
+        std::wstring const deep = L"C:\\" + std::wstring(296, L'a') + L"\\x";
+        EXPECT_EQ(extendedLengthSpelling(fs::path{deep}).native(), L"\\\\?\\" + deep);
+    }
+#else
+    for (char const* spelling : {"/a/b.c", "//host/share/x", "rel/x.c", "x.c.", ""}) {
+        EXPECT_EQ(extendedLengthSpelling(fs::path{spelling}).native(), fs::path{spelling}.native()) << spelling;
+    }
+#endif
+}
+
+// ★ THE ONE NORMALIZATION IS THE OS'S ANSWER (P69 H6): over F3's universe the Win32 grammar's text normalization
+// EQUALS GetFullPathNameW -- the OS asked live, through the rule's one home (os_path_spelling.hpp) -- on every
+// Windows leg, so the model a host without Win32 answers by and the OS a Windows host asks cannot drift apart. The
+// cells are every absolute cell the OS was measured on (runs 20261104-222037-6ef9b98e and 20261104-223135-5f04ee9f:
+// each root kind, its climbs, the trim, where a separator ends the answer, the device name `NUL`), a relative spelling
+// joined below this process's directory, and a 300-character spelling. ⚠ Not a cell: a reserved name other than the
+// forms of `NUL` every release maps -- `CON`, `COM1`, `NUL.txt`, ... are names to this Windows 11 and devices to older
+// ones (DOCUMENTED, "Naming Files, Paths, and Namespaces"), the RELEASE's answer, which a Windows host's key takes from
+// the OS itself (`normalizeKeepingRoot`).
+TEST(PathIdentitySubstrate, TheWin32NormalizationEqualsTheOsFullSpellingOfEveryCell) {
+#ifdef _WIN32
+    std::wstring const cells[] = {
+        L"C:\\a\\..\\..\\x", L"c:/a/b", L"C:\\", L"C:\\x", L"C:/", L"C:\\a\\.\\b\\", L"C:\\a\\\\b", L"C:\\\\",
+        L"C:\\a\\\\", L"C:\\a\\\\\\",
+        L"\\\\server\\share\\a\\..\\..\\x", L"//server/share/x", L"\\\\server", L"\\\\server\\", L"\\\\server\\share",
+        L"\\\\server\\share\\", L"\\\\server\\share\\..", L"\\\\h\\s\\x.txt.", L"\\\\h\\s\\d.\\x",
+        L"\\\\server\\share\\.", L"\\\\server\\share\\..\\", L"\\\\server\\share\\.\\", L"\\\\server\\share\\a\\..",
+        L"\\\\server\\share\\a\\..\\", L"\\\\server\\share\\\\", L"\\\\server\\share\\a\\.", L"\\\\server\\share\\a\\",
+        L"\\\\.\\C:\\a\\..\\..\\x", L"//./C:/x", L"//?/C:/sub/../x", L"//?/C:/x", L"\\\\.\\C:\\x", L"\\\\.\\C:",
+        L"\\\\.\\GLOBALROOT\\Device\\HarddiskVolume3\\..\\x", L"\\\\.\\UNC\\h\\s\\..\\x", L"\\\\.\\Volume{G}\\x",
+        L"\\\\.\\C:\\d.\\x.txt", L"\\\\.\\C:\\d\\NUL", L"\\\\.\\pipe\\x", L"\\\\.\\NUL", L"\\\\.\\",
+        L"\\\\.\\C:\\..", L"\\\\.\\C:\\.", L"\\\\.\\C:\\d\\..", L"\\\\.\\C:\\d\\..\\", L"\\\\.\\C:\\d\\.", L"\\\\.\\C:\\",
+        L"\\\\.\\C:\\d\\", L"\\\\.\\C:\\..\\..", L"\\\\.\\UNC\\h\\s\\..", L"\\\\.\\x\\..",
+        L"//?/C:/x/", L"//?/C:/x/.", L"//?/C:/x/..", L"//?/C:/", L"//./C:/x/..",
+        L"C:\\d.\\x.txt", L"C:\\d..\\x.txt", L"C:\\d \\x.txt", L"C:\\d. \\x.txt", L"C:\\d .\\x.txt",
+        L"C:\\d\\...\\x.txt", L"C:\\x.txt..", L"C:\\x.txt. .", L"C:\\d \\", L"C:\\d.\\", L"C:\\d\\...", L"C:\\d\\   ",
+        L"C:\\sub\\.. \\x.txt", L"C:\\sub\\. \\x.txt", L"C:\\d.\\..\\x.txt", L"C:\\d\\..", L"C:\\d\\.",
+        L"C:\\d\\x.\\", L"C:\\d\\x. \\", L"C:\\d\\...\\",
+        L"C:\\a\\b\\..\\", L"C:\\a\\b\\..", L"C:\\a\\.\\", L"C:\\a\\.", L"C:\\.", L"C:\\..", L"C:\\.\\", L"C:\\..\\",
+        L"C:\\a\\b\\..\\.", L"C:\\a\\.\\.\\", L"C:\\a\\..\\b\\.",
+        L"C:\\d\\NUL", L"C:\\d\\nul", L"C:\\d\\Nul", L"C:\\d\\NUL.", L"C:\\d\\NUL ", L"C:\\d\\NUL. ", L"C:\\d\\NUL..",
+        L"C:\\d\\NUL:", L"C:\\d\\NUL::", L"C:\\d\\NUL.:", L"C:\\d\\NUL :", L"C:\\d\\.\\NUL", L"C:\\d\\x\\..\\NUL",
+        L"C:\\NUL", L"C:\\NUL.", L"C:\\d\\NUL\\", L"C:\\d\\NUL\\x",
+        L"\\\\h\\s\\NUL", L"\\\\h\\s\\d\\NUL",
+        L"C:\\d\\x:stream", L"C:\\d\\x::$DATA",
+        L"C:\\" + std::wstring(296, L'a') + L"\\b\\..\\x.c. ",
+    };
+    std::wstring dir = fs::current_path().native();
+    if (!dir.empty() && dir.back() != L'\\') dir += L'\\';
+    std::vector<std::wstring> asked(std::begin(cells), std::end(cells));
+    for (wchar_t const* relative : {L"a\\.", L"a\\b\\..", L"a\\..", L"..\\", L"a\\\\b", L"a\\..\\..\\b", L"a\\.\\",
+                                    L"a\\b\\..\\", L"d\\NUL", L"x.c. "}) {
+        asked.push_back(dir + relative);
+    }
+    for (std::wstring const& cell : asked) {
+        SCOPED_TRACE(ascii(cell));
+        std::wstring const os = dss::substrate::osFullPathSpelling(cell);
+        ASSERT_FALSE(os.empty()) << "the OS resolved no full spelling of the cell";
+        std::wstring const ours = dss::core::normalizedSpelling(cell, dss::core::PathGrammar::Win32);
+        EXPECT_EQ(ours, os) << "normalized as " << ascii(ours) << ", the OS's " << ascii(os);
+    }
+#else
+    GTEST_SKIP() << "GetFullPathNameW is Win32's: this host has no OS answer to equal (the text rows above hold the "
+                    "Win32 grammar here)";
+#endif
 }

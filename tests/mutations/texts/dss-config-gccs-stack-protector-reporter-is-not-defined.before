@@ -1,3 +1,7 @@
 void __stack_chk_fail(void) {
+    static char const kSmashed[] = "*** stack smashing detected ***: terminated\n";
+    HANDLE const      err        = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD             written    = 0;
+    if (err != NULL && err != INVALID_HANDLE_VALUE) WriteFile(err, kSmashed, (DWORD)(sizeof kSmashed - 1u), &written, NULL);
     failFast(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE);
 }

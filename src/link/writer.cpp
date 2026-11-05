@@ -302,8 +302,10 @@ namespace detail {
 [[nodiscard]] std::FILE*
 createExclusiveBinary(std::filesystem::path const& p) {
 #ifdef _WIN32
+    // At any length: the extended-length spelling (`core::extendedLengthSpelling`; a plain one of 260 or more opens
+    // nothing on a Windows that has not opted into long paths).
     HANDLE const h = ::CreateFileW(
-        p.c_str(),
+        core::extendedLengthSpelling(p).c_str(),
         GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,                                    // bInheritHandle = FALSE
@@ -407,7 +409,7 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 [[nodiscard]] std::string
 removeTempNote(std::filesystem::path const& tempPath) {
     std::error_code ec;
-    std::filesystem::remove(tempPath, ec);
+    static_cast<void>(core::removeEntry(tempPath, ec));   // at any length (`core::removeEntry`)
     if (!ec) {
         return {};
     }
@@ -529,11 +531,13 @@ static_assert(FileRenameInfoEx == kFileRenameInfoEx);
 // semantics, else the classic `FileRenameInfo`, the replace `MoveFileExW`
 // performs. ✔MEASURED: the name is resolved the way `MoveFileExW` resolves it —
 // forward slashes, a bare relative name and a `..` component all land against
-// the current directory — so `target` is handed over exactly as spelled.
+// the current directory — so `target` is handed over in its extended-length
+// spelling (`core::extendedLengthSpelling`: that same resolution, then `\\?\`),
+// which names it at any length where a plain one of 260 or more names nothing.
 [[nodiscard]] DWORD renameByHandle(HANDLE                       staged,
                                    std::filesystem::path const& target,
                                    bool                         posix) {
-    std::wstring const& name  = target.native();
+    std::wstring const  name  = core::extendedLengthSpelling(target).native();
     std::size_t const   bytes =
         offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(WCHAR);
     // `std::uint64_t` storage so the HANDLE member is aligned whatever the size.
@@ -588,7 +592,7 @@ enum class RefusalKind : std::uint8_t {
                                           std::filesystem::path const& target) {
     if (error == ERROR_SHARING_VIOLATION) return RefusalKind::Holder;
     if (error != ERROR_ACCESS_DENIED || onStaged) return RefusalKind::Other;
-    DWORD const attributes = ::GetFileAttributesW(target.c_str());
+    DWORD const attributes = ::GetFileAttributesW(core::extendedLengthSpelling(target).c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         DWORD const why = ::GetLastError();
         return (why == ERROR_FILE_NOT_FOUND || why == ERROR_PATH_NOT_FOUND)
@@ -655,7 +659,7 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
                "NtQueryInformationFile)";
     }
     HANDLE const handle = ::CreateFileW(
-        file.c_str(), FILE_READ_ATTRIBUTES,
+        core::extendedLengthSpelling(file).c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
         nullptr);
@@ -757,7 +761,7 @@ CommitOutcome commitReplacing(std::filesystem::path const& staged,
         // FILE_FLAG_OPEN_REPARSE_POINT renames the ENTRY, as `MoveFileExW`
         // does, never a link's target.
         if (handle == INVALID_HANDLE_VALUE) {
-            handle = ::CreateFileW(staged.c_str(), DELETE | SYNCHRONIZE,
+            handle = ::CreateFileW(core::extendedLengthSpelling(staged).c_str(), DELETE | SYNCHRONIZE,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                    nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
                                    nullptr);

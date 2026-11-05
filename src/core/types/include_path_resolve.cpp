@@ -113,10 +113,20 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     NativeString key = cacheKeyOf(dir);
     if (auto const hit = c.listings.find(key); hit != c.listings.end()) return hit->second;
     HeaderSearchCache::Impl::Listing l;
-    std::error_code ec;
-    for (fs::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
-        l.names.push_back(it->path().filename().native());
-    }
+    // THE SUBSTRATE'S LISTING (P69 H6): it lists at any length, and one it could not read whole hands out no name --
+    // the library's `directory_iterator` miscounts a directory of 260 characters or more under MinGW's libstdc++ with
+    // no error (`core::extendedLengthSpelling`'s header). A name is all a listing answers here, so a link whose reach
+    // cannot be examined is listed by its name like any other.
+    core::TreeWalkOptions options;
+    options.handOutUnreadableLinks = true;
+    core::TreeWalk const walk = core::walkTree(
+        dir,
+        [&l](core::TreeEntry const& entry) {
+            l.names.push_back(entry.path.filename().native());
+            return core::WalkStep::Prune;
+        },
+        options);
+    std::error_code const ec = walk.error;
     // A failed listing is ABSENCE only when there is no directory there to list (the
     // substrate's answer: nothing, or no directory). A directory -- or a `dir` whose
     // reach cannot be examined -- that could not be listed whole is a listing the
@@ -433,8 +443,14 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
 // before this handed a directory back as Found: the quote pre-scan passed over it with a second look of its own, and
 // the angle form THREW out of the preprocessor (`SourceBuffer::fromFile`: "is not a regular file", ✔MEASURED on the
 // Mac, run 20261029-002544-d3909fed).
-HeaderSearchResult descend(fs::path base, fs::path const& rel,
-                           HeaderNameMatching matching, HeaderSearchCache& cache) {
+// Whether `descend` takes `.`, `..` and an empty component as STEPS (every spelling Win32 normalizes, and POSIX), or
+// as NAMES -- below a verbatim `\\?\` root, whose rest Win32 opens literally (`core::rootSpelling`'s header measures
+// it): there a `..` is a name no listing holds, never a step up, and an empty component a name nothing has.
+enum class Components : bool { Navigate, Literal };
+
+template <class Range>
+HeaderSearchResult descendThrough(fs::path base, Range const& rel, Components components,
+                                  HeaderNameMatching matching, HeaderSearchCache& cache) {
     // What `base` reaches, as the search examined it: known once a component is matched (its probe's
     // answer), unknown at the start and after a `..` -- a path no probe named.
     std::optional<core::EntryKind> reaches;
@@ -444,16 +460,21 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
         // documented on `matchComponent` — on the REQUEST side this time.
         // `rel` was built from the source text ONCE, by the caller.
         NativeString const& name = comp.native();
+        if (components == Components::Literal && name.empty()) return HeaderSearchResult::notFound();
         // A `.`/empty component (from a trailing separator, or `a/./b`) moves
         // nowhere and has no on-disk name to match.
-        if (name.empty() || isDotComponent(name)) continue;
+        if (components == Components::Navigate && (name.empty() || isDotComponent(name))) continue;
         // `..` is a NAVIGATION component, not a filename: no directory listing
         // ever contains an entry called `..`, so running it through the
         // name-matcher below would turn every `#include "../shared.h"` into a
         // miss. Append it and let the OS resolve it exactly as the pre-policy
         // `dir / rel` did — the case rule still applies to every component that
         // actually names a file.
-        if (isDotDotComponent(name)) { base /= comp; reaches.reset(); continue; }
+        if (components == Components::Navigate && isDotDotComponent(name)) {
+            base /= comp;
+            reaches.reset();
+            continue;
+        }
         core::EntryKind    reached = core::EntryKind::Absent;
         HeaderSearchResult step    = matchComponent(base, comp, matching, cache, reached);
         if (step.status != HeaderSearchStatus::Found) return step;
@@ -476,166 +497,51 @@ HeaderSearchResult descend(fs::path base, fs::path const& rel,
     return HeaderSearchResult::found(std::move(base));
 }
 
-// ── [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] ───────────────────────
-//
-// ★★★ THE INTERMITTENCY IS ROOT-CAUSED AND IT WAS NEVER THE FILESYSTEM. The
-// first cut of this file made a UNC include resolve 23 times in 30 and nobody
-// could say why the other 7 missed; every filesystem primitive here was hammered
-// in isolation (>2000 operations, 0 failures) and `--jobs 1` did not move the
-// rate, so the cause was correctly stated as "inside DSS, not root-caused". IT
-// WAS UNDEFINED BEHAVIOUR IN `isListedInItsParent` BELOW — a reference bound to
-// the `native()` of a TEMPORARY `fs::path` — and the named lead
-// (`weakly_canonical` failing on UNC, degrading `core::PathIdentity`) is
-// REFUTED as its cause: the miss happens in `rootPrefixOf`, strictly before any
-// identity key is computed. See that function for the measurement.
-
-// The ROOT PREFIX of a rooted path, plus the components below it.
-//
-// ★★★ WHY THE MODEL'S OWN SPLIT CANNOT BE USED, MEASURED RATHER THAN ARGUED.
-// `descend` used to be handed `rel.root_path()` and `rel.relative_path()`, and
-// that split IS NOT LOSSLESS on every path model:
-//     path("//server/share/x.h").root_path()     -> "/"   (ONE slash)
-//     path("//server/share/x.h").relative_path() -> "server/share/x.h"
-//     root_path() / relative_path()              -> "/server/share/x.h"  != input
-// The authority is demoted to an ordinary component, so the walk restarted from
-// the bare separator, asked for a directory named after the SERVER, found
-// nothing, and reported the HEADER missing. The same split round-trips fine for
-// `C:/...` and for a relative path -- which is exactly why every local test
-// stayed green while the cross-host route was dead.
-//
-// ★★ THE RULE, AND IT ASKS THE FILESYSTEM RATHER THAN THE PLATFORM. A root
-// prefix is exactly the part of a path that NO DIRECTORY LISTING CONTAINS: a
-// drive letter is not an entry in any directory, the bare separator is not, and
-// neither is a server nor the share below it. So the root prefix is the DEEPEST
-// ancestor whose own parent cannot be enumerated -- and the model's `root_path()`
-// when there is no such ancestor. ✔MEASURED walking a real UNC header on this
-// host: the server alone does not exist; the SHARE exists but its parent cannot
-// be enumerated (that is the boundary); every ancestor below it has an
-// enumerable parent AND is listed in it. On a local drive path EVERY ancestor is
-// listed in its own parent, so the boundary stays at the drive root and local
-// behaviour is byte-for-byte what it was -- a wrong-case absolute include is
-// still rejected at the first component.
-//
-// ⚠ NO PLATFORM MACRO, NO UNC SPELLING, AND DELIBERATELY NOT A SECOND COPY OF
-// `platformModelsUncRoots` (src/lsp/workspace_project.cpp, cycle P43). That
-// predicate asks "does this path type model an authority as a root NAME", which
-// is the right question for URI round-tripping and the wrong one here: this code
-// does not care how the authority is modelled, only where the part of the path
-// that can be case-checked BEGINS. Two notions of "does this platform model UNC
-// roots" would be the two-oracles problem; there is still exactly one, and this
-// is not it.
-//
-// The ancestors come from the `parent_path()` chain, which ✔MEASURED preserves
-// the input exactly in every case tried (both UNC spellings, a drive path, a
-// relative path) -- unlike accumulating `base /= component`, which loses the
-// authority and flips separators besides.
-// Is `p` an ENTRY IN ITS OWN PARENT'S LISTING? That is the operational form of
-// "a directory listing contains this". A server, a share, a drive letter and the
-// bare separator all answer NO; every ordinary directory and file answers YES.
-// Byte-exact on the native string, and a fold-match would only mean "this IS an
-// ordinary component", which is the safe direction.
-//
-// ★★★ `want` IS A VALUE AND MUST NEVER BE A REFERENCE AGAIN. This line shipped
-// as `NativeString const& want = p.filename().native();` and that is UNDEFINED
-// BEHAVIOUR: `filename()` returns an `fs::path` BY VALUE, `native()` hands back
-// a reference INTO that temporary, and binding a reference to the RESULT OF A
-// CALL does not extend the temporary's lifetime the way binding to the
-// temporary itself would. The path died at the end of that statement and the
-// loop below then compared every directory entry against freed memory.
-//
-// ✔MEASURED — the whole of this row's unexplained intermittency, in one A/B
-// inside a single process, same path, only the binding differing:
-//     path                shipped (reference)   fixed (value)
-//     //wsl.localhost     YES 141/200           YES   0/200
-//     \\wsl.localhost     YES  86/200           YES   0/200
-//     C:\Users            YES 200/200           YES 200/200
-// ⓘ THE DIVERGENCE ABOVE IS MEASURED; THE MECHANISM BELOW IS INFERRED, and the
-// fix does not rest on it. The freed buffer is very likely reused by
-// `directory_iterator`'s own allocation and comes back holding an ENTRY NAME, so
-// the comparison matches on the first entry -- which fits the observed
-// "answers YES immediately". Whatever the allocator actually did, reading freed
-// memory has no defined answer. It fails toward YES,
-// which for the shallowest ancestor of a UNC path collapses `rootPrefixOf`'s
-// boundary to 0, sends `descend` at `root_path()` -- ONE separator, the local
-// drive root -- and reports the header missing.
-//
-// ★★ WHY ONLY UNC PATHS EVER SHOWED IT, which is also why a local control was
-// inert at 15/15 in every arm and could never have caught this. On a drive path
-// EVERY ancestor genuinely IS listed in its parent, so a spurious YES and the
-// true YES agree; the boundary lands one step apart and both splits resolve. A
-// UNC path is the one shape where the correct answer at the shallowest ancestor
-// is NO and a spurious YES changes the verdict.
-//
-// The parent's listing comes from the compile's cache, so a rooted path's
-// ancestors are listed once per compile, not once per resolution — for a UNC
-// include, one SMB round trip per ancestor instead of one per ancestor per
-// `#include`.
-[[nodiscard]] bool isListedInItsParent(fs::path const& p, HeaderSearchCache& cache) {
-    NativeString const want = p.filename().native();
-    if (want.empty()) return false;
-    // The root-prefix question is "does any listing CONTAIN it", and a listing that
-    // cannot be read contains nothing -- by design: that is how a server's root,
-    // which no one can list, joins the prefix (`rootPrefixOf`). So its error is not asked.
-    std::error_code unread;
-    return listsExactly(cache, p.parent_path(), want, unread);
+HeaderSearchResult descend(fs::path base, fs::path const& rel,
+                           HeaderNameMatching matching, HeaderSearchCache& cache) {
+    return descendThrough(std::move(base), rel, Components::Navigate, matching, cache);
 }
 
-[[nodiscard]] fs::path rootPrefixOf(fs::path const& full, fs::path& below,
-                                    HeaderSearchCache& cache) {
-    std::vector<fs::path> chain;   // deepest first
-    for (fs::path q = full; !q.empty() && q != q.parent_path();
-         q = q.parent_path()) {
-        chain.push_back(q);
-    }
-    below.clear();
-    if (chain.empty()) return full.root_path();
-    // The LEADING RUN of ancestors that no listing contains. It stops at the
-    // first ordinary component, so a MISSING header -- whose own last component
-    // is also unlisted -- can never be swallowed into the "root": that component
-    // is at the END of the path, never in the leading run.
-    std::size_t boundary = 0;
-    for (std::size_t shallow = 0; shallow < chain.size(); ++shallow) {
-        if (isListedInItsParent(chain[chain.size() - 1 - shallow], cache)) break;
-        boundary = shallow + 1;
-    }
-    fs::path base = (boundary == 0) ? full.root_path()
-                                    : chain[chain.size() - boundary];
-    // \u26a0 THE GUARD THAT KEEPS A MISSING HEADER MISSING, AND IT IS STRUCTURAL ON
-    // PURPOSE. A path on an unreachable server has NO listed ancestor at all, so
-    // the run would swallow the WHOLE path, leave nothing to verify, and
-    // `descend` would answer "found" for a file nobody can open. If the run
-    // consumed every component it is not a root prefix: fall back to the model's
-    // own `root_path()`, which walks and fails exactly as it did before.
-    //
-    // \u2605\u2605 IT ASKS THE FILESYSTEM NOTHING, AND THAT IS THE POINT. The first
-    // version guarded with `is_directory(base)`, and \u2714MEASURED over 30 compiles
-    // the UNC arms failed 6 times: a cold SMB connection makes a probe on a UNC
-    // ancestor fail transiently, "could not tell" was read as "not a directory",
-    // and the fallback then lost the header. A decision that must be STABLE
-    // cannot rest on a call that fails for reasons that are not about the path.
-    if (boundary >= chain.size()) {
-        base     = full.root_path();
-        boundary = 0;
-    }
-    for (std::size_t shallow = boundary; shallow < chain.size(); ++shallow) {
-        below /= chain[chain.size() - 1 - shallow].filename();
-    }
-    return base;
-}
-
-// Resolve a name that may be absolute or relative-to-`dir`, applying the
-// policy to every component the SOURCE wrote. Directory-list entries
-// (`-I` dirs, systemDirs) are NOT case-checked: they come from the driver and
-// the build config, not from a header name in the program text.
+// ── [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] — THE BASE A ROOTED NAME IS SEARCHED FROM ──────────────────
+//
+// ★★★ IT IS THE VOLUME ROOT `core::rootSpelling` PARSES (P69 H6), and nothing else decides it. The base and the
+// components below it come from ONE split of the native spelling: `C:\` and `inc\x.h`, `\\server\share\` and
+// `inc\x.h`, `\\.\C:\`, `\\?\Volume{G}\`, `\\?\UNC\server\share\`, `/` -- and every component below the volume root
+// is case-checked by `descend`, the first one included.
+//
+// ★★ WHAT IT REPLACED, AND WHY BOTH OF ITS RULES WERE WRONG. `descend` was first handed the library's `root_path()`,
+// which is not lossless (`path("//server/share/x.h").root_path()` is `/`, ONE slash, on the MinGW model: the authority
+// demoted to a component, the walk asking the local drive root for a directory named after the SERVER). Its
+// successor took as the root the leading run of ancestors no directory listing CONTAINS -- asking the filesystem
+// where the root ends. It was wrong twice over (the P69 review of H5, F6 and F3; the first pinned by
+// `RootedIncludeResolution.AMisCasedFirstComponentIsCaseChecked`): a MIS-CASED FIRST component (`C:\SOURCE\...` for
+// `C:\Source\...`) is not listed byte-exactly in its parent, so it joined the "root" and was never case-checked -- the
+// wrong-case absolute include the CaseSensitive policy exists to refuse was accepted; and the library's own root of a
+// device spelling ends inside its volume (MS STL's `root_name()` of `\\.\C:\x` is `\\.`, ✔MEASURED in
+// `core::rootSpelling`'s header), so the run started from a prefix that is no directory. A root is a property of the
+// SPELLING, decided once; the filesystem is asked about the components below it.
+// (The history: that listing walk's first cut read freed memory -- a reference bound to the `native()` of a temporary
+// `fs::path` -- and failed toward a spurious "listed", the whole of an intermittent UNC miss; ✔MEASURED and fixed then.)
+//
+// Below a VERBATIM root the components are split at `\` alone and taken as NAMES (`Components::Literal`): Win32 opens
+// that rest literally, so `\\?\C:\a\..\x.h` names no file (ERROR_INVALID_NAME) and the search finds none, as the OS
+// would, where a `..` taken as a step would have found `C:\x.h`.
 HeaderSearchResult resolveMaybeAbsolute(fs::path const& rel, fs::path const& dir,
                                         HeaderNameMatching matching,
                                         HeaderSearchCache& cache) {
-    if (isRootedPath(rel)) {
-        fs::path below;
-        fs::path const base = rootPrefixOf(rel, below, cache);
-        return descend(base, below, matching, cache);
+    if (!isRootedPath(rel)) return descend(dir, rel, matching, cache);
+    NativeString const&      spelled = rel.native();
+    core::RootSpelling const root    = core::rootSpelling(rel);
+    fs::path const           base{spelled.substr(0, root.volume)};
+    if (root.kind != core::RootSpelling::Kind::Verbatim)
+        return descend(base, fs::path{spelled.substr(root.volume)}, matching, cache);
+    std::vector<fs::path> names;
+    for (std::size_t at = root.volume; at <= spelled.size();) {
+        std::size_t const end = std::min(spelled.find(NativeChar{'\\'}, at), spelled.size());
+        names.emplace_back(spelled.substr(at, end - at));
+        at = end + 1;
     }
-    return descend(dir, rel, matching, cache);
+    return descendThrough(base, names, Components::Literal, matching, cache);
 }
 
 // Sorted (key, count) pairs out of a tally map, keys back as paths.
@@ -686,7 +592,8 @@ std::vector<std::pair<fs::path, std::size_t>> HeaderSearchTally::probesPerCandid
 // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] -- see the header for the
 // measurement and for why this is exported rather than repeated per tier.
 bool isRootedPath(fs::path const& p) {
-    return p.is_absolute() || p.has_root_directory();
+    core::RootSpelling::Kind const kind = core::rootSpelling(p).kind;
+    return kind != core::RootSpelling::Kind::Relative && kind != core::RootSpelling::Kind::DriveRelative;
 }
 
 // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 lifted this out of

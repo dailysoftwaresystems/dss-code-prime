@@ -29,6 +29,7 @@
 // a library's exports from its file).
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"   // DiagnosticCode: the merged-image refusal is pinned by its code
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "ffi/binary_readers/ar_reader.hpp"
@@ -40,6 +41,7 @@
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
 #include "program/compile_pipeline.hpp"   // extractStaticArchiveMembers, readObjectInputModules: the readers a link uses
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -386,6 +388,18 @@ constexpr ArchiveDocument kArchiveDocuments[] = {
     {"arm64", "macho64-arm64-darwin-staticlib", "asm-arm64-gas", "\tmov\tw0, #1\n\tret\n", "%function"},
 };
 
+// Every shipped RELOCATABLE-object document (neither an image nor an archive), with its target: the universe of the
+// two relocatable cases below. Censused, like `kArchiveDocuments`, by
+// `ArchivePackaging.TheTablesHoldEveryShippedArchiveAndRelocatableDocument`.
+struct RelocatableDocument {
+    char const* arch;     // the target
+    char const* format;   // the relocatable document
+};
+constexpr RelocatableDocument kRelocatableDocuments[] = {
+    {"x86_64", "elf64-x86_64-linux"},  {"x86_64", "pe64-x86_64-windows"}, {"x86_64", "macho64-x86_64-darwin"},
+    {"arm64", "elf64-aarch64-linux"}, {"arm64", "macho64-arm64-darwin"},
+};
+
 // The unit, in C or in the document's assembly dialect: two external functions, `unit_api` and `unit_helper`.
 [[nodiscard]] std::pair<std::string, std::string> unitOf(ArchiveDocument const& d, bool assembly) {
     if (!assembly) return {"unit.c", "int unit_api(void) { return 1; }\nint unit_helper(void) { return 1; }\n"};
@@ -398,6 +412,54 @@ constexpr ArchiveDocument kArchiveDocuments[] = {
 }
 
 }  // namespace
+
+// ★ THE TWO TABLES ARE THE SHIPPED VOCABULARY'S, CENSUSED (P69 H6, the review of H5's N4): every shipped object-format
+// document a shipped target builds for (its `targetArch` names a `<target>.target.json` of src/dss-config/targets)
+// that is a static-archive container is a row of `kArchiveDocuments`, its target and its dialect the target's own
+// `defaultAssemblyLanguage`, and every one that is neither an image nor an archive -- a relocatable object -- a row
+// of `kRelocatableDocuments` with its target. A document added later fails HERE until its row is written, so no pin's
+// universe can fall behind the documents it claims. (spirv-1.6 and wasm32-v1 name targets no shipped target
+// document declares, so no C build reaches them: outside both universes, as the census itself reads.)
+TEST(ArchivePackaging, TheTablesHoldEveryShippedArchiveAndRelocatableDocument) {
+    fs::path const config = dss::test::repoRoot() / "src" / "dss-config";
+    std::vector<std::string> targets;
+    for (auto const& entry : fs::directory_iterator{config / "targets"}) {
+        std::string const file = entry.path().filename().string();
+        if (file.ends_with(".target.json")) targets.push_back(file.substr(0, file.size() - std::strlen(".target.json")));
+    }
+    ASSERT_FALSE(targets.empty()) << "the census read no target document";
+    std::vector<std::string> archives;      // "<arch>:<format>"
+    std::vector<std::string> relocatables;  // "<arch>:<format>"
+    std::size_t              read = 0;
+    for (auto const& entry : fs::directory_iterator{config / "object-formats"}) {
+        std::string const file = entry.path().filename().string();
+        if (!file.ends_with(".format.json")) continue;
+        std::string const name   = file.substr(0, file.size() - std::strlen(".format.json"));
+        auto const        format = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(format.has_value()) << name << " did not load";
+        ++read;
+        std::string const arch{(*format)->targetArch()};
+        if (std::find(targets.begin(), targets.end(), arch) == targets.end()) continue;   // no C build reaches it
+        if ((*format)->isStaticArchive()) archives.push_back(arch + ":" + name);
+        else if (!(*format)->isImageFlavor()) relocatables.push_back(arch + ":" + name);
+    }
+    ASSERT_FALSE(archives.empty() || relocatables.empty()) << "the census found no document of a kind; it read " << read;
+    std::vector<std::string> archiveRows;
+    for (ArchiveDocument const& d : kArchiveDocuments) {
+        archiveRows.push_back(std::string{d.arch} + ":" + d.format);
+        auto const target = TargetSchema::loadShipped(d.arch);
+        ASSERT_TRUE(target.has_value()) << d.arch;
+        EXPECT_EQ((*target)->defaultAssemblyLanguage(), std::string_view{d.assembly})
+            << d.format << ": the row's dialect is not its target's own";
+    }
+    std::vector<std::string> relocatableRows;
+    for (RelocatableDocument const& r : kRelocatableDocuments) relocatableRows.push_back(std::string{r.arch} + ":" + r.format);
+    for (auto* v : {&archives, &relocatables, &archiveRows, &relocatableRows}) std::sort(v->begin(), v->end());
+    EXPECT_EQ(archiveRows, archives) << "a shipped static-archive document has no row of kArchiveDocuments, or a row "
+                                        "names no such document or the wrong target";
+    EXPECT_EQ(relocatableRows, relocatables) << "a shipped relocatable document has no row of kRelocatableDocuments, "
+                                                "or a row names no such document or the wrong target";
+}
 
 TEST(ArchivePackaging, EveryTierPackagesItsUnitAsAMemberWithTheArchivesVisibility) {
     for (ArchiveDocument const& d : kArchiveDocuments) {
@@ -456,10 +518,7 @@ TEST(ArchivePackaging, EveryTierPackagesItsUnitAsAMemberWithTheArchivesVisibilit
 // `__main` and every other routine of the pe `compilerSupport` role, and two such objects linked together redefined
 // them all.
 TEST(ArchivePackaging, ARelocatableObjectOfAUnitThatNamesNoRoutineDefinesItsOwnNamesAlone) {
-    struct Relocatable { char const* arch; char const* format; };
-    for (Relocatable const& r : {Relocatable{"x86_64", "elf64-x86_64-linux"}, Relocatable{"x86_64", "pe64-x86_64-windows"},
-                                 Relocatable{"x86_64", "macho64-x86_64-darwin"}, Relocatable{"arm64", "elf64-aarch64-linux"},
-                                 Relocatable{"arm64", "macho64-arm64-darwin"}}) {
+    for (RelocatableDocument const& r : kRelocatableDocuments) {
         SCOPED_TRACE(r.format);
         ScratchDir scratch{Location::InsideRepo, "archive-packaging-relocatable"};
         writeText(scratch.path() / "plain.c", "int plain_api(int x) { return x + 42; }\n");
@@ -497,10 +556,7 @@ TEST(ArchivePackaging, ARelocatableObjectOfAUnitThatNamesNoRoutineDefinesItsOwnN
 // body pulled into the object would be defined again by every other object that calls it, and by the image's own pull
 // (K_SymbolRedefinedAcrossUnits). THE TABLE IS THE UNIVERSE: every shipped relocatable document.
 TEST(ArchivePackaging, ARelocatableObjectOfAUnitThatCallsARuntimeRoutineLeavesItAReference) {
-    struct Relocatable { char const* arch; char const* format; };
-    for (Relocatable const& r : {Relocatable{"x86_64", "elf64-x86_64-linux"}, Relocatable{"x86_64", "pe64-x86_64-windows"},
-                                 Relocatable{"x86_64", "macho64-x86_64-darwin"}, Relocatable{"arm64", "elf64-aarch64-linux"},
-                                 Relocatable{"arm64", "macho64-arm64-darwin"}}) {
+    for (RelocatableDocument const& r : kRelocatableDocuments) {
         SCOPED_TRACE(r.format);
         ScratchDir scratch{Location::InsideRepo, "archive-packaging-runtime-reference"};
         writeText(scratch.path() / "calls.c",
@@ -533,5 +589,103 @@ TEST(ArchivePackaging, ARelocatableObjectOfAUnitThatCallsARuntimeRoutineLeavesIt
         ASSERT_EQ(defined.size(), 1u) << "a relocatable object defines its unit's function alone, never a runtime body "
                                          "it calls; it defines" << named;
         EXPECT_TRUE(defined.front().ends_with("uses_runtime")) << defined.front();
+    }
+}
+
+// SEVERAL UNITS INTO ONE ARCHIVE, IN EITHER LANGUAGE: one member each, named after its own source, defining its own
+// function alone -- the table's units axis (P69 H6, the review of H5's F4). A member is never merged with another, so
+// nothing about several units needs a merged symbol space; the assembly route refused them all the same
+// (D_PlanNotLanded, "a multi-CU standalone-assembly build is not yet lowered") where `as` + `ar`, `ml64` + `lib` and
+// `gcc -c a.s b.s` + `ar rcs` build it. Two units as the CLI makes them (`dsscp a.s b.s`: `compileUnits`).
+TEST(ArchivePackaging, SeveralUnitsArePackagedAsOneMemberEachInEitherLanguage) {
+    for (ArchiveDocument const& d : kArchiveDocuments) {
+        for (bool const assembly : {false, true}) {
+            SCOPED_TRACE(std::string{d.format} + (assembly ? " / assembly" : " / C"));
+            ScratchDir scratch{Location::InsideRepo, "archive-units"};
+            std::vector<std::string> sources;
+            for (char const* stem : {"first", "second"}) {
+                std::string const fn = std::string{stem} + "_api";
+                std::string text;
+                if (assembly) {
+                    text = std::string{"\t.text\n\t.globl\t"} + fn + "\n\t.type\t" + fn + ", " + d.marker + "\n" + fn
+                         + ":\n" + d.asmBody;
+                } else {
+                    text = "int " + fn + "(void) { return 1; }\n";
+                }
+                fs::path const file = scratch.path() / (std::string{stem} + (assembly ? ".s" : ".c"));
+                writeText(file, text);
+                sources.push_back(file.string());
+            }
+            Program p;
+            p.setOutputDir(scratch.path());
+            DiagnosticReporter rep;
+            std::string said;
+            int const rc = p.compileUnits(sources, assembly ? d.assembly : "c", {std::string{d.arch} + ":" + d.format},
+                                          rep);
+            for (auto const& diag : rep.all()) said += "\n  " + diag.actual;
+            ASSERT_EQ(rc, 0) << "two units did not build into the archive; errors=" << rep.errorCount() << said;
+            ASSERT_EQ(p.artifactPaths().size(), 1u);
+            ASSERT_TRUE(p.artifactPaths().front().has_value());
+            fs::path const artifact = *p.artifactPaths().front();
+            auto const bytes = readFileBytes(artifact);
+            ASSERT_GE(bytes.size(), 8u);
+            EXPECT_EQ(std::string(bytes.begin(), bytes.begin() + 8), std::string{"!<arch>\n"});
+            auto const target = TargetSchema::loadShipped(d.arch);
+            auto const format = ObjectFormatSchema::loadShipped(d.format);
+            ASSERT_TRUE(target.has_value() && format.has_value());
+            DiagnosticReporter readRep;
+            auto const members = extractStaticArchiveMembers(std::span<fs::path const>{&artifact, 1}, **target,
+                                                             **format, readRep);
+            ASSERT_TRUE(members.has_value()) << "the archive did not read back; errors=" << readRep.errorCount();
+            ASSERT_EQ(members->modules.size(), 2u) << "two units, two members";
+            std::string const ext{(*format)->archiveMemberExtension()};
+            for (std::size_t i = 0; i < 2; ++i) {
+                std::string const stem = i == 0 ? "first" : "second";
+                EXPECT_EQ(members->names[i], stem + ext) << "the member is named after its own unit's source";
+                std::vector<std::string> defined;
+                for (auto const& ms : members->modules[i].symbols) {
+                    if (ms.binding != SymbolBinding::Local && (ms.name.ends_with("first_api")
+                                                               || ms.name.ends_with("second_api")))
+                        defined.push_back(ms.name);
+                }
+                ASSERT_EQ(defined.size(), 1u) << stem << "'s member defines one of the two functions";
+                EXPECT_TRUE(defined.front().ends_with(stem + "_api")) << defined.front();
+            }
+        }
+    }
+}
+
+// ...AND INTO A MERGED IMAGE THEY ARE STILL REFUSED, BY NAME. The archive's several units are members, never merged;
+// an image MERGES its units, and the assembly route has no namespacing of one unit's symbols from another's, so two
+// `.s` units into an executable stay D_PlanNotLanded (its text now names the merged image). Each archive document's
+// executable sibling, so the refusal is pinned on every target and format family the archive cell covers. (The ONE-
+// unit assembly archive is `EveryTierPackagesItsUnitAsAMemberWithTheArchivesVisibility`'s assembly cell.)
+TEST(ArchivePackaging, SeveralAssemblyUnitsIntoAMergedImageAreStillRefusedByName) {
+    for (ArchiveDocument const& d : kArchiveDocuments) {
+        std::string exec{d.format};
+        ASSERT_TRUE(exec.ends_with("-staticlib")) << exec;
+        exec.replace(exec.size() - std::string_view{"-staticlib"}.size(), std::string_view{"-staticlib"}.size(),
+                     "-exec");
+        SCOPED_TRACE(exec);
+        ScratchDir scratch{Location::InsideRepo, "asm-units-image"};
+        std::vector<std::string> sources;
+        for (char const* stem : {"first", "second"}) {
+            std::string const fn = std::string{stem} + "_api";
+            fs::path const file = scratch.path() / (std::string{stem} + ".s");
+            writeText(file, std::string{"\t.text\n\t.globl\t"} + fn + "\n" + fn + ":\n" + d.asmBody);
+            sources.push_back(file.string());
+        }
+        Program p;
+        p.setOutputDir(scratch.path());
+        DiagnosticReporter rep;
+        EXPECT_NE(p.compileUnits(sources, d.assembly, {std::string{d.arch} + ":" + exec}, rep), 0)
+            << "two assembly units were linked into one image with no namespacing of their symbols";
+        bool refused = false;
+        for (auto const& diag : rep.all()) {
+            if (diag.code == DiagnosticCode::D_PlanNotLanded && diag.actual.find("into a merged image") != std::string::npos)
+                refused = true;
+        }
+        EXPECT_TRUE(refused) << "the merged image was not refused by D_PlanNotLanded naming it; errors="
+                             << rep.errorCount();
     }
 }

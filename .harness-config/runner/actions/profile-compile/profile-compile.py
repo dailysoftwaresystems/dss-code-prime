@@ -124,7 +124,12 @@ SUPPORT_REL = (".harness-config", "runner", "actions", "profile-compile",
 # so /usr/local/bin ends up first -- what the retired shell program did.
 PATH_PROBES = ("/opt/homebrew/bin", "/usr/local/bin")
 
-_PHASE_LINE = re.compile(r"compile time|^dsscp:   phase")
+# The `--time` report dsscp writes (program.cpp `emitPhaseTimeReport`): its first line `dsscp: compile time ...`, then
+# a table whose header and every row -- each phase, `[other]`, a violation -- begin `dsscp:   `. The report is that
+# BLOCK: the first line and every line after it that begins with the table's prefix. ⚠ The pattern this replaced
+# matched `^dsscp:   phase`, the HEADER alone, so the report printed a table's head with no row under it (P69 H6).
+_REPORT_FIRST = re.compile(r"^dsscp: compile time ")
+_REPORT_ROW   = "dsscp:   "
 
 
 def _flush():
@@ -457,16 +462,29 @@ def support(repo, support_path, argv, extra_env=None, capture=False):
     return _status(p.returncode), text
 
 
+def report_lines(text):
+    """The `--time` report's lines in `text`: its `compile time` line and the table under it, header and rows."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if _REPORT_FIRST.match(line):
+            out.append(line)
+            inside = True
+        elif inside and line.startswith(_REPORT_ROW):
+            out.append(line)
+        else:
+            inside = False
+    return out
+
+
 def phase_report(log):
-    """The compile log's `compile time` line and its `dsscp:   phase` lines."""
+    """The compile log's `--time` report, whole: its `compile time` line and every row of the table under it."""
     try:
         with open(log, "rb") as fh:
             text = fh.read().decode("utf-8", "replace")
     except OSError:
         return
-    for line in text.splitlines():
-        if _PHASE_LINE.search(line):
-            sys.stdout.write(line + "\n")
+    for line in report_lines(text):
+        sys.stdout.write(line + "\n")
 
 
 def list_artifacts(image_dir, limit):
@@ -488,7 +506,17 @@ def list_artifacts(image_dir, limit):
 # ── THE COMMAND LINE'S OWN SELF-TEST: no kit, no build ───────────────────────────
 SELFTEST_MARKER = "profile-compile self-test: "
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 5
+EXPECTED_ARMS = 7
+# A compile log's `--time` report as dsscp writes it (program.cpp `emitPhaseTimeReport`'s own lines), with a trace line
+# before it and an optimizer trace line after it, which are no part of it.
+_REPORT_SAMPLE = (
+    "opt: pass inline 3 changed\n"
+    "dsscp: compile time 1.25s  (process wall)\n"
+    "dsscp:   phase                         cpu        wall   peak    runs\n"
+    "dsscp:   parse                       0.10s       0.10s      1       1\n"
+    "dsscp:   optimize                    0.80s       0.81s      1       1\n"
+    "dsscp:   [other]                                 0.34s\n"
+    "opt: fixpoint release converged after 2 iteration(s)\n")
 _REQUIRED = ["--kit", "kit", "--target", "x86_64:elf64-x86_64-linux-exec", "--label", "leg"]
 
 
@@ -536,6 +564,14 @@ def self_test():
     arm("a value that is no path may begin with `-` (the control)",
         got is not None and (got["reference_opt"], got["reference_link_libs"]) == ("-O2", "-lm"),
         "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["reference_opt"],),))
+    shown = report_lines(_REPORT_SAMPLE)
+    rows = [l for l in shown if l.startswith(_REPORT_ROW)]
+    arm("the phase report shows the table's header AND every row under it",
+        len(rows) == 4 and rows[0].startswith(_REPORT_ROW + "phase") and any("optimize" in r for r in rows)
+        and any("[other]" in r for r in rows), "reported %r" % (shown,))
+    arm("the phase report shows the `compile time` line and nothing of the traces around it (the control)",
+        shown[:1] == ["dsscp: compile time 1.25s  (process wall)"] and not any(l.startswith("opt:") for l in shown),
+        "reported %r" % (shown,))
     failed = ran.count(False)
     if len(ran) != EXPECTED_ARMS:
         print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))

@@ -157,6 +157,12 @@ dss_add_test(NAME program/test_dump_predefined_macros
 dss_add_test(NAME program/test_entry_argv_run
              SOURCES test_entry_argv_run.cpp)
 
+# D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE: an object written, read back and linked, and the
+# image started, at a path of 300 characters or more and below 260 -- the substrate's extended-length spelling end
+# to end (Windows; every other host compiles it).
+dss_add_test(NAME program/test_artifact_at_any_length
+             SOURCES test_artifact_at_any_length.cpp)
+
 # D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the environment entry forms' REAL-INPUT-PATH
 # witnesses, live on EVERY host (the host's own exec format): a variable the test
 # sets must reach `main(int, char**, char**)` byte-exact with real arguments, and

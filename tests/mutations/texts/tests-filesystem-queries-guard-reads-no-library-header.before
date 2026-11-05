@@ -1,1 +1,0 @@
-                if (name == "filesystem" || isUnreadLibraryHeader(name)) work.push_back(s.relative);

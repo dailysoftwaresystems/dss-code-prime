@@ -254,7 +254,7 @@ struct PeekedLibraryIdentity {
 [[nodiscard]] static PeekedLibraryIdentity
 peekLibraryIdentity(std::filesystem::path const& libraryPath) {
     PeekedLibraryIdentity out;
-    std::ifstream in(libraryPath, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(libraryPath), std::ios::binary);
     if (!in) return out;
     std::uint8_t buf[kArchitectureLeadBytes] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
@@ -452,7 +452,7 @@ checkArchiveMembersMatchTargetFormat(std::filesystem::path const& archivePath,
     // the same bytes with the same reader and reports structural faults in
     // full. Reporting here as well would double-report one broken archive; the
     // contract is `peekLibraryIdentity`'s, one tier up.
-    std::ifstream in(archivePath, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
     if (!in) return std::nullopt;
     std::vector<std::uint8_t> const bytes{
         std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};

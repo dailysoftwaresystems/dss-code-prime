@@ -34,7 +34,10 @@
 //     GUARD. A `DefiningSite` is an ORDINAL; a summary paired with the wrong
 //     module resolves every fetch to a real function with the wrong body.
 //   * TheBudgetStillDecidesTheOutcome — option B of the fork remains the one
-//     knob that legitimately changes what is imported.
+//     knob that legitimately changes what is imported, and what it refused is
+//     no demand: the module is optimized once.
+//   * TheImportBoundIsReturnedAndNothingIsReportedAtThisTier — the bound's
+//     demand is RETURNED for the driver to report as a compiler defect; this tier reports nothing.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -51,9 +54,12 @@
 
 #include <gtest/gtest.h>
 
+#include <charconv>
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace dss;
@@ -536,4 +542,156 @@ TEST(LazyImportEdge, TheBudgetStillDecidesTheOutcome) {
     ASSERT_TRUE(r.outcome.ok);
     EXPECT_EQ(r.outcome.importedBodies, 1u)
         << "the ThinLTO-style instruction budget is a REAL bound, unlike depth";
+    // ...and what it refused is no DEMAND (P69 H6). `f1`'s body names `f2`, which the budget refused; no later round
+    // can take it (what is spent only grows), so the module is optimized ONCE and nothing is left at the bound. The
+    // outer round once asked importability alone: it re-optimized this module to `kMaxImportRounds` for a body no
+    // round could take, and said the import fixpoint had hit its bound.
+    EXPECT_EQ(r.outcome.optimizeRuns, 1u)
+        << "a callee the budget refused was taken for demand: the module was re-optimized for a body no round can "
+           "take";
+    EXPECT_EQ(r.outcome.importMerges, 1u);
+    EXPECT_EQ(r.outcome.demandLeftAtBound, 0u)
+        << "a callee the budget refused was counted as demand left at the import bound";
+}
+
+// ── ★ THE IMPORT BOUND IS RETURNED, NEVER REPORTED HERE (P69 H6) ──────────
+// Reaching `kMaxImportRounds` is a broken invariant of the closure, which the DRIVER reports as a compiler defect
+// (`importBoundReached`, compile_pipeline.hpp: X_OptImportBoundReached, the stage stopping); this MIR-tier leaf has no
+// reporter of its own. So driven to its bound, the loop RETURNS the demand left and reports NOTHING.
+//
+// The optimizer here is a stub that EXPOSES one fresh importable callee per run -- the shape no real optimize of
+// DSS's makes today: a callee whose address escapes is never importable, and the closure takes every other one a
+// module names before the first optimize. `main` calls `f1` (so the first round imports and optimizes) and holds
+// the address of each of `g1`..`g10` unused (so each is declared, and none escapes); its run `k` rebuilds `main` to
+// call `g1`..`gk`. Round `k` imports `gk`, so at the bound `g8` is still demand. ⚠ The stub names every symbol by
+// NAME, through the extern rows each run is handed, and never by the id the fixture gave it: the merge keeps a
+// destination's own value only for a name no other input defines, and an imported body's name takes its definition's
+// fresh id (mir_merge.cpp, the winner's `claim` / `mint`). A stub that kept `g1`'s fixture id met it stale the round
+// after `g1` arrived (✔MEASURED, P69 H6, three legs: "GlobalAddr in CU 0 references symbol v=21 with no unified merged
+// id"). `main` is defined in the destination alone, so it keeps its 100.
+TEST(LazyImportEdge, TheImportBoundIsReturnedAndNothingIsReportedAtThisTier) {
+    static constexpr std::uint32_t kGs = 10;
+    std::vector<TestCu> cus;
+    {
+        TestCu cu;
+        cu.lattice = std::make_unique<TypeLattice>(CompilationUnitId{1}, "c");
+        TypeId const i32 = cu.lattice->interner().primitive(TypeKind::I32);
+        TypeId const sig = cu.lattice->interner().fnSig({}, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(sig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        for (std::uint32_t k = 1; k <= kGs; ++k) (void)mb.addGlobalAddr(SymbolId{20 + k}, sig);
+        MirInstId const f1 = mb.addGlobalAddr(SymbolId{10}, sig);
+        MirInstId const ops[] = {f1};
+        mb.addReturn(mb.addInst(MirOpcode::Call, ops, i32));
+        cu.mir = std::move(mb).finish();
+        cu.names.assign(101, std::string{});
+        cu.names[100] = "main";
+        cu.names[10]  = "f1";
+        cu.externs.push_back(ExternImport{SymbolId{10}, "f1", ""});
+        for (std::uint32_t k = 1; k <= kGs; ++k) {
+            cu.names[20 + k] = std::format("g{}", k);
+            cu.externs.push_back(ExternImport{SymbolId{20 + k}, cu.names[20 + k], ""});
+        }
+        cus.push_back(std::move(cu));
+    }
+    cus.push_back(makeLink(1, "f1", "", 1));
+    for (std::uint32_t k = 1; k <= kGs; ++k)
+        cus.push_back(makeLink(1 + k, std::format("g{}", k), "", static_cast<std::int64_t>(k)));
+
+    auto const summaries = summarize(cus);
+    auto const views     = viewsOf(cus);
+    DiagnosticReporter rep;
+    auto const policy = policyAt(4);
+    auto index = buildSummaryIndex(summaries, policy, dss::test_support::ordinaryLinkFormat(), rep);
+    ASSERT_TRUE(index.has_value());
+    ASSERT_TRUE(summariesDescribeModules(views, summaries, rep));
+    for (std::uint32_t k = 1; k <= kGs; ++k)
+        ASSERT_TRUE(isImportable(0, std::format("g{}", k), views, summaries, *index, policy))
+            << "g" << k << " is not importable, so no round could expose it: the case is vacuous";
+
+    std::uint32_t runs = 0;
+    LazyOptimizeFn const exposeOneMore = [&runs](Mir& m, TypeInterner const&, std::span<ExternImport const> externs) {
+        ++runs;
+        // Each name's id in THIS run's module. Every `g` and `f1` has exactly one row in every run: a reference while
+        // it is undefined, the available-externally row once its body is imported (lazy_import_optimize.cpp). A name
+        // spelled twice, or one missing, ends the run unoptimized -- and `runs` then misses its bound, loudly.
+        std::unordered_map<std::string, SymbolId>      idOf;
+        std::unordered_map<std::uint32_t, std::string> nameOf;
+        for (ExternImport const& e : externs) {
+            if (!idOf.emplace(e.mangledName, e.symbol).second) return false;
+            nameOf.emplace(e.symbol.v, e.mangledName);
+        }
+        // The types the module already holds: `main`'s signature, and the type of the call `main` makes.
+        MirFuncId mainFn{};
+        bool      found = false;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            if (m.funcSymbol(m.funcAt(fi)).v == 100) {
+                mainFn = m.funcAt(fi);
+                found  = true;
+            }
+        }
+        if (!found) return false;
+        TypeId const sig = m.funcSignature(mainFn);
+        TypeId       ret = InvalidType;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(mainFn) && ret == InvalidType; ++bi) {
+            MirBlockId const b = m.funcBlockAt(mainFn, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const inst = m.blockInstAt(b, ii);
+                if (m.instOpcode(inst) == MirOpcode::Call) {
+                    ret = m.instType(inst);
+                    break;
+                }
+            }
+        }
+        if (ret == InvalidType) return false;
+        MirBuilder mb;
+        mb.carryModuleFactsOf(m);
+        mb.addFunction(sig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId last{};
+        for (std::uint32_t k = 1; k <= kGs; ++k) {
+            auto const g = idOf.find(std::format("g{}", k));
+            if (g == idOf.end()) return false;
+            MirInstId const addr = mb.addGlobalAddr(g->second, sig);
+            if (k > runs) continue;
+            MirInstId const ops[] = {addr};
+            last = mb.addInst(MirOpcode::Call, ops, ret);
+        }
+        mb.addReturn(last);
+        // Every other function the module holds -- the bodies earlier rounds imported, `f1` and `g1`.. -- is re-added
+        // as it came: its symbol, its linkage, its body (`return 1` for f1, `return k` for gk, as `makeLink` wrote
+        // them). A rebuild of `main` alone would drop them.
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const     f = m.funcAt(fi);
+            std::uint32_t const s = m.funcSymbol(f).v;
+            if (s == 100) continue;
+            auto const n = nameOf.find(s);
+            if (n == nameOf.end() || n->second.size() < 2) return false;
+            std::int64_t value = 0;
+            char const* const digits = n->second.data() + 1;
+            char const* const end    = n->second.data() + n->second.size();
+            if (std::from_chars(digits, end, value).ptr != end) return false;   // `f1` -> 1, `gk` -> k
+            mb.addFunction(m.funcSignature(f), SymbolId{s}, m.funcLinkage(f));
+            MirBlockId const body = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(body);
+            mb.addReturn(mb.addConst(i32Lit(value), ret));
+        }
+        m = std::move(mb).finish();
+        return true;
+    };
+
+    ImportRun const r = runImporter(cus, policy, exposeOneMore, rep, *index, summaries, views);
+    ASSERT_TRUE(r.outcome.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(runs, kMaxImportRounds) << "the loop did not run to its bound, so the case proves nothing";
+    EXPECT_EQ(r.outcome.optimizeRuns, kMaxImportRounds);
+    EXPECT_EQ(r.outcome.importMerges, kMaxImportRounds) << "one merge per round: f1, then g1..g7";
+    EXPECT_EQ(r.outcome.importedBodies, kMaxImportRounds);
+    EXPECT_EQ(r.outcome.demandLeftAtBound, 1u)
+        << "the demand left at the bound (g8) was not RETURNED, so no stage can say whether it is a truncation";
+    std::string said;
+    for (auto const& d : rep.all()) said += "\n  " + d.actual;
+    EXPECT_TRUE(rep.all().empty()) << "the MIR tier, which knows no stage, reported at the import bound:" << said;
 }

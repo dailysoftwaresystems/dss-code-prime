@@ -1,1 +1,1 @@
-            fs::path out{resolved};
+            return fs::path{dosSpellingOf(resolved)};

@@ -91,7 +91,7 @@ readChecked(fs::path const& path, std::optional<std::uintmax_t> maxBytes) {
     // The OS's reason for a refused open is read from `errno` the open left -- it is cleared first, so a stale one
     // is never reported: gcc and clang name it ("Permission denied"), and so does this.
     errno = 0;
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(extendedLengthSpelling(path), std::ios::binary);
     if (!in) {
         int const why = errno;
         return std::unexpected(FileReadError{

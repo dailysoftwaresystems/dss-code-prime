@@ -1,1 +1,2 @@
-    return to.lexically_relative(from);
+    return fs::path{to.native().substr(toRoot.volume)}.lexically_relative(
+        fs::path{from.native().substr(fromRoot.volume)});

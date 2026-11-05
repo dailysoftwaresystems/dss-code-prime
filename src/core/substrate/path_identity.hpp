@@ -5,6 +5,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -121,9 +122,165 @@ genericSpelling(std::filesystem::path const& p);
 [[nodiscard]] DSS_EXPORT std::u8string
 genericSpellingU8(std::filesystem::path const& p);
 
+// THE ROOT OF A PATH'S SPELLING -- ONE parse, this one, for every path the compiler splits, normalizes, compares or
+// walks up (P69 H6). The library's own root model cannot be asked: the two Windows libraries DISAGREE on every
+// namespace prefix. ✔MEASURED 2026-11-04 (probe-reference-cc run 20261104-204243-d5c02d5f, both Windows legs, MinGW
+// g++ 13.2.0 and cl 19.51.36260, one file spelled every way on the scratch's own volume): MS STL's `root_name()` is
+// `\\?` for `\\?\C:\x` and `\\?\Volume{G}\x`, `\\.` for `\\.\C:\x`, `\\localhost` for `\\localhost\C$\x` (the share
+// left in the relative path), `//?` for `//?/C:/x`; libstdc++'s is EMPTY for every one of them, `is_absolute()` false,
+// and its `lexically_normal()` destroys the prefix (`\\?\` -> `\?\`, `\\.\` -> `\`, `\\localhost` -> `\localhost`).
+//
+// ★★ WHAT WIN32 ITSELF DOES WITH EACH PREFIX, which is what the parse states (✔MEASURED, the run above and run
+// 20261104-205708-1394b8a2, cl 19.51, a handle opened on each spelling and GetFullPathNameW of it):
+//   - `\\?\` (exactly that, four backslashes and `?`) is VERBATIM: the opened handle takes the rest LITERALLY -- `..`
+//     opens nothing (ERROR_INVALID_NAME), nor `.` or `/` (ERROR_PATH_NOT_FOUND), nor a trailing dot or space
+//     (ERROR_FILE_NOT_FOUND), nor a doubled separator (ERROR_INVALID_NAME) -- although GetFullPathNameW collapses every
+//     one of them. The handle is what is reached, so nothing under `\\?\` is normalized here either.
+//   - `\\.\`, and the forward-slash `//./` and `//?/`, are DEVICE paths the OS NORMALIZES -- and its `..` stops only at
+//     the four-character prefix: `\\.\C:\..\x` is `\\.\x`, `\\.\GLOBALROOT\Device\V\..\x` is `\\.\GLOBALROOT\Device\x`,
+//     `\\.\UNC\h\s\..\x` is `\\.\UNC\h\x`. A `..` under `//?/` opens (`//?/` is NOT verbatim).
+//   - `\\server\share\` holds its `..` (`\\localhost\C$\..\x` opens `\\localhost\C$\x`), as `C:\` does.
+//   - `UNC`, `Volume{G}` and `GLOBALROOT` are matched in any case (each lowercase spelling opens).
+// So a spelling has TWO extents: the PREFIX a normalization keeps whole, and the VOLUME ROOT -- the directory every
+// path below it lies in, where a walk up stops, with its separator: `C:\`, `\\server\share\`, `\\.\C:\`, `\\?\C:\`,
+// `\\?\Volume{G}\`, `\\?\UNC\server\share\`, `\\?\GLOBALROOT\Device\HarddiskVolumeN\` (an object directory and the
+// device in it). On POSIX the root is the separator run: `/`, and a run of exactly two kept apart (POSIX makes `//`
+// implementation-defined), a run of three or more being `/` (POSIX: "shall be treated as a single slash").
+// ⚠ BOUNDARY, NAMED: a GLOBALROOT spelling whose device is deeper than one name below its object directory (the
+// network redirector's `\Device\Mup\server\share`) has a volume root wider than the parse's; no route of the
+// compiler produces one (`reachedPath` asks the NT name only of a volume with no DOS name), and a walk on one asks
+// the OS for the heads it passes, which refuses what it cannot open.
+enum class PathGrammar : std::uint8_t {
+    Win32,   // `\` and `/` separate; drive letters, shares and the `\\?\` / `\\.\` namespaces
+    Posix,   // `/` separates; nothing else is a root
+};
+#ifdef _WIN32
+inline constexpr PathGrammar kHostPathGrammar = PathGrammar::Win32;
+#else
+inline constexpr PathGrammar kHostPathGrammar = PathGrammar::Posix;
+#endif
+
+struct RootSpelling {
+    enum class Kind : std::uint8_t {
+        Relative,        // `x`, `..\x`: no root
+        DriveRelative,   // `C:x`: a drive and THAT drive's working directory
+        Rooted,          // `\x`: the current drive's root (Win32); `/x`, `///x` (POSIX)
+        Drive,           // `C:\x`
+        Share,           // `\\server\share\x` (Win32)
+        Authority,       // `//x` (POSIX: implementation-defined, kept apart from `/x`)
+        Device,          // `\\.\`, `//./`, `//?/`: a device path Win32 normalizes
+        Verbatim,        // `\\?\`: a device path Win32 passes unparsed
+    };
+    Kind        kind      = Kind::Relative;
+    std::size_t prefix    = 0;      // code units a normalization keeps whole: what a `..` never climbs into
+    std::size_t volume    = 0;      // code units of the volume root, its separator included when spelled
+    bool        authority = false;  // names another machine: a share (also `UNC\` under a device prefix), POSIX `//`
+};
+
+// The root of `native` under `grammar` (both grammars are pure text, so either can be asked on any host).
+[[nodiscard]] DSS_EXPORT RootSpelling rootSpelling(std::wstring_view native, PathGrammar grammar);
+[[nodiscard]] DSS_EXPORT RootSpelling rootSpelling(std::string_view native, PathGrammar grammar);
+// The root of `p` as this host's path model spells it.
+[[nodiscard]] DSS_EXPORT RootSpelling rootSpelling(std::filesystem::path const& p);
+
+// THE ONE STEP OF A WALK UP: the directory `p` lies in, spelled as `p` spells it, its volume root kept whole with its
+// separator -- or EMPTY when `p` is its volume root (there is nothing above it to step to) or a relative spelling's
+// last name. The library's `parent_path()` steps from `\\?\C:\x` onto `\\?\C:`, the volume's DEVICE, and from a
+// share onto its bare server; `reachedPath`'s and the short-name expansion's walks take this same step.
+[[nodiscard]] DSS_EXPORT std::filesystem::path parentWithinRoot(std::filesystem::path const& p);
+
+// THE ONE NORMALIZATION of a spelling, as text in either grammar -- `normalizeKeepingRoot` is this under the host's.
+// The root `rootSpelling` parses keeps its prefix whole (its separators the grammar's own; a device prefix its own
+// `\\.\` or `\\?\`, whichever separators wrote it -- `//?/C:/x` is `\\?\C:\x` to the OS; a POSIX run of three or more
+// one `/`); the rest is normalized in components -- empty ones and `.` dropped, a `..` taking the name before it and
+// never climbing into the prefix (kept below a relative or drive-relative one, as `lexically_normal()` keeps it), and,
+// in the Win32 grammar, each name trimmed as Win32 trims it: ONE trailing period from a name a separator follows,
+// every trailing period and space from the last (✔MEASURED 2026-11-04, probe-reference-cc run
+// 20261104-210843-61c9329b: `C:\d.\x` is `C:\d\x`, `C:\d .\x` is `C:\d \x`, `d..`, `d ` and `...` stay; `x.txt. .` is
+// `x.txt`; a last `...` vanishes, its separator staying). A separator ends the result where the grammar's resolver
+// leaves one: POSIX's `lexically_normal()` after a last `.` or a `..` that took a name too; Win32's only where the
+// spelling ended in one or in a name the trim removed (`C:\d\.` is `C:\d`, `\\server\share\..` is `\\server\share`,
+// `C:\a\b\..\` is `C:\a\`, `C:\d\..` is `C:\`). In the Win32 grammar a LAST name `NUL` (any case, every trailing
+// period, space and `:` dropped) is the device `\\.\NUL` below every root but a share's and a device path's.
+// ★ UNDER WIN32 THIS IS GetFullPathNameW's ANSWER, PINNED EQUAL to it on both Windows legs over F3's universe
+// (✔MEASURED, runs 20261104-222037-6ef9b98e and 20261104-223135-5f04ee9f; the OS's side is os_path_spelling.hpp) --
+// the model a host with no Win32 answers by; on a Windows host `normalizeKeepingRoot` asks the OS itself. A verbatim
+// spelling comes back as written; an empty one empty; one with nothing left `.`.
+[[nodiscard]] DSS_EXPORT std::wstring normalizedSpelling(std::wstring_view native, PathGrammar grammar);
+[[nodiscard]] DSS_EXPORT std::string normalizedSpelling(std::string_view native, PathGrammar grammar);
+
+// Whether the DOS spelling of a tail below a Win32 volume root names the file its verbatim (`\\?\`) spelling names:
+// true unless the DOS normalization would rewrite it -- an empty component (a doubled separator), a `.` or `..`, a
+// `/`, a component ending in a dot or a space, or a last component that is a reserved device name (`NUL`, `CON`, ...).
+// ✔MEASURED for each kind (run 20261104-205708-1394b8a2): `C:\d\x.txt.`, `C:\d\x.txt ` and `C:\d\\x.txt` open
+// `x.txt`, and their `\\?\` spellings open nothing; `C:\d\NUL` is `\\.\NUL` and `\\?\C:\d\NUL` is a file name
+// (`nul.txt` is a file on this Windows 11). The reserved set beyond NUL is DOCUMENTED (Microsoft, "Naming Files,
+// Paths, and Namespaces"), unmeasured.
+[[nodiscard]] DSS_EXPORT bool dosSpellingNamesTheSameFile(std::wstring_view tail);
+
+// ════ THE SPELLING A FILE CALL TAKES, AT ANY LENGTH (P69 H6) ════
+//
+// INVARIANT: every Win32 file call opens what the PLAIN spelling means, at any length. A plain spelling of 260
+// characters or more opens nothing on a Windows that has not opted into long paths (the registry switch, a system
+// setting, is not ours to assume), and that limit is the namespace's, not the file's: ✔MEASURED 2026-11-04
+// (probe-reference-cc runs 20261104-215014-7ba4f08f, cl 19.51 / MS STL; 20261104-215144-4893b98f, g++ 13.2 /
+// libstdc++; 20261104-215351-24246ad8, both; RtlAreLongPathsEnabled 0, a 316-character tree):
+//   * at 260 or more, a drive, forward-slash, UNC, relative AND `\\.\` spelling fails in CreateDirectoryW, CreateFileW
+//     (create and open), GetFileAttributesExW, FindFirstFileExW, MoveFileExW, DeleteFileW, RemoveDirectoryW and
+//     _wfopen (ERROR_PATH_NOT_FOUND) and in every std::filesystem operation of both libraries; GetFullPathNameW and
+//     `fs::absolute`, string operations, answer at any length;
+//   * `\\?\` and `\\?\UNC\` open in every one of those calls at any length, and in `std::ifstream`, `std::ofstream`
+//     and `_wfopen` under both libraries;
+//   * ⚠ BUT NOT IN libstdc++'s std::filesystem: `directory_iterator` over a `\\?\` or `\\?\UNC\` directory of 260 or
+//     more returns a WRONG entry count (3 for 2) with NO error, and `status`, `exists`, `file_size`,
+//     `create_directories` (EINVAL) and `remove` fail on `\\?\UNC\` at ANY length. So this spelling is handed to Win32
+//     calls, streams and the C runtime -- NEVER to a std::filesystem operation; this file's operations below are Win32
+//     on Windows for that reason.
+//
+// THE SPELLING, ONE RULE AT EVERY LENGTH, AND IT IS THE OS'S: `substrate::osExtendedSpelling`
+// (core/substrate/os_path_spelling.hpp, the rule's ONE home, header-only so a target that links no DSS library takes
+// it too). `p`'s full spelling as the OS resolves it -- GetFullPathNameW: the caller's directories for a relative
+// spelling, the separators, `.` and `..` (under `\\.\` the climb over the volume), the trim, a reserved name to its
+// device -- prefixed: `\\?\` before a drive, `\\?\UNC\` in place of a share's `\\`, `\\?\` in place of a device
+// spelling's `\\.\` (a reserved name the OS resolved, `\\.\NUL`, so becomes `\\?\NUL`: the same device). A device
+// spelling converts so because both name one NT namespace (✔MEASURED, run 20261104-215748-2946f6a6, below 260:
+// `\\.\X` and its converted `\\?\` spelling open the SAME object -- one NT name, one file id -- for a file, a trailing
+// dot, a `..`, the climb, `\\.\C:\d\NUL` (a file in both), `\\.\NUL`, `\\.\CONIN$`, an absent `\\.\COM1`, GLOBALROOT,
+// `\\.\UNC\` and `\\.\pipe\`). Kept as written: a verbatim spelling (already literal), one the OS refuses to resolve,
+// and every spelling on a POSIX host, which has no such limit.
+[[nodiscard]] DSS_EXPORT std::filesystem::path extendedLengthSpelling(std::filesystem::path const& p);
+
+// The spelling a process's IMAGE takes as CreateProcessW's application name: its extended-length spelling exactly
+// where its plain one cannot start, and as given everywhere else. ✔MEASURED 2026-11-04 (probe-reference-cc runs
+// 20261104-220546-3ec56792 and 20261104-220446-62443cb7, cl 19.51): a plain application name starts up to MAX_PATH - 1
+// = 259 characters and fails from 260 (ERROR_PATH_NOT_FOUND, where CreateFileW's open fails too); `\\?\` starts at any
+// length -- but the child then reads its OWN image name verbatim (GetModuleFileNameW: `\\?\...`, at 80 characters as
+// at 322), so an image a plain spelling starts keeps the name the child reads as it was given. The length is the
+// OS's full spelling's (a relative image is resolved against the caller's directory). It is
+// `substrate::osApplicationName` (os_path_spelling.hpp), which every spawn of the tree takes -- the process spawner's
+// and the test harness's (tests/test_support/run_binary.hpp) alike. POSIX: `p`.
+[[nodiscard]] DSS_EXPORT std::filesystem::path applicationNameSpelling(std::filesystem::path const& p);
+
+// The file-system OPERATIONS a site would otherwise ask of std::filesystem, at any length: Win32 on Windows, through
+// `extendedLengthSpelling` (see above for why never the library there), std::filesystem elsewhere. Each answers as the
+// std::filesystem call of the same name does, `ec` included.
+//   * `createDirectories`: every missing directory of `p`; true when it made one; a level that exists as a file is
+//     an error (ERROR_ALREADY_EXISTS on Windows, as the library's EEXIST).
+//   * `removeEntry`: the file, link or EMPTY directory at `p` (a link itself, never what it reaches); false, with `ec`
+//     clear, when nothing is there; a read-only file is removed as MS STL's `remove` removes one.
+//   * `copyFile`: the file `from` reaches, copied to a NEW file `to` -- refused when `to` exists, as
+//     `fs::copy_file` under `copy_options::none`.
+// A rename has no operation here: the one rename DSS commits is the writer's (src/link/writer.cpp), by handle.
+//   * `openFileStream`: a C stream on `p`, opened as `std::fopen(p, mode)` opens it (`_wfopen` of the extended-length
+//     spelling on Windows, which takes it under both libraries); null when the open is refused, `errno` as it left it.
+[[nodiscard]] DSS_EXPORT std::FILE* openFileStream(std::filesystem::path const& p, char const* mode);
+[[nodiscard]] DSS_EXPORT bool createDirectories(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT bool removeEntry(std::filesystem::path const& p, std::error_code& ec);
+DSS_EXPORT void copyFile(std::filesystem::path const& from, std::filesystem::path const& to, std::error_code& ec);
+
 // `fs::absolute` WITHOUT letting it invent a drive for a path that already names
-// an AUTHORITY. Same invariant as `genericSpelling` above and as this file's
-// private `normalizeKeepingRoot`: never change the leading separator RUN.
+// an AUTHORITY or a NAMESPACE (`rootSpelling`: a share, POSIX `//`, a device or verbatim prefix). Same invariant as
+// `genericSpelling` above and as `normalizeKeepingRoot`: never change the root.
 //
 // ★★★ THE DEFECT THIS EXISTS FOR, ✔MEASURED 2026-08-28 on the toolchain that
 // builds DSS (libstdc++ 13.2, MinGW-w64 UCRT), printed from one path object:
@@ -136,14 +293,12 @@ genericSpellingU8(std::filesystem::path const& p);
 // gives a UNC authority no `root_name()` of its own, so `is_absolute()` is false
 // and `absolute()` "repairs" it by supplying a drive that was never asked for.
 //
-// ★★ THE DISCRIMINATOR IS THE SEPARATOR RUN, NOT `is_absolute()` AND NOT
-// `isRootedPath`. A run of ONE (`/foo`) genuinely IS a location on the current
+// ★★ THE DISCRIMINATOR IS THE ROOT'S KIND (`rootSpelling`), NOT `is_absolute()` AND NOT
+// `isRootedPath`. A root of ONE separator (`/foo`) genuinely IS a location on the current
 // drive and MUST keep going through `fs::absolute`, which pins the drive that
 // was current at resolution time -- skipping it there would be a regression, not
-// a fix. A run of TWO OR MORE names an authority or a namespace (`//host/share`,
-// `\\?\C:\…` extended-length, `\\.\…` device), none of which has any meaning to
-// re-root. That is the same rule, and the same private helper, that
-// `normalizeKeepingRoot` already applies to the lexical transform.
+// a fix; so must a drive-relative `C:x`, which names that drive's working directory. A share, POSIX `//`, and a
+// device or verbatim prefix (`\\.\…`, `\\?\…`) have no meaning to re-root.
 //
 // ⚠ NOT A WINDOWS-ONLY GUARD. On a model where a UNC path is already absolute,
 // `fs::absolute` returns it unchanged, so skipping the call is a no-op there and
@@ -168,8 +323,15 @@ absoluteKeepingRoot(std::filesystem::path const& p, std::error_code& ec);
 // drive, and now wrong for a DIFFERENT reason. A partial fix here reads exactly
 // like a complete one, because both spellings are equally absent from disk.
 //
-// ⚠ A run of 0 or 1 is untouched and takes `lexically_normal()` exactly as
-// before, so this changes no local path.
+// ★★ BY THE ROOT'S KIND (`rootSpelling`, whose header states each measurement): a VERBATIM spelling comes back
+// UNCHANGED -- Win32 opens its rest literally, so a `..`, a `.` or a `/` there is a name, never a step; a SHARE keeps
+// `\\server\share\` whole and a DEVICE path keeps its four-character prefix whole (its own `.` or `?`, its separators
+// the OS's), and the rest is normalized in components, its `..` never climbing into what is kept -- what the OS does
+// with each (`\\.\C:\..\x` is `\\.\x`). Every kind of root takes `normalizedSpelling` under the host's grammar -- the
+// library's `lexically_normal()` keeps what Win32 trims and climbs where the OS does not -- and ON A WINDOWS HOST an
+// absolute plain spelling (a drive, a share, a device path) is the OS's own answer, GetFullPathNameW
+// (`substrate::osFullPathSpelling`), which that normalization is pinned equal to wherever every Windows release agrees;
+// a relative, rooted or drive-relative one stays the text's, never resolved against a directory here.
 [[nodiscard]] DSS_EXPORT std::filesystem::path
 normalizeKeepingRoot(std::filesystem::path const& p);
 
@@ -307,12 +469,19 @@ enum class EntryKind : std::uint8_t {
 // while its own `weakly_canonical` REFUSES a tail that does not exist there (error 1), and MinGW's
 // library re-roots such a path onto the C: drive. So this answers where MS STL's `weakly_canonical`
 // does not: the existing part as `canonical` spells it, the rest appended as written.
+// ★ THE WALK UP STOPS AT THE VOLUME ROOT `rootSpelling` parses, with its separator -- never one step past it onto the
+// volume's DEVICE (`\\?\C:` without its separator opens the device: no file information, no final path); the walk
+// splits a verbatim spelling at `\` alone, `/` being a character there. The answer is spelled in the DOS form
+// (`C:\...`, `\\server\share\...`) exactly when that form names the same file (`dosSpellingNamesTheSameFile`), and
+// in the OS's verbatim form otherwise.
 [[nodiscard]] DSS_EXPORT std::filesystem::path reachedPath(std::filesystem::path const& p, std::error_code& ec);
 
 // The path `p` REACHES, spelled relative to the path `base` REACHES -- every link on either side resolved
 // (`reachedPath`), then compared lexically: `std::filesystem::relative`'s answer, which the standard defines
 // as `weakly_canonical(p).lexically_relative(weakly_canonical(base))`. Empty when no relative spelling
-// exists (another root); `ec` is set when either resolution fails, and the answer is then empty.
+// exists (another root -- the two reached paths' volume roots differ by `rootSpelling`, never by the library's
+// `root_name()`, under which MinGW reads `\\a\s\x` and `\\b\s\y` as one root); `ec` is set when either resolution
+// fails, and the answer is then empty.
 // ✔MEASURED 2026-10-21 (one probe, both Windows libraries, links made by the OS): libstdc++ on Windows
 // answers `relative` WITHOUT resolving a link -- `base/lnk/x.txt` from `base`, `lnk` naming a directory
 // outside it, is `lnk/x.txt` there and `../outside/x.txt` under MS STL -- so where one path lies from

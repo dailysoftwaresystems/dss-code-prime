@@ -249,6 +249,10 @@ private:
 // preserves. A Windows DRIVE-RELATIVE `C:foo` has a root NAME but no root
 // DIRECTORY and correctly stays relative -- it IS relative, to that drive's
 // working directory.
+// ★ SINCE P69 H6 IT READS `core::rootSpelling`, the ONE parse of a root, and that disjunction is its measured
+// precursor: rooted is every kind but a relative and a drive-relative spelling -- a drive, a separator on the current
+// drive, a share, POSIX `//`, and a device or verbatim prefix (both libraries agree with the parse on every row of
+// the parse's measured table; the parse, not the library, is what is asked).
 [[nodiscard]] DSS_EXPORT bool isRootedPath(std::filesystem::path const& p);
 
 // ── THE CONTAINMENT PREDICATE FOR A CONFIG-ROOT-RELATIVE SOURCE PATH ──────

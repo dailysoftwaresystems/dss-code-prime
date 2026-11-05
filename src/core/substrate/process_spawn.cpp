@@ -1,6 +1,7 @@
 #include "core/substrate/process_spawn.hpp"
 
 #include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, genericSpellingU8
+#include "core/substrate/os_path_spelling.hpp"   // a child's image and directory as the OS spells them
 
 #include <algorithm>
 #include <cstddef>
@@ -329,7 +330,9 @@ CandidateVerdict classifyCandidate(fs::path const& candidate) {
         return CandidateVerdict::NotAFile;
     }
     WIN32_FIND_DATAW found{};
-    HANDLE const     search = ::FindFirstFileW(wide.c_str(), &found);
+    // At any length: the extended-length spelling (`core::extendedLengthSpelling`; the wildcard test above is on the
+    // name as given, and the conversion adds none).
+    HANDLE const     search = ::FindFirstFileW(core::extendedLengthSpelling(candidate).c_str(), &found);
     if (search == INVALID_HANDLE_VALUE) {
         return CandidateVerdict::NotAFile;
     }
@@ -1047,6 +1050,26 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
                            + (ec ? ": " + ec.message() : std::string{});
             return out;
         }
+#if defined(_WIN32)
+        // ★ THE OS'S OWN LIMIT ON A CHILD'S CURRENT DIRECTORY, refused HERE and named (P69 H6), never left to an
+        // opaque CreateProcessW failure. ✔MEASURED 2026-11-04 (probe-reference-cc run 20261104-220446-62443cb7):
+        // CreateProcessW takes a current directory of at most MAX_PATH - 2 = 258 characters WITH its trailing
+        // separator, and refuses a longer one in EVERY spelling (`\\?\` counts its prefix and gains nothing),
+        // ERROR_DIRECTORY. Measured on the directory as the OS resolves it: its full spelling (`osFullPathSpelling`,
+        // os_path_spelling.hpp); one the OS will not resolve is left to CreateProcessW to refuse.
+        std::wstring resolved = osFullPathSpelling(cwd.wstring());
+        if (!resolved.empty() && resolved.back() != L'\\') resolved += L'\\';
+        if (resolved.size() > std::size_t{MAX_PATH - 2}) {
+            out.diagnostic = self + "working directory '" + cwd.string() + "' is "
+                           + std::to_string(resolved.size())
+                           + " characters with its trailing separator, and Windows starts no process in a current "
+                             "directory longer than "
+                           + std::to_string(MAX_PATH - 2)
+                           + " (CreateProcessW refuses it in every spelling, the extended-length one included: "
+                             "ERROR_DIRECTORY)";
+            return out;
+        }
+#endif
     }
 
     // Resolving here (rather than letting the OS search) is what makes
@@ -1094,6 +1117,9 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
 
     std::wstring const exePath = exe->wstring();
     std::wstring const cwdPath = cwd.empty() ? std::wstring{} : cwd.wstring();
+    // ★ THE IMAGE AT ANY LENGTH (P69 H6): `osApplicationName` (os_path_spelling.hpp) -- its extended-length spelling
+    // exactly where its plain one cannot start (the header measures both, and why a shorter image keeps its name).
+    std::wstring const startPath = osApplicationName(exePath);
 
     // The environment arm: the child's own block when something is withheld,
     // built BEFORE any handle is opened so a failure here has nothing to clean
@@ -1162,7 +1188,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         inheritable.nLength              = sizeof(inheritable);
         inheritable.lpSecurityDescriptor = nullptr;
         inheritable.bInheritHandle       = TRUE;
-        redirectHandle = ::CreateFileW(stdoutFile.c_str(), GENERIC_WRITE,
+        redirectHandle = ::CreateFileW(core::extendedLengthSpelling(stdoutFile).c_str(), GENERIC_WRITE,
                                        FILE_SHARE_READ, &inheritable,
                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                        nullptr);
@@ -1212,7 +1238,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // as the CALLER wrote it, matching execv's semantics on the POSIX arm
     // (the child sees the argv[0] it was given, not our resolution of it).
     BOOL const created = ::CreateProcessW(
-        exePath.c_str(), commandBuffer.data(),
+        startPath.c_str(), commandBuffer.data(),
         /*lpProcessAttributes*/ nullptr,
         /*lpThreadAttributes*/  nullptr,
         /*bInheritHandles*/     TRUE,

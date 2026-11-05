@@ -45,6 +45,7 @@
 //
 // Every TEST but the `…Native` ones runs in-process on every leg: the images are linked, never run, there.
 
+#include "core/substrate/path_identity.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "program/program.hpp"
@@ -231,7 +232,7 @@ constexpr std::string_view kNoSource{};
 }
 
 [[nodiscard]] std::vector<std::uint8_t> bytesOf(fs::path const& path) {
-    std::ifstream in{path, std::ios::binary};
+    std::ifstream in{dss::core::extendedLengthSpelling(path), std::ios::binary};   // at any length
     if (!in.good()) {
         ADD_FAILURE() << "cannot open " << path.string();
         return {};
@@ -245,28 +246,115 @@ constexpr std::string_view kNoSource{};
     return s.empty() ? std::string{"\n  <no diagnostic>"} : s;
 }
 
-// DSS's image of `source` (a DSS unit; none when empty) beside `object`, for `target` (an EXE unless a DLL is asked);
-// the image's path, or empty with `rep` holding why.
+// The DSS program that calls `__GSHandlerCheck_SEH` AS THE EXCEPTION DISPATCHER CALLS IT -- a DISPATCHER_CONTEXT, a
+// scope table of one scope, the GS data after it -- in each of the 8 cells {dispatching, unwinding} x {the GS data's
+// flag for that phase, the other one} x {the cookie intact, overwritten} (the mode's three letters). It is the pin
+// the review of H5 asked for (F1), on the routine itself: the cl objects whose frames would reach the same cells
+// (`__try/__finally`, an expression filter) carry their funclets in ASSOCIATIVE code COMDATs, which the object reader
+// refuses today (D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION, its trigger fired by this measurement); their end-to-end
+// cells join the GS row's universe when that row lands. The SAME source is h6's MSVC measurement (`DSS_REF_CELL`
+// picks the cell there, and argv here).
+constexpr char const* kGsSehMain = R"(#include <stdint.h>
+#include <windows.h>
+
+EXCEPTION_DISPOSITION __GSHandlerCheck_SEH(EXCEPTION_RECORD *record, void *establisherFrame, PCONTEXT context,
+                                           DISPATCHER_CONTEXT *dispatch);
+extern uintptr_t __security_cookie;
+
+static int volatile g_ran;
+static LONG scope_filter(EXCEPTION_POINTERS *pointers, void *frame) {
+    (void)pointers;
+    (void)frame;
+    g_ran = 1;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void scope_finally(BYTE abnormal, void *frame) {   /* winnt.h: typedef BYTE BOOLEAN */
+    (void)abnormal;
+    (void)frame;
+    g_ran = 1;
+}
+static void covered(void) {}
+static unsigned char const unwind_info[4] = {1, 0, 0, 0};   /* version 1, no frame register */
+static char const *const kCells[] = {"deg", "dug", "deb", "dub", "uug", "ueg", "uub", "ueb"};
+
+int main(int argc, char **argv) {
+#ifdef DSS_REF_CELL
+    char const *m = kCells[DSS_REF_CELL];
+#else
+    char const *m = argc > 1 ? argv[1] : kCells[0];
+#endif
+    int const       unwinding   = m[0] == 'u';
+    ULONG const     flag        = m[1] == 'e' ? 1u : 2u;
+    int const       overwritten = m[2] == 'b';
+    /* The base every RVA below is taken from: below the lowest of this image's addresses the tables name, at a
+     * 64 KiB boundary -- the image's own base, for an image this small -- so no RVA is 0 or 1 (a scope's filter
+     * RVA of 1 means EXCEPTION_EXECUTE_HANDLER), and the dispatcher context hands the handler the same base. */
+    ULONG_PTR lowest = (ULONG_PTR)covered;
+    if ((ULONG_PTR)unwind_info < lowest) lowest = (ULONG_PTR)unwind_info;
+    if ((ULONG_PTR)scope_filter < lowest) lowest = (ULONG_PTR)scope_filter;
+    if ((ULONG_PTR)scope_finally < lowest) lowest = (ULONG_PTR)scope_finally;
+    ULONG_PTR const base = (lowest - 16u) & ~(ULONG_PTR)0xFFFFu;
+    RUNTIME_FUNCTION entry;
+    entry.BeginAddress = 0;
+    entry.EndAddress   = 0;
+    entry.UnwindData   = (ULONG)((ULONG_PTR)unwind_info - base);
+    ULONG data[6];
+    data[0] = 1;
+    data[1] = (ULONG)((ULONG_PTR)covered - base);
+    data[2] = data[1] + 1;
+    data[3] = (ULONG)((unwinding ? (ULONG_PTR)scope_finally : (ULONG_PTR)scope_filter) - base);
+    data[4] = unwinding ? 0u : data[1];   /* a termination handler has no jump target */
+    data[5] = 8u | flag;
+    uintptr_t       frame[4]    = {0, 0, 0, 0};
+    ULONG_PTR const establisher = (ULONG_PTR)frame;
+    frame[1] = __security_cookie ^ establisher;
+    if (overwritten) frame[1] ^= 1u;
+    EXCEPTION_RECORD record = {0};
+    record.ExceptionCode  = 0xE0000002u;
+    record.ExceptionFlags = unwinding ? EXCEPTION_UNWINDING : 0u;
+    /* A CONTEXT -- x64: 1232 bytes, 16-aligned, Rsp at 0x98 (winnt.h); DSS's windows.h declares its pointer type
+     * alone -- its Rsp a stack address: the context a dispatcher hands is the thread's. */
+    DWORD64        context_words[156] = {0};
+    PCONTEXT const context            = (PCONTEXT)(((ULONG_PTR)context_words + 15u) & ~(ULONG_PTR)15u);
+    ((DWORD64 *)context)[0x98 / 8]    = (DWORD64)establisher;
+    DISPATCHER_CONTEXT dispatch = {0};
+    dispatch.ControlPc        = (ULONG_PTR)covered;
+    dispatch.ImageBase        = base;
+    dispatch.FunctionEntry    = &entry;
+    dispatch.EstablisherFrame = establisher;
+    dispatch.ContextRecord    = context;
+    dispatch.HandlerData      = data;
+    EXCEPTION_DISPOSITION const d = __GSHandlerCheck_SEH(&record, (void *)establisher, context, &dispatch);
+    return d == ExceptionContinueSearch ? (g_ran ? 42 : 43) : 44;
+}
+)";
+
+// DSS's image of `source` (a DSS unit; none when empty) beside `object` (none when empty), for `target` (an EXE
+// unless a DLL is asked); the image's path, or empty with `rep` holding why.
 [[nodiscard]] fs::path dssImageOf(fs::path const& dir, std::string_view source, fs::path const& object,
                                   DiagnosticReporter& rep, char const* target = kExec) {
-    fs::create_directories(dir);
+    // At any length, as DSS itself writes (P69 H6): the substrate's operations and the extended-length spelling.
+    std::error_code made;
+    static_cast<void>(dss::core::createDirectories(dir, made));
     auto const out = dir / "dss.out";
-    fs::create_directories(out);
+    static_cast<void>(dss::core::createDirectories(out, made));
     Program p;
     p.setOutputDir(out);
     std::vector<std::string> inputs;
     if (!source.empty()) {
         auto const unit = dir / "main.c";
-        std::ofstream(unit, std::ios::binary) << source;
+        std::ofstream(dss::core::extendedLengthSpelling(unit), std::ios::binary) << source;
         inputs.push_back(unit.string());
     }
-    inputs.push_back(object.string());
+    if (!object.empty()) inputs.push_back(object.string());
     if (p.compileFiles(inputs, "c", std::vector<std::string>{target}, rep) != 0) return {};
     std::string const want = std::string_view{target} == kDll ? ".dll" : ".exe";
-    for (auto const& e : fs::directory_iterator(out)) {
-        if (e.is_regular_file() && e.path().extension() == want) return e.path();
-    }
-    return {};
+    fs::path          image;
+    static_cast<void>(dss::core::walkTree(out, [&](dss::core::TreeEntry const& e) {
+        if (e.kind == dss::core::EntryKind::File && e.path.extension() == want) image = e.path;
+        return image.empty() ? dss::core::WalkStep::Prune : dss::core::WalkStep::Stop;
+    }));
+    return image;
 }
 
 // Every routine of the platform runtime a reference object may name, in the order the rows list them: none may be
@@ -344,7 +432,44 @@ TEST(PeCompilerSupportRuntime, AGccStackProtectorObjectLinksWithItsGuardAndRepor
     }
 }
 
+// The program that calls `__GSHandlerCheck_SEH` as the dispatcher does links into an EXE with the routine and the
+// cookie DEFINED in the image, by the runtime archive.
+TEST(PeCompilerSupportRuntime, TheSehCookieHandlerProgramLinksWithItsRoutineDefined) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-compiler-support-gs-seh-link"};
+    DiagnosticReporter       rep;
+    auto const image = dssImageOf(scratch.path() / "exe", kGsSehMain, fs::path{}, rep);
+    ASSERT_FALSE(image.empty()) << "DSS refused the link:" << diagnosticsOf(rep);
+    expectNoneImported(image, kEveryRoutine);
+}
+
 // ══ NATIVE: each image runs as the reference's does ══════════════════════════════════════════════════════════════
+
+// Windows x86_64: `__GSHandlerCheck_SEH` checks the frame's cookie WHENEVER an exception passes through the frame,
+// in either phase, and calls the scope table's handler only in the phase the GS data's flag names -- the frame lets
+// the exception go on in the other. Each cell ends as MSVC's own routine ends it on the same program (✔MEASURED
+// 2026-11-04, probe-reference-cc runs 20261104-211814-aecd751e and 20261104-211838-134b9ebf, windows-x86_64-release,
+// cl 19.51.36260 /O2 /GS /MD, `DSS_REF_CELL` 0..7): deg 42, dug 43, deb and dub 0xC0000409, uug 42, ueg 43, uub and
+// ueb 0xC0000409 -- and the same eight from the program as it stands, which asks only what DSS's windows.h declares
+// (runs 20261105-000246-081e1c80 and 20261105-000254-abe24ffe; the first text asked GetModuleHandleW, BOOLEAN and
+// CONTEXT, which no non-Windows host's DSS compiles, ✔MEASURED on macos-arm64-debug). The first cut checked the cookie only in the flagged phase and called the scope handler in every
+// phase: dug 42, dub 42, ueg 42, ueb 42 -- the four cells the arm turns red.
+TEST(PeCompilerSupportRuntimeNative, TheSehCookieHandlerChecksEveryPhaseAndCallsTheScopeOnlyInItsOwn) {
+    if (!onWindowsX64()) GTEST_SKIP() << "the images run only where the host is Windows x86_64";
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-compiler-support-gs-seh-run"};
+    DiagnosticReporter       rep;
+    auto const image = dssImageOf(scratch.path() / "exe", kGsSehMain, fs::path{}, rep);
+    ASSERT_FALSE(image.empty()) << diagnosticsOf(rep);
+    struct Cell { char const* mode; std::uint32_t exit; };
+    Cell const cells[] = {{"deg", 42u}, {"dug", 43u}, {"deb", kStackBufferOverrun}, {"dub", kStackBufferOverrun},
+                          {"uug", 42u}, {"ueg", 43u}, {"uub", kStackBufferOverrun}, {"ueb", kStackBufferOverrun}};
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.mode);
+        auto const r = test_support::runBinary(image, test_support::kRunBudget, false, {}, {c.mode});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, c.exit) << "42 = the scope's handler ran, 43 = it did not, 0xC0000409 = the cookie check";
+    }
+}
 
 // Windows x86_64: the cl program DSS links runs every mode to the exit cl's own link of the same source gives
 // (MEASURED, probe-reference-cc run 20261029-031937-7c816e30, windows-x86_64-release, cl 19.51.36260; `c` is DSS's own, the shipped runtime's seeding):
@@ -413,10 +538,12 @@ TEST(PeCompilerSupportRuntimeNative, AGccProgramPassesOverAForeignExceptionAndRe
 // Windows x86_64: each gcc stack-protector program DSS links (-O0 and -O2) runs as decided (MEASURED for the
 // reference, probe-reference-cc run 20261103-192258-21a07b3f, MinGW-W64 gcc 13.2.0 from the final recipe):
 //   o  42           in bounds: gcc's own link gives 42 too
-//   s  0xC0000409   32 bytes into the 16-byte array, the canary moved: DSS's `__stack_chk_fail` is the fast fail /GS's
-//                   report is. gcc's own link ends 0xC000001D, libssp's trap, at -O0 and -O2 -- an exception a caller's
-//                   `__try` could catch; the fast fail runs no handler (a meaning both references share: the process
-//                   ends; the status is DSS's decision, recorded in the row)
+//   s  0xC0000409   32 bytes into the 16-byte array, the canary moved: DSS's `__stack_chk_fail` says "*** stack
+//                   smashing detected ***: terminated" on the standard error and is the fast fail /GS's report is --
+//                   what libmingwex's own reporter does (MEASURED, run 20261104-235014-6f1093e3) and what GCC's manual
+//                   says a failed guard check does. gcc's default link (libssp's) ends 0xC000001D, a trap, saying
+//                   nothing, at -O0 and -O2 -- an exception a caller's `__try` could catch; the fast fail runs no
+//                   handler. In o and g nothing is said.
 //   g  42           `__security_init_cookie`, the ONE seeding routine, replaces the shipped guard, once (gcc's library
 //                   seeds its own per run: three runs, three values)
 TEST(PeCompilerSupportRuntimeNative, EachGccStackProtectorModeEndsAsDecided) {
@@ -431,10 +558,14 @@ TEST(PeCompilerSupportRuntimeNative, EachGccStackProtectorModeEndsAsDecided) {
         ASSERT_FALSE(image.empty()) << diagnosticsOf(rep);
         for (auto const& m : modes) {
             SCOPED_TRACE(m.arg);
-            auto const r = test_support::runBinary(image, test_support::kRunBudget, false, {}, {m.arg});
+            auto const r = test_support::runBinary(image, test_support::kRunBudget, true, {}, {m.arg});
             ASSERT_TRUE(r.spawned) << r.diagnostic;
             EXPECT_FALSE(r.timedOut);
             EXPECT_EQ(r.exitCode, m.exit) << "6 = the guard was not seeded once; 5 = a value was wrong";
+            bool const said = r.capturedStdout.find("*** stack smashing detected ***: terminated") != std::string::npos;
+            EXPECT_EQ(said, m.exit == kStackBufferOverrun)
+                << "the moved canary must be reported on the standard error, and nothing else said; the run printed: "
+                << r.capturedStdout;
         }
     }
 }

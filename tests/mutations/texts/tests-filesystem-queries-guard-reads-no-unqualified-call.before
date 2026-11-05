@@ -1,1 +1,1 @@
-        if (!exposed) continue;
+        for (std::sregex_iterator it{line.begin(), line.end(), unqualified}, end; it != end; ++it) {

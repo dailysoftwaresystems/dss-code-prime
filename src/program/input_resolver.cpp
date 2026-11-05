@@ -210,13 +210,19 @@ bool InputResolver::checkSearchDirectoriesUsable(
         }
         std::error_code ec;
         // ★ ONE QUESTION, ASKED OF THE FILESYSTEM DIRECTLY: can this be
-        //   enumerated? `directory_iterator`'s own failure is the authority,
-        //   because it is the exact operation the include search performs.
+        //   enumerated? The substrate's listing's own failure is the authority,
+        //   because it is the exact operation the include search performs
+        //   (`core::walkTree`, at any length -- P69 H6). It is asked to stop at
+        //   the first entry: listing the directory whole is what proves it
+        //   enumerates, and nothing below it is asked.
         //   The `exists` / `is_directory` split below runs only to CLASSIFY
         //   a failure that already happened, so a directory that enumerates
         //   fine is never described by anything but success — and no
         //   pre-check can disagree with the operation it is predicting.
-        fs::directory_iterator const probe(dir, ec);
+        core::TreeWalkOptions handOut;
+        handOut.handOutUnreadableLinks = true;   // as the include search lists: by name
+        ec = core::walkTree(fs::path{dir}, [](core::TreeEntry const&) { return core::WalkStep::Stop; }, handOut)
+                 .error;
         if (!ec) continue;                     // enumerable — nothing to say
 
         std::error_code       existsEc;

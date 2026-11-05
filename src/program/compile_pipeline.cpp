@@ -307,8 +307,9 @@ bool optimizeModule(Mir&                  mir,
         // the thin-LTO import stage is followed by the merged module's (the
         // topology `PipelineStage` states) -- so a fixpoint truncated at any
         // other stage is resumed, whatever schedule ran: the `unitPipeline`
-        // document, the config's own, or an override.
-        /*laterStageResumes=*/stage != PipelineStage::Program);
+        // document, the config's own, or an override. The rule is the ONE
+        // predicate beside `PipelineStage`.
+        laterStageResumes(stage));
     bool const optimized = optResult.ok && tierClean(reporter, optEntry);
     if (optimized) reportStage({StageEvent::Kind::Optimized, stage, &mir});
     return optimized;
@@ -505,7 +506,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
-            std::ifstream probe(lib.path, std::ios::binary);
+            std::ifstream probe(core::extendedLengthSpelling(lib.path), std::ios::binary);
             if (!probe) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -3298,7 +3299,7 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
 }  // namespace
 
 bool isArArchiveFile(std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
     if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
     std::uint8_t buf[8] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
@@ -3311,7 +3312,7 @@ bool isArArchiveFile(std::filesystem::path const& path) {
 
 bool isRelocatableObjectFile(std::filesystem::path const& path,
                              ObjectFormatSchema const&    format) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
     if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
 
     // A HEADER PREFIX, never the file. Every field the backends inspect lives in
@@ -3884,7 +3885,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     std::vector<ParsedArchive> archives;
     archives.reserve(archivePaths.size());
     for (auto const& archivePath : archivePaths) {
-        std::ifstream in(archivePath, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -4501,7 +4502,7 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     // the resolution is the identity case and costs nothing.
     ArchiveMemberFormat memberFormat;
     for (auto const& archivePath : archivePaths) {
-        std::ifstream in(archivePath, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -4565,7 +4566,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     // object-format tree for every object named.
     ArchiveMemberFormat memberFormat;
     for (auto const& objectPath : objectPaths) {
-        std::ifstream in(objectPath, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(objectPath), std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -5361,6 +5362,23 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                         target, format, outPath, reporter);
 }
 
+// The import fixpoint's bound, the invariant its declaration states: the compiler defect by name, and the answer the
+// stage stops on.
+bool importBoundReached(std::size_t unit, std::uint32_t demandLeft, DiagnosticReporter& reporter) {
+    if (demandLeft == 0) return false;
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::X_OptImportBoundReached;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = std::format(
+        "runThinLtoImportStage: module #{} still had {} importable callee(s) when the import fixpoint reached its "
+        "bound of {} round(s). The import closure takes every direct callee before the first optimize, so no later "
+        "round has a body to take: this is a defect of the compiler's import closure, not a property of the program.",
+        unit, demandLeft, ::dss::mirsum::kMaxImportRounds);
+    // Anchored: D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES.
+    reporter.report(std::move(d));
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // THE THIN-LTO PER-TU IMPORT STAGE (D-OPT11-LAZY-IMPORT-EDGE, plan 22 §0.2)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5556,6 +5574,9 @@ bool runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
     bool ok = true;
     for (std::size_t i = 0; i < cuMirs.size(); ++i) {
         copyDiagnostics(scratch[i], reporter);
+        // The import fixpoint's bound is an INVARIANT, never a truncation (`importBoundReached`, beside the stage
+        // rule): a unit that reached it stops the stage, whatever its report became.
+        if (importBoundReached(i, outcomes[i].demandLeftAtBound, reporter)) { ok = false; continue; }
         if (!outcomes[i].ok) { ok = false; continue; }
         if (!outcomes[i].mir.has_value()) continue;   // imported nothing
         cuMirs[i].mir                 = std::move(*outcomes[i].mir);

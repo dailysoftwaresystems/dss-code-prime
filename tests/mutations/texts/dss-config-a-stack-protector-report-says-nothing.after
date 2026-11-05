@@ -1,0 +1,3 @@
+    (void)err;
+    (void)written;
+    (void)kSmashed;

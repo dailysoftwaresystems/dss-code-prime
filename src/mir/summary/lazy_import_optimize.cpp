@@ -251,6 +251,30 @@ bool isImportable(std::uint32_t importer, std::string const& calleeName,
 
 namespace {
 
+// ★ THE ONE ADMISSION RULE (P69 H6): the body `name` names, when the import would take it NOW -- not yet taken,
+// importable, and within what the budget has left -- else null. The closure takes by it and the outer round asks it
+// whether an optimize exposed demand, so the two can never disagree about what demand is. They did: the outer round
+// asked importability alone, so a callee the budget refused was "demand" every round, the module was re-optimized
+// to `kMaxImportRounds` for a body no round could take (`spent` only grows, so a callee over the budget now is over
+// it at every later round), and the bound's warning named it as inlining left undone.
+[[nodiscard]] SummaryFunction const*
+admitted(std::uint32_t importer, std::string const& name,
+         std::span<LazyImportCu const> cus, std::span<ModuleSummary const> summaries,
+         SummaryIndex const& index, SummaryIndexPolicy const& policy,
+         std::unordered_set<std::string> const& taken, std::uint32_t spent) {
+    if (taken.count(name) != 0) return nullptr;
+    if (!isImportable(importer, name, cus, summaries, index, policy)) return nullptr;
+    auto const site = index.definitionOf(name);
+    SummaryFunction const& callee =
+        summaries[site->moduleIndex].functions[site->functionIndex];
+    // Over budget -- a later, cheaper callee may still fit. This is option B of the §B fork, and it is the ONE knob
+    // that legitimately changes the outcome.
+    if (policy.perModuleImportInstBudget != 0
+        && spent + callee.instCount > policy.perModuleImportInstBudget)
+        return nullptr;
+    return &callee;
+}
+
 // One import batch: the names to page in, grouped by defining module.
 struct ImportBatch {
     // definingModule → the names to take from it, sorted.
@@ -298,20 +322,11 @@ takeClosure(std::uint32_t importer, std::vector<std::string> frontier,
             sortUnique(frontier);
             std::vector<std::string> next;
             for (std::string const& name : frontier) {
-                if (taken.count(name) != 0) continue;
-                if (!isImportable(importer, name, cus, summaries, index, policy))
-                    continue;
+                SummaryFunction const* const admittedCallee =
+                    admitted(importer, name, cus, summaries, index, policy, taken, spent);
+                if (admittedCallee == nullptr) continue;
+                SummaryFunction const& callee = *admittedCallee;
                 auto const site = index.definitionOf(name);
-                SummaryFunction const& callee =
-                    summaries[site->moduleIndex].functions[site->functionIndex];
-                if (policy.perModuleImportInstBudget != 0
-                    && spent + callee.instCount
-                           > policy.perModuleImportInstBudget) {
-                    // Over budget — a later, cheaper callee may still fit. This
-                    // is option B of the §B fork, and it is the ONE knob that
-                    // legitimately changes the outcome.
-                    continue;
-                }
                 spent += callee.instCount;
                 taken.insert(name);
                 picked[site->moduleIndex].push_back(name);
@@ -713,33 +728,21 @@ lazyImportOptimize(std::uint32_t importer,
         ++out.optimizeRuns;
 
         // ── OUTER: did the optimize EXPOSE demand the closure never saw? ─────
+        // Demand is what the closure would TAKE (`admitted`), never what it merely could import: a callee the budget
+        // refused is no demand, at this round or any later one.
         std::vector<std::string> fresh;
         for (std::string const& n : outboundCallees(owned, liveNames)) {
-            if (taken.count(n) != 0) continue;
-            if (isImportable(importer, n, cus, summaries, index, policy))
+            if (admitted(importer, n, cus, summaries, index, policy, taken, spent) != nullptr)
                 fresh.push_back(n);
         }
         if (fresh.empty()) break;
         if (round + 1 >= kMaxImportRounds) {
+            // ★ THE BOUND IS RETURNED, NOT REPORTED HERE (P69 H6): this MIR-tier leaf has no reporter of its own.
+            // Reaching it is no truncation but a broken invariant -- the closure above takes every direct callee
+            // before the first optimize, so a round after the first has nothing to take -- and the driver reports it
+            // as the compiler defect it is (`importBoundReached`, compile_pipeline.hpp: X_OptImportBoundReached, the
+            // stage stops).
             out.demandLeftAtBound = static_cast<std::uint32_t>(fresh.size());
-            ParseDiagnostic d;
-            // ★ THE SAME CODE THE PASS-SCHEDULE FIXPOINT USES WHEN IT HITS ITS
-            // CAP, and the same severity, because it is the same event one tier
-            // out: a bounded loop stopped because it ran out of rounds, not
-            // because it converged. The module is correct; it is simply not the
-            // module a converged import fixpoint would have produced. Minting a
-            // second code for the identical fact would let one of them be
-            // suppressed while the other is not.
-            d.code     = DiagnosticCode::X_OptFixpointTruncated;
-            d.severity = DiagnosticSeverity::Warning;
-            d.actual   = std::format(
-                "lazyImportOptimize: module #{} still had {} importable "
-                "callee(s) after {} optimize round(s) — the import fixpoint hit "
-                "its bound. The module is CORRECT; some cross-CU inlining was "
-                "left for the whole-program stage.",
-                importer, fresh.size(), round + 1);
-            // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
-            reporter.report(std::move(d));
             break;
         }
     }

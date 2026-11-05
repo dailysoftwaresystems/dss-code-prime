@@ -1,2 +1,2 @@
-	cmpq	%r10, %rcx
+	cmpq	__security_cookie(%rip), %rcx
 	ret

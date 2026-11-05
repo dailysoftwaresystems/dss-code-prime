@@ -1118,7 +1118,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     fs::path const outDir = resolveArtifactOutputDir(
         outputDir, parsed->formatName, multiTargetBuild, perFormatOutputSubdir);
     std::error_code ec;
-    fs::create_directories(outDir, ec);
+    static_cast<void>(core::createDirectories(outDir, ec));   // at any length (`core::createDirectories`)
     if (ec) {
         // Driver-tier mkdir failure — distinct from the linker's
         // refuse-to-mkdir contract (which uses
@@ -1781,11 +1781,34 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         case PipelineTier::Hir:
             break;   // the ordinary path below
         case PipelineTier::Encode: {
+            // A static-archive format packages EVERY unit as its own member, by the one step every unit enters
+            // (`packageUnitsAsStaticArchive`): never a bare object under the archive's name, and never a merge -- a
+            // member keeps its own symbol space, so the refusal below, which is about merging the units into ONE
+            // image, does not hold here. `as` + `ar`, `ml64` + `lib` and `gcc -c a.s b.s` + `ar rcs` build it (P69 H6,
+            // the review of H5's F4). Each unit is assembled as the single-unit route assembles it, in source order,
+            // which is the order the step names its members by.
+            if ((*formatR)->isStaticArchive()) {
+                std::vector<AssembledModule> units;
+                units.reserve(cus.size());
+                for (std::size_t i = 0; i < cus.size(); ++i) {
+                    auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
+                                                reporter, perCuOpts);
+                    if (!unit) {
+                        emitNullNoDiagnostic("the assembly unit build "
+                                             "(assembleAsmUnit)");
+                        return std::nullopt;
+                    }
+                    units.push_back(std::move(*unit));
+                }
+                if (analysisOnly) return std::nullopt;
+                return packageUnitsAsStaticArchive(std::move(units));
+            }
             if (cus.size() != 1) {
                 emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
-                           "a multi-CU standalone-assembly build is not yet "
-                           "lowered — each unit's symbol space would have to be "
-                           "namespaced before the modules merge");
+                           "a multi-CU standalone-assembly build into a merged "
+                           "image is not yet lowered — each unit's symbol space "
+                           "would have to be namespaced before the modules merge "
+                           "(a static archive takes several: each is a member)");
                 return std::nullopt;
             }
             // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY: the WHOLE format schema
@@ -1810,13 +1833,6 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // diagnostic it produced is reported; the LINK is what must not
             // happen for a knowingly-incomplete program.
             if (analysisOnly) return std::nullopt;
-            // A static-archive format packages this unit as a member, by the one step every unit enters
-            // (`packageUnitsAsStaticArchive`): never a bare object under the archive's name.
-            if ((*formatR)->isStaticArchive()) {
-                std::vector<AssembledModule> units;
-                units.push_back(std::move(*mod));
-                return packageUnitsAsStaticArchive(std::move(units));
-            }
             // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER, the STATIC
             // half: this route used to call `linkAndWrite` directly, so a `.a` /
             // `.lib` named on `--resolve-library` was partitioned out of the
@@ -3146,7 +3162,7 @@ class LanguageBlockExtensionReader {
 // failure, so a broken sibling document never became a claimant then and does
 // not now.
 [[nodiscard]] std::vector<std::string> declaredFileExtensionsOf(fs::path const& doc) {
-    std::ifstream in{doc, std::ios::binary};
+    std::ifstream in{core::extendedLengthSpelling(doc), std::ios::binary};
     if (!in) return {};
     LanguageBlockExtensionReader reader;
     // The return value is DELIBERATELY ignored: `false` means either "we aborted
@@ -3571,7 +3587,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
 // stored artifact host-dependent under a key that says it is not.
 [[nodiscard]] std::optional<std::vector<std::uint8_t>>
 readWholeBinaryFile(fs::path const& path) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
     if (!in) return std::nullopt;
     std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                     std::istreambuf_iterator<char>()};
@@ -3637,9 +3653,9 @@ serveArtifactFromCache(ArtifactCacheTicket const& ticket,
     // indistinguishable from. A crash between the two leaves no artifact, which
     // is the state a crashed link leaves too.
     std::error_code ec;
-    fs::remove(outPath, ec);
+    static_cast<void>(core::removeEntry(outPath, ec));   // at any length, as the copy below
     ec.clear();
-    fs::copy_file(**hit, outPath, fs::copy_options::none, ec);
+    core::copyFile(**hit, outPath, ec);
     if (ec) {
         // ⚠ A HARD FAILURE, NOT A FALL-THROUGH TO COMPILING. The verified entry
         // IS this build's artifact; failing to place it is a failure to produce
@@ -3713,11 +3729,13 @@ public:
                                                .time_since_epoch().count()),
                                        counter.fetch_add(1u));
                 std::error_code mkEc;
-                // `create_directory` (not `create_directories`) returns FALSE for a
-                // path that already existed, which is exactly the uniqueness probe
-                // this needs — `create_directories` would happily adopt somebody
-                // else's directory and two builds would share a staging area.
-                if (fs::create_directory(candidate, mkEc) && !mkEc) return candidate;
+                // `createDirectories` returns FALSE for a path that already existed
+                // (it made no level), which is exactly the uniqueness probe this
+                // needs — taking an existing directory would adopt somebody else's
+                // and two builds would share a staging area. (The parent, the system
+                // temporary directory, exists, so the candidate is the one level it
+                // can make; and it makes it at any length.)
+                if (core::createDirectories(candidate, mkEc) && !mkEc) return candidate;
                 whyNot = "'" + core::genericSpelling(candidate) + "' "
                        + (mkEc ? "could not be created (" + mkEc.message() + ")"
                                : std::string{"already exists"});
@@ -4378,7 +4396,7 @@ buildDependencyArtifactKey(
         fs::path const unitDir =
             stagingRoot / fs::path{claim.source}.stem();
         std::error_code mkEc;
-        fs::create_directories(unitDir, mkEc);
+        static_cast<void>(core::createDirectories(unitDir, mkEc));   // at any length
         if (std::error_code dirEc; mkEc && core::reachedKind(unitDir, dirEc) != core::EntryKind::Directory) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: could not create the "
@@ -6956,7 +6974,7 @@ int Program::emitHirText(
     // compared byte-for-byte by its consumers (and by this repo's goldens), so a
     // host-dependent line ending would make the same compiler produce two
     // different files for one input.
-    std::ofstream o{fs::path{path}, std::ios::binary | std::ios::trunc};
+    std::ofstream o{core::extendedLengthSpelling(fs::path{path}), std::ios::binary | std::ios::trunc};
     if (!o) {
         err << "error: --emit-hir: could not open '" << path
             << "' for writing.\n";

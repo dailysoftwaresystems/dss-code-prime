@@ -99,19 +99,33 @@ void __report_rangecheckfailure(void) {
     failFast(FAST_FAIL_RANGE_CHECK_FAILURE);
 }
 
-/* A gcc stack-protected frame's canary no longer matched `__stack_chk_guard`: the same report as a /GS frame's, so a
- * stack overrun ends the process alike whichever compiler wrote the check. mingw-w64 gcc's own (libssp's) ends it with
- * a trap instead -- exit 0xC000001D, nothing said (✔MEASURED 2026-11-03, -O0 and -O2) -- an exception the dispatcher
- * would walk the overwritten stack for, which a caller's `__try` could catch and go on from; the fast fail runs no
- * handler, Windows' own reason for it. */
+/* A gcc stack-protected frame's canary no longer matched `__stack_chk_guard`. ★ WHAT IT MEANS IS gcc's, BY ITS
+ * DOCUMENT: GCC's manual (-fstack-protector) says a failed guard check prints an error message and the program exits.
+ * The two reporters mingw-w64 gcc can link differ only in that (✔MEASURED 2026-11-04, probe-reference-cc run
+ * 20261104-235014-6f1093e3, MinGW-W64 gcc 13.2.0 -O0 -fstack-protector-strong):
+ *   - libmingwex.a's own `__stack_chk_fail` (stack_chk_fail.o, linked when the name is undefined before libmingwex
+ *     is searched) writes "*** stack smashing detected ***: terminated" to the standard error, then fast-fails with
+ *     FAST_FAIL_STACK_COOKIE_CHECK_FAILURE (`int 0x29` where IsProcessorFeaturePresent says it may, else
+ *     TerminateProcess with 0xC0000409): the process exits 0xC0000409 having said that line;
+ *   - libssp-0.dll's, the driver's default, ends with a trap: exit 0xC000001D, nothing said (also -O2, 2026-11-03) --
+ *     an exception the dispatcher would walk the overwritten stack for, which a caller's `__try` could catch.
+ * So DSS's is libmingwex's: the line, then the fast fail /GS's report uses too -- a stack overrun ends the process
+ * alike whichever compiler wrote the check, running no handler, Windows' own reason for the fast fail. The line goes
+ * out through WriteFile on the standard error handle: no C runtime state is touched from a frame whose stack is
+ * known to be overwritten. */
 void __stack_chk_fail(void) {
+    static char const kSmashed[] = "*** stack smashing detected ***: terminated\n";
+    HANDLE const      err        = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD             written    = 0;
+    if (err != NULL && err != INVALID_HANDLE_VALUE) WriteFile(err, kSmashed, (DWORD)(sizeof kSmashed - 1u), &written, NULL);
     failFast(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE);
 }
 
 /* The cookie check a /GS frame's exception handler makes, from the GS data cl writes after the handler's RVA in the
- * frame's unwind data: the cookie's offset in the frame, whose low three bits are flags (1 check while dispatching,
- * 2 while unwinding, 4 the frame is realigned and two more words follow -- the offset from the establisher frame to
- * the aligned base, and the alignment). The cookie was stored combined with the frame's stack pointer, which is the
+ * frame's unwind data: the cookie's offset in the frame, whose low three bits are flags (1 the frame's own handler is
+ * called while dispatching, 2 while unwinding -- read by `__GSHandlerCheck_SEH`, never by the check -- and 4 the frame
+ * is realigned and two more words follow -- the offset from the establisher frame to the aligned base, and the
+ * alignment). The cookie was stored combined with the frame's stack pointer, which is the
  * establisher frame plus, for a function with a frame register, the frame register's offset from it (the high nibble
  * of the unwind data's fourth byte, in 16-byte units). */
 static void checkFrameCookie(ULONG const *gs, ULONG_PTR establisherFrame, DISPATCHER_CONTEXT const *dispatch) {
@@ -136,12 +150,23 @@ EXCEPTION_DISPOSITION __GSHandlerCheck(EXCEPTION_RECORD *record, void *establish
 
 /* The handler cl names for a /GS frame that also has `__try`: its handler data is the scope table
  * `__C_specific_handler` reads (a count, then sixteen bytes per scope), with the GS data after it. The cookie is
- * checked in the phase the GS data's flags name, then the scope table's handler decides. */
+ * checked WHENEVER an exception passes through the frame, in either phase; the GS data's two flag bits (1 while
+ * dispatching, 2 while unwinding -- UNW_FLAG_EHANDLER and UNW_FLAG_UHANDLER) name the phases in which the scope
+ * table's handler is called, and in any other the frame lets the exception go on. MSVC's runtime does exactly this:
+ * READ, vcruntime's `__GSHandlerCheck_EH4` (crt/src/x64/gshandlereh4.cpp, MSVC 14.51) checks the cookie
+ * unconditionally and calls its frame handler only if `IS_DISPATCHING ? EHANDLER : UHANDLER` is set in the GS data's
+ * first word; and ✔MEASURED 2026-11-04 for `__GSHandlerCheck_SEH` itself (probe-reference-cc run
+ * 20261104-205243-dd194040, cl 19.51 /O2 /GS): a `__try/__finally` frame whose cookie was overwritten, an exception
+ * raised through it and caught nowhere -- so ONLY the dispatch phase runs, the phase a `__finally` frame's flags do
+ * not name -- ends 0xC0000409, not the exception's own 0xE0000002; and an `__except` frame whose filter overwrites
+ * the cookie ends 0xC0000409 before its handler runs (the unwind phase's check). The first cut checked the cookie only
+ * in the phases the flags name and called the scope handler in every phase: the reverse. */
 EXCEPTION_DISPOSITION __GSHandlerCheck_SEH(EXCEPTION_RECORD *record, void *establisherFrame, PCONTEXT context,
                                            DISPATCHER_CONTEXT *dispatch) {
     ULONG const *scopes = (ULONG const *)dispatch->HandlerData;
     ULONG const *gs     = scopes + 1 + scopes[0] * 4u;
     ULONG const  phase  = (record->ExceptionFlags & EXCEPTION_UNWIND) != 0 ? 2u : 1u;
-    if ((gs[0] & phase) != 0) checkFrameCookie(gs, (ULONG_PTR)establisherFrame, dispatch);
+    checkFrameCookie(gs, (ULONG_PTR)establisherFrame, dispatch);
+    if ((gs[0] & phase) == 0) return ExceptionContinueSearch;
     return __C_specific_handler(record, establisherFrame, context, dispatch);
 }

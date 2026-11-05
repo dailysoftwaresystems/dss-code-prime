@@ -61,14 +61,15 @@ ___chkstk_ms:
 	ret
 
 # __security_check_cookie -- called by a /GS function's epilogue with the frame's cookie (already combined with the
-# frame's stack pointer) in %rcx, AFTER the function's return value is in %rax or %xmm0. So it changes nothing but
-# %r10 and the flags on the path that returns -- %r10 is volatile across any call, and the caller keeps nothing in
-# it. A cookie that does not match is the report, which never returns.
+# frame's stack pointer) in %rcx, AFTER the function's return value is in %rax or %xmm0. cl treats the call as one of
+# its own convention, keeping %rax live across it, so the check changes NOTHING but the flags on the path that
+# returns -- the compare reads the cookie in place, touching only what MSVC's own routine touches (%rcx, which it
+# restores on its failure path, as the review of P69 fold H5 READ vcruntime's amd64 routine). A cookie that does not match is
+# the report, which never returns.
 	.globl	__security_check_cookie
 	.type	__security_check_cookie, @function
 __security_check_cookie:
-	movq	__security_cookie(%rip), %r10
-	cmpq	%r10, %rcx
+	cmpq	__security_cookie(%rip), %rcx
 	jne	1f
 	ret
 1:	jmp	__report_gsfailure

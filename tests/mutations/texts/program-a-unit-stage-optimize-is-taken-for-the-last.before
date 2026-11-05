@@ -1,1 +1,1 @@
-        /*laterStageResumes=*/stage != PipelineStage::Program);
+    return stage != PipelineStage::Program;

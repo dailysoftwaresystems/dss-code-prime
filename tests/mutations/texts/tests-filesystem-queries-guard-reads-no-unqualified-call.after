@@ -1,1 +1,1 @@
-        continue;
+        for (std::sregex_iterator it{line.end(), line.end(), unqualified}, end; it != end; ++it) {

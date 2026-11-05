@@ -6285,7 +6285,7 @@ private:
                                                         std::uint64_t maxBytes,
                                                         bool pipe = false) {
         if (pipe) {
-            std::ifstream in(path, std::ios::binary);
+            std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
             if (!in) return std::nullopt;
             std::string out(static_cast<std::size_t>(maxBytes), '\0');
             in.read(out.data(), static_cast<std::streamsize>(maxBytes));
@@ -6313,7 +6313,7 @@ private:
         // The BOUNDED arm keeps the same short-read detector: `gcount()` must
         // deliver exactly the bytes asked for, or the read failed and the
         // caller refuses LOUD rather than embedding a shorter resource.
-        std::ifstream in(path, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
         if (!in) return std::nullopt;
         std::string out(static_cast<std::size_t>(maxBytes), '\0');
         in.read(out.data(), static_cast<std::streamsize>(maxBytes));

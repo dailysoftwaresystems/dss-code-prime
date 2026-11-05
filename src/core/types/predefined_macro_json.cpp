@@ -138,7 +138,7 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
     std::sort(files.begin(), files.end());
 
     for (fs::path const& f : files) {
-        std::ifstream in(f, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(f), std::ios::binary);
         if (!in) continue;
         // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`).
         // `operator>>` into a `json` is `json::parse` under another spelling —

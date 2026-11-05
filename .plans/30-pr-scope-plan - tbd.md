@@ -11,7 +11,7 @@
 > The decisions in §4 are the orchestrator's, under the operator's order of 2026-09-21 (*"you do everything"*),
 > and each one is veto-able.
 
-## 0. Where we are (MEASURED 2026-11-05, checkpoint 40 = fold f26c on `cd349db1`)
+## 0. Where we are (MEASURED 2026-11-05, checkpoint 41 = fold H6 on `13946f9d`)
 
 **687 open rows.**
 
@@ -28,8 +28,8 @@
 
 | PR | rows | what |
 |---|---|---|
-| **PR #59** (current) | 101 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 32 of the 101 carry FIX FOLDED in their trigger or closing (a match at checkpoint 40, `scope/count_pr59_fix_folded.py`) and close when their arms pass and their review findings are answered; the round-close sweep's group holds two more fixed rows |
-| **the next PR** | 469 | every remaining actionable row, in three rounds; plus full debug information (§3) |
+| **PR #59** (current) | 102 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 33 of the 102 carry FIX FOLDED in their trigger or closing (a match at checkpoint 41, `scope/count_pr59_fix_folded.py`) and close when their arms pass and their review findings are answered; the round-close sweep's group holds two more fixed rows |
+| **the next PR** | 468 | every remaining actionable row, in three rounds; plus full debug information (§3) |
 | **the capability PR** | 21 | plan 28's boot half, plan 09.5's tier skeleton with its C harmlessness proof, plan 16's codesign |
 | **the wasm32 PR** | 1 | plan 18, the first ILP32 target |
 | **the C++ PR** | 2 | the second source language and the second embedding language |
@@ -40,7 +40,7 @@
   - weeks 33–36: 161, 147, 197, 127;
   - weeks 37–41: 40, 44, 163, 54, 32;
   - week 43 so far: 13.
-- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 95 opened (3 created, 92 disclosed): counted −25, REAL net +67** (2026-11-05, at checkpoint 40). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
+- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 95 opened (3 created, 92 disclosed): counted −25, REAL net +67** (2026-11-05, at checkpoint 41). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
 - (read 2026-10-22) **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
 
 ## 1. PR #59 — the exit scope
@@ -56,14 +56,14 @@ The merge is the operator's.
 
 ### 1.1 Folds, in order
 
-`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c` ✔ (checkpoint 40: its code; its rows stay open on the review's send-back) `→ H6 → f26c2 → 3e → L2b2 → f26d → H7`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
+`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c` ✔ (checkpoint 40: its code; its rows stay open on the review's send-back) `→ H6` ✔ (checkpoint 41: its code; the review sent it back) `→ f26c2 / H6b (whichever is ready first) → 3e → 3f → L2b2 → f26d → H7`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
 
 | lane | rows (§8 A.1) | what it is |
 |---|---|---|
 | `lm` | 35 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement, the try/except and `#if` truth P0s; L2a2 and L2b1 folded (checkpoints 36, 37); L2b2: every asker on the binder sketch's homes, the type-name reader with the finish() oracle retired, the variadic surface's names exactly where the references' headers make them visible, the va_list record recognized by identity, a type name in a value position refused, and L2b's own rows |
 | `cs` | 26 | f26c FOLDED (checkpoint 40: the stacked-argument realignment, the SysV memory class, the order-aware lookup, the implicit declaration, `mode`, the conditional's composite), its rows open until their arms pass and the review's 15 findings are answered; f26c2: that answer (COMPLEX_X87 first, every arm's red set, the aapcs64 stacked slot); f26d: the shipped `<windows.h>` constants and declarations P0 first, then the P1–P3 rows |
 | `xa` | 31 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; 3d FOLDED (checkpoint 39); 3e: the review of 3d's answer — ONE entry election over every route and grammar (an archive member, a `.s`, no `--language`, `/ENTRY`), the audited X8 and X9 plans — and the `strtol` half of the client-import P0; 3f on: the chained unwind, the home audits, the relocatable objects' unwind tables, shared-library initializers, the non-alloc carry, each fold at a measured boundary |
-| `hm` | 7 | the PE platform runtime, FOLDED (H5, checkpoint 38); H6 handed back (checkpoint 41 next: every Win32 file and process call at any length, one Win32 root parse, the import bound, the file URI); H7: the verbatim-path URI first, then the compiler-support routines reference objects call, format-wide if the ELF and Mach-O census says so |
+| `hm` | 8 | the PE platform runtime, FOLDED (H5, checkpoint 38); H6 FOLDED (checkpoint 41: every Win32 file and process call at any length, one Win32 root parse, the import bound, the file URI), its rows open on the review's send-back; H6b: the walk-up class's HOME AUDIT (its third send-back, a design failure), one path-spelling home, the profile report's invariant block; H7: the verbatim-path URI first, then the compiler-support routines reference objects call, format-wide if the ELF and Mach-O census says so |
 | first lane to free | 2 | the shipped-constants P0, and the SysV memory-class ABI P0 |
 | round-close sweep | 2 | fixed rows whose arms have not been read |
 
@@ -244,12 +244,13 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-DSSHIR-NATIVE-SIDE-TABLES-HAVE-NO-TEXT-FORM]] (P2)
 - [[D-LK3-EXEC-EXPORT-SCOPE-NOT-CONFIG-DRIVEN]] (P3)
 
-#### hm (H6, H7) — 7
+#### hm (H6, H7) — 8
 
 - [[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]] (P1)
 - [[D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED]] (P1)
 - [[D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED]] (P1)
 - [[D-HARNESS-PROTOTYPE-CENSUS-DEFAULT-REFERENCE-IS-ABSENT-ON-ITS-WINDOWS-LEGS]] (P2)
+- [[D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE]] (P2)
 - [[D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES]] (P2)
 - [[D-AUDIT-P68-ROUND-12-MINOR-FINDINGS]] (P3)
 - [[D-AUDIT-P68-ROUND-13-MINOR-FINDINGS]] (P3)
@@ -475,7 +476,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-SEMANTIC-MAYBE-UNINITIALIZED-WARN]] (P2)
 - [[D-TOKENIZER-FORMFEED-SCHEMA-CURSOR-DESYNC]] (P2)
 
-#### R2, lane B — 53
+#### R2, lane B — 52
 
 - [[D-AS-REWRITE-CALL-HOISTED-ABOVE-ARG-CAPTURE]] (P2)
 - [[D-AS4-ARM64-INDEXED-LEA-SCALE]] (P2)
@@ -503,7 +504,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FF2-MSG-JARGON]] (P2)
 - [[D-FF2-UNSUPP-FULL-SWEEP]] (P2)
 - [[D-FF5-EXTERNDECLREF-VALIDATE]] (P2)
-- [[D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE]] (P2)
 - [[D-LINK-MACHO-STATIC-EXEC-SYMTAB-UNALIGNED]] (P2)
 - [[D-LK-ARM64-DEFINED-GLOBAL-ADDR-PIE-GOT]] (P2)
 - [[D-LK-DEDUP-INTERNAL-BREACH-MISFILED-AS-SYMBOL-UNDEFINED]] (P2)

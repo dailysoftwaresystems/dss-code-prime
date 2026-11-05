@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -584,15 +585,22 @@ TEST(DirectoryTree, APathOnAVolumeWithNoDosNameIsReachedThroughItsNtName) {
 #endif
 }
 
-// THE WALK UP OF A PATH THAT DOES NOT EXIST STOPS AT A DIRECTORY, WHATEVER WIN32 SPELLING NAMES THE VOLUME (P69 H5).
+// THE WALK UP OF A PATH STOPS AT ITS VOLUME'S ROOT DIRECTORY, WHATEVER WIN32 SPELLING NAMES THE VOLUME (P69 H5, H6).
 // ✔MEASURED 2026-11-03 (probe-reference-cc run 20261104-021850-b279d3e9, both Windows legs, MinGW's library and
 // MS STL's): the library's `parent_path()` of `\\?\Volume{G}\x`, `\\?\C:\x` and
 // `\\?\GLOBALROOT\Device\HarddiskVolumeN\x` is
 // the volume WITHOUT its separator -- the name the OS opens as the volume's DEVICE, whose handle has no file
 // information and no final path (ERROR_INVALID_FUNCTION) -- and the same name WITH its separator is the volume's root
-// directory. THE TABLE IS THE UNIVERSE of the file namespace's spellings of one volume -- its drive, `\\?\` and its
-// drive, its GUID name, its NT name -- on the volume this test's scratch lies on: for a name its root does not hold,
-// each reaches where the drive spelling does. (`\\.\` is the DEVICE namespace, no spelling of a file path.)
+// directory; the walk stops there because `rootSpelling` parses where the root ends (H6), never by an error.
+// THE TABLE IS THE UNIVERSE of the spellings of one volume (✔MEASURED 2026-11-04, runs 20261104-204243-d5c02d5f and
+// 20261104-205708-1394b8a2: each of them opens): its drive, `\\?\` and `\\.\` with its drive, the forward-slash
+// `//?/` and `//./` (both NORMALIZED device paths), its GUID name under `\\?\` and `\\.\` and in lower case, its NT
+// name under `\\?\GLOBALROOT` in either case -- on the volume this test's scratch lies on, for a name the scratch
+// holds and one its volume root does not: each reaches where the drive spelling does, and keys alike. And the edges
+// Win32 itself draws: a `..` under `\\.\` climbs over the volume (`\\.\C:\..\x` is `\\.\x`, which opens nothing), a
+// verbatim rest is literal (`\\?\...\sub\..\held.txt` and `\\?\...\held.txt.` name no file the drive spelling
+// names, and are answered in the verbatim form), and the DOS spelling trims what Win32 trims (`held.txt.` is
+// `held.txt`).
 TEST(DirectoryTree, EverySpellingOfAVolumeWalksUpToItsRootDirectory) {
 #if !defined(_WIN32)
     GTEST_SKIP() << "a POSIX path has one spelling of its root; the Windows legs ask this";
@@ -603,14 +611,19 @@ TEST(DirectoryTree, EverySpellingOfAVolumeWalksUpToItsRootDirectory) {
         GTEST_SKIP() << "this host's scratch lies on no drive letter (" << root.string() << "): no spelling to compare";
     std::wstring const absent = L"dss-absent-" + std::to_wstring(::GetCurrentProcessId());
     ASSERT_FALSE(fs::exists(root / absent)) << "the name this case asks for is held by the volume's root";
+    writeFile(scratch.path() / "held.txt");
+    fs::create_directories(scratch.path() / "sub");
     std::error_code ec;
-    fs::path const  expected = dss::core::reachedPath(root / absent / L"x.txt", ec);
+    fs::path const  expectedAbsent = dss::core::reachedPath(root / absent / L"x.txt", ec);
     ASSERT_FALSE(ec) << "the drive spelling was refused: " << ec.message();
-    ASSERT_EQ(expected.parent_path().parent_path(), dss::core::reachedPath(root, ec)) << "the drive spelling walked "
-                                                                                          "up to no root";
+    ASSERT_EQ(expectedAbsent.parent_path().parent_path(), dss::core::reachedPath(root, ec))
+        << "the drive spelling walked up to no root";
+    fs::path const expectedHeld = dss::core::reachedPath(scratch.path() / "held.txt", ec);
+    ASSERT_FALSE(ec) << "the held name's drive spelling was refused: " << ec.message();
     wchar_t guid[MAX_PATH]{};
     ASSERT_TRUE(::GetVolumeNameForVolumeMountPointW(root.c_str(), guid, MAX_PATH)) << "no GUID name: "
                                                                                   << ::GetLastError();
+    std::wstring const guidName = std::wstring{guid}.substr(4);   // `Volume{G}\`
     std::wstring nt(1024, L'\0');
     {
         HANDLE const h = ::CreateFileW(root.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -623,18 +636,108 @@ TEST(DirectoryTree, EverySpellingOfAVolumeWalksUpToItsRootDirectory) {
         nt.resize(n);
     }
     std::wstring const drive = root.native().substr(0, 2);
-    struct Spelling { char const* what; std::wstring rootSpelled; };
-    for (Spelling const& s : {Spelling{"\\\\?\\ and the drive", L"\\\\?\\" + drive + L"\\"},
-                              Spelling{"the GUID name", std::wstring{guid}},
-                              Spelling{"the NT name", L"\\\\?\\GLOBALROOT" + nt}}) {
+    std::wstring const below = scratch.path().native().substr(3);   // the scratch below the drive's root
+    auto const         slashed = [](std::wstring s) {
+        std::replace(s.begin(), s.end(), L'\\', L'/');
+        return s;
+    };
+    struct Spelling { char const* what; std::wstring rootSpelled; bool forward; };
+    Spelling const spellings[] = {
+        {"\\\\?\\ and the drive", L"\\\\?\\" + drive + L"\\", false},
+        {"\\\\.\\ and the drive", L"\\\\.\\" + drive + L"\\", false},
+        {"//?/ and the drive", L"//?/" + drive + L"/", true},
+        {"//./ and the drive", L"//./" + drive + L"/", true},
+        {"the GUID name", std::wstring{guid}, false},
+        {"the GUID name under \\\\.\\", L"\\\\.\\" + guidName, false},
+        {"the GUID name in lower case", L"\\\\?\\volume" + guidName.substr(6), false},
+        {"the NT name", L"\\\\?\\GLOBALROOT" + nt, false},
+        {"the NT name in lower case", L"\\\\?\\globalroot" + nt, false},
+    };
+    for (Spelling const& s : spellings) {
         SCOPED_TRACE(s.what);
-        fs::path const asked = fs::path{s.rootSpelled + absent + L"\\x.txt"};
-        std::error_code askedEc;
-        fs::path const  reached = dss::core::reachedPath(asked, askedEc);
+        std::wstring const tail    = s.forward ? slashed(absent + L"\\x.txt") : absent + L"\\x.txt";
+        fs::path const     asked   = fs::path{s.rootSpelled + tail};
+        std::error_code    askedEc;
+        fs::path const     reached = dss::core::reachedPath(asked, askedEc);
         ASSERT_FALSE(askedEc) << "refused -- " << askedEc.message() << " (the walk stopped at the volume's device)";
-        EXPECT_EQ(reached, expected) << "reached " << reached.string() << ", where the drive spelling reaches "
-                                     << expected.string();
+        EXPECT_EQ(reached, expectedAbsent) << "reached " << reached.string() << ", where the drive spelling reaches "
+                                           << expectedAbsent.string();
+        std::wstring const heldTail = s.forward ? slashed(below + L"\\held.txt") : below + L"\\held.txt";
+        fs::path const     heldAsked{s.rootSpelled + heldTail};
+        fs::path const     heldReached = dss::core::reachedPath(heldAsked, askedEc);
+        ASSERT_FALSE(askedEc) << "the held name was refused -- " << askedEc.message();
+        EXPECT_EQ(heldReached, expectedHeld) << "reached " << heldReached.string();
+        EXPECT_EQ(dss::core::PathIdentity::of(heldAsked), dss::core::PathIdentity::of(scratch.path() / "held.txt"))
+            << "one file, two keys";
+        EXPECT_EQ(dss::core::PathIdentity::of(asked), dss::core::PathIdentity::of(root / absent / L"x.txt"))
+            << "one not-yet-made file, two keys";
     }
+    // Win32's own edges, each as the OS draws it.
+    std::error_code edgeEc;
+    fs::path const  climbed =
+        dss::core::reachedPath(fs::path{L"\\\\.\\" + drive + L"\\..\\" + below + L"\\held.txt"}, edgeEc);
+    EXPECT_NE(climbed, expectedHeld) << "a `..` under \\\\.\\ climbs over the volume, and reaches no drive file";
+    for (std::wstring const& literal : {L"\\\\?\\" + drive + L"\\" + below + L"\\sub\\..\\held.txt",
+                                        L"\\\\?\\" + drive + L"\\" + below + L"\\held.txt."}) {
+        fs::path const reached = dss::core::reachedPath(fs::path{literal}, edgeEc);
+        ASSERT_FALSE(edgeEc) << edgeEc.message();
+        EXPECT_NE(reached, expectedHeld) << "a verbatim rest is literal: " << reached.string();
+        EXPECT_TRUE(reached.native().starts_with(L"\\\\?\\"))
+            << "a rest the DOS form would rewrite stays verbatim: " << reached.string();
+        EXPECT_NE(dss::core::PathIdentity::of(fs::path{literal}),
+                  dss::core::PathIdentity::of(scratch.path() / "held.txt"));
+    }
+    fs::path const trimmed = dss::core::reachedPath(fs::path{scratch.path().native() + L"\\held.txt."}, edgeEc);
+    ASSERT_FALSE(edgeEc) << edgeEc.message();
+    EXPECT_EQ(trimmed, expectedHeld) << "the DOS spelling trims a trailing dot, as Win32 does";
+#endif
+}
+
+// THE SAME WALK UNDER A SHARE: `\\server\share\` is its volume root, holding its `..`, in each spelling of the share
+// -- `\\localhost\C$`, `//localhost/C$`, `\\?\UNC\localhost\C$`, `\\?\unc\` (✔MEASURED: each opens on both Windows legs,
+// run 20261104-204243-d5c02d5f) -- for a name the scratch holds and one it does not.
+TEST(DirectoryTree, EverySpellingOfAShareWalksUpToItsShare) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX path has no share; the Windows legs ask this";
+#else
+    ScratchDir scratch{Location::Temp, "directory_tree_share_spellings"};
+    writeFile(scratch.path() / "held.txt");
+    std::wstring const local = scratch.path().native();
+    if (local.size() < 3 || local[1] != L':') GTEST_SKIP() << "the scratch lies on no drive letter";
+    std::wstring const share = L"\\\\localhost\\" + local.substr(0, 1) + L"$" + local.substr(2);
+    {
+        HANDLE const h = ::CreateFileW(share.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+            GTEST_SKIP() << "this host's administrative share does not open (" << ::GetLastError()
+                         << "): the share walk is UNMEASURED on this leg, not passing";
+        ::CloseHandle(h);
+    }
+    std::error_code ec;
+    fs::path const  expectedHeld   = dss::core::reachedPath(fs::path{share + L"\\held.txt"}, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    fs::path const expectedAbsent = dss::core::reachedPath(fs::path{share + L"\\absent\\x.txt"}, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    EXPECT_TRUE(expectedHeld.native().starts_with(L"\\\\localhost\\")) << expectedHeld.string();
+    std::wstring forward = share;
+    std::replace(forward.begin(), forward.end(), L'\\', L'/');
+    struct Spelling { char const* what; std::wstring spelled; };
+    Spelling const spellings[] = {{"//localhost/", forward},
+                                  {"\\\\?\\UNC\\", L"\\\\?\\UNC" + share.substr(1)},
+                                  {"\\\\?\\unc\\", L"\\\\?\\unc" + share.substr(1)}};
+    for (auto const& [what, spelled] : spellings) {
+        SCOPED_TRACE(what);
+        bool const     slashed = spelled.starts_with(L"//");
+        fs::path const held{spelled + (slashed ? L"/held.txt" : L"\\held.txt")};
+        fs::path const gone{spelled + (slashed ? L"/absent/x.txt" : L"\\absent\\x.txt")};
+        EXPECT_EQ(dss::core::reachedPath(held, ec), expectedHeld);
+        ASSERT_FALSE(ec) << ec.message();
+        EXPECT_EQ(dss::core::reachedPath(gone, ec), expectedAbsent);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+    // The share holds its `..`: `\\localhost\C$\..\<below>\held.txt` is the held file.
+    std::wstring const climbed = L"\\\\localhost\\" + local.substr(0, 1) + L"$\\.." + local.substr(2) + L"\\held.txt";
+    EXPECT_EQ(dss::core::reachedPath(fs::path{climbed}, ec), expectedHeld);
 #endif
 }
 
@@ -831,4 +934,79 @@ TEST(DirectoryTree, ADirectoryMadeCaseSensitiveAnswersThatItKeepsCase) {
     std::error_code eca;
     EXPECT_TRUE(dss::core::directoryFoldsCase(scratch.path(), eca).value_or(false)) << "its parent still folds";
 #endif
+}
+
+// ★ EVERY OPERATION AT ANY LENGTH (P69 H6, [[D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE]]): a
+// directory made, a file written through a stream, examined, listed, read, copied, opened as a C stream and removed,
+// its identity keyed and the tree removed -- at a path of 300 characters or more and, the control, below 260 --
+// through the substrate's operations and the extended-length spelling. ✔MEASURED before the fix (probe-reference-cc
+// runs 20261104-215014-7ba4f08f and 20261104-215144-4893b98f, RtlAreLongPathsEnabled 0): at 260 or more every plain
+// Win32 call, _wfopen and std::filesystem call of either library opens nothing. A host with no such limit holds the
+// same cells.
+TEST(DirectoryTree, EveryOperationReachesAPathOf300CharactersAsBelow260) {
+    ScratchDir scratch{Location::Temp, "directory_tree_long_paths"};
+    fs::path const top = scratch.path() / std::string(40, 'd');
+    fs::path       deep = top;
+    while (deep.native().size() < 300) deep /= std::string(40, 'd');
+    fs::path const shallow = scratch.path() / "s";
+    ASSERT_LT(shallow.native().size(), 260u) << "the control is not below the limit";
+    for (fs::path const& dir : {shallow, deep}) {
+        SCOPED_TRACE(std::to_string(dir.native().size()) + " characters");
+        std::error_code ec;
+        EXPECT_TRUE(dss::core::createDirectories(dir, ec)) << ec.message();
+        ASSERT_FALSE(ec) << "the directory was not made: " << ec.message();
+        EXPECT_FALSE(dss::core::createDirectories(dir, ec)) << "it exists: there was nothing to make";
+        EXPECT_FALSE(ec) << ec.message();
+        fs::path const file = dir / "f.txt";
+        {
+            std::ofstream out{dss::core::extendedLengthSpelling(file), std::ios::binary};
+            out << "abc";
+            ASSERT_TRUE(out.good()) << "the file was not written";
+        }
+        EXPECT_EQ(dss::core::entryKind(file, ec), EntryKind::File) << ec.message();
+        EXPECT_EQ(dss::core::reachedKind(dir, ec), EntryKind::Directory) << ec.message();
+        auto const size = dss::core::reachedFileSize(file, ec);
+        ASSERT_TRUE(size.has_value()) << "the file's size was not read: " << ec.message();
+        EXPECT_EQ(*size, 3u);
+        std::vector<std::string> names;
+        auto const walk = dss::core::walkTree(dir, [&names](TreeEntry const& e) {
+            names.push_back(e.path.filename().string());
+            return WalkStep::Continue;
+        });
+        EXPECT_FALSE(walk.error) << "the directory was not listed: " << walk.error.message();
+        EXPECT_EQ(names, std::vector<std::string>{"f.txt"});
+        {
+            std::ifstream in{dss::core::extendedLengthSpelling(file), std::ios::binary};
+            std::string   text;
+            in >> text;
+            EXPECT_EQ(text, "abc") << "the file was not read back";
+        }
+        fs::path const copy = dir / "g.txt";
+        dss::core::copyFile(file, copy, ec);
+        EXPECT_FALSE(ec) << "the copy was refused: " << ec.message();
+        dss::core::copyFile(file, copy, ec);
+        EXPECT_TRUE(ec) << "a copy onto an existing file must be refused";
+        ec.clear();
+        if (std::FILE* const c = dss::core::openFileStream(copy, "rb")) {
+            char bytes[4] = {};
+            EXPECT_EQ(std::fread(bytes, 1, 3, c), 3u);
+            std::fclose(c);
+            EXPECT_STREQ(bytes, "abc");
+        } else {
+            ADD_FAILURE() << "the C stream was not opened";
+        }
+        EXPECT_TRUE(dss::core::removeEntry(copy, ec)) << ec.message();
+        EXPECT_FALSE(dss::core::removeEntry(copy, ec)) << "nothing is there any more";
+        EXPECT_FALSE(ec) << "absence is no error: " << ec.message();
+        EXPECT_FALSE(dss::core::canonicalIdentityKey(file, ec).empty());
+        EXPECT_FALSE(ec) << "the identity was not keyed: " << ec.message();
+#ifdef _WIN32
+        // The DEVICE spelling of the same file, at the same length: converted, it opens what it means.
+        EXPECT_EQ(dss::core::entryKind(fs::path{L"\\\\.\\" + file.native()}, ec), EntryKind::File) << ec.message();
+#endif
+    }
+    auto const removal = dss::core::removeTree(top);
+    EXPECT_EQ(removal.failures, 0u) << removal.firstPath.string() << ": " << removal.firstError.message();
+    std::error_code ec;
+    EXPECT_EQ(dss::core::entryKind(deep, ec), EntryKind::Absent) << "the deep tree was not removed";
 }

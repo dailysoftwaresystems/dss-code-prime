@@ -5801,7 +5801,7 @@ struct CorpusIndex {
     if (walk.error)
         throw fs::filesystem_error("the shipped descriptor corpus could not be walked", walk.where, walk.error);
     for (fs::path const& descriptor : descriptors) {
-        std::ifstream in(descriptor, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(descriptor), std::ios::binary);
         if (!in) continue;  // lenient: unreadable descriptor skipped
         // THE ONE CONFIG PARSE, and the reason a LENIENT scanner routes through
         // it too: `operator>>` into a `json` is `json::parse` under another

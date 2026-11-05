@@ -82,7 +82,7 @@ public:
         AcquisitionLock lock;
 #ifdef _WIN32
         lock.handle_ = ::CreateFileW(
-            file.c_str(), GENERIC_READ | GENERIC_WRITE,
+            core::extendedLengthSpelling(file).c_str(), GENERIC_READ | GENERIC_WRITE,   // at any length
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,  // not inheritable
             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -416,7 +416,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
 
     // ── MARK INCOMPLETE BEFORE ONE BYTE OF THE TREE IS WRITTEN ──────────────
     if (!markedOurs) {
-        fs::create_directories(marker.parent_path(), ec);
+        static_cast<void>(core::createDirectories(marker.parent_path(), ec));
         std::FILE* const claimed =
             ec ? nullptr : linker::detail::createExclusiveBinary(marker);
         if (claimed == nullptr || std::fclose(claimed) != 0) {
@@ -434,7 +434,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
         // The substrate's removal (a link is removed as itself, never followed).
         if (core::removeTree(checkoutDir).failures == 0) {
             std::error_code rmec;
-            fs::remove(marker, rmec);
+            static_cast<void>(core::removeEntry(marker, rmec));
         }
         return result;
     };
@@ -455,7 +455,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
     // 3300 create-then-remove cycles under load), so one attempt; a failure is
     // LOUD, and the marker left behind makes the next build re-acquire rather
     // than trust.
-    fs::remove(marker, ec);
+    static_cast<void>(core::removeEntry(marker, ec));
     if (ec) {
         out.ok     = false;
         out.detail = "the checkout at '" + core::genericSpelling(checkoutDir)
@@ -498,7 +498,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // tree, and never a `remove_all` racing the other build's.
     std::error_code ec;
     fs::path const  lockDir = depsDir_ / std::string{kDependencyLockDirName};
-    fs::create_directories(lockDir, ec);
+    static_cast<void>(core::createDirectories(lockDir, ec));
     auto held = ec ? std::expected<AcquisitionLock, std::string>{std::unexpected(
                          "the lock directory '" + core::genericSpelling(lockDir)
                          + "' could not be created: " + ec.message())}
@@ -580,7 +580,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // down only when the checkout succeeded.
     bool refreshLeftTreeIncomplete = false;
     if (acq.ok && hasCheckout) {
-        fs::create_directories(marker.parent_path(), ec);
+        static_cast<void>(core::createDirectories(marker.parent_path(), ec));
         std::FILE* const claimed =
             ec ? nullptr : linker::detail::createExclusiveBinary(marker);
         if (claimed == nullptr || std::fclose(claimed) != 0) {
@@ -591,7 +591,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
         } else {
             acq = git_->checkout(checkoutDir, "FETCH_HEAD");
             if (acq.ok) {
-                fs::remove(marker, ec);
+                static_cast<void>(core::removeEntry(marker, ec));
                 if (ec) {
                     acq.ok     = false;
                     acq.detail = "the refreshed checkout is complete but could "

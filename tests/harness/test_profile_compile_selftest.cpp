@@ -34,7 +34,11 @@ namespace {
     X(OutHelpIsNoSpellingOfAValueHereRefusedAsAnUnknownArgument,                                                       \
       "--out=--help is no spelling of a value here: refused as an unknown argument")                                   \
     X(APathHoldingADashIsKeptTheControl, "a path holding a dash is kept (the control)")                                \
-    X(AValueThatIsNoPathMayBeginWithTheControl, "a value that is no path may begin with `-` (the control)")
+    X(AValueThatIsNoPathMayBeginWithTheControl, "a value that is no path may begin with `-` (the control)")         \
+    X(ThePhaseReportShowsTheTablesHeaderAndEveryRowUnderIt,                                                            \
+      "the phase report shows the table's header AND every row under it")                                              \
+    X(ThePhaseReportShowsTheCompileTimeLineAndNothingOfTheTracesAroundItTheControl,                                    \
+      "the phase report shows the `compile time` line and nothing of the traces around it (the control)")
 
 #define DSS_PROFILE_COMPILE_SELFTEST_ARM_NAME(caseName, armName) armName,
 constexpr std::string_view kArmNames[] = {DSS_PROFILE_COMPILE_SELFTEST_ARMS(DSS_PROFILE_COMPILE_SELFTEST_ARM_NAME)};
