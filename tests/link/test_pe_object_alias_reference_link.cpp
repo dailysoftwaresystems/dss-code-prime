@@ -31,7 +31,6 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
-#include "lld_link_of_any_instance.hpp"
 #include "pe_raw_entry.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -266,9 +265,10 @@ TEST(PeObjectAliasReferenceLinkNative, LldLinkReadsASelectAnyDefinitionThroughIt
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    std::string why;
-    auto const lld = test_support::lldLinkOfAnyInstance(dir, why);
-    if (lld.empty()) GTEST_SKIP() << "no lld-link on this host: " << why;
+    // lld-link of ANY Visual Studio instance carrying the LLVM component (`locateLldLink`, the one owner).
+    auto const lld = test_support::native_probe::locateLldLink(dir);
+    if (lld.toolAbsent()) GTEST_SKIP() << "no lld-link on this host: " << lld.detail;
+    ASSERT_TRUE(lld.ok()) << lld.describe();
     // lld-link reads the import libraries through the developer environment's LIB, as link.exe does.
     auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
     ASSERT_TRUE(env.ready()) << env.describe();
@@ -279,7 +279,7 @@ TEST(PeObjectAliasReferenceLinkNative, LldLinkReadsASelectAnyDefinitionThroughIt
             << "DSS must write the select-any definition and its strong alias to a PE object; errs="
             << rep.errorCount();
         std::string const exe = std::string{"selectany_lld_"} + configName(config) + ".exe";
-        ASSERT_TRUE(env.run("\"" + lld.string() + "\" /nologo /OUT:" + exe + " /ENTRY:" + test::pe_raw_entry::kSymbol
+        ASSERT_TRUE(env.run("\"" + lld.lldLink.string() + "\" /nologo /OUT:" + exe + " /ENTRY:" + test::pe_raw_entry::kSymbol
                             + " /SUBSYSTEM:CONSOLE /NODEFAULTLIB selectany.obj reader.obj entry.obj kernel32.lib"))
             << "lld-link must take the DSS objects: the strong alias is an external label of the COMDAT section";
         expectTheValueThroughTheAlias(dir / exe, "lld-link");

@@ -187,6 +187,14 @@ public:
     isExecFlavor(detail::ObjectFormatData const& d) const noexcept override {
         return d.macho.filetype == MachOObjectType::Execute;
     }
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the Mach-O
+    // neighbour): both image writers (`macho::encodeExec`, and
+    // `encodeExecDynamic` for MH_EXECUTE and MH_DYLIB) give each image-defined
+    // name the address of the image's own mach header, at __TEXT's vmaddr.
+    [[nodiscard]] bool
+    writesImageDefinedSymbols(detail::ObjectFormatData const& d) const noexcept override {
+        return isImageFlavor(d);
+    }
 
     // c153 (D-LK3-3): MH_DYLIB is FALSE. The shipped bind model is the modern
     // TWO-LEVEL namespace (MH_TWOLEVEL — every LC_DYLD_INFO bind opcode names
@@ -1638,9 +1646,11 @@ public:
                 if (!sawText) {
                     fail("/sections",
                          "Mach-O MH_DYLIB format requires a Text "
-                         "section row (SectionKind::Text) -- a dynamic "
-                         "library without code has nothing to export. "
-                         "D-LK3-3.");
+                         "section row (SectionKind::Text) -- the writer "
+                         "lays the image out from that row's address: "
+                         "`__text` sits at 'image.segmentPageSize', "
+                         "and every section after it is placed from "
+                         "there, a dylib with no function included.");
                 }
                 if (processExit.has_value()
                  || !entryCallingConvention.empty()

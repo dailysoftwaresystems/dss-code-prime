@@ -1,0 +1,1 @@
+            entry.path += "@" + std::to_string(*compileOpts.objectInputPlaces[oi]);

@@ -2998,7 +2998,15 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    // An MH_EXECUTE whose one function holds no byte is a program with no
+    // instruction to start at: refused under K_ProgramEntryUndefined alone
+    // (P69 fold 3d; K_RelocationKindMismatch before).
+    std::size_t entryUndefined = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ProgramEntryUndefined) ++entryUndefined;
+        EXPECT_NE(d.code, DiagnosticCode::K_RelocationKindMismatch) << d.actual;
+    }
+    EXPECT_EQ(entryUndefined, 1u);
 }
 
 TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {

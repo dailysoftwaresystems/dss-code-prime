@@ -5,7 +5,7 @@
 // (`link/format/win64_unwind_decode.hpp`) and carries a handler — its routine, its phases, its data and the addresses
 // the data holds — as the function's `languageHandler`; the PE writers encode both back
 // (`pe.cpp`'s `buildFunctionUnwindInfo`). The fixtures are the reference compilers' own objects
-// (`tests/link/data/win64_unwind_{forms,try}.source.c` state how each was built):
+// (`tests/link/data/win64_unwind_{forms,try,huge}.source.c` state how each was built):
 //
 //   win64_unwind_forms_x86_64_pe_cl_O2.obj       md5 00fc7fb0ebc3d54c79abd29d84c361f3   cl 19.44.35229 /O2
 //   win64_unwind_forms_x86_64_pe_cl_Od.obj       md5 8315ff5df0389809c69df2b9e52d4577   cl 19.44.35229 /Od
@@ -14,10 +14,19 @@
 //   win64_unwind_try_x86_64_pe_cl_O2.obj         md5 456673ea5a0db1a9a0bd7853219a0740   cl 19.44.35229 /O2
 //   win64_unwind_try_x86_64_pe_cl_Od.obj         md5 c845ec0ca0cba582ae0def850743440c   cl 19.44.35229 /Od
 //   win64_unwind_try_x86_64_pe_clangcl_O2.obj    md5 4bbee256080fc8ca3b4e445d7be1f009   clang-cl 19.1.5 /O2
+//   win64_unwind_huge_x86_64_pe_cl_O2.obj        md5 0e891c54cbedc3620b22d361982bc6ca   cl 19.44.35229 /O2
+//   win64_unwind_huge_x86_64_pe_cl_Od.obj        md5 7a8f3302014a8d2b54d3474a0d7d2411   cl 19.44.35229 /Od
+//   win64_unwind_huge_x86_64_pe_clangcl_O2.obj   md5 28d27e5709409eb1cb511c7e1902b4d0   clang-cl 19.1.5 /O2
+//   win64_unwind_huge_x86_64_pe_gcc_O2.obj       md5 8c2d658251dfa25615fade918c238f55   mingw-w64 gcc 13.2.0 -O2
 //
-// ✔MEASURED at the build (P69 fold 3c): each object comes out of a second build byte-identical and records no path of
-// the host that built it; each `try` object linked by link.exe beside a cl `main` runs to 42. No guard enforces an
-// md5: it records WHICH BYTES were measured.
+// ✔MEASURED at the build (P69 folds 3c and 3d): each object comes out of a second build byte-identical and records no
+// path of the host that built it; each `try` object linked by link.exe beside a cl `main` runs to 42, and each `huge`
+// object linked by its own toolchain beside a `reach` that unwinds two frames with RtlVirtualUnwind lands in `main`
+// (exit 42). No guard enforces an md5: it records WHICH BYTES were measured.
+//
+// D-WIN64-HUGE-FRAME-ALLOC (P69 fold 3d): the `huge` objects carry the long spellings of the codes — UWOP_ALLOC_LARGE
+// op-info 1 (every object), UWOP_SAVE_NONVOL_FAR (cl /O2) and UWOP_SAVE_XMM128_FAR (every /O2 and -O2 object) — and
+// DSS compiles the same source and runs it, its own frames written in those spellings.
 //
 // Every TEST but the native suite runs in-process on every leg: the fixtures are read, never compiled.
 
@@ -31,7 +40,9 @@
 #include "link/object_format_schema.hpp"
 #include "program/program.hpp"
 
+#include "../core/native_c_probe.hpp"
 #include "host_native_target.hpp"
+#include "image_dependency_table.hpp"
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -46,6 +57,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -57,14 +69,17 @@ namespace {
 
 namespace fs = std::filesystem;
 
-[[nodiscard]] std::vector<std::uint8_t> fixture(std::string_view name) {
-    auto const    path = dss::test::repoRoot() / "tests" / "link" / "data" / std::string{name};
+[[nodiscard]] std::vector<std::uint8_t> bytesOf(fs::path const& path) {
     std::ifstream in{path, std::ios::binary};
     if (!in.good()) {
         ADD_FAILURE() << "cannot open " << path.string();
         return {};
     }
     return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+[[nodiscard]] std::vector<std::uint8_t> fixture(std::string_view name) {
+    return bytesOf(dss::test::repoRoot() / "tests" / "link" / "data" / std::string{name});
 }
 
 [[nodiscard]] std::string diagnosticsOf(DiagnosticReporter const& rep) {
@@ -293,6 +308,29 @@ constexpr char const* kForms[] = {"win64_unwind_forms_x86_64_pe_cl_O2.obj", "win
                                   "win64_unwind_forms_x86_64_pe_gcc_O2.obj"};
 constexpr char const* kTries[] = {"win64_unwind_try_x86_64_pe_cl_O2.obj", "win64_unwind_try_x86_64_pe_cl_Od.obj",
                                   "win64_unwind_try_x86_64_pe_clangcl_O2.obj"};
+constexpr char const* kHuge[]  = {"win64_unwind_huge_x86_64_pe_cl_O2.obj", "win64_unwind_huge_x86_64_pe_cl_Od.obj",
+                                  "win64_unwind_huge_x86_64_pe_clangcl_O2.obj",
+                                  "win64_unwind_huge_x86_64_pe_gcc_O2.obj"};
+
+[[nodiscard]] std::vector<std::string> everyFixture() {
+    std::vector<std::string> all(std::begin(kForms), std::end(kForms));
+    all.insert(all.end(), std::begin(kTries), std::end(kTries));
+    all.insert(all.end(), std::begin(kHuge), std::end(kHuge));
+    return all;
+}
+
+// The operations an UNWIND_INFO's codes state, each with its operation info: "<op>/<info>" in array order, read by
+// the test's own walk of the slots.
+[[nodiscard]] std::vector<std::string> opsOf(std::vector<std::uint8_t> const& codes) {
+    std::vector<std::string> out;
+    std::size_t const        count = codes.size() >= 4 ? codes[2] : 0u;
+    for (std::size_t slot = 0; slot < count && 4 + 2 * slot + 1 < codes.size();) {
+        std::uint8_t const op = codes[4 + 2 * slot + 1] & 0x0Fu, info = codes[4 + 2 * slot + 1] >> 4;
+        out.push_back(std::to_string(op) + "/" + std::to_string(info));
+        slot += op == 1u ? (info == 0u ? 2u : 3u) : op == 4u || op == 8u ? 2u : op == 5u || op == 9u ? 3u : 1u;
+    }
+    return out;
+}
 
 [[nodiscard]] std::string nameOf(AssembledModule const& m, SymbolId id) {
     for (auto const& s : m.symbols) {
@@ -313,9 +351,7 @@ constexpr char const* kTries[] = {"win64_unwind_try_x86_64_pe_cl_O2.obj", "win64
 TEST(CoffForeignUnwind, EveryDescribedFunctionOfAReferenceObjectArrivesWithItsFrameAndHandler) {
     auto const l = load();
     ASSERT_TRUE(l.target && l.object);
-    std::vector<std::string> all(std::begin(kForms), std::end(kForms));
-    all.insert(all.end(), std::begin(kTries), std::end(kTries));
-    for (auto const& name : all) {
+    for (auto const& name : everyFixture()) {
         SCOPED_TRACE(name);
         auto const bytes = fixture(name);
         ASSERT_FALSE(bytes.empty());
@@ -348,14 +384,13 @@ TEST(CoffForeignUnwind, EveryDescribedFunctionOfAReferenceObjectArrivesWithItsFr
 
 // THE ROUND TRIP: what the object says, read and written back by the shipped writer, is what it said — every code
 // byte for byte, every handler naming the same routine, its data the same bytes and its addresses the same places.
-// The encoder's three forms are all here: UWOP_PUSH_NONVOL (every fixture), UWOP_SET_FPREG with a frame offset (cl's
-// and gcc's `dyn`), and saves measured from the frame register's base (cl /O2's `dyn`).
+// The encoder's forms are all here: UWOP_PUSH_NONVOL (every fixture), UWOP_SET_FPREG with a frame offset (cl's and
+// gcc's `dyn`), saves measured from the frame register's base (cl /O2's `dyn`), and the long spellings of the
+// allocation and of both saves (the `huge` fixtures; `TheHugeFixturesStateEveryLongSpelling` holds them to it).
 TEST(CoffForeignUnwind, ReferenceUnwindInfoSurvivesTheShippedWriterByteForByte) {
     auto const l = load();
     ASSERT_TRUE(l.target && l.object);
-    std::vector<std::string> all(std::begin(kForms), std::end(kForms));
-    all.insert(all.end(), std::begin(kTries), std::end(kTries));
-    for (auto const& name : all) {
+    for (auto const& name : everyFixture()) {
         SCOPED_TRACE(name);
         auto const bytes = fixture(name);
         ASSERT_FALSE(bytes.empty());
@@ -403,6 +438,95 @@ TEST(CoffForeignUnwind, ReferenceUnwindInfoSurvivesTheShippedWriterByteForByte) 
     }
 }
 
+// The round trip above is only as strong as the spellings its fixtures hold: each long spelling is in the `huge`
+// objects, where the references wrote it (✔MEASURED P69 fold 3d at the build, llvm-readobj 19.1.5 `--unwind`).
+TEST(CoffForeignUnwind, TheHugeFixturesStateEveryLongSpelling) {
+    std::map<std::string, std::vector<std::string>> holders;   // a spelling -> the fixtures stating it
+    for (auto const* name : kHuge) {
+        SCOPED_TRACE(name);
+        auto const bytes = fixture(name);
+        ASSERT_FALSE(bytes.empty());
+        auto const u = unwindOf(Coff::of(bytes));
+        EXPECT_EQ(u.size(), 3u) << "huge, hugeregs and hugexmm, each described";
+        std::set<std::string> here;
+        for (auto const& [fn, f] : u) {
+            for (auto const& op : opsOf(f.codes)) {
+                if (op == "1/1") here.insert("UWOP_ALLOC_LARGE op-info 1");
+                if (op.rfind("5/", 0) == 0) here.insert("UWOP_SAVE_NONVOL_FAR");
+                if (op.rfind("9/", 0) == 0) here.insert("UWOP_SAVE_XMM128_FAR");
+            }
+        }
+        for (auto const& s : here) holders[s].push_back(name);
+    }
+    using V = std::vector<std::string>;
+    EXPECT_EQ(holders["UWOP_ALLOC_LARGE op-info 1"], V(std::begin(kHuge), std::end(kHuge)))
+        << "every reference allocates a frame past 512 KiB - 8 in the long spelling";
+    EXPECT_EQ(holders["UWOP_SAVE_NONVOL_FAR"], V{"win64_unwind_huge_x86_64_pe_cl_O2.obj"})
+        << "cl /O2 saves rbx in its caller's home slot, 700128 bytes above the establisher frame";
+    EXPECT_EQ(holders["UWOP_SAVE_XMM128_FAR"],
+              (V{"win64_unwind_huge_x86_64_pe_cl_O2.obj", "win64_unwind_huge_x86_64_pe_clangcl_O2.obj",
+                 "win64_unwind_huge_x86_64_pe_gcc_O2.obj"}))
+        << "every optimising reference saves a vector register past 1 MiB";
+}
+
+// A long spelling means what its short one means, in bytes: the rules read from the codes are the frame the machine
+// code builds. ✔MEASURED P69 fold 3d (llvm-objdump of the cl /O2 object): `hugeregs` stores rbx at entry with
+// `movq %rbx, 0x18(%rsp)` — 16 above the CFA — then pushes seven registers and subtracts 0xAAE90 (700048);
+// `hugexmm` pushes rbx, subtracts 0x125010 (1200144) and stores xmm6 to xmm11 at 0x125000 down to 0x124FB0 above the
+// new stack pointer, 32 to 112 below the CFA. gcc's `huge` subtracts 700040 and pushes nothing.
+TEST(CoffForeignUnwind, ALongSpellingDecodesToTheFrameItsCodeBuilds) {
+    auto const l = load();
+    ASSERT_TRUE(l.target && l.object);
+    struct Rule {
+        std::uint32_t pc;
+        char const*   reg;   // null: the CFA's offset
+        std::int64_t  offset;
+    };
+    struct Case {
+        char const*       object;
+        char const*       function;
+        std::vector<Rule> rules;
+    };
+    std::vector<Case> const cases{
+        {"win64_unwind_huge_x86_64_pe_cl_O2.obj", "hugeregs",
+         {{6, nullptr, 16}, {6, "rbp", -16}, {7, nullptr, 24}, {7, "rsi", -24}, {8, nullptr, 32}, {8, "rdi", -32},
+          {10, nullptr, 40}, {10, "r12", -40}, {12, nullptr, 48}, {12, "r13", -48}, {14, nullptr, 56},
+          {14, "r14", -56}, {16, nullptr, 64}, {16, "r15", -64}, {29, nullptr, 700112}, {29, "rbx", 16}}},
+        {"win64_unwind_huge_x86_64_pe_cl_O2.obj", "hugexmm",
+         {{2, nullptr, 16}, {2, "rbx", -16}, {15, nullptr, 1200160}, {23, "xmm6", -32}, {31, "xmm7", -48},
+          {40, "xmm8", -64}, {49, "xmm9", -80}, {58, "xmm10", -96}, {67, "xmm11", -112}}},
+        {"win64_unwind_huge_x86_64_pe_gcc_O2.obj", "huge", {{13, nullptr, 700048}}},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(std::string{c.object} + " " + c.function);
+        auto const         bytes = fixture(c.object);
+        DiagnosticReporter rep;
+        auto const         mod = read(l, bytes, rep);
+        ASSERT_TRUE(mod.has_value()) << diagnosticsOf(rep);
+        AssembledFunction const* fn = nullptr;
+        for (auto const& f : mod->functions) {
+            if (nameOf(*mod, f.symbol) == c.function) fn = &f;
+        }
+        ASSERT_NE(fn, nullptr);
+        ASSERT_TRUE(fn->cfi.has_value());
+        ASSERT_EQ(fn->cfi->ops.size(), c.rules.size()) << "one rule per code's statement";
+        for (std::size_t k = 0; k < c.rules.size(); ++k) {
+            auto const& got = fn->cfi->ops[k];
+            auto const& want = c.rules[k];
+            EXPECT_EQ(got.pcOffset, want.pc) << "rule " << k;
+            if (want.reg == nullptr) {
+                EXPECT_EQ(static_cast<int>(got.kind), static_cast<int>(CfiOpKind::DefCfaOffset)) << "rule " << k;
+            } else {
+                EXPECT_EQ(static_cast<int>(got.kind), static_cast<int>(CfiOpKind::RegAtCfaOffset)) << "rule " << k;
+                auto const r = l.target->registerByName(want.reg);
+                ASSERT_TRUE(r.has_value()) << want.reg;
+                EXPECT_TRUE(got.reg == CfiRegRef::physical(*r)) << "rule " << k << ": " << want.reg;
+            }
+            EXPECT_EQ(got.offset, want.offset) << "rule " << k;
+        }
+    }
+}
+
 // The decode and the encode are inverses on every frame form, read back through the reader: each frame below is
 // written by the shipped object writer and read again, and its rules come back as they went in.
 TEST(CoffForeignUnwind, EveryFrameFormDecodesBackToTheRulesItWasWrittenFrom) {
@@ -437,6 +561,15 @@ TEST(CoffForeignUnwind, EveryFrameFormDecodesBackToTheRulesItWasWrittenFrom) {
         {"large", 17, {def(1, 16), at(1, reg("rsi"), -16), def(8, 224), at(17, reg("xmm15"), -32)}},
         // An allocation of one slot that saves nothing (clang's `push rax`): no push.
         {"oneslot", 3, {def(1, 16), at(1, reg("rbp"), -16), def(3, 24)}},
+        // Past every short spelling's reach: an allocation of 700000 (UWOP_ALLOC_LARGE op-info 1), a general
+        // register 700032 above the establisher frame (UWOP_SAVE_NONVOL_FAR) and a vector register 1200000 above it
+        // (UWOP_SAVE_XMM128_FAR).
+        {"hugealloc", 8, {def(1, 16), at(1, reg("rbp"), -16), def(8, 700016)}},
+        {"farsave", 12, {def(1, 16), at(1, reg("rbp"), -16), def(8, 700016), at(12, reg("rbx"), 16)}},
+        {"farvector", 17, {def(8, 1200016), at(17, reg("xmm6"), -16)}},
+        // A general register at a slot no multiple of 8 can name: the short spelling cannot state it, the long one
+        // states it exactly.
+        {"oddslot", 9, {def(4, 48), at(9, reg("rbx"), -44)}},
     };
     AssembledModule mod;
     mod.cuId = CompilationUnitId{1};
@@ -555,13 +688,15 @@ TEST(CoffForeignUnwind, AFormNoReferenceWroteIsRefusedByName) {
         std::uint8_t keep, set;   // byte = (byte & keep) | set
         char const* sentence;
     };
+    // The long spellings of UWOP_ALLOC_LARGE and of both saves are READ (every reference writes them past the short
+    // ones' reach: `TheHugeFixturesStateEveryLongSpelling`); an operation info UWOP_ALLOC_LARGE does not define is a
+    // corrupt record, refused as one.
     std::vector<Edit> const edits{
         {"version 2", *big, 0xF8, 0x02, "is version 2"},
         {"chained", *big, 0xFF, 0x04 << 3, "is chained to another function's"},
-        {"UWOP_ALLOC_LARGE op-info 1", *big + 5, 0x0F, 0x10, "states UWOP_ALLOC_LARGE with op-info 1"},
         {"UWOP_PUSH_MACHFRAME", *big + 5, 0xF0, 10, "states UWOP_PUSH_MACHFRAME"},
-        {"UWOP_SAVE_NONVOL_FAR", *big + 5, 0xF0, 5, "states UWOP_SAVE_NONVOL_FAR"},
-        {"UWOP_SAVE_XMM128_FAR", *big + 5, 0xF0, 9, "states UWOP_SAVE_XMM128_FAR"},
+        {"UWOP_ALLOC_LARGE op-info 2", *big + 5, 0x0F, 0x20,
+         "states UWOP_ALLOC_LARGE with op-info 2; the format defines 0"},
     };
     for (auto const& e : edits) {
         SCOPED_TRACE(e.what);
@@ -608,9 +743,11 @@ TEST(CoffForeignUnwind, ARecordThatRunsPastItsFunctionIsRefused) {
     EXPECT_TRUE(said(rep, "a record past its function's end describes another function's bytes")) << diagnosticsOf(rep);
 }
 
-// The `.eh_frame` writers state no personality and no data area yet: a function carrying a handler is refused by
-// each, by name, before any byte — and the PE writer refuses a function that carries both a foreign handler and
-// scopes of its own.
+// A handler comes in two shapes, one per unwind format (`eh_frame_handler_refusal.hpp`), and each writer refuses, by
+// name and before any byte, the shape it cannot state: the `.eh_frame` writers a handler whose data its object wrote
+// after the UNWIND_INFO (an `.eh_frame` names a handler's data only by a pointer to a data area), the PE writer a
+// handler that names its data by such a pointer (UNWIND_INFO carries it inline) -- and the PE writer a function that
+// carries both a foreign handler and scopes of its own.
 TEST(CoffForeignUnwind, AWriterThatCannotStateAHandlerRefusesItByName) {
     auto const l = load();
     ASSERT_TRUE(l.target && l.object);
@@ -659,13 +796,33 @@ TEST(CoffForeignUnwind, AWriterThatCannotStateAHandlerRefusesItByName) {
         std::vector<AssembledModule> one{handled(false)};
         LinkedImage const            img = linker::link(std::span<AssembledModule const>{one}, *l.target, **f, rep);
         EXPECT_FALSE(img.ok());
-        EXPECT_TRUE(said(rep, "carries the handler routine and data its object named for it")) << diagnosticsOf(rep);
+        EXPECT_TRUE(said(rep, "carries a handler whose data its object wrote after the function's Win64 unwind "
+                              "information (4 byte(s), 0 relocation(s))"))
+            << diagnosticsOf(rep);
     }
+    {
+        DiagnosticReporter           rep;
+        std::vector<AssembledModule> one{handled(true)};
+        LinkedImage const img = linker::link(std::span<AssembledModule const>{one}, *l.target, *l.object, rep);
+        EXPECT_FALSE(img.ok());
+        EXPECT_TRUE(said(rep, "carries a foreign object's handler too")) << diagnosticsOf(rep);
+    }
+    // The DWARF shape: no inline data, a pointer to an area in a data item of the link.
+    AssembledModule dwarf = handled(false);
+    dwarf.functions[0].languageHandler->data.clear();
+    dwarf.functions[0].languageHandler->dataArea = DataAreaRef{SymbolId{3}, 2};
+    AssembledData area;
+    area.symbol  = SymbolId{3};
+    area.section = DataSectionKind::Rodata;
+    area.bytes   = {0x00, 0x00, 0xff, 0x9b, 0x01, 0x00};
+    dwarf.dataItems.push_back(std::move(area));
     DiagnosticReporter           rep;
-    std::vector<AssembledModule> one{handled(true)};
+    std::vector<AssembledModule> one{std::move(dwarf)};
     LinkedImage const            img = linker::link(std::span<AssembledModule const>{one}, *l.target, *l.object, rep);
-    EXPECT_FALSE(img.ok());
-    EXPECT_TRUE(said(rep, "carries a foreign object's handler too")) << diagnosticsOf(rep);
+    EXPECT_FALSE(img.ok()) << "a handler naming its data by a pointer was written into UNWIND_INFO";
+    EXPECT_TRUE(said(rep, "names its data by a pointer to a language-specific data area, and UNWIND_INFO carries a "
+                          "handler's data only inline"))
+        << diagnosticsOf(rep);
 }
 
 // ══ THE LINK: a foreign `__try` object and a C `main`, through the production driver ═══════════════════════════════
@@ -744,4 +901,323 @@ TEST(CoffForeignUnwindNative, AReferenceTryObjectLinkedByDssCatchesItsFault) {
         EXPECT_FALSE(r.timedOut);
         EXPECT_EQ(r.exitCode, 42u) << kExit;
     }
+}
+
+// ══ A FILTER THAT IS AN EXPRESSION: cl's funclet in a section that goes with its function ═══════════════════════════
+//
+// `tests/link/data/win64_unwind_filter.source.c` (it states how each object was built): `cs_trygs`'s `__except`
+// filter is an EXPRESSION, so cl writes it as a function of its own, the funclet `cs_trygs$filt$0` (a STATIC
+// DTYPE_FUNCTION), and the scope table names it by ADDR32NB. Under /O2 and under /Gy the funclet's `.text$x` is a
+// COMDAT of selection ASSOCIATIVE to `cs_trygs`'s NODUPLICATES `.text$mn` -- a C object reaching ASSOCIATIVE with no
+// C++ in sight. ✔MEASURED P69 fold 3d (lane `xa`'s `seh_filter_probe.py`, cl 19.51, 2026-10-29): the objects of
+// /O2 /GS-, /O2 /GS, /Od /GS- and /Od /Gy /GS-, each linked by link.exe beside a cl `main` and by DSS from objects
+// alone and beside a C `main`, run to 42 -- the filter taking 0xE0000002 and declining 0xE0000003 to an outer
+// `__except`. Until P69 fold 3d the reader refused the /O2 and /Gy objects (checkpoint 35's Gate 3, "has COMDAT
+// Selection 5"); lane `hm`'s census object of the same shape (cl /O2 /GS /MD) was refused so.
+//
+//   win64_unwind_filter_x86_64_pe_cl_O2.obj    2190 B  md5 ddad35b486f36f585d4dbd4dcb07c2f9   cl 19.51 /O2 /GS /MD
+//   win64_unwind_filter_x86_64_pe_cl_OdGy.obj  2752 B  md5 4b548680aed546dbe42364c65a0f9716   cl 19.51 /Od /Gy /GS- /MD
+
+namespace {
+
+constexpr char const* kFilters[] = {"win64_unwind_filter_x86_64_pe_cl_O2.obj",
+                                    "win64_unwind_filter_x86_64_pe_cl_OdGy.obj"};
+constexpr char const* kFilterMain =
+    "int cs_trygs(unsigned code);\nint cs_trygs_outer(void);\n"
+    "int main(void) { return cs_trygs(0xE0000002u) + cs_trygs_outer(); }\n";
+constexpr char const* kFilterExit =
+    "42 is the filter RUN, taking 0xE0000002 to its handler (40) and declining 0xE0000003 to the outer `__except` (2); "
+    "80 every exception taken by the inner handler (the filter's answer never read); an exception code 0xE000000x no "
+    "handler was reached (the scope table named no filter the dispatcher could call)";
+
+// The symbol id the unit gives the name, or none.
+[[nodiscard]] std::optional<SymbolId> symbolNamed(AssembledModule const& m, std::string_view name) {
+    for (auto const& s : m.symbols) {
+        if (s.name == name) return s.symbol;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+// Every leg: the funclet is a LOCAL function of its own section, a section of its unit in no group (the section it goes
+// with is defined once); `cs_trygs`'s scope table names it; and DSS links each object beside a C `main`.
+// RED-ON-DISABLE: refuse an associative section rooted in NODUPLICATES (checkpoint 35's reader) -> both objects are
+// refused at read.
+TEST(CoffForeignUnwind, AFilterFuncletInASectionThatGoesWithItsFunctionIsReadAndLinked) {
+    auto const l = load();
+    ASSERT_TRUE(l.target && l.object);
+    for (auto const* name : kFilters) {
+        SCOPED_TRACE(name);
+        auto const bytes = fixture(name);
+        ASSERT_FALSE(bytes.empty());
+        DiagnosticReporter rep;
+        auto const unit = read(l, bytes, rep);
+        ASSERT_TRUE(unit.has_value()) << diagnosticsOf(rep);
+        auto const funclet = symbolNamed(*unit, "cs_trygs$filt$0");
+        auto const parent  = symbolNamed(*unit, "cs_trygs");
+        ASSERT_TRUE(funclet.has_value() && parent.has_value()) << "the reader states the funclet and its function";
+        for (auto const& s : unit->symbols) {
+            if (s.symbol == *funclet) EXPECT_EQ(s.binding, SymbolBinding::Local) << "the funclet is file-local";
+        }
+        AssembledFunction const* filter = nullptr;
+        AssembledFunction const* owner  = nullptr;
+        for (auto const& f : unit->functions) {
+            if (f.symbol == *funclet) filter = &f;
+            if (f.symbol == *parent) owner = &f;
+        }
+        ASSERT_NE(filter, nullptr) << "the funclet is a function of the unit";
+        ASSERT_NE(owner, nullptr);
+        ASSERT_TRUE(filter->inputSection.has_value() && owner->inputSection.has_value());
+        EXPECT_NE(filter->inputSection->section, owner->inputSection->section)
+            << "the funclet is cut from its own section, the one that goes with its function's";
+        EXPECT_TRUE(unit->sectionGroupOfInputSection.empty())
+            << "the section it goes with is defined once: no section of the unit is a copy";
+        ASSERT_TRUE(owner->languageHandler.has_value()) << "cs_trygs carries its handler and scope table";
+        bool const namesTheFilter =
+            std::any_of(owner->languageHandler->relocations.begin(), owner->languageHandler->relocations.end(),
+                        [&](Relocation const& r) { return r.target == *funclet; });
+        EXPECT_TRUE(namesTheFilter) << "the scope table's filter field names the funclet";
+        test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign-unwind-filter"};
+        EXPECT_FALSE(dssImage(scratch.path(), name, kFilterMain).empty());
+    }
+}
+
+// Windows x86_64: the filter RUNS -- each object's image, DSS's beside the C `main` and link.exe's beside a cl
+// `main`, raises both exceptions and runs to 42.
+TEST(CoffForeignUnwindNative, AFilterFuncletDecidesEachExceptionUnderLinkExeAndDss) {
+    if (test_support::hostNativeTarget().execTarget != "x86_64:pe64-x86_64-windows-exec") {
+        GTEST_SKIP() << "the image runs only where the host is Windows x86_64";
+    }
+    test_support::ScratchDir refs{test_support::Location::InsideRepo, "coff-foreign-unwind-filter-refs"};
+    auto const msvc = test_support::native_probe::locateMsvcToolchain(refs.path());
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const tools = test_support::native_probe::msvcToolsIn(msvc, refs.path());
+    ASSERT_TRUE(tools.ready()) << tools.describe();
+    std::ofstream(refs.path() / "main.c", std::ios::binary) << kFilterMain;
+    ASSERT_TRUE(tools.run("cl /nologo /c /O2 /GS- main.c /Fomain.obj")) << "cl compiles the C main";
+    std::size_t k = 0;
+    for (auto const* name : kFilters) {
+        SCOPED_TRACE(name);
+        {
+            test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign-unwind-filter-run"};
+            auto const image = dssImage(scratch.path(), name, kFilterMain);
+            ASSERT_FALSE(image.empty());
+            auto const r = test_support::runBinary(image);
+            ASSERT_TRUE(r.spawned) << r.diagnostic;
+            EXPECT_FALSE(r.timedOut);
+            EXPECT_EQ(r.exitCode, 42u) << "DSS's image: " << kFilterExit;
+        }
+        auto const bytes = fixture(name);
+        ASSERT_FALSE(bytes.empty());
+        std::ofstream(refs.path() / name, std::ios::binary)
+            .write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        std::string const exe = "filter_" + std::to_string(k++) + ".exe";
+        ASSERT_TRUE(tools.run("link /nologo /OUT:" + exe + " main.obj " + name)) << "MEASURED: link.exe links it";
+        auto const r = test_support::runBinary(refs.path() / exe);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u) << "link.exe's image: " << kFilterExit;
+    }
+}
+
+// ══ DSS's OWN FRAMES PAST THE SHORT SPELLINGS — D-WIN64-HUGE-FRAME-ALLOC ═════════════════════════════════════════════
+//
+// DSS compiles the `huge` fixtures' own source. Its frames pass 512 KiB - 8 as the references' do, and its writer
+// states them in the long spelling of UWOP_ALLOC_LARGE; before P69 fold 3d it refused every such frame by name.
+
+namespace {
+
+// `reach` reads through `p`: a null `p` faults inside it, and the fault is dispatched through the frame past 512 KiB
+// to the `__except` of the `main` that called it.
+constexpr char const* kHugeMain =
+    "int huge(int volatile *);\n"
+    "int hugeregs(int volatile *, int const *);\n"
+    "int hugexmm(int volatile *, double, double, double);\n"
+    "int reach(int volatile *p, char *b) { return *p + b[0]; }\n"
+    "int use(int x) { return x & 1; }\n"
+    "double dsink(double x) { return x * 0.5; }\n"
+    "int main(void) {\n"
+    "  int volatile v = 20;\n"
+    "  int w[8] = {0, 0, 0, 0, 0, 0, 0, 0};\n"
+    "  int r = 0;\n"
+    "  if (huge(&v) != 20 || hugeregs(&v, w) != 20 || hugexmm(&v, 0.0, 0.0, 0.0) != 20) return 90;\n"
+    "  __try { r = huge((int volatile *)0); } __except (1) { r = -1; }\n"
+    "  if (r != -1) return 11;\n"
+    "  __try { r = hugeregs((int volatile *)0, w); } __except (1) { r = -2; }\n"
+    "  if (r != -2) return 12;\n"
+    "  __try { r = hugexmm((int volatile *)0, 0.0, 0.0, 0.0); } __except (1) { r = -3; }\n"
+    "  return r == -3 ? 42 : 13;\n"
+    "}\n";
+constexpr char const* kHugeExit =
+    "42 is each fault dispatched through its frame past 512 KiB to `main`'s `__except`; 90 a frame miscomputed; 11 to "
+    "13 a handler ran and returned the wrong value; 0xC0000005 a fault escaped: the dispatcher could not unwind the "
+    "frame past 512 KiB";
+
+// The `huge` fixtures' source, copied into `dir` as `huge.c`.
+[[nodiscard]] fs::path hugeSource(fs::path const& dir) {
+    auto const bytes = fixture("win64_unwind_huge.source.c");
+    auto const src   = dir / "huge.c";
+    std::ofstream(src, std::ios::binary).write(reinterpret_cast<char const*>(bytes.data()),
+                                               static_cast<std::streamsize>(bytes.size()));
+    return src;
+}
+
+}  // namespace
+
+// Every leg: the relocatable object DSS writes for the source describes each of its three functions, and each with
+// UWOP_ALLOC_LARGE op-info 1 for the whole of its frame past 512 KiB - 8; the reader reads the object back.
+TEST(Win64HugeFrame, DssWritesItsOwnFramePastFiveHundredTwelveKiBInTheLongSpelling) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "win64-huge-frame-object"};
+    auto const               src = hugeSource(scratch.path());
+    auto const               out = scratch.path() / "dss.out";
+    fs::create_directories(out);
+    Program p;
+    p.setOutputDir(out);
+    DiagnosticReporter rep;
+    ASSERT_EQ(p.compileFiles(std::vector<std::string>{src.string()}, "c",
+                             std::vector<std::string>{"x86_64:pe64-x86_64-windows"}, rep),
+              0)
+        << "DSS describes a frame past 512 KiB:" << diagnosticsOf(rep);
+    auto const bytes = bytesOf(out / "huge.obj");
+    ASSERT_FALSE(bytes.empty());
+    auto const u = unwindOf(Coff::of(bytes));
+    for (char const* fn : {"huge", "hugeregs", "hugexmm"}) {
+        SCOPED_TRACE(fn);
+        auto const it = u.find(std::string{fn} + "+0");
+        ASSERT_NE(it, u.end()) << "the function is described";
+        // The allocation's operand: the two nodes after its code's own, low word first, unscaled.
+        auto const&                  c = it->second.codes;
+        auto const                   node = [&](std::size_t k) { return static_cast<std::uint32_t>(c[4 + 2 * k] | (c[5 + 2 * k] << 8)); };
+        std::optional<std::uint32_t> size;
+        for (std::size_t slot = 0; slot < c[2];) {
+            std::uint8_t const op = c[5 + 2 * slot] & 0x0Fu, info = c[5 + 2 * slot] >> 4;
+            if (op == 1u && info == 1u) size = node(slot + 1) | (node(slot + 2) << 16);
+            slot += op == 1u ? (info == 0u ? 2u : 3u) : op == 4u || op == 8u ? 2u : op == 5u || op == 9u ? 3u : 1u;
+        }
+        ASSERT_TRUE(size.has_value()) << "UWOP_ALLOC_LARGE op-info 1, codes " << hex(c);
+        EXPECT_GT(*size, 524280u) << "an allocation the short spelling cannot state";
+        EXPECT_EQ(*size % 8u, 0u);
+    }
+    DiagnosticReporter rrep;
+    auto const         l = load();
+    ASSERT_TRUE(l.target && l.object);
+    EXPECT_TRUE(read(l, bytes, rrep).has_value()) << "the reader reads DSS's own long spellings:" << diagnosticsOf(rrep);
+}
+
+// The reference `huge` objects, each built by its own toolchain from the source above (each states how), and the
+// routines of the platform runtime each names. ✔MEASURED P69 fold 3d (the first run that linked them,
+// 20261022-021409-34892492, when DSS refused each link by exactly these names): cl /O2 names the probe, the /GS
+// cookie, its check and the handler its UNWIND_INFO carries (`__GSHandlerCheck`); cl /Od those and
+// `__report_rangecheckfailure`; clang-cl /O2 the probe, the cookie and its check; gcc -O2 its probe alone. Since lane
+// `hm`'s H5 every one is DEFINED in a pe64 image by the format's compilerSupport runtime
+// (D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED, D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED).
+namespace {
+
+constexpr char const* kHugeObjects[] = {
+    "win64_unwind_huge_x86_64_pe_cl_O2.obj",
+    "win64_unwind_huge_x86_64_pe_cl_Od.obj",
+    "win64_unwind_huge_x86_64_pe_clangcl_O2.obj",
+    "win64_unwind_huge_x86_64_pe_gcc_O2.obj",
+};
+std::set<std::string> const kHugePlatformRoutines{"__chkstk",           "___chkstk_ms",     "__security_cookie",
+                                                  "__security_check_cookie", "__GSHandlerCheck",
+                                                  "__report_rangecheckfailure"};
+
+// DSS's image of the reference object beside `kHugeMain` (a 4 MiB stack: `hugexmm`'s frame passes the 1 MiB
+// default), or empty with `rep` holding why.
+[[nodiscard]] fs::path hugeObjectImage(fs::path const& dir, char const* object, DiagnosticReporter& rep) {
+    auto const bytes = fixture(object);
+    if (bytes.empty()) return {};
+    auto const obj = dir / object;
+    std::ofstream(obj, std::ios::binary).write(reinterpret_cast<char const*>(bytes.data()),
+                                               static_cast<std::streamsize>(bytes.size()));
+    auto const main = dir / "main.c";
+    std::ofstream(main, std::ios::binary) << kHugeMain;
+    auto const out = dir / "dss.out";
+    fs::create_directories(out);
+    Program p;
+    p.setOutputDir(out);
+    p.setStackReserveBytes(std::uint64_t{4} << 20);
+    if (p.compileUnits(std::vector<std::string>{obj.string(), main.string()}, "c",
+                       std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep)
+        != 0) {
+        return {};
+    }
+    for (auto const& e : fs::directory_iterator(out)) {
+        if (e.is_regular_file() && e.path().extension() == ".exe") return e.path();
+    }
+    return {};
+}
+
+}  // namespace
+
+// Every leg: each reference `huge` object, linked by DSS beside the same `main`, is READ whole, its long spellings
+// included, and LINKS -- every routine of the platform runtime it calls defined in the image, none imported. Until
+// H5 the link was refused by name for exactly those routines.
+TEST(CoffForeignUnwind, AReferenceHugeObjectLinksWithEveryPlatformRoutineItCallsDefined) {
+    for (auto const* object : kHugeObjects) {
+        SCOPED_TRACE(object);
+        test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign-huge-link"};
+        DiagnosticReporter rep;
+        auto const image = hugeObjectImage(scratch.path(), object, rep);
+        ASSERT_FALSE(image.empty()) << "DSS links the reference object beside the C `main`:" << diagnosticsOf(rep);
+        auto const imported = test_support::peImportedSymbols(bytesOf(image));
+        for (auto const& routine : kHugePlatformRoutines) {
+            EXPECT_EQ(std::find(imported.begin(), imported.end(), routine), imported.end())
+                << routine << " is imported; the compilerSupport runtime defines it in the image";
+        }
+    }
+}
+
+// Windows x86_64: each reference object's program runs, every fault dispatched through the REFERENCE's own frame past
+// 512 KiB to `main`'s `__except`, as the DSS-compiled source's program does below.
+TEST(CoffForeignUnwindNative, EachReferenceHugeObjectsFaultReachesMainsExcept) {
+    if (test_support::hostNativeTarget().execTarget != "x86_64:pe64-x86_64-windows-exec") {
+        GTEST_SKIP() << "the image runs only where the host is Windows x86_64";
+    }
+    for (auto const* object : kHugeObjects) {
+        SCOPED_TRACE(object);
+        test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-foreign-huge-run"};
+        DiagnosticReporter rep;
+        auto const image = hugeObjectImage(scratch.path(), object, rep);
+        ASSERT_FALSE(image.empty()) << diagnosticsOf(rep);
+        auto const r = test_support::runBinary(image);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u) << kHugeExit;
+    }
+}
+
+// Windows x86_64: DSS compiles the source beside a `main` that faults through each frame inside a `__try`, and every
+// fault reaches its `__except` (the references' own links of the same functions unwind into `main`, MEASURED at the
+// fixtures' build). The image asks for a 4 MiB stack: `hugexmm`'s frame passes the 1 MiB default.
+TEST(Win64HugeFrameNative, ADssFramePastFiveHundredTwelveKiBUnwindsToItsCallersExcept) {
+    if (test_support::hostNativeTarget().execTarget != "x86_64:pe64-x86_64-windows-exec") {
+        GTEST_SKIP() << "the image runs only where the host is Windows x86_64";
+    }
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "win64-huge-frame-run"};
+    auto const               src  = hugeSource(scratch.path());
+    auto const               main = scratch.path() / "main.c";
+    std::ofstream(main, std::ios::binary) << kHugeMain;
+    auto const out = scratch.path() / "dss.out";
+    fs::create_directories(out);
+    Program p;
+    p.setOutputDir(out);
+    p.setStackReserveBytes(std::uint64_t{4} << 20);
+    DiagnosticReporter rep;
+    ASSERT_EQ(p.compileUnits(std::vector<std::string>{src.string(), main.string()}, "c",
+                             std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep),
+              0)
+        << diagnosticsOf(rep);
+    fs::path image;
+    for (auto const& e : fs::directory_iterator(out)) {
+        if (e.is_regular_file() && e.path().extension() == ".exe") image = e.path();
+    }
+    ASSERT_FALSE(image.empty()) << "no image in " << out.string();
+    auto const r = test_support::runBinary(image);
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u) << kHugeExit;
 }

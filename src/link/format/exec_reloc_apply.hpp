@@ -9,8 +9,10 @@
 #include "link/branch_reloc_geometry.hpp"
 #include "link/format/byte_emit.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -19,7 +21,7 @@
 #include <vector>
 
 // Shared walker substrate for the 3 image-side walkers (ELF
-// ET_EXEC, PE PE32+, Mach-O MH_EXECUTE). Two concerns now live
+// ET_EXEC, PE PE32+, Mach-O MH_EXECUTE). Three concerns now live
 // here:
 //
 //   1. `applyExecRelocations` — in-place relocation applier (plan
@@ -35,7 +37,12 @@
 //      name resolution, defaults to functions[0]. 5 walker sites
 //      collapsed via this helper.
 //
-// The two functions share the `dss::link::format` namespace and
+//   3. `anImageThatStartsAProgramHoldsAnInstruction` — whether an
+//      image may hold no instruction, asked of its document's entry
+//      declaration by each format's writer first, once, at its entry
+//      (P69 fold 3d).
+//
+// The functions share the `dss::link::format` namespace and
 // rely on the `detail::emit` reporter helper from `byte_emit.hpp`.
 //
 // LK6 cycle 2a generalisation: the caller now passes an
@@ -186,6 +193,15 @@ namespace dss::link::format {
 // the lowering: the slot is a separate symbol, so the two references name two
 // symbols.
 
+// The Linear arm's value is `linearFieldValue`'s (`core/types/target_schema.hpp`),
+// the one formula every writer of a Linear field asks.
+//
+// `imageRelativeBase`: the address an IMAGE-RELATIVE field (`imageRelative`, an
+// RVA — COFF's ADDR32NB) is measured from, i.e. the image's base, as the caller's
+// image states it. Absent where the image states none: an image-relative field
+// then has nothing to be measured from and is refused by name, never written as
+// an address. (P69 fold 3d, review F4: the Linear arm wrote S + A for such a
+// field — a VA where the field holds an RVA.)
 [[nodiscard]] inline bool applyExecRelocations(
     std::vector<std::uint8_t>&  text,
     AssembledModule const&      module,
@@ -194,19 +210,15 @@ namespace dss::link::format {
     TargetSchema const&         targetSchema,
     std::uint64_t               patchSectionVa,
     std::string_view            diagPrefix,
-    DiagnosticReporter&         reporter) {
+    DiagnosticReporter&         reporter,
+    std::optional<std::uint64_t> imageRelativeBase = std::nullopt) {
     using ::dss::link::format::detail::emit;
     auto const prefixStr = std::string{diagPrefix};
 
-    if (text.empty()) {
-        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-             prefixStr + ": `.text` is empty — every "
-                           "AssembledFunction contributed zero bytes. "
-                           "An exec with no instructions would crash "
-                           "at entry.");
-        return false;
-    }
-
+    // An image with no instruction has no relocation of a function to apply, and that is no error of this kernel's:
+    // whether the image may hold none is its KIND's question, asked by every writer before it gets here
+    // (`anImageThatStartsAProgramHoldsAnInstruction` below). This kernel refused an empty `.text` under
+    // K_RelocationKindMismatch until P69 fold 3d, which refused every library that holds data alone.
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
         auto const& fn = module.functions[fi];
         std::uint64_t const fnStart = funcTextStart[fi];
@@ -302,10 +314,15 @@ namespace dss::link::format {
 
             switch (tri->formulaKind) {
                 case RelocFormulaKind::Linear: {
-                    std::int64_t const value =
-                        static_cast<std::int64_t>(S) + A
-                        + (tri->pcRelative ? -static_cast<std::int64_t>(P) : 0)
-                        + tri->addendBias;
+                    auto const linear = linearFieldValue(*tri, S, A, P, imageRelativeBase);
+                    if (!linear.has_value()) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' is image-relative, and this image states no base "
+                                   "for it to be measured from.");
+                        return false;
+                    }
+                    std::int64_t const value = *linear;
                     // The field's range is the row's (`linearFieldHolds`, the
                     // one check every Linear writer asks — P69 fold 3c).
                     if (std::string why; !linearFieldHolds(*tri, value, why)) {
@@ -610,6 +627,46 @@ namespace dss::link::format {
         }
     }
     return true;
+}
+
+// ── AN IMAGE MUST HOLD AN INSTRUCTION ONLY WHEN ITS KIND STARTS A PROGRAM ──
+//    D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS (P69 fold 3d)
+//
+// What decides whether an image may hold no instruction is what its document declares about the image kind's
+// entry, never a format name. The document's entry verbs (`ObjectFormatSchema::entryVerbs`) are that declaration:
+// a document that declares some starts a program, and an empty set is the declared answer "this kind starts none",
+// the one the engine's "does this build need an entry" question reads everywhere else. A program with no
+// instruction has nothing to start at, so it is refused as a program with no entry (K_ProgramEntryUndefined). A
+// library kind is written with its data alone, as each reference writes one. ✔MEASURED 2026-10-21 and 2026-10-28,
+// a library of one exported datum and no function, its datum read through an import by a program that exits 42:
+// link.exe `/DLL /NOENTRY` writes `.rdata` and `.data` and no code section (SizeOfCode 0, AddressOfEntryPoint 0);
+// GNU ld and ld.lld `-shared -nostdlib` write no executable PT_LOAD; ld64 `-dynamiclib` writes a 0-byte `__text`
+// and the `__data`.
+//
+// Each format's writer asks it ONCE, FIRST, at its one entry (`pe::encode`, `elf::encode`, `macho::encode`), before
+// any other question about what the image holds -- every kind of the format, so a library's and an object's answer
+// is "yes" from their documents rather than from a path that skips the question. Every writer used to refuse an
+// empty `.text` under a code that said something else: K_RelocationKindMismatch ("an exec with no instructions
+// would crash at entry", the PE writer and the shared relocation kernel above) or K_SymbolUndefined (the ELF and
+// Mach-O writers), a library included. ✔MEASURED (run 20261103-182329-b11a07e8): asked inside a Mach-O writer's
+// arm, the question came after `macho::encode`'s code-signature gate, which refused a program of data alone as
+// a signed image with no import (K_FormatLacksImportSupport) -- a second, wrong answer to the same question.
+// The code it holds is its functions' bytes: what every writer lays out as its code section.
+[[nodiscard]] inline bool anImageThatStartsAProgramHoldsAnInstruction(
+        AssembledModule const&    module,
+        ObjectFormatSchema const& format,
+        std::string_view          diagPrefix,
+        DiagnosticReporter&       reporter) {
+    bool const holdsCode = std::any_of(module.functions.begin(), module.functions.end(),
+                                       [](AssembledFunction const& fn) { return !fn.bytes.empty(); });
+    if (holdsCode || format.entryVerbs().empty()) return true;
+    ::dss::link::format::detail::emit(
+        reporter, DiagnosticCode::K_ProgramEntryUndefined,
+        std::format("{}: the image holds no instruction, and its document '{}' starts a program (it declares {} "
+                    "entry verb(s)), so the program has no entry to start at. Only an image whose document "
+                    "declares no entry verb, a library's, is written with its data alone.",
+                    diagPrefix, format.name(), format.entryVerbs().size()));
+    return false;
 }
 
 // D-LK10-ENTRY-RESOLVE-ENTRY-FN-IDX (3-agent FOLD-NOW at Slice C

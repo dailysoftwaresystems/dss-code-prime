@@ -1,0 +1,1 @@
+        return false && b.size > a.size ? GroupCopyJudgement{GroupCopyVerdict::KeepNew, {}} : keepKept;

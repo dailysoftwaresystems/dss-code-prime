@@ -75,6 +75,13 @@ maxExistingSymbolIdV(AssembledModule const& mod) noexcept {
     for (SymbolId const s : mod.nullAddressSymbols) {
         if (s.v > maxV) maxV = s.v;
     }
+    // ★ AND EVERY SYMBOL THE IMAGE DEFINES (P69 fold 3d,
+    // D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): the reference gate takes the
+    // import row out of `externImports` and keeps its id only in that list, so
+    // without it a pass minting "the next free id" could hand that id out again.
+    for (auto const& b : mod.imageDefinedSymbols) {
+        if (b.symbol.v > maxV) maxV = b.symbol.v;
+    }
     // ★ AND THE TWO IDS AN EXCEPTION SCOPE NAMES — the FIFTH widening (P69,
     // D-LK-MERGE-LEFT-SEH-SCOPE-IDS-AND-UNIT-ENTRY-UNRENUMBERED). A scope's
     // filter funclet and personality are references that no relocation carries,
@@ -115,12 +122,16 @@ maxExistingSymbolIdV(AssembledModule const& mod) noexcept {
     // ★ AND A CARRIED HANDLER'S — the SEVENTH widening (P69 fold 3c): its routine
     // and the targets of its data's relocations are references no function's
     // relocation list carries, so an id one of them names that nothing else
-    // holds is passed for the reason the scope's two ids are above.
+    // holds is passed for the reason the scope's two ids are above. Its DWARF
+    // shape's data area names an item (P69 fold 3d): an id too.
     for (auto const& fn : mod.functions) {
         if (!fn.languageHandler.has_value()) continue;
         if (fn.languageHandler->personality.v > maxV) maxV = fn.languageHandler->personality.v;
         for (auto const& rel : fn.languageHandler->relocations) {
             if (rel.target.v > maxV) maxV = rel.target.v;
+        }
+        if (fn.languageHandler->dataArea.has_value() && fn.languageHandler->dataArea->item.v > maxV) {
+            maxV = fn.languageHandler->dataArea->item.v;
         }
     }
     return maxV;

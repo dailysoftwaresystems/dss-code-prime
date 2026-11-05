@@ -1,0 +1,1 @@
+an under-aligned `_Atomic` load must call the document's generic `__atomic_load`

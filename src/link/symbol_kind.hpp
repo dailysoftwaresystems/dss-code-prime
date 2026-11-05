@@ -40,6 +40,12 @@ enum class SymbolKind : std::uint8_t {
     // names it directly sees it. Neither a body nor an import: the writer that
     // places the image at its link address gives it the address 0.
     NullAddress = 4,
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a symbol the
+    // IMAGE defines (`AssembledModule::imageDefinedSymbols`) — a name the image's
+    // document states that no linked unit defines. Neither a body nor an import:
+    // the writer gives it an address of the image itself (PE's `__ImageBase`, the
+    // image's DOS header).
+    ImageDefined = 5,
 };
 
 // A `SymbolId` scoped to its defining CompilationUnit — the linker's collision-

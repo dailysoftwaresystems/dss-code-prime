@@ -485,6 +485,37 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
     return true;
 }
 
+// P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): add each name the
+// IMAGE defines (`AssembledModule::imageDefinedSymbols`, bound by
+// `linker::link`'s reference gate) to `symbolVa` at the address of the image it
+// denotes. The one place an image writer turns the vocabulary into an address,
+// so every writer reads `ImageHeader` alike: the image's first byte, which the
+// writer maps at `imageHeaderVa` (PE: the image base; ELF: the first PT_LOAD's
+// VA, whose file offset is 0; Mach-O: the `__TEXT` segment's). A name already
+// in the map collides with a definition the gate should have kept: the caller's
+// bug, `K_SymbolUndefined`, false.
+[[nodiscard]] inline bool addImageDefinedSymbolVas(
+    std::span<AssembledModule::ImageDefinedBinding const> bindings,
+    std::uint64_t                                         imageHeaderVa,
+    std::unordered_map<SymbolId, std::uint64_t>&          symbolVa,
+    std::string_view                                      writerName,
+    DiagnosticReporter&                                   reporter) {
+    using ::dss::link::format::detail::emit;
+    for (auto const& b : bindings) {
+        std::uint64_t va = 0;
+        switch (b.address) {
+            case ImageDefinedAddress::ImageHeader: va = imageHeaderVa; break;
+        }
+        if (!symbolVa.emplace(b.symbol, va).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format("{}: the image-defined symbol #{} collides with another symbol.",
+                             writerName, b.symbol.v));
+            return false;
+        }
+    }
+    return true;
+}
+
 // D-CSUBSET-THREAD-LOCAL (TLS C1): register each NAMED thread-local data
 // item's THREAD-POINTER OFFSET (tpoff) into the caller's `symbolVa` map, and
 // its SymbolId into `tlsSymbols`.
@@ -679,19 +710,21 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
 }
 
 // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each reloc-bearing data item's bytes
-// IN PLACE with its target symbol's absolute VA. Shared by the exec writers
-// (PE/ELF/Mach-O): an exec image has resolved VAs, so an abs64 data fixup is
-// written directly into the section bytes (no `.rela` section for an exec image; a
-// PIE image carries the loader-applied slide). `bytesOut` is the section's MUTABLE
+// IN PLACE with its Linear field's value. The ELF and Mach-O exec writers ask it
+// (a PE image's data items go through `pe.cpp`'s own collector, which asks the
+// same `linearFieldValue`): an exec image has resolved VAs, so a data fixup is
+// written directly into the section bytes. `bytesOut` is the section's MUTABLE
 // byte buffer (the caller emits it); `layout` is the one buildExecDataSection
 // produced for `dataItems` + this section's kind (itemOffsets/itemIndices
-// parallel); `sectionVa` is the section base (a VA — for PE an RVA). Only ABSOLUTE
-// relocs are valid in data (a pc-relative kind is a producer bug). `siteVasOut`
-// (optional): each 8-byte-absolute fixup's `sectionVa + patchOffset` is appended —
-// PE passes it for the `.reloc` DIR64 base-relocation table; ELF / Mach-O pass
-// nullptr. Returns false + emits on any error (unresolved target, pc-relative /
-// zero-width kind, write overrun, or — when collecting sites — a non-8-byte
-// absolute reloc with no base-reloc representation).
+// parallel); `sectionVa` is the section base. An absolute field or a pc-relative
+// one (a jump table's self-relative entry); never a thread-local or an
+// image-relative one. `siteVasOut` (optional): the VA of each field the loader
+// rebases (`loaderRebasesTheField`) is appended — an ELF ET_DYN passes it for its
+// R_*_RELATIVE rows and a Mach-O image for its rebase opcodes; a fixed-base image
+// passes nullptr. Returns false + emits on any error (unresolved target, a
+// non-Linear / zero-width / thread-local / image-relative kind, write overrun, a
+// value outside the field, or — when collecting sites — a rebased field narrower
+// than 8 bytes, which neither loader can rebase).
 [[nodiscard]] inline bool applyDataItemRelocations(
     std::vector<std::uint8_t>&                          bytesOut,
     std::vector<AssembledData> const&                   dataItems,
@@ -758,13 +791,40 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                                  static_cast<int>(tri->widthBytes), di.bytes.size()));
                 return false;
             }
-            // value = S + A + (pcRel ? -P : 0) + addendBias  (the schema formula).
+            // A THREAD-LOCAL field: its value is an offset into a thread's block,
+            // which this writer does not compute — and no route hands it one
+            // (✔MEASURED 2026-10-21, P69 fold 3d: the C front end refuses a
+            // thread-local's address in a static initializer, the x86_64 and
+            // arm64 assembler dialects refuse `@tpoff` / `@dtpoff` / `:tprel:`
+            // in a data directive, and a foreign object's thread-local
+            // relocations are refused at read). Refused by name, so a route that
+            // opens one meets this instead of an address in the field.
+            if (tri->tls) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("{}: data item SymbolId={{ {} }} relocation '{}' is "
+                                 "thread-local - a data item's field holds an address "
+                                 "or a distance, and this writer computes no "
+                                 "thread-block offset.",
+                                 writerName, di.symbol.v, tri->name));
+                return false;
+            }
+            // The value is the schema formula's (`linearFieldValue`, the one every
+            // writer of a Linear field asks). An image-relative field: these
+            // images state no image base (PE's, the only format that writes one,
+            // goes through `pe.cpp`).
             std::uint64_t const patchVa =
                 sectionVa + static_cast<std::uint64_t>(patchOff);
-            std::int64_t signedValue = static_cast<std::int64_t>(sIt->second)
-                                     + rel.addend
-                                     + static_cast<std::int64_t>(tri->addendBias);
-            if (tri->pcRelative) signedValue -= static_cast<std::int64_t>(patchVa);
+            auto const linear = linearFieldValue(*tri, sIt->second, rel.addend, patchVa,
+                                                 std::nullopt);
+            if (!linear.has_value()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("{}: data item SymbolId={{ {} }} relocation '{}' is "
+                                 "image-relative, and this image states no base for it "
+                                 "to be measured from.",
+                                 writerName, di.symbol.v, tri->name));
+                return false;
+            }
+            std::int64_t const signedValue = *linear;
             // Range tripwire for a narrow (< 8-byte) fixup -- the SAME
             // last-line guard the instruction-fixup kernel applies
             // (`applyExecRelocations`, exec_reloc_apply.hpp): a value outside the
@@ -786,21 +846,20 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                 bytesOut[patchOff + b] =
                     static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
             }
-            // A pc-relative (self-relative) data fixup is invariant under a uniform
-            // image rebase, so it needs NO base-relocation entry. Only an ABSOLUTE
-            // 8-byte pointer slot does (PE `.reloc` DIR64).
-            if (siteVasOut != nullptr && !tri->pcRelative) {
+            // Only a field holding an ADDRESS moves with the image
+            // (`loaderRebasesTheField`, the one predicate): a pc-relative
+            // (self-relative) entry is invariant under a uniform rebase.
+            if (siteVasOut != nullptr && loaderRebasesTheField(*tri)) {
                 if (tri->widthBytes != 8) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format("{}: data item SymbolId={{ {} }} absolute "
                                      "relocation '{}' has width {} — only an 8-byte "
-                                     "absolute fixup has a base-relocation form.",
+                                     "absolute fixup has a rebase form.",
                                      writerName, di.symbol.v, tri->name,
                                      static_cast<int>(tri->widthBytes)));
                     return false;
                 }
-                siteVasOut->push_back(
-                    sectionVa + static_cast<std::uint64_t>(patchOff));
+                siteVasOut->push_back(patchVa);
             }
         }
     }

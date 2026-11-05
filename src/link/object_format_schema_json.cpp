@@ -455,7 +455,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // realizes what a reference toolchain's own static runtime defines for its
     // objects, and the /GS cookie seeder DSS's PE startup calls. OPTIONAL:
     // stated by the four PE documents.
-    static constexpr std::array<std::string_view, 60> kFormatDocumentKeys{
+    // 60 -> 61 (P69 fold 3d, lane `xa`): `imageDefinedSymbols`, the names an
+    // image's linker defines at its own header (PE `__ImageBase`, ELF
+    // `__ehdr_start`, Mach-O `__mh_execute_header`, ...). OPTIONAL: stated by
+    // the four PE, the ten ELF and the eight Mach-O documents.
+    static constexpr std::array<std::string_view, 61> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -550,6 +554,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // the routines a reference toolchain's own static runtime defines for
         // its objects, and the cookie seeder DSS's PE startup calls (P69 H5)
         "compilerSupport",
+        // the names the image defines for a reference no unit defines (P69 3d)
+        "imageDefinedSymbols",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // where an image records its library search path (DT_RUNPATH /
@@ -2556,6 +2562,76 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     cs.at(kInitKey).get<std::string>();
             }
             if (ok) data.compilerSupport = std::move(out);
+        }
+    }
+
+    // ── P69 fold 3d: `imageDefinedSymbols` ─────────────────────────────────
+    //
+    // `[{"name": <non-empty>, "address": <ImageDefinedAddress>}, …]`, each name
+    // once: the names every reference linker of this format defines in an image,
+    // at an address of the image, for a reference no linked unit defines
+    // (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL). OPTIONAL: absent, the image
+    // defines no name. WHICH documents may state one -- an image whose backend
+    // writes the address -- is `validate()`'s question, asked of the loaded data.
+    static constexpr std::array<std::string_view, 2>
+        kImageDefinedSymbolKeys{"name", "address"};
+    DSS_CHECK_KEY_VOCABULARY(kImageDefinedSymbolKeys);
+    if (doc.contains("imageDefinedSymbols")) {
+        auto const& list = doc.at("imageDefinedSymbols");
+        if (!list.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/imageDefinedSymbols",
+                      std::format("'imageDefinedSymbols' must be an array of "
+                                  "objects with the keys {}",
+                                  allowedList(kImageDefinedSymbolKeys, ", ")));
+        } else {
+            std::vector<std::string> seen;
+            for (std::size_t i = 0; i < list.size(); ++i) {
+                std::string const at = "/imageDefinedSymbols/" + std::to_string(i);
+                auto const& row = list[i];
+                if (!row.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, at,
+                              std::format("an 'imageDefinedSymbols' row must be an "
+                                          "object with the keys {}",
+                                          allowedList(kImageDefinedSymbolKeys, ", ")));
+                    continue;
+                }
+                rejectUnknownKeys(row, kImageDefinedSymbolKeys, at,
+                                  "an 'imageDefinedSymbols' row", coll);
+                ImageDefinedSymbol out;
+                bool ok = true;
+                if (!row.contains("name") || !row.at("name").is_string()
+                 || row.at("name").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField, at + "/name",
+                              "requires a non-empty 'name' -- the link-level "
+                              "name a unit's reference names (pe: \"__ImageBase\")");
+                    ok = false;
+                } else {
+                    out.name = row.at("name").get<std::string>();
+                    if (std::find(seen.begin(), seen.end(), out.name) != seen.end()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField, at + "/name",
+                                  std::format("states '{}' a second time -- one "
+                                              "name denotes one address of the image",
+                                              out.name));
+                        ok = false;
+                    }
+                    seen.push_back(out.name);
+                }
+                std::optional<ImageDefinedAddress> address;
+                if (row.contains("address") && row.at("address").is_string()) {
+                    address = imageDefinedAddressFromName(
+                        row.at("address").get<std::string>());
+                }
+                if (!address.has_value()) {
+                    coll.emit(DiagnosticCode::C_MissingField, at + "/address",
+                              std::format("requires 'address', the address of the "
+                                          "image the name denotes: one of {}",
+                                          allowedList(allNames(kImageDefinedAddressTable), ", ")));
+                    ok = false;
+                } else {
+                    out.address = *address;
+                }
+                if (ok) data.imageDefinedSymbols.push_back(std::move(out));
+            }
         }
     }
 

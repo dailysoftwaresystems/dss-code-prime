@@ -73,6 +73,11 @@
     "securityCookieInitializer": "__security_init_cookie"
   },
 
+  "$imageDefinedSymbolsComment": "P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, ledger 484): the names the IMAGE this object ends in will define -- `__ImageBase`, the image's DOS header -- stated here because the compile reads them: a reference to one is DIRECT (never an import's slot), as cl's own `lea __ImageBase` is, so a DSS object and cl's link into one image by link.exe and by DSS alike. This document's link defines nothing itself (an object's final linker does); that is the image documents' rows, which their writers give the address.",
+  "imageDefinedSymbols": [
+    { "name": "__ImageBase", "address": "imageHeader" }
+  ],
+
   "$sehPersonalityComment": "UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION + D-WIN64-SEH-FUNCLETS) and P69 fold 3c (the review of the fix fold, A2; D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO): the routine an emitted UNWIND_INFO names as its EHANDLER, and the ROLE that owns the image it is imported from -- the same declaration as the exec and dll documents, so a `__try` compiled into this OBJECT is what `cl /c` makes of it: a function whose `.xdata` names the personality and states its scope table, each RVA a relocation (`IMAGE_REL_AMD64_ADDR32NB`) the final linker resolves, the personality an undefined external the final link binds. Until this fold the document stated none, on a premise the writer had outgrown: its omission comment said `pe::encode`'s Obj arm REFUSED a module whose functions carry scope tables, while the arm writes the table as relocations (`PeObjWriter.ATryRegionCarriesItsScopeTableIntoTheObject`, and the guarded overridable body's records of `CoffWeakDefaultRecord`); so a `__try` compiled for this document was refused before that writer was reached (`L_UnsupportedLoweringForOpcode`), where cl compiles it into an object and link.exe links it -- one working reference makes it required. Pinned through the CLI's OBJECT door, the object linked by DSS and by link.exe and run (`tests/link/test_pe_object_unwind_reference_link.cpp`, `PeObjSeh`). `__C_specific_handler` is exported by ucrtbase (ord 30), msvcrt, ntdll and vcruntime140 (MEASURED 2026-08-10); an object names it by name only, and the final link decides which image binds it.",
   "sehPersonality": { "role": "unwindPersonality", "mangledName": "__C_specific_handler" },
 
@@ -230,7 +235,7 @@
       "nativeId": 1
     },
     {
-      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. P69 fold 3c (D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND): `kind` = 14 matches x86_64.target.json's `addr32` row -- the one wire type COFF has for `.long sym` and `movl $sym` alike, so its field holds GNU ld's range for it, [-2^31, 2^32) (MEASURED 2026-10-20), and this row OWNS the wire id: an object's ADDR32 reads back as `addr32`.",
+      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. P69 fold 3c (D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND): `kind` = 14 matches x86_64.target.json's `addr32` row -- the one wire type COFF has for `.long sym` and `movl $sym` alike, so its field holds [-2^31, 2^32): the upper edge GNU ld's (MEASURED 2026-10-20), the lower edge DECIDED (a value below -2^31 reads back as neither itself zero-extended nor itself sign-extended; x86_64.target.json's `addr32` row states the reason), and this row OWNS the wire id: an object's ADDR32 reads back as `addr32`.",
       "name": "IMAGE_REL_AMD64_ADDR32",
       "kind": 14,
       "nativeId": 2

@@ -1,0 +1,3 @@
+    if (linkPositionPrecedes(aPosition, bPosition)) return true;
+    if (linkPositionPrecedes(bPosition, aPosition)) return false;
+    return lessKey(a, b);

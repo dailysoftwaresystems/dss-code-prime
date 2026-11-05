@@ -1,0 +1,2 @@
+                        if (auto signature = copiesSignatureOf(rootDefinition)) {
+                            (void)signature;

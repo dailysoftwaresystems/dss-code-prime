@@ -1,0 +1,2 @@
+                    case kComdatSelNoDuplicates:
+                        break;   // one copy: the section goes with its unit

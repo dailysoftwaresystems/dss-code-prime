@@ -1,1 +1,1 @@
-    if (link::format::refuseAHandlerTheEhFrameCannotState(module.functions, "macho::encode", reporter)) {
+    if (link::format::refuseAWin64HandlerTheEhFrameCannotState(module.functions, "macho::encode", reporter)) {

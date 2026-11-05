@@ -1,0 +1,1 @@
+            if (bestLen != 0) base.resize(bestLen);

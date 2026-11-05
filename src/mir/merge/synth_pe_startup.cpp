@@ -110,37 +110,74 @@ entryCallConv(TypeInterner const& interner, TypeId entrySig) {
     return static_cast<CallConv>(raw);
 }
 
-} // namespace
+// The type a parameter of an entry verb's row has (`entryVerbParams`): the
+// STRUCTURE the semantic tier matches a definition against (`int`; a pointer to a
+// pointer to an 8-bit or a 16-bit unit), built rather than classified.
+[[nodiscard]] TypeId typeOfEntryParamShape(TypeInterner& interner, EntryParamShape shape) {
+    switch (shape) {
+    case EntryParamShape::I32:        return interner.primitive(TypeKind::I32);
+    case EntryParamShape::PtrPtrChar: return interner.pointer(interner.pointer(interner.primitive(TypeKind::I8)));
+    case EntryParamShape::PtrPtrU16:  return interner.pointer(interner.pointer(interner.primitive(TypeKind::U16)));
+    case EntryParamShape::None:       break;
+    }
+    return InvalidType;   // the loader refuses a `none` shape: no verb row holds one
+}
 
-bool realizeEntryShape(Mir&                              mir,
-                       TypeInterner&                     interner,
-                       std::optional<SymbolId>&          userEntrySymbol,
-                       std::vector<ExternImport>&        externImports,
-                       EntryMaterialization              verb,
-                       std::optional<ProcessArgs> const& processArgs,
-                       CSymbolDecorationScheme           scheme,
-                       std::string_view                  formatName,
-                       DiagnosticReporter&               reporter) {
+// The one body of both doors below. `userEntrySymbol` set: the entry is a
+// function of `mir`. Unset with `foreignEntryName` named: the entry is a
+// function ANOTHER input of the link defines under that name, and the init calls
+// it through an import row of the module, by that name.
+[[nodiscard]] bool materializeEntryShape(Mir&                              mir,
+                                         TypeInterner&                     interner,
+                                         std::optional<SymbolId>&          userEntrySymbol,
+                                         std::string_view                  foreignEntryName,
+                                         std::vector<ExternImport>&        externImports,
+                                         EntryMaterialization              verb,
+                                         std::optional<ProcessArgs> const& processArgs,
+                                         CSymbolDecorationScheme           scheme,
+                                         std::string_view                  formatName,
+                                         DiagnosticReporter&               reporter) {
+    bool const foreign = !userEntrySymbol.has_value() && !foreignEntryName.empty();
     // No resolved entry (a library TU with no `main`) — nothing to gate and
     // nothing to materialize.
-    if (!userEntrySymbol.has_value()) return true;
+    if (!userEntrySymbol.has_value() && !foreign) return true;
 
-    // Locate the entry function + its signature in the module.
+    // Locate the entry function + its signature in the module — or, for an
+    // entry another input defines, its signature from the verb (below).
     MirFuncId entryFn{};
     TypeId    entrySig = InvalidType;
     std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        MirFuncId const f = mir.funcAt(i);
-        if (mir.funcSymbol(f).v == userEntrySymbol->v) {
-            entryFn  = f;
-            entrySig = mir.funcSignature(f);
-            break;
+    if (!foreign) {
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = mir.funcAt(i);
+            if (mir.funcSymbol(f).v == userEntrySymbol->v) {
+                entryFn  = f;
+                entrySig = mir.funcSignature(f);
+                break;
+            }
         }
+        // The entry symbol isn't a defined function here (e.g. resolved to an
+        // extern) — leave it; the trampoline's own resolution reports that case
+        // with `K_EntryPointResolvesToExtern`, which is the accurate diagnostic.
+        if (!entryFn.valid() || !entrySig.valid()) return true;
+    } else {
+        // ★ AN ENTRY FROM AN OBJECT HAS NO SIGNATURE IN THE INPUT — an assembled
+        // function carries no type — so the init calls it with the signature of
+        // the verb it was elected with: the language row's parameter shapes and
+        // `int`, the row's result (P69 fold 3d,
+        // D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS; the verb is
+        // the richest the format realizes, `collectObjectEntryCandidates`). Its
+        // convention is the one the semantic tier gives every function it types,
+        // the canonical MIR-tier placeholder the calling-convention pass replaces
+        // with the target's at materialize time (`functionTypeOfParams`), so the
+        // init and the call it makes are given the target's C convention exactly
+        // as a source entry's are.
+        std::vector<TypeId> params;
+        for (EntryParamShape const shape : entryVerbParams(verb)) {
+            params.push_back(typeOfEntryParamShape(interner, shape));
+        }
+        entrySig = interner.fnSig(params, interner.primitive(TypeKind::I32), CallConv::CcSysV);
     }
-    // The entry symbol isn't a defined function here (e.g. resolved to an extern)
-    // — leave it; the trampoline's own resolution reports that case with
-    // `K_EntryPointResolvesToExtern`, which is the accurate diagnostic.
-    if (!entryFn.valid() || !entrySig.valid()) return true;
 
     // ── MATERIALIZE: dispatch on the DECIDED verb × the declared MECHANISM ──
     //
@@ -272,10 +309,12 @@ bool realizeEntryShape(Mir&                              mir,
     // MIR in hand and about nothing declared anywhere. Without it, `params[k]`
     // below is an out-of-bounds read — a silent one, on the program entry.
     //
-    // ⚠ AND IT CANNOT COVER THE FOREIGN-OBJECT CASE, so do not read it as
-    // closing that gap. `AssembledFunction` carries no TypeId and no signature;
-    // a pre-built `.obj`/`.lib` member's entry has no C signature IN THE INPUT at
-    // all, so there is nothing here to check its arity against.
+    // ⓘ IT HAS NOTHING TO CHECK FOR AN ENTRY ANOTHER INPUT DEFINES. An assembled
+    // function carries no TypeId and no signature, so a pre-built object's entry
+    // has no C signature IN THE INPUT; its signature above is BUILT from the verb,
+    // and agrees with it by construction. Whether the object's `main` declares
+    // fewer parameters is the case every reference startup also passes through
+    // (it passes every value to every `main`).
     auto const params = interner.fnParams(entrySig);
     if (params.size() < verbParams.size()) {
         // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
@@ -327,6 +366,20 @@ bool realizeEntryShape(Mir&                              mir,
     MirBuilder builder;
     continueSymbolIdsPastImports(builder, mir, externImports);
     SymbolId const synthSym = builder.mintSymbolOrAbort(kMinter);
+    // What the init calls: the module's entry, or — for an entry another input
+    // defines — an import row of the module naming it, which the link's merge
+    // binds to that input's definition as it binds any reference between units.
+    SymbolId calleeSym{};
+    if (foreign) {
+        calleeSym = builder.mintSymbolOrAbort(kMinter);
+        ExternImport entryImport;
+        entryImport.symbol      = calleeSym;
+        entryImport.mangledName = std::string{foreignEntryName};   // already the format's spelling
+        entryImport.isData      = false;
+        externImports.push_back(std::move(entryImport));
+    } else {
+        calleeSym = *userEntrySymbol;
+    }
     IdentityClonePolicy policy;
     for (std::uint32_t i = 0; i < nf; ++i) {
         opt::passes::MirFunctionRebuilder rb{mir, builder, policy};
@@ -383,7 +436,7 @@ bool realizeEntryShape(Mir&                              mir,
         MirInstId const envp = builder.addInst(
             MirOpcode::Gep, std::array<MirInstId, 2>{argv, bytes}, envpTy);
         MirInstId const entryAddr =
-            builder.addGlobalAddr(*userEntrySymbol, pEntrySig);
+            builder.addGlobalAddr(calleeSym, pEntrySig);
         MirInstId const ret = builder.addInst(
             MirOpcode::Call,
             std::array<MirInstId, 4>{entryAddr, argc, argv, envp},
@@ -550,7 +603,7 @@ bool realizeEntryShape(Mir&                              mir,
         builder.beginBlock(callBlk);
         {
             MirInstId const entryAddr =
-                builder.addGlobalAddr(*userEntrySymbol, pEntrySig);
+                builder.addGlobalAddr(calleeSym, pEntrySig);
             MirInstId ret{};
             if (passesEnvironment) {
                 TypeId const envAccSig = interner.fnSig({}, envpTy, cc);
@@ -587,6 +640,37 @@ bool realizeEntryShape(Mir&                              mir,
     // Retarget the program entry to the synth function.
     userEntrySymbol = synthSym;
     return true;
+}
+
+} // namespace
+
+bool realizeEntryShape(Mir&                              mir,
+                       TypeInterner&                     interner,
+                       std::optional<SymbolId>&          userEntrySymbol,
+                       std::vector<ExternImport>&        externImports,
+                       EntryMaterialization              verb,
+                       std::optional<ProcessArgs> const& processArgs,
+                       CSymbolDecorationScheme           scheme,
+                       std::string_view                  formatName,
+                       DiagnosticReporter&               reporter) {
+    return materializeEntryShape(mir, interner, userEntrySymbol, {}, externImports, verb,
+                                 processArgs, scheme, formatName, reporter);
+}
+
+bool realizeForeignEntryShape(Mir&                              mir,
+                              TypeInterner&                     interner,
+                              std::string_view                  entryLinkName,
+                              std::optional<SymbolId>&          init,
+                              std::vector<ExternImport>&        externImports,
+                              EntryMaterialization              verb,
+                              std::optional<ProcessArgs> const& processArgs,
+                              CSymbolDecorationScheme           scheme,
+                              std::string_view                  formatName,
+                              DiagnosticReporter&               reporter) {
+    init.reset();
+    if (entryLinkName.empty()) return true;   // no entry: nothing to materialize
+    return materializeEntryShape(mir, interner, init, entryLinkName, externImports, verb,
+                                 processArgs, scheme, formatName, reporter);
 }
 
 } // namespace dss

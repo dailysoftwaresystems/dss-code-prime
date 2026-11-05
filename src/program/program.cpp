@@ -7,6 +7,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/preprocess/preprocessor.hpp"   // PreScanMemoCounters, for the --time report
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
+#include "core/substrate/mint_monotonic_id.hpp"  // the startup module's unit id (an all-object link's)
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
 #include "core/types/config_path_walk.hpp"      // findShippedConfigDir — shared src/dss-config/<dir> resolver
@@ -70,6 +71,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>    // std::fprintf — the link order's internal-breach stop
+#include <cstdlib>   // std::abort
 // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
 // `serveArtifactFromCache` and `buildDependencyArtifactKey` return
 // `std::expected`. It arrived transitively through `runtime_object_cache.hpp`
@@ -1373,10 +1376,160 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // channel, so there is one definition of what an object input means and no
     // second engine to keep in step. APPENDED, never assigned: `compileOpts`
     // may already carry objects the source partition routed here.
+    // ── WHERE EACH INPUT STANDS IN THE LINK'S ORDER (P69 fold 3d,
+    //    D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──────────────────
+    // `CompileOptions::objectInputPlaces` is parallel to the objects the
+    // operator named among the inputs; an object `--resolve-library` named is
+    // ordered by nothing the operator wrote, so it states no place (a
+    // library's: after every named input). Either list is empty (a caller that
+    // states no order) or one place per input — anything else is a caller that
+    // lost track of what it partitioned, an internal breach no input can cause
+    // (`runCusToTargets` fills both lists in the loop that partitions), so it
+    // stops the process rather than link in an order nobody stated.
+    if ((!perCuOpts.objectInputPlaces.empty()
+         && perCuOpts.objectInputPlaces.size() != perCuOpts.objectInputs.size())
+        || (!perCuOpts.unitPlaces.empty() && perCuOpts.unitPlaces.size() != cus.size())) {
+        std::fprintf(stderr,
+                     "dss::compileOneTarget fatal: target '%s' was handed %zu object input(s) "
+                     "with %zu place(s) and %zu unit(s) with %zu place(s) -- the link's order "
+                     "states one place per input or none at all.\n",
+                     targetSpecStr.c_str(), perCuOpts.objectInputs.size(),
+                     perCuOpts.objectInputPlaces.size(), cus.size(), perCuOpts.unitPlaces.size());
+        std::abort();
+    }
+    if (perCuOpts.objectInputPlaces.empty()) {
+        perCuOpts.objectInputPlaces.resize(perCuOpts.objectInputs.size());
+    }
     perCuOpts.objectInputs.insert(perCuOpts.objectInputs.end(),
                                   resolveLibs.objectInputs.begin(),
                                   resolveLibs.objectInputs.end());
+    perCuOpts.objectInputPlaces.resize(perCuOpts.objectInputs.size());
     perCuOpts.resolveLibraries = std::move(resolveLibs.dynamicLibraries);
+    // The place of unit `i` — none where the caller stated no order.
+    auto const unitPlace = [&perCuOpts](std::size_t i) -> std::optional<std::uint32_t> {
+        if (i < perCuOpts.unitPlaces.size()) return perCuOpts.unitPlaces[i];
+        return std::nullopt;
+    };
+
+    // ── EVERY OBJECT INPUT, READ ONCE, BEFORE ANY ROUTE (P69 fold 3d) ────────
+    //
+    // Each route links the objects; the all-object route also elects among
+    // them, and every route now elects the program's entry over the units AND
+    // the objects (`collectObjectEntryCandidates`). So they are read HERE, once,
+    // by the one reader every object and archive member takes
+    // (`readObjectInputModules`, which also asks the named objects' `/ENTRY:`
+    // directive together), each stamped with its place, and handed to the
+    // route's link as modules. An object that cannot be read fails the target
+    // here, loud, before any unit is lowered.
+    auto objectModules = readObjectInputModules(
+        std::span<std::filesystem::path const>{perCuOpts.objectInputs}, **targetR, **formatR,
+        reporter);
+    if (!objectModules) return std::nullopt;   // read fail-loud already reported
+    for (std::size_t oi = 0; oi < objectModules->size(); ++oi) {
+        (*objectModules)[oi].linkPosition = perCuOpts.objectInputPlaces[oi];
+    }
+    // The program-entry candidates the objects define, with the richest verb of
+    // each name the format realizes — empty for a format that starts no program.
+    std::vector<ForeignEntryCandidate> const objectEntries = collectObjectEntryCandidates(
+        std::span<AssembledModule const>{*objectModules}, grammar, **formatR);
+
+    // The LOWER half of a whole module (the merge's, or the startup's below):
+    // the one call both make, with every format fact the merged route reads.
+    auto const lowerWholeModule = [&](MergedMirModule& whole, CompilationUnitId wholeId,
+                                      std::vector<MirSehScope> sehScopes) {
+        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128 softcall runtime
+        // library, resolved here (the lower body has no ObjectFormatKind in
+        // scope). Empty = the format declares none (F128 softcall fails loud).
+        std::string_view const wfLib = (*targetR)->wideFloatSoftcallLibrary((*formatR)->kind());
+        std::optional<std::string> wideFloatSoftcallLibrary =
+            wfLib.empty() ? std::nullopt : std::optional<std::string>(std::string(wfLib));
+        return lowerMergedToAssembly(whole, grammar, **targetR,
+                                     (*formatR)->dataModel(),
+                                     effectiveBitFieldStrategy(**targetR, **formatR),
+                                     effectiveUnnamedBitFieldAlignment(**targetR, **formatR),
+                                     ccIndex, wholeId,
+                                     (*formatR)->externCallDispatch(),
+                                     (*formatR)->dataImportBinding(),
+                                     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                                     // format's extern-ADDRESS binding.
+                                     (*formatR)->externAddrBinding(),
+                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
+                                     // thread-local access block.
+                                     (*formatR)->tlsAccess(),
+                                     std::move(sehScopes),
+                                     std::move(wideFloatSoftcallLibrary),
+                                     reporter,
+                                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                                     // atomics-runtime block.
+                                     (*formatR)->atomicsRuntime(),
+                                     // P55, anchor
+                                     // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+                                     // the format's narrowing of WHICH bindings the
+                                     // `indirect-slot` dispatch above reaches through the
+                                     // import slot — a whole module lowered without it
+                                     // would disagree with the linker's slot pass, which
+                                     // reads the format DIRECTLY, symbol for symbol.
+                                     (*formatR)->indirectSlotBindings(),
+                                     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                                     // WHICH of this artifact's OWN definitions its loader
+                                     // may replace — lowered without it, the module would
+                                     // branch to its own body for a name the loader has
+                                     // already given the process a different answer for.
+                                     (*formatR)->preemptibleDefinitionBindings(),
+                                     // P68 round 9: the format kind, ONLY as a key into an
+                                     // inline-asm dialect's `symbolParts`. P69 fold 3b (lane
+                                     // `xa`): this call once passed `std::nullopt` — the one
+                                     // field the sole-CU route sets and the merged route
+                                     // dropped — so a program of two sources whose inline
+                                     // asm names an address part (`@PAGE`, `:lo12:`) was
+                                     // refused where one source built (DriverArgumentSupply.
+                                     // MergedMultiCuRouteSuppliesTheAssemblyFormatKind).
+                                     (*formatR)->kind(),
+                                     // P69 fold 3b: how a whole module writes a tentative
+                                     // definition — a COMMON where the document states one
+                                     // and every linker gives it its alignment. Required: a
+                                     // merged object written with `.bss` definitions is
+                                     // refused beside another object of the name where the
+                                     // references' commons fold.
+                                     (*formatR)->commonsStatement(),
+                                     // P69 fold 3d: the names the image will define. A
+                                     // whole module lowered without them reads each one
+                                     // through a slot, and the image link refuses it
+                                     // (DriverArgumentSupply.
+                                     // MergedMultiCuRouteSuppliesTheImageDefinedNames).
+                                     (*formatR)->imageDefinedNames());
+    };
+
+    // ── THE PROGRAM'S STARTUP FOR AN ENTRY AN OBJECT DEFINES (P69 fold 3d,
+    //    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────
+    //
+    // The all-object link compiles nothing, so an entry whose arguments need a
+    // pre-main init (the CRT accessors of a PE image) had none: ✔MEASURED before
+    // (lane `xa`, `argc_pe.py`, cl 19.44 /O2 objects run as `prog 7 x y`), DSS's
+    // image of `main(argc, argv)` exited 1091911680 and of `main(argc, argv,
+    // envp)` 12, where link.exe's exit 47 and 11 — the trampoline called `main`
+    // on whatever the argument registers held. So the link gets ONE compiled
+    // module of its own, holding only that init (`buildForeignEntryStartup`: the
+    // init synthesized by the pass every route's entry takes, then the two
+    // optimize stages every compiled module receives), lowered here by the call
+    // the merged module takes. It is made ONLY where that pass synthesizes
+    // something; elsewhere the trampoline calls the object's entry itself.
+    // Returns nullopt when it failed (reported); an empty inner optional when no
+    // init was needed.
+    auto const compileForeignEntryStartup =
+        [&](ForeignEntryCandidate const& entry, EntryMaterialization verb)
+        -> std::optional<std::optional<AssembledModule>> {
+        CompilationUnitId const        startupId = substrate::mintMonotonicId<CompilationUnitId>();
+        std::optional<MergedMirModule> startup;
+        if (!buildForeignEntryStartup(entry, verb, startupId, grammar, **targetR, **formatR,
+                                      compileOpts, startup, reporter)) {
+            return std::nullopt;   // reported
+        }
+        if (!startup.has_value()) return std::optional<AssembledModule>{};
+        auto lowered = lowerWholeModule(*startup, startupId, {});
+        if (!lowered) return std::nullopt;   // reported
+        return std::optional<AssembledModule>{std::move(*lowered)};
+    };
 
     // ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS — WHAT THIS
     // BUILD'S FINAL MODULE IS TO ITS LINK, decided ONCE here, where the output
@@ -1579,18 +1732,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // input becomes its own member under its own file name, exactly as an
         // extracted archive member does. CU-derived members lead, then the input
         // archives' members, then these.
-        if (!perCuOpts.objectInputs.empty()) {
-            auto objects = readObjectInputModules(
-                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
-                **targetR, **formatR, reporter);
-            if (!objects) return std::nullopt;  // fail-loud already reported
-            members.reserve(members.size() + objects->size());
-            memberNames.reserve(memberNames.size() + objects->size());
-            for (std::size_t i = 0; i < objects->size(); ++i) {
-                members.push_back(std::move((*objects)[i]));
-                memberNames.push_back(
-                    perCuOpts.objectInputs[i].filename().string());
-            }
+        // The objects were read once, above, before any route.
+        members.reserve(members.size() + objectModules->size());
+        memberNames.reserve(memberNames.size() + objectModules->size());
+        for (std::size_t i = 0; i < objectModules->size(); ++i) {
+            members.push_back(std::move((*objectModules)[i]));
+            memberNames.push_back(perCuOpts.objectInputs[i].filename().string());
         }
         return reported(linkAndWriteStaticArchive(members, memberNames,
                                                   **targetR, **formatR, outPath,
@@ -1679,6 +1826,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // `linkAndWrite` when the archive list is empty (its documented
             // contract), so the ordinary `.s` build is unchanged and the flag
             // now has an effect on both halves.
+            mod->linkPosition = unitPlace(0);   // the unit stands where its source does
             return reported(linkAndWriteWithStaticArchives(
                 std::move(*mod),
                 // D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: an
@@ -1687,7 +1835,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // tier reaches the linker through this same composition, which
                 // is why the parameter is threaded here rather than defaulted
                 // away on the route least likely to be exercised.
-                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+                std::move(*objectModules),
                 std::span<std::filesystem::path const>{staticArchives},
                 // D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the
                 // DYNAMIC half, so a pulled member's extern can rebind to a
@@ -1863,6 +2011,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             }
             auto mod = lowerCuMirToAssembly(
                 cuMirs[i], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+                // A member is packaged, not linked: no other input's entry is
+                // elected beside it (an archive starts no program).
+                std::span<ForeignEntryCandidate const>{},
                 (*formatR)->sehPersonality(), (*formatR)->name(),
                 cuMirs[i].target->wideFloatSoftcallLibrary(
                     (*formatR)->kind()),
@@ -1888,15 +2039,15 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // arm does not fire, and the N>1 whole-program merge would fold ZERO
     // modules into one and lower the empty result.
     //
-    // ★ THE FIRST OBJECT IS ELECTED CLIENT, THE REST STAY OBJECT INPUTS. The
-    // link composition below is `[client, objects…, pulled…]`, and it needs a
-    // client to seed the archive pull with; with no CU there is no natural one,
-    // so the first object takes the role. That is a NAMING of one of the
-    // inputs, never a promotion: `linkAndWriteWithStaticArchives` merges the
-    // client and the object inputs by the same `mergeModules` that binds a
-    // sibling CU's reference, so which object holds the seat cannot change what
-    // the image contains. ⓘ It is READ HERE and the REST are passed as PATHS —
-    // one read per object, never two.
+    // ★ EVERY OBJECT IS AN OBJECT INPUT, IN THE OPERATOR'S ORDER (P69 fold 3d).
+    // The link composition is `[compiled?, objects…, pulled…]`, and with no CU
+    // nothing is compiled, so the objects ARE the link — none is promoted to a
+    // "client". That role once went to the object defining the entry, which put
+    // it first in the link's order (D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER:
+    // `weak1.o mainown.o` kept `mainown.o`'s weak definition where every reference
+    // keeps `weak1.o`'s) and left its library imports unbound
+    // (D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT). Each object
+    // was read once, before any route, and stands at its own place.
     //
     // ⓘ The STATIC-ARCHIVE route above already answered this case correctly on
     // its own (zero CU-derived members, the objects packaged as members), which
@@ -1906,15 +2057,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // shipped driver (`compileFiles`/`compileUnits` refuse an empty file
         // list, and a gathered file that is not an object stays a source), so
         // this is the net under a future gathering route, not a live arm.
-        if (perCuOpts.objectInputs.empty()) {
+        if (objectModules->empty()) {
             emitDriver(reporter, DiagnosticCode::D_EmptyInput,
                        "nothing to compile or link for target '" + targetSpecStr
                        + "': the build produced no compilation unit and named "
                          "no pre-assembled object input.");
             return std::nullopt;
         }
-        std::span<std::filesystem::path const> const objectPaths{
-            perCuOpts.objectInputs};
 
         // ── WHICH OBJECT HOLDS THE PROGRAM ENTRY, AND WHY IT MUST BE ASKED BY
         //    NAME ───────────────────────────────────────────────────────────
@@ -1928,87 +2077,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // …-exec` reached the entry trampoline with two functions, no
         // `userEntrySymbol` and an empty format `entryPoint`, and failed loud
         // with `K_SymbolUndefined`. Every ordinary build sidesteps this because
-        // its client is a CU the pipeline stamped.
+        // its entry is a unit the pipeline stamped.
         //
         // ★★ THE NAME IS THE FORMAT-LEVEL IDENTITY, and it is the one the merge
         // ALREADY uses — `ModuleSymbol::name` is the cross-module match key
-        // precisely because `SymbolId` is not portable across units. Resolving
-        // the entry the same way is reuse, not a parallel mechanism.
-        //
-        // ★ THE CANDIDATE SET IS THE DECLARED INTERSECTION, not a `"main"`
-        // literal: the LANGUAGE's `entryFunctions` rows supply the names, the
-        // FORMAT's `entryVerbs` set says which of those verbs it can realize,
-        // and the format's own C decoration spells the on-binary form. That is
-        // the same two-owner intersection `entry_shape.hpp` documents and the
-        // same `applyCMangling` the merge keys on (`_main` on Mach-O, identity
-        // on ELF/PE) — so `wmain` is a candidate on a Windows image and on
-        // nothing else, with no format identity tested anywhere here.
-        //
-        // ⚠ NAME ONLY, NEVER THE SIGNATURE. The CU route intersects the
-        // signature too (`collectEntryCandidates` reads each SemanticModel);
-        // an object carries no prototype, so that half is simply not knowable
-        // here. The name+verb intersection is what the format itself can see.
-        std::vector<std::string> entryNames;
-        {
-            CSymbolDecorationScheme const scheme =
-                (*formatR)->cSymbolDecoration().scheme;
-            for (auto const& decl : grammar.semantics().declarations) {
-                for (auto const& row : decl.entryFunctions) {
-                    if (!(*formatR)->realizesEntryVerb(row.verb)) continue;
-                    std::string mangled =
-                        dss::ffi::applyCMangling(row.name, scheme);
-                    if (std::find(entryNames.begin(), entryNames.end(), mangled)
-                        == entryNames.end()) {
-                        entryNames.push_back(std::move(mangled));
-                    }
-                }
-            }
-        }
-        // Does this module DEFINE one of the candidates as a function? A
-        // `ModuleSymbol` row alone is not enough — the readers mint one for
-        // data and for section symbols too — so the row's `SymbolId` has to
-        // name an actual `AssembledFunction`, which is what the trampoline will
-        // call.
-        auto definedEntryOf =
-            [&entryNames](AssembledModule const& m) -> std::optional<SymbolId> {
-            for (auto const& ms : m.symbols) {
-                if (std::find(entryNames.begin(), entryNames.end(), ms.name)
-                    == entryNames.end()) continue;
-                for (auto const& fn : m.functions) {
-                    if (fn.symbol.v == ms.symbol.v) return ms.symbol;
-                }
-            }
-            return std::nullopt;
-        };
-
-        // ★ THE CLIENT IS THE OBJECT THAT DEFINES THE ENTRY, and the election
-        // is what makes the choice mean something. `linkAndWriteWithStaticArchives`
-        // composes `[client, objects…, pulled…]` and the client is the module
-        // whose `userEntrySymbol` survives the merge, so electing the FIRST
-        // object unconditionally would have made `--compile helper.o main.o`
-        // and `--compile main.o helper.o` two different programs.
-        //
-        // ⓘ ONE READ PER OBJECT. The probe stops at the winner and keeps its
-        // module, so the common case (`main.o` named first) reads one object
-        // here and the rest exactly once more inside the link. Object 0 is
-        // retained on the way past so the no-entry fallback costs no re-read.
-        std::optional<AssembledModule> client;
-        std::optional<AssembledModule> firstObject;
-        std::optional<SymbolId>        entrySymbol;
-        std::size_t                    clientIndex = 0;
-        for (std::size_t oi = 0; oi < objectPaths.size(); ++oi) {
-            auto one = readObjectInputModules(objectPaths.subspan(oi, 1),
-                                              **targetR, **formatR, reporter);
-            if (!one) return std::nullopt;  // fail-loud already reported
-            if (auto sym = definedEntryOf((*one)[0])) {
-                entrySymbol = sym;
-                clientIndex = oi;
-                client      = std::move((*one)[0]);
-                break;
-            }
-            if (oi == 0) firstObject = std::move((*one)[0]);
-        }
-        if (!client) {
+        // precisely because `SymbolId` is not portable across units. The
+        // candidates are `collectObjectEntryCandidates`' — the language's entry
+        // names the format realizes, in the format's C decoration, each with the
+        // richest verb of its name the format realizes (an object carries no
+        // prototype; see the function) — and the SAME election every route
+        // holds decides among them: two objects defining `main` are the
+        // ambiguity `K_ProgramEntryAmbiguous` names, never the first one read.
+        if (objectEntries.empty()) {
             // ★ NO OBJECT DEFINES AN ENTRY THE FORMAT CAN REALIZE — and when
             // the language DID name some, that is a refusal this arm owes the
             // operator IN ITS OWN WORDS. Falling through would reach the
@@ -2019,19 +2099,22 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // clang and MSVC all refuse the same link naming the same fact, so
             // this is the union's answer and not an invented strictness.
             //
-            // ⓘ GATED ON A NON-EMPTY CANDIDATE SET. With no `--language` the
+            // ⓘ GATED ON A NON-EMPTY NAME SET. With no `--language` the
             // resolved grammar is the target's assembly dialect, which
             // declares no entry rows at all — there is then no claim to make
             // about a missing `main`, and the trampoline's own single-function
-            // fallback stays the answer, unchanged.
+            // fallback stays the answer, unchanged. A format that starts no
+            // program realizes no entry name, so a relocatable link of objects
+            // refuses nothing here either.
+            std::vector<EntryLinkName> const entryNames = entryLinkNames(grammar, **formatR);
             if (!entryNames.empty() && (*formatR)->isImageFlavor()) {
                 std::string names;
                 for (auto const& n : entryNames) {
                     if (!names.empty()) names += ", ";
-                    names += '\'' + n + '\'';
+                    names += '\'' + n.linkName + '\'';
                 }
                 std::string objs;
-                for (auto const& p : objectPaths) {
+                for (auto const& p : perCuOpts.objectInputs) {
                     if (!objs.empty()) objs += ", ";
                     objs += core::genericSpelling(p);
                 }
@@ -2046,24 +2129,40 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                              "of its own, so the link has nothing to call.");
                 return std::nullopt;
             }
-            // The FIRST object is elected and left unstamped, which preserves
-            // the trampoline's own single-function fallback and, for anything
-            // else, its existing loud refusal — this arm neither invents an
-            // entry nor swallows the refusal.
-            client      = std::move(firstObject);
-            clientIndex = 0;
+            // No object is stamped, which preserves the trampoline's own
+            // single-function fallback and, for anything else, its existing
+            // loud refusal — this arm neither invents an entry nor swallows the
+            // refusal.
         }
-        if (entrySymbol.has_value()) client->userEntrySymbol = entrySymbol;
-
-        // Everything except the elected client, IN THE OPERATOR'S ORDER.
-        std::vector<std::filesystem::path> remaining;
-        remaining.reserve(objectPaths.size() - 1);
-        for (std::size_t oi = 0; oi < objectPaths.size(); ++oi) {
-            if (oi != clientIndex) remaining.push_back(objectPaths[oi]);
+        // The program's startup: compiled only where the entry's arguments need
+        // a pre-main init (below); otherwise the link compiles nothing.
+        std::optional<AssembledModule> startup;
+        if (!objectEntries.empty()) {
+            std::vector<EntryCandidate> candidates;
+            candidates.reserve(objectEntries.size());
+            for (ForeignEntryCandidate const& c : objectEntries) candidates.push_back(c.candidate);
+            bool       entryOk = true;
+            auto const elected = resolveProgramEntry(candidates, (*formatR)->entryVerbs(),
+                                                     (*formatR)->name(), reporter, entryOk);
+            if (!entryOk) return std::nullopt;   // two objects define an entry — reported
+            // `objectEntries` is non-empty only on a format that starts a
+            // program, so the election named one.
+            ForeignEntryCandidate const& winner = objectEntries[elected->index];
+            // ── THE PROGRAM'S STARTUP, WHERE THE ENTRY'S ARGUMENTS NEED ONE (P69
+            //    fold 3d, D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS)
+            // Made only where `realizeForeignEntryShape` synthesizes the pre-main
+            // init (the CRT accessors of a PE image); anywhere else the
+            // trampoline calls the object's entry itself and the object is
+            // stamped.
+            auto made = compileForeignEntryStartup(winner, elected->verb);
+            if (!made.has_value()) return std::nullopt;   // reported
+            startup = std::move(*made);
+            if (!startup.has_value()) {
+                (*objectModules)[winner.object].userEntrySymbol = winner.symbol;
+            }
         }
         return reported(linkAndWriteWithStaticArchives(
-            std::move(*client),
-            std::span<std::filesystem::path const>{remaining},
+            std::move(startup), std::move(*objectModules),
             std::span<std::filesystem::path const>{staticArchives},
             std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
             **targetR, **formatR, outPath, reporter, imageRequest));
@@ -2105,6 +2204,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         }
         auto mod = lowerCuMirToAssembly(
             cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+            // P69 fold 3d: an object input's entry is elected with this unit's
+            // (D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED).
+            std::span<ForeignEntryCandidate const>{objectEntries},
             (*formatR)->sehPersonality(), (*formatR)->name(),
             cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
             reporter,
@@ -2114,6 +2216,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
             return std::nullopt;
         }
+        mod->linkPosition = unitPlace(0);   // the unit stands where its source does
+        // ★ AN OBJECT WON THE ENTRY AND NEEDED NO INIT: it is stated on that
+        // object. The election succeeded on a format that starts a program, so
+        // exactly one candidate was realizable; the unit's module names no entry
+        // only when that one was an object's, and every object candidate is
+        // realizable by construction — so there was exactly one, and it won.
+        // (Where its verb needed an init, the init is the unit's entry and calls
+        // the object's function by name.)
+        if (!(*formatR)->entryVerbs().empty() && !mod->userEntrySymbol.has_value()
+            && objectEntries.size() == 1) {
+            (*objectModules)[objectEntries[0].object].userEntrySymbol = objectEntries[0].symbol;
+        }
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.
@@ -2122,7 +2236,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // the operator named (`perCuOpts` — archives already partitioned out).
         return reported(linkAndWriteWithStaticArchives(
             std::move(*mod),
-            std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+            std::move(*objectModules),
             std::span<std::filesystem::path const>{staticArchives},
             std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
             **targetR, **formatR, outPath, reporter, imageRequest));
@@ -2290,10 +2404,22 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     std::vector<EntryCandidate> cands;
     std::vector<std::uint32_t>  candSym;   // per-model record indices; unused here
     for (auto& cu : cuMirs) collectEntryCandidates(cu.model, cands, candSym);
+    // P69 fold 3d (D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED):
+    // an object input's entry is elected with the units', after them, so an index
+    // past theirs names an object's.
+    std::size_t const unitCandidates = cands.size();
+    for (ForeignEntryCandidate const& c : objectEntries) cands.push_back(c.candidate);
     bool entryOk = true;
-    auto const resolvedEntry = resolveProgramEntry(
+    auto resolvedEntry = resolveProgramEntry(
         cands, (*formatR)->entryVerbs(), (*formatR)->name(), reporter, entryOk);
     if (!entryOk) return std::nullopt;   // undefined / ambiguous entry — already reported.
+    ForeignEntryCandidate const* objectEntry = nullptr;
+    EntryMaterialization         objectEntryVerb = EntryMaterialization::None;
+    if (resolvedEntry.has_value() && resolvedEntry->index >= unitCandidates) {
+        objectEntry     = &objectEntries[resolvedEntry->index - unitCandidates];
+        objectEntryVerb = resolvedEntry->verb;
+        resolvedEntry.reset();   // no unit names the entry: the merge is handed none
+    }
 
     // The winning name, MANGLED to the merge's DEFINITION-KEY convention.
     //
@@ -2397,11 +2523,24 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // ran at the SEMANTIC tier, per definition, with a source span
     // (`S_EntryShapeNotDeclared`); candidacy was decided by `resolveProgramEntry`
     // above. This call does exactly one job.
-    if (!realizeEntryShape(merged->mir, merged->host.interner(),
-                           merged->userEntrySymbol, merged->externImports,
-                           entryVerb, (*formatR)->processArgs(), cSymDecor,
-                           (*formatR)->name(), reporter)) {
+    // An OBJECT's entry (P69 fold 3d): its init, where its verb needs one, is
+    // synthesized into the merged module and calls it by name; where none is
+    // needed the object itself names the entry.
+    bool const shaped =
+        objectEntry != nullptr
+            ? realizeForeignEntryShape(merged->mir, merged->host.interner(), objectEntry->linkName,
+                                       merged->userEntrySymbol, merged->externImports,
+                                       objectEntryVerb, (*formatR)->processArgs(), cSymDecor,
+                                       (*formatR)->name(), reporter)
+            : realizeEntryShape(merged->mir, merged->host.interner(),
+                                merged->userEntrySymbol, merged->externImports,
+                                entryVerb, (*formatR)->processArgs(), cSymDecor,
+                                (*formatR)->name(), reporter);
+    if (!shaped) {
         return std::nullopt;  // unusable mechanism — fail-loud already reported.
+    }
+    if (objectEntry != nullptr && !merged->userEntrySymbol.has_value()) {
+        (*objectModules)[objectEntry->object].userEntrySymbol = objectEntry->symbol;
     }
 
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): whole-program
@@ -2570,87 +2709,29 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     }
 
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
-    // (target, format); pass that format's extern-call shape so MIR→LIR
-    // selects the right call-site opcode for any surviving extern import.
-    // D-CSUBSET-BITFIELD-ABI-EXACT: resolve + pass the FORMAT-determined bit-field
-    // strategy (gnu_packed / msvc_straddle) so a bit-field global in the merged
-    // whole-program image is laid out byte-ABI-exact for the active format.
-    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the F128 softcall
-    // runtime library here (the merge lower body has no ObjectFormatKind in
-    // scope) — exactly where externCallDispatch is pre-resolved from the
-    // format. Empty = the format declares none (nullopt → F128 softcall fails
-    // loud).
-    std::string_view const wfLib =
-        (*targetR)->wideFloatSoftcallLibrary((*formatR)->kind());
-    std::optional<std::string> wideFloatSoftcallLibrary =
-        wfLib.empty() ? std::nullopt
-                      : std::optional<std::string>(std::string(wfLib));
-    auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
-                                     (*formatR)->dataModel(),
-                                     effectiveBitFieldStrategy(**targetR, **formatR),
-                                     effectiveUnnamedBitFieldAlignment(**targetR,
-                                                                       **formatR),
-                                     ccIndex, cuMirs[0].cuId,
-                                     (*formatR)->externCallDispatch(),
-                                     (*formatR)->dataImportBinding(),
-                                     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT
-                                     // (TF-C52): the format's extern-ADDRESS
-                                     // binding (`got` on arm64 relocatable /
-                                     // static-archive; nullopt elsewhere).
-                                     (*formatR)->externAddrBinding(),
-                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the
-                                     // format's thread-local access block.
-                                     (*formatR)->tlsAccess(),
-                                     std::move(sehScopes),
-                                     std::move(wideFloatSoftcallLibrary),
-                                     reporter,
-                                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the
-                                     // format's atomics-runtime block.
-                                     (*formatR)->atomicsRuntime(),
-                                     // P55, anchor
-                                     // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
-                                     // the format's
-                                     // narrowing of WHICH bindings the
-                                     // `indirect-slot` dispatch above reaches
-                                     // through the import slot. Passed here
-                                     // and not left to the default because the
-                                     // merge path emits `.obj`s too, and the
-                                     // linker's slot pass reads the format
-                                     // DIRECTLY — a merged module lowered
-                                     // without the narrowing would disagree
-                                     // with it symbol for symbol.
-                                     (*formatR)->indirectSlotBindings(),
-                                     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
-                                     // WHICH of this artifact's OWN
-                                     // definitions its loader may replace.
-                                     // Passed here for the same reason the
-                                     // narrowing above is: a merged module
-                                     // lowered without it would branch to
-                                     // its own body for a name the loader
-                                     // has already given the process a
-                                     // different answer for.
-                                     (*formatR)->preemptibleDefinitionBindings(),
-                                     // P68 round 9: the format kind, ONLY as a key
-                                     // into an inline-asm dialect's `symbolParts`
-                                     // (`CuMirModule::assemblyFormatKind`). P69
-                                     // fold 3b (lane `xa`): this call passed
-                                     // `std::nullopt` — the one field the sole-CU
-                                     // route sets and the merged route dropped —
-                                     // so a program of two sources whose inline
-                                     // asm names an address part (`@PAGE`,
-                                     // `:lo12:`) was refused where one source
-                                     // built (DriverArgumentSupply.
-                                     // MergedMultiCuRouteSuppliesTheAssemblyFormatKind).
-                                     (*formatR)->kind(),
-                                     // P69 fold 3b: how the merged module writes a
-                                     // tentative definition — a COMMON where the
-                                     // document states one and every linker gives
-                                     // it its alignment. Required: a merged object
-                                     // written with `.bss` definitions is refused
-                                     // beside another object of the name where the
-                                     // references' commons fold.
-                                     (*formatR)->commonsStatement());
+    // (target, format); the lowering passes that format's extern-call shape so
+    // MIR→LIR selects the right call-site opcode for any surviving extern import,
+    // and the FORMAT-determined bit-field strategy (D-CSUBSET-BITFIELD-ABI-EXACT)
+    // so a bit-field global in the merged whole-program image is laid out
+    // byte-ABI-exact for the active format — with every other format fact, in the
+    // one call the startup module's lowering makes too (`lowerWholeModule`).
+    // The unit each kept definition came from, read before the lowering takes the
+    // merged module (`MergedMirModule::unitOfDefinition`, stated by the merge).
+    auto const unitOfDefinition = merged->unitOfDefinition;
+    auto mod = lowerWholeModule(*merged, cuMirs[0].cuId, std::move(sehScopes));
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
+    // The merged module stands where its first unit's source does (P69 fold 3d,
+    // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER), and each definition it
+    // holds where ITS unit's source does: the merge keys them by the merged
+    // module's own symbols, which the lowering keeps as the assembled module's.
+    // A unit with no stated place states none for its definitions (the module's
+    // then answers, `linkPositionOf`).
+    mod->linkPosition = unitPlace(0);
+    for (auto const& [symbol, unit] : unitOfDefinition) {
+        if (auto const place = unitPlace(unit); place.has_value()) {
+            mod->linkPositionOfDefinition.insert_or_assign(SymbolId{symbol}, *place);
+        }
+    }
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way
     // the single-CU path does (pull referenced members + merge). No archives =>
@@ -2661,7 +2742,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // silently keep the gap for whichever builds happen to take it.
     return reported(linkAndWriteWithStaticArchives(
         std::move(*mod),
-        std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+        std::move(*objectModules),
         std::span<std::filesystem::path const>{staticArchives},
         std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
         **targetR, **formatR, outPath, reporter, imageRequest));
@@ -3918,8 +3999,22 @@ buildDependencyArtifactKey(
         }
         request.linkInputs.push_back(std::move(entry));
     }
-    for (fs::path const& object : compileOpts.objectInputs) {
-        request.linkInputs.push_back(digestLinkInput("object-input", object));
+    // ⚠ EACH NAMED OBJECT'S PLACE RIDES WITH ITS PATH (P69 fold 3d,
+    // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER). The link's order is the
+    // operator's, a source in its place among the objects, and an image's bytes
+    // follow it (the first weak definition and the first COMDAT copy in that
+    // order are the ones kept), while this list and the unit closure each keep
+    // only their own order. The objects' places complete the interleaving — a
+    // unit's place is the gathered index no object takes. An archive packages
+    // its members by kind and reads no order, so for one this term only
+    // over-invalidates, the safe direction (the declared-import-name precedent
+    // above).
+    for (std::size_t oi = 0; oi < compileOpts.objectInputs.size(); ++oi) {
+        auto entry = digestLinkInput("object-input", compileOpts.objectInputs[oi]);
+        if (oi < compileOpts.objectInputPlaces.size() && compileOpts.objectInputPlaces[oi].has_value()) {
+            entry.path += "@" + std::to_string(*compileOpts.objectInputPlaces[oi]);
+        }
+        request.linkInputs.push_back(std::move(entry));
     }
 
     return dss::runtime::computeDependencyArtifactKey(request);
@@ -4737,17 +4832,31 @@ int runCusToTargets(
     // reaches the front end exactly as before, so a build that names no object
     // is byte-identical: `objectInputsFromSources` is empty and
     // `sourcesToBuild` is `sourceFiles` itself.
-    std::vector<std::string>           sourcesToBuild;
-    std::vector<std::filesystem::path> objectInputsFromSources;
+    //
+    // ★ AND EACH INPUT'S PLACE (P69 fold 3d,
+    // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER): its index in the
+    // gathered list, which is the order every reference driver hands its linker
+    // — a source stands where the object it compiles to would. Recorded by the
+    // same loop that partitions, so the two lists cannot fall out of step.
+    std::vector<std::string>                  sourcesToBuild;
+    std::vector<std::uint32_t>                placeOfSource;   // parallel to `sourcesToBuild`
+    std::vector<std::filesystem::path>        objectInputsFromSources;
+    std::vector<std::optional<std::uint32_t>> placeOfObjectInput;   // parallel to it
     {
-        for (auto const& file : sourceFiles) {
+        for (std::size_t place = 0; place < sourceFiles.size(); ++place) {
+            std::string const& file = sourceFiles[place];
             fs::path const path{file};
             bool isObject = false;
             for (auto const& [_, format] : formatByName) {
                 if (isRelocatableObjectFile(path, *format)) { isObject = true; break; }
             }
-            if (isObject) objectInputsFromSources.push_back(path);
-            else          sourcesToBuild.push_back(file);
+            if (isObject) {
+                objectInputsFromSources.push_back(path);
+                placeOfObjectInput.push_back(static_cast<std::uint32_t>(place));
+            } else {
+                sourcesToBuild.push_back(file);
+                placeOfSource.push_back(static_cast<std::uint32_t>(place));
+            }
         }
     }
 
@@ -5193,6 +5302,18 @@ int runCusToTargets(
         // INPUTS and the first of them is what an all-object link elects as its
         // client module.
         compileOpts.objectInputs     = objectInputsFromSources;
+        compileOpts.objectInputPlaces = placeOfObjectInput;
+        // Each unit's place: a unit per source (`compileUnits`) stands where
+        // its source does; ONE unit of several sources (an API unity build,
+        // `compileFiles`) where its first does. Where a unit failed to parse
+        // the units were compacted and nothing links (`analysisOnly`), so no
+        // place is stated.
+        compileOpts.unitPlaces.clear();
+        if (liveCus == cus.size() && cus.size() == placeOfSource.size()) {
+            compileOpts.unitPlaces = placeOfSource;
+        } else if (liveCus == cus.size() && cus.size() == 1 && !placeOfSource.empty()) {
+            compileOpts.unitPlaces.push_back(placeOfSource.front());
+        }
 
         // ── D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: THIS TARGET'S SHIPPED
         //    RUNTIME, AS CACHED STATIC ARCHIVES ────────────────────────────

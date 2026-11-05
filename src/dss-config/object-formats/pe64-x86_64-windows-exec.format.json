@@ -79,6 +79,11 @@
     "securityCookieInitializer": "__security_init_cookie"
   },
 
+  "$imageDefinedSymbolsComment": "P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): the names every PE linker defines in the image it writes, for a reference no linked unit defines -- `__ImageBase`, the image's DOS header (`imageHeader`, the image's first byte, at the image base). cl's dense `switch` reads its ADDR32NB jump table through `lea __ImageBase` (cl 19.51 /O2 and /Od), and a C program reads the image's own header as `extern IMAGE_DOS_HEADER __ImageBase;`. MEASURED P69 fold 3d (probe-reference-cc run 20261104-200657-1038ae7c, windows-x86_64-release): link.exe links the C idiom, and it runs to 42; a unit that DEFINES `int __ImageBase = 1;` links too, and reads its own 1 -- so a unit's definition is that unit's, and the image defines the name only for a reference nothing else defines. Until this fold DSS refused each such object and unit `K_SymbolUndefined`.",
+  "imageDefinedSymbols": [
+    { "name": "__ImageBase", "address": "imageHeader" }
+  ],
+
   "processExit": {
     "mechanism": "by-name-import",
     "role": "cLibrary",
@@ -272,7 +277,7 @@
       "nativeId": 1
     },
     {
-      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. P69 fold 3c (D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND): `kind` = 14 matches x86_64.target.json's `addr32` row -- the one wire type COFF has for `.long sym` and `movl $sym` alike, so its field holds GNU ld's range for it, [-2^31, 2^32) (MEASURED 2026-10-20), and this row OWNS the wire id: an object's ADDR32 reads back as `addr32`.",
+      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. P69 fold 3c (D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND): `kind` = 14 matches x86_64.target.json's `addr32` row -- the one wire type COFF has for `.long sym` and `movl $sym` alike, so its field holds [-2^31, 2^32): the upper edge GNU ld's (MEASURED 2026-10-20), the lower edge DECIDED (a value below -2^31 reads back as neither itself zero-extended nor itself sign-extended; x86_64.target.json's `addr32` row states the reason), and this row OWNS the wire id: an object's ADDR32 reads back as `addr32`.",
       "name": "IMAGE_REL_AMD64_ADDR32",
       "kind": 14,
       "nativeId": 2
@@ -283,6 +288,12 @@
       "kind": 3,
       "nativeId": 2,
       "emitOnly": true
+    },
+    {
+      "$comment": "P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): image-relative 32-bit (an RVA), the relocatable document's row. IMAGE_REL_AMD64_ADDR32NB = 3; `kind` = 6 matches x86_64.target.json's `imagerel32` row (`imageRelative: true`), which the image writes as the address less the image base and lists no base-relocation site for. A foreign object's own fields reach the image in it: cl's dense `switch` keeps its jump table in `.text$mn` as ADDR32NB entries and reads them through `__ImageBase` (MEASURED cl 19.51 /O2 and /Od, `tests/link/data/coff_comdat_switch_cl_{O2,Od}.obj`). Without the row the reader could not decode the entries, and they could not reach the image.",
+      "name": "IMAGE_REL_AMD64_ADDR32NB",
+      "kind": 6,
+      "nativeId": 3
     },
     {
       "$comment": "TLS C3 (D-CSUBSET-THREAD-LOCAL): the thread-local SECTION-RELATIVE fixup — the disp32 of `lea rax, [rax + secrel32(sym)]`, the FINAL instruction of the pe-indexed access sequence. kind=4 is the SHARED target-schema `tls-tpoff32` row (Linear, width 4, absolute, tls:true) — x86_64 serves BOTH ELF and PE from ONE `[reg, symbol]` lea variant, so the ELF↔PE split lives HERE at the FORMAT level (this row) not on the target (mirrors elf64's kind-4 `R_X86_64_TPOFF32`). The walker patches the 4 bytes from its POSITIVE templateOffset-valued symbolVa entry (the variable's byte offset within the `.tls` template — NOT the ELF NEGATIVE tpoff), so `blockBase + templateOffset` = the per-thread address; the image carries NO runtime reloc for this disp32 (it is an ASLR-invariant relative offset, a link-time constant). nativeId = IMAGE_REL_AMD64_SECREL (11) — meaningful only for a future .obj emission of this kind; the row's existence satisfies the linker's pre-walker cross-reference unifier + the walker's in-arm tls-kind check (the CRIT-1 XOR backstop).",

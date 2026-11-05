@@ -2475,7 +2475,18 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // exactly as the F5 scalar arm does. MUST precede decodeScalarLiteralBits
     // (which would reject the MirSymbolAddrValue variant).
     if (std::holds_alternative<MirSymbolAddrValue>(v.value)) {
-        if (!absPtrRelocKind.has_value()) return false;
+        // The cause is this leaf's own (P69 fold 3d): the generic text the
+        // caller falls back to names several causes, and this one is exact.
+        if (!absPtrRelocKind.has_value()) {
+            why.set(DiagnosticCode::K_NoMatchingObjectFormat,
+                    std::format("has a member at byte offset {} initialized to a "
+                                "symbol address, but the target declares no "
+                                "absolute address slot of a pointer's width "
+                                "(an absolute relocation whose field holds every "
+                                "address) — cannot emit the member's pointer fixup",
+                                base));
+            return false;
+        }
         auto const& sa = std::get<MirSymbolAddrValue>(v.value);
         relocs.push_back(Relocation{static_cast<std::uint32_t>(base),
                                     SymbolId{sa.symbol}, *absPtrRelocKind,

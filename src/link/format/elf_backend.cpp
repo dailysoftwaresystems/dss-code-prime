@@ -275,6 +275,15 @@ public:
         return d.elf.objectType == ElfObjectType::Exec;
     }
 
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the ELF
+    // neighbour): both image writers -- the static ET_EXEC arm and
+    // `encodeElfExecDynamic` (ET_EXEC, PIE, `.so`) -- map the image's own
+    // header from file offset 0 and give each image-defined name its address.
+    [[nodiscard]] bool writesImageDefinedSymbols(
+            detail::ObjectFormatData const& d) const noexcept override {
+        return isImageFlavor(d);
+    }
+
     // ★★ THE BYTE PROBE. Three conditions, each DEFINITE:
     //   (1) the file opens with `0x7F 'E' 'L' 'F'` — the gABI magic;
     //   (2) its `e_ident[EI_CLASS]` and `e_ident[EI_DATA]` are the ones THIS
@@ -798,8 +807,11 @@ public:
             if (secText == nullptr) {
                 fail("/sections",
                      "ELF ET_DYN format requires a Text section row "
-                     "(SectionKind::Text) -- a shared library without "
-                     "code has nothing to export.");
+                     "(SectionKind::Text) -- the writer lays the image "
+                     "out from that row's address: the image base is one "
+                     "page below it, and the code and every section after "
+                     "it are placed from there, a library with no "
+                     "function included.");
             } else if (elf.pageAlign != 0
                        && secText->virtualAddress != elf.pageAlign) {
                 // ET_DYN VAs are BASE-RELATIVE (the loader slides the

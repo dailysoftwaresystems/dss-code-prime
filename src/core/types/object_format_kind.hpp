@@ -1334,6 +1334,41 @@ struct DSS_EXPORT CompilerSupport {
     std::string securityCookieInitializerMangledName; // "__security_init_cookie"
 };
 
+// ── P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a symbol the
+//    IMAGE defines ───────────────────────────────────────────────────────────
+//
+// A name every reference linker of the format defines in each image it links,
+// at an address of the image itself, for a reference that no linked unit
+// defines. PE's is `__ImageBase`, the image's DOS header: cl's dense `switch`
+// reaches its ADDR32NB jump table through an `lea` of it, and a C program reads
+// it as `extern IMAGE_DOS_HEADER __ImageBase;`. The document states each one
+// (`imageDefinedSymbols`). A linked unit's own definition of the name is that
+// unit's, as link.exe keeps it (✔MEASURED P69 fold 3d: a unit defining
+// `int __ImageBase = 1;` links and reads 1, probe-reference-cc run
+// 20261104-200657-1038ae7c).
+enum class ImageDefinedAddress : std::uint8_t {
+    ImageHeader = 0,   // the image's first byte: its header, where the loader maps it
+};
+
+inline constexpr EnumNameTable<ImageDefinedAddress, 1> kImageDefinedAddressTable{{{
+    { ImageDefinedAddress::ImageHeader, "imageHeader" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kImageDefinedAddressTable);
+
+[[nodiscard]] constexpr std::string_view
+imageDefinedAddressName(ImageDefinedAddress a) noexcept {
+    return kImageDefinedAddressTable.name(a);
+}
+[[nodiscard]] constexpr std::optional<ImageDefinedAddress>
+imageDefinedAddressFromName(std::string_view s) noexcept {
+    return kImageDefinedAddressTable.fromName(s);
+}
+
+struct DSS_EXPORT ImageDefinedSymbol {
+    std::string         name;      // the link-level name a unit's reference names
+    ImageDefinedAddress address = ImageDefinedAddress::ImageHeader;
+};
+
 // The format's shipped-library synthesis block (`"librarySynthesis"` in
 // `.format.json`). `vehicle` selects the primitive family the synth pass
 // emits over; `libraryPath` is the native library its on-demand helper

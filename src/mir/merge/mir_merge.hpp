@@ -10,6 +10,7 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 #include "mir/mir.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -146,12 +147,22 @@ struct MergeCuInput {
 //                        stripped), with each `symbol` unified-remapped.
 //   * `userEntrySymbol`— the merged symbol of the function whose name is in the
 //                        grammar's entry-name list (e.g. "main"), or nullopt.
+//   * `unitOfDefinition` — merged-symbol id (`.v`) → the index in `cus` of the
+//                        unit whose definition of it the merge KEPT, for every
+//                        function, global and alias the merged module defines
+//                        (P69 fold 3d, D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER):
+//                        the driver turns it into the place of that unit's
+//                        source among the operator's inputs
+//                        (`AssembledModule::linkPositionOfDefinition`), so a
+//                        definition of the merged module meets a named object's
+//                        in the link's order, not as one unit standing first.
 struct MergedMirModule {
     Mir                                            mir;
     TypeLattice                                    host;
     std::unordered_map<std::uint32_t, std::string> symbolNames;
     std::vector<ExternImport>                      externImports;
     std::optional<SymbolId>                        userEntrySymbol;
+    std::unordered_map<std::uint32_t, std::size_t> unitOfDefinition;
 };
 
 // Merge `cus` into one module. `host` is MOVED in — the driver moves CU0's

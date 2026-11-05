@@ -398,6 +398,33 @@ target_link_libraries(dss_link_test_runtime_library_roles
 dss_add_test(NAME link/test_pe_compiler_support_runtime
              SOURCES test_pe_compiler_support_runtime.cpp)
 
+# P69 fold 3d (lane `xa`) — [[D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED]]'s seeding: the entry trampoline
+# calls the document's `compilerSupport.securityCookieInitializer` FIRST whenever the program defines it -- every
+# exec-flavored document that states one, in-process on every leg, and cl's /GS objects
+# (`tests/link/data/pe_security_cookie_init*`) linked alone by DSS, link.exe and lld-link and run on Windows x86_64.
+dss_add_test(NAME link/test_pe_security_cookie_init
+             SOURCES test_pe_security_cookie_init.cpp)
+
+# P69 fold 3d (lane `xa`) — [[D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL]]: the names the image defines
+# (`imageDefinedSymbols`, PE's `__ImageBase` at the image's header), read DIRECT by every compile whose output ends in
+# an image and defined by the image link. The universe {EXE, DLL} x {a unit of the image's compile, a `-c` object, a
+# static library's member} x {a DSS reader, cl's switch object, both}, linked on every leg and RUN on Windows x86_64.
+# Its document cases splice rows into the shipped documents as JSON -- hence the json link.
+dss_add_test(NAME link/test_pe_image_defined_symbols
+             SOURCES test_pe_image_defined_symbols.cpp)
+target_link_libraries(dss_link_test_pe_image_defined_symbols
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3d (lane `xa`) — the ELF and Mach-O neighbours of the same class: `__ehdr_start` and
+# `__executable_start` (ELF), `__mh_execute_header`, `__mh_dylib_header` and `___dso_handle` (Mach-O), at the
+# image's own header. The universe {each ISA} x {each image flavor} x {each name, the Mach-O cross name refused} x
+# {a unit, a `-c` object, a static library's member}, linked on every leg and RUN where the host runs the image (the
+# run gate reads the host's translations -- hence the json link).
+dss_add_test(NAME link/test_image_header_symbols
+             SOURCES test_image_header_symbols.cpp)
+target_link_libraries(dss_link_test_image_header_symbols
+                      PRIVATE nlohmann_json::nlohmann_json)
+
 # D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE — the
 # CROSS-TIER half of the role table: the `shippedLibs/*.json` descriptors spell
 # the SAME images as literals, and nothing forced the two tiers to agree. Lives
@@ -555,6 +582,23 @@ dss_add_test(NAME link/test_merged_foreign_unwind
              SOURCES test_merged_foreign_unwind.cpp)
 target_link_libraries(dss_link_test_merged_foreign_unwind
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3d (lane `xa`): a foreign function's DWARF handler -- the personality its CIE names and the data area its
+# FDE points at -- read from five reference objects (`tests/link/data/elf_cleanup_handler_*.o`), carried, and written.
+dss_add_test(NAME link/test_elf_language_handler
+             SOURCES test_elf_language_handler.cpp)
+
+# P69 fold 3d (lane `xa`): the ELF reader routes every relocation or says why not -- a constructor or destructor
+# table it made no item of is refused by name, a non-alloc section's relocations go with the section, an empty
+# table drops nothing (`tests/link/data/elf_{constructor,destructor}_table.o`, `elf_debug_info_g.o`).
+dss_add_test(NAME link/test_elf_reader_unrouted_relocations
+             SOURCES test_elf_reader_unrouted_relocations.cpp)
+
+# P69 fold 3d (lane `xa`): an image's `.eh_frame` states each function's handler -- one CIE per handler shape, the
+# routine and the data area filled after layout on the dynamic ELF and Mach-O writers, a reference object's handler
+# carried into a shared object -- and the flavors that write none refuse one by name.
+dss_add_test(NAME link/test_eh_frame_handler_writers
+             SOURCES test_eh_frame_handler_writers.cpp)
 
 # D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION -- the `.dss.summary` / `.dss.mir`
 # pair every LINK-INPUT format declares. Pins the VOCABULARY (declared, on the
@@ -844,9 +888,55 @@ dss_add_test(NAME link/test_pe_object_unwind_reference_link
 # RUNTIME_FUNCTION's UNWIND_INFO decoded into its function's frame rules and a handler carried with its data, both
 # written back by the shipped PE writer byte for byte, on the committed objects of cl, clang-cl and mingw-w64 gcc
 # (`tests/link/data/win64_unwind_*`). Every leg reads and links them; on Windows x86_64 a `__try` object linked by
-# DSS beside a C `main` runs and catches its fault.
+# DSS beside a C `main` runs and catches its fault. P69 fold 3d (lane `xa`) — [[D-WIN64-HUGE-FRAME-ALLOC]]: the long
+# spellings of UWOP_ALLOC_LARGE and of both saves, read from the references' frames past 512 KiB and 1 MiB and written
+# back; DSS's own frames past 512 KiB written in them, and on Windows x86_64 unwound to a caller's `__except`.
 dss_add_test(NAME link/test_coff_foreign_unwind
              SOURCES test_coff_foreign_unwind.cpp)
+
+# P69 fold 3d (lane `xa`) — [[D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION]]: clang-cl's jump tables, each an `.rdata`
+# COMDAT ASSOCIATIVE to its function's section (`tests/link/data/coff_comdat_*`). A table of a function defined once
+# reads as an ordinary section; a table of one copy of an inline function reads as a member of that copy's section
+# group, a link keeps one copy with its table, and the PE relocatable writer hands the kept group on (the copy ANY,
+# the table ASSOCIATIVE to it). Every leg reads, links and writes them; on Windows x86_64 DSS's images run, and
+# link.exe and lld-link link DSS's artifact beside a second copy in both orders and run it.
+dss_add_test(NAME link/test_coff_comdat_selection
+             SOURCES test_coff_comdat_selection.cpp)
+
+# P69 fold 3d (lane `xa`) — [[D-LK-COFF-READER-REFUSES-GNU-DOTTED-TEXT-SUBSECTIONS]]: mingw-w64 gcc's `.` subsections
+# of `.text` (`.text.unlikely`, `.text.hot`, their -ffunction-sections forms) read as `.text` with their unwind
+# records (a -fexceptions `cleanup` function's cold path beside its handled body), a -g object's DISCARDABLE DWARF
+# sections are passed over, and an initializer or terminator table (gcc's
+# `.ctors` / `.dtors`, clang-cl's `.CRT$XC*` / `.CRT$XT*`) is refused by name rather than skipped
+# (`tests/link/data/coff_gnu_subsections*`). Every leg reads them; on Windows x86_64 DSS's programs of the cold and
+# cleanup objects run to gcc's result.
+dss_add_test(NAME link/test_coff_gnu_subsections
+             SOURCES test_coff_gnu_subsections.cpp)
+
+# P69 fold 3d (lane `xa`) — [[D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER]]: the link's order is the operator's
+# order of the inputs. The name election breaks every tie by the place of each definition's input first, and the
+# section-group keep judges each copy where its input stands, not where the link holds its unit; every route of the
+# driver (a merged build's image and relocatable link, a build of objects alone; ELF and PE) on every leg, in-process,
+# and each order's program run where the host is Linux x86_64 or Windows x86_64.
+dss_add_test(NAME link/test_link_order
+             SOURCES test_link_order.cpp)
+
+# P69 fold 3d (lane `xa`) — [[D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS]] and
+# [[D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED]]: a program's entry defined by an object a
+# reference compiler built (`tests/link/data/object_entry_*`: cl /MD and MinGW-w64 gcc for PE, gcc and clang for ELF
+# x86_64, gcc for ELF arm64, Apple clang for Mach-O arm64), elected beside the units' entries and called with its
+# arguments, on every route (objects alone, beside one source, beside two). Every leg links every family's; where the
+# family's executable target is the host's own, each program runs as `prog 7 x y` to the reference's exit code.
+dss_add_test(NAME link/test_object_entry
+             SOURCES test_object_entry.cpp)
+
+# P69 fold 3d (lane `xa`) — [[D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS]]: a library
+# of data alone is written with its data alone on every library document (no PE code section, no executable ELF
+# segment, a 0-byte Mach-O `__text`), and a program with no instruction is refused as a program with no entry. Every
+# leg builds and reads each; the host's own library is read back by its reference dump tool and a program reads its
+# datum there.
+dss_add_test(NAME link/test_data_only_shared_library
+             SOURCES test_data_only_shared_library.cpp)
 
 # P69 fold 3c (lane `xa`) — [[D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND]],
 # [[D-ASM-DATA-WORD-RELOCATION-KIND-PICKED-BY-DECLARATION-ORDER]] and
@@ -865,6 +955,8 @@ dss_add_test(NAME link/test_coff_relocation_count_overflow
 # [[D-FF1-AR-READER-REFUSES-THE-COFF-LONGNAMES-MEMBER]]: a foreign object that calls the C library, named to the link
 # or archived by lib.exe under a long name, bound to the library's image as the archive-pulled member is
 # (`tests/link/data/foreign_object_library_binding.*`). Every leg links them; on Windows x86_64 each image runs.
+# Fold 3d: the object defining the entry in a build of objects alone, bound as every other named object is (cl /MD
+# for PE, gcc for ELF x86_64, `tests/link/data/object_entry_{puts,getenv}_*`), run where the host runs the format.
 dss_add_test(NAME link/test_foreign_object_library_binding
              SOURCES test_foreign_object_library_binding.cpp)
 

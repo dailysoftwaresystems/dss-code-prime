@@ -258,38 +258,6 @@ struct DssObjects {
     return test_support::native_probe::tailOf(dir / logName, 30, who);
 }
 
-// lld-link from a Visual Studio instance carrying the LLVM component — ANY instance, not only the one the cl
-// toolchain was found in (`-latest` picks one; this host's LLVM component lives in another), at
-// `<instance>\VC\Tools\Llvm\x64\bin\lld-link.exe`. Empty, with `why` set, when no instance carries it.
-[[nodiscard]] fs::path lldLinkOfAnyInstance(fs::path const& work, std::string& why) {
-    fs::path const vswhere{"C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"};
-    std::error_code ec;
-    if (!fs::is_regular_file(vswhere, ec)) {
-        why = "no Visual Studio Installer (vswhere.exe) on this machine";
-        return {};
-    }
-    fs::path const listed = work / "llvm-instances.txt";
-    std::string const q = "\"\"" + vswhere.string() + "\" -products * -requires "
-                          "Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath > \""
-                        + listed.string() + "\"\"";
-    if (std::system(q.c_str()) != 0) {
-        why = "vswhere.exe is present but the query for the LLVM component failed: `" + q + "`";
-        return {};
-    }
-    std::ifstream in{listed};
-    std::string seen;
-    for (std::string line; std::getline(in, line);) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        if (line.empty()) continue;
-        fs::path const lld = fs::path{line} / "VC" / "Tools" / "Llvm" / "x64" / "bin" / "lld-link.exe";
-        if (fs::is_regular_file(lld, ec)) return lld;
-        seen += " `" + lld.string() + "`";
-    }
-    why = seen.empty() ? std::string{"no Visual Studio instance carries Microsoft.VisualStudio.Component.VC.Llvm.Clang"}
-                       : "vswhere listed instances with the LLVM component, but none holds lld-link.exe:" + seen;
-    return {};
-}
-
 void expectOneAddress(fs::path const& exe, unsigned want, char const* who) {
     auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << who << ": " << r.diagnostic;
@@ -325,15 +293,17 @@ TEST(PeObjectFunctionAddressReferenceLinkNative, LldLinkGivesTheMembersEveryForm
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    std::string why;
-    auto const lld = lldLinkOfAnyInstance(dir, why);
-    if (lld.empty()) GTEST_SKIP() << "no lld-link on this host: " << why;
+    // lld-link of ANY Visual Studio instance carrying the LLVM component, not only the cl toolchain's
+    // (`locateLldLink`, the one owner of that question).
+    auto const lld = test_support::native_probe::locateLldLink(dir);
+    if (lld.toolAbsent()) GTEST_SKIP() << "no lld-link on this host: " << lld.detail;
+    ASSERT_TRUE(lld.ok()) << lld.describe();
     // lld-link reads the import libraries through the developer environment's LIB, as link.exe does.
     auto const tools = test_support::native_probe::msvcToolsIn(msvc, dir);
     ASSERT_TRUE(tools.ready()) << tools.describe();
     auto const objs = buildDssObjects(dir);
     ASSERT_TRUE(objs.ok()) << objs.diagnostics;
-    ASSERT_TRUE(linkCapturing(&tools, dir, "\"" + lld.string() + "\" /nologo /OUT:fa_lld.exe " + msEntryOption()
+    ASSERT_TRUE(linkCapturing(&tools, dir, "\"" + lld.lldLink.string() + "\" /nologo /OUT:fa_lld.exe " + msEntryOption()
                               + " /SUBSYSTEM:CONSOLE /NODEFAULTLIB main.obj member.obj entry.obj kernel32.lib ucrt.lib",
                               "lld.txt"))
         << "lld-link must link the DSS objects against kernel32.lib and ucrt.lib"

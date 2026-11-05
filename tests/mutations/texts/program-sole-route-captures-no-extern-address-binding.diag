@@ -1,0 +1,1 @@
+`&extern` used as a VALUE must materialize through a GOT slot

@@ -135,15 +135,19 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->29 exported declarations
-// — <!--census:source:program.exportedFunctions-->24 exported functions plus
-// <!--census:source:program.exportedStructs-->5 exported structs (`CuMirModule`,
-// `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
+//     <!--census:source:program.exportedDecls-->35 exported declarations
+// — <!--census:source:program.exportedFunctions-->27 exported functions plus
+// <!--census:source:program.exportedStructs-->8 exported structs (`CuMirModule`,
+// `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `EntryLinkName`, `ForeignEntryCandidate` -- declared
+// twice, ahead of its first use and where it is defined --, `ResolveLibraryPartition`).
 //
 // ⚠ THE CALL-SITE FIGURES BELOW ARE **NOT** MACHINE-CHECKED, and that is stated
 // rather than left to be assumed from the markers above. Driver call-site counts
-// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 27 call sites
-// over 17 of the 22 entry points — and neither is expressible as a census CLAIM,
+// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 33 call sites
+// over 21 of the 27 exported functions (re-derived in P69 fold 3d by a scan of
+// every exported function's calls; the same scan read 30 over 18 of 24 before
+// that fold, so the P64 pair "27 over 17 of 22" no longer reproduced either)
+// — and neither is expressible as a census CLAIM,
 // which binds one integer to one line-count: "19 of 25" is a DISTINCT count and
 // the ratio further down is a RATIO. They were corrected by hand in P63 and
 // again in P64 and are unguarded. A raw grep over-counts there too:
@@ -233,24 +237,46 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   merged program-stage call short-circuited away, BOTH of them stayed green.
 //   Reading them as driver coverage is the mistake this block exists to stop.
 //
-// `lowerCuMirToAssembly` (2: archive member, N==1) — FIVE format-declared facts
-//   read off the schema at the call site. `processArgs` / `sehPersonality` are
-//   optionals (a `nullopt` compiles), `entryVerbs` is a span (an empty one
-//   compiles AND means "this format starts no program"), `formatName` is a
-//   `string_view` (any string compiles). PINNED: `processArgs` by
-//   `program/test_entry_argv_run` `EntryArgvRun.RealCommandLineReachesMainByteExact`
-//   (a nullopt makes the entry read register garbage); `entryVerbs` on this
-//   route by the corpus pair `examples/c/entry_wmain_only_refused_elf` /
-//   `entry_wmain_only_refused_macho`.
+// `lowerCuMirToAssembly` (2: archive member, N==1) — SEVEN driver-derived
+//   arguments, SIX of them format facts read off the schema at the call site.
+//   ⚠ This said FIVE until P69 fold 3d: `atomicsRuntime` had joined the call
+//   uncounted, and fold 3d's own `entriesOfTheOtherInputs` joined it the same
+//   way. `processArgs` / `sehPersonality` / `atomicsRuntime` are optionals (a
+//   `nullopt` compiles), `entryVerbs` and `entriesOfTheOtherInputs` are spans
+//   (an empty one compiles, and means "this format starts no program" and "no
+//   other input elects an entry"), `formatName` and `wideFloatSoftcallLibrary`
+//   are `string_view`s (any string compiles). PINNED on the N==1 call:
+//   `processArgs` by `program/test_entry_argv_run`
+//   `EntryArgvRun.RealCommandLineReachesMainByteExact` (a nullopt makes the entry
+//   read register garbage); `entryVerbs` by the corpus pair
+//   `examples/c/entry_wmain_only_refused_elf` / `entry_wmain_only_refused_macho`;
+//   `entriesOfTheOtherInputs` by `link/test_object_entry`
+//   `ObjectEntry.EveryRouteLinksAnObjectsEntryForItsFormat`; `sehPersonality`,
+//   `wideFloatSoftcallLibrary` and `atomicsRuntime` by the sole-CU pins section
+//   D's table names. `formatName`: pin not measured. The archive-member call:
+//   pin not measured for any of the seven but `entriesOfTheOtherInputs`, which
+//   it passes empty by design (an archive starts no program).
 //
-// `resolveProgramEntry` (1, merged route) — `formatVerbs`. ★★★ THE WORST
+// `resolveProgramEntry` (2: the merged route, and since P69 fold 3d the
+//   objects-alone route, which elects among the objects' entries) — `formatVerbs`. ★★★ THE WORST
 //   FAILURE SHAPE IN THIS HEADER, AND IT IS SILENT: an EMPTY span is a DECLARED
 //   answer, so it takes the "this format starts no program" arm and resolves by
 //   NAME with no verb requirement and NO ambiguity check, returning candidate 0.
 //   A driver that passed `{}` on an EXEC format would restore the exact
 //   first-match-wins defect this function was created to remove. PINNED by
 //   `program/test_driver_argument_supply`
-//   `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsEntryVerbs`.
+//   `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsEntryVerbs`. The
+//   objects-alone call's `formatVerbs` is NAMED here and pinned by no mutation
+//   of its own: `ObjectEntry.EveryRouteLinksAnObjectsEntryForItsFormat` reads
+//   the shapes it elects on that route.
+//
+// `buildForeignEntryStartup` (1, the objects-alone route, since P69 fold 3d)
+//   — `verb`, the ELECTED entry's materialization, and the
+//   run's `grammar` / `target` / `format`. A wrong verb compiles and links: the
+//   entry then receives the wrong arguments, silently. PINNED by
+//   `link/test_object_entry` `ObjectEntryNative.EachProgramReceivesItsArgumentsAsTheReferencesDo`
+//   (the program run as `prog 7 x y` reads 47 / 5 / 11, as the references' do)
+//   and `ObjectEntry.EveryRouteLinksAnObjectsEntryForItsFormat`.
 //
 // `isArArchiveFile` (**0** — ⚠ this said "1" until P63, and 0 is not a smaller
 //   number, it is a DIFFERENT CLAIM: `program.cpp` never calls this predicate, so
@@ -297,21 +323,40 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `memberNames` by `program/test_static_link`
 //   `StaticLink.ElfStaticLibDriverEmitsArchiveWithArmap`.
 //
-// `lowerMergedToAssembly` (1, merged) — NINE driver-derived arguments with an
-//   observable consequence, every one of them now pinned on this route by
-//   `program/test_driver_argument_supply`. It is the largest concentration in
-//   the kernel and the least-travelled route to it, so each pin names the
-//   argument it protects:
-//     `bitFieldStrategy`         → `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy`
-//     `dataModel`                → `…SuppliesTheFormatsDataModel`
-//     `callingConventionIndex`   → `…SuppliesTheCallingConventionIndex`
-//     `externCallDispatch`       → `…SuppliesTheFormatsExternCallDispatch`
-//     `dataImportBinding`        → `…SuppliesTheFormatsDataImportBinding`
-//     `externAddrBinding`        → `…SuppliesTheFormatsExternAddrBinding`
-//     `sehScopes`                → `…SuppliesTheSehScopes`
-//     `wideFloatSoftcallLibrary` → `…SuppliesTheWideFloatSoftcallLibrary`
-//     `tlsAccess`                → `program/test_compile_pipeline`
-//                                  `Program_CompileFiles.CrossCuExternThreadLocalMergesAndAccessesTpRelativeE2E`
+// `lowerMergedToAssembly` (1, merged) — SEVENTEEN driver-derived arguments,
+//   SIXTEEN with an observable consequence (`cuId` has none here: section C).
+//   ⚠ This said NINE, with `cuId` "the TENTH", until P69 fold 3d. Six arguments
+//   had joined the call since and the count and the list moved with none of
+//   them — `unnamedBitFieldAlignment`, `atomicsRuntime`, `indirectSlotBindings`,
+//   `preemptibleDefinitionBindings`, `assemblyFormatKind` and `commons` — so
+//   four of them reached the route with no pin at all; `imageDefinedNames` is
+//   fold 3d's own. It is the largest concentration in the kernel and the
+//   least-travelled route to it, so each pin names the argument it protects; a
+//   pin is `program/test_driver_argument_supply`'s unless it names another
+//   file, and the CU route's twin of each is in section D's table:
+//     `bitFieldStrategy`              → `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy`
+//     `dataModel`                     → `…SuppliesTheFormatsDataModel`
+//     `callingConventionIndex`        → `…SuppliesTheCallingConventionIndex`
+//     `externCallDispatch`            → `…SuppliesTheFormatsExternCallDispatch`
+//     `dataImportBinding`             → `…SuppliesTheFormatsDataImportBinding`
+//     `externAddrBinding`             → `…SuppliesTheFormatsExternAddrBinding`
+//     `sehScopes`                     → `…SuppliesTheSehScopes`
+//     `wideFloatSoftcallLibrary`      → `…SuppliesTheWideFloatSoftcallLibrary`
+//     `tlsAccess`                     → `program/test_compile_pipeline`
+//                                       `Program_CompileFiles.CrossCuExternThreadLocalMergesAndAccessesTpRelativeE2E`
+//     `unnamedBitFieldAlignment`      → `…SuppliesTheFormatsUnnamedBitFieldAlignment`
+//     `atomicsRuntime`                → `…SuppliesTheFormatsAtomicsRuntime`
+//     `indirectSlotBindings`          → `…SuppliesTheFormatsIndirectSlotBindings`
+//     `preemptibleDefinitionBindings` → `…SuppliesThePreemptibleDefinitionBindings`
+//     `assemblyFormatKind`            → `…SuppliesTheAssemblyFormatKind`
+//     `commons`                       → `…SuppliesWhetherTheDocumentStatesCommons`
+//     `imageDefinedNames`             → `…SuppliesTheImageDefinedNames`
+//   ⚠ FIVE OF THOSE PINS ARE NEW WITH FOLD 3d — `unnamedBitFieldAlignment`,
+//   `atomicsRuntime`, `indirectSlotBindings`, `preemptibleDefinitionBindings`,
+//   `imageDefinedNames` — and so is every sole-CU twin. Each has its arm in
+//   `tests/mutations/arms.registry` (`program-merged-route-…`,
+//   `program-sole-route-…`), DECLARED from the case's assertions and NOT YET READ
+//   BY A SWEEP. The measurement below is of the first nine only.
 //   ★★ EVERY ONE OF THOSE PINS ASSERTS THE OBSERVABLE CONSEQUENCE IN THE
 //   PRODUCED IMAGE, NEVER THE ARGUMENT'S SHAPE — bytes of a const-init global, a
 //   relocation type, an unwind-info flag, a declared library name. Six of the
@@ -334,9 +379,15 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   site, so the driver cannot quietly supply the wrong one; the only failure
 //   available is walking the wrong CU set, which the merge then reports.
 //
-// `lowerMergedToAssembly`'s `cuId` — the TENTH driver-derived argument, and the
-//   one with no pin, because on this route it has no observable consequence to
-//   pin. `lowerMergedToAssembly`'s own docblock says so: the merged image
+// `entryLinkNames` (1) and `collectObjectEntryCandidates` (1), both since P69
+//   fold 3d — the run's one `grammar` and one `format`, and the objects the
+//   driver read once before any route. No second grammar, format or object set
+//   is in scope at either call, so the driver cannot quietly supply the wrong
+//   one; an empty answer is the format's own (it starts no program).
+//
+// `lowerMergedToAssembly`'s `cuId` — one of its SEVENTEEN driver-derived
+//   arguments (counted "the TENTH" until P69 fold 3d), and the one with no pin,
+//   because on this route it has no observable consequence to pin. `lowerMergedToAssembly`'s own docblock says so: the merged image
 //   carries CU0's id and it is "cosmetic, since the linker gets one module" —
 //   the merge already collapsed every CU into ONE symbol space, so the
 //   `(cuId, SymbolId)` key the linker builds has a single cuId whatever value
@@ -345,14 +396,63 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   (`linkAndWriteStaticArchive`'s symbol index is keyed by the pair), and
 //   there the same argument is load-bearing.
 //
-// ── D. WITNESSED, BUT ONLY WHERE THE IMAGE RUNS — the honest remainder ─────
-// No driver-derived argument of any entry point above is UNWITNESSED any more.
-// What is left is narrower and worth naming precisely, because a reader who
-// assumes "pinned" means "pinned on every leg" would be wrong about two of
-// them: their DISCRIMINATING arm needs a pe64 image to EXECUTE, so it runs on
-// the Windows leg and is skipped elsewhere. On the other legs those two pins
-// still assert the build and their own premise — they simply cannot tell a
-// correct supply from a wrong one there.
+// ── D. THE TABLE, AND WHAT IS WITNESSED ONLY WHERE THE IMAGE RUNS ──────────
+// ⚠ Until P69 fold 3d this section opened "No driver-derived argument of any
+// entry point above is UNWITNESSED any more." Four of `lowerMergedToAssembly`'s
+// were, and no cell of the CU route was named at all, so the sentence is
+// WITHDRAWN until every cell below is a pin. The universe is the product of
+// `lowerMergedToAssembly`'s seventeen arguments and the two routes that carry
+// them:
+//   * the CU route — `buildCuMir` → `CuMirModule` → `lowerCuMirToAssembly`,
+//     which the N==1 build AND each archive member take. It carries an argument
+//     as a `CuMirModule` field the build half fills from the format (one capture
+//     serves both of its calls), or as an argument of the driver's own
+//     `lowerCuMirToAssembly` call (one per call, "[2 calls]");
+//   * the merged route — `lowerMergedToAssembly`'s parameter (section B).
+// A pin is `program/test_driver_argument_supply`'s unless a file is named.
+// `Sole…` is `DriverArgumentSupply.SingleCuRouteSupplies…` and `Merged…` its
+// `MergedMultiCuRouteSupplies…` twin: ONE check, run on each route. ⓦ = the
+// discriminating arm needs a pe64 image to RUN (the two rows after the table).
+//   `bitFieldStrategy`: CU field, `Sole…TheFormatsBitFieldStrategy`; merged, its twin.
+//   `dataModel`: CU field, `Sole…TheFormatsDataModel`; merged, its twin.
+//   `callingConventionIndex` ⓦ: CU field (from `buildCuMir`'s own argument, whose
+//     build-half use `EntryArgvRun.RealCommandLineReachesMainByteExact` pins),
+//     `Sole…TheCallingConventionIndex`; merged, its twin.
+//   `cuId`: CU field (`cu.id()`). On the N==1 call one module, so no consequence;
+//     on the archive-member call it is load-bearing (section C): pin not
+//     measured. Merged: no consequence (section C).
+//   `externCallDispatch`: CU field, `Sole…TheFormatsExternCallDispatch`; merged, its twin.
+//   `dataImportBinding` ⓦ: CU field, `Sole…TheFormatsDataImportBinding`; merged, its twin.
+//   `externAddrBinding`: CU field, `Sole…TheFormatsExternAddrBinding`; merged, its twin.
+//   `tlsAccess`: CU field, `program/test_compile_pipeline`
+//     `Program_CompileFiles.ThreadLocalEmitsPtTlsAndFsAccessSequence` (one source
+//     through `compileFiles`; with no block the access is refused, and the case
+//     asserts the build); merged, section B's pin.
+//   `sehScopes`: on the CU route derived inside `lowerCuMirToAssembly` from the
+//     driver's `sehPersonality` [2 calls] — N==1 `Sole…TheSehScopes`, the
+//     archive-member call pin not measured; merged, `Merged…TheSehScopes`.
+//   `wideFloatSoftcallLibrary`: CU driver [2 calls] — N==1
+//     `Sole…TheWideFloatSoftcallLibrary`, the archive-member call pin not
+//     measured; merged, its twin.
+//   `unnamedBitFieldAlignment`: CU field, `Sole…TheFormatsUnnamedBitFieldAlignment`; merged, its twin.
+//   `atomicsRuntime`: CU driver [2 calls] — N==1 `Sole…TheFormatsAtomicsRuntime`,
+//     the archive-member call pin not measured; merged, its twin.
+//   `indirectSlotBindings`: CU field, `Sole…TheFormatsIndirectSlotBindings`; merged, its twin.
+//   `preemptibleDefinitionBindings`: CU field, `Sole…ThePreemptibleDefinitionBindings`; merged, its twin.
+//   `assemblyFormatKind`: CU field, the sole-CU arm of `Merged…TheAssemblyFormatKind`; merged, that case.
+//   `commons`: CU field, `Sole…WhetherTheDocumentStatesCommons`; merged, its twin.
+//   `imageDefinedNames`: CU field, `Sole…TheImageDefinedNames`; merged, its twin.
+// FOUR CELLS ARE NOT PINS, all on the archive-member call: `cuId`, `sehScopes`,
+// `wideFloatSoftcallLibrary` and `atomicsRuntime`. The withdrawn sentence comes
+// back when they are.
+//
+// What is witnessed only where the image runs is narrower and worth naming
+// precisely, because a reader who assumes "pinned" means "pinned on every leg"
+// would be wrong about two of the arguments, on either route: their
+// DISCRIMINATING arm needs a pe64 image to EXECUTE, so it runs on the Windows
+// leg and is skipped elsewhere. On the other legs those pins still assert the
+// build and their own premise — they simply cannot tell a correct supply from a
+// wrong one there.
 //   * `callingConventionIndex` on the merged route. ✔MEASURED: every static
 //     signature of the wrong ordinal — which register `main` reads `argc` from,
 //     which callee-saved registers spill, the `sub rsp` in a calling frame, the
@@ -638,6 +738,27 @@ struct CompileOptions {
     // `compileOneTarget` takes only the PATH for the same reason it does for
     // `ar` archives.
     std::vector<std::filesystem::path> objectInputs;
+
+    // ── WHERE EACH NAMED INPUT STANDS IN THE LINK'S ORDER (P69 fold 3d,
+    //    D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──────────────────
+    //
+    // A PLACE is an input's index in the operator's gathered file list — the
+    // order every reference driver hands its linker, a source in its own place
+    // as the object it compiles to (`AssembledModule::linkPosition` holds the
+    // measurement). `objectInputPlaces` is PARALLEL to `objectInputs`: the
+    // place of each object the operator named among the inputs, and none for
+    // one named on `--resolve-library`, which the gathered list does not order
+    // (a library's place: after every named input). `unitPlaces` holds the
+    // place of each compilation unit, in unit order: a unit compiled from one
+    // source stands where that source stands, and a unit of several sources
+    // (an API unity build) where its first one does.
+    //
+    // Stated by `runCusToTargets`, the one place the gathered list is
+    // partitioned; `compileOneTarget` refuses either list when it is neither
+    // empty nor one place per input. Empty (a caller that states no order)
+    // places nothing: every module then stands in the order the link holds it.
+    std::vector<std::optional<std::uint32_t>> objectInputPlaces;
+    std::vector<std::uint32_t>                unitPlaces;
 
     // ── ★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: WHICH
     //    OF `resolveLibraries`' ARCHIVES THE DRIVER RESOLVED FOR THE SHIPPED
@@ -955,6 +1076,16 @@ struct DSS_EXPORT CuMirModule {
     // readers produce instead of a `.bss` definition — unless it is wider than
     // every linker gives a common of its size (`CommonsStatement::admitsCommon`).
     CommonsStatement commons;
+
+    // ★★ THE NAMES THE IMAGE THIS UNIT ENDS IN WILL DEFINE (P69 fold 3d, lane
+    // `xa`) — the document's `imageDefinedSymbols` (`ObjectFormatSchema::
+    // imageDefinedNames`), captured for the SAME reason as `externCallDispatch`:
+    // the LOWER half sees only this struct. A reference to one is in the image,
+    // never an import, so MIR→LIR lowers it DIRECT; without them it reads
+    // through a slot, and the image link refuses a slot for a name the image
+    // defines. Every pe64 flavor states them, the relocatable and archive ones
+    // included, because their objects end in an image too.
+    std::vector<std::string> imageDefinedNames;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -1218,13 +1349,27 @@ verifySynthesizedModule(Mir const&          mir,
 //                        when this is nullopt.
 //   * `formatName`     — names the format in those two diagnostics, so the reader
 //                        knows WHICH `.format.json` to open.
+//   * `entriesOfTheOtherInputs` — the program-entry candidates the link's OTHER
+//                        inputs define (`collectObjectEntryCandidates`: a named
+//                        object's `main`), elected WITH this unit's own in one
+//                        `resolveProgramEntry`. No default: every caller answers
+//                        it, and the routes with no other input hand none (an
+//                        archive member, `assembleUnit`). When one of them wins,
+//                        the unit's module names no entry of its own, and where
+//                        the verb needs a pre-main init that init is synthesized
+//                        HERE, calling the winner by its name (`realizeEntryShape`'s
+//                        foreign entry) — the module's `userEntrySymbol` is then the
+//                        init; otherwise it stays unset and the caller states the
+//                        entry on the object that defines it.
 // After the user entry is resolved this drives `realizeEntryShape` — the single-CU
 // counterpart of the merge-path pass in `program.cpp` — which materializes the
 // entry's arguments per the resolved verb × the format's declared mechanism.
+struct DSS_EXPORT ForeignEntryCandidate;   // defined beside `collectEntryCandidates`
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
                      std::span<EntryMaterialization const> entryVerbs,
+                     std::span<ForeignEntryCandidate const> entriesOfTheOtherInputs,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
@@ -1330,6 +1475,87 @@ DSS_EXPORT void collectEntryCandidates(
     SemanticModel const& model, std::vector<EntryCandidate>& out,
     std::vector<std::uint32_t>& outSymbolIndex);
 
+// ── AN ENTRY ANOTHER INPUT OF THE LINK DEFINES (P69 fold 3d,
+//    D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED and
+//    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────────
+//
+// A program's entry may be a function a pre-assembled OBJECT input defines —
+// `cc helper.c main.o` is an ordinary build — and it is elected with the units'
+// candidates in ONE election (`resolveProgramEntry`), so an entry in an object
+// and one in a source are the ambiguity that election already names.
+//
+// ★ AN OBJECT CARRIES NO PROTOTYPE, SO ITS ENTRY'S VERB IS THE ONE EVERY
+// REFERENCE STARTUP PASSES: of the rows the language declares for that name,
+// the one with the MOST parameters that this format realizes (its
+// `entryVerbs`). The references pass every value to every `main` whatever it
+// declares — the UCRT's `invoke_main` calls `main(__argc, __argv,
+// _get_initial_narrow_environment())` (DOCUMENTED, the MSVC toolset's
+// `exe_common.inl`), glibc's `__libc_start_main` passes argc, argv and envp, and
+// dyld passes four values — and a `main(void)` called so is how all of them call
+// it. ✔MEASURED P69 fold 3d (lane `xa`, `argc_pe.py`, `argc_elf_*`): an object
+// `main(argc, argv)`, `main(void)` and `main(argc, argv, envp)` from cl 19.44,
+// gcc 13.3 and clang 18.1.3 each return what its own reference link returns
+// when called so.
+// Each entry NAME the language (`grammar`) declares of which the format realizes
+// at least one row: its spelling on the binary (the format's C decoration), its
+// spelling in the language, and the richest of its rows the format realizes (the
+// most parameters; the first such row in the language's order). Empty for a
+// format that starts no program. The one statement of which names an object's
+// entry may have — `collectObjectEntryCandidates` asks it, and so does the
+// all-object link's refusal of a program with none.
+struct DSS_EXPORT EntryLinkName {
+    std::string          linkName;
+    std::string          languageName;
+    EntryMaterialization verb = EntryMaterialization::None;
+};
+[[nodiscard]] DSS_EXPORT std::vector<EntryLinkName>
+entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format);
+
+struct DSS_EXPORT ForeignEntryCandidate {
+    EntryCandidate candidate;     // the language's spelling of the name + that verb
+    std::string    linkName;      // the name the object defines it under
+    std::size_t    object = 0;    // the index of the object among the link's objects
+    SymbolId       symbol{};      // the object's own id of the definition
+};
+
+// Every program-entry candidate `objects` define: a function DEFINITION of
+// external linkage under an entry name the language (`grammar`) declares, in the
+// format's C decoration, for a name of which the format realizes at least one
+// row. Empty for a format that starts no program (`entryVerbs` empty), so a
+// relocatable link elects nothing among its objects. In object order, then in
+// each object's symbol order.
+[[nodiscard]] DSS_EXPORT std::vector<ForeignEntryCandidate>
+collectObjectEntryCandidates(std::span<AssembledModule const> objects,
+                             GrammarSchema const&             grammar,
+                             ObjectFormatSchema const&        format);
+
+// ── THE STARTUP MODULE OF A LINK THAT COMPILES NOTHING (P69 fold 3d,
+//    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────────
+//
+// An all-object link's entry is an object's function, and where its verb × the
+// format's mechanism needs a pre-main init (the CRT accessors of a PE image) the
+// link has no module to hold one. This builds that module: an EMPTY module whose
+// symbol-id end its maker states (its name table holds no id), the init
+// `realizeForeignEntryShape` synthesizes into it — calling the entry by name —
+// and then the two optimize stages every compiled module receives, the Unit
+// stage and the Program stage as its last (`PipelineStage`'s contract; the
+// synthesis comes first, so the init is optimizer INPUT and each stage's
+// verification covers it, as on the merged route). `startup` is EMPLACED and
+// optimized in place, so the module the caller lowers is the one each stage
+// reported (`pipeline_testing`'s stage seam keys a module by its address).
+// `startup` stays empty where no init is needed — the trampoline then calls the
+// object's entry itself. Returns false when a step failed (reported).
+[[nodiscard]] DSS_EXPORT bool
+buildForeignEntryStartup(ForeignEntryCandidate const&    entry,
+                         EntryMaterialization            verb,
+                         CompilationUnitId               startupId,
+                         GrammarSchema const&            grammar,
+                         TargetSchema const&             target,
+                         ObjectFormatSchema const&       format,
+                         CompileOptions const&           compileOpts,
+                         std::optional<MergedMirModule>& startup,
+                         DiagnosticReporter&             reporter);
+
 // LOWER half for the MERGED whole-program module (Cycle 25 Stage C). Drives the
 // single module `mergeCuMirs` produced (N CUs unified, cross-CU calls already DIRECT,
 // resolved externs stripped, user-entry pre-computed) through the SAME lowering body
@@ -1418,7 +1644,14 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // definition, and two such objects of one name are
                       // refused by every linker where the references' commons
                       // fold (`DriverArgumentSupply` pins it on the artifact).
-                      CommonsStatement const& commons);
+                      CommonsStatement const& commons,
+                      // ★★ P69 fold 3d (lane `xa`): the names the image will
+                      // define (`ObjectFormatSchema::imageDefinedNames`; see
+                      // `CuMirModule::imageDefinedNames`), pre-resolved in
+                      // program.cpp for the same reason the facts above are.
+                      // A merged module lowered without them reads each such
+                      // name through a slot, and the image link refuses it.
+                      std::vector<std::string> imageDefinedNames);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's
@@ -1723,39 +1956,54 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                             ObjectFormatSchema const&              format,
                             DiagnosticReporter&                    reporter);
 
-// Link `clientModule` against zero-or-more pre-assembled OBJECT inputs and
-// zero-or-more static `ar` archives, then write the image to `outPath`. When
-// BOTH input lists are empty this is exactly `linkAndWrite({clientModule})`
-// (byte-identical to the pre-c165 path). Otherwise it reads every object input
-// (`readObjectInputModules`, EAGER), pulls the referenced archive members
+// Link the module DSS compiled (`compiledModule`, if the build compiled one)
+// with zero-or-more pre-assembled OBJECT inputs, already READ
+// (`readObjectInputModules`, once, by the caller), and zero-or-more static `ar`
+// archives, then write the image to `outPath`. With no object and no archive
+// this is exactly `linkAndWrite({compiledModule})` (byte-identical to the
+// pre-c165 path). Otherwise it pulls the referenced archive members
 // (`pullStaticArchiveMembers`, LAZY) and links the COMBINED span
-// `[clientModule, objects..., pulled...]` -- the N>1 `linker::link` path, whose
+// `[compiledModule, objects..., pulled...]` -- the N>1 `linker::link` path, whose
 // `mergeModules` binds each cross-module reference to its definition (stripping
 // the extern import) exactly as it does a sibling-CU reference. Returns true iff
-// every read, the pull, the merge, the link and the write all succeeded.
+// the pull, the binding, the merge, the link and the write all succeeded.
 //
-// ── `objectInputs` (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION)
+// ── `objects` (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION)
 // ───────────────────────────
 // ★★ THE ORDER OF THE TWO INPUT KINDS IS LOAD-BEARING, not stylistic. Objects
-// are read FIRST and then seed the archive pull together with `clientModule`,
-// because an object input's own unresolved externs are references an archive
-// may satisfy: reading objects after the pull -- or pulling with the client
-// alone as the seed -- would leave exactly those members unpulled and fail the
-// link naming a symbol the operator had already supplied. The reverse ordering
-// has no corresponding hazard: an archive member cannot introduce a reference
-// that only an object input satisfies without that object also being in the
-// seed, which it is.
+// seed the archive pull together with the compiled module, because an object
+// input's own unresolved externs are references an archive may satisfy: pulling
+// with the compiled module alone as the seed would leave exactly those members
+// unpulled and fail the link naming a symbol the operator had already supplied.
+// The reverse ordering has no corresponding hazard: an archive member cannot
+// introduce a reference that only an object input satisfies without that object
+// also being in the seed, which it is.
+//
+// ★ EVERY OBJECT IS FOREIGN, AND EVERY ONE IS BOUND (P69 fold 3d,
+// D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT): each names the
+// libraries it calls by NAME alone, so each goes through `bindForeignImports`
+// after the search, the one that defines the program's entry included. The
+// compiled module is DSS's own and was bound when it was compiled. ✔MEASURED
+// before: an all-object link made the entry-defining object a "client" ahead of
+// the others and bound none of ITS imports (`puts` undefined), and a lone
+// `--compile main.o` short-circuited to `linkAndWrite` and bound nothing at all.
+// An all-object link passes NO compiled module, unless the program's startup
+// had to be compiled for it (`compileOneTarget`); a call with neither a compiled
+// module nor an object is refused, as an internal breach of this contract.
+//
+// Each object's `linkPosition` is the caller's to state (where it stands among
+// the operator's inputs); a pulled member states none.
 //
 // `dynamicLibraries` rides through to `pullStaticArchiveMembers` -- see its
 // contract above for why a pulled member's library binding has to be re-derived
 // and why this must be the DYNAMIC half of `--resolve-library`. Neither it nor
-// `objectInputs` is defaulted: every route that produces an image has to answer
+// `objects` is defaulted: every route that produces an image has to answer
 // the question, and a default would let a new route silently inherit the gap
-// each parameter closes -- which for `objectInputs` is a silently INCOMPLETE
+// each parameter closes -- which for `objects` is a silently INCOMPLETE
 // link, the characteristic failure of a separate-compilation driver.
 [[nodiscard]] DSS_EXPORT bool
-linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
-                               std::span<std::filesystem::path const> objectInputs,
+linkAndWriteWithStaticArchives(std::optional<AssembledModule>         compiledModule,
+                               std::vector<AssembledModule>           objects,
                                std::span<std::filesystem::path const> staticArchives,
                                std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                TargetSchema const&                    target,

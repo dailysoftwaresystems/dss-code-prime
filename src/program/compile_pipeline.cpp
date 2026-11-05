@@ -1097,6 +1097,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // P69 fold 3b: how this unit writes a tentative definition — the document's
     // facts, for the LOWER half (see the field).
     cuMir.commons = format.commonsStatement();
+    // P69 fold 3d: the names the image this unit ends in will define, for the
+    // LOWER half (see the field).
+    cuMir.imageDefinedNames = format.imageDefinedNames();
     return cuMir;
 }
 
@@ -1438,7 +1441,11 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::optional<ObjectFormatKind>             assemblyFormatKind,
                          // P69 fold 3b: how the document writes a tentative
                          // definition (`stateTentativeDefinitionsAsCommons`).
-                         CommonsStatement const&                     commons) {
+                         CommonsStatement const&                     commons,
+                         // P69 fold 3d: the names the image will define
+                         // (`CuMirModule::imageDefinedNames`), threaded into
+                         // MIR→LIR, which lowers a reference to one DIRECT.
+                         std::vector<std::string>                    imageDefinedNames) {
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
     // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
     // definition. Built HERE because this is where names live — `nameOf` is
@@ -1517,7 +1524,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           std::move(definedSymbolNames),
                           // P68 round 9: the format kind, ONLY as a key into
                           // the assembly dialect's `symbolParts`.
-                          assemblyFormatKind);
+                          assemblyFormatKind,
+                          // P69 fold 3d: the names the image will define.
+                          std::move(imageDefinedNames));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -2292,6 +2301,97 @@ void collectEntryCandidates(SemanticModel const& model,
     }
 }
 
+// See the header: the entry names an object's entry may have, each with the
+// richest of its rows the format realizes.
+std::vector<EntryLinkName> entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format) {
+    std::vector<EntryLinkName> out;
+    std::vector<std::size_t>   arityOf;   // parallel to `out`
+    CSymbolDecorationScheme const scheme = format.cSymbolDecoration().scheme;
+    for (auto const& decl : grammar.semantics().declarations) {
+        for (auto const& row : decl.entryFunctions) {
+            // A row the format does not realize is no way into a program on it;
+            // a format that starts no program realizes none.
+            if (!format.realizesEntryVerb(row.verb)) continue;
+            std::string       linkName = dss::ffi::applyCMangling(row.name, scheme);
+            std::size_t const arity    = entryVerbParams(row.verb).size();
+            auto const it = std::find_if(out.begin(), out.end(),
+                                         [&](EntryLinkName const& e) { return e.linkName == linkName; });
+            if (it == out.end()) {
+                out.push_back(EntryLinkName{std::move(linkName), std::string{row.name}, row.verb});
+                arityOf.push_back(arity);
+            } else if (std::size_t const at = static_cast<std::size_t>(it - out.begin());
+                       arity > arityOf[at]) {
+                it->verb    = row.verb;   // the first row of the greatest arity
+                arityOf[at] = arity;
+            }
+        }
+    }
+    return out;
+}
+
+// See the header: an OBJECT's entry candidates.
+std::vector<ForeignEntryCandidate>
+collectObjectEntryCandidates(std::span<AssembledModule const> objects,
+                             GrammarSchema const&             grammar,
+                             ObjectFormatSchema const&        format) {
+    std::vector<ForeignEntryCandidate> out;
+    std::vector<EntryLinkName> const   names = entryLinkNames(grammar, format);
+    if (names.empty()) return out;
+    for (std::size_t k = 0; k < objects.size(); ++k) {
+        AssembledModule const& m = objects[k];
+        for (ModuleSymbol const& ms : m.symbols) {
+            if (ms.binding == SymbolBinding::Local) continue;   // an entry is external
+            auto const it = std::find_if(names.begin(), names.end(),
+                                         [&](EntryLinkName const& e) { return e.linkName == ms.name; });
+            if (it == names.end()) continue;
+            // A row alone is not a definition — a reader mints rows for data and
+            // section symbols too — so the row has to name a FUNCTION of the
+            // object, which is what the init (or the trampoline) will call.
+            bool const isFunction = std::any_of(m.functions.begin(), m.functions.end(),
+                                                [&](auto const& fn) { return fn.symbol.v == ms.symbol.v; });
+            if (!isFunction) continue;
+            out.push_back(ForeignEntryCandidate{EntryCandidate{it->languageName, it->verb}, ms.name, k,
+                                                ms.symbol});
+        }
+    }
+    return out;
+}
+
+// See the header: the startup module of a link that compiles nothing.
+bool buildForeignEntryStartup(ForeignEntryCandidate const&    entry,
+                              EntryMaterialization            verb,
+                              CompilationUnitId               startupId,
+                              GrammarSchema const&            grammar,
+                              TargetSchema const&             target,
+                              ObjectFormatSchema const&       format,
+                              CompileOptions const&           compileOpts,
+                              std::optional<MergedMirModule>& startup,
+                              DiagnosticReporter&             reporter) {
+    startup.reset();
+    MirBuilder emptyModule;
+    emptyModule.stateSymbolIdEnd(1);   // its name table holds no id: the space starts past 0
+    Mir                       mir = std::move(emptyModule).finish();
+    TypeLattice               host{startupId, std::string{grammar.configName()}};
+    std::optional<SymbolId>   init;
+    std::vector<ExternImport> imports;
+    if (!realizeForeignEntryShape(mir, host.interner(), entry.linkName, init, imports, verb,
+                                  format.processArgs(), format.cSymbolDecoration().scheme,
+                                  format.name(), reporter)) {
+        return false;   // an unusable mechanism — reported
+    }
+    if (!init.has_value()) return true;   // no init needed: the trampoline calls the entry itself
+    startup.emplace(MergedMirModule{std::move(mir), std::move(host), {}, std::move(imports), init, {}});
+    std::span<SymbolId const> const roots{&*startup->userEntrySymbol, 1};
+    for (PipelineStage const stage : {PipelineStage::Unit, PipelineStage::Program}) {
+        if (!optimizeModule(startup->mir, target, startup->host.interner(), compileOpts, stage,
+                            opt::ModuleExtent::LinkInput, roots, reporter, startup->externImports)) {
+            startup.reset();
+            return false;   // reported
+        }
+    }
+    return true;
+}
+
 std::optional<ResolvedEntry>
 resolveProgramEntry(std::span<EntryCandidate const>       candidates,
                     std::span<EntryMaterialization const> formatVerbs,
@@ -2480,6 +2580,7 @@ std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
                      std::span<EntryMaterialization const> entryVerbs,
+                     std::span<ForeignEntryCandidate const> entriesOfTheOtherInputs,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
@@ -2494,10 +2595,16 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // `realizeEntryShape` may retarget it.
     //
     // Both driver paths call the SAME `resolveProgramEntry`; see its docblock for
-    // why that had to become single-owner.
+    // why that had to become single-owner. The OTHER inputs' candidates (a named
+    // object's `main`) join this unit's in the same election (P69 fold 3d), after
+    // them, so an index past this unit's own names one of theirs.
     std::vector<EntryCandidate> cands;
     std::vector<std::uint32_t>  candSym;
     collectEntryCandidates(model, cands, candSym);
+    std::size_t const ownCandidates = cands.size();
+    for (ForeignEntryCandidate const& other : entriesOfTheOtherInputs) {
+        cands.push_back(other.candidate);
+    }
     bool entryOk = true;
     auto const resolved = resolveProgramEntry(cands, entryVerbs, formatName,
                                               reporter, entryOk);
@@ -2505,12 +2612,16 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
 
     std::optional<SymbolId> userEntry;
     EntryMaterialization    entryVerb = EntryMaterialization::None;
-    if (resolved.has_value()) {
+    ForeignEntryCandidate const* foreignEntry = nullptr;
+    if (resolved.has_value() && resolved->index < ownCandidates) {
         // `collectEntryCandidates` records each candidate's index in
         // `model.symbols()`, which IS its SymbolId on this path (the same identity
         // the pre-existing scan minted).
         userEntry = SymbolId{candSym[resolved->index]};
         entryVerb = resolved->verb;
+    } else if (resolved.has_value()) {
+        foreignEntry = &entriesOfTheOtherInputs[resolved->index - ownCandidates];
+        entryVerb    = resolved->verb;
     }
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
@@ -2527,10 +2638,21 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // the MODULE carries that end and hands out the ids (mir/merge/synth_symbol_floor.hpp;
     // ✔MEASURED P69 round 4: an id counted from the module alone published this init as
     // `T __func__` in an x86_64 Linux image).
-    if (!realizeEntryShape(cuMir.mir, model.lattice().interner(),
-                           userEntry, cuMir.externImports,
-                           entryVerb, processArgs, cuMir.cSymbolDecoration,
-                           formatName, reporter)) {
+    // An entry another input defines (P69 fold 3d): its init, where its verb needs
+    // one, is synthesized into THIS module and calls it by name; `userEntry` is
+    // then that init, and stays unset where none is needed (the caller states the
+    // entry on the object).
+    bool const shaped =
+        foreignEntry != nullptr
+            ? realizeForeignEntryShape(cuMir.mir, model.lattice().interner(),
+                                       foreignEntry->linkName, userEntry,
+                                       cuMir.externImports, entryVerb, processArgs,
+                                       cuMir.cSymbolDecoration, formatName, reporter)
+            : realizeEntryShape(cuMir.mir, model.lattice().interner(),
+                                userEntry, cuMir.externImports,
+                                entryVerb, processArgs, cuMir.cSymbolDecoration,
+                                formatName, reporter);
+    if (!shaped) {
         return std::nullopt;  // unusable mechanism — fail-loud already reported.
     }
 
@@ -2657,7 +2779,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
         atomicsRuntime, cuMir.indirectSlotBindings,
         cuMir.preemptibleDefinitionBindings, reporter,
-        cuMir.assemblyFormatKind, cuMir.commons);
+        cuMir.assemblyFormatKind, cuMir.commons, cuMir.imageDefinedNames);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2709,7 +2831,10 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::optional<ObjectFormatKind> assemblyFormatKind,
                       // P69 fold 3b: the document's facts, pre-resolved in
                       // program.cpp (see the declaration).
-                      CommonsStatement const& commons) {
+                      CommonsStatement const& commons,
+                      // P69 fold 3d: the names the image will define,
+                      // pre-resolved in program.cpp (see the declaration).
+                      std::vector<std::string> imageDefinedNames) {
     reportStage({StageEvent::Kind::Lowered, PipelineStage::Program, &merged.mir});
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -2728,7 +2853,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
         std::move(atomicsRuntime), std::move(indirectSlotBindings),
         std::move(preemptibleDefinitionBindings), reporter,
-        assemblyFormatKind, commons);
+        assemblyFormatKind, commons, std::move(imageDefinedNames));
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -4480,8 +4605,8 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     return objects;
 }
 
-bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
-                                    std::span<std::filesystem::path const> objectInputs,
+bool linkAndWriteWithStaticArchives(std::optional<AssembledModule>         compiledModule,
+                                    std::vector<AssembledModule>           objects,
                                     std::span<std::filesystem::path const> staticArchives,
                                     std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                     TargetSchema const&                    target,
@@ -4489,32 +4614,45 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
                                     std::filesystem::path const&           outPath,
                                     DiagnosticReporter&                    reporter,
                                     ImageRequest const&                    request) {
-    if (objectInputs.empty() && staticArchives.empty()) {
-        return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
+    if (!compiledModule.has_value() && objects.empty()) {
+        // The contract's one refusal: a caller reached the link with nothing to
+        // link. Every route that produces an image hands a compiled module or at
+        // least one object (the all-object route refuses an empty input before).
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::D_EmptyInput;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "linkAndWriteWithStaticArchives: nothing to link into '{}' -- no compiled "
+            "module and no object input reached the link (an internal breach of the "
+            "link's contract: the driver refuses an empty build before this point).",
+            core::genericSpelling(outPath));
+        reporter.report(std::move(d));
+        return false;
+    }
+    if (objects.empty() && staticArchives.empty()) {
+        return linkAndWrite(std::span<AssembledModule const>{&*compiledModule, 1},
                             target, format, outPath, reporter, request);
     }
 
-    // EAGER FIRST -- see the header's ordering note. The objects join the seed
-    // the lazy archive pull resolves against, so an archive member an object
-    // input needs is pulled rather than silently left behind.
-    auto objects = readObjectInputModules(objectInputs, target, format, reporter);
-    if (!objects) return false;   // read fail-loud already reported
-
+    // The objects join the seed the lazy archive pull resolves against (the
+    // header's ordering note), so an archive member an object input needs is
+    // pulled rather than silently left behind.
+    std::size_t const compiledCount = compiledModule.has_value() ? 1u : 0u;
+    std::size_t const objectCount   = objects.size();
     std::vector<AssembledModule> combined;
-    combined.reserve(1 + objects->size());
-    combined.push_back(std::move(clientModule));
-    for (auto& object_mod : *objects) combined.push_back(std::move(object_mod));
+    combined.reserve(compiledCount + objectCount);
+    if (compiledModule.has_value()) combined.push_back(std::move(*compiledModule));
+    for (auto& object_mod : objects) combined.push_back(std::move(object_mod));
 
     auto pulled = pullStaticArchiveMembers(
         std::span<AssembledModule const>{combined.data(), combined.size()},
         staticArchives, dynamicLibraries, target, format, reporter);
     if (!pulled) return false;   // pull fail-loud already reported
 
-    // Link the COMBINED span [client, objects..., pulled...]. >1 element triggers
+    // Link the COMBINED span [compiled, objects..., pulled...]. >1 element triggers
     // the c154 cross-CU merge in `linker::link`, whose `mergeModules` binds each
     // cross-module reference to its definition (stripping the extern import)
-    // exactly as it resolves a sibling-CU reference. With no objects and nothing
-    // pulled the span is the client alone -- the single-CU path, unchanged.
+    // exactly as it resolves a sibling-CU reference.
     combined.reserve(combined.size() + pulled->size());
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
 
@@ -4525,7 +4663,9 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
     // before any library does, as under link.exe and GNU ld. Until the fold nothing bound them, so ✔MEASURED
     // 2026-10-20 every object of cl /MD, clang-cl, cl /MT and mingw-w64 gcc that calls `puts` — directly or through
     // `__imp_puts` — was refused "undefined symbol" here, though the same object in an archive linked and ran.
-    std::size_t const objectCount = objects->size();
+    // EVERY named object (P69 fold 3d): the one that defines the program's entry is foreign too. ✔MEASURED before
+    // (lane `xa`, `client_bind_dss.py`): an all-object link made that object a "client" ahead of the span bound here,
+    // and its `puts` was refused undefined.
     if (objectCount != 0u) {
         // Every name the link defines — external-linkage definitions and commons, of every module — is bound by
         // the merge to its definition, never to a library (the search's own `definedNames`, asked of the whole
@@ -4539,7 +4679,7 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
                 if (ext.commonSize != 0u && !ext.mangledName.empty()) definedNames.insert(ext.mangledName);
             }
         }
-        if (!bindForeignImports(std::span<AssembledModule>{combined.data() + 1, objectCount}, definedNames,
+        if (!bindForeignImports(std::span<AssembledModule>{combined.data() + compiledCount, objectCount}, definedNames,
                                 dynamicLibraries, target, format, reporter)) {
             return false;   // reported
         }
@@ -4736,6 +4876,8 @@ assembleUnit(CompilationUnit const&        cu,
     }
     return lowerCuMirToAssembly(
         *cuMir, format.processArgs(), format.entryVerbs(),
+        // One unit assembled alone: no other input of a link stands beside it.
+        std::span<ForeignEntryCandidate const>{},
         format.sehPersonality(), format.name(),
         target.wideFloatSoftcallLibrary(format.kind()), reporter,
         // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics runtime, read

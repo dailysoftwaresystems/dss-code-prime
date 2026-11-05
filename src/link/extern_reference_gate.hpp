@@ -78,6 +78,10 @@ relocationTargetIds(AssembledModule const& m) {
         if (fn.languageHandler.has_value()) {
             targets.insert(fn.languageHandler->personality.v);
             for (auto const& rel : fn.languageHandler->relocations) targets.insert(rel.target.v);
+            // Its DWARF shape's data area is a use of that item (P69 fold 3d).
+            if (fn.languageHandler->dataArea.has_value()) {
+                targets.insert(fn.languageHandler->dataArea->item.v);
+            }
         }
     }
     for (auto const& di : m.dataItems) {

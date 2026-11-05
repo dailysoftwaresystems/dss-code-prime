@@ -1,0 +1,1 @@
+             && loaderRebasesTheField(*tri) && tri->widthBytes != 8) {

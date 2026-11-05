@@ -256,6 +256,12 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     for (SymbolId const s : m.nullAddressSymbols) {
         declare(s, SymbolKind::NullAddress, "null-address symbol");
     }
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a symbol the
+    // image defines is declared for the same reason; the writer gives it its
+    // address of the image.
+    for (auto const& b : m.imageDefinedSymbols) {
+        declare(b.symbol, SymbolKind::ImageDefined, "image-defined symbol");
+    }
     for (std::size_t i = 0; i < m.externImports.size(); ++i) {
         auto const& ext = m.externImports[i];
         // Empty mangledName silently produces broken imports
@@ -483,10 +489,63 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // all three exec formats with `K_SymbolUndefined`, which is a loud refusal
     // of a correct program and therefore below the union.
     std::vector<SymbolId> nullBound;
+    // ★ P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): the imports
+    // this link resolves to the IMAGE ITSELF. A referenced, unbound row whose
+    // name the image's document states (`imageDefinedSymbols`) is a name every
+    // reference linker of the format defines in the image it writes -- PE's
+    // `__ImageBase`, the image's DOS header, which cl's dense `switch` reaches
+    // its jump table through. ✔MEASURED P69 fold 3d: link.exe links cl's /O2
+    // and /Od switch objects and the C idiom `extern IMAGE_DOS_HEADER
+    // __ImageBase;`, each run to 42 (probe-reference-cc run
+    // 20261104-200657-1038ae7c), where DSS refused each `K_SymbolUndefined`.
+    // ASKED FIRST, of every flavor and every binding: the name is defined, so
+    // neither the weak arm's NOTHING nor a loader's undefined symbol is its
+    // answer. A unit that defines the name never reaches here -- its reference
+    // was bound to that definition -- as link.exe keeps a unit's own
+    // `__ImageBase` (MEASURED, the same run).
+    // ★ ONE SHAPE OF REFERENCE: every unit names the symbol DIRECTLY -- an
+    // object's own `lea __ImageBase`, and DSS's compiled code, which lowers a
+    // reference to a name the image defines without a slot (`lowerToLir`'s
+    // `imageDefinedNames`): the name is in the image, never an import. So the
+    // row's id is given the address, and a cl object's reference beside a DSS
+    // unit's resolves to the one header address, as link.exe links the two.
+    // Only the link of an IMAGE binds them: a relocatable link's rows state what
+    // the image the object ends in will define, and its final linker defines it.
+    std::vector<AssembledModule::ImageDefinedBinding> imageBound;
+    bool const imageLink = objectFormatSchema.isImageFlavor();
+    auto const imageDefinedAddressOf =
+        [&](std::string const& name) -> std::optional<ImageDefinedAddress> {
+        if (!imageLink) return std::nullopt;
+        for (auto const& s : objectFormatSchema.imageDefinedSymbols()) {
+            if (s.name == name) return s.address;
+        }
+        return std::nullopt;
+    };
     for (auto const& ext : m.externImports) {
         if (ext.mangledName.empty()) continue;   // already rejected (compound index)
         if (ext.isEagerImport) continue;         // eager law: keep even if unreferenced
         if (externIsReferenced(ext, relocationTargets)) {
+            if (auto const address = imageDefinedAddressOf(ext.mangledName);
+                address.has_value() && ext.libraryPath.empty()) {
+                if (ext.readThroughSlot) {
+                    // An invariant of the lowering, refused rather than met
+                    // wrongly: a slot read would load the header's first bytes
+                    // as a pointer.
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           std::format(
+                               "cannot define '{}' for this link: the image defines "
+                               "it ('imageDefinedSymbols'), but a linked unit reads it "
+                               "THROUGH A SLOT, a shape the compiler gives only to an "
+                               "import -- the unit was lowered for a document that does "
+                               "not state the name. Compile it for this link's format.",
+                               ext.mangledName));
+                    continue;
+                }
+                imageBound.push_back({ext.symbol, *address});
+                anyDrop = true;
+                continue;
+            }
             if (ext.libraryPath.empty()) {
                 // REFERENCED + UNBOUND — the c143/c150 policy, UNCHANGED. The
                 // schema-driven THREE-flavor `allowsUndefinedImports()`:
@@ -664,11 +723,18 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     std::unordered_set<std::uint32_t> nullBoundIds;
     nullBoundIds.reserve(nullBound.size());
     for (SymbolId id : nullBound) nullBoundIds.insert(id.v);
+    std::unordered_set<std::uint32_t> imageBoundIds;
+    for (auto const& b : imageBound) imageBoundIds.insert(b.symbol.v);
     std::erase_if(filtered.externImports, [&](ExternImport const& ext) {
         if (ext.mangledName.empty()) return false;
         if (nullBoundIds.contains(ext.symbol.v)) return true;
+        if (imageBoundIds.contains(ext.symbol.v)) return true;
         return !ext.isEagerImport && !externIsReferenced(ext, relocationTargets);
     });
+    // Each such row keeps its id: every relocation naming it still does, and the
+    // writer gives the id its address of the image.
+    filtered.imageDefinedSymbols.insert(filtered.imageDefinedSymbols.end(),
+                                        imageBound.begin(), imageBound.end());
     // ── EVERY REFERENCE TO A SYMBOL RESOLVED TO NOTHING ──────────────────
     //    D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69, lane `lm`)
     //
@@ -1221,10 +1287,12 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 // LK11a — the cross-CU symbol merge + resolution, in three steps:
 //  (1) DEFINITION merge + weak-vs-strong: only Global/Weak definitions participate
 //      (Local stays module-private); the surviving definition of each name lands in
-//      `image.resolvedGlobalDefs` (name -> winning (cuId, SymbolId)). Order-INDEPENDENT:
-//      a strong (Global) def always shadows weak; two strong defs of one name are an
-//      ambiguous redefinition (K_SymbolRedefinedAcrossUnits); among all-weak defs the
-//      lowest (cuId, SymbolId) wins (same result regardless of module order).
+//      `image.resolvedGlobalDefs` (name -> winning (cuId, SymbolId)). Independent of the
+//      order the link HOLDS its modules in: a strong (Global) def always shadows weak; two
+//      strong defs of one name are an ambiguous redefinition (K_SymbolRedefinedAcrossUnits);
+//      among weak defs that rank alike the first in the LINK's order wins -- the operator's
+//      order of the inputs (`linkPositionOf`, P69 fold 3d) -- and the lowest (cuId,
+//      SymbolId) only at one place or at none.
 //  (2) REFERENCE resolution: an extern import whose name is DEFINED in a sibling CU is a
 //      cross-CU reference — a local/sibling definition shadows the extern declaration, so
 //      the reference binds to that definition (recorded in `image.resolvedCrossCuRefs`),
@@ -1334,6 +1402,13 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
             defs.push_back(CrossCuDef{
                 s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol},
                 s.duplicateMatch, body.size, body.bytes});
+            // Where the input this definition came from stands in the operator's
+            // order (P69 fold 3d, D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER):
+            // the definition's own place where its module holds several inputs'
+            // (a merge of the compiled units), else its module's. The election
+            // reads it before any key (`firstInLinkOrder`); a link no module
+            // states a place for elects exactly as before.
+            defs.back().linkPosition = linkPositionOf(m, s.symbol);
             kindOfEntry.push_back(s.weakKind);
             // What the link's document says of this definition's KIND, stated
             // by the ONE function every door of the fold calls
@@ -2877,6 +2952,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 out.languageHandler->personality =
                     SymbolId{mergedIdFor(i, out.languageHandler->personality)};
                 retargetRelocs(i, out.languageHandler->relocations);
+                // P69 fold 3d: the DWARF shape names its data area's ITEM, a
+                // reference to bytes exactly as a data relocation's target is.
+                if (out.languageHandler->dataArea.has_value()) {
+                    out.languageHandler->dataArea->item =
+                        SymbolId{relocationTargetFor(i, out.languageHandler->dataArea->item)};
+                }
             }
             // CODE: a reference read through a slot goes to its slot (P68 round 9).
             retargetCodeRelocs(i, out.relocations);
@@ -3072,6 +3153,17 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // reads each option's precedence from. They name symbols by NAME, so no id
     // remap applies.
     for (auto const& m : modules) appendUnitLinkerRequests(combined.linkerRequests, m.linkerRequests);
+    // P69 fold 3d (D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION): the rule of each group
+    // the merge carries, its leader under the section's new key — the copy every
+    // other unit's was discarded for (`discardLaterSectionGroups`), so one unit
+    // states each. A relocatable artifact's writer writes the rule back.
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        for (auto const& [signature, rule] : modules[i].sectionGroupRuleOf) {
+            auto const key = mergedUnitKey.find(std::pair{i, rule.leader});
+            if (key == mergedUnitKey.end()) continue;   // the leader holds no item of the link
+            combined.sectionGroupRuleOf.try_emplace(signature, SectionGroupRule{rule.keep, key->second});
+        }
+    }
     // combined.cuId stays default — the merged image is not a single CU.
     return combined;
 }
@@ -3436,30 +3528,23 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // next mint, so each call returns a new one) — and `id`, the id every
 // relocation of the unit names, becomes a plain reference row of `name`. The
 // reference states what the body was, a datum or a function, thread-local or
-// not. Every name the body still carries goes with it, and so does what names
-// the BODY rather than the name: a constructor schedule, the unit's entry.
+// not. Every name the body still carries goes with it, and so does every other
+// statement of the BODY rather than the name -- a constructor schedule, the
+// unit's entry, its place in the link's order -- through the one mover
+// (`moveDefinitionId`, asm/asm.hpp; P69 fold 3d: the place was the statement a
+// mover of its own left behind).
 void leaveTheIdToTheName(AssembledModule& m, SymbolId id, std::string const& name) {
     SymbolId const fresh{maxExistingSymbolIdV(m) + 1u};
     ExternImport   ref;
     ref.symbol      = id;
     ref.mangledName = name;
-    for (auto& f : m.functions) {
-        if (f.symbol == id) f.symbol = fresh;
-    }
-    for (auto& d : m.dataItems) {
+    for (auto const& d : m.dataItems) {
         if (d.symbol != id) continue;
-        d.symbol          = fresh;
         ref.isData        = true;
         ref.isThreadLocal = d.section == DataSectionKind::Tdata
                             || d.section == DataSectionKind::Tbss;
     }
-    for (auto& row : m.symbols) {
-        if (row.symbol == id) row.symbol = fresh;
-    }
-    for (auto& s : m.staticInitSchedule) {
-        if (s.symbol == id) s.symbol = fresh;
-    }
-    if (m.userEntrySymbol == id) m.userEntrySymbol = fresh;
+    moveDefinitionId(m, id, fresh);
     m.externImports.push_back(std::move(ref));
 }
 
@@ -3542,17 +3627,249 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
     return false;
 }
 
+// ── TWO COPIES OF A SECTION GROUP, JUDGED BY THE KEPT COPY'S RULE (P69 fold 3d;
+//    D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION) — the table `discardLaterSectionGroups`
+//    states, and why each cell is what it is.
+enum class GroupCopyVerdict : std::uint8_t { KeepKept, KeepNew, Refused };
+
+// The rule unit `m` states for its copy of `group`, or nullopt where it states
+// none (an ELF group): such a copy is kept as the first in link order, and has
+// no leader to compare.
+[[nodiscard]] std::optional<SectionGroupRule> ruleOfCopy(AssembledModule const& m, std::string_view group) {
+    auto const it = m.sectionGroupRuleOf.find(std::string{group});
+    if (it == m.sectionGroupRuleOf.end()) return std::nullopt;
+    return it->second;
+}
+
+[[nodiscard]] SectionGroupKeep keepOfCopy(std::optional<SectionGroupRule> const& rule) {
+    return rule.has_value() ? rule->keep : SectionGroupKeep::FirstInLinkOrder;
+}
+
+// A copy's LEADER as the rules compare it: every item cut from the leader
+// section laid at its offset, zero where no item is (and through a zero-fill
+// item); its size the furthest extent of those items. In-place addends are in
+// the bytes; relocations are not compared.
+struct LeaderImage {
+    std::uint64_t             size = 0;
+    std::vector<std::uint8_t> bytes;
+};
+
+[[nodiscard]] LeaderImage leaderImageOf(AssembledModule const& m, std::uint32_t leader) {
+    LeaderImage img;
+    auto const place = [&](std::optional<InputSectionSlice> const& at, std::span<std::uint8_t const> bytes,
+                           std::uint64_t extent) {
+        if (!at.has_value() || at->section != leader) return;
+        img.size = std::max(img.size, at->offset + extent);
+        if (img.bytes.size() < at->offset + bytes.size()) img.bytes.resize(at->offset + bytes.size(), 0u);
+        std::copy(bytes.begin(), bytes.end(), img.bytes.begin() + static_cast<std::ptrdiff_t>(at->offset));
+    };
+    for (AssembledFunction const& fn : m.functions) place(fn.inputSection, fn.bytes, fn.bytes.size());
+    for (AssembledData const& di : m.dataItems) {
+        place(di.inputSection, di.bytes, di.bytes.empty() ? di.reservedSize : di.bytes.size());
+    }
+    img.bytes.resize(img.size, 0u);
+    return img;
+}
+
+// A judgement, and for a refusal WHY the kept copy's rule does not admit the
+// later copy -- the promise that broke, which the diagnostic names.
+struct GroupCopyJudgement {
+    GroupCopyVerdict verdict = GroupCopyVerdict::KeepKept;
+    std::string_view why;
+};
+
+// Unit `n`'s copy of `group` against the copy kept so far, unit `k`'s, under
+// `k`'s rule (the table at `discardLaterSectionGroups`).
+[[nodiscard]] GroupCopyJudgement judgeSectionGroupCopies(std::span<AssembledModule const> modules,
+                                                         std::string_view group, std::size_t k, std::size_t n) {
+    using enum SectionGroupKeep;
+    std::optional<SectionGroupRule> const rk = ruleOfCopy(modules[k], group);
+    std::optional<SectionGroupRule> const rn = ruleOfCopy(modules[n], group);
+    SectionGroupKeep const keepK = keepOfCopy(rk), keepN = keepOfCopy(rn);
+    GroupCopyJudgement const keepKept{GroupCopyVerdict::KeepKept, {}};
+    GroupCopyJudgement const rulesDiffer{GroupCopyVerdict::Refused,
+                                         "the kept copy's rule admits no copy kept by the later one's"};
+    if (keepK == FirstInLinkOrder && keepN == FirstInLinkOrder) return keepKept;
+    // Every other cell compares the leaders, which a copy stating no rule has none of.
+    if (!rk.has_value() || !rn.has_value()) {
+        return {GroupCopyVerdict::Refused, "one copy states no rule, so it has no leader to compare"};
+    }
+    LeaderImage const a = leaderImageOf(modules[k], rk->leader);
+    LeaderImage const b = leaderImageOf(modules[n], rn->leader);
+    GroupCopyJudgement const sizesDiffer{GroupCopyVerdict::Refused, "their leaders' sizes differ"};
+    auto const larger = [&] {
+        return b.size > a.size ? GroupCopyJudgement{GroupCopyVerdict::KeepNew, {}} : keepKept;
+    };
+    auto const ifEqualBytes = [&] {
+        if (a.size != b.size) return sizesDiffer;
+        return a.bytes == b.bytes ? keepKept
+                                  : GroupCopyJudgement{GroupCopyVerdict::Refused, "same length, differing content"};
+    };
+    switch (keepK) {
+        case FirstInLinkOrder:
+            return keepN == Largest ? larger() : rulesDiffer;
+        case Largest:
+            return larger();
+        case FirstOfEqualBytes:
+            return keepN == Largest || keepN == FirstOfEqualBytes ? ifEqualBytes() : rulesDiffer;
+        case FirstOfEqualSize:
+            if (keepN == Largest) return ifEqualBytes();
+            if (keepN == FirstOfEqualSize) return a.size == b.size ? keepKept : sizesDiffer;
+            return rulesDiffer;
+    }
+    return rulesDiffer;
+}
+
+[[nodiscard]] std::string_view keepRuleText(SectionGroupKeep keep) {
+    switch (keep) {
+        case SectionGroupKeep::FirstInLinkOrder:  return "the first copy in link order";
+        case SectionGroupKeep::Largest:           return "the largest copy";
+        case SectionGroupKeep::FirstOfEqualBytes: return "the first copy, every other of equal bytes";
+        case SectionGroupKeep::FirstOfEqualSize:  return "the first copy, every other of equal size";
+    }
+    return "an unknown rule";
+}
+
+void reportGroupCopiesRefused(std::span<AssembledModule const> modules, std::string_view group, std::size_t k,
+                              std::size_t n, std::string_view why, DiagnosticReporter& reporter) {
+    std::optional<SectionGroupRule> const rk = ruleOfCopy(modules[k], group);
+    std::optional<SectionGroupRule> const rn = ruleOfCopy(modules[n], group);
+    auto const sizeOf = [&](std::size_t u, std::optional<SectionGroupRule> const& r) -> std::string {
+        return r.has_value() ? std::format("{} bytes", leaderImageOf(modules[u], r->leader).size)
+                             : std::string{"no leader stated"};
+    };
+    report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits, DiagnosticSeverity::Error,
+           std::format("linker: \"{}\" is defined as copies of one section group in linked unit #{} (the copy kept "
+                       "so far; its rule keeps {}; {}) and in linked unit #{} (its rule keeps {}; {}), and the kept "
+                       "copy's rule does not admit the later copy in this order: {}. This format's linkers refuse "
+                       "such a pair as a duplicate definition, and so does DSS rather than keep either copy.",
+                       group, k, keepRuleText(keepOfCopy(rk)), sizeOf(k, rk), n, keepRuleText(keepOfCopy(rn)),
+                       sizeOf(n, rn), why));
+}
+
+// ── A COMPILED UNIT'S SELECT-ANY DEFINITION IS ONE COPY OF ITS NAME'S GROUP
+//    (P69 fold 3d, D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION) ───────────────────
+//
+// Where the link's document discards a superseded definition of a kind WHOLE
+// (`supersededDefinition`: PE's select-any -- the fact the election reads as a
+// definition being a COPY, below), the definition is one copy of several: DSS's
+// own relocatable writer puts it in a COMDAT section of its own, selection ANY
+// (the relocatable document's `weakDefinition` dialect "comdat"), so read back
+// from its object it is one copy of a group of its name, kept by the
+// first-in-link-order rule. ✔MEASURED P69 fold 3d (lane
+// `xa`'s `weakmix.py`; link.exe 14.44 and lld-link 19.1.5, both orders, each
+// image run): DSS's object of `__declspec(selectany) int x[3]` -- a COMDAT
+// Selection Any -- beside a SAME_SIZE or EXACT_MATCH copy of `x` is refused
+// as a duplicate, at an equal size too, and beside a LARGEST copy the larger
+// is kept: the First row of the table at `discardLaterSectionGroups`, and the
+// unit's own read of `x` reaches the kept copy in every cell. Until this the
+// merged route met the pair only in the name election, which compared sizes
+// and kept the first copy.
+//
+// So a definition of a COMPILED unit (one with no input section: an object
+// reader's sits in the section it was cut from, which states its own group or
+// none) of a kind the document discards whole, in no group, whose name is the
+// signature of another unit's group, is stated as that copy for the
+// judgement: its item alone in an input section of its own, the group its
+// name, the rule the first in link order with the item as its leader. A copy
+// that loses goes as every lost copy goes (`discardLaterSectionGroups`); one
+// that is kept is stated so only for the judgement (`unstateCopiesKept`), and
+// links on as its unit compiled it.
+struct StatedCopy {
+    std::size_t   unit = 0;
+    SymbolId      definition{};
+    std::uint32_t section = 0;
+    std::string   name;
+};
+
+[[nodiscard]] std::vector<StatedCopy> stateCompiledSelectAnyCopies(std::span<AssembledModule const> modules,
+                                                                   ObjectFormatSchema const&        format,
+                                                                   std::vector<AssembledModule>&    out) {
+    std::unordered_map<std::string_view, std::vector<std::size_t>> carriersOf;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        for (auto const& [section, group] : modules[i].sectionGroupOfInputSection) {
+            if (group.empty()) continue;
+            auto& units = carriersOf[group];
+            if (units.empty() || units.back() != i) units.push_back(i);
+        }
+    }
+    std::vector<StatedCopy> stated;
+    if (carriersOf.empty()) return stated;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        AssembledModule const&            m = modules[i];
+        std::unordered_set<std::uint32_t> seen;
+        for (ModuleSymbol const& s : m.symbols) {
+            if (s.binding != SymbolBinding::Weak || s.name.empty() || !s.symbol.valid()) continue;
+            if (format.supersededDefinition().answerFor(s.weakKind)
+                != std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole}) {
+                continue;
+            }
+            auto const carriers = carriersOf.find(s.name);
+            if (carriers == carriersOf.end()) continue;
+            if (std::find(carriers->second.begin(), carriers->second.end(), i) != carriers->second.end()) continue;
+            bool compiled = false;   // an item of the unit, placed on its own
+            for (auto const& fn : m.functions) compiled = compiled || (fn.symbol == s.symbol && !fn.inputSection);
+            for (auto const& di : m.dataItems) compiled = compiled || (di.symbol == s.symbol && !di.inputSection);
+            if (!compiled || !seen.insert(s.symbol.v).second) continue;
+            stated.push_back(StatedCopy{i, s.symbol, 0, s.name});
+        }
+    }
+    if (stated.empty()) return stated;
+    out.assign(modules.begin(), modules.end());
+    for (StatedCopy& c : stated) {
+        AssembledModule& m   = out[c.unit];
+        std::uint32_t    top = 0;   // the unit's input sections and the groups it states, to key a new one past
+        for (auto const& fn : m.functions) top = fn.inputSection ? std::max(top, fn.inputSection->section) : top;
+        for (auto const& di : m.dataItems) top = di.inputSection ? std::max(top, di.inputSection->section) : top;
+        for (auto const& [section, group] : m.sectionGroupOfInputSection) top = std::max(top, section);
+        c.section = top + 1u;
+        for (auto& fn : m.functions) {
+            if (fn.symbol == c.definition) fn.inputSection = InputSectionSlice{c.section, 0};
+        }
+        for (auto& di : m.dataItems) {
+            if (di.symbol == c.definition) di.inputSection = InputSectionSlice{c.section, 0};
+        }
+        m.sectionGroupOfInputSection.emplace(c.section, c.name);
+        m.sectionGroupRuleOf.emplace(c.name, SectionGroupRule{SectionGroupKeep::FirstInLinkOrder, c.section});
+    }
+    return stated;
+}
+
+// Each stated copy the judgement KEPT, as its unit compiled it again: no input
+// section, no group. (A lost one the discard took, with its statement.)
+void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy const> stated) {
+    for (StatedCopy const& c : stated) {
+        AssembledModule& m     = units[c.unit];
+        auto const       group = m.sectionGroupOfInputSection.find(c.section);
+        if (group == m.sectionGroupOfInputSection.end()) continue;   // lost
+        m.sectionGroupOfInputSection.erase(group);
+        m.sectionGroupRuleOf.erase(c.name);
+        for (auto& fn : m.functions) {
+            if (fn.symbol == c.definition) fn.inputSection.reset();
+        }
+        for (auto& di : m.dataItems) {
+            if (di.symbol == c.definition) di.inputSection.reset();
+        }
+    }
+}
+
 // ── A LATER UNIT'S SECTION GROUP IS DISCARDED WHOLE (P69 fold 3c;
 //    D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE) ───────────
 //
 // A unit's object may state that some of its input sections are the members
 // of a section group (`AssembledModule::sectionGroupOfInputSection` — ELF's
-// `SHT_GROUP` marked `GRP_COMDAT`, whose signature is a symbol's name). The
-// format's linkers keep the group of the FIRST unit, in link order, that
-// carries a signature, and DISCARD every later unit's with all it holds: its
-// bytes, the definitions in it, the relocations standing in it. They do it
-// before any name is resolved, so a definition in a discarded group never
-// meets the kept one. ✔MEASURED 2026-10-20 (gcc 13.3.0's objects, GNU ld 2.42
+// `SHT_GROUP` marked `GRP_COMDAT`, and since P69 fold 3d COFF's select-any
+// COMDAT with every section ASSOCIATIVE to it; either way the signature is a
+// symbol's name). ✔MEASURED 2026-10-21 for COFF: clang-cl 19.1.5's two units
+// of one C `inline` function, each a select-any `.text` copy and an `.rdata`
+// jump table ASSOCIATIVE to it, linked by link.exe 14.44 and lld-link 19.1.5
+// in either order to programs that exit 42 — one copy, its own table. The
+// format's linkers keep ONE unit's copy of a group — of a group that states no
+// rule, the FIRST unit's in link order that carries the signature (the rules:
+// below) — and DISCARD every other unit's with all it holds: its bytes, the
+// definitions in it, the relocations standing in it. They do it before any
+// name is resolved, so a definition in a discarded group never meets the kept
+// one. ✔MEASURED 2026-10-20 (gcc 13.3.0's objects, GNU ld 2.42
 // and ld.lld 18.1.3, both orders): an image keeps one copy of every group —
 //   * a function and its jump table (`.text.f` + `.rodata.f`)    44 / 88;
 //   * two groups, the later one's member naming the first's       6 / 60;
@@ -3571,7 +3888,10 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
 //     `link/format/object_atom_coverage.hpp`). Where the definition has several
 //     strong names the first in the unit's order is kept: a COMDAT group's
 //     definition is one definition, and every name of it is a name of each copy
-//     of the group.
+//     of the group. A COMPILED unit's copy (`stateCompiledSelectAnyCopies`)
+//     names its definition by id, never through a row of the name, and its
+//     object would name it through the copy's own name, weak as it is: so a
+//     relocation of such a unit keeps that name.
 //   * a relocation left on a definition with no strong name names its BYTES —
 //     through a local label, or its section — and they are not in the link.
 //     GNU ld refuses it ("defined in discarded section"), ld.lld too
@@ -3580,32 +3900,255 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
 //   * the unit's entry, a constructor schedule and an SEH scope name a
 //     DEFINITION, never a name. No object reader states one beside a group, and
 //     each is refused by name rather than pointed at another unit's copy.
+// What the discarding unit's OTHER names of a discarded definition become is
+// the name's own kind's answer (`carriedNameGoesWithItsCarrier`,
+// link/common_yield.hpp, the election's own predicate, so the discard and the
+// election cannot answer one name two ways): a name
+// that goes with the copy goes, every row of it -- a label inside the section;
+// a weak name that stays -- on PE a WEAK EXTERNAL (class 105) whose default is
+// the body -- is a name of its own that resolves to its DEFAULT
+// (`ModuleSymbol::weakDefaultName`), so the unit keeps a reference row of it
+// whose fallback is the default's name (`bindFallbackReferences`): a
+// definition of the name elsewhere wins it, and with none it reads whatever
+// defines the default -- the kept copy where the default is the COMDAT's own
+// symbol, nothing where it is a label of the lost section. ✔MEASURED P69 fold
+// 3d (lane `xa`'s `carried.py`, lane cs's wk1 cell 3: `a` a select-any `w = 7`,
+// `b` one of `w = 9` with `m` a weak alias of it, `main` reading both through
+// `a`, `b` and itself; link.exe 14.44, lld-link 19.1.5, each image run):
+// clang-cl's `m` defaults to `w`, and both read 7 everywhere in the order a b,
+// 9 in b a; MinGW gcc 13.2's `m` defaults to its own label `.weak.m.<n>` in
+// `w`'s COMDAT, and in the order a b both leave `m` undefined (in b a lld-link
+// reads 9, link.exe leaves it undefined).
 // A group beside a definition of its name in NO group discards nothing: the
 // format compares groups only (7 and 9 in the same 2026-10-10 measurement).
 // Membership is a fact of a SECTION, so every item cut from a member section
 // goes — a member need hold no named definition (a function's jump table).
-// Returns TRUE when no unit carries a group an earlier unit carries (`out`
-// untouched).
+//
+// ★★ WHICH UNIT'S COPY IS KEPT (P69 fold 3d,
+//    D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION). A group's rule
+// (`AssembledModule::sectionGroupRuleOf`; none is the first in link order)
+// decides it, and the carriers are judged IN LINK ORDER: each later copy `n`
+// against the copy kept so far `k`, under THAT copy's own rule. The table is
+// the UNION of the references': a carrier is accepted in an order iff link.exe
+// 14.44 or lld-link 19.1.5 accepts it in that order, keeping the copy it keeps,
+// and where both accept and disagree, the decided fork (lld-link's: the larger
+// copy, the first on a tie) — ✔MEASURED P69 fold 3d, every order of every
+// cell, `tests/link/test_coff_comdat_selection.cpp`:
+//
+//   k's rule \ n's   First        Largest      EqualBytes        EqualSize
+//   First            k            larger, k    refused           refused
+//                                 on a tie
+//   Largest          larger, k on a tie, whatever n's rule
+//   EqualBytes       refused      k iff the    k iff the         refused
+//                                 bytes equal  bytes equal
+//   EqualSize        refused      k iff the    refused           k iff the
+//                                 bytes equal                    sizes equal
+//
+// A copy's size and bytes are its LEADER's (the section the signature's
+// definition is in): its items laid at their offsets, so in-place addends are
+// compared and relocations are not (neither reference compares them: E-reloc),
+// and no checksum is read (lld-link accepts a pair differing in it alone:
+// E-sum). Three carriers judge as the table says (MEASURED: link.exe refuses
+// LARGEST, EXACT 16 B, EXACT 16 B of other bytes, where the FIRST carrier's
+// rule would keep the second).
+// A compiled unit's select-any definition beside a group of its name is one
+// copy of it too (`stateCompiledSelectAnyCopies`, which states it so before
+// this pass, and says why).
+// Returns TRUE when no unit loses a group (`out` untouched); FALSE with a
+// refusal reported, or with `out` the units without their lost groups.
 [[nodiscard]] bool discardLaterSectionGroups(std::span<AssembledModule const> modules,
+                                             std::span<StatedCopy const>       stated,
+                                             ObjectFormatSchema const&         format,
                                              std::vector<AssembledModule>&     out,
                                              DiagnosticReporter&               reporter) {
-    std::unordered_map<std::string_view, std::size_t> firstCarrier;
+    // The carriers of each group, in the order the link holds them; the groups in order of their first carrier,
+    // then name.
+    std::unordered_map<std::string_view, std::vector<std::size_t>> carriersOf;
+    std::vector<std::string_view>                                     groups;
     for (std::size_t i = 0; i < modules.size(); ++i) {
+        std::vector<std::string_view> fresh;
         for (auto const& [section, group] : modules[i].sectionGroupOfInputSection) {
-            if (!group.empty()) firstCarrier.try_emplace(group, i);
+            if (group.empty()) continue;
+            auto& units = carriersOf[group];
+            if (units.empty()) fresh.push_back(group);
+            if (units.empty() || units.back() != i) units.push_back(i);
         }
+        std::sort(fresh.begin(), fresh.end());
+        groups.insert(groups.end(), fresh.begin(), fresh.end());
     }
-    // What each unit loses: every input section of a group an EARLIER unit carries, with the group's signature.
+    // ── THE CARRIERS IN THE LINK'S ORDER (P69 fold 3d,
+    //    D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──────────────────
+    //
+    // "The first copy in link order" is the first in the OPERATOR'S order of the
+    // inputs (`AssembledModule::linkPosition` says what was measured), not the
+    // order the link holds its units in: a build's compiled units are merged into
+    // one unit that the link holds before every named object, wherever their
+    // sources stood. A copy stands where the input it came from stands -- the
+    // earliest place any definition its member sections hold came from
+    // (`linkPositionOf`: a stated copy of a compiled unit, its source's), else its
+    // unit's; and copies at one place, or at none, keep the order the link holds
+    // them in. Only a unit that states a position for a DEFINITION (the merge of the compiled units) is walked
+    // item by item; every other unit's copies stand where the unit does.
+    std::vector<std::unordered_map<std::string_view, std::uint32_t>> definitionPlaceOf(modules.size());
+    bool anyPlace = false;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        AssembledModule const& m = modules[i];
+        anyPlace = anyPlace || m.linkPosition.has_value() || !m.linkPositionOfDefinition.empty();
+        if (m.linkPositionOfDefinition.empty() || m.sectionGroupOfInputSection.empty()) continue;
+        auto const consider = [&](std::optional<InputSectionSlice> const& from, SymbolId symbol) {
+            if (!from.has_value()) return;
+            auto const member = m.sectionGroupOfInputSection.find(from->section);
+            auto const stated = m.linkPositionOfDefinition.find(symbol);
+            if (member == m.sectionGroupOfInputSection.end() || member->second.empty()
+                || stated == m.linkPositionOfDefinition.end()) {
+                return;
+            }
+            auto const [place, fresh] = definitionPlaceOf[i].try_emplace(member->second, stated->second);
+            if (!fresh && stated->second < place->second) place->second = stated->second;
+        };
+        for (auto const& fn : m.functions) consider(fn.inputSection, fn.symbol);
+        for (auto const& di : m.dataItems) consider(di.inputSection, di.symbol);
+    }
+    auto const copyPositionOf = [&](std::size_t i, std::string_view group) -> std::optional<std::uint32_t> {
+        auto const place = definitionPlaceOf[i].find(group);
+        return place != definitionPlaceOf[i].end() ? std::optional<std::uint32_t>{place->second}
+                                                   : modules[i].linkPosition;
+    };
+    if (anyPlace) {
+        for (std::string_view const group : groups) {
+            std::vector<std::size_t>& units = carriersOf.at(group);
+            std::stable_sort(units.begin(), units.end(), [&](std::size_t a, std::size_t b) {
+                return linkPositionPrecedes(copyPositionOf(a, group), copyPositionOf(b, group));
+            });
+        }
+        std::stable_sort(groups.begin(), groups.end(), [&](std::string_view a, std::string_view b) {
+            return linkPositionPrecedes(copyPositionOf(carriersOf.at(a).front(), a),
+                                        copyPositionOf(carriersOf.at(b).front(), b));
+        });
+    }
+    // The unit whose copy each group keeps.
+    std::unordered_map<std::string_view, std::size_t> keeperOf;
+    bool refused = false;
+    for (std::string_view const group : groups) {
+        std::vector<std::size_t> const& units = carriersOf.at(group);
+        std::size_t                     k     = units.front();
+        for (std::size_t c = 1; c < units.size() && !refused; ++c) {
+            std::size_t const n = units[c];
+            GroupCopyJudgement const judged = judgeSectionGroupCopies(modules, group, k, n);
+            switch (judged.verdict) {
+                case GroupCopyVerdict::KeepKept:    break;
+                case GroupCopyVerdict::KeepNew:     k = n; break;
+                case GroupCopyVerdict::Refused:
+                    reportGroupCopiesRefused(modules, group, k, n, judged.why, reporter);
+                    refused = true;
+                    break;
+            }
+        }
+        keeperOf.emplace(group, k);
+    }
+    if (refused) return false;
+    // What each unit loses: every input section of a group another unit's copy of which is kept.
     std::vector<std::unordered_map<std::uint32_t, std::string_view>> lost(modules.size());
     bool any = false;
     for (std::size_t i = 0; i < modules.size(); ++i) {
         for (auto const& [section, group] : modules[i].sectionGroupOfInputSection) {
-            auto const first = firstCarrier.find(group);
-            if (first != firstCarrier.end() && first->second < i) lost[i].emplace(section, group);
+            auto const kept = keeperOf.find(group);
+            if (kept != keeperOf.end() && kept->second != i) lost[i].emplace(section, group);
         }
         any = any || !lost[i].empty();
     }
     if (!any) return true;
+    // ── A LOST COPY THAT CARRIES A NAME THE DOCUMENT KEEPS IS THE ELECTION's (P69 fold 3d, the orchestrator's
+    //    ruling of ledger 455) ─────────────────────────────────────────────────────────────────────────────────
+    // Invariant: a name a lost copy carries is settled by the election alone (`resolveSettlingCarriedNames`, its
+    // carried-name settle; its pair rule, `weakPairsTheLinkRefuses`), for every format and route. A name the
+    // document keeps (`carriedNameGoesWithItsCarrier` false: PE's overridable weak alias of a select-any copy) is
+    // a weak definition of its OWN name that names the copy that won its carrier's: the election decides whether
+    // it holds the name, names the winner, or is refused beside another weak definition a third unit reads. This
+    // pass used to settle it itself, as a reference whose fallback is its default, so the election's pair rule
+    // never saw it. ✔MEASURED (run 20261103-182329-b11a07e8; lane cs's wk1 cell 2: `main` reads `m`, `a` a
+    // select-any `w` = 7 and a weak `m` = 5, `b` a select-any `w` = 9 and `m` a weak alias of it): DSS's objects
+    // linked in the order a b gave 5 where link.exe, lld-link and GNU ld refuse the pair, and refused it in b a
+    // (there `b`'s copy is kept and its alias reaches the election). So the DEFINITION that carries such a name
+    // stays in its unit, out of every group, for the election to elect under its own name -- it loses it to the
+    // kept copy, which is the first in the link's order as the election's own tie is -- and its other member
+    // sections go as every lost section does. Only where the name's default is the copy's own name: a default
+    // that is another label of the lost copy goes with it, and the name with no answer is refused below.
+    // ✔MEASURED (run 20261103-213753-ec92f19d and lane xa's `carried_bfd.py`, on the TEST's fixtures
+    // `coff_carried_alias_*_O2.obj`): MinGW gcc's `m`, whose default is `.weak.m.ub`, in the order a b is refused
+    // by link.exe 14.44, lld-link 19.1.5 and MinGW-w64 GNU ld 2.42 ("undefined reference to `m'"), where leaving
+    // it to the election linked it to the kept copy (7777, checkpoint 32's answer); clang-cl's `m`, whose default
+    // is `w`, reads the kept copy (7777 / 9999) under link.exe and lld-link, DSS the same. And only where the kept
+    // copy is the FIRST carrier: a rule that keeps a later copy (LARGEST, the larger) is one the election does not
+    // state, so there the name is settled below as
+    // before (unmeasured, the orchestrator's consolidation of the two doors, fold 3e). ELF and Mach-O keep no such
+    // name: ✔MEASURED P69 fold 3d (`elfgrp`, gcc 13.3 + GNU ld 2.42 and clang 18 + ld.lld 18): a weak alias in a
+    // discarded ELF group goes with it (5 in a b, 9 in b a), DSS the same.
+    std::vector<std::unordered_set<std::uint32_t>> electionsCarrier(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (lost[i].empty()) continue;
+        AssembledModule const& in        = modules[i];
+        auto const             lostGroup = [&](std::optional<InputSectionSlice> const& from) -> std::string_view {
+            if (!from.has_value()) return {};
+            auto const it = lost[i].find(from->section);
+            return it == lost[i].end() ? std::string_view{} : it->second;
+        };
+        std::unordered_map<std::uint32_t, std::string_view> groupOfDefinition;
+        for (auto const& fn : in.functions) {
+            if (auto const g = lostGroup(fn.inputSection); !g.empty() && fn.symbol.valid()) {
+                groupOfDefinition.emplace(fn.symbol.v, g);
+            }
+        }
+        for (auto const& di : in.dataItems) {
+            if (auto const g = lostGroup(di.inputSection); !g.empty() && di.symbol.valid()) {
+                groupOfDefinition.emplace(di.symbol.v, g);
+            }
+        }
+        for (ModuleSymbol const& ms : in.symbols) {
+            auto const g = groupOfDefinition.find(ms.symbol.v);
+            if (g == groupOfDefinition.end() || ms.name.empty() || ms.binding == SymbolBinding::Local
+                || ms.name == g->second || carriedNameGoesWithItsCarrier(format, ms.binding, ms.weakKind)) {
+                continue;
+            }
+            // The election hands the name the copy that won its carrier's: that is what its DEFAULT resolves to by
+            // name only where the default IS the copy's own name (clang-cl's shape, DSS's own: the COMDAT's symbol,
+            // which the kept copy carries too). A default that is ANOTHER name of the lost copy (MinGW gcc's shape:
+            // `.weak.m.<n>`, a label inside the COMDAT section) goes with the copy, so the name is settled below by
+            // that default -- refused where nothing else answers it, as every reference refuses it.
+            std::string_view const defaultName =
+                ms.weakDefaultName.empty() ? g->second : std::string_view{ms.weakDefaultName};
+            if (defaultName != g->second) continue;
+            if (keeperOf.at(g->second) != carriersOf.at(g->second).front()) continue;   // the election's tie differs
+            electionsCarrier[i].insert(ms.symbol.v);
+        }
+    }
+    auto const leftToTheElection = [&](std::size_t i, SymbolId id) { return electionsCarrier[i].contains(id.v); };
+    // The names the link answers OUTSIDE every lost copy: a definition no discard takes, a common, a library's
+    // binding -- what a name a lost copy carries can still resolve to.
+    std::unordered_set<std::string_view> answered;
+    for (std::size_t j = 0; j < modules.size(); ++j) {
+        std::unordered_set<std::uint32_t> goes;
+        for (auto const& fn : modules[j].functions) {
+            if (!fn.inputSection || !lost[j].contains(fn.inputSection->section) || leftToTheElection(j, fn.symbol)) {
+                continue;
+            }
+            goes.insert(fn.symbol.v);
+            for (auto const& block : fn.blockSymbols) goes.insert(block.symbol.v);
+        }
+        for (auto const& di : modules[j].dataItems) {
+            if (di.inputSection && lost[j].contains(di.inputSection->section) && !leftToTheElection(j, di.symbol)) {
+                goes.insert(di.symbol.v);
+            }
+        }
+        for (ModuleSymbol const& r : modules[j].symbols) {
+            if (r.binding != SymbolBinding::Local && !r.name.empty() && !goes.contains(r.symbol.v)) {
+                answered.insert(r.name);
+            }
+        }
+        for (ExternImport const& e : modules[j].externImports) {
+            if (!e.libraryPath.empty() || e.commonSize != 0u) answered.insert(e.mangledName);
+        }
+    }
     out.assign(modules.begin(), modules.end());
     for (std::size_t i = 0; i < modules.size(); ++i) {
         if (lost[i].empty()) continue;
@@ -3616,18 +4159,22 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             auto const it = lost[i].find(from->section);
             return it == lost[i].end() ? std::string_view{} : it->second;
         };
+        // The lost group an ITEM goes with: its section's, unless it is a definition left to the election (above).
+        auto const goesWith = [&](std::optional<InputSectionSlice> const& from, SymbolId symbol) -> std::string_view {
+            return leftToTheElection(i, symbol) ? std::string_view{} : groupOf(from);
+        };
         // Every definition the discard takes, by id, with its group: the items cut from a lost section and the
         // labels inside a lost function; and of each datum, whether it is thread-local.
         std::unordered_map<std::uint32_t, std::string_view> lostIds;
         std::unordered_map<std::uint32_t, bool>             threadLocalDatum;
         for (auto const& fn : in.functions) {
-            std::string_view const group = groupOf(fn.inputSection);
+            std::string_view const group = goesWith(fn.inputSection, fn.symbol);
             if (group.empty()) continue;
             if (fn.symbol.valid()) lostIds.emplace(fn.symbol.v, group);
             for (auto const& block : fn.blockSymbols) lostIds.emplace(block.symbol.v, group);
         }
         for (auto const& di : in.dataItems) {
-            std::string_view const group = groupOf(di.inputSection);
+            std::string_view const group = goesWith(di.inputSection, di.symbol);
             if (group.empty() || !di.symbol.valid()) continue;
             lostIds.emplace(di.symbol.v, group);
             threadLocalDatum.emplace(di.symbol.v, di.section == DataSectionKind::Tdata
@@ -3639,12 +4186,21 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             }
             return {};
         };
-        // A relocation of a KEPT item that names a lost definition: through a strong name of it, or its bytes.
+        // A relocation of a KEPT item that names a lost definition: through a strong name of it (or, of a compiled
+        // unit's stated copy, through the copy's own name), or its bytes.
+        std::unordered_map<std::uint32_t, std::string_view> copyNameOf;   // this unit's stated copies, by id
+        for (StatedCopy const& c : stated) {
+            if (c.unit == i) copyNameOf.emplace(c.definition.v, c.name);
+        }
         std::unordered_set<std::uint32_t> settled;
         auto const followTheName = [&](SymbolId id) -> bool {
             if (settled.contains(id.v)) return true;
+            auto const copy = copyNameOf.find(id.v);
             for (ModuleSymbol const& ms : in.symbols) {
-                if (ms.symbol != id || ms.binding != SymbolBinding::Global || ms.name.empty()) continue;
+                if (ms.symbol != id || ms.name.empty()) continue;
+                if (ms.binding != SymbolBinding::Global && (copy == copyNameOf.end() || ms.name != copy->second)) {
+                    continue;
+                }
                 ExternImport ref;
                 ref.symbol      = id;
                 ref.mangledName = ms.name;
@@ -3665,14 +4221,14 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             std::string const      name  = nameOf(id);
             report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
                    std::format("linker: a relocation of linked unit #{} names the BYTES of {} — not a name of "
-                               "it — and it lies in section group '{}', which linked unit #{} carries too. This "
-                               "format's linkers keep the first unit's group and discard every later one with "
-                               "all it holds, so the relocation names bytes that are not in the link: they "
-                               "refuse it, and so does DSS.",
+                               "it — and it lies in section group '{}', whose copy the link keeps from linked "
+                               "unit #{}. This format's linkers keep one unit's copy of a group and discard every "
+                               "other with all it holds, so the relocation names bytes that are not in the link: "
+                               "they refuse it, and so does DSS.",
                                i,
                                name.empty() ? std::string{"an unnamed item of that unit"}
                                             : std::format("that unit's own definition '{}'", name),
-                               group, firstCarrier.at(group)));
+                               group, keeperOf.at(group)));
         };
         auto const judge = [&](std::vector<Relocation> const& relocs) {
             for (Relocation const& rel : relocs) {
@@ -3686,15 +4242,15 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             std::string const      name  = nameOf(id);
             report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
                    std::format("linker: {} of linked unit #{} names that unit's own definition{} in section "
-                               "group '{}', which linked unit #{} carries too. This format's linkers keep the "
-                               "first unit's group and discard every later one with all it holds, so it names a "
-                               "definition that is not in the link -- no object reader states such a unit, and "
-                               "DSS refuses it rather than name another unit's copy in its place.",
+                               "group '{}', whose copy the link keeps from linked unit #{}. This format's linkers "
+                               "keep one unit's copy of a group and discard every other with all it holds, so it "
+                               "names a definition that is not in the link -- no object reader states such a unit, "
+                               "and DSS refuses it rather than name another unit's copy in its place.",
                                site, i, name.empty() ? std::string{} : std::format(" '{}'", name), group,
-                               firstCarrier.at(group)));
+                               keeperOf.at(group)));
         };
         for (auto const& fn : in.functions) {
-            if (!groupOf(fn.inputSection).empty()) continue;   // discarded with its group: no linker reads it
+            if (!goesWith(fn.inputSection, fn.symbol).empty()) continue;   // discarded with its group: no linker reads it
             judge(fn.relocations);
             for (auto const& scope : fn.sehScopes) {
                 refuseTheSite("an SEH scope", scope.filterFuncletSymbol);
@@ -3703,10 +4259,17 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             if (fn.languageHandler.has_value()) {
                 refuseTheSite("a carried handler", fn.languageHandler->personality);
                 judge(fn.languageHandler->relocations);
+                // P69 fold 3d: a data area in a group a later unit's copy loses
+                // is bytes that are not in the link -- refused as a relocation
+                // naming them is.
+                if (fn.languageHandler->dataArea.has_value()) {
+                    SymbolId const area = fn.languageHandler->dataArea->item;
+                    if (lostIds.contains(area.v)) refuseTheBytes(area);
+                }
             }
         }
         for (auto const& di : in.dataItems) {
-            if (!groupOf(di.inputSection).empty()) continue;   // the same
+            if (!goesWith(di.inputSection, di.symbol).empty()) continue;   // the same
             judge(di.relocations);
         }
         if (in.userEntrySymbol.has_value()) refuseTheSite("the entry", *in.userEntrySymbol);
@@ -3719,23 +4282,77 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
         // their membership, and the entry's index counted again.
         if (m.imageEntryOverride.has_value()) {
             std::size_t const entry = *in.imageEntryOverride;
-            if (entry >= in.functions.size() || !groupOf(in.functions[entry].inputSection).empty()) {
+            if (entry >= in.functions.size()
+                || !goesWith(in.functions[entry].inputSection, in.functions[entry].symbol).empty()) {
                 m.imageEntryOverride.reset();   // the entry is no function of the unit any more (refused above)
             } else {
                 std::size_t before = 0;
                 for (std::size_t k = 0; k < entry; ++k) {
-                    if (!groupOf(in.functions[k].inputSection).empty()) ++before;
+                    if (!goesWith(in.functions[k].inputSection, in.functions[k].symbol).empty()) ++before;
                 }
                 *m.imageEntryOverride = entry - before;
             }
         }
         std::size_t const lostFunctions = std::erase_if(m.functions, [&](AssembledFunction const& fn) {
-            return !groupOf(fn.inputSection).empty();
+            return !goesWith(fn.inputSection, fn.symbol).empty();
         });
-        std::erase_if(m.dataItems, [&](AssembledData const& di) { return !groupOf(di.inputSection).empty(); });
+        std::erase_if(m.dataItems,
+                      [&](AssembledData const& di) { return !goesWith(di.inputSection, di.symbol).empty(); });
+        // Each OTHER name of a lost definition that stays with no copy under it: a reference row of the name whose
+        // fallback is its default's name (an object reader's weak external states it), else the copy's own name (a
+        // compiled unit's alias names the definition it aliases) -- the unit's own row of the name where it has one.
+        // A reference, not a weak one: where nothing defines the name or its default, it is undefined, as both
+        // reference linkers leave it.
+        std::uint32_t nextId = maxExistingSymbolIdV(m) + 1u;
+        for (ModuleSymbol const& ms : in.symbols) {
+            auto const lostIn = lostIds.find(ms.symbol.v);
+            if (lostIn == lostIds.end() || ms.name.empty() || ms.binding == SymbolBinding::Local) continue;
+            if (ms.name == lostIn->second || carriedNameGoesWithItsCarrier(format, ms.binding, ms.weakKind)) continue;
+            std::string const fallback =
+                ms.weakDefaultName.empty() ? std::string{lostIn->second} : ms.weakDefaultName;
+            if (!answered.contains(ms.name) && !answered.contains(fallback)) {
+                // Its default went with the copy (a label of the lost section), and nothing else answers the name.
+                report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                       std::format("linker: '{}' of linked unit #{} is a weak name whose default '{}' is a name of its "
+                                   "copy in section group '{}', whose copy the link keeps from linked unit #{}: the "
+                                   "default goes with the discarded copy, and nothing else in the link defines '{}' "
+                                   "or '{}'. Both reference linkers leave the name undefined, and so does DSS.",
+                                   ms.name, i, fallback, lostIn->second, keeperOf.at(lostIn->second), ms.name,
+                                   fallback));
+                continue;
+            }
+            auto const own = std::find_if(m.externImports.begin(), m.externImports.end(),
+                                          [&](ExternImport const& e) { return e.mangledName == ms.name; });
+            if (own != m.externImports.end()) {
+                if (own->fallbackName.empty()) {
+                    own->fallbackName = fallback;
+                } else if (own->fallbackName != fallback) {
+                    report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
+                           std::format("linker: linked unit #{} gives '{}' the fallback '{}', and its definition of "
+                                       "the name lies in section group '{}', whose copy the link keeps from linked "
+                                       "unit #{}: the name stays and resolves to '{}', so it would have two "
+                                       "fallbacks -- refused rather than pick one.",
+                                       i, ms.name, own->fallbackName, lostIn->second, keeperOf.at(lostIn->second),
+                                       fallback));
+                }
+                continue;
+            }
+            ExternImport stays;
+            stays.symbol       = SymbolId{nextId++};
+            stays.mangledName  = ms.name;
+            stays.fallbackName = fallback;
+            if (auto const datum = threadLocalDatum.find(ms.symbol.v); datum != threadLocalDatum.end()) {
+                stays.isData        = true;
+                stays.isThreadLocal = datum->second;
+            }
+            m.externImports.push_back(std::move(stays));
+        }
         std::erase_if(m.symbols, [&](ModuleSymbol const& ms) { return lostIds.contains(ms.symbol.v); });
         m.expectedFuncCount -= std::min(m.expectedFuncCount, lostFunctions);
-        for (auto const& [section, group] : lost[i]) m.sectionGroupOfInputSection.erase(section);
+        for (auto const& [section, group] : lost[i]) {
+            m.sectionGroupOfInputSection.erase(section);
+            m.sectionGroupRuleOf.erase(std::string{group});
+        }
     }
     return false;
 }
@@ -4271,14 +4888,21 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // resolves a name, a definition in a discarded group must never meet the
     // kept one (`discardLaterSectionGroups`). An image and a relocatable
     // artifact alike: both reference linkers discard it under `-r` too.
+    // P69 fold 3d: a compiled unit's select-any definition beside a group of its
+    // name is judged as the copy its object would be (`stateCompiledSelectAnyCopies`).
     std::vector<AssembledModule> groupBoundStorage;   // populated only when a group is discarded
     {
-        std::size_t const errsBeforeGroups = reporter.errorCount();
-        if (!discardLaterSectionGroups(modules, groupBoundStorage, reporter)) {
+        std::size_t const              errsBeforeGroups = reporter.errorCount();
+        std::vector<AssembledModule>   statedStorage;   // populated only when a copy is stated
+        std::vector<StatedCopy> const  stated = stateCompiledSelectAnyCopies(modules, objectFormatSchema, statedStorage);
+        std::span<AssembledModule const> const judged =
+            stated.empty() ? modules : std::span<AssembledModule const>{statedStorage};
+        if (!discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {
             if (reporter.errorCount() != errsBeforeGroups) {
                 image.resolvedFuncCount = 0;
                 return image;
             }
+            unstateCopiesKept(groupBoundStorage, stated);
             modules = std::span<AssembledModule const>{groupBoundStorage};
         }
     }

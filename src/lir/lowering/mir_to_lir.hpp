@@ -538,6 +538,13 @@ lowerToLir(Mir const&          mir,
            // `lowerAsmTemplateToLirRun` verbatim. nullopt ⇒ no format stated,
            // and every such operator is refused by name. Trailing (like every
            // format fact above) so positional callers are unaffected.
-           std::optional<ObjectFormatKind> assemblyFormatKind = std::nullopt);
+           std::optional<ObjectFormatKind> assemblyFormatKind = std::nullopt,
+           // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): the
+           // names the IMAGE defines, from the active format's
+           // `imageDefinedSymbols` (every flavor states the names the image it
+           // ends in will define). Such a name is in the image, never an import,
+           // so a reference to it is DIRECT and takes no slot. Empty = no name
+           // is exempt, the lowering unchanged.
+           std::vector<std::string> imageDefinedNames = {});
 
 } // namespace dss

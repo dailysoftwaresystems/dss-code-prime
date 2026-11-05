@@ -51,11 +51,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// The DLL also defines a function: a DLL of data ALONE is refused by DSS's PE writer today ("`.text` is empty"),
-// a defect of its own that this pin does not ask about —
-// [[D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS]], whose fold removes this function.
-constexpr char const* kLibraryUnit = "int dss_imported_value = 40;\n"
-                                     "int dss_library_value(void) { return dss_imported_value; }\n";
+// The DLL holds the datum and nothing else: no function, so DSS writes it with no code section, as link.exe
+// `/DLL /NOENTRY` does (P69 fold 3d; `tests/link/test_data_only_shared_library.cpp` reads that image's shape).
+constexpr char const* kLibraryUnit = "int dss_imported_value = 40;\n";
 
 struct ImportingUnit {
     char const* stem;

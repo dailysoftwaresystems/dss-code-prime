@@ -23,7 +23,14 @@
 //                                                                 cl /MD object under its own 52-character name
 // No guard enforces an md5: it records WHICH BYTES were measured.
 //
-// Every TEST but the `…Native` one runs in-process on every leg: the images are linked, never run, there.
+// P69 fold 3d, the same row's second half: in a build of OBJECTS ALONE the object defining the entry was made the
+// link's client, and the client reached no binder. ✔MEASURED (lane `xa`'s `client_entry_dss.py`, run 24's dsscp):
+// `tests/link/data/object_entry_puts_*` (a `main` calling `puts`) linked alone or beside `object_entry_getenv_*` (a
+// unit calling `getenv`), in either order, was refused "undefined symbol" for `__imp_puts` (cl /MD, PE) and for
+// `puts` (gcc 13.3, ELF x86_64), the other object's `getenv` bound, where link.exe and GNU ld link both and the
+// program exits 42. Every named object is an object input of the link now, the entry's included.
+//
+// Every TEST but the `…Native` ones runs in-process on every leg: the images are linked, never run, there.
 
 #include "asm/asm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -52,6 +59,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -141,6 +149,130 @@ TEST(ForeignObjectLibraryBinding, EachNamedObjectsLibraryCallIsBoundToTheLibrary
         ASSERT_FALSE(image.empty()) << "DSS links the object named to it, as link.exe and GNU ld do:"
                                     << diagnosticsOf(rep);
         expectPutsFromTheCLibrary(image);
+    }
+}
+
+// ══ THE ENTRY'S OWN OBJECT, in a build of objects alone ═══════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr char const* kPeEntryPuts    = "object_entry_puts_x86_64_pe_cl_MD_O2.obj";
+constexpr char const* kPeEntryGetenv  = "object_entry_getenv_x86_64_pe_cl_MD_O2.obj";
+constexpr char const* kElfEntryPuts   = "object_entry_puts_x86_64_elf_gcc_O2.o";
+constexpr char const* kElfEntryGetenv = "object_entry_getenv_x86_64_elf_gcc_O2.o";
+constexpr char const* kElfExec        = "x86_64:elf64-x86_64-linux-exec";
+
+// DSS's image of `objects` alone, in that order, for `target`: the image's path, or empty with `rep` holding why.
+[[nodiscard]] fs::path dssImageOfObjects(fs::path const& dir, std::vector<char const*> const& objects,
+                                         char const* target, DiagnosticReporter& rep) {
+    fs::create_directories(dir);
+    std::vector<std::string> inputs;
+    for (char const* name : objects) inputs.push_back(fixturePath(name).string());
+    auto const out = dir / "dss.out";
+    fs::create_directories(out);
+    Program p;
+    p.setOutputDir(out);
+    std::vector<std::string> const targets{target};
+    int const rc = inputs.size() == 1u ? p.compileFiles(inputs, "c", targets, rep)
+                                       : p.compileUnits(inputs, "c", targets, rep);
+    if (rc != 0) return {};
+    fs::path image;
+    for (auto const& e : fs::directory_iterator(out)) {
+        if (e.is_regular_file() && (image.empty() || e.path().extension() == ".exe")) image = e.path();
+    }
+    return image;
+}
+
+// The orders each pair is linked in, the entry's object alone first.
+std::vector<std::vector<char const*>> const kPeEntryOrders{
+    {kPeEntryPuts}, {kPeEntryPuts, kPeEntryGetenv}, {kPeEntryGetenv, kPeEntryPuts}};
+std::vector<std::vector<char const*>> const kElfEntryOrders{
+    {kElfEntryPuts}, {kElfEntryPuts, kElfEntryGetenv}, {kElfEntryGetenv, kElfEntryPuts}};
+
+// The names an ELF64 little-endian image's `.dynsym` states UNDEFINED (section index 0): the references its loader
+// binds. Read by the test's own walk of the section headers, not by the readers under test.
+[[nodiscard]] std::vector<std::string> undefinedDynamicSymbolsOf(std::vector<std::uint8_t> const& b) {
+    std::vector<std::string> out;
+    auto const u16 = [&](std::size_t o) { return static_cast<std::uint32_t>(b[o] | (b[o + 1] << 8)); };
+    auto const u32 = [&](std::size_t o) { return u16(o) | (u16(o + 2) << 16); };
+    auto const u64 = [&](std::size_t o) { return static_cast<std::uint64_t>(u32(o)) | (std::uint64_t{u32(o + 4)} << 32); };
+    if (b.size() < 64u || b[0] != 0x7F || b[1] != 'E' || b[4] != 2u || b[5] != 1u) {
+        ADD_FAILURE() << "the image is no ELF64 little-endian file";
+        return out;
+    }
+    std::uint64_t const shoff = u64(0x28);
+    std::uint32_t const shentsize = u16(0x3A), shnum = u16(0x3C);
+    if (shoff == 0u || shentsize < 64u || shoff + std::uint64_t{shnum} * shentsize > b.size()) {
+        ADD_FAILURE() << "the image states no section headers in the file";
+        return out;
+    }
+    auto const sh = [&](std::uint32_t i) { return static_cast<std::size_t>(shoff + std::uint64_t{i} * shentsize); };
+    for (std::uint32_t s = 0; s < shnum; ++s) {
+        if (u32(sh(s) + 4) != 11u /*SHT_DYNSYM*/) continue;
+        std::uint32_t const link = u32(sh(s) + 0x28);
+        if (link >= shnum) continue;
+        std::size_t const symOff = u64(sh(s) + 0x18), symSize = u64(sh(s) + 0x20);
+        std::size_t const strOff = u64(sh(link) + 0x18);
+        for (std::size_t e = symOff + 24u; e + 24u <= symOff + symSize && e + 24u <= b.size(); e += 24u) {
+            if (u16(e + 6) != 0u /*SHN_UNDEF*/) continue;
+            std::string name;
+            for (std::size_t p = strOff + u32(e); p < b.size() && b[p] != 0u; ++p) name.push_back(static_cast<char>(b[p]));
+            out.push_back(std::move(name));
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::string labelOf(std::vector<char const*> const& objects) {
+    std::string s;
+    for (char const* o : objects) s += (s.empty() ? "" : ", ") + std::string{o};
+    return s;
+}
+
+}  // namespace
+
+// Every leg: the cl /MD object defining `main`, which calls `puts`, linked alone or beside an object calling
+// `getenv`, in either order: `puts` is imported from the C library's image, and so is `getenv` where it is named.
+// RED-ON-DISABLE: make the entry's object the link's client again -> "undefined symbol '__imp_puts'".
+TEST(ForeignObjectLibraryBinding, TheEntrysObjectInABuildOfObjectsAloneIsBoundOnPe) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "foreign-object-entry-pe"};
+    std::size_t k = 0;
+    for (auto const& objects : kPeEntryOrders) {
+        SCOPED_TRACE(labelOf(objects));
+        DiagnosticReporter rep;
+        auto const image = dssImageOfObjects(scratch.path() / std::to_string(k++), objects, kExec, rep);
+        ASSERT_FALSE(image.empty()) << "link.exe links these objects:" << diagnosticsOf(rep);
+        expectPutsFromTheCLibrary(image);
+        if (objects.size() == 2u) {
+            auto const symbols = test_support::peImportedSymbols(bytesOf(image));
+            EXPECT_NE(std::find(symbols.begin(), symbols.end(), "getenv"), symbols.end()) << "the image imports getenv";
+        }
+    }
+}
+
+// Every leg: gcc's object defining `main`, which calls `puts`, linked alone or beside an object calling `getenv`, in
+// either order, for an ELF x86_64 executable: the image needs the C library, and its `.dynsym` names `puts` (and
+// `getenv`) undefined, for the loader to bind. RED-ON-DISABLE: make the entry's object the link's client again ->
+// "undefined symbol 'puts'".
+TEST(ForeignObjectLibraryBinding, TheEntrysObjectInABuildOfObjectsAloneIsBoundOnElf) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "foreign-object-entry-elf"};
+    std::size_t k = 0;
+    for (auto const& objects : kElfEntryOrders) {
+        SCOPED_TRACE(labelOf(objects));
+        DiagnosticReporter rep;
+        auto const image = dssImageOfObjects(scratch.path() / std::to_string(k++), objects, kElfExec, rep);
+        ASSERT_FALSE(image.empty()) << "GNU ld links these objects:" << diagnosticsOf(rep);
+        auto const bytes  = bytesOf(image);
+        auto const needed = test_support::elfNeededLibraries(bytes);
+        EXPECT_EQ(test_support::dependencyOccurrences(needed, "libc.so.6"), 1u)
+            << "the image needs the C library once; it needs: " << test_support::joinDependencies(needed);
+        auto const undefined = undefinedDynamicSymbolsOf(bytes);
+        EXPECT_EQ(test_support::dependencyOccurrences(undefined, "puts"), 1u)
+            << "its .dynsym names puts undefined; it names: " << test_support::joinDependencies(undefined);
+        if (objects.size() == 2u) {
+            EXPECT_EQ(test_support::dependencyOccurrences(undefined, "getenv"), 1u)
+                << "and getenv; it names: " << test_support::joinDependencies(undefined);
+        }
     }
 }
 
@@ -280,4 +412,27 @@ TEST(ForeignObjectLibraryBindingNative, EachImageRunsTo42) {
     auto const image = dssImageOf(scratch.path() / "archive", std::nullopt, fixturePath(kArchive), rep);
     ASSERT_FALSE(image.empty()) << diagnosticsOf(rep);
     runs(image);
+}
+
+// Where the host runs the format's executables (Windows x86_64: the PE images; Linux x86_64: the ELF ones): each image
+// of the entry's object, alone or beside the `getenv` object in either order, runs to 42, as the reference linker's
+// program of the same objects does.
+TEST(ForeignObjectLibraryBindingNative, EachImageOfTheEntrysObjectRunsTo42) {
+    auto const host = std::string{test_support::hostNativeTarget().execTarget};
+    bool const pe   = host == kExec;
+    bool const elf  = host == kElfExec;
+    if (!pe && !elf) GTEST_SKIP() << "the images run only where the host is Windows x86_64 or Linux x86_64";
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "foreign-object-entry-run"};
+    std::size_t k = 0;
+    for (auto const& objects : pe ? kPeEntryOrders : kElfEntryOrders) {
+        SCOPED_TRACE(labelOf(objects));
+        DiagnosticReporter rep;
+        auto const image = dssImageOfObjects(scratch.path() / std::to_string(k++), objects, pe ? kExec : kElfExec, rep);
+        ASSERT_FALSE(image.empty()) << diagnosticsOf(rep);
+        auto const r = test_support::runBinary(image, test_support::kRunBudget, /*captureStdout=*/true);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u) << "main returns 42 when `puts` succeeded";
+        EXPECT_NE(r.capturedStdout.find("entry object"), std::string::npos) << "puts wrote its line";
+    }
 }

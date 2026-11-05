@@ -70,8 +70,10 @@ struct DSS_EXPORT LinkedImage {
 
     // LK11a: the cross-CU symbol-resolution outcome — for each externally-visible
     // NAME defined across the linked CUs, the WINNING definition's compound key after
-    // weak-vs-strong resolution (a strong/Global def shadows weak; among all-weak the
-    // lowest (cuId, SymbolId) wins deterministically). Empty for single-CU links (no
+    // weak-vs-strong resolution (a strong/Global def shadows weak; among weak ones
+    // that rank alike the first in the link's order wins -- the operator's order of
+    // the inputs, `AssembledModule::linkPosition` -- and the compound key only at one
+    // place or at none, P69 fold 3d). Empty for single-CU links (no
     // cross-CU merge). Load-bearing for the OPT7 Weak-inline guard: the optimizer must
     // not inline a weak callee whose winning definition here is a DIFFERENT, strong one.
     std::unordered_map<std::string, LinkedSymbolKey> resolvedGlobalDefs;

@@ -509,6 +509,12 @@ public:
     isExecFlavor(detail::ObjectFormatData const& d) const noexcept override {
         return d.pe.objectType == PeObjectType::Exec;
     }
+    // P69 fold 3d: the EXE and DLL writers give each image-defined name its
+    // address (`pe::encodeExec`, the image header at the image base).
+    [[nodiscard]] bool
+    writesImageDefinedSymbols(detail::ObjectFormatData const& d) const noexcept override {
+        return isImageFlavor(d);
+    }
 
     // c152 (D-LK2-4): PE Dll is FALSE. Windows has no ld.so-style deferred
     // global scope for implicitly-linked DLLs — every import binds at load
@@ -1171,8 +1177,10 @@ public:
             if (!sawText) {
                 fail("/sections",
                      "PE32+ dll format requires a Text section row "
-                     "(SectionKind::Text) -- a dynamic-link library "
-                     "without code has nothing to export. D-LK2-4.");
+                     "(SectionKind::Text) -- the writer lays the image "
+                     "out from that row's address: the code section "
+                     "starts there and the data sections follow it, and "
+                     "a DLL with no function starts its data there.");
             }
             if (processExit.has_value() || !entryCallingConvention.empty()
              || processArgs.has_value()) {

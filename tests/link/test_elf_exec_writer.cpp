@@ -15,7 +15,9 @@
 //   * Cycle-2 fail-loud guard: modules with non-empty relocations[]
 //     emit `K_RelocationKindMismatch` and return empty bytes.
 //   * Cycle-2 fail-loud guard: zero-function module emits
-//     `K_SymbolUndefined`.
+//     `K_ProgramEntryUndefined` (P69 fold 3d: a program with no
+//     instruction has no entry; it was `K_SymbolUndefined` /
+//     `K_RelocationKindMismatch` before).
 
 #include "asm/asm.hpp"
 #include "ffi/binary_reader.hpp"
@@ -1433,23 +1435,56 @@ TEST(ElfExecWriter, PtLoadHeaderHasReadExecutePermsAndPageAlign) {
     EXPECT_EQ(pType, 1u);  // PT_LOAD
     std::uint32_t const pFlags = readU32LE(bytes, 64 + 4);
     EXPECT_EQ(pFlags, 5u);  // PF_X | PF_R
-    // p_offset @ +8 = file offset of .text (depends on layout, > 64+56)
+    // p_offset @ +8 = 0: since P69 fold 3d the segment opens at the image's
+    // first byte, its own ELF header, which it maps as GNU ld maps it in every
+    // static image (`__ehdr_start` names it). `.text` follows at 0x1000.
     std::uint64_t const pOffset = readU64LE(bytes, 64 + 8);
-    EXPECT_GE(pOffset, 64u + 56u);
-    // p_vaddr / p_paddr @ +16, +24 = 0x401000
-    EXPECT_EQ(readU64LE(bytes, 64 + 16), 0x401000u);
-    EXPECT_EQ(readU64LE(bytes, 64 + 24), 0x401000u);
-    // p_filesz / p_memsz @ +32, +40 — the segment closes on
-    // `.note.gnu.build-id`, which this format now declares
+    EXPECT_EQ(pOffset, 0u);
+    // p_vaddr / p_paddr @ +16, +24 = 0x400000: `.text`'s VA (0x401000) less
+    // its file offset (0x1000), the address of the header.
+    EXPECT_EQ(readU64LE(bytes, 64 + 16), 0x400000u);
+    EXPECT_EQ(readU64LE(bytes, 64 + 24), 0x400000u);
+    // p_filesz / p_memsz @ +32, +40 — the header page, then the segment closes
+    // on `.note.gnu.build-id`, which this format now declares
     // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE): 3 bytes of `.text`, padded to the
     // note's 4-byte addralign, then the 48-byte note (12-byte Nhdr + "GNU\0"
-    // + a 32-byte SHA-256 descriptor) = 52. The note is SHF_ALLOC in both
-    // references, so it MUST be inside a PT_LOAD — an unmapped identity is
-    // invisible to the crash reporter that reads it.
-    EXPECT_EQ(readU64LE(bytes, 64 + 32), 52u);
-    EXPECT_EQ(readU64LE(bytes, 64 + 40), 52u);
+    // + a 32-byte SHA-256 descriptor) = 0x1000 + 52. The note is SHF_ALLOC in
+    // both references, so it MUST be inside a PT_LOAD — an unmapped identity
+    // is invisible to the crash reporter that reads it.
+    EXPECT_EQ(readU64LE(bytes, 64 + 32), 0x1000u + 52u);
+    EXPECT_EQ(readU64LE(bytes, 64 + 40), 0x1000u + 52u);
     // p_align @ +48 = 0x1000 (4KB page, kernel-required)
     EXPECT_EQ(readU64LE(bytes, 64 + 48), 0x1000u);
+}
+
+// P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the ELF neighbour):
+// the static arm gives an image-defined name the address of the image's own
+// header -- the bytes at it are "\x7fELF", mapped by PT_LOAD #1 -- through
+// the same relocation kernel as every other address. A `rel32` from `.text`
+// (an `lea`'s disp32 at offset 3 of `48 8D 05 <disp32> C3`) lands at the
+// header: target = P + 4 + disp32 == 0x400000. RED-ON-DISABLE: give the name
+// no address -> the relocation is refused undefined; open PT_LOAD #1 at
+// `.text` again -> the address is unmapped (p_offset != 0).
+TEST(ElfExecWriter, AnImageDefinedNameIsTheImagesOwnMappedHeader) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3}, 1);
+    Relocation rel;
+    rel.offset = 3;
+    rel.target = SymbolId{77};
+    rel.kind   = RelocationKind{1};   // x86_64.target.json: rel32 (pc-relative, bias -4)
+    mod.functions[0].relocations.push_back(rel);
+    mod.imageDefinedSymbols.push_back({SymbolId{77}, ImageDefinedAddress::ImageHeader});
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    std::uint64_t const textVa = 0x401000u;
+    std::int32_t const disp = static_cast<std::int32_t>(readU32LE(bytes, 0x1000 + 3));
+    std::uint64_t const target = textVa + 7u + static_cast<std::uint64_t>(static_cast<std::int64_t>(disp));
+    EXPECT_EQ(target, 0x400000u) << "the name is the image's first address";
+    EXPECT_EQ(readU64LE(bytes, 64 + 8), 0u) << "PT_LOAD #1 maps the header";
+    EXPECT_EQ(readU64LE(bytes, 64 + 16), target) << "...at the name's address";
+    EXPECT_EQ(bytes[0], 0x7Fu);
+    EXPECT_EQ(bytes[1], 'E');
 }
 
 TEST(ElfExecWriter, TextSectionHeaderShAddrEqualsVirtualAddress) {
@@ -1878,13 +1913,19 @@ TEST(ElfExecWriter, ZeroFunctionModuleFailLoud) {
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
-    // The LK6 cycle-1 empty-.text guard fires before the entry-point
-    // lookup would reach K_SymbolUndefined — a zero-function module
-    // produces zero `.text` bytes, and an executable with no entry
-    // instructions would SIGSEGV at exec time. EITHER diagnostic
-    // code counts as fail-loud; pin the contract loosely so future
-    // re-orderings of the two guards don't churn this test.
-    EXPECT_GT(rep.errorCount(), 0u);
+    // A zero-function module produces zero `.text` bytes, and a program
+    // with no instruction has no entry: the document declares entry
+    // verbs, so it is refused as a program with no entry — ONE code,
+    // pinned exactly (P69 fold 3d: before it, the shared relocation
+    // kernel refused it under K_RelocationKindMismatch and the e_entry
+    // lookup under K_SymbolUndefined, and this cell accepted either).
+    std::size_t entryUndefined = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ProgramEntryUndefined) ++entryUndefined;
+        EXPECT_NE(d.code, DiagnosticCode::K_RelocationKindMismatch) << d.actual;
+        EXPECT_NE(d.code, DiagnosticCode::K_SymbolUndefined) << d.actual;
+    }
+    EXPECT_EQ(entryUndefined, 1u);
 }
 
 // ── Schema validate rules pinned ───────────────────────────────

@@ -1180,6 +1180,23 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 }
             }
         }
+        // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, ledger 484):
+        // `imageDefinedSymbols` is read TWICE. Every compile reads it, so a
+        // reference to a name the image will define is direct, never an
+        // import's slot -- on a relocatable or archive document too, whose
+        // object ends in an image later. The link of an IMAGE reads it again,
+        // and there the address each name denotes is the writer's to give: a
+        // backend capability, as `zero` is above. On an image whose writer
+        // gives no such address every reference would be refused "not defined"
+        // at the walker, naming the wrong defect.
+        if (!imageDefinedSymbols.empty() && image
+            && !backend->writesImageDefinedSymbols(*this)) {
+            fail("/imageDefinedSymbols",
+                 "'imageDefinedSymbols' is declared on an image, but this "
+                 "format's writer gives no image-defined name its address "
+                 "(`writesImageDefinedSymbols`), so every reference to one would "
+                 "reach the writer naming nothing it places.");
+        }
     }
 
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:

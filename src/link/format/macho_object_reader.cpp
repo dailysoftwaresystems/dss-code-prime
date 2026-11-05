@@ -1964,6 +1964,22 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 "macho::readRelocatableObject", reporter);
             if (!decoded.has_value()) return std::nullopt;  // already reported
 
+            // P69 fold 3d: the decoder READS a CIE's personality and an FDE's
+            // language-specific data area, and the ELF reader binds both into
+            // the function's `LanguageHandler`. This reader does not bind them
+            // yet, so a record naming either is refused by name here: carried
+            // without them, an exception dispatched to the frame would find
+            // no handler, and the image would look complete.
+            for (auto const& fde : decoded->fdes) {
+                if (!fde.personality.has_value() && !fde.dataArea.has_value()) continue;
+                return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                    "macho::readRelocatableObject: an FDE of '" + where
+                    + "' names a personality routine or a language-specific data "
+                      "area, which this reader does not bind to its function yet; "
+                      "carried without them, an exception dispatched to the frame "
+                      "would find no handler.");
+            }
+
             for (auto const& fde : decoded->fdes) {
                 // ★ THE REFERENCE IS RESOLVED THROUGH THE ENCODING THE CIE
                 //   DECLARED, not through a convention this reader picked. The

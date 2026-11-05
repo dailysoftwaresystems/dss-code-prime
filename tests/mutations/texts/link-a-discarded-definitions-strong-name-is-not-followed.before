@@ -1,1 +1,1 @@
-                if (ms.symbol != id || ms.binding != SymbolBinding::Global || ms.name.empty()) continue;
+                if (ms.symbol != id || ms.name.empty()) continue;

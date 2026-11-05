@@ -333,6 +333,16 @@ std::vector<Route> const kRoutes = {
                                    writeSource(s, "main.c", kMain).generic_string()},
                                   "c", {"x86_64:elf64-x86_64-linux"}) == 0;
      }},
+    // A build of objects alone compiles one module: the program's startup, the init that calls an object's entry
+    // with its arguments (here gcc's `main(argc, argv, envp)`-elected `main`, its environment computed by the init).
+    {"compileUnits: a build of objects alone, its startup module",
+     [](fs::path const&) {
+         Program prog;
+         auto const data = dss::test::repoRoot() / "tests" / "link" / "data";
+         return prog.compileUnits({(data / "object_entry_args_x86_64_elf_gcc_O2.o").generic_string(),
+                                   (data / "object_entry_helper_x86_64_elf_gcc_O2.o").generic_string()},
+                                  "c", {"x86_64:elf64-x86_64-linux-exec"}) == 0;
+     }},
     {"assembleUnit: one unit to its assembled module",
      [](fs::path const&) {
          auto grammarR = GrammarSchema::loadShipped("c");

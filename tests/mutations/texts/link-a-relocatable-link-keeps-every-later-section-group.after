@@ -1,1 +1,1 @@
-        if (objectFormatSchema.isImageFlavor() && !discardLaterSectionGroups(modules, groupBoundStorage, reporter)) {
+        if (objectFormatSchema.isImageFlavor() && !discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {

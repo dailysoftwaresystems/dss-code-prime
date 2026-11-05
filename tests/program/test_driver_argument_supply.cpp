@@ -609,6 +609,38 @@ findAll(std::vector<std::uint8_t> const& hay,
                              "c", {std::string{targetSpec}}, rep);
 }
 
+// ── THE TWO ROUTES ONE PROGRAM TAKES (P69 fold 3d, lane `xa`) ──────────────
+// Every format fact the merged route takes from the driver, the sole-CU route
+// carries too: in a `CuMirModule` field the build half fills from the format,
+// or as an argument of the driver's own `lowerCuMirToAssembly` call. A pin on
+// one route says NOTHING about the other (the header's classification block),
+// so each check below runs on BOTH, each under its route's own TEST name. The
+// sole-CU route compiles ONE source holding the pair's two texts in order,
+// under the pair's first name, so the artifact is named alike on both.
+enum class Route : std::uint8_t { SoleUnit, MergedUnits };
+
+[[nodiscard]] constexpr std::string_view routeName(Route r) noexcept {
+    return r == Route::SoleUnit ? "the sole-CU route" : "the merged route";
+}
+
+[[nodiscard]] int buildOnRoute(Route route, ScratchDir& scratch, std::string_view nameA,
+                               std::string_view srcA, std::string_view nameB,
+                               std::string_view srcB, std::string_view targetSpec,
+                               fs::path const& outDir, DiagnosticReporter& rep,
+                               CompileConfig config = CompileConfig::Debug) {
+    if (route == Route::MergedUnits) {
+        return buildMergedPair(scratch, nameA, srcA, nameB, srcB, targetSpec, outDir, rep, config);
+    }
+    std::string text{srcA};
+    text += '\n';
+    text += srcB;
+    auto const one = writeSrc(scratch.path(), nameA, text);
+    Program prog;
+    prog.setOutputDir(outDir);
+    prog.setCompileConfig(config);
+    return prog.compileUnits({one.generic_string()}, "c", {std::string{targetSpec}}, rep);
+}
+
 // ── ELF64: count relocations of one wire type ──────────────────────────────
 // Walks every SHT_RELA section rather than looking `.rela.text` up by name: the
 // section NAME is a convention, the section TYPE is the format. Returns 0 for
@@ -715,12 +747,14 @@ constexpr std::string_view kElfArm64RelocSpec = "arm64:elf64-aarch64-linux";
 // emitted pe64 binary: exit 42 → exit 41, rc 0, ZERO diagnostics. The 16 global
 // bytes went `01 00 00 00 01 00 00 00 88 77 66 55 44 33 22 11` (correct) →
 // `03 00 00 00 00 00 00 00 88 77 66 55 44 33 22 11` (gnu_packed).
-TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy) {
+namespace {
+void suppliesTheFormatsBitFieldStrategy(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-bitfield"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "bitfield_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "bitfield_a.c",
                   "struct S { int a : 1; char b : 1; long long c; };\n"
                   "struct S bf_g = { 1, 1, 0x1122334455667788LL };\n"
@@ -730,12 +764,12 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy)
                   "int main(void) { return bf_read_b() + 41; }\n",
                   kPeExecSpec, out, rep),
               0)
-        << "the 2-CU pe64 bit-field build must succeed; a red here means the "
+        << "the pe64 bit-field build must succeed; a red here means the "
            "FIXTURE is broken, not the pin\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "bitfield_a.exe");
-    ASSERT_FALSE(img.empty()) << "the merged pe64 artifact must exist";
+    ASSERT_FALSE(img.empty()) << "the pe64 artifact must exist";
 
     // The trailing `long long` is the ANCHOR: it is unaffected by either
     // strategy, so it locates the global without depending on section layout.
@@ -757,13 +791,17 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy)
                                             + static_cast<std::ptrdiff_t>(hits[0]));
     EXPECT_TRUE(std::equal(std::begin(kMsvcStraddle), std::end(kMsvcStraddle),
                            got.begin()))
-        << "the merged route must hand the lower half the FORMAT-resolved "
+        << "the route must hand the lower half the FORMAT-resolved "
            "bit-field strategy. Reading `03 00 00 00 00 00 00 00` here is "
            "gnu_packed — the TARGET's back-compat fallback, which the pe64 "
            "format overrides — and it is a SILENT MISCOMPILE: the code reads "
            "`b` at byte 4 while the global stored it at byte 0 bit 1. Got: "
         << hexWindow(img, hits[0] - 8, 16);
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy) { suppliesTheFormatsBitFieldStrategy(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsBitFieldStrategy) { suppliesTheFormatsBitFieldStrategy(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `dataModel` — the FORMAT's data model, threaded into the merged module's
@@ -791,12 +829,14 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy)
 // (correct) → `EF BE AD DE | <8-byte pointer overwriting the 4-byte slot AND
 // the tag>`, i.e. the 8-byte absolute relocation was written into a 4-byte
 // pointer slot and ate the following field.
-TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataModel) {
+namespace {
+void suppliesTheFormatsDataModel(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-datamodel"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "datamodel_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "datamodel_a.c",
                   "int dm_anchor = 7;\n"
                   "struct P { unsigned int head; int* p; unsigned int tag; };\n"
@@ -808,12 +848,12 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataModel) {
                   "int main(void) { return dm_read_tag() + 41; }\n",
                   kPeExecSpec, out, rep),
               0)
-        << "the 2-CU pe64 pointer-global build must succeed; a red here means "
+        << "the pe64 pointer-global build must succeed; a red here means "
            "the FIXTURE is broken, not the pin\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "datamodel_a.exe");
-    ASSERT_FALSE(img.empty()) << "the merged pe64 artifact must exist";
+    ASSERT_FALSE(img.empty()) << "the pe64 artifact must exist";
 
     // `head` is the anchor; the POINTER between it and `tag` is relocated, so
     // its bytes cannot be pinned — its WIDTH can, by where `tag` lands.
@@ -829,11 +869,15 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataModel) {
                            img.begin() + static_cast<std::ptrdiff_t>(tagAt)))
         << "`tag` must sit 16 bytes after `head`: 4 bytes of `head`, 4 of "
            "alignment padding, and an EIGHT-byte pointer. Anything else means "
-           "the merged route handed the globals layout a data model whose "
+           "the route handed the globals layout a data model whose "
            "pointer width is not the format's — and the artifact still builds, "
            "still runs, and answers wrong. Window from `head`: "
         << hexWindow(img, hits[0], 24);
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataModel) { suppliesTheFormatsDataModel(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsDataModel) { suppliesTheFormatsDataModel(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `callingConventionIndex` on the MERGED route — the ordinal `dss::ffi::
@@ -864,12 +908,14 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataModel) {
 // ✔MEASURED 2026-08-20 with the mutant: rc 0, ZERO diagnostics, and the emitted
 // binary died with STATUS_STACK_BUFFER_OVERRUN (0xC0000409) instead of exiting
 // 42. The sibling probe that calls a UCRT import died with 0xC0000005.
-TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheCallingConventionIndex) {
+namespace {
+void suppliesTheCallingConventionIndex(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-callconv"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "callconv_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(scratch, "callconv_a.c",
+    ASSERT_EQ(buildOnRoute(route, scratch, "callconv_a.c",
                               "int cc_double(int a) { return a + a; }\n",
                               "callconv_b.c",
                               "extern int cc_double(int);\n"
@@ -878,29 +924,33 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheCallingConventionIndex) 
                               "}\n",
                               kPeExecSpec, out, rep),
               0)
-        << "the 2-CU pe64 build must succeed\n"
+        << "the pe64 build must succeed\n"
         << allDiagnosticText(rep);
     auto const exe = out / "callconv_a.exe";
-    ASSERT_TRUE(fs::exists(exe)) << "the merged pe64 artifact must exist";
+    ASSERT_TRUE(fs::exists(exe)) << "the pe64 artifact must exist";
 
 #if defined(_WIN32)
     auto const r = dss::test_support::runBinary(exe, dss::test_support::kRunBudget);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     ASSERT_FALSE(r.timedOut) << r.diagnostic;
     EXPECT_EQ(r.exitCode, 42u)
-        << "argc(1) doubled, plus a non-null argv, plus 39. A merged pe64 "
+        << "argc(1) doubled, plus a non-null argv, plus 39. A pe64 "
            "program must be lowered under the ordinal `resolveAbi` returned "
            "for THIS format. Supplied ordinal 0 (`sysv_amd64`) the frames lose "
            "the 32-byte shadow space and `main` reads its arguments from the "
            "wrong registers — the build still succeeds with no diagnostic and "
            "the image dies at run time (D-FF3-3-RESOLVED-CC-INDEX-THREADED)";
 #else
-    GTEST_SKIP() << "a pe64 image only RUNS on Windows; the merged route's "
+    GTEST_SKIP() << "a pe64 image only RUNS on Windows; the route's "
                     "calling-convention ordinal has no host-independent "
                     "signature that is not a register-allocation outcome. The "
                     "build assertion above still runs on every leg.";
 #endif
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheCallingConventionIndex) { suppliesTheCallingConventionIndex(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheCallingConventionIndex) { suppliesTheCallingConventionIndex(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `externCallDispatch` — the FORMAT's extern-call shape
@@ -925,13 +975,14 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheCallingConventionIndex) 
 // stopped building with `L_RequiredLirOpcodeMissing` ("module declares extern
 // imports but the active object format declares no `externCallDispatch`
 // shape"), while the two probes with no externs were byte-identical.
-TEST(DriverArgumentSupply,
-     MergedMultiCuRouteSuppliesTheFormatsExternCallDispatch) {
+namespace {
+void suppliesTheFormatsExternCallDispatch(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-externcall"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "externcall_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "externcall_a.c",
                   "#include <stdio.h>\n"
                   "int ecd_emit(void) { return puts(\"driver-arg-supply\"); }\n",
@@ -940,14 +991,14 @@ TEST(DriverArgumentSupply,
                   "int main(void) { return ecd_emit() >= 0 ? 42 : 1; }\n",
                   kPeExecSpec, out, rep),
               0)
-        << "a merged 2-CU program with a library CALL must build. A refusal "
-           "naming `externCallDispatch` means the merged route stopped "
+        << "a program with a library CALL must build. A refusal "
+           "naming `externCallDispatch` means the route stopped "
            "supplying the format's dispatch shape — MIR→LIR will not guess "
            "between indirect-slot and direct-PLT (D-FFI-EXTERN-CALL-DISPATCH)\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "externcall_a.exe");
-    ASSERT_FALSE(img.empty()) << "the merged pe64 artifact must exist";
+    ASSERT_FALSE(img.empty()) << "the pe64 artifact must exist";
     // The premise: this fixture really does carry a live extern import, so the
     // dispatch gate really was armed by the build above.
     EXPECT_GE(countBytes(img, "puts"), 1u)
@@ -957,6 +1008,10 @@ TEST(DriverArgumentSupply,
     EXPECT_GE(countBytes(img, "ucrtbase.dll"), 1u)
         << "the emitted image must name the library the import binds to";
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsExternCallDispatch) { suppliesTheFormatsExternCallDispatch(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsExternCallDispatch) { suppliesTheFormatsExternCallDispatch(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `dataImportBinding` — how an extern DATA object's address materializes
@@ -983,13 +1038,14 @@ TEST(DriverArgumentSupply,
 // discriminate (a merged program comparing `stdout` against `stderr` still sees
 // two distinct non-null words when both are slot addresses, so it exits 42
 // either way). Every leg still asserts the build and the import premise.
-TEST(DriverArgumentSupply,
-     MergedMultiCuRouteSuppliesTheFormatsDataImportBinding) {
+namespace {
+void suppliesTheFormatsDataImportBinding(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-dataimport"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "dataimport_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "dataimport_a.c",
                   "extern unsigned char *_mbcasemap;\n"
                   "extern unsigned char *__p__mbcasemap(void);\n"
@@ -1007,12 +1063,12 @@ TEST(DriverArgumentSupply,
                   "int main(void) { return dib_check(); }\n",
                   kPeExecSpec, out, rep),
               0)
-        << "the 2-CU pe64 extern-DATA build must succeed\n"
+        << "the pe64 extern-DATA build must succeed\n"
         << allDiagnosticText(rep);
 
     auto const exe = out / "dataimport_a.exe";
     auto const img = readAllBytes(exe);
-    ASSERT_FALSE(img.empty()) << "the merged pe64 artifact must exist";
+    ASSERT_FALSE(img.empty()) << "the pe64 artifact must exist";
     // The premise: BOTH the data object and its accessor are really imported,
     // so the binding this pin is about really was consulted.
     EXPECT_GE(countBytes(img, "_mbcasemap"), 1u)
@@ -1036,6 +1092,10 @@ TEST(DriverArgumentSupply,
                     "import-premise assertions above still run on every leg.";
 #endif
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataImportBinding) { suppliesTheFormatsDataImportBinding(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsDataImportBinding) { suppliesTheFormatsDataImportBinding(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `externAddrBinding` — how an undefined extern's ADDRESS-AS-A-VALUE
@@ -1065,13 +1125,14 @@ TEST(DriverArgumentSupply,
 // `R_AARCH64_ADR_PREL_PG_HI21` + `R_AARCH64_ADD_ABS_LO12_NC`. The four wire
 // numbers below are the `nativeId` values DECLARED on those rows in
 // `elf64-aarch64-linux.format.json`, not constants invented here.
-TEST(DriverArgumentSupply,
-     MergedMultiCuRouteSuppliesTheFormatsExternAddrBinding) {
+namespace {
+void suppliesTheFormatsExternAddrBinding(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-externaddr"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "externaddr_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "externaddr_a.c",
                   "extern int eab_extern_obj;\n"
                   "int* eab_addr_of(void) { return &eab_extern_obj; }\n",
@@ -1080,11 +1141,11 @@ TEST(DriverArgumentSupply,
                   "int eab_entry(void) { return eab_addr_of() != 0 ? 42 : 1; }\n",
                   kElfArm64RelocSpec, out, rep),
               0)
-        << "the 2-CU arm64 relocatable build must succeed\n"
+        << "the arm64 relocatable build must succeed\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "externaddr_a.o");
-    ASSERT_FALSE(img.empty()) << "the merged arm64 relocatable must exist";
+    ASSERT_FALSE(img.empty()) << "the arm64 relocatable must exist";
 
     constexpr std::uint32_t kAdrGotPage   = 311;  // R_AARCH64_ADR_GOT_PAGE
     constexpr std::uint32_t kLd64GotLo12  = 312;  // R_AARCH64_LD64_GOT_LO12_NC
@@ -1094,7 +1155,7 @@ TEST(DriverArgumentSupply,
     EXPECT_GE(elfRelaTypeCount(img, kAdrGotPage), 1u)
         << "`&extern` used as a VALUE must materialize through a GOT slot when "
            "the format declares `externAddrBinding: got`. Zero of these means "
-           "the merged route dropped the binding and emitted an absolute "
+           "the route dropped the binding and emitted an absolute "
            "page-pair lea instead (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT)";
     EXPECT_GE(elfRelaTypeCount(img, kLd64GotLo12), 1u)
         << "the GOT page relocation's low-12 partner must be present too — one "
@@ -1107,6 +1168,10 @@ TEST(DriverArgumentSupply,
     EXPECT_EQ(elfRelaTypeCount(img, kAddAbsLo12), 0u)
         << "the absolute page-pair's low-12 partner, same reasoning";
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsExternAddrBinding) { suppliesTheFormatsExternAddrBinding(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsExternAddrBinding) { suppliesTheFormatsExternAddrBinding(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `sehScopes` — the SEH scope records `synthesizeSehFunclets` produced for the
@@ -1133,12 +1198,14 @@ TEST(DriverArgumentSupply,
 // UNW_FLAG_EHANDLER) → 0x01 (version 1, no handler), `.xdata`'s virtual size
 // dropped by the whole scope table, and the binary died with
 // EXCEPTION_ACCESS_VIOLATION instead of exiting 42.
-TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) {
+namespace {
+void suppliesTheSehScopes(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-seh"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "seh_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "seh_a.c",
                   "#include <windows.h>\n"
                   "int seh_guarded(void) {\n"
@@ -1156,11 +1223,11 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) {
                   "int main(void) { return seh_guarded(); }\n",
                   kPeExecSpec, out, rep),
               0)
-        << "the 2-CU pe64 SEH build must succeed\n"
+        << "the pe64 SEH build must succeed\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "seh_a.exe");
-    ASSERT_FALSE(img.empty()) << "the merged pe64 artifact must exist";
+    ASSERT_FALSE(img.empty()) << "the pe64 artifact must exist";
 
     std::size_t       resolved = 0;
     std::size_t const withHandler = peFunctionsWithExceptionHandler(img, resolved);
@@ -1168,13 +1235,17 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) {
         << "the premise: `.pdata` must resolve at least one RUNTIME_FUNCTION's "
            "UNWIND_INFO. Zero would make the handler count below vacuous";
     EXPECT_GE(withHandler, 1u)
-        << "a merged program containing `__try`/`__except` must ship unwind "
-           "info that CLAIMS an exception handler. Zero means the merged route "
+        << "a program containing `__try`/`__except` must ship unwind "
+           "info that CLAIMS an exception handler. Zero means the route "
            "handed the lower half an empty SEH scope table: the funclet bodies "
            "still ship, the image still builds with no diagnostic, and the OS "
            "has nothing to dispatch to when the fault arrives "
            "(D-WIN64-SEH-FUNCLETS)";
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheSehScopes) { suppliesTheSehScopes(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheSehScopes) { suppliesTheSehScopes(Route::SoleUnit); }
 
 // ═════════════════════════════════════════════════
 // THE GUARDED REGIONS, END TO END — what a handler reads
@@ -1843,13 +1914,14 @@ TEST(DriverArgumentSupply, ProcessorCountNameHasItsPlatformsNumberOnEveryPosixFo
 // `L_RequiredLirOpcodeMissing` ("F128 softcall needs a runtime-library binding
 // but the active format declares none"), while every non-F128 probe was
 // byte-identical.
-TEST(DriverArgumentSupply,
-     MergedMultiCuRouteSuppliesTheWideFloatSoftcallLibrary) {
+namespace {
+void suppliesTheWideFloatSoftcallLibrary(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-widefloat"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "widefloat_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(
+    ASSERT_EQ(buildOnRoute(route,
                   scratch, "widefloat_a.c",
                   "long double wf_lhs;\n"
                   "long double wf_rhs;\n"
@@ -1863,13 +1935,13 @@ TEST(DriverArgumentSupply,
                   "int main(void) { return wf_sum(); }\n",
                   kElfArm64ExecSpec, out, rep),
               0)
-        << "a merged 2-CU program doing IEEE-binary128 arithmetic must build. "
-           "A refusal naming the runtime-library binding means the merged route "
+        << "a program doing IEEE-binary128 arithmetic must build. "
+           "A refusal naming the runtime-library binding means the route "
            "stopped supplying it (D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH)\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "widefloat_a");
-    ASSERT_FALSE(img.empty()) << "the merged arm64 exec must exist";
+    ASSERT_FALSE(img.empty()) << "the arm64 exec must exist";
     EXPECT_GE(countBytes(img, "libgcc_s.so.1"), 1u)
         << "the emitted image must NAME the library the target declares for "
            "this format. Its absence with a successful build would mean the "
@@ -1879,6 +1951,10 @@ TEST(DriverArgumentSupply,
         << "the premise: the fixture must really mint an F128 softcall, or the "
            "library assertion above is about a binding nothing consulted";
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheWideFloatSoftcallLibrary) { suppliesTheWideFloatSoftcallLibrary(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheWideFloatSoftcallLibrary) { suppliesTheWideFloatSoftcallLibrary(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // `statesCommons` — whether the merged module writes a tentative definition as
@@ -1941,12 +2017,14 @@ struct ElfSymbolRecord {
 
 } // namespace
 
-TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesWhetherTheDocumentStatesCommons) {
+namespace {
+void suppliesWhetherTheDocumentStatesCommons(Route const route) {
+    SCOPED_TRACE(routeName(route));
     ScratchDir scratch{Location::InsideRepo, "driver-arg-states-commons"};
     scratch.useAsCwd();
     auto const out = scratch.path() / "commons_out";
     DiagnosticReporter rep;
-    ASSERT_EQ(buildMergedPair(scratch, "commons_a.c",
+    ASSERT_EQ(buildOnRoute(route, scratch, "commons_a.c",
                               "int dss_tentative_v;\n"
                               "int *dss_tentative_a(void) { return &dss_tentative_v; }\n",
                               "commons_b.c",
@@ -1954,7 +2032,7 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesWhetherTheDocumentStatesCom
                               "int *dss_tentative_b(void) { return &dss_tentative_v; }\n",
                               "x86_64:elf64-x86_64-linux", out, rep),
               0)
-        << "the 2-CU relocatable ELF build of one tentative definition in each unit must succeed; a red here "
+        << "the relocatable ELF build of two tentative definitions of one name must succeed; a red here "
            "means the FIXTURE is broken, not the pin\n"
         << allDiagnosticText(rep);
 
@@ -1962,20 +2040,24 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesWhetherTheDocumentStatesCom
     for (auto const& e : fs::directory_iterator(out)) {
         if (e.is_regular_file()) written.push_back(e.path());
     }
-    ASSERT_EQ(written.size(), 1u) << "the merged route writes ONE relocatable object";
+    ASSERT_EQ(written.size(), 1u) << "the route writes ONE relocatable object";
     auto const obj = readAllBytes(written.front());
-    ASSERT_FALSE(obj.empty()) << "the merged relocatable object must exist";
+    ASSERT_FALSE(obj.empty()) << "the relocatable object must exist";
     constexpr std::uint16_t kShnCommon = 0xFFF2;
     auto const records = elfSymbolsNamed(obj, "dss_tentative_v");
-    ASSERT_EQ(records.size(), 1u) << "the merge folds the two tentative definitions into ONE record";
+    ASSERT_EQ(records.size(), 1u) << "the build folds the two tentative definitions into ONE record";
     EXPECT_EQ(records[0].shndx, kShnCommon)
-        << "the merged object must state the tentative definition as a COMMON (`SHN_COMMON`), as gcc -fcommon, "
+        << "the object must state the tentative definition as a COMMON (`SHN_COMMON`), as gcc -fcommon, "
            "clang -fcommon, cl and Apple clang do; a section index here (" << records[0].shndx
-        << ") is the zero-filled `.bss` DEFINITION the merged route writes when `program.cpp` stops passing "
+        << ") is the zero-filled `.bss` DEFINITION the route writes when `program.cpp` stops passing "
            "the document's `statesCommons` — and every linker refuses it beside another object of the name";
     EXPECT_EQ(records[0].value, 4u) << "an ELF common's `st_value` is its alignment";
     EXPECT_EQ(records[0].size, 4u);
 }
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesWhetherTheDocumentStatesCommons) { suppliesWhetherTheDocumentStatesCommons(Route::MergedUnits); }
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesWhetherTheDocumentStatesCommons) { suppliesWhetherTheDocumentStatesCommons(Route::SoleUnit); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // The FORMAT KIND — the one key an inline-asm template's address-part
@@ -2057,4 +2139,281 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheAssemblyFormatKind) {
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE FIVE ARGUMENTS NO PIN WITNESSED (P69 fold 3d, lane `xa`) — each run on
+// BOTH routes, like the conversions above.
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `lowerMergedToAssembly` takes SEVENTEEN driver-derived arguments (the header's
+// classification block lists each with its pin). Four of them reached it with no
+// pin on any route — `unnamedBitFieldAlignment`, `atomicsRuntime`,
+// `indirectSlotBindings`, `preemptibleDefinitionBindings` — and the seventeenth,
+// `imageDefinedNames`, is new with this fold. READ 2026-11-04: no TEST of this
+// file named any of the five.
+// The format of each pin is the one format family whose document states the fact
+// in a way a drop can be told apart from. Each is named where it is chosen.
+namespace {
+
+// Every relocation of an ELF64 little-endian file whose SYMBOL is `name`. Each
+// SHT_RELA section names its symbol table by `sh_link`, and that table names its
+// string table by its own, so `.rela.dyn` reads `.dynsym` and `.rela.text` reads
+// `.symtab` alike. 0 for anything that is not ELF64 little-endian.
+[[nodiscard]] std::size_t elfRelocationsNaming(std::vector<std::uint8_t> const& img,
+                                               std::string_view                 name) {
+    constexpr std::uint32_t kShtRela   = 4;
+    constexpr std::size_t   kRelaEntry = 24;
+    constexpr std::size_t   kSymEntry  = 24;
+    if (img.size() < 0x40 || !(img[0] == 0x7F && img[1] == 'E' && img[2] == 'L' && img[3] == 'F' && img[4] == 2
+                               && img[5] == 1)) {
+        return 0;
+    }
+    std::uint64_t const shoff     = rdU64(img, 0x28);
+    std::uint16_t const shentsize = rdU16(img, 0x3A);
+    std::uint16_t const shnum     = rdU16(img, 0x3C);
+    auto const header = [&](std::uint32_t i) { return static_cast<std::size_t>(shoff) + std::size_t{i} * shentsize; };
+    std::size_t hits = 0;
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::size_t const sh = header(i);
+        if (rdU32(img, sh + 4) != kShtRela) continue;
+        std::uint32_t const symtab = rdU32(img, sh + 0x28);
+        if (symtab == 0 || symtab >= shnum) continue;
+        std::size_t const   symSh  = header(symtab);
+        std::size_t const   symOff = static_cast<std::size_t>(rdU64(img, symSh + 0x18));
+        std::size_t const   symSz  = static_cast<std::size_t>(rdU64(img, symSh + 0x20));
+        std::uint32_t const strtab = rdU32(img, symSh + 0x28);
+        if (strtab >= shnum) continue;
+        std::size_t const strSh  = header(strtab);
+        std::size_t const strOff = static_cast<std::size_t>(rdU64(img, strSh + 0x18));
+        std::size_t const strSz  = static_cast<std::size_t>(rdU64(img, strSh + 0x20));
+        std::size_t const off    = static_cast<std::size_t>(rdU64(img, sh + 0x18));
+        std::size_t const sz     = static_cast<std::size_t>(rdU64(img, sh + 0x20));
+        for (std::size_t e = 0; e + kRelaEntry <= sz; e += kRelaEntry) {
+            std::uint64_t const sym = rdU64(img, off + e + 8) >> 32;   // ELF64: r_info's high half
+            if (sym == 0 || (sym + 1) * kSymEntry > symSz) continue;
+            std::size_t const nm = rdU32(img, symOff + static_cast<std::size_t>(sym) * kSymEntry);
+            if (nm >= strSz) continue;
+            std::size_t end = strOff + nm;
+            while (end < img.size() && end < strOff + strSz && img[end] != 0) ++end;
+            std::string_view const s{reinterpret_cast<char const*>(img.data() + strOff + nm), end - (strOff + nm)};
+            if (s == name) ++hits;
+        }
+    }
+    return hits;
+}
+
+// The one regular file a build wrote into `dir` (a pin that does not know the
+// artifact's spelling on this format reads it so); empty when there is not
+// exactly one.
+[[nodiscard]] std::vector<std::uint8_t> theOneArtifactIn(fs::path const& dir) {
+    std::vector<fs::path> written;
+    for (auto const& e : fs::directory_iterator(dir)) {
+        if (e.is_regular_file()) written.push_back(e.path());
+    }
+    if (written.size() != 1u) return {};
+    return readAllBytes(written.front());
+}
+
+// ── `unnamedBitFieldAlignment` (D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT) ─────
+// What an UNNAMED bit-field gives its struct's alignment: the FORMAT's rule, and
+// the lower half lays out a const-init global's BYTES by it. aarch64 ELF is the
+// one family that states `contributes`, where `{char c; unsigned :0; char d;}`
+// is 8 bytes at alignment 4; every other shipped document states `ignored` (5 at
+// 1). ✔MEASURED (gcc 13.3.0 and clang 18.1.3 on aarch64-linux; row Z1 of
+// `core/test_type_layout` `TypeLayout.BitFieldZeroWidthGnuPackedIsPerAbi`). So
+// the pin reads a two-element array, where the element STRIDE is the rule: under
+// `ignored` the second element's `c` sits at byte 5, not 8.
+void suppliesTheFormatsUnnamedBitFieldAlignment(Route const route) {
+    SCOPED_TRACE(routeName(route));
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-unnamed-bitfield"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "ubf_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildOnRoute(route, scratch, "ubf_a.c",
+                           "struct U { char c; unsigned : 0; char d; };\n"
+                           "struct U ubf_g[2] = { { 0x11, 0x22 }, { 0x33, 0x44 } };\n"
+                           "int ubf_read(void) { return ubf_g[1].d; }\n",
+                           "ubf_b.c",
+                           "extern int ubf_read(void);\n"
+                           "int ubf_entry(void) { return ubf_read(); }\n",
+                           kElfArm64RelocSpec, out, rep),
+              0)
+        << "the aarch64 relocatable build of a global whose struct holds a zero-width bit-field must succeed. A "
+           "refusal naming the unnamed bit-field rule means the route handed the lower half no rule\n"
+        << allDiagnosticText(rep);
+    auto const obj = readAllBytes(out / "ubf_a.o");
+    ASSERT_FALSE(obj.empty()) << "the relocatable object must exist";
+    constexpr std::uint8_t kContributes[] = {0x11, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00,
+                                             0x33, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00};
+    EXPECT_EQ(findAll(obj, std::span<std::uint8_t const>{kContributes}).size(), 1u)
+        << "the array must be laid out at the stride the document's `contributes` rule gives (8 bytes, the "
+           "zero-width `unsigned` contributing its alignment of 4), exactly once. Its absence means the global's "
+           "bytes were laid out by another rule than the one the code reads them by";
+}
+
+// ── `atomicsRuntime` (D-CSUBSET-PACKED-ATOMIC-MEMBER) ────────────────────────
+// The image that owns the generic atomics entries an UNDER-ALIGNED `_Atomic`
+// access calls. x86_64 is the processor where a drop is SILENT: its target
+// states `losesAtomicity`, so with no runtime the access keeps the native form
+// (gcc's), where arm64's `traps` refuses it loud. So the pin reads an x86_64 ELF
+// relocatable object: it must reference the document's `__atomic_load`.
+void suppliesTheFormatsAtomicsRuntime(Route const route) {
+    SCOPED_TRACE(routeName(route));
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-atomics-runtime"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "par_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildOnRoute(route, scratch, "par_a.c",
+                           "struct __attribute__((packed)) PA { char pad; _Atomic int a; };\n"
+                           "struct PA par_g;\n"
+                           "int par_load(void) { return par_g.a; }\n",
+                           "par_b.c",
+                           "extern int par_load(void);\n"
+                           "int par_entry(void) { return par_load(); }\n",
+                           "x86_64:elf64-x86_64-linux", out, rep),
+              0)
+        << "the x86_64 relocatable build of an under-aligned `_Atomic` load must succeed\n"
+        << allDiagnosticText(rep);
+    auto const obj = readAllBytes(out / "par_a.o");
+    ASSERT_FALSE(obj.empty()) << "the relocatable object must exist";
+    EXPECT_GE(countBytes(obj, "__atomic_load"), 1u)
+        << "an under-aligned `_Atomic` load must call the document's generic `__atomic_load`. An object that "
+           "names no such entry kept the native form: the route handed the lower half no atomics runtime, and on "
+           "x86_64 that builds, runs, and loses atomicity with no diagnostic";
+}
+
+// ── `indirectSlotBindings` (D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT)
+// WHICH bindings the `indirect-slot` dispatch reaches through an import slot. The
+// pe64 relocatable and archive documents state `weak` only, so a STRONG
+// undefined function keeps its direct call and its object carries no
+// `.refptr.` slot for it; dropped, every import pays one (✔MEASURED in P55: the
+// unnarrowed dispatch wrote an `FF 15` call and an 8-byte `.refptr.maybe` for a
+// strong extern — `link/test_pe_object_data_import_slot`). The exec and dll
+// documents state no narrowing, so the relocatable one is the witness.
+void suppliesTheFormatsIndirectSlotBindings(Route const route) {
+    SCOPED_TRACE(routeName(route));
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-slot-narrowing"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "isb_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildOnRoute(route, scratch, "isb_a.c",
+                           "extern int isb_strong(int);\n"
+                           "int isb_call(int v) { return isb_strong(v) + 1; }\n",
+                           "isb_b.c",
+                           "extern int isb_call(int);\n"
+                           "int isb_entry(void) { return isb_call(41); }\n",
+                           "x86_64:pe64-x86_64-windows", out, rep),
+              0)
+        << "the pe64 relocatable build of a call to a strong undefined function must succeed\n"
+        << allDiagnosticText(rep);
+    auto const obj = readAllBytes(out / "isb_a.obj");
+    ASSERT_FALSE(obj.empty()) << "the relocatable object must exist";
+    EXPECT_GE(countBytes(obj, "isb_strong"), 1u) << "the premise: the object references the strong function";
+    EXPECT_EQ(countBytes(obj, ".refptr.isb_strong"), 0u)
+        << "a STRONG undefined function keeps its direct call: the document states that only a weak one reaches "
+           "through an import slot. A `.refptr.isb_strong` slot means the route handed the lower half no narrowing, "
+           "so every import paid the weak import's slot";
+}
+
+// ── `preemptibleDefinitionBindings` (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING)
+// WHICH of an artifact's OWN definitions its loader may replace. The ELF shared
+// object documents state `global` and `weak`, so a call to the artifact's own
+// default-visibility function is resolved by the loader, as gcc 13.3.0 and clang
+// 18.1.3 resolve it (`call <st@plt>`, ✔MEASURED 2026-09-05,
+// `lir/test_preemptible_definition_routing`); dropped, it is a direct branch to
+// the artifact's own body. So the pin reads the `.so`: a relocation the loader
+// resolves names the called function. Nothing else in the fixture names it.
+void suppliesThePreemptibleDefinitionBindings(Route const route) {
+    SCOPED_TRACE(routeName(route));
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-preemptible"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "pdb_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildOnRoute(route, scratch, "pdb_a.c",
+                           "int pdb_callee(int v) { return v + 1; }\n"
+                           "int pdb_caller(int v) { return pdb_callee(v) * 2; }\n",
+                           "pdb_b.c",
+                           "extern int pdb_caller(int);\n"
+                           "int pdb_entry(void) { return pdb_caller(20); }\n",
+                           "x86_64:elf64-x86_64-linux-dyn", out, rep),
+              0)
+        << "the x86_64 shared-object build must succeed\n"
+        << allDiagnosticText(rep);
+    auto const so = theOneArtifactIn(out);
+    ASSERT_FALSE(so.empty()) << "the build writes ONE shared object";
+    EXPECT_GE(elfRelocationsNaming(so, "pdb_callee"), 1u)
+        << "a call to the shared object's own default-visibility function must be resolved by the loader, which "
+           "the document states may give the process another image's body for the name. No relocation naming "
+           "`pdb_callee` means the call is a direct branch: the route handed the lower half no preemptible binding";
+}
+
+// ── `imageDefinedNames` (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL) ─────────
+// The names the image a unit ends in will define (`__ImageBase` on every pe64
+// document). Such a name is in the image, never an import, so the lower half
+// reads it DIRECT; dropped, it reads it through an import slot, and the image
+// link refuses a slot for a name the image defines. So the build itself is the
+// pin on every leg, and on Windows the program reads the header the name
+// stands for: the image's own `MZ`.
+void suppliesTheImageDefinedNames(Route const route) {
+    SCOPED_TRACE(routeName(route));
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-image-defined"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "idn_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildOnRoute(route, scratch, "idn_a.c",
+                           "extern char __ImageBase;\n"
+                           "int idn_header(void) {\n"
+                           "    unsigned char const *h = (unsigned char const *)&__ImageBase;\n"
+                           "    return h[0] == 'M' && h[1] == 'Z' ? 42 : 1;\n"
+                           "}\n",
+                           "idn_b.c",
+                           "extern int idn_header(void);\n"
+                           "int main(void) { return idn_header(); }\n",
+                           kPeExecSpec, out, rep),
+              0)
+        << "a pe64 program reading `__ImageBase` must build: the image defines it. A refusal naming it means the "
+           "route handed the lower half no image-defined name, so the reference read an import slot\n"
+        << allDiagnosticText(rep);
+    auto const exe = out / "idn_a.exe";
+    ASSERT_TRUE(fs::exists(exe)) << "the pe64 artifact must exist";
+#if defined(_WIN32)
+    auto const r = dss::test_support::runBinary(exe, dss::test_support::kRunBudget);
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_FALSE(r.timedOut) << r.diagnostic;
+    EXPECT_EQ(r.exitCode, 42u) << "`&__ImageBase` must be the image's own header, which begins `MZ`";
+#endif
+}
+
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsUnnamedBitFieldAlignment) {
+    suppliesTheFormatsUnnamedBitFieldAlignment(Route::MergedUnits);
+}
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsUnnamedBitFieldAlignment) {
+    suppliesTheFormatsUnnamedBitFieldAlignment(Route::SoleUnit);
+}
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsAtomicsRuntime) {
+    suppliesTheFormatsAtomicsRuntime(Route::MergedUnits);
+}
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsAtomicsRuntime) {
+    suppliesTheFormatsAtomicsRuntime(Route::SoleUnit);
+}
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsIndirectSlotBindings) {
+    suppliesTheFormatsIndirectSlotBindings(Route::MergedUnits);
+}
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsIndirectSlotBindings) {
+    suppliesTheFormatsIndirectSlotBindings(Route::SoleUnit);
+}
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesThePreemptibleDefinitionBindings) {
+    suppliesThePreemptibleDefinitionBindings(Route::MergedUnits);
+}
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesThePreemptibleDefinitionBindings) {
+    suppliesThePreemptibleDefinitionBindings(Route::SoleUnit);
+}
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheImageDefinedNames) {
+    suppliesTheImageDefinedNames(Route::MergedUnits);
+}
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheImageDefinedNames) {
+    suppliesTheImageDefinedNames(Route::SoleUnit);
 }

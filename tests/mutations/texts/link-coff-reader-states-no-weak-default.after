@@ -1,0 +1,1 @@
+            if (false && d.defaultRecord.has_value()) mod.symbols.back().weakDefaultName = syms[*d.defaultRecord].name;

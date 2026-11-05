@@ -29,6 +29,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/elf_object_reader.hpp"
+#include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/object_format_schema.hpp"
 #include "link/pointer_reloc.hpp"
@@ -218,7 +219,9 @@ void expectEdges(TargetSchema const& t, std::string_view kind, std::initializer_
 }  // namespace
 
 // ✔MEASURED 2026-10-20 (GNU ld 2.42 and ld.lld 18.1.3 alike): R_X86_64_32 links exactly [0, 2^32), R_X86_64_32S
-// exactly [-2^31, 2^31). COFF's ADDR32 is GNU ld's [-2^31, 2^32) (mingw ld 2.41.90, its in-place addend read signed);
+// exactly [-2^31, 2^31). COFF's ADDR32 is [-2^31, 2^32): GNU ld's upper edge (mingw ld 2.41.90, its in-place addend read
+// signed), the lower edge DECIDED (below -2^31 no read of the field gives the value back; BFD's bitfield check is
+// DOCUMENTED to accept down to -2^32);
 // R_AARCH64_ABS32 is ld.lld's [-2^31, 2^32) (a program reads the -1 back; GNU ld refuses it).
 TEST(LinearFieldRange, EachKindHoldsItsOwnRangeAndNothingPastIt) {
     auto const x = shippedTarget("x86_64");
@@ -240,6 +243,41 @@ TEST(LinearFieldRange, EachKindHoldsItsOwnRangeAndNothingPastIt) {
                 {{kTwo31, true}, {kTwo32 - 1, true}, {kTwo32, false}, {-1, true}, {-kTwo31, true},
                  {-kTwo31 - 1, false}},
                 "either");
+}
+
+// P69 fold 3d (review F4): the kernel measures an IMAGE-RELATIVE field (`imagerel32`, COFF's ADDR32NB) from the image
+// base its caller's image states — S + A - base, an RVA — and refuses one where the image states no base. It used to
+// write S + A, a VA, into the field. (The PE image's own half: `PeExecWriter.AnImageRelativeFieldHoldsItsRvaAndTakes
+// NoBaseRelocation`.)
+TEST(LinearFieldRange, AnImageRelativeFieldIsMeasuredFromTheImagesBase) {
+    auto const x = shippedTarget("x86_64");
+    ASSERT_TRUE(x);
+    auto const& r = row(*x, "imagerel32");
+    ASSERT_TRUE(r.imageRelative);
+    EXPECT_FALSE(loaderRebasesTheField(r)) << "an RVA is not a field the loader moves";
+    EXPECT_TRUE(loaderRebasesTheField(row(*x, "abs64")));
+    EXPECT_FALSE(loaderRebasesTheField(row(*x, "rel32")));
+    auto const apply = [&](std::optional<std::uint64_t> base, std::string& messages) -> std::optional<std::uint32_t> {
+        AssembledModule   mod;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes.assign(4, 0);
+        fn.relocations.push_back(Relocation{0, SymbolId{2}, r.kind, 8});
+        mod.functions.push_back(std::move(fn));
+        std::vector<std::uint8_t>                   text(4, 0);
+        std::vector<std::uint64_t>                  starts{0};
+        std::unordered_map<SymbolId, std::uint64_t> va{{SymbolId{2}, 0x140003000ull}};
+        DiagnosticReporter                          rep;
+        bool const ok = link::format::applyExecRelocations(text, mod, starts, va, *x, 0x140001000ull, "test", rep, base);
+        messages      = diagnosticsOf(rep);
+        if (!ok) return std::nullopt;
+        return static_cast<std::uint32_t>(text[0]) | (static_cast<std::uint32_t>(text[1]) << 8)
+             | (static_cast<std::uint32_t>(text[2]) << 16) | (static_cast<std::uint32_t>(text[3]) << 24);
+    };
+    std::string m;
+    EXPECT_EQ(apply(0x140000000ull, m), std::optional<std::uint32_t>{0x3008u}) << "the target's RVA + 8:" << m;
+    EXPECT_EQ(apply(std::nullopt, m), std::nullopt) << "an image that states no base has nothing to measure from";
+    EXPECT_NE(m.find("is image-relative, and this image states no base"), std::string::npos) << m;
 }
 
 // ══ THE CHECK on the data fixups (`applyDataItemRelocations`, through the ELF image writer) ═══════════════════════
@@ -294,8 +332,102 @@ TEST(LinearFieldRange, ADataSlotHoldsItsKindsRangeToo) {
     EXPECT_NE(m.find("the signed 32-bit range"), std::string::npos) << m;
 }
 
+// ══ WHAT A DATA FIELD HOLDS (`applyDataItemRelocations`, the ELF and Mach-O images' data items) ════════════════════
+//
+// P69 fold 3d: the value is the schema formula's (`linearFieldValue`, the one every writer of a Linear field asks): an
+// ADDRESS, or the target's DISTANCE FROM THE FIELD ITSELF (a jump table's self-relative entry). Only the address is a
+// field the loader rebases (`loaderRebasesTheField`): an ELF ET_DYN lists it as an R_*_RELATIVE row, a Mach-O image as
+// a rebase. A THREAD-LOCAL field and an IMAGE-RELATIVE one are refused by name: no route hands this writer either
+// (✔MEASURED 2026-10-21: the C front end refuses a thread-local's address in a static initializer, both assembler
+// dialects refuse a TLS operator in a data directive, and a foreign object's TLS relocations are refused at read), and
+// these images state no base for an RVA.
+
+namespace {
+
+struct DataField {
+    std::optional<std::vector<std::uint8_t>> bytes;   // the section's bytes, or nullopt when refused
+    std::vector<std::uint64_t>               sites;   // the fields the loader rebases
+    std::string                              messages;
+};
+
+// One 16-byte item at offset 0 of a section at 0x402000 whose field at `offset` names a symbol at 0x401000 through
+// `kind` with addend `addend`, applied as an image the loader may move applies it (the rebase sites collected).
+[[nodiscard]] DataField applyDataField(TargetSchema const& t, std::string_view kind, std::int64_t addend,
+                                       std::uint32_t offset) {
+    std::vector<AssembledData> items(1);
+    items[0].symbol  = SymbolId{3};
+    items[0].section = DataSectionKind::Data;
+    items[0].bytes.assign(16, 0);
+    items[0].relocations.push_back(Relocation{offset, SymbolId{2}, row(t, kind).kind, addend});
+    link::format::ExecDataSectionLayout layout;
+    layout.bytes.assign(16, 0);
+    layout.itemOffsets = {0};
+    layout.itemIndices = {0};
+    layout.spanSize    = 16;
+    std::unordered_map<SymbolId, std::uint64_t> const va{{SymbolId{2}, 0x401000ull}};
+    DiagnosticReporter                                rep;
+    DataField                                         out;
+    bool const ok = link::format::applyDataItemRelocations(layout.bytes, items, layout, 0x402000ull, va, t, "test",
+                                                           rep, &out.sites);
+    out.messages = diagnosticsOf(rep);
+    if (ok) out.bytes = layout.bytes;
+    return out;
+}
+
+[[nodiscard]] std::uint64_t fieldAt(std::vector<std::uint8_t> const& b, std::size_t at, std::size_t width) {
+    std::uint64_t v = 0;
+    for (std::size_t i = 0; i < width; ++i) v |= static_cast<std::uint64_t>(b[at + i]) << (8u * i);
+    return v;
+}
+
+}  // namespace
+
+TEST(LinearFieldRange, ADataFieldHoldsAnAddressOrItsDistanceFromItself) {
+    auto const x = shippedTarget("x86_64");
+    ASSERT_TRUE(x);
+    auto const address = applyDataField(*x, "abs64", 16, 8);
+    ASSERT_TRUE(address.bytes.has_value()) << address.messages;
+    EXPECT_EQ(fieldAt(*address.bytes, 8, 8), 0x401010ull) << "S + A";
+    EXPECT_EQ(address.sites, (std::vector<std::uint64_t>{0x402008ull})) << "an address moves with the image";
+    // rel32 (R_X86_64_PC32's bias, -4) at offset 4: S + A - P - 4, with P the FIELD's address, not the section's.
+    auto const distance = applyDataField(*x, "rel32", 8, 4);
+    ASSERT_TRUE(distance.bytes.has_value()) << distance.messages;
+    EXPECT_EQ(fieldAt(*distance.bytes, 4, 4), static_cast<std::uint32_t>(0x401000 + 8 - 0x402004 - 4))
+        << "S + A - P - 4, P the field's address";
+    EXPECT_TRUE(distance.sites.empty()) << "a distance moves with neither end";
+    auto const plain = applyDataField(*x, "pcrel32", 0, 4);
+    ASSERT_TRUE(plain.bytes.has_value()) << plain.messages;
+    EXPECT_EQ(fieldAt(*plain.bytes, 4, 4), static_cast<std::uint32_t>(0x401000 - 0x402004));
+    EXPECT_TRUE(plain.sites.empty());
+    // (`beyond`, not `far`: the Windows headers define `far` as a macro.) The field sits 0x1008 bytes PAST its target
+    // (S - P - 4 = -0x1008), so an addend of 2^31 alone still lands inside the range; 2^31 + 64 KiB does not.
+    auto const beyond = applyDataField(*x, "rel32", kTwo31 + 0x10000, 4);
+    EXPECT_FALSE(beyond.bytes.has_value()) << "a distance past 2^31 is refused, never wrapped";
+    EXPECT_NE(beyond.messages.find("the signed 32-bit range"), std::string::npos) << beyond.messages;
+}
+
+TEST(LinearFieldRange, AThreadLocalDataFieldIsRefusedByName) {
+    auto const x = shippedTarget("x86_64");
+    ASSERT_TRUE(x);
+    ASSERT_TRUE(row(*x, "tls-tpoff32").tls);
+    auto const f = applyDataField(*x, "tls-tpoff32", 0, 4);
+    EXPECT_FALSE(f.bytes.has_value()) << "a thread-block offset is not an address";
+    EXPECT_NE(f.messages.find("relocation 'tls-tpoff32' is thread-local"), std::string::npos) << f.messages;
+}
+
+TEST(LinearFieldRange, AnImageRelativeDataFieldIsRefusedWhereTheImageStatesNoBase) {
+    auto const x = shippedTarget("x86_64");
+    ASSERT_TRUE(x);
+    auto const f = applyDataField(*x, "imagerel32", 0, 4);
+    EXPECT_FALSE(f.bytes.has_value()) << "an RVA needs a base to be measured from";
+    EXPECT_NE(f.messages.find("relocation 'imagerel32' is image-relative, and this image states no base"),
+              std::string::npos)
+        << f.messages;
+}
+
 // THE PE ADDR32 OWNER. A COFF IMAGE_REL_AMD64_ADDR32 read from an object is the row whose field holds BOTH halves —
-// `addr32`, [-2^31, 2^32), GNU ld's range (✔MEASURED 2026-10-20, mingw GNU ld 2.41.90: 0x80000000 and 0xffffffff link,
+// `addr32`, [-2^31, 2^32) — its upper edge GNU ld's, its lower edge DECIDED, as x86_64.target.json's row says why —
+// (✔MEASURED 2026-10-20, mingw GNU ld 2.41.90: 0x80000000 and 0xffffffff link,
 // and 0 + (-1) writes 0xffffffff; link.exe 14.44 and lld-link check nothing against an absolute symbol) — on every PE
 // document, the object's, the archive member's, the image's and the library's; and DSS's own 4-byte absolute word
 // (`abs32`) is still WRITTEN as ADDR32, through the emit-only alias. Read as the signed `abs32s`, an object's `.long sym`

@@ -79,6 +79,11 @@
     "securityCookieInitializer": "__security_init_cookie"
   },
 
+  "$imageDefinedSymbolsComment": "P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): as the exec sibling's -- `__ImageBase` is the DLL's own DOS header (`imageHeader`, at the image base the loader maps the DLL to), the module handle a DLL reads as `(HINSTANCE)&__ImageBase`. A unit's own definition of the name is that unit's.",
+  "imageDefinedSymbols": [
+    { "name": "__ImageBase", "address": "imageHeader" }
+  ],
+
   "$sehPersonalityComment": "UCRT-P4 (D-WIN64-SEH-FUNCLETS + D-FFI-PE-CRT-UCRT-MIGRATION): the routine an emitted UNWIND_INFO names as its EHANDLER, plus the ROLE that owns the image it is imported from. Declared here and not only on the exec sibling because A DLL CAN CONTAIN `__try`, which is not a hypothetical -- much of Windows itself is written that way -- and a format declaring no personality REFUSES such a translation unit outright. MEASURED 2026-08-10, both arms: WITHOUT this block, `__try` compiled for x86_64:pe64-x86_64-windows-dll failed rc=1 at `synthesizeSehFunclets`; WITH it, rc=0 and the emitted .dll carries BOTH `.xdata` (the UNWIND_INFO with UNW_FLAG_EHANDLER and the __C_specific_handler scope table) AND `.pdata` (the RUNTIME_FUNCTION rows the OS unwinder binary-searches), so the handler is genuinely REACHABLE rather than merely accepted. The role is `unwindPersonality` rather than `cLibrary` even though ucrtbase.dll would serve both: sameness is a fact about this DLL configuration, not about the model (Microsoft names the C library and the VC runtime separately in both /MD and /MT), and here the distinction is load-bearing rather than theoretical, because this format declares NO cLibrary row at all. MEASURED that the image choice is link-safe: `__C_specific_handler` is exported by ucrtbase (ord 30), msvcrt (106), ntdll (2332) and vcruntime140 (8). * READ THIS BEFORE COPYING THE BLOCK INTO THE .obj OR .lib SIBLING, because the `synthesizeSehFunclets` diagnostic's own advice ('Add the block') is WRONG for those two: `pe::encode`'s Obj arm attaches no FrameUnwindInfo and emits no `.pdata`/`.xdata` whatsoever (AssembledFunction::unwind is nullopt on the object path by construction, and SehScopeEntry is consumed only by the image-side .xdata emitter). MEASURED 2026-08-10 by actually declaring this block on both of them: the compile then SUCCEEDS rc=0 and the emitted seh.obj / seh.lib carry `.text` ONLY -- the filter funclets and the scope table are SILENTLY DROPPED, and the `__except` body can never run. That trades today's loud, correct refusal for a silent miscompile, which is the one outcome this project's bar rules out unconditionally; so those two files record the absence as deliberate, with the measurement, instead. This block is legal HERE because `pe.type = dll` routes through the SAME `encodeExec` substrate the .exe image uses (see $comment above), and that substrate is what emits the two unwind sections.",
   "sehPersonality": {
     "role": "unwindPersonality",
@@ -218,7 +223,7 @@
       "nativeId": 1
     },
     {
-      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. P69 fold 3c (D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND): `kind` = 14 matches x86_64.target.json's `addr32` row -- the one wire type COFF has for `.long sym` and `movl $sym` alike, so its field holds GNU ld's range for it, [-2^31, 2^32) (MEASURED 2026-10-20), and this row OWNS the wire id: an object's ADDR32 reads back as `addr32`.",
+      "$comment": "Absolute 32-bit. IMAGE_REL_AMD64_ADDR32 = 2. P69 fold 3c (D-LK-LINEAR-RELOCATION-FIELD-RANGE-CHECKED-AS-SIGNED-FOR-EVERY-KIND): `kind` = 14 matches x86_64.target.json's `addr32` row -- the one wire type COFF has for `.long sym` and `movl $sym` alike, so its field holds [-2^31, 2^32): the upper edge GNU ld's (MEASURED 2026-10-20), the lower edge DECIDED (a value below -2^31 reads back as neither itself zero-extended nor itself sign-extended; x86_64.target.json's `addr32` row states the reason), and this row OWNS the wire id: an object's ADDR32 reads back as `addr32`.",
       "name": "IMAGE_REL_AMD64_ADDR32",
       "kind": 14,
       "nativeId": 2
@@ -229,6 +234,12 @@
       "kind": 3,
       "nativeId": 2,
       "emitOnly": true
+    },
+    {
+      "$comment": "P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): image-relative 32-bit (an RVA), the relocatable document's row -- as the exec sibling's. IMAGE_REL_AMD64_ADDR32NB = 3; `kind` = 6 matches x86_64.target.json's `imagerel32` row, which the image writes as the address less the image base with no base-relocation site; cl's dense `switch` keeps its jump table as such entries, read through `__ImageBase`.",
+      "name": "IMAGE_REL_AMD64_ADDR32NB",
+      "kind": 6,
+      "nativeId": 3
     },
     {
       "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction. COFF writes it as IMAGE_REL_AMD64_REL32 with the addend IN PLACE (✔MEASURED 2026-09-23, mingw gas and clang), so this row is an EMISSION ALIAS of the `rel32` row's wire type.",

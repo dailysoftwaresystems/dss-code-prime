@@ -739,7 +739,8 @@ TEST(GroupMemberRelocations, AKeptPartOfAUnitThatNamesADiscardedDefinitionItself
                                           && d.actual.find(std::string{cell.says} + " of linked unit #1 names")
                                                  != std::string::npos
                                           && d.actual.find("section group 'h'") != std::string::npos
-                                          && d.actual.find("linked unit #0 carries too") != std::string::npos);
+                                          && d.actual.find("whose copy the link keeps from linked unit #0")
+                                                 != std::string::npos);
                 }
                 EXPECT_TRUE(refused) << diagnosticsOf(rep);
             } else {

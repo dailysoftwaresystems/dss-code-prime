@@ -213,6 +213,42 @@ constexpr std::size_t kStackVectorLoadedArgs = 2;
     return n;
 }
 
+// ── THE /GS SECURITY COOKIE IS SEEDED BEFORE ANY OTHER CODE RUNS ────────────
+//
+// The routine the image's document names (`compilerSupport.
+// securityCookieInitializer`), when the linked program DEFINES it: the symbol
+// the trampoline calls first, or none. Every reference C runtime calls it before
+// any initializer and before the entry. MSVC's and mingw-w64's startups both do,
+// whether or not an object was compiled /GS. Without the call, a guarded frame
+// compares against the value the runtime's object ships, which an attacker knows
+// and which protects nothing.
+//
+// ★ "DEFINES" IS "USES" HERE, AND THAT IS A FACT OF THE RUNTIME'S LAYOUT. The
+// compiler-support runtime is linked as archives, so a member is linked only
+// when something names it. The cookie and its initializer are defined by ONE
+// member, and the member holding `__security_check_cookie` names the cookie. So
+// an image that reads the cookie, directly or through the checker, links the
+// initializer too. An image that names none of them links neither and calls
+// nothing. A definition of the name in the program's own units is the one the
+// call binds to, as a reference startup's call binds to it.
+//
+// A FILE-LOCAL row of the name is not the routine: a `static` function of that
+// name in some unit is that unit's own, as it is to a reference linker.
+[[nodiscard]] std::optional<SymbolId> securityCookieInitializerOf(
+        AssembledModule const&    module,
+        ObjectFormatSchema const& format) {
+    auto const& support = format.compilerSupport();
+    if (!support.has_value()) return std::nullopt;
+    std::string const& name = support->securityCookieInitializerMangledName;
+    for (auto const& row : module.symbols) {
+        if (row.binding == SymbolBinding::Local || row.name != name) continue;
+        for (auto const& fn : module.functions) {
+            if (fn.symbol.v == row.symbol.v) return fn.symbol;
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 bool injectEntryTrampoline(AssembledModule&          module,
@@ -660,6 +696,10 @@ bool injectEntryTrampoline(AssembledModule&          module,
     auto const afterEntry =
         runsSchedule ? staticInitOrder(module, StaticInitPhase::AfterEntry)
                      : std::vector<StaticInitOrderEntry>{};
+    // The cookie's seeding is no static initializer. No loader runs it, so the
+    // trampoline calls it whichever runner the format declares.
+    auto const cookieInitializer = securityCookieInitializerOf(module, format);
+    bool const callsBeforeEntry  = cookieInitializer.has_value() || !beforeEntry.empty();
 
     // The convention's own callee-saved GENERAL-PURPOSE registers, handed out in
     // declaration order. Every value the trampoline must carry ACROSS a call goes
@@ -700,7 +740,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // count cannot be the one the entry is called with, so it is refused rather
     // than parked partially.
     std::vector<std::pair<LirReg, LirReg>> parkedArgs;   // (saved, original)
-    if (!beforeEntry.empty()) {
+    if (callsBeforeEntry) {
         std::size_t const nArgs = liveEntryArgumentCount(format);
         if (nArgs > cc->argGprs.size()) {
             // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
@@ -750,10 +790,17 @@ bool injectEntryTrampoline(AssembledModule&          module,
         }
     }
 
-    // 0. call each before-entry initializer, in schedule order. Emitted AFTER the
-    //    ABI prologue above — these are ordinary calls and need the shadow space
-    //    and the alignment bias the prologue established, exactly as the user
-    //    entry does.
+    // 0. seed the /GS security cookie, FIRST: an initializer may hold a guarded
+    //    frame of its own (`securityCookieInitializerOf`).
+    if (cookieInitializer.has_value()) {
+        LirOperand const cookieOps[] = { LirOperand::makeSymbolRef(cookieInitializer->v) };
+        (void)b.addInst(*callOp, InvalidLirReg, cookieOps);
+    }
+
+    //    Then call each before-entry initializer, in schedule order. Emitted AFTER
+    //    the ABI prologue above — these are ordinary calls and need the shadow
+    //    space and the alignment bias the prologue established, exactly as the
+    //    user entry does.
     for (auto const& e : beforeEntry) {
         LirOperand const ctorOps[] = { LirOperand::makeSymbolRef(e.symbol.v) };
         (void)b.addInst(*callOp, InvalidLirReg, ctorOps);

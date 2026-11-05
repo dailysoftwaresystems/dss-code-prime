@@ -1095,8 +1095,12 @@ constexpr std::uint32_t kScnText      = 0x60500020u;  // CODE|ALIGN16|EXEC|READ 
 constexpr std::uint32_t kScnRData     = 0x40000040u;  // INITIALIZED_DATA|READ   (.rdata)
 constexpr std::uint32_t kScnData      = 0xC0000040u;  // INIT_DATA|READ|WRITE    (.data)
 constexpr std::uint32_t kScnXData     = 0x40300040u;  // INIT_DATA|ALIGN4|READ   (.xdata metadata)
+constexpr std::uint32_t kScnDebugS    = 0x42100040u;  // INIT_DATA|ALIGN1|DISCARDABLE|READ (cl's `.debug$S`, MEASURED)
 constexpr std::uint32_t kScnLnkComdat = 0x00001000u;  // IMAGE_SCN_LNK_COMDAT
-constexpr std::uint8_t  kSelNoDup = 1, kSelAny = 2, kSelAssoc = 5, kSelLargest = 6;
+// Every COMDAT selection byte this file spells (one place: a literal `3` passed
+// as `auxSelection` reads as an ordinal, not as a policy).
+constexpr std::uint8_t  kSelNoDup = 1, kSelAny = 2, kSelSameSize = 3, kSelExactMatch = 4,
+                        kSelAssoc = 5, kSelLargest = 6;
 constexpr std::uint8_t  kClassExternal = 2, kClassStatic = 3;
 constexpr std::uint16_t kDtypeFunction = 0x20u;
 constexpr std::uint16_t kRelAddr64 = 1u;
@@ -1132,6 +1136,9 @@ struct BSym {
     std::uint8_t  storage = kClassExternal;
     std::optional<std::uint8_t> auxSelection;   // set -> emit a section-def aux
     std::optional<BWeakAux>     auxWeakExtern;  // set -> emit a format-3 aux
+    // The section-def aux's `Number` (offset 12): the 1-based ordinal an
+    // ASSOCIATIVE section goes with. Written only with `auxSelection`.
+    std::uint16_t               auxNumber = 0;
 };
 
 void emitU16(std::vector<std::uint8_t>& b, std::uint16_t v) {
@@ -1217,6 +1224,8 @@ buildCoff(std::vector<BSec> const& secs, std::vector<BSym> const& syms) {
         out.push_back(static_cast<std::uint8_t>(auxCount(s)));
         if (s.auxSelection.has_value()) {
             std::array<std::uint8_t, 18> aux{};
+            aux[12] = static_cast<std::uint8_t>(s.auxNumber & 0xFFu);          // Number (low byte)
+            aux[13] = static_cast<std::uint8_t>((s.auxNumber >> 8) & 0xFFu);   // Number (high byte)
             aux[14] = *s.auxSelection;   // Selection byte (section-def aux, format 5)
             out.insert(out.end(), aux.begin(), aux.end());
         }
@@ -1324,34 +1333,216 @@ TEST(CoffForeignObject, DataComdatAnyLiftsWeak) {
     EXPECT_EQ(weakKindOf(*got, "W"), "select-any");
 }
 
-// -- Gate 3: LARGEST / ASSOCIATIVE on a kind-resolved COMDAT -> FAIL LOUD ----
-TEST(CoffForeignObject, ComdatLargestOnDataFailsLoud) {
+// -- Gate 3: a copy whose selection states WHICH copy a link keeps leads a group kept by that rule (P69 fold 3d) ----
+// LARGEST, EXACT_MATCH and SAME_SIZE each state a rule the link applies to the copies before any name is resolved
+// (`linker.cpp`, `discardLaterSectionGroups`; the measured table is `test_coff_comdat_selection.cpp`'s): the section
+// is the LEADER of a group signed by its COMDAT symbol, and the unit states the rule. Until P69 fold 3d LARGEST was
+// refused at read. RED-ON-DISABLE: state no rule -> the group is kept by link order, and a smaller copy can win.
+TEST(CoffForeignObject, AComdatThatStatesWhichCopyIsKeptLeadsAGroupKeptByThatRule) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
-    auto const obj = buildCoff(
-        {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
-        {BSym{".data", 0, 1, 0, kClassStatic, kSelLargest},
-         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
-    DiagnosticReporter rep;
-    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(got.has_value())
-        << "LARGEST(6) on a code/data COMDAT must fail loud (silent wrong-size risk)";
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
-    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION"));
+    struct Case {
+        std::uint8_t     selection;
+        SectionGroupKeep keep;
+    };
+    for (auto const& c : {Case{kSelLargest, SectionGroupKeep::Largest},
+                          Case{kSelExactMatch, SectionGroupKeep::FirstOfEqualBytes},
+                          Case{kSelSameSize, SectionGroupKeep::FirstOfEqualSize}}) {
+        SCOPED_TRACE(static_cast<int>(c.selection));
+        auto const obj = buildCoff(
+            {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+            {BSym{".data", 0, 1, 0, kClassStatic, c.selection},
+             BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+        DiagnosticReporter rep;
+        auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+        auto const group = got->sectionGroupOfInputSection.find(1u);
+        ASSERT_NE(group, got->sectionGroupOfInputSection.end()) << "the copy's section is a member of a group";
+        EXPECT_EQ(group->second, "W");
+        auto const rule = got->sectionGroupRuleOf.find("W");
+        ASSERT_NE(rule, got->sectionGroupRuleOf.end()) << "the unit states the rule the copies are kept by";
+        EXPECT_EQ(rule->second.keep, c.keep) << "the rule the selection states";
+        EXPECT_EQ(rule->second.leader, 1u) << "the leader is the section the signature's definition is in";
+        EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Global), SymbolBinding::Weak);
+    }
 }
 
-TEST(CoffForeignObject, ComdatAssociativeOnDataFailsLoud) {
+// ── ASSOCIATIVE(5): A SECTION KEPT IFF THE SECTION IT GOES WITH IS (P69 fold 3d) ─────────────────────────────────────
+//
+// The reader states it through the unit's SECTION GROUPS (`AssembledModule::sectionGroupOfInputSection`), the one
+// statement of "kept or discarded with" the link reads: an ANY, LARGEST, EXACT_MATCH or SAME_SIZE section whose COMDAT
+// symbol is external is one copy of that name, and it and every section of a chain rooted in it are one group signed
+// by the name (the three but ANY stating the rule the copies are kept by); a chain rooted in a
+// NODUPLICATES section, a file-local COMDAT symbol or no COMDAT at all is an ordinary section of its unit. The real
+// objects -- clang-cl's jump tables -- are pinned in `test_coff_comdat_selection.cpp`.
+namespace {
+
+// The signature of the section group the unit states for its input section `ordinal`; empty for none.
+[[nodiscard]] std::string groupOfSection(AssembledModule const& m, std::uint32_t ordinal) {
+    auto const it = m.sectionGroupOfInputSection.find(ordinal);
+    return it == m.sectionGroupOfInputSection.end() ? std::string{} : it->second;
+}
+// Whether the unit holds an item cut from its input section `ordinal`.
+[[nodiscard]] bool holdsAnItemOf(AssembledModule const& m, std::uint32_t ordinal) {
+    for (auto const& d : m.dataItems) {
+        if (d.inputSection.has_value() && d.inputSection->section == ordinal) return true;
+    }
+    for (auto const& f : m.functions) {
+        if (f.inputSection.has_value() && f.inputSection->section == ordinal) return true;
+    }
+    return false;
+}
+
+std::vector<std::uint8_t> const kRetBody = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};   // mov eax,42; ret
+
+}  // namespace
+
+// A table that goes with a function defined ONCE -- clang-cl's dense switch -- is an ordinary section of its unit:
+// read, and in no group. So is one that goes with a section that is no COMDAT at all. RED-ON-DISABLE: refuse
+// ASSOCIATIVE (the reader before P69 fold 3d) -> neither object reads.
+TEST(CoffForeignObject, AnAssociativeSectionOfAFunctionDefinedOnceIsAnOrdinarySectionOfItsUnit) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    for (bool const comdatLeader : {true, false}) {
+        SCOPED_TRACE(comdatLeader ? "the function's section: COMDAT NODUPLICATES" : "the function's section: no COMDAT");
+        std::vector<BSym> syms;
+        if (comdatLeader) syms.push_back(BSym{".text$mn", 0, 1, 0, kClassStatic, kSelNoDup});
+        syms.push_back(BSym{"pick", 0, 1, kDtypeFunction, kClassExternal, std::nullopt});
+        syms.push_back(BSym{".rdata", 0, 2, 0, kClassStatic, kSelAssoc, std::nullopt, 1});
+        auto const obj = buildCoff(
+            {BSec{".text$mn", kScnText | (comdatLeader ? kScnLnkComdat : 0u), kRetBody, {}},
+             BSec{".rdata", kScnRData | kScnLnkComdat, std::vector<std::uint8_t>(8u, 0u),
+                  {BReloc{0, "pick", kRelAddr64}}}},
+            syms);
+        DiagnosticReporter rep;
+        auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(got.has_value()) << "an associative table of a function defined once must read; errs="
+                                     << rep.errorCount();
+        EXPECT_TRUE(holdsAnItemOf(*got, 2)) << "the table is read, as an item of its section";
+        EXPECT_TRUE(got->sectionGroupOfInputSection.empty())
+            << "the section it goes with is never one of several copies: no group";
+        EXPECT_EQ(bindingOf(*got, "pick").value_or(SymbolBinding::Weak), SymbolBinding::Global);
+    }
+}
+
+// An ANY section whose COMDAT symbol is EXTERNAL is one copy of that name; it and every section of a chain rooted in
+// it -- here a table, and a section that goes with the table -- are ONE group signed by the name. RED-ON-DISABLE:
+// state no group for an associative section -> sections 2 and 3 read ungrouped, and a later unit's table outlives the
+// copy it belongs to.
+TEST(CoffForeignObject, AnAnySectionAndEverySectionThatGoesWithItAreOneGroupSignedByItsName) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
     auto const obj = buildCoff(
-        {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
-        {BSym{".data", 0, 1, 0, kClassStatic, kSelAssoc},
-         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+        {BSec{".text$mn", kScnText | kScnLnkComdat, kRetBody, {}},
+         BSec{".rdata", kScnRData | kScnLnkComdat, std::vector<std::uint8_t>(8u, 0u), {BReloc{0, "pick", kRelAddr64}}},
+         BSec{".data", kScnData | kScnLnkComdat, {7, 0, 0, 0}, {}}},
+        {BSym{".text$mn", 0, 1, 0, kClassStatic, kSelAny},
+         BSym{"pick", 0, 1, kDtypeFunction, kClassExternal, std::nullopt},
+         BSym{".rdata", 0, 2, 0, kClassStatic, kSelAssoc, std::nullopt, 1},
+         BSym{".data", 0, 3, 0, kClassStatic, kSelAssoc, std::nullopt, 2}});
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(got.has_value())
-        << "ASSOCIATIVE(5) on a kind-resolved code/data COMDAT must fail loud (unmodeled)";
-    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION"));
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    EXPECT_EQ(groupOfSection(*got, 1), "pick") << "the copy itself";
+    EXPECT_EQ(groupOfSection(*got, 2), "pick") << "the section that goes with it";
+    EXPECT_EQ(groupOfSection(*got, 3), "pick") << "the section that goes with THAT one: the chain's root decides";
+    EXPECT_EQ(got->sectionGroupOfInputSection.size(), 3u);
+    EXPECT_TRUE(holdsAnItemOf(*got, 2) && holdsAnItemOf(*got, 3));
+    EXPECT_EQ(bindingOf(*got, "pick").value_or(SymbolBinding::Global), SymbolBinding::Weak)
+        << "ANY still lifts the name to a select-any copy";
+}
+
+// A COMDAT whose symbol is FILE-LOCAL is no copy of anything another object holds: cl 19.44 writes a `static inline`
+// function so, in a `.text$mn` of selection ANY with a STATIC symbol (MEASURED 2026-10-21). No group, and its table
+// is an ordinary section. RED-ON-DISABLE: sign a group with a static name -> two objects' unrelated `static`
+// functions of one name would discard each other.
+TEST(CoffForeignObject, AnAnySectionWhoseComdatSymbolIsFileLocalStatesNoGroup) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text$mn", kScnText | kScnLnkComdat, kRetBody, {}},
+         BSec{".rdata", kScnRData | kScnLnkComdat, std::vector<std::uint8_t>(8u, 0u), {BReloc{0, "pick", kRelAddr64}}}},
+        {BSym{".text$mn", 0, 1, 0, kClassStatic, kSelAny},
+         BSym{"pick", 0, 1, kDtypeFunction, kClassStatic, std::nullopt},
+         BSym{".rdata", 0, 2, 0, kClassStatic, kSelAssoc, std::nullopt, 1}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    EXPECT_TRUE(got->sectionGroupOfInputSection.empty());
+    EXPECT_TRUE(holdsAnItemOf(*got, 1) && holdsAnItemOf(*got, 2));
+}
+
+// A table that goes with a copy kept by a rule (SAME_SIZE, EXACT_MATCH, LARGEST) is a member of that copy's group, as
+// a table of an ANY copy is: the link compares the copies' LEADERS, and the table goes with the copy it keeps. Until
+// P69 fold 3d it was refused. RED-ON-DISABLE: leave it out of the group -> two units' tables both reach the link.
+TEST(CoffForeignObject, AnAssociativeSectionOfACopyKeptByARuleJoinsThatCopysGroup) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    for (std::uint8_t const selection : {kSelSameSize, kSelExactMatch, kSelLargest}) {
+        SCOPED_TRACE(static_cast<int>(selection));
+        auto const obj = buildCoff(
+            {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}},
+             BSec{".rdata", kScnRData | kScnLnkComdat, std::vector<std::uint8_t>(8u, 0u),
+                  {BReloc{0, "W", kRelAddr64}}}},
+            {BSym{".data", 0, 1, 0, kClassStatic, selection},
+             BSym{"W", 0, 1, 0, kClassExternal, std::nullopt},
+             BSym{".rdata", 0, 2, 0, kClassStatic, kSelAssoc, std::nullopt, 1}});
+        DiagnosticReporter rep;
+        auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+        EXPECT_EQ(groupOfSection(*got, 1), "W") << "the copy, the group's leader";
+        EXPECT_EQ(groupOfSection(*got, 2), "W") << "the table that goes with it";
+        auto const rule = got->sectionGroupRuleOf.find("W");
+        ASSERT_NE(rule, got->sectionGroupRuleOf.end());
+        EXPECT_EQ(rule->second.leader, 1u) << "the copy's section is compared, never its table";
+        EXPECT_TRUE(holdsAnItemOf(*got, 2));
+    }
+}
+
+// A chain that names no section of the object, or comes back on itself, has no section deciding it: the object is
+// corrupt, and says which. So is a selection the format does not define. RED-ON-DISABLE: follow Number unchecked ->
+// an out-of-range ordinal indexes past the section table, and a cycle never ends.
+TEST(CoffForeignObject, AnAssociativeChainThatNamesNoSectionOrComesBackIsCorrupt) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    struct Arm {
+        char const*           label;
+        std::vector<BSec>     secs;
+        std::vector<BSym>     syms;
+        char const*           detail;
+    };
+    std::vector<Arm> const arms = {
+        {"Number 0",
+         {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+         {BSym{".data", 0, 1, 0, kClassStatic, kSelAssoc, std::nullopt, 0},
+          BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}},
+         "chain names section #0"},
+        {"Number past the section table",
+         {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+         {BSym{".data", 0, 1, 0, kClassStatic, kSelAssoc, std::nullopt, 9},
+          BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}},
+         "chain names section #9"},
+        {"a cycle of two",
+         {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}},
+          BSec{".rdata", kScnRData | kScnLnkComdat, {1, 2, 3, 4}, {}}},
+         {BSym{".data", 0, 1, 0, kClassStatic, kSelAssoc, std::nullopt, 2},
+          BSym{"W", 0, 1, 0, kClassExternal, std::nullopt},
+          BSym{".rdata", 0, 2, 0, kClassStatic, kSelAssoc, std::nullopt, 1}},
+         "a cycle"},
+        {"a selection the format does not define",
+         {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+         {BSym{".data", 0, 1, 0, kClassStatic, std::uint8_t{7}},
+          BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}},
+         "does not define"},
+    };
+    for (auto const& arm : arms) {
+        SCOPED_TRACE(arm.label);
+        DiagnosticReporter rep;
+        auto got = pe::readRelocatableObject(buildCoff(arm.secs, arm.syms), *loaded.target, *loaded.format, rep);
+        EXPECT_FALSE(got.has_value());
+        EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+        EXPECT_TRUE(sawDetail(rep, arm.detail));
+    }
 }
 
 // -- Gate 3: a COMDAT section with NO section-def aux -> FAIL LOUD -----------
@@ -1367,7 +1558,8 @@ TEST(CoffForeignObject, ComdatSectionMissingSectionDefAuxFailsLoud) {
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
     EXPECT_FALSE(got.has_value());
-    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION"));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "carries no section-definition auxiliary record"));
 }
 
 // -- Gate 2 red-on-disable: a KIND-RESOLVED section, reloc, no atom -> LOUD --
@@ -1442,8 +1634,15 @@ TEST(CoffForeignObject, UnmodeledMetadataSectionWithRelocSkipped) {
     // (`CoffForeignUnwind.ARelocationOfTheUnwindSectionsNoRecordReadsIsRefused`).
     // `.debug$S` is what really takes this path: cl's CodeView symbols, whose
     // relocations name the functions they describe.
+    // ⚠ P69 fold 3d: the section carries the characteristics every producer gives
+    // it -- IMAGE_SCN_MEM_DISCARDABLE among them (✔MEASURED: cl 19.51's `.debug$S`
+    // 0x42100040, gcc 13.2 -g's `.debug_*` 0x42100040 and `.debug_frame`
+    // 0x42400040) -- because the mark IS what the reader passes such a section
+    // over on: a relocated section no row names and nothing marks discardable is
+    // bytes the program reads, refused (the TEST after this one). This section
+    // carried `kScnXData`, no discardable mark, a section no producer writes.
     auto const obj = buildCoff(
-        {BSec{".debug$S", kScnXData, std::vector<std::uint8_t>(8, 0),
+        {BSec{".debug$S", kScnDebugS, std::vector<std::uint8_t>(8, 0),
               {BReloc{0u, "g", kRelAddr64}}}},
         {BSym{"g", 0, 0, 0, kClassExternal, std::nullopt}});
     DiagnosticReporter rep;
@@ -1453,6 +1652,33 @@ TEST(CoffForeignObject, UnmodeledMetadataSectionWithRelocSkipped) {
            "not fail loud; errs=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_NE(externNamed(*got, "g"), nullptr) << "the extern g is still decoded";
+}
+
+// -- Gate 2 refusal: the same section with NO discardable mark is refused ----
+// The negative of the TEST above: the same bytes and relocation in a section no
+// row names, marked only INITIALIZED_DATA | ALIGN_4 | READ, is not metadata the
+// object set aside but bytes the program reads, and dropping it with its
+// relocation would change the program in silence. RED-ON-DISABLE: skip every
+// relocated section no row names (the reader before fold 3d) -> the object reads.
+TEST(CoffForeignObject, ARelocatedSectionNoRowNamesAndNothingMarksDiscardableIsRefused) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".debug$S", kScnXData, std::vector<std::uint8_t>(8, 0),
+              {BReloc{0u, "g", kRelAddr64}}}},
+        {BSym{"g", 0, 0, 0, kClassExternal, std::nullopt}});
+    DiagnosticReporter rep;
+    auto const got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value()) << "the object is refused";
+    auto const& all     = rep.all();
+    auto const  refusal = std::find_if(all.begin(), all.end(), [](auto const& d) {
+        return d.code == DiagnosticCode::K_ObjectSectionNotModelled;
+    });
+    ASSERT_NE(refusal, all.end()) << "refused under K_ObjectSectionNotModelled; errs=" << rep.errorCount();
+    EXPECT_NE(refusal->actual.find("section '.debug$S'"), std::string::npos)
+        << "the refusal names the section: " << refusal->actual;
+    EXPECT_NE(refusal->actual.find("nothing marks it discardable"), std::string::npos)
+        << "and says why it is refused: " << refusal->actual;
 }
 
 // -- Cross-object COMDAT dedup at the reader+merge level (hermetic) ----------
@@ -2068,7 +2294,15 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
 // `K_SymbolRedefinedAcrossUnits` collision between two members' unrelated
 // `sym_<n>`, and ANY -> Weak lets one member's private body be SILENTLY dropped
 // as a shadowed duplicate. RED-ON-DISABLE: consult `comdatBindingBySection` in
-// the static-function arm -> this reads Weak.
+// the static-function arm -> this reads the section's lifted binding.
+//
+// The section's COMDAT symbol is `pub`: the first symbol after the section's
+// own record (PE/COFF 5.5.6), and EXTERNAL, so the section IS a copy and the
+// lift is live in it. (Since P69 fold 3d a COMDAT whose COMDAT symbol is
+// file-local is no copy at all -- its external definitions read strong, as
+// link.exe and lld-link refuse two of them; that case is pinned in
+// `test_coff_comdat_selection.cpp`. With `helper` first this subject would be
+// that case, and say nothing of the lift.)
 TEST(CoffForeignObject, ComdatStaticFunctionKeepsInternalLinkageNotTheSelectionLift) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -2078,8 +2312,8 @@ TEST(CoffForeignObject, ComdatStaticFunctionKeepsInternalLinkageNotTheSelectionL
     auto const obj = buildCoff(
         {BSec{".text$mn", kScnText | kScnLnkComdat, body, {}}},
         {BSym{".text$mn", 0, 1, 0, kClassStatic, kSelAny},
-         BSym{"helper", 0, 1, kDtypeFunction, kClassStatic, std::nullopt},
-         BSym{"pub", 6, 1, kDtypeFunction, kClassExternal, std::nullopt}});
+         BSym{"pub", 6, 1, kDtypeFunction, kClassExternal, std::nullopt},
+         BSym{"helper", 0, 1, kDtypeFunction, kClassStatic, std::nullopt}});
 
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
@@ -3917,22 +4151,23 @@ TEST(CoffObjectReader, ANamedUndefExternStillReadsGreenAsAnImport) {
 //     (`ModuleSymbol::duplicateMatch`) -- pinned here, per selection, because a
 //     narrowing typo in the switch would otherwise fall to the `default:`
 //     fail-loud arm and reject a legal object with nothing to notice;
-//   * the FOLD discharges the duty -- pinned end-to-end below through
-//     `linker::link`, and directly against the shared kernel in
-//     `tests/link/test_cross_cu_resolve.cpp`.
+//   * the LINK discharges it. Since P69 fold 3d each such COMDAT also leads
+//     a section group that states its rule (keep the first copy, every
+//     other of equal size / of equal bytes), and two objects' copies are
+//     judged by that rule before any name is resolved
+//     (`discardLaterSectionGroups`, linker.cpp) -- the end-to-end pins below
+//     read THAT judgement through `linker::link`. The duty itself is what the
+//     fold checks for a copy against a weak definition in no group, pinned
+//     against the shared kernel in `tests/link/test_cross_cu_resolve.cpp`.
 //
 // RED ON DISABLE (reader half): collapse `case kComdatSelSameSize:` /
 // `case kComdatSelExactMatch:` back into the `kComdatSelAny` arm in
-// `coff_object_reader.cpp`. The duty degrades to `Any`, the mismatch is no
-// longer detected, and `MismatchedSameSizeComdatDuplicatesFailLoud` /
+// `coff_object_reader.cpp`. The duty degrades to `Any` and the group's rule to
+// the first copy, the mismatch is no longer detected, and
+// `MismatchedSameSizeComdatDuplicatesFailLoud` /
 // `MismatchedExactMatchComdatDuplicatesFailLoud` below go RED.
 
 namespace {
-
-// The two selection bytes this file had no constant for until now. Deliberately
-// spelled beside the existing four rather than inline: a literal `3` passed as
-// `auxSelection` reads as an ordinal, not as a policy.
-constexpr std::uint8_t kSelSameSize = 3, kSelExactMatch = 4;
 
 // The reconstructed ModuleSymbol row of a defined symbol (by name). `bindingOf`
 // above answers only about the binding; the COMDAT duty rides on the SAME row
@@ -4129,10 +4364,12 @@ TEST(CoffForeignObject, MismatchedSameSizeComdatDuplicatesFailLoud) {
            "kept one anyway. The format specifies this as a multiply defined "
            "symbol error (D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED). "
            "Diagnostics were: " << got.messages;
-    EXPECT_NE(got.messages.find("same-size"), std::string::npos)
+    EXPECT_NE(got.messages.find("its rule keeps the first copy, every other of equal size"), std::string::npos)
         << "the diagnostic must name WHICH promise was broken, otherwise the "
            "reader cannot tell it from an ordinary two-strong collision: "
         << got.messages;
+    EXPECT_NE(got.messages.find("their leaders' sizes differ"), std::string::npos)
+        << "the diagnostic must say what broke it: " << got.messages;
     EXPECT_NE(got.messages.find("shared_w"), std::string::npos);
 }
 
@@ -4155,7 +4392,7 @@ TEST(CoffForeignObject, MismatchedExactMatchComdatDuplicatesFailLoud) {
         << "two IMAGE_COMDAT_SELECT_EXACT_MATCH definitions of `shared_w` with "
            "the SAME length and DIFFERENT bytes broke their promise; only a "
            "content compare can see this one: " << got.messages;
-    EXPECT_NE(got.messages.find("exact-content"), std::string::npos)
+    EXPECT_NE(got.messages.find("its rule keeps the first copy, every other of equal bytes"), std::string::npos)
         << got.messages;
     EXPECT_NE(got.messages.find("same length, differing content"),
               std::string::npos)

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -20,7 +21,8 @@
 //
 // **Why a separate, pure function** (the Cycle-25 whole-program-MIR-merge
 // prerequisite): the cross-CU symbol policy (strong-shadows-weak / two-strong is
-// ambiguous / all-weak lowest-key wins, order-independent) is the SINGLE source of
+// ambiguous / all-weak: the first in the link's order wins, independent of the order
+// the definitions are handed in) is the SINGLE source of
 // truth both the linker AND a future whole-program MIR merge must agree on. Extracting
 // it as a pure value→value function lets a direct unit test pin the policy (the
 // `test_cross_cu_resolve` tripwire) so the two consumers can never silently diverge.
@@ -39,6 +41,21 @@
 // only.** (The standing source/target/linker agnosticism veto.)
 
 namespace dss::linker {
+
+// ── THE LINK'S ORDER (P69 fold 3d, D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──
+//
+// Every tie this kernel breaks is "the first in the link's order", and the link's
+// order is the OPERATOR'S order of the inputs: the place on the command line of the
+// input a definition came from (`AssembledModule::linkPosition`, which states what
+// was measured). The one comparison of two such places, which the section-group
+// keep (`linker.cpp`, `discardLaterSectionGroups`) asks too: a stated position
+// before none, a lower one before a higher. At one position, or with none on both
+// sides, neither precedes the other, and the order the caller holds them in decides.
+[[nodiscard]] inline bool linkPositionPrecedes(std::optional<std::uint32_t> a,
+                                               std::optional<std::uint32_t> b) noexcept {
+    if (!a.has_value()) return false;
+    return !b.has_value() || *a < *b;
+}
 
 // The ranks a caller states for a weak definition today (`CrossCuDef::weakRank`). Only
 // their ORDER means anything to the kernel.
@@ -143,7 +160,7 @@ struct CrossCuDef {
     // Read only when `binding == Weak`. A weak definition of a HIGHER rank
     // replaces one of a lower rank whatever their keys and whatever the order
     // they arrive in; weak definitions of ONE rank fold as weak definitions
-    // always did (the promise checked, the lowest key kept). A definition
+    // always did (the promise checked, the first in the link's order kept). A definition
     // outranked by another weak definition of its name is not one of the copies
     // the fold compares, so nothing is asked of it.
     //
@@ -170,7 +187,7 @@ struct CrossCuDef {
     //     initialized definition is the object (✔MEASURED 2026-10-12, 16 of 16
     //     PE cells and 8 of 8 ELF cells, both orders);
     //   * TWO of them are ONE object, the larger (`bodySize`, which a caller
-    //     passing a tentative definition states), the lowest key on a tie
+    //     passing a tentative definition states), the first in the link's order on a tie
     //     (✔MEASURED the same day, 16 of 16 and 8 of 8) — until this field the
     //     kernel had only "two strong definitions", and DSS refused the program
     //     cl links;
@@ -184,6 +201,20 @@ struct CrossCuDef {
     // in its emulated-TLS control object) and two units holding one are refused
     // by every linker measured, as two strong definitions are.
     bool                           tentative = false;
+    // ── WHERE THIS DEFINITION'S INPUT STANDS IN THE LINK'S ORDER (P69 fold 3d) ──
+    //
+    // The place of the input the definition came from (`linkPositionPrecedes`;
+    // the caller reads it with `linkPositionOf`). Every tie below is broken by it
+    // FIRST -- two weak definitions of one rank, two commons of one size, the
+    // strong definition a conflict names first -- and by `key` only among
+    // definitions at one place or at none. A caller that states no position (the
+    // merge of the compiled units, whose keys are their units' places among the
+    // sources) folds exactly as before. ✔MEASURED P69 fold 3d: two weak ELF
+    // definitions of `w`, one in a C unit and one in a named object, under gcc
+    // 13.3 + GNU ld 2.42 and clang 18 + ld.lld 18 -- the definition FIRST ON THE
+    // COMMAND LINE is the program's, in all four orders; DSS kept the unit's in
+    // all four, its key minted before every object's.
+    std::optional<std::uint32_t>   linkPosition;
 };
 
 // One two-strong collision event. `name` is the colliding cross-CU name; `existing` is
@@ -247,9 +278,10 @@ struct CrossCuUndecided {
 };
 
 // The resolution outcome. `winners[name]` is the winning definition's compound key for
-// every externally-visible name (a strong def shadows weak; among all-weak the
-// lexicographically-lowest `(cuId, SymbolId)` wins; among multiple strongs the lowest
-// key is recorded so `winners` stays order-independent even for an ambiguous name).
+// every externally-visible name (a strong def shadows weak; among all-weak the first in
+// the link's order wins -- the earliest `linkPosition`, then the lexicographically-lowest
+// `(cuId, SymbolId)`; among multiple strongs the first the same way is recorded so
+// `winners` stays independent of the order of `defs` even for an ambiguous name).
 // `conflicts` lists one entry PER two-strong collision event — K strong definitions of
 // one name yield K-1 entries (mirrors the former per-pair diagnostic count exactly, so
 // the caller's diagnostic count is unchanged) — each carrying the colliding key pair.

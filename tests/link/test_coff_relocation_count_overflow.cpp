@@ -7,8 +7,9 @@
 //   D-LK-COFF-READER-IGNORES-THE-RELOCATION-COUNT-OVERFLOW — the reader took the count record for a relocation:
 //     ✔MEASURED 2026-10-20, the lane's dsscp on x86_64-w64-mingw32-gcc -O0's object of
 //     examples/c/long_branch_imm19_escape (main renamed; `.text` NumberOfRelocations 0xFFFF, first record
-//     VirtualAddress 98307) refused it, F_CorruptedBinary "relocation Type 0 in section '.text' is not declared by PE
-//     format 'pe64-x86_64-windows-staticlib'", where GNU ld links it and the program exits 42.
+//     VirtualAddress 98308 before 98307 relocations, re-read from the object's bytes 2026-10-21) refused it,
+//     F_CorruptedBinary "relocation Type 0 in section '.text' is not declared by PE format
+//     'pe64-x86_64-windows-staticlib'", where GNU ld links it and the program exits 42.
 //   D-LK2-3 — the writer refused such a section as a capacity it lacked (K_NoMatchingObjectFormat).
 //
 // The object is not a fixture (1.6 MB): each test SYNTHESIZES its table through DSS's own PE object writer, and reads

@@ -783,14 +783,6 @@ encodeElfExecDynamic(
              "self-contained .so still carries export metadata.)");
         return {};
     }
-    if (module.functions.empty()) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "elf::encodeElfExecDynamic: zero functions -- an ET_EXEC "
-             "image needs at least one entry function, and a "
-             "function-less (data-only) ET_DYN library has no "
-             "shipped producer (D-LK1-4).");
-        return {};
-    }
     if (!elfId.bindNow) {
         emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
              "elf::encodeElfExecDynamic: schema requests lazy "
@@ -828,13 +820,8 @@ encodeElfExecDynamic(
         funcTextStart.push_back(text.size());
         text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
     }
-    if (text.empty()) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "elf::encodeElfExecDynamic: every AssembledFunction "
-             "contributed zero bytes — `.text` is empty; ET_EXEC "
-             "requires at least one entry instruction.");
-        return {};
-    }
+    // (Whether this image may hold no instruction was `elf::encode`'s first question: a `.so` of data alone reaches
+    // here with `text` empty, and NO segment is then executable, PT_LOAD #1 below.)
 
     // ── (a.5) Build the data sections for the dynamic image ────────────
     //
@@ -1374,10 +1361,16 @@ encodeElfExecDynamic(
         }
         perFuncCfi.push_back(fn.cfi);
     }
+    // P69 fold 3d: each function's handler -- its CIE names the routine, its
+    // FDE the data area; both fields are filled once every address is known,
+    // after the relocations (the `fillEhFrameHandlerFields` call below). The
+    // personality field is direct pc-relative: an image's own routine, or an
+    // import's call stub.
+    auto const perFuncHandler = link::format::ehFrameHandlersOf(module.functions);
     auto ehFrameOpt =
         link::format::buildEhFrame(perFuncCfi,
                                    link::format::dwarfRegisterMappingOf(targetSchema),
-                                   /*addressSize=*/8, reporter);
+                                   /*addressSize=*/8, reporter, perFuncHandler);
     if (!ehFrameOpt.has_value()) {
         // `buildEhFrame` has already reported the specific refusal (an
         // undeclared numbering, an unencodable rule, disagreeing entry
@@ -2812,6 +2805,20 @@ encodeElfExecDynamic(
             }
         }
     }
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the ELF
+    // neighbour): each name the document states the image defines
+    // (`__ehdr_start`, `__executable_start`) takes the address of the image's
+    // own ELF header -- file offset 0, which PT_LOAD #1 maps at `baseImageVa`.
+    // In an ET_DYN image that VA is base-relative like every other one here, so
+    // a PC-relative field is a constant and an absolute word takes the same
+    // R_*_RELATIVE as any address of the image. ✔MEASURED (probe-reference-cc
+    // run 20261104-215456-eb7e3a93, gcc 13.3 and clang 18.1 through GNU ld):
+    // `__ehdr_start` reads "\x7fELF" in -no-pie, -pie, -static and -static-pie.
+    if (!link::format::addImageDefinedSymbolVas(
+            module.imageDefinedSymbols, baseImageVa, symbolVa,
+            "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
     // block-address `lea`s) get their interior-block VAs before relocation
     // resolution — sectionVa = textVa, the SAME base as the function
@@ -3192,6 +3199,14 @@ encodeElfExecDynamic(
             "elf::encodeElfExecDynamic", reporter)) {
         return {};
     }
+    // P69 fold 3d: the handler fields of `.eh_frame` -- each names an address
+    // `symbolVa` now holds (a routine, an import's stub, a data area's item).
+    if (hasEhFrame
+        && !link::format::fillEhFrameHandlerFields(*ehFrameOpt, ehFrameVa, module, symbolVa,
+                                                   tlsSymbols, "elf::encodeElfExecDynamic",
+                                                   reporter)) {
+        return {};
+    }
 
     // (No post-layout patch of a data IMPORT's dynsym entry any more.
     // The deleted copy-relocation arm wrote st_value = the `.bss`
@@ -3320,7 +3335,12 @@ encodeElfExecDynamic(
     };
     // PT_LOAD #1 R+X — Ehdr + PHT + [.interp] + .text + .plt + .dynsym
     //                  + .dynstr + .hash + .rela.dyn
-    appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
+    // Executable only when it maps an instruction — a function's or a PLT stub's. A `.so` of data alone maps none,
+    // and its first segment is R, as GNU ld and ld.lld write it (✔MEASURED, P69 fold 3d, gcc 13.3 and clang 18.1.3
+    // `-shared -nostdlib` of one datum: GNU ld's PT_LOADs R and RW, ld.lld's R, RW and RW, and ld.lld's `.text` is
+    // empty, as this writer's is; a program reading the datum exits 42).
+    std::uint32_t const ptLoad1Flags = (text.size() + pltSize) != 0 ? PF_X | PF_R : PF_R;
+    appendPhdrEntry(PT_LOAD,    ptLoad1Flags, 0,           baseImageVa,
                     ptLoad1End,    ptLoad1End,
                     segmentAlign(std::max({secText.addrAlign,
                                            rodataAlignDyn,
@@ -3754,6 +3774,13 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
+    // The FIRST question about what the image holds, asked once for every kind and before the dispatch below: an
+    // executable or a PIE must hold the instruction it starts at; a `.so`, whose document declares no entry, may
+    // hold its data alone. Its `.text` is then empty and NO segment is executable, as GNU ld and ld.lld write one
+    // (`-shared -nostdlib`; `encodeElfExecDynamic`'s PT_LOAD #1).
+    if (!link::format::anImageThatStartsAProgramHoldsAnInstruction(module, fmt, "elf::encode", reporter)) {
+        return {};
+    }
 
     // ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ──
     //    ASK THE CONFIG BEFORE SPELLING A WEAK DEFINITION.
@@ -3803,9 +3830,11 @@ encode(AssembledModule const&    module,
                                                             reporter)) {
         return {};
     }
-    // P69 fold 3c: a carried handler is stated by no `.eh_frame` this writer
-    // builds yet — refused by name, one gate for every ELF flavor.
-    if (link::format::refuseAHandlerTheEhFrameCannotState(module.functions, "elf::encode", reporter)) {
+    // P69 fold 3d: a carried handler of the Win64 shape (data written after an
+    // UNWIND_INFO) has no place in an `.eh_frame` -- refused by name, one gate
+    // for every ELF flavor. The DWARF shape is stated by the dynamic image's
+    // `.eh_frame` and refused below by the flavors that write none.
+    if (link::format::refuseAWin64HandlerTheEhFrameCannotState(module.functions, "elf::encode", reporter)) {
         return {};
     }
 
@@ -3979,6 +4008,21 @@ encode(AssembledModule const&    module,
     // (LK6 cycle 1 — see `applyExecRelocations` below) and adds a
     // PT_LOAD program header.
     bool const isExec = (fmt.elf().objectType == ElfObjectType::Exec);
+
+    // P69 fold 3d: neither flavor below states a handler. The image that
+    // imports nothing writes no `.eh_frame` at all; the relocatable object's
+    // `.eh_frame` would have to name its personality routine through a slot of
+    // its own (an indirect pointer: the direct one is refused by the reference
+    // linkers for a PIE and a shared object, measured), which this writer does
+    // not write yet. Refused by name, before any byte.
+    if (link::format::refuseAHandlerThisFlavourCannotState(
+            module.functions, isExec ? "elf::encode (ET_EXEC)" : "elf::encode (ET_REL)",
+            isExec ? "an image that imports nothing is written with no `.eh_frame` to state it in"
+                   : "a relocatable object's `.eh_frame` names a personality routine only through a "
+                     "slot of its own, which this writer does not write yet",
+            reporter)) {
+        return {};
+    }
 
     // Resolve the section schema rows we need. ET_REL requires
     // RelocTable (.rela.text); ET_EXEC doesn't (relocs are either
@@ -4536,6 +4580,81 @@ encode(AssembledModule const&    module,
                       bssAlign)
             : 0;
 
+    // ── The headers, and the address of the image's first byte ─────────────
+    //
+    // ET_REL: [Ehdr] + section bodies + SHT at end.
+    // ET_EXEC: [Ehdr] + [PHT (program headers)] + section bodies +
+    //          SHT at end. The PHT lives immediately after the Ehdr
+    //          so e_phoff = 64 and runtime loaders find it without
+    //          a seek.
+    constexpr std::uint64_t kEhdrSize = 64;
+    constexpr std::uint64_t kProgramHeaderSize = 56;  // Elf64_Phdr
+    // PT_LOAD #1 = R+X (Ehdr + PHT + .text [+ .rodata]); PT_LOAD #2 = R+W
+    // ([.data] [+ .bss]) when the module has writable globals
+    // (D-LK4-DATA-PRODUCER). W^X: the writable segment is a SEPARATE PT_LOAD so
+    // mutable data never shares a page with executable code.
+    std::uint64_t const kPtLoadCount = 1 + (hasWritableSeg ? 1u : 0u);
+    std::uint64_t const phtSize = isExec ? (kPtLoadCount * kProgramHeaderSize) : 0;
+    // `.text`'s file offset: the first page boundary past the Ehdr and the
+    // program headers, where the layout pass below writes it (and checks that it
+    // did). Known here, before any relocation is applied, because the image's
+    // header address is derived from it: P69 fold 3d
+    // (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the ELF neighbour) maps the
+    // Ehdr and the program headers in PT_LOAD #1, from file offset 0, as GNU ld
+    // maps them in every static image and as `encodeElfExecDynamic` maps them in
+    // its images, so the address `__ehdr_start` denotes is the image's.
+    std::uint64_t const textFileOffset =
+        isExec ? alignUp(kEhdrSize + phtSize, pageAlignStatic) : 0;
+    // ⚠ BUT THE BASE MUST EXIST FIRST, AND UNTIL P65 NOTHING SAID SO —
+    // D-LINK-ELF-STATIC-IMAGE-BASE-UNDERFLOWS-BELOW-ITS-OWN-HEADERS.
+    // `.text`'s VA is DECLARED per document and its file offset is the one just
+    // derived; a document that puts `.text` BELOW the headers makes the
+    // subtraction WRAP. ★ AND THE WRAP CANCELS, which is why it is silent:
+    // every allocated section is then written at `va - imageBaseVa`, i.e.
+    // `va - textVa + textOff`, an ordinary small offset, so `.rodata`'s file/VA
+    // congruence guard below PASSES and the object looks well formed. What does
+    // not survive is the PT_LOAD: `p_vaddr` is the declared sub-header VA while
+    // `p_offset` is a whole page, so the kernel's
+    // `p_vaddr % p_align == p_offset % p_align` rule breaks and execve() answers
+    // ENOEXEC with nothing said by the toolchain. ✔MEASURED with this guard
+    // removed, on BOTH shipped exec documents: `.text` VA 0x800 emits a clean
+    // image, zero diagnostics, whose PT_LOAD #0 maps file offset 0x1000 at
+    // address 0x800 with p_align 0x1000.
+    //
+    // ⚠ THE SHAPE MATTERS, AND THE FIRST DRAFT OF THIS PARAGRAPH GOT IT WRONG:
+    // it said every congruence guard below passes. ✔MEASURED — they do not. A
+    // module WITH writable data is caught further down by the `.data` belt
+    // (`textVa(2048) + fileDelta(4096) != dataSectionVa(4096)`), which refuses
+    // the build but names `.data` rather than the base that underflowed. It is
+    // the TEXT-ONLY image that reaches no belt at all and ships. So this guard's
+    // unique value is that shape, and it also turns the other one from a
+    // misdirected refusal into an accurate one.
+    //
+    // validate() rejects only `virtualAddress == 0`, so this is reachable from a
+    // document it accepts, and `encodeElfExecDynamic` has refused the same shape
+    // since it was written ("baseImageVa would underflow") while this walker had
+    // no belt at all. (P69 fold 3d moved it here, ahead of the relocations,
+    // because the header's address is now derived from the same base.)
+    if (isExec && secText->virtualAddress < textFileOffset) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("elf::encode (ET_EXEC): .text virtualAddress ({:#x}) "
+                         "is below the file offset this image gives it ({:#x}) "
+                         "— the image base would UNDERFLOW. Every allocated "
+                         "section would still be written at a sane-looking "
+                         "offset (the two wraps cancel), but the PT_LOAD would "
+                         "break the kernel's p_vaddr/p_offset page congruence "
+                         "and execve() would answer ENOEXEC with no diagnostic. "
+                         "The format document must leave room below `.text` for "
+                         "the Ehdr and the program headers. D-LK6-3.",
+                         secText->virtualAddress, textFileOffset));
+        return {};
+    }
+    // The image's verbatim-mapping delta: `va == imageBaseVa + fileOffset` for
+    // every ALLOCATED byte of an ET_EXEC image, the Ehdr at offset 0 included.
+    // Unused (and zero) on the ET_REL arm, which has no addresses at all.
+    std::uint64_t const imageBaseVa =
+        isExec ? secText->virtualAddress - textFileOffset : 0;
+
     // ── ET_EXEC: apply intra-module relocations in-place ───────
     //
     // Delegated to the shared `applyExecRelocations` kernel in
@@ -4601,6 +4720,14 @@ encode(AssembledModule const&    module,
                            "cannot be shared.");
                 return {};
             }
+        }
+        // P69 fold 3d: each name the image defines takes the address of the
+        // image's own header, which PT_LOAD #1 maps from file offset 0 at
+        // `imageBaseVa` (the program headers below), as the dynamic arm does.
+        if (!link::format::addImageDefinedSymbolVas(
+                module.imageDefinedSymbols, imageBaseVa, symbolVa,
+                "elf::encode (ET_EXEC)", reporter)) {
+            return {};
         }
         // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
         // interior-block VAs before relocation resolution — sectionVa =
@@ -5960,31 +6087,13 @@ encode(AssembledModule const&    module,
 
     // ── Layout pass: compute sh_offset for each section ────────
     //
-    // ET_REL: [Ehdr] + section bodies + SHT at end.
-    // ET_EXEC: [Ehdr] + [PHT (program headers)] + section bodies +
-    //          SHT at end. The PHT lives immediately after the Ehdr
-    //          so e_phoff = 64 and runtime loaders find it without
-    //          a seek.
-    constexpr std::uint64_t kEhdrSize = 64;
-    constexpr std::uint64_t kProgramHeaderSize = 56;  // Elf64_Phdr
-    // PT_LOAD #1 = R+X (.text [+ .rodata]); PT_LOAD #2 = R+W ([.data] [+ .bss])
-    // when the module has writable globals (D-LK4-DATA-PRODUCER). W^X: the
-    // writable segment is a SEPARATE PT_LOAD so mutable data never shares a page
-    // with executable code.
-    std::uint64_t const kPtLoadCount = 1 + (hasWritableSeg ? 1u : 0u);
-    std::uint64_t const phtSize = isExec ? (kPtLoadCount * kProgramHeaderSize) : 0;
-
+    // The headers' sizes and the image base are derived above, before the
+    // relocations (the image's header address is one of the addresses they
+    // read); this pass writes the bytes where those values say they are.
     std::vector<std::uint8_t> bytes;
     bytes.reserve(kEhdrSize + phtSize + text.size() + relaText.size()
                   + symtab.size() + strtab.size() + shstrtab.size() + 7 * 64);
     bytes.resize(kEhdrSize + phtSize);  // placeholder; rewritten below
-
-    // The image's verbatim-mapping delta: `va == imageBaseVa + fileOffset` for
-    // every ALLOCATED section of an ET_EXEC image. DERIVED from `.text`'s
-    // emitted file offset immediately below rather than assumed from
-    // `pageAlign`, so it stays true even if the Ehdr + PHT ever grow past a
-    // page. Unused (and zero) on the ET_REL arm, which has no addresses at all.
-    std::uint64_t imageBaseVa = 0;
 
     // Single layout lambda — `vector<uint8_t> const&` decays to
     // `span<uint8_t const>` so both the in-memory section bodies
@@ -6022,57 +6131,24 @@ encode(AssembledModule const&    module,
     std::uint64_t const pageAlign = fmt.elf().pageAlign;
     if (isExec) padTo(bytes, pageAlign);
     layoutSection(hText, text);
-    // `.text` is placed; the image's constant VA<->file delta is now KNOWN, and
-    // every allocated section below is written at the offset its chosen ADDRESS
-    // implies (see `layoutSection`'s `allocVa`). Derived rather than assumed:
-    // the alternative, `secText->virtualAddress - pageAlign`, silently becomes
-    // wrong the day the Ehdr + program headers outgrow one page.
-    //
-    // ⚠ BUT THE BASE MUST EXIST FIRST, AND UNTIL P65 NOTHING SAID SO —
-    // D-LINK-ELF-STATIC-IMAGE-BASE-UNDERFLOWS-BELOW-ITS-OWN-HEADERS.
-    // `.text`'s VA is DECLARED per document and its file offset is what this
-    // pass just emitted; a document that puts `.text` BELOW the headers makes
-    // the subtraction WRAP. ★ AND THE WRAP CANCELS, which is why it is silent:
-    // every allocated section is then written at `va - imageBaseVa`, i.e.
-    // `va - textVa + textOff`, an ordinary small offset, so `.rodata`'s file/VA
-    // congruence guard below PASSES and the object looks well formed. What does
-    // not survive is the PT_LOAD: `p_vaddr` is the declared sub-header VA while
-    // `p_offset` is a whole page, so the kernel's
-    // `p_vaddr % p_align == p_offset % p_align` rule breaks and execve() answers
-    // ENOEXEC with nothing said by the toolchain. ✔MEASURED with this guard
-    // removed, on BOTH shipped exec documents: `.text` VA 0x800 emits a clean
-    // image, zero diagnostics, whose PT_LOAD #0 maps file offset 0x1000 at
-    // address 0x800 with p_align 0x1000.
-    //
-    // ⚠ THE SHAPE MATTERS, AND THE FIRST DRAFT OF THIS PARAGRAPH GOT IT WRONG:
-    // it said every congruence guard below passes. ✔MEASURED — they do not. A
-    // module WITH writable data is caught further down by the `.data` belt
-    // (`textVa(2048) + fileDelta(4096) != dataSectionVa(4096)`), which refuses
-    // the build but names `.data` rather than the base that underflowed. It is
-    // the TEXT-ONLY image that reaches no belt at all and ships. So this guard's
-    // unique value is that shape, and it also turns the other one from a
-    // misdirected refusal into an accurate one.
-    //
-    // validate() rejects only `virtualAddress == 0`, so this is reachable from a
-    // document it accepts, and `encodeElfExecDynamic` has refused the same shape
-    // since it was written ("baseImageVa would underflow") while this walker had
-    // no belt at all. Stated against the offset actually emitted rather than
-    // against `pageAlign`, for the same reason the subtraction itself is.
-    if (isExec && secText->virtualAddress < hText.offset) {
+    // `.text` is placed. Every allocated section below is written at the
+    // offset its chosen ADDRESS implies (see `layoutSection`'s `allocVa`),
+    // through the base derived above from the offset `.text` was to take.
+    // ★ THE BELT ON THAT DERIVATION: the offset the pass wrote is the offset the
+    // base -- and so every address the relocations read, the image header's
+    // among them -- was derived from. They agree by construction (the same
+    // round-up of the same header sizes); a pass that ever wrote `.text`
+    // elsewhere would map every byte at the wrong address, silently.
+    if (isExec && hText.offset != textFileOffset) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::format("elf::encode (ET_EXEC): .text virtualAddress ({:#x}) "
-                         "is below the file offset this image gives it ({:#x}) "
-                         "— the image base would UNDERFLOW. Every allocated "
-                         "section would still be written at a sane-looking "
-                         "offset (the two wraps cancel), but the PT_LOAD would "
-                         "break the kernel's p_vaddr/p_offset page congruence "
-                         "and execve() would answer ENOEXEC with no diagnostic. "
-                         "The format document must leave room below `.text` for "
-                         "the Ehdr and the program headers. D-LK6-3.",
-                         secText->virtualAddress, hText.offset));
+             std::format("elf::encode (ET_EXEC): .text was written at file "
+                         "offset {:#x}, but the image base (and every address "
+                         "the relocations read) was derived from offset {:#x} "
+                         "-- the image would map its bytes at the wrong "
+                         "addresses.",
+                         hText.offset, textFileOffset));
         return {};
     }
-    if (isExec) imageBaseVa = secText->virtualAddress - hText.offset;
     // `.rodata` immediately after `.text` (D-LK1-ELF-EXEC-DATA-SECTIONS).
     // The on-disk rodata-from-text delta MUST equal the VA rodata-from-text
     // delta so the single PT_LOAD's file<->mem mapping is congruent. That now
@@ -6311,8 +6387,10 @@ encode(AssembledModule const&    module,
         //     HIR→LIR→AssembledFunction land at LK7); the lookup
         //     accepts that synthesized form. Unknown name = fail
         //     loud K_SymbolUndefined.
+        // A program with no function has no entry: the same refusal, under the same code, as
+        // `anImageThatStartsAProgramHoldsAnInstruction` (which a shipped document meets first).
         if (module.functions.empty()) {
-            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+            emit(reporter, DiagnosticCode::K_ProgramEntryUndefined,
                  "ELF ET_EXEC writer: cannot derive e_entry — the "
                  "AssembledModule has zero functions; ET_EXEC requires "
                  "at least one function to serve as the entry point");
@@ -6397,20 +6475,28 @@ encode(AssembledModule const&    module,
             return link::format::segmentAlignForImageBase(imageBaseVa, pageAlign,
                                                           strongestMember);
         };
-        // PT_LOAD #1 (R+X) covers `.text` and — when present — `.rodata`
-        // (D-LK1-ELF-EXEC-DATA-SECTIONS). Both are contiguous on disk + VA
-        // (the layout congruence guard above proves it). p_flags is the OR of
-        // the segment's sections' mapped permissions: .text(R+X) | .rodata(R)
-        // = R+X (W^X preserved). Span derived from the on-disk extent.
+        // PT_LOAD #1 (R+X) covers the Ehdr and the program headers, `.text`
+        // and — when present — `.rodata` (D-LK1-ELF-EXEC-DATA-SECTIONS) and the
+        // build-id note, all contiguous on disk + VA (the layout congruence
+        // guard above proves it). p_flags is the OR of the segment's sections'
+        // mapped permissions: .text(R+X) | .rodata(R) = R+X (W^X preserved).
+        // ★ P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the ELF
+        // neighbour): THE SEGMENT OPENS AT FILE OFFSET 0, at `imageBaseVa`, so
+        // the image's own header is mapped and `__ehdr_start` names it. Until
+        // this fold it opened at `.text`, and no segment mapped the header.
+        // ✔MEASURED (probe-reference-cc run 20261104-215456-eb7e3a93): GNU ld
+        // maps it in a `-static` image (gcc 13.3 and clang 18.1 both read
+        // "\x7fELF" through `__ehdr_start`), as `encodeElfExecDynamic` maps it
+        // in its images. Congruent by construction: offset 0, and `imageBaseVa`
+        // a multiple of the segment's promise (`segmentAlign`'s own rule).
         std::uint32_t pFlags1 = shFlagsToPFlags(secText->flags);
         if (hasRodata) pFlags1 |= shFlagsToPFlags(secRodata->flags);
         if (hasBuildId) pFlags1 |= shFlagsToPFlags(secNote->flags);
-        std::uint64_t const seg1ByteLen =
-            hasBuildId ? (hNote.offset + buildIdNote.size() - hText.offset)
-            : hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
-                        : text.size();
-        appendPhdr(pFlags1, hText.offset, secText->virtualAddress,
-                   seg1ByteLen, seg1ByteLen,
+        std::uint64_t const seg1FileEnd =
+            hasBuildId ? (hNote.offset + buildIdNote.size())
+            : hasRodata ? (hRodata.offset + rodataBytes.size())
+                        : (hText.offset + text.size());
+        appendPhdr(pFlags1, 0, imageBaseVa, seg1FileEnd, seg1FileEnd,
                    segmentAlign(std::max({hText.addr_align, rodataAlign,
                                           buildIdAlign})));
         // PT_LOAD #2 (R+W) covers `.data` (file-backed) + `.bss` (zero-fill).

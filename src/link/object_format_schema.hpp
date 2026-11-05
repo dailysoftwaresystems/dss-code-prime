@@ -2950,6 +2950,21 @@ struct DSS_EXPORT ObjectFormatData {
     // refused undefined at the link, by name. See `CompilerSupport`.
     std::optional<CompilerSupport> compilerSupport;
 
+    // ── P69 fold 3d: the symbols the IMAGE defines ─────────────────────────
+    //
+    // OPTIONAL top-level `"imageDefinedSymbols"` (`[{"name": …, "address": …}]`):
+    // each name every reference linker of this format defines in the images it
+    // links, at an address of the image, for a reference no linked unit defines
+    // (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL). Empty = the link defines no
+    // name, and a reference no unit defines is refused undefined, by name.
+    // READ TWICE: by every compile of the document -- a reference to a stated
+    // name is direct, never an import's slot, on a relocatable or archive
+    // document as well (its object ends in an image later) -- and by the link of
+    // an IMAGE, which binds such a reference to the image. On an image the rows
+    // need a backend that writes the address
+    // (`ObjectFormatBackend::writesImageDefinedSymbols`). See `ImageDefinedSymbol`.
+    std::vector<ImageDefinedSymbol> imageDefinedSymbols;
+
     // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the REALIZED
     //    ENTRY-VERB set ─────────────────────────────────────────────
     //
@@ -4196,6 +4211,18 @@ public:
     // cookie is its `securityCookieInitializerMangledName`.
     [[nodiscard]] std::optional<CompilerSupport> const&
     compilerSupport() const noexcept { return d_.compilerSupport; }
+    // P69 fold 3d: the names the image defines for a reference no linked unit
+    // defines (`imageDefinedSymbols`), empty if it defines none.
+    [[nodiscard]] std::span<ImageDefinedSymbol const>
+    imageDefinedSymbols() const noexcept { return d_.imageDefinedSymbols; }
+    // Their names alone: what a compile of this format reads (`lowerToLir`'s
+    // `imageDefinedNames`), so a reference to one is direct.
+    [[nodiscard]] std::vector<std::string> imageDefinedNames() const {
+        std::vector<std::string> out;
+        out.reserve(d_.imageDefinedSymbols.size());
+        for (auto const& s : d_.imageDefinedSymbols) out.push_back(s.name);
+        return out;
+    }
     // The program-entry materialization VERBS this format realizes. Non-empty on
     // every exec-flavored format, empty on every other (both directions
     // load-enforced), so EMPTY is the engine's "this build needs no program

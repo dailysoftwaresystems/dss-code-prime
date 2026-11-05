@@ -11,15 +11,15 @@
 > The decisions in §4 are the orchestrator's, under the operator's order of 2026-09-21 (*"you do everything"*),
 > and each one is veto-able.
 
-## 0. Where we are (MEASURED 2026-11-04, checkpoint 38 = fold H5 on `ff1c4ff7`)
+## 0. Where we are (MEASURED 2026-11-04, checkpoint 39 = fold 3d on `0ef84d03`)
 
-**683 open rows.**
+**687 open rows.**
 
 | band | OPEN | DISCLOSED | GATED | total |
 |---|---|---|---|---|
-| P0 | 2 | 23 | — | 25 |
-| P1 | 44 | 50 | 1 | 95 |
-| P2 | 139 | 56 | 22 | 217 |
+| P0 | 2 | 25 | — | 27 |
+| P1 | 44 | 51 | 1 | 96 |
+| P2 | 140 | 57 | 21 | 218 |
 | P3 | 221 | 7 | 103 | 331 |
 | P4 | 8 | — | 3 | 11 |
 | P5 | 4 | — | — | 4 |
@@ -28,8 +28,8 @@
 
 | PR | rows | what |
 |---|---|---|
-| **PR #59** (current) | 96 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b and H5, two fixed rows awaiting their arms |
-| **the next PR** | 470 | every remaining actionable row, in three rounds; plus full debug information (§3) |
+| **PR #59** (current) | 101 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 24 of the 101 have their fix folded or built and close when their arms pass (a match over each row's status and trigger at checkpoint 39), two of them in the round-close sweep's group |
+| **the next PR** | 469 | every remaining actionable row, in three rounds; plus full debug information (§3) |
 | **the capability PR** | 21 | plan 28's boot half, plan 09.5's tier skeleton with its C harmlessness proof, plan 16's codesign |
 | **the wasm32 PR** | 1 | plan 18, the first ILP32 target |
 | **the C++ PR** | 2 | the second source language and the second embedding language |
@@ -40,7 +40,7 @@
   - weeks 33–36: 161, 147, 197, 127;
   - weeks 37–41: 40, 44, 163, 54, 32;
   - week 43 so far: 13.
-- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 91 opened (3 created, 88 disclosed): counted −25, REAL net +63** (2026-11-04, at checkpoint 38). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
+- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts 28 closed and 95 opened (3 created, 92 disclosed): counted −25, REAL net +67 The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
 - (read 2026-10-22) **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
 
 ## 1. PR #59 — the exit scope
@@ -56,14 +56,14 @@ The merge is the operator's.
 
 ### 1.1 Folds, in order
 
-`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d → f26c → 3e → L2b2 → f26d`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
+`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c → H6 → 3e → L2b2 → f26d → H7`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
 
 | lane | rows (§8 A.1) | what it is |
 |---|---|---|
-| `lm` | 33 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement; then the try/except P0 pair and the `#if` truth P0; L2a2 folded (checkpoint 36); L2b1 folded (checkpoint 37: the home audit of the binder sketch — one declarator walk, a per-name binding index, counted stack reads — and the ONE homes of "variably modified" and of the comma fold rule, built with no asker switched yet); L2b2 after f26c: every asker switched onto both homes, the tag/member name-space predicate, K&R definitions, and L2b's own rows |
+| `lm` | 34 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement; then the try/except P0 pair and the `#if` truth P0; L2a2 folded (checkpoint 36); L2b1 folded (checkpoint 37: the home audit of the binder sketch — one declarator walk, a per-name binding index, counted stack reads — and the ONE homes of "variably modified" and of the comma fold rule, built with no asker switched yet); L2b2 after f26c: every asker switched onto both homes, the tag/member name-space predicate, K&R definitions, and L2b's own rows |
 | `cs` | 25 | f26b folded (attributes, weak/select-any, declarations and type rules, visibility, `dllimport` as an import); f26c: the name-used-before-its-declaration P0 (its typedef form included), the implicit declaration, the pointer-to-array composite, a VM type name in a cast, the out-of-scope survivor arm |
-| `xa` | 27 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; the all-object link's order and its client object's imports (3d); 3e opens with two home audits — the link-side select-any / weak / alias election with the `-r` writer (cs's review finding F3 moved here) and the foreign unwind carry (the reopened chained-unwind row) — then a library datum, data symbols and a shared library's initializers |
-| `hm` | 8 | the PE platform runtime, FOLDED (H5, checkpoint 38: the stack probes, the /GS family, gcc's stack protector, `__main`, the gcc SEH personality and `_Unwind_Resume`, one packaging path for every unit of an archive build); its three runtime rows, the gcc main-hook row it opened and the fixpoint-cap row close on their arms after the fold (the runtime rows after 3d); the census row it opened and the filesystem substrate's row until main's sweep of its arms |
+| `xa` | 31 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame` (its Mach-O and COFF halves), TLS; 3d FOLDED (checkpoint 39: the link order, an object's entry and its arguments, the image-defined header names on every format, the associative COMDAT and the SEH funclets, GNU dotted subsections, data-only shared libraries, the cookie's seeding call); 3e: the `strtol` half of the client-import P0 first, the chained unwind, its home audits, the relocatable objects' unwind tables, shared-library initializers; the non-alloc carry is its own fold |
+| `hm` | 8 | the PE platform runtime, FOLDED (H5, checkpoint 38); H6 answers H5's review: the GS handler's phase rule, the truncation report through one later-stage predicate, one Win32 path parse, every Win32 file call at any length, the trailing dot and space; H7: the compiler-support routines reference objects call, format-wide if the ELF and Mach-O census says so |
 | first lane to free | 2 | the shipped-constants P0, and the SysV memory-class ABI P0 |
 | round-close sweep | 2 | fixed rows whose arms have not been read |
 
@@ -210,7 +210,7 @@ Each fold is a pushed checkpoint. Each round ends with the 8-run gate, the arm s
 
 ## 8. Every open row, placed
 
-Generated from the production registry at plan 30's measurement: 683 rows, each placed once.
+Generated from the production registry at plan 30's measurement: 687 rows, each placed once.
 A row closed since then still resolves (the done registry), and the next refresh drops it.
 
 ### A.1 PR #59 (current)
@@ -254,7 +254,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-AUDIT-P68-ROUND-12-MINOR-FINDINGS]] (P3)
 - [[D-AUDIT-P68-ROUND-13-MINOR-FINDINGS]] (P3)
 
-#### lm (L2a2, L2b) — 33
+#### lm (L2a2, L2b) — 34
 
 - [[D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT]] (P0)
 - [[D-C-A-DECLARATORS-NAME-IS-BOUND-AT-THE-END-OF-ITS-DECLARATION]] (P0)
@@ -289,6 +289,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-PARSE-A-PARENTHESISED-CHAIN-COSTS-PARSE-WORK-EXPONENTIAL-IN-ITS-DEPTH]] (P1)
 - [[D-C-A-SCALAR-INITIALIZER-IN-MORE-BRACES-OR-WITH-MORE-ELEMENTS-IS-REFUSED]] (P2)
 - [[D-C-ARITHMETIC-ON-A-POINTER-TO-A-VLA-IS-REFUSED]] (P2)
+- [[D-PP-FC2-ORACLE-RETIRE]] (P4)
 
 #### the dss-config holder — 1
 
@@ -299,12 +300,14 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY]] (P2)
 - [[D-PLAN00-D14-FC4-DECLARATOR-SUBSTRATE-SCOPE-DESIGN-CHOSEN]] (P3)
 
-#### xa (3d, 3e) — 27
+#### xa (3d, 3e) — 31
 
 - [[D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE]] (P0)
 - [[D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN]] (P0)
 - [[D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT]] (P0)
 - [[D-LK-OBJECT-READERS-GAVE-RECORD-ZERO-THE-INVALID-SYMBOL-ID]] (P0)
+- [[D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER]] (P0)
+- [[D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS]] (P0)
 - [[D-ASM-TEMPLATE-CANNOT-NAME-A-SYMBOL-OF-THE-EMBEDDING-PROGRAM]] (P1)
 - [[D-LK-COFF-READER-REFUSES-A-CUSTOM-NAMED-SECTION]] (P1)
 - [[D-LK-COFF-READER-REFUSES-GNU-DOTTED-TEXT-SUBSECTIONS]] (P1)
@@ -313,6 +316,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ]] (P1)
 - [[D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT]] (P1)
 - [[D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE]] (P1)
+- [[D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL]] (P1)
 - [[D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER]] (P1)
 - [[D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS]] (P1)
 - [[D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED]] (P2)
@@ -321,6 +325,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS]] (P2)
 - [[D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION]] (P2)
 - [[D-LK-COFF-FOREIGN-UNWIND-DROP]] (P2)
+- [[D-LK-FOREIGN-NON-ALLOC-SECTIONS-ARE-NOT-CARRIED]] (P2)
 - [[D-LK-PE-DLL-EXPORTS-AN-OVERRIDABLE-WEAK-NAME]] (P2)
 - [[D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE]] (P2)
 - [[D-LK-SHARED-LIBRARY-RUNS-NO-STATIC-INITIALIZERS]] (P2)
@@ -591,7 +596,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-SQLITE-CLI-TERMINAL-WIDTH-SHADOWED-SILENTLY]] (P2)
 - [[D-TEST-SIZEOF-THROUGH-A-POINTER-TO-A-VLA-PIN-ACCEPTS-ANY-SLOT-LOAD]] (P2)
 
-#### R3, lane A — 15
+#### R3, lane A — 14
 
 - [[D-C-CONST-QUALIFIED-NAMED-VOID-PARAMETER-DECLARATION-REFUSED]] (P3)
 - [[D-C-DUPLICATE-ARRAY-PARAMETER-QUALIFIERS-ARE-ACCEPTED]] (P3)
@@ -607,7 +612,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LANG-NULL-PTR-CONST-EVAL]] (P3)
 - [[D-LANG-NUMERIC-PROMOTION-CONFIG]] (P3)
 - [[D-LANG-STRUCTURAL-DECAY-OPT-OUT]] (P3)
-- [[D-PP-FC2-ORACLE-RETIRE]] (P4)
 
 #### R3, lane B — 79
 

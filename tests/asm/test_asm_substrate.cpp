@@ -1973,6 +1973,40 @@ TEST(AsmAggregateGlobal, IntToPtrLeafBesideSymbolEncodesRawBytesPlusReloc) {
     EXPECT_EQ(aHead, zero8) << "the symbol slot stays zero (linker writes the VA)";
 }
 
+// P69 fold 3d (review NIT3): the same mix on a target that declares no absolute
+// address slot of a pointer's width (the caller passes no kind) is refused with
+// the LEAF's own cause — the member's offset and what the target lacks — and not
+// with the caller's generic text, which names several causes this one is not.
+TEST(AsmAggregateGlobal, ASymbolAddressMemberWithNoAddressSlotNamesItsOwnCause) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const ptr = ti.pointer(ti.primitive(TypeKind::Void));
+    std::array<TypeId, 2> const f{ptr, ptr};
+    TypeId const s = ti.structType("MixTwo", f);
+    MirLiteralValue itp;   // offset 0: raw bytes, encodable everywhere
+    itp.value = std::uint64_t{5};
+    itp.core  = TypeKind::Ptr;
+    MirLiteralValue sym;   // offset 8: a link-time symbol address, which needs the slot
+    sym.value = MirSymbolAddrValue{/*symbol=*/2u, /*addend=*/0};
+    sym.core  = TypeKind::Ptr;
+    MirBuilder b;
+    std::uint32_t const lit =
+        b.literalPoolAdd(aggOf({std::move(itp), std::move(sym)}, TypeKind::Struct));
+    b.addGlobal(s, SymbolId{1}, lit, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    Mir const m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto const items = lowerMirGlobalsToDataItems(m, ti, kNatural16, DataModel::Lp64, rep);
+    EXPECT_TRUE(items.empty()) << "no partial item";
+    ASSERT_EQ(rep.errorCount(), 1u);
+    auto const& d = rep.all().front();
+    EXPECT_EQ(d.code, DiagnosticCode::K_NoMatchingObjectFormat);
+    EXPECT_NE(d.actual.find("has a member at byte offset 8 initialized to a symbol address, but the "
+                            "target declares no absolute address slot of a pointer's width"),
+              std::string::npos)
+        << d.actual;
+    EXPECT_EQ(d.actual.find("shape mismatch"), std::string::npos) << "not the generic text: " << d.actual;
+}
+
 // A TENTATIVE (zero-init, no initializer) global lowers to `.bss` with EMPTY
 // bytes + a non-zero `reservedSize` (the zero-fill extent). RED if asm.cpp
 // reverts the bss arm to the former fail-loud (D-LK4-RODATA-PRODUCER-BSS-EMIT)

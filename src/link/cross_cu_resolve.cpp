@@ -20,6 +20,16 @@ namespace {
                                   : (a.symbol.v < b.symbol.v);
 }
 
+// The link's order on two definitions (P69 fold 3d): the place of each one's input
+// first (`linkPositionPrecedes`), the compound key only at one place or at none. Every
+// tie the kernel breaks asks this, so "the first in the link's order" is one fact.
+[[nodiscard]] bool firstInLinkOrder(std::optional<std::uint32_t> aPosition, LinkedSymbolKey a,
+                                    std::optional<std::uint32_t> bPosition, LinkedSymbolKey b) noexcept {
+    if (linkPositionPrecedes(aPosition, bPosition)) return true;
+    if (linkPositionPrecedes(bPosition, aPosition)) return false;
+    return lessKey(a, b);
+}
+
 } // namespace
 
 CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
@@ -35,10 +45,15 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
         std::size_t                   bodySize;
         std::span<std::uint8_t const> body;
         CommonBesideWeakAnswer        commonBesideIt;
+        std::optional<std::uint32_t>  linkPosition;
     };
     auto winnerOf = [](CrossCuDef const& d) {
         return Winner{d.key, d.binding, d.duplicateMatch, d.bodySize, d.body,
-                      d.commonBesideIt};
+                      d.commonBesideIt, d.linkPosition};
+    };
+    // Whether `d` comes before the running winner `w` in the link's order.
+    auto before = [](CrossCuDef const& d, Winner const& w) {
+        return firstInLinkOrder(d.linkPosition, d.key, w.linkPosition, w.key);
     };
     // ── THREE CLASSES OF DEFINITION PER NAME, EACH WITH ITS OWN RUNNING WINNER ──
     //
@@ -49,11 +64,15 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
     // winner is. So each class folds among its own, in the order the
     // definitions arrive and by the rule it always had, and the classes are set
     // against each other ONCE, after the walk:
-    //   strong  — the lowest key; every further strong definition is a conflict;
+    //   strong  — the first in the link's order; every further strong definition
+    //             is a conflict;
     //   weak    — the top rank only; the duplicate-match promise checked, the
-    //             lowest key kept; a weak definition that arrives after a strong
-    //             one is shadowed and not folded (as before);
-    //   common  — the LARGEST (`bodySize`), the lowest key on a tie.
+    //             first in the link's order kept; a weak definition that arrives
+    //             after a strong one is shadowed and not folded (as before);
+    //   common  — the LARGEST (`bodySize`), the first in the link's order on a tie.
+    // "The first in the link's order" is `firstInLinkOrder`: the input's place,
+    // then the key (P69 fold 3d; until it, the key alone, whose cuIds a driver
+    // mints in the order it MAKES units, not the order the operator named them).
     struct NameState {
         std::optional<Winner> strong;
         std::optional<Winner> weak;
@@ -160,17 +179,17 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
             if (d.weakRank < topWeakRank.at(d.name)) continue;   // outranked by another weak definition
             if (state.strong.has_value()) continue;              // the strong definition shadows it
             if (!state.weak.has_value()) { state.weak = winnerOf(d); continue; }
-            // both weak — lowest key wins deterministically
+            // both weak — the first in the link's order wins deterministically
             checkDuplicatePromise(*state.weak, d);
-            if (lessKey(d.key, state.weak->key)) state.weak = winnerOf(d);
+            if (before(d, *state.weak)) state.weak = winnerOf(d);
             continue;
         }
         if (d.tentative) {
-            // A COMMON: the larger extent is the object, the lowest key on a tie.
+            // A COMMON: the larger extent is the object, the first in the link's order on a tie.
             if (!state.common.has_value()
                 || d.bodySize > state.common->bodySize
                 || (d.bodySize == state.common->bodySize
-                    && lessKey(d.key, state.common->key))) {
+                    && before(d, *state.common))) {
                 state.common = winnerOf(d);
             }
             continue;
@@ -191,10 +210,10 @@ CrossCuResolution resolveCrossCuDefs(std::span<CrossCuDef const> defs) {
         // per-pair diagnostic count) carrying the colliding key PAIR: `existing` is
         // the winner-so-far's key at THIS moment, `incoming` is the duplicate — the
         // exact pair the linker names ("CU #existing and CU #incoming"). Capture
-        // before the swap below. Then keep the lowest key as the winner so `winners`
-        // is order-independent even across the conflicting strongs.
+        // before the swap below. Then keep the first in the link's order as the
+        // winner so `winners` is order-independent even across the conflicting strongs.
         out.conflicts.push_back(CrossCuConflict{d.name, state.strong->key, d.key});
-        if (lessKey(d.key, state.strong->key)) state.strong = winnerOf(d);
+        if (before(d, *state.strong)) state.strong = winnerOf(d);
     }
 
     // ── A WEAK DEFINITION BESIDE A STRONG ONE: A REPLACEMENT, OR A DUPLICATE ───

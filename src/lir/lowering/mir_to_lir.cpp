@@ -1509,7 +1509,8 @@ struct Lowerer {
             std::vector<SymbolBinding> indirectSlotBindings,
             std::vector<SymbolBinding> preemptibleDefinitionBindings,
             std::span<DefinedSymbolName const> definedSymbolNames,
-            std::optional<ObjectFormatKind> assemblyFormatKind)
+            std::optional<ObjectFormatKind> assemblyFormatKind,
+            std::span<std::string const> imageDefinedNames)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
@@ -1560,9 +1561,21 @@ struct Lowerer {
         // object of `_Thread_local int shared = 7;` was refused on both ELF
         // execs (`K_RelocationKindMismatch`, the writer's thread-local
         // data-item backstop) where GNU ld and ld.lld link it and it exits 7.
+        // ★ P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a name
+        // the IMAGE defines (`imageDefinedNames`, the document's
+        // `imageDefinedSymbols`) never joins this set, under this binding or
+        // the dispatch below. It is in the image, never an import, so no slot
+        // holds its address: its reference is DIRECT, as cl's own
+        // `lea __ImageBase` is, and every unit of a link -- a DSS unit, a DSS
+        // `-c` object or library member, a cl object -- reaches it in ONE
+        // shape the link binds to the image.
+        auto const imageDefines = [&](ExternImport const& e) {
+            return std::find(imageDefinedNames.begin(), imageDefinedNames.end(),
+                             e.mangledName) != imageDefinedNames.end();
+        };
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
-                if (e.isData && !e.isThreadLocal) {
+                if (e.isData && !e.isThreadLocal && !imageDefines(e)) {
                     slotIndirectAddrSymbols_.insert(e.symbol.v);
                 }
             }
@@ -1597,7 +1610,7 @@ struct Lowerer {
         // no `.refptr` slot either.)
         if (externCallDispatch_ == ExternCallDispatch::IndirectSlot) {
             for (auto const& e : externImports) {
-                if (importTakesSlot(e.binding) && !e.isThreadLocal) {
+                if (importTakesSlot(e.binding) && !e.isThreadLocal && !imageDefines(e)) {
                     slotIndirectAddrSymbols_.insert(e.symbol.v);
                 }
             }
@@ -16839,7 +16852,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::vector<SymbolBinding>
                               preemptibleDefinitionBindings,
                           std::vector<DefinedSymbolName> definedSymbolNames,
-                          std::optional<ObjectFormatKind> assemblyFormatKind) {
+                          std::optional<ObjectFormatKind> assemblyFormatKind,
+                          std::vector<std::string> imageDefinedNames) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -16882,7 +16896,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
               std::move(atomicsRuntime), std::move(indirectSlotBindings),
               std::move(preemptibleDefinitionBindings), definedSymbolNames,
-              assemblyFormatKind};
+              assemblyFormatKind, imageDefinedNames};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

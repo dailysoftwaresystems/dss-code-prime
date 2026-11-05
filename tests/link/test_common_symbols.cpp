@@ -1335,7 +1335,8 @@ TEST(CommonSymbolsNative, ClTentativeDefinitionsLinkUnderDssAsUnderLinkExe) {
 }
 
 // mingw-w64 gcc 13.2.0 -fcommon writes the same commons plus a `-aligncomm:` for each; the program's `main` is a DSS
-// unit (gcc's own main calls mingw's `__main`, a startup DSS does not link).
+// unit, so the cell is the commons alone (a gcc object's own `main`, which calls mingw's `__main` -- a routine DSS's
+// PE runtime defines since P69 H5 -- is `ObjectEntry`'s cell).
 TEST(CommonSymbolsNative, MingwCommonsLinkUnderDss) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "common-gnu"};
     auto const dir = scratch.path();
@@ -7093,7 +7094,8 @@ void stateGroupOn(AssembledModule& m, std::string const& name, std::string const
         if (d.code == DiagnosticCode::K_CrossCuMergeUnsupported
             && d.actual.find("section group '" + std::string{group} + "'") != std::string::npos
             && d.actual.find("linked unit #" + std::to_string(loser) + " names the BYTES") != std::string::npos
-            && d.actual.find("linked unit #" + std::to_string(keeper) + " carries too") != std::string::npos) {
+            && d.actual.find("whose copy the link keeps from linked unit #" + std::to_string(keeper))
+                   != std::string::npos) {
             return true;
         }
     }

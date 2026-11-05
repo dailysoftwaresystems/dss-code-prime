@@ -1,1 +1,1 @@
-        if (!discardLaterSectionGroups(modules, groupBoundStorage, reporter)) {
+        if (!discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {

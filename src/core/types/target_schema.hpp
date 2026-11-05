@@ -4516,9 +4516,33 @@ struct DSS_EXPORT TargetRelocationInfo {
 [[nodiscard]] DSS_EXPORT std::optional<std::string>
 gotSlotTwinMismatch(TargetRelocationInfo const& gotRow, TargetRelocationInfo const& twin);
 
-// Whether a Linear row's field holds `value` (S + A, less P when pc-relative,
-// plus the bias) — THE ONE CHECK every writer of a Linear field asks: the
-// instruction fixups, the data fixups, the weak-null constant. An 8-byte field
+// ★ A LINEAR FIELD: THE ONE VALUE AND THE ONE CHECK every writer of one asks —
+// the instruction fixups (`applyExecRelocations`, link/format/exec_reloc_apply.hpp),
+// a PE image's data items (`pe.cpp`: encodeExec's data-item collector and
+// `buildDataRelocTable`), and the ELF and Mach-O images' data items
+// (`applyDataItemRelocations`, link/format/exec_data_section.hpp); the weak-null
+// constant asks the check. Until P69 fold 3d each writer computed the value by
+// hand, and the copies had drifted: the PE data paths wrote an image-relative
+// field as an address and refused a pc-relative one outright — the REL32 entries
+// of a jump table that MinGW gcc -O0 and -O1 keep in `.rdata` (✔MEASURED
+// 2026-10-21: gcc's own program runs, DSS refused the object).
+//
+// `linearFieldValue`: S + A, less the field's own address P when the row is
+// pc-relative, less the image's base when it is image-relative (an RVA), plus the
+// row's addend bias. nullopt: the row is image-relative and the caller states no
+// base to measure from (an image whose loader has no "image base" — the caller
+// refuses by name). The value's RANGE is asked separately, of `linearFieldHolds`.
+[[nodiscard]] inline std::optional<std::int64_t>
+linearFieldValue(TargetRelocationInfo const& r, std::uint64_t S, std::int64_t A, std::uint64_t P,
+                 std::optional<std::uint64_t> imageRelativeBase) noexcept {
+    if (r.imageRelative && !imageRelativeBase.has_value()) return std::nullopt;
+    return static_cast<std::int64_t>(S) + A
+         - (r.pcRelative ? static_cast<std::int64_t>(P) : 0)
+         - (r.imageRelative ? static_cast<std::int64_t>(*imageRelativeBase) : 0)
+         + static_cast<std::int64_t>(r.addendBias);
+}
+
+// `linearFieldHolds`: whether a Linear row's field holds `value`. An 8-byte field
 // holds every value. A narrower field holds what its declared range admits; a
 // narrower field with NO declared range holds nothing (the loader refuses such
 // a row, so only a schema built past the loader reaches it, and it fails loud).
@@ -4572,12 +4596,27 @@ gotSlotTwinMismatch(TargetRelocationInfo const& gotRow, TargetRelocationInfo con
 //
 // `addressSlotCandidates` is the rule; `addressSlotRelocationKind` is its answer
 // when it names exactly one row. The loader asks the first, every slot the second.
+//
+// ★ THE LOADER REBASES THIS FIELD: a relocation that writes the target's ADDRESS,
+// as the image is laid out at its preferred base, so the field must move when a
+// loader places the image anywhere else. Each other kind of field is a quantity
+// that does not move with the image: a pc-relative field holds a distance whose
+// two ends move together; a thread-local field, an offset into a thread's block;
+// an IMAGE-relative field, the distance from the image's own base (an RVA). One
+// predicate, because three places ask it: the address slot a pointer takes
+// (below), and the PE image's `.reloc` collector and its refusal of a code field
+// the collector cannot state. Until P69 fold 3d the last two asked it without
+// `imageRelative`, so the image refused a field it never needed to rebase.
+[[nodiscard]] inline bool loaderRebasesTheField(TargetRelocationInfo const& r) noexcept {
+    return !r.pcRelative && !r.tls && !r.imageRelative;
+}
+
 template <typename Rows>
 [[nodiscard]] std::vector<TargetRelocationInfo const*>
 addressSlotCandidates(Rows const& rows, std::uint8_t widthBytes) {
     auto const isSlot = [&](TargetRelocationInfo const& r) {
         return r.formulaKind == RelocFormulaKind::Linear && r.widthBytes == widthBytes
-            && !r.pcRelative && !r.tls && !r.imageRelative;
+            && loaderRebasesTheField(r);
     };
     bool anyExact = false;
     for (TargetRelocationInfo const& r : rows) {

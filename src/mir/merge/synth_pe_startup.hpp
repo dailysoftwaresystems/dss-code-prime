@@ -179,4 +179,40 @@ realizeEntryShape(Mir&                              mir,
                   std::string_view                  formatName,
                   DiagnosticReporter&               reporter);
 
+// ── THE SAME MATERIALIZATION FOR AN ENTRY ANOTHER INPUT DEFINES (P69 fold 3d,
+//    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────────
+//
+// The program's entry is a function a pre-assembled OBJECT input defines, under
+// `entryLinkName` (the format's spelling), elected with `verb` — the richest
+// row of its name the format realizes (`collectObjectEntryCandidates`, program
+// tier). Where the verb × the mechanism needs a pre-main init, the init is
+// synthesized into `mir` exactly as `realizeEntryShape` synthesizes it, and it
+// calls the entry through an import row it appends to `externImports`, by name —
+// the link's merge binds that row to the object's definition. The entry's
+// signature is the verb's own (its row's parameter shapes, an `int` result).
+// `init` is set to the init when one was synthesized, and left unset where none
+// is needed (a no-argument verb; a loader that hands the arguments itself, Mach-O;
+// an entry-stack vector with no environment, which the trampoline materializes):
+// the caller then states the entry on the object that defines it.
+//
+// ✔MEASURED before (lane `xa`, `argc_pe.py`): an object's `main` linked for
+// `pe64-x86_64-windows-exec` was called on whatever the argument registers held
+// (cl 19.44's `return argc * 10 + (argv[1][0] - '0')`, run as `prog 7 x y`,
+// exited 1091911680 where link.exe's image exits 47), because the init was made
+// only for an entry `mir` defines.
+//
+// `mir` may hold nothing else: the all-object link's STARTUP module is made for
+// this alone (an empty module, its symbol-id end stated by its maker).
+[[nodiscard]] DSS_EXPORT bool
+realizeForeignEntryShape(Mir&                              mir,
+                         TypeInterner&                     interner,
+                         std::string_view                  entryLinkName,
+                         std::optional<SymbolId>&          init,
+                         std::vector<ExternImport>&        externImports,
+                         EntryMaterialization              verb,
+                         std::optional<ProcessArgs> const& processArgs,
+                         CSymbolDecorationScheme           scheme,
+                         std::string_view                  formatName,
+                         DiagnosticReporter&               reporter);
+
 } // namespace dss

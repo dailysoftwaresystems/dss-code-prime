@@ -7,6 +7,7 @@
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
+#include "core/types/object_format_kind.hpp"   // ImageDefinedAddress
 #include "core/types/section_kind.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"
@@ -199,6 +200,22 @@ struct DSS_EXPORT SehScopeEntry {
 // always beside `cfi` (the handler is reached through the frame description).
 // A DSS-compiled function's `__try` scopes are `sehScopes`; a function never
 // carries both.
+//
+// ★ TWO SHAPES OF DATA, ONE PER UNWIND FAMILY (P69 fold 3d). Win64 writes the
+// routine's data INSIDE the function's UNWIND_INFO, so it is carried as bytes
+// (`data`, `relocations`). DWARF's `.eh_frame` writes only a POINTER to it —
+// the FDE's language-specific data area, which lives in a data section of its
+// own (`.gcc_except_table`) — so it is carried as a reference to the data item
+// the reader made of that section (`dataArea`), laid out, relocated and merged
+// like any datum. A handler carries one shape or the other, never both; each
+// writer refuses by name the shape its encoding cannot state.
+struct DSS_EXPORT DataAreaRef {
+    // The data item holding the area.
+    SymbolId     item{};
+    // The area's first byte, measured from the item's first byte.
+    std::int64_t offset = 0;
+};
+
 struct DSS_EXPORT LanguageHandler {
     // The routine: an import, or a function a unit of the link defines.
     SymbolId personality{};
@@ -211,6 +228,9 @@ struct DSS_EXPORT LanguageHandler {
     // Each address the data holds, as a relocation whose `offset` is a byte
     // offset into `data`.
     std::vector<Relocation> relocations;
+    // The DWARF shape: where the routine's data lives, when the function has
+    // any (an FDE whose CIE states a data area, and whose field names one).
+    std::optional<DataAreaRef> dataArea;
 };
 
 // ★★★ THE PRODUCER'S INPUT SECTION AN ATOM WAS CUT FROM, when that section is
@@ -629,11 +649,53 @@ struct DSS_EXPORT ModuleSymbol {
     // under a document that states none (`requireOneInstancePerProcessSpelling`).
     // An object READER states it, through its document; nothing else does.
     bool             oneInstancePerProcess = false;
+    // P69 fold 3d: of a WEAK EXTERNAL whose default is a body of its object (a
+    // COFF record of class 105 whose Auxiliary Format 3 names a defined record),
+    // the NAME of that default: what the weak name resolves to where the link
+    // discards the section of its body and nothing else defines it
+    // (`discardLaterSectionGroups`). It may be a name the kept copy of the
+    // section defines too (clang-cl's alias names the COMDAT's own symbol) or a
+    // label of its own inside the section, which goes with it (MinGW gcc's
+    // `.weak.<name>.<n>`) -- ✔MEASURED P69 fold 3d, lane `xa`'s `carried.py`:
+    // link.exe 14.44 and lld-link 19.1.5 resolve the first to the kept copy and
+    // leave the second undefined. Empty on every other row; the COFF reader
+    // states it.
+    std::string      weakDefaultName;
     // ⓘ A definition's SECTION GROUP is not stated here: membership is a fact
     // of the definition's input SECTION, stated once for the unit
     // (`AssembledModule::sectionGroupOfInputSection`). Until P69 fold 3c a
     // second copy of it lived on the row (`sectionGroup`); it was removed with
     // the merge refusal that was its one reader of its own.
+};
+
+// ── WHICH COPY OF A SECTION GROUP A LINK KEEPS (P69 fold 3d;
+//    D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION) ───────────────────────────────
+//
+// A format's linkers keep ONE copy of each section group (the signature names
+// it), and the rule that picks the copy is the one its producer stated:
+//   * FirstInLinkOrder  -- the first unit in link order that carries it (ELF's
+//                          GRP_COMDAT; COFF's ANY);
+//   * Largest           -- the copy whose LEADER holds the most bytes (COFF's
+//                          LARGEST);
+//   * FirstOfEqualBytes -- the first, every other copy's leader holding the
+//                          same bytes (COFF's EXACT_MATCH);
+//   * FirstOfEqualSize  -- the first, every other copy's leader holding as many
+//                          bytes (COFF's SAME_SIZE).
+// The LEADER is the member section holding the definition the signature names;
+// every other member goes with it. How the link judges copies stating
+// DIFFERENT rules is the link's (`discardLaterSectionGroups`), measured there.
+enum class SectionGroupKeep : std::uint8_t {
+    FirstInLinkOrder,
+    Largest,
+    FirstOfEqualBytes,
+    FirstOfEqualSize,
+};
+
+struct DSS_EXPORT SectionGroupRule {
+    SectionGroupKeep keep = SectionGroupKeep::FirstInLinkOrder;
+    // The leader: an input section of the unit, as its items name it
+    // (`InputSectionSlice::section`).
+    std::uint32_t    leader = 0;
 };
 
 struct DSS_EXPORT AssembledModule {
@@ -687,23 +749,70 @@ struct DSS_EXPORT AssembledModule {
     // Key: an input section of the unit, as its items name it
     // (`InputSectionSlice::section`). Value: the signature of the COMDAT group
     // that section is a member of — a symbol's name. Stated by an object reader
-    // whose form has such groups (ELF's `SHT_GROUP` marked `GRP_COMDAT`); empty
-    // everywhere else, a unit DSS compiles included.
+    // whose form has such groups: ELF's `SHT_GROUP` marked `GRP_COMDAT`, and
+    // (P69 fold 3d) COFF's COMDAT of selection ANY, LARGEST, EXACT_MATCH or
+    // SAME_SIZE whose COMDAT symbol is external, with every section ASSOCIATIVE
+    // to it (`coff_object_reader.cpp`, Gate 3). Empty everywhere else, a unit
+    // DSS compiles included.
     //
     // ★ THE ONE STATEMENT OF MEMBERSHIP, AND WHY IT IS A SECTION'S. A group is
-    // kept or discarded WHOLE by its format's linkers — the first unit that
-    // carries a signature keeps its group, every later unit's goes, bytes and all
-    // — and a member section need hold no named definition at all: the jump
+    // kept or discarded WHOLE by its format's linkers — ONE unit's copy is kept,
+    // by the group's rule (`sectionGroupRuleOf`), every other unit's goes, bytes
+    // and all — and a member section need hold no named definition at all: the jump
     // table gcc writes for a function of a group is `.rodata.<f>`, whose only
     // symbol is the section's own, and it reaches the link as an item with no
     // row. Until P69 fold 3c a definition's row carried a second copy
     // (`ModuleSymbol::sectionGroup`); two statements of one fact can disagree,
     // and the row's could not speak for the table. Read by the link's discard
-    // (`linker.cpp`, `discardLaterSectionGroups`), which drops every later
+    // (`linker.cpp`, `discardLaterSectionGroups`), which drops every other
     // unit's member sections before any name is resolved; a merged module
     // carries the statement of each group it keeps, for the relocatable writer,
     // which writes the group back.
     std::unordered_map<std::uint32_t, std::string> sectionGroupOfInputSection;
+
+    // ── THE RULE EACH OF THIS UNIT'S SECTION GROUPS IS KEPT BY (P69 fold 3d) ──
+    //
+    // Key: a group's signature, as `sectionGroupOfInputSection` names it. A
+    // group with no entry is kept by `FirstInLinkOrder` and has no leader to
+    // compare -- every ELF group. Stated by the COFF reader for every group it
+    // reads, ANY's (`FirstInLinkOrder`) included, so a copy of it can be compared
+    // with a LARGEST one; carried by the link's merge for each group it keeps,
+    // under that group's new leader key, so the relocatable writer writes the
+    // selection back.
+    std::unordered_map<std::string, SectionGroupRule> sectionGroupRuleOf;
+
+    // ── WHERE THIS UNIT STANDS IN THE LINK'S ORDER (P69 fold 3d,
+    //    D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──────────────────
+    //
+    // The link's ORDER is the operator's order of the inputs: every reference
+    // driver hands its linker the inputs as the command line names them, a
+    // source in its own place as the object it compiles to, and every answer
+    // "the first in link order" gives is taken in that order. ✔MEASURED P69
+    // fold 3d (lane `xa`'s `order.py`, `elfweak_wsl.sh` and `objonly_wsl.sh`,
+    // each image run): a select-any `x` in a C unit and in a named object --
+    // cl 19.44, clang-cl 19.1.5 with link.exe 14.44 and with lld-link, and
+    // MinGW-w64 gcc 13.2 with GNU ld keep the copy first on the command line,
+    // so `main.c obj.obj own.c` reads the object's; two weak ELF definitions
+    // of one name under gcc 13.3 + GNU ld 2.42 and clang 18 + ld.lld 18, the
+    // same; a build of objects alone, the same. DSS took each of them in the
+    // order it had MADE its modules -- every compiled unit, merged into one,
+    // before every named object, and the object defining the entry first --
+    // and kept the other definition, in silence.
+    //
+    // `linkPosition` is the operator's position of the input this unit IS (a
+    // named object, a unit compiled alone); `linkPositionOfDefinition` the
+    // position of the input each DEFINITION came from, where one unit holds
+    // the definitions of several inputs (the whole-program merge of the
+    // compiled units). Stated by the driver. A unit no input names (an archive
+    // member the search pulled, a module a caller assembled) states none, and
+    // stands after every stated position, in the order the link holds it.
+    // Read through `linkPositionOf` by every judgement of the link's order:
+    // which copy of a section group is kept (`linker.cpp`,
+    // `discardLaterSectionGroups`) and the name election's tie
+    // (`linker::CrossCuDef::linkPosition`). A definition whose id moves takes
+    // its place along, through the one mover (`moveDefinitionId`).
+    std::optional<std::uint32_t>                linkPosition;
+    std::unordered_map<SymbolId, std::uint32_t> linkPositionOfDefinition;
 
     // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ──
     //
@@ -718,6 +827,22 @@ struct DSS_EXPORT AssembledModule {
     // each the address 0. Never carried by a module a compiler or an object
     // reader produced.
     std::vector<SymbolId>          nullAddressSymbols;
+
+    // ── P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL) ──
+    //
+    // Symbols the IMAGE defines: each the import row of a name the image's
+    // document states (`imageDefinedSymbols`) that no linked unit defines,
+    // taken out of `externImports` by `linker::link`'s reference gate and kept
+    // here with the address of the image it denotes. Every relocation naming it
+    // keeps the row's id, and the writer gives that id the address
+    // (`ObjectFormatBackend::writesImageDefinedSymbols`, which the loader asks
+    // before it accepts the rows). Never carried by a module a compiler or an
+    // object reader produced.
+    struct ImageDefinedBinding {
+        SymbolId            symbol{};
+        ImageDefinedAddress address = ImageDefinedAddress::ImageHeader;
+    };
+    std::vector<ImageDefinedBinding> imageDefinedSymbols;
 
     // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ──
     //
@@ -820,6 +945,52 @@ struct DSS_EXPORT AssembledModule {
         return (i < functions.size()) ? &functions[i] : nullptr;
     }
 };
+
+// Where `definition`'s input stands in the link's order (`AssembledModule::linkPosition`): the position its unit
+// states for that definition, else the unit's own; none where neither is stated.
+[[nodiscard]] inline std::optional<std::uint32_t> linkPositionOf(AssembledModule const& m, SymbolId definition) {
+    if (auto const it = m.linkPositionOfDefinition.find(definition); it != m.linkPositionOfDefinition.end()) {
+        return it->second;
+    }
+    return m.linkPosition;
+}
+
+// ── A DEFINITION WHOSE ID MOVES TAKES EVERY STATEMENT OF IT ALONG (P69 fold 3d,
+//    D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──────────────────────
+//
+// The ONE place a module's definition changes its id after a reader or the
+// lowering made it: its body (the function or the datum), every row naming it,
+// the constructor schedule's entries, the unit's entry, and its place in the
+// link's order (`linkPositionOfDefinition`). A statement of the module keyed by
+// a definition's id that is added later is added HERE, or a move drops it in
+// silence. ✔MEASURED, the reason this exists (run 20261103-182329-b11a07e8):
+// the weak-name restatement of a relocatable link (`linker.cpp`,
+// `leaveTheIdToTheName`) moved every statement of a weak body to a fresh id but
+// its place, so the body then stood where its merged module stands, and DSS's
+// `-r` of `main.c obj.o own.c` kept own.c's weak definition where GNU ld and
+// ld.lld keep the object's. What still names `from` -- a relocation, a reference
+// row, a handler's area -- is a REFERENCE, and stays: whether it now means the
+// name or the bytes is the caller's to say.
+inline void moveDefinitionId(AssembledModule& m, SymbolId from, SymbolId to) {
+    for (auto& f : m.functions) {
+        if (f.symbol == from) f.symbol = to;
+    }
+    for (auto& d : m.dataItems) {
+        if (d.symbol == from) d.symbol = to;
+    }
+    for (auto& row : m.symbols) {
+        if (row.symbol == from) row.symbol = to;
+    }
+    for (auto& s : m.staticInitSchedule) {
+        if (s.symbol == from) s.symbol = to;
+    }
+    if (m.userEntrySymbol == from) m.userEntrySymbol = to;
+    if (auto const place = m.linkPositionOfDefinition.find(from); place != m.linkPositionOfDefinition.end()) {
+        std::uint32_t const at = place->second;
+        m.linkPositionOfDefinition.erase(place);
+        m.linkPositionOfDefinition.insert_or_assign(to, at);
+    }
+}
 
 // ★★★ AN INPUT SECTION THAT MAY NOT BE SPLIT IS NOT SPLIT (see
 // `InputSectionSlice`). Checked once, on the module the format writers receive.

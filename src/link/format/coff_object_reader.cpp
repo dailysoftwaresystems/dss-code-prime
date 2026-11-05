@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -215,11 +216,13 @@ constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
 // VirtualAddress is the record count INCLUDING itself, and the relocations are
 // the records after it — as LLVM's COFFObjectFile reads it ("-1 to exclude
 // this first relocation entry") and both GNU ld and LLVM's writer emit it.
-// ✔MEASURED 2026-10-20: x86_64-w64-mingw32-gcc -O0 of
-// examples/c/long_branch_imm19_escape writes `.text` with Characteristics
-// 0x61500020, NumberOfRelocations 0xFFFF and a first record (VirtualAddress
-// 98307, symbol 0, type 0) followed by exactly 98306 relocations; GNU ld links
-// the object and the program exits 42. Until this flag was read, DSS took the
+// ✔MEASURED 2026-10-20 and RE-READ 2026-10-21 from the object's bytes:
+// x86_64-w64-mingw32-gcc 13.2.0 -O0 of examples/c/long_branch_imm19_escape
+// writes `.text` with Characteristics 0x61500020, NumberOfRelocations 0xFFFF
+// and a first record (VirtualAddress 98308, symbol 0, type 0) followed by
+// exactly 98307 relocations — 98308 ten-byte records in all, the count record
+// among them, and llvm-readobj lists 98307; GNU ld links the object and the
+// program exits 42. Until this flag was read, DSS took the
 // count record for a relocation of type 0 and refused the object as corrupted
 // (`relocation Type 0 in section '.text' is not declared`) — and, had type 0
 // been declared, would have read 65535 records and silently dropped the rest.
@@ -316,8 +319,7 @@ alignFromCharacteristics(std::uint32_t chars) noexcept {
 // duplicate-resolution. A real cl.exe/clang-cl `.obj` places each
 // function-level-linked (`/Gy`) / `__declspec(selectany)` / inline / template
 // body in its OWN COMDAT section; the duplicate-resolution policy lives in the
-// section-definition auxiliary record's Selection byte (decoded below --
-// D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION).
+// section-definition auxiliary record's Selection byte (decoded below, GATE 3).
 // ⚠ THIS BIT IS NO LONGER FOREIGN-ONLY. It said so until D-LK-OBJECT-WEAK-DEF-RELOCATABLE
 // landed: COFF has no per-symbol weak-DEFINITION encoding, so DSS's
 // own writer now spells every weak definition as a per-body IMAGE_SCN_LNK_COMDAT
@@ -331,17 +333,45 @@ alignFromCharacteristics(std::uint32_t chars) noexcept {
 // what DSS reads back from its own objects.
 constexpr std::uint32_t kScnLnkComdat = 0x00001000u;
 
+// The sections an object marks NOT FOR THE IMAGE (PE Format spec, "Section
+// Flags"): IMAGE_SCN_LNK_INFO (comments or other information), IMAGE_SCN_LNK_REMOVE
+// (will not become part of the image) and IMAGE_SCN_MEM_DISCARDABLE (can be
+// discarded as needed: CodeView `.debug$S` / `.debug$T`, DWARF `.debug_*`). Gate 2
+// passes over such a section with its relocations, and refuses any other section
+// it cannot place (see there).
+constexpr std::uint32_t kScnLnkInfo        = 0x00000200u;
+constexpr std::uint32_t kScnLnkRemove      = 0x00000800u;
+constexpr std::uint32_t kScnMemDiscardable = 0x02000000u;
+constexpr std::uint32_t kScnNotForTheImage = kScnLnkInfo | kScnLnkRemove | kScnMemDiscardable;
+
+// An initializer or terminator table's name -- GNU's `.ctors` / `.dtors`, alone or
+// with a `.NNNNN` priority, and MSVC's `.CRT$X<group>` -- for the WORDS of Gate 2's
+// refusal alone: the refusal itself is decided by the section's structure.
+[[nodiscard]] bool isInitializerTableName(std::string_view name) noexcept {
+    for (std::string_view const gnu : {std::string_view{".ctors"}, std::string_view{".dtors"}}) {
+        if (name == gnu
+            || (name.size() > gnu.size() && name.substr(0, gnu.size()) == gnu && name[gnu.size()] == '.')) {
+            return true;
+        }
+    }
+    return name.starts_with(".CRT$X");
+}
+
 // IMAGE_COMDAT_SELECT_* -- the COMDAT Selection byte (aux format 5, offset 14).
 // Maps to the universal SymbolBinding the format-blind merge already resolves.
 constexpr std::uint8_t kComdatSelNoDuplicates = 1;  // -> Strong (Global)
-constexpr std::uint8_t kComdatSelAny          = 2;  // -> Weak
+constexpr std::uint8_t kComdatSelAny          = 2;  // -> Weak, and a section group (see the decode)
 constexpr std::uint8_t kComdatSelSameSize     = 3;  // -> Weak
 constexpr std::uint8_t kComdatSelExactMatch   = 4;  // -> Weak
-// ASSOCIATIVE(5) / LARGEST(6) / 0 / unknown -> FAIL LOUD (see the decode).
+constexpr std::uint8_t kComdatSelAssociative  = 5;  // -> kept iff the section it names is (see the decode)
+constexpr std::uint8_t kComdatSelLargest      = 6;  // -> refused by name (see the decode)
+// 0 / unknown -> F_CorruptedBinary: the format defines no such selection.
 
-// Section-definition auxiliary record (aux format 5) field offset: the
+// Section-definition auxiliary record (aux format 5) field offsets: the
 // Selection byte sits at offset 14 of the 18-byte aux record (after Length[4],
-// NumberOfRelocations[2], NumberOfLinenumbers[2], CheckSum[4], Number[2]).
+// NumberOfRelocations[2], NumberOfLinenumbers[2], CheckSum[4], Number[2]);
+// Number, the 1-based ordinal of the section an ASSOCIATIVE one goes with, at 12.
+constexpr std::size_t kAuxSectionDefNumberOff    = 12;
 constexpr std::size_t kAuxSectionDefSelectionOff = 14;
 
 // ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
@@ -858,7 +888,34 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // NOT clone ELF's single-kind longest-prefix resolver: the two
         // header-identical `.rdata` rows (rodata vs relro) are disambiguated
         // ONLY by reloc-presence, which the longest-prefix collapse would lose.
-        std::string const base = sec.name.substr(0, sec.name.find('$'));
+        //
+        // GNU'S `.` SUBSECTION OF A ROW (P69 fold 3d,
+        // D-LK-COFF-READER-REFUSES-GNU-DOTTED-TEXT-SUBSECTIONS): a base the
+        // document does not name verbatim is the row whose name is its LONGEST
+        // `<row>.` prefix -- the ELF reader's rule (2), and what GNU ld's PE
+        // script does merging `.text.*` into `.text`. mingw-w64 gcc places
+        // `main` and the constructors in `.text.startup`, a cold path in
+        // `.text.unlikely`, a hot function in `.text.hot`, the destructors in
+        // `.text.exit`, and under -ffunction-sections each of those suffixed by
+        // the function (`.text.startup.main`). The prefix decides the row's
+        // NAME, never its kind, and the name then takes the two maps above, so
+        // the reloc-presence split of `.rdata` survives it. ✔MEASURED (lane `xa`'s census,
+        // 560 mingw-w64 gcc 13.2 objects at -O0, -O2, -fexceptions,
+        // -ffunction-sections and -g): every name either resolves to a row this
+        // way or by its `$` group, belongs to the unwind families (7.5) or to
+        // the directive section (3b), is refused below by Gate 2, or is a
+        // discardable debug section.
+        std::string base = sec.name.substr(0, sec.name.find('$'));
+        if (!nameToKind.contains(base)) {
+            std::size_t bestLen = 0;
+            for (auto const& row : objectFormatSchema.sections()) {
+                std::size_t const n = row.name.size();
+                if (base.size() > n + 1 && base[n] == '.' && base.compare(0, n, row.name) == 0 && n > bestLen) {
+                    bestLen = n;
+                }
+            }
+            if (bestLen != 0) base.resize(bestLen);
+        }
         if (auto it = nameToKind.find(base); it != nameToKind.end()) {
             sec.kind = it->second;
         }
@@ -1204,57 +1261,165 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // acquires an entry in one and not the other, and the failure would be a
     // COMDAT lifted to Weak with its promise silently downgraded to `Any` --
     // i.e. this exact defect, reintroduced by bookkeeping.
+    //
+    // ★★ ASSOCIATIVE(5): A SECTION THAT GOES WITH ANOTHER, AND THE SECTION
+    // GROUP THAT CARRIES IT (P69 fold 3d). "If the section named by Number is
+    // linked, link this section too" -- the record's `Number` names the section,
+    // and a chain of associative sections ends at the one that decides. What
+    // writes it, ✔MEASURED 2026-10-21 (clang-cl 19.1.5 /O2): a dense switch's
+    // jump table, `.rdata` associative to its function's `.text` -- of
+    // selection NODUPLICATES for an external function, ANY for a C99 `inline`
+    // one with its `extern inline` definition. A section is kept iff the root
+    // of its chain is, which this reader states through the unit's SECTION
+    // GROUPS (`AssembledModule::sectionGroupOfInputSection`), the one statement
+    // of "kept or discarded with" the link reads (`discardLaterSectionGroups`):
+    //   * a section of selection ANY, LARGEST, EXACT_MATCH or SAME_SIZE whose
+    //     COMDAT symbol is EXTERNAL is one of several copies of that name: it
+    //     (the group's LEADER) and every section of a chain rooted in it are one
+    //     group, signed by the name, and the link keeps ONE unit's copy -- its
+    //     tables with it -- by the rule the selection states
+    //     (`AssembledModule::sectionGroupRuleOf`; ANY states none, the first in
+    //     link order), and discards every other unit's before any name is
+    //     resolved. The link compares the copies' leaders where the rule says to
+    //     (D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION, ✔MEASURED P69 fold 3d against
+    //     link.exe 14.44 and lld-link 19.1.5; `linker.cpp` states the table).
+    //   * a chain whose root is NODUPLICATES, a COMDAT whose symbol is not
+    //     external, or no COMDAT at all goes with a section no link discards
+    //     (one copy, or one object's own): it is an ordinary section of its unit.
+    //   * a chain that ends at no section of the object, or comes back on
+    //     itself, is F_CorruptedBinary: no section decides it.
+    // Until P69 fold 3d LARGEST, and every chain rooted in SAME_SIZE or
+    // EXACT_MATCH, were refused: the link kept a group by link order alone and
+    // discarded it before the fold that compares copies. No C source measured
+    // writes LARGEST (✔MEASURED 2026-10-21: a dense switch,
+    // `__declspec(selectany)`, tentative definitions with -fcommon and
+    // over-aligned, a C99 `inline` function; cl 19.44, clang-cl 19.1.5, MinGW gcc
+    // 13.2); the fixtures that pin it are hand-assembled.
     struct ComdatPolicy {
         SymbolBinding  binding;
         DuplicateMatch duty;
     };
     std::unordered_map<std::uint16_t, ComdatPolicy> comdatBindingBySection;
+
+    // The section-definition record of every COMDAT section, read once: its
+    // Selection, its Number, and its COMDAT SYMBOL -- PE/COFF 5.5.6: the first
+    // symbol after the section's own record that is defined in the section, the
+    // name the copies of a COMDAT are matched by across objects. The section's
+    // record is the shared 5.5.5 recogniser's (NAME matches the section AND an
+    // aux record follows): taking the first aux-bearing STATIC symbol of the
+    // ordinal instead would read a gcc static function's format-1 aux record as
+    // a Selection byte, because gcc emits that record ahead of the section
+    // symbol; and no symbol ahead of the section's record is its COMDAT symbol.
+    struct ComdatDefinition {
+        std::uint8_t                 selection = 0;
+        std::uint16_t                number    = 0;
+        std::optional<std::uint32_t> comdatSymbol;
+    };
+    std::unordered_map<std::uint16_t, ComdatDefinition> comdatDefinitionOf;
+    {
+        std::unordered_set<std::uint16_t> awaitingComdatSymbol;
+        for (std::uint32_t k = 0; k < numSymbols; ++k) {
+            if (auxSlot[k]) continue;                          // an aux slot, not a symbol
+            std::uint16_t const ordinal = syms[k].sectNum;
+            if (ordinal < 1u || ordinal > numSections) continue;
+            if ((sections[ordinal - 1u].chars & kScnLnkComdat) == 0u) continue;
+            if (!comdatDefinitionOf.contains(ordinal)) {
+                if (!isSectionDefinitionSymbol(k)) continue;
+                // The aux record sits at symtab index k + 1; [ao, ao+18) is in
+                // bounds (k + 1 < numSymbols, and the symbol table [symTabPtr,
+                // +18*numSymbols) was proven file-backed in (1)).
+                std::size_t const ao = static_cast<std::size_t>(symTabPtr)
+                                     + (static_cast<std::size_t>(k) + 1u) * kSymbolSz;
+                comdatDefinitionOf.emplace(
+                    ordinal, ComdatDefinition{bytes[ao + kAuxSectionDefSelectionOff],
+                                              rdU16(bytes, ao + kAuxSectionDefNumberOff),
+                                              std::nullopt});
+                awaitingComdatSymbol.insert(ordinal);
+                continue;
+            }
+            if (awaitingComdatSymbol.erase(ordinal) != 0u) {
+                comdatDefinitionOf[ordinal].comdatSymbol = k;
+            }
+        }
+    }
+    // The signature of an ANY section's copies: its COMDAT symbol's name, when
+    // that symbol is EXTERNAL -- a name another object's copy can carry. A
+    // COMDAT whose symbol is file-local is no copy of anything another object
+    // holds.
+    auto copiesSignatureOf = [&](ComdatDefinition const& d) -> std::optional<std::string> {
+        if (!d.comdatSymbol.has_value()) return std::nullopt;
+        Sym const& s = syms[*d.comdatSymbol];
+        if (s.storage != kSymClassExternal || s.name.empty()) return std::nullopt;
+        return s.name;
+    };
+    // The section group each COMDAT section of this unit is a member of, by
+    // ordinal, and the rule each group is kept by, by signature -- stated on the
+    // unit once it exists (step 6). ANY's rule is the first in link order; its
+    // leader is stated too, because the link compares an ANY copy with a
+    // LARGEST one of the same name.
+    std::unordered_map<std::uint16_t, std::string> groupOfComdatSection;
+    std::unordered_map<std::string, SectionGroupRule> ruleOfGroup;
+    auto const leadGroup = [&](std::uint16_t ordinal, ComdatDefinition const& d,
+                               std::optional<SectionGroupKeep> keep) {
+        auto signature = copiesSignatureOf(d);
+        if (!signature.has_value()) return;   // no copy (the arms below are reached only with one)
+        ruleOfGroup.emplace(*signature,
+                            SectionGroupRule{keep.value_or(SectionGroupKeep::FirstInLinkOrder), ordinal});
+        groupOfComdatSection.emplace(ordinal, std::move(*signature));
+    };
+    auto const keepOf = [](std::uint8_t selection) -> std::optional<SectionGroupKeep> {
+        switch (selection) {
+            case kComdatSelLargest:    return SectionGroupKeep::Largest;
+            case kComdatSelExactMatch: return SectionGroupKeep::FirstOfEqualBytes;
+            case kComdatSelSameSize:   return SectionGroupKeep::FirstOfEqualSize;
+            default:                   return std::nullopt;   // ANY: the first in link order
+        }
+    };
     for (std::uint16_t si = 0; si < numSections; ++si) {
         Section const& sec = sections[si];
         if ((sec.chars & kScnLnkComdat) == 0u) continue;  // not a COMDAT section
         // Only a COMDAT section whose KIND resolved (real code/data --
         // `.text$mn`/`.data`/`.rdata`) reconstructs a BODY whose external
         // symbol we lift + whose wrong-size selection is a miscompile risk. A
-        // COMDAT section with UNRESOLVED kind is unmodeled metadata -- a real
-        // `/Gy` object marks its `.pdata`/`.xdata` COMDAT with
-        // ASSOCIATIVE(5) selection tying them to the function COMDAT -- which
-        // reconstructs NO body + has NO external defined symbol to lift, and is
-        // SKIPPED whole by Gate 2 (D-LK-COFF-FOREIGN-UNWIND-DROP). Reading its
-        // selection would fail loud on ASSOCIATIVE for a section we drop anyway
-        // (blocking every `/Gy`-compiled object). Gate 3 owns kind-RESOLVED
-        // COMDAT (the miscompile surface); Gate 2 owns the kind-UNRESOLVED
-        // metadata -- the same kind split both gates key on.
+        // COMDAT section with UNRESOLVED kind is metadata -- a real `/Gy`
+        // object marks its `.pdata`/`.xdata` COMDAT with ASSOCIATIVE(5)
+        // selection tying them to the function COMDAT -- which reconstructs NO
+        // item of its own: its unwind is carried on the function it describes
+        // ((7.5)), and goes with that function's section. Gate 3 owns
+        // kind-RESOLVED COMDAT; Gate 2 owns the kind-UNRESOLVED metadata -- the
+        // same kind split both gates key on.
         if (!sec.kind.has_value()) continue;
         std::uint16_t const ordinal = static_cast<std::uint16_t>(si + 1u);
-        // The section-definition symbol for THIS ordinal (the shared 5.5.5
-        // recogniser above -- NAME matches the section AND an aux record
-        // follows). Its Selection byte is the policy. Taking the first
-        // aux-bearing STATIC symbol of the ordinal instead would read a gcc
-        // static function's format-1 aux record as a Selection byte, because
-        // gcc emits that record ahead of the section symbol.
-        std::optional<std::uint8_t> selection;
-        for (std::uint32_t k = 0; k < numSymbols; ++k) {
-            if (auxSlot[k]) continue;                          // an aux slot, not a symbol
-            if (syms[k].sectNum != ordinal) continue;
-            if (!isSectionDefinitionSymbol(k)) continue;
-            std::size_t const auxIdx = static_cast<std::size_t>(k) + 1u;
-            // The aux record sits at symtab index auxIdx; [ao, ao+18) is in
-            // bounds (auxIdx < numSymbols, and the symbol table [symTabPtr,
-            // +18*numSymbols) was proven file-backed in (1)).
-            std::size_t const ao =
-                static_cast<std::size_t>(symTabPtr) + auxIdx * kSymbolSz;
-            selection = bytes[ao + kAuxSectionDefSelectionOff];
-            break;
-        }
-        if (!selection.has_value()) {
+        auto const definition = comdatDefinitionOf.find(ordinal);
+        if (definition == comdatDefinitionOf.end()) {
             return fail(DiagnosticCode::F_CorruptedBinary,
                 "pe::readRelocatableObject: section '" + sec.name + "' is flagged "
                 "IMAGE_SCN_LNK_COMDAT but carries no section-definition auxiliary "
                 "record (aux format 5) to read its COMDAT Selection from -- "
                 "refusing to default a selection (a wrong default would silently "
-                "mis-dedup). D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION.");
+                "mis-dedup).");
         }
-        switch (*selection) {
+        std::uint8_t const selection = definition->second.selection;
+        // ★ A COMDAT WHOSE COMDAT SYMBOL IS NOT EXTERNAL IS NO COPY (P69 fold
+        // 3d). Its copies are matched by that symbol's name, which no other
+        // object can carry, so an EXTERNAL definition inside it is one
+        // definition of its name like any other: STRONG, and a second one is a
+        // duplicate whatever the selection says. ✔MEASURED (lane `xa`'s
+        // `exotic.py`; clang 19.1.5 objects, a COMDAT `.data$x` of the static
+        // `xsec` holding the external `x`): link.exe 14.44 (LNK2005) and
+        // lld-link 19.1.5 ("duplicate symbol") refuse every pair of such objects
+        // in both orders -- ANY, SAME_SIZE at an equal and another size,
+        // EXACT_MATCH identical and not, LARGEST. Until this the selection made
+        // `x` weak, and DSS linked the ANY, the equal-size SAME_SIZE and the
+        // identical EXACT_MATCH pairs keeping the first. An associative section
+        // rooted in it is an ordinary section of its unit (that arm, below).
+        bool const selectsACopy = selection == kComdatSelAny || selection == kComdatSelSameSize
+                               || selection == kComdatSelExactMatch || selection == kComdatSelLargest;
+        if (selectsACopy && !copiesSignatureOf(definition->second).has_value()) {
+            comdatBindingBySection.emplace(ordinal, ComdatPolicy{SymbolBinding::Global, DuplicateMatch::Any});
+            continue;
+        }
+        switch (selection) {
             case kComdatSelNoDuplicates:
                 // NODUPLICATES: a genuine duplicate IS an error. Keep the
                 // symbol STRONG (Global) so the existing all-strong merge fires
@@ -1280,15 +1445,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 comdatBindingBySection.emplace(
                     ordinal,
                     ComdatPolicy{SymbolBinding::Weak, DuplicateMatch::Any});
+                // ...and the section is one copy of its name: a section group,
+                // with every section that goes with it (the ASSOCIATIVE arm).
+                leadGroup(ordinal, definition->second, std::nullopt);
                 break;
             case kComdatSelSameSize:
                 // SAME_SIZE: duplicates are legal ONLY IF every definition has
                 // the same size; otherwise the format requires a multiply-
-                // defined-symbol error. Same WEAK lift, plus the duty.
+                // defined-symbol error. Same WEAK lift, plus the duty -- which
+                // the fold discharges against a copy in no group, and the
+                // group's rule against every other unit's copy.
                 comdatBindingBySection.emplace(
                     ordinal,
                     ComdatPolicy{SymbolBinding::Weak,
                                  DuplicateMatch::SameSize});
+                leadGroup(ordinal, definition->second, keepOf(selection));
                 break;
             case kComdatSelExactMatch:
                 // EXACT_MATCH: duplicates are legal ONLY IF the definitions
@@ -1297,26 +1468,94 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 comdatBindingBySection.emplace(
                     ordinal, ComdatPolicy{SymbolBinding::Weak,
                                           DuplicateMatch::ExactContent});
+                leadGroup(ordinal, definition->second, keepOf(selection));
                 break;
+            case kComdatSelLargest:
+                // LARGEST: of several copies the link keeps the largest -- the
+                // group's rule, judged before any name is resolved. The copy
+                // the link keeps is the only one the fold meets, so it promises
+                // nothing beyond the ANY lift.
+                comdatBindingBySection.emplace(
+                    ordinal, ComdatPolicy{SymbolBinding::Weak, DuplicateMatch::Any});
+                leadGroup(ordinal, definition->second, keepOf(selection));
+                break;
+            case kComdatSelAssociative: {
+                // Kept iff the root of its chain is (the header above). The
+                // section itself names no copies, so its symbols take no lift.
+                std::uint16_t at = ordinal;
+                std::unordered_set<std::uint16_t> seen{ordinal};
+                std::optional<std::uint16_t> root;   // none: the chain ends at no COMDAT
+                for (;;) {
+                    std::uint16_t const next = comdatDefinitionOf.at(at).number;
+                    if (next < 1u || next > numSections) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: section '" + sec.name + "' (#"
+                            + std::to_string(ordinal) + ") is an ASSOCIATIVE COMDAT whose "
+                            "chain names section #" + std::to_string(next)
+                            + ", and the object has sections #1 to #"
+                            + std::to_string(numSections)
+                            + " -- no section decides whether it is linked.");
+                    }
+                    if (!seen.insert(next).second) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: section '" + sec.name + "' (#"
+                            + std::to_string(ordinal) + ") is an ASSOCIATIVE COMDAT whose "
+                            "chain comes back to section #" + std::to_string(next)
+                            + " -- a cycle, in which no section decides whether it is "
+                              "linked.");
+                    }
+                    if ((sections[next - 1u].chars & kScnLnkComdat) == 0u) break;
+                    auto const nextDefinition = comdatDefinitionOf.find(next);
+                    if (nextDefinition == comdatDefinitionOf.end()) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: section '" + sec.name + "' (#"
+                            + std::to_string(ordinal) + ") is an ASSOCIATIVE COMDAT that "
+                            "goes with section #" + std::to_string(next) + " ('"
+                            + sections[next - 1u].name + "'), which is flagged "
+                            "IMAGE_SCN_LNK_COMDAT but carries no section-definition "
+                            "auxiliary record (aux format 5) to read its Selection from.");
+                    }
+                    if (nextDefinition->second.selection != kComdatSelAssociative) {
+                        root = next;
+                        break;
+                    }
+                    at = next;
+                }
+                if (!root.has_value()) break;   // goes with a section no link discards
+                ComdatDefinition const& rootDefinition = comdatDefinitionOf.at(*root);
+                std::string const rootText = "section #" + std::to_string(*root) + " ('"
+                                           + sections[*root - 1u].name + "')";
+                switch (rootDefinition.selection) {
+                    case kComdatSelNoDuplicates:
+                        break;   // one copy: the section goes with its unit
+                    case kComdatSelAny:
+                    case kComdatSelSameSize:
+                    case kComdatSelExactMatch:
+                    case kComdatSelLargest:
+                        // A member of the root's group (a root whose COMDAT
+                        // symbol is file-local is no copy: no group, and the
+                        // section is an ordinary one of its unit). The root's
+                        // own arm states the group's rule.
+                        if (auto signature = copiesSignatureOf(rootDefinition)) {
+                            groupOfComdatSection.emplace(ordinal, std::move(*signature));
+                        }
+                        break;
+                    default:
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: section '" + sec.name + "' (#"
+                            + std::to_string(ordinal) + ") is an ASSOCIATIVE COMDAT that "
+                            "goes with " + rootText + ", whose COMDAT Selection is "
+                            + std::to_string(rootDefinition.selection)
+                            + " -- a selection the format does not define (1 to 6).");
+                }
+                break;
+            }
             default:
-                // LARGEST(6) / ASSOCIATIVE(5) / 0 / unknown -> FAIL LOUD.
-                // Lifting LARGEST to Weak would be a SILENT WRONG-SIZE
-                // MISCOMPILE: cuId is minted in PULL order (compile_pipeline.cpp
-                // readArchiveMemberModule), NOT size order, so weak lowest-key
-                // -wins can keep the SMALLER copy. ASSOCIATIVE ties a section's
-                // liveness to another section, which the symbol-atomic model
-                // does not represent. Both are C++ selectany/RTTI/vtable
-                // constructs essentially absent from C/SQLite -- fail-loud is
-                // the correct best-long-term stance for this target (the
-                // size-aware successor is D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION).
                 return fail(DiagnosticCode::F_CorruptedBinary,
-                    "pe::readRelocatableObject: section '" + sec.name + "' has "
-                    "COMDAT Selection " + std::to_string(*selection)
-                    + " (LARGEST / ASSOCIATIVE / unknown), which the format-blind "
-                    "all-weak merge cannot honor without size-aware selection: "
-                    "cuId is minted in PULL order, not size order, so a weak lift "
-                    "could keep the smaller copy (a silent wrong-size "
-                    "miscompile). D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION.");
+                    "pe::readRelocatableObject: section '" + sec.name + "' (#"
+                    + std::to_string(ordinal) + ") states COMDAT Selection "
+                    + std::to_string(selection)
+                    + " -- a selection the format does not define (1 to 6).");
         }
     }
 
@@ -1324,6 +1563,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     AssembledModule mod;
     mod.cuId = cuId;
     mod.linkerRequests = std::move(unitRequests);   // (3b)'s: the exports, the image requests, the hand-on
+    // GATE 3's section groups: a member section is named by its ordinal, the key
+    // every atom cut from it carries (`sliceOf`, below -- a COFF object declares
+    // no subsections, so its sections are always units of placement).
+    for (auto& [ordinal, signature] : groupOfComdatSection) {
+        mod.sectionGroupOfInputSection.emplace(ordinal, std::move(signature));
+    }
+    mod.sectionGroupRuleOf = std::move(ruleOfGroup);
 
     // symtab index -> the extern's position in mod.externImports (for the
     // isData inference in step 7).
@@ -2067,6 +2313,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             mod.symbols.push_back(ModuleSymbol{symbolIds.of(d.symIdx), d.name,
                                                d.binding, d.visibility,
                                                d.duplicateMatch, d.weakKind});
+            if (d.defaultRecord.has_value()) mod.symbols.back().weakDefaultName = syms[*d.defaultRecord].name;
         }
     };
 
@@ -2355,6 +2602,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     ModuleSymbol alias{symbolIds.of(owner), defs[k].name, defs[k].binding,
                                        defs[k].visibility};
                     alias.weakKind = defs[k].weakKind;
+                    if (defs[k].defaultRecord.has_value()) {
+                        alias.weakDefaultName = syms[*defs[k].defaultRecord].name;
+                    }
                     aliasRows.push_back(std::move(alias));
                 }
                 continue;
@@ -2844,17 +3094,51 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // that reconstructed NO atom. The skip is gated on KIND-UNRESOLVED,
             // never atom-absence.
             if (!sec.kind.has_value()) {
-                // An UNMODELED metadata section whose BASE name is absent from
-                // the schema (`.pdata` / `.xdata` / `.debug$S` / `.debug$T` /
-                // `.drectve` / `.chks64`) -- kind stayed nullopt. These carry
-                // their OWN relocations (`.pdata`/`.xdata` are 0x40000040, NOT
-                // discardable -- so the DISCARDABLE bit alone cannot gate this)
-                // but hold no reconstructable code/data body the AssembledModule
-                // models. SKIP the section AND its reloc table HERE: DSS has no
-                // representation for CodeView / linker-directive metadata, and
-                // the unwind pair is read by (7.5) below, which accounts for
-                // every relocation the two carry.
-                continue;
+                // A section whose name resolves to no row of the document --
+                // kind stayed nullopt -- passed over here with its relocation
+                // table ONLY where something else accounts for it:
+                //   * the UNWIND FAMILIES (`.pdata` / `.xdata`, any `$` or `.`
+                //     suffix: 0x40000040, NOT discardable), read by (7.5) below,
+                //     which accounts for every relocation the two carry;
+                //   * a section the object itself marks NOT FOR THE IMAGE
+                //     (`kScnNotForTheImage`: DISCARDABLE, LNK_REMOVE, LNK_INFO) --
+                //     CodeView `.debug$S` / `.debug$T`, DWARF `.debug_*`, which
+                //     no DSS output carries today
+                //     (D-LK-FOREIGN-NON-ALLOC-SECTIONS-ARE-NOT-CARRIED).
+                // ★ ANY OTHER IS REFUSED, never skipped (P69 fold 3d). An
+                // allocated section with relocations is bytes the program
+                // reads, and the case is not hypothetical: an INITIALIZER or
+                // TERMINATOR TABLE -- GNU's `.ctors` / `.dtors` (`.ctors.NNNNN`
+                // with a priority), MSVC's `.CRT$XC*` / `.CRT$XT*` -- defines no
+                // symbol, so it reaches this point and only here. ✔MEASURED
+                // (lane `xa`'s census, 2325 x86_64 COFF objects of every
+                // producer): those tables are the ONLY sections the rule
+                // refuses, and before it a DSS link skipped each one and the
+                // functions it lists never ran, in silence (mingw-w64 gcc -O0,
+                // whose constructors sit in `.text`; clang-cl's `.CRT$XCU`;
+                // cl's `.CRT$XCU` under a static pointer). A section holding
+                // an EXTERNAL definition never gets here: the defined-symbol
+                // refusal above answers it.
+                // Running them is D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN.
+                namespace win64 = link::format::win64;
+                if (win64::isSectionOf(sec.name, win64::kFunctionTableSection)
+                    || win64::isSectionOf(sec.name, win64::kUnwindInfoSection)
+                    || (sec.chars & kScnNotForTheImage) != 0u) {
+                    continue;
+                }
+                std::string const why =
+                    isInitializerTableName(sec.name)
+                        ? "it is an initializer or terminator table (the addresses of functions a program runs "
+                          "before or after its entry: GNU's `.ctors` / `.dtors`, MSVC's `.CRT$X*`), and a DSS "
+                          "link does not run another compiler's tables: carried as data, every function it "
+                          "lists would never run, and nothing would say so"
+                        : "nothing marks it discardable and it is no unwind table, so it is bytes the program "
+                          "reads, and dropping it with its relocations would change the program in silence";
+                return fail(DiagnosticCode::K_ObjectSectionNotModelled,
+                    "pe::readRelocatableObject: section '" + sec.name + "' carries "
+                    + std::to_string(sec.relocCount) + " relocation(s) and no row of format '"
+                    + std::string{objectFormatSchema.name()} + "' names it; " + why
+                    + ". The object is well-formed; DSS refuses it rather than drop the section.");
             }
             // A KIND-RESOLVED section that reconstructed NO atom. Since (6.45)
             // this is a TEXT section specifically: an anonymous DATA section is

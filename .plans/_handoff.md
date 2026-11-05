@@ -730,15 +730,17 @@ round's close; each checkpoint's commit message says what was and was not run on
   parameter lists its returned type closes (`(T) - 1` under `typedef int T` in `int (*g(int T))(int)` runs 42 as gcc,
   clang and cl do — the regression fixed); a HOME AUDIT of the binder sketch's binding store (its third touch this
   round) made its invariants structural: one declarator walk (src/core/types/declarator_walk.hpp, the second copy
-  deleted), a per-name binding index whose lookup passes each dead binding once across every probe and rollback, a
-  definition's parameters re-bound from its own list's mark, every stack read counted where it is handed out (the
+  deleted), a per-name binding index (its claim that a lookup passes each dead binding once across every probe and
+  rollback was REFUTED by the review of L2b1, W1: a binding that dies between an outer and an inner live snapshot is
+  passed again through a journaled move each inner rollback undoes — L2b2 replaces the index with live-only per-name
+  chains under one LIFO trail), a definition's parameters re-bound from its own list's mark, every stack read counted where it is handed out (the
   span-walk overload of the scope check deleted); the ONE home of "is this type variably modified" (C 6.7.6p3,
   `TypeInterner::isVariablyModified`) and of the comma's constant-fold rule (`DiscardedOperandSequence`, asked by both
   constant evaluators) are built — their other askers move in L2b2, so the four rows stay open with their
   class-closure records stating the sites left. 4 rows amended, none closed, none new. ✔MEASURED by the lane on its
   final bytes, every changed test binary run whole (run 20261104-190117-e19be98e): 12 of 12 on windows-x86_64-release
   (MSVC 19.51), windows-x86_64-debug (GNU 13.2.0), linux-x86_64-debug (GNU 13.3.0) and macos-arm64-debug (AppleClang
-  21.0.0); the read count costs nothing measurable (DSS's release compile of sqlite3.c, parse phase 1.01–1.12 s with
+  21.0.0); the read count costs nothing measurable (DSS's release compile of sqlite3.c + shell.c, parse phase 1.01–1.12 s with
   it, 1.09–1.10 s without). Folded with no conflict. The MERGED tree's five-leg suite, repo-guard and the sweep of the
   fold's 41 arms follow checkpoint 38 (one reading for both folds: their changed test binaries are disjoint).
 - **Checkpoint 38 (2026-11-04) = the harness lane's fold H5, the PE platform runtime**: every stack probe and stack
@@ -763,12 +765,42 @@ round's close; each checkpoint's commit message says what was and was not run on
   anchor guards on the main-hook citation (green once this commit applies its row) and
   `link/test_pe_compiler_support_runtime`'s gcc cases (owed to 3d, by name); the CLI's `dsscp <x>.s` static-library
   route measured through the built binary (one member, its own name). Folded onto checkpoint 37 with the arm registry
-  settled by arm against its true base (41 arms from L2b1, 152 from H5, 1 retired; 1305 arms). The MERGED tree's
-  five-leg suite, repo-guard and the sweep of both folds' arms follow the commit.
+  settled by arm against its true base (41 arms from L2b1, 152 from H5, 1 retired; 1305 arms). ✔MEASURED on the
+  MERGED tree (main checkout, run 20261104-200150-207f5503, `dssharness test`, five legs): 2893 of 2894 on
+  linux-x86_64-debug (GNU 13.3.0), linux-arm64-debug (GNU 13.3.0), macos-arm64-debug (AppleClang 21.0.0),
+  windows-x86_64-debug (GNU 13.2.0) and windows-x86_64-release (MSVC 19.51), each the ONE known red below; repo-guard
+  29 of 29 (run 20261104-222425-566c684b). The sweep of both folds' own arms: macos-arm64-debug 147 of 148 passed (run
+  20261104-200151-40139806; `opt-a-resumed-truncation-is-reported` VIOLATED, an undeclared red in F2's class — back to
+  the harness lane, H6), linux-x86_64-debug 2 of 2 (run 20261104-212632-19d7cd27); the Windows legs' sweep was STOPPED
+  for the 3d fold before it read an arm (it waited on the heavy-leg slots) — those arms sweep `--pending` on 3d's bytes.
 - **KNOWN RED ON CHECKPOINT 38, owed to 3d by name:** `link/test_pe_compiler_support_runtime` —
   `PeCompilerSupportRuntime.AGccObjectsMainHookProbeAndUnwinderEntriesAreDefined` (every leg) and
   `PeCompilerSupportRuntimeNative.AGccProgramPassesOverAForeignExceptionAndRefusesGccsOwn` (Windows),
-  `K_SymbolUndefined '__imp_RaiseException'`, until the link lane's all-object client bind folds.
+  `K_SymbolUndefined '__imp_RaiseException'`, until the link lane's all-object client bind folds. 3d (checkpoint 39)
+  carries that bind: green on the link lane's tree on Linux and the Mac; its Windows cells are read on the merged tree.
+- **Checkpoint 39 (2026-11-04) = the link lane's fold 3d**: a link reads its inputs in the command line's order on every
+  route (the place travels with a definition through every move of its id: `linkPositionOf`, one mover
+  `moveDefinitionId`); an object's entry is called with its arguments, elected by ONE election over every input's
+  candidates (`resolveProgramEntry` + `collectObjectEntryCandidates`), its startup materialized from the document's
+  entry verbs; every library import a foreign object names is bound, whichever input it is (the client half; the
+  `strtol` half is 3e's first item); the names every reference linker defines at an image's header (`__ImageBase`,
+  `__ehdr_start` / `__executable_start`, `__mh_execute_header` / `__mh_dylib_header`, `___dso_handle`) are stated by
+  the documents (`imageDefinedSymbols`), read DIRECT by every compile whose output can end in such an image (the `-c`
+  and static-library routes included) and given the header's address by the writers; COFF Gate 3 walks an associative
+  COMDAT to its root and keeps or drops it with its group, on code as on data (cl's SEH funclets link and run whether
+  their copy is kept or dropped); GNU dotted text subsections resolve by their longest row prefix; a data-only shared
+  library links on every format; the entry trampoline calls the document's `/GS` cookie initializer first; every
+  driver-derived argument of `lowerMergedToAssembly` is pinned on both routes that carry it (17 × 2, 39 TESTs). 16 rows
+  applied: 5 NEW (2 P0 and 1 P1 disclosed as HEAD's debt, fixed or built here; 1 P2 disclosed and not fixed, the
+  non-alloc carry, its own fold in this PR; 1 born closed, a recorded fork), none closed at the fold — the fixed rows
+  close on main's sweep of the fold's arms (113 NEW, 120 CHANGED; 1418 arms). ✔MEASURED by the lane on its final bytes
+  (run 20261104-225658-a4131df1, whole runners, four legs): linux-x86_64-debug and macos-arm64-debug 68 of 68; both
+  Windows legs 66 of 68, each red `K_ImageWriteOpenFailed` past MAX_PATH on the lane worktree's longer paths — the
+  Windows long-path defect (no Win32 file call opens a path of 260 characters or more) the harness lane closes in H6
+  under a row of its own, born and closed there.
+  Folded with one file settled by hand (program.cpp: the lane reads the objects once before every route and packages
+  them inside H5's one packaging step; every other H5 line kept, MEASURED). The merged tree's five-leg suite, repo-guard
+  and the sweep of 3d's arms follow the commit. Fold order now: f26c → H6 → 3e → L2b2 → f26d → H7.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

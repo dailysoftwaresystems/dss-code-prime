@@ -128,6 +128,13 @@ constexpr std::uint16_t IMAGE_SYM_DTYPE_FUNCTION = 0x20;
 // (Object Only)" + "Auxiliary Format 5: Section Definitions").
 constexpr std::uint32_t kScnLnkComdat          = 0x00001000u;
 constexpr std::uint8_t  IMAGE_COMDAT_SELECT_ANY = 2;
+// P69 fold 3d (D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION): the selections that state
+// WHICH copy a link keeps, written back for a section group the unit states the
+// rule of (`AssembledModule::sectionGroupRuleOf`; the reader's mirrors are
+// coff_object_reader.cpp's `kComdatSel*`).
+constexpr std::uint8_t  IMAGE_COMDAT_SELECT_SAME_SIZE   = 3;
+constexpr std::uint8_t  IMAGE_COMDAT_SELECT_EXACT_MATCH = 4;
+constexpr std::uint8_t  IMAGE_COMDAT_SELECT_LARGEST     = 6;
 // IMAGE_SCN_LNK_NRELOC_OVFL (PE Format spec, "Section Flags"): a section with
 // more relocations than the u16 NumberOfRelocations holds sets this flag, writes
 // 0xFFFF in the field, and puts the real count — itself included — in the
@@ -350,14 +357,32 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // a DWARF-style CFA rule change at PC X is a Win64 UNWIND_CODE with CodeOffset X.
 //   * CFA offset grows by 8 and a general register R is stated at the new top
 //     of the stack, at one PC        -> UWOP_PUSH_NONVOL (R)
-//   * CFA offset grows by N          -> UWOP_ALLOC_{SMALL,LARGE} of N
+//   * CFA offset grows by N          -> UWOP_ALLOC_SMALL (N <= 128), else
+//                                       UWOP_ALLOC_LARGE op-info 0 (N/8 in one
+//                                       node) while N/8 fits it, else op-info 1
+//                                       (N UNSCALED in two nodes, to 4 GiB - 8)
 //   * CFA base becomes register R    -> UWOP_SET_FPREG (R, offset 0)
 //   * CFA becomes R + K              -> UWOP_SET_FPREG (R, FrameOffset (C - K)/16),
 //                                       C the stack-pointer-based offset there
 //   * general register R saved at CFA+K
-//                                    -> UWOP_SAVE_NONVOL (R, (K + B)/8)
+//                                    -> UWOP_SAVE_NONVOL (R, (K + B)/8) while
+//                                       the slot is a multiple of 8 whose
+//                                       quotient fits one node, else
+//                                       UWOP_SAVE_NONVOL_FAR (R, K + B UNSCALED,
+//                                       in two nodes)
 //   * 16-byte vector register X saved at CFA+K, a multiple of 16 from RSP
 //                                    -> UWOP_SAVE_XMM128 (X, (K + B)/16)
+//                                       while the quotient fits one node, else
+//                                       UWOP_SAVE_XMM128_FAR (X, K + B,
+//                                       UNSCALED, in two nodes) -- the far REACH;
+//                                       a slot that is not a multiple of 16 has
+//                                       no code in either form and is refused
+// Each long form is the short one's REACH, never another meaning, and the
+// short form is written wherever it can say the value: so do the references
+// (✔MEASURED P69 fold 3d: cl, clang-cl and mingw-w64 gcc write op-info 1 for
+// a 700000-byte frame and op-info 0 below 512 KiB, and a _FAR save only past
+// its short form's reach), which is what lets a foreign object's codes come
+// back byte for byte.
 // B is the CFA's distance above the ESTABLISHER FRAME every save code is
 // measured from: RSP after the prologue's allocation, or the frame register's
 // base once UWOP_SET_FPREG has run (`win64_unwind_decode.hpp` states the rule
@@ -368,11 +393,6 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // also the stack-pointer-based offset at the save; the decoder reads a save
 // stated earlier from the frame's base, as the unwinder does in the body, and
 // this encoder is its inverse.
-//                                       while the quotient fits one node, else
-//                                       UWOP_SAVE_XMM128_FAR (X, K + cfaOffset,
-//                                       UNSCALED, in two nodes) -- the far REACH;
-//                                       a slot that is not a multiple of 16 has
-//                                       no code in either form and is refused
 // Anything else is REFUSED by name -- see `fail` below.
 //
 // CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
@@ -383,10 +403,11 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // The operation numbers are the format's, stated once beside the decoder
 // (`win64_unwind_decode.hpp`), so the two directions cannot disagree on one.
 constexpr std::uint8_t kUwopPushNonvol  = link::format::win64::kUwopPushNonvol;  // 1 node, opinfo = register
-constexpr std::uint8_t kUwopAllocLarge  = link::format::win64::kUwopAllocLarge;  // 2 nodes (opinfo 0, size/8 as u16) — frames ≤ 512 KiB
+constexpr std::uint8_t kUwopAllocLarge  = link::format::win64::kUwopAllocLarge;  // opinfo 0: 2 nodes (size/8 as u16, to 512 KiB - 8); opinfo 1: 3 nodes (size UNSCALED as u32, low word first)
 constexpr std::uint8_t kUwopAllocSmall  = link::format::win64::kUwopAllocSmall;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
 constexpr std::uint8_t kUwopSetFpReg    = link::format::win64::kUwopSetFpReg;    // 1 node, opinfo 0 — CFA base becomes the frame register
 constexpr std::uint8_t kUwopSaveNonvol  = link::format::win64::kUwopSaveNonvol;  // 2 nodes (opinfo=reg, offset/8 as u16)
+constexpr std::uint8_t kUwopSaveNonvolFar = link::format::win64::kUwopSaveNonvolFar; // 3 nodes (opinfo=reg, offset UNSCALED as u32, low word first)
 constexpr std::uint8_t kUwopSaveXmm128    = link::format::win64::kUwopSaveXmm128;    // 2 nodes (opinfo=vector register number, offset/16 as u16)
 constexpr std::uint8_t kUwopSaveXmm128Far = link::format::win64::kUwopSaveXmm128Far; // 3 nodes (opinfo=vector register number, offset UNSCALED as u32, low word first)
 // The width of the one vector save the format can state: UWOP_SAVE_XMM128 and
@@ -508,6 +529,15 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                     "dispatch; UNWIND_INFO states a handler only through the phases "
                     "that call it");
     }
+    // P69 fold 3d: a handler of the DWARF shape names its data by a pointer to
+    // a language-specific data area (`LanguageHandler::dataArea`); UNWIND_INFO
+    // carries the routine's data INLINE, after the codes. Writing the routine
+    // with no data would call it without what it reads.
+    if (languageHandler != nullptr && languageHandler->dataArea.has_value()) {
+        return fail("the function's handler names its data by a pointer to a "
+                    "language-specific data area, and UNWIND_INFO carries a "
+                    "handler's data only inline, after the codes");
+    }
     std::uint8_t frameRegisterByte = 0x00u;   // FrameRegister nibble | FrameOffset nibble
     std::int64_t cfaOffset = cfi.initial.cfaOffset;
     // Set once the CFA's base is a frame register: from there on, a change of
@@ -617,14 +647,21 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                                          kUwopAllocSmall
                                          | ((static_cast<std::uint8_t>(slots) - 1u) << 4)),
                                      {}, 0u});
-            } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
+            } else if (slots <= 0xFFFFu) {  // to 512 KiB - 8 — opinfo 0, one u16 node
                 codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
                                      static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
                                      {static_cast<std::uint16_t>(slots), 0u}, 1u});
+            } else if (delta <= 0xFFFFFFFFll) {  // to 4 GiB - 8 — opinfo 1, the size UNSCALED in two nodes
+                codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
+                                     static_cast<std::uint8_t>(kUwopAllocLarge | (1u << 4)),
+                                     {static_cast<std::uint16_t>(delta & 0xFFFF),
+                                      static_cast<std::uint16_t>((delta >> 16) & 0xFFFF)},
+                                     2u});
             } else {
-                return fail("frame " + std::to_string(delta) + " > 512 KiB needs "
-                            "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
-                            "corpus reaches it (D-WIN64-HUGE-FRAME-ALLOC)");
+                return fail("frame allocation " + std::to_string(delta)
+                            + " bytes at offset " + std::to_string(op.pcOffset)
+                            + " is past the 4 GiB - 8 the longer form of "
+                              "UWOP_ALLOC_LARGE states (its 32-bit operand)");
             }
             break;
         }
@@ -806,21 +843,29 @@ buildFunctionUnwindInfo(CfiFunction const&              cfi,
                               "states a general register's save only as the "
                               "whole 8-byte register");
             }
-            if (slotFromSp < 0 || slotFromSp % 8 != 0) {
+            if (slotFromSp < 0 || slotFromSp > 0xFFFFFFFFll) {
                 return fail("saved-reg slot " + std::to_string(slotFromSp)
                             + " for " + ri->name
-                            + " is negative or not 8-aligned — UWOP_SAVE_NONVOL "
-                              "node is offset/8 from the frame base");
+                            + " is negative or past the 32-bit offset "
+                              "UWOP_SAVE_NONVOL_FAR carries");
             }
-            if (slotFromSp / 8 > 0xFFFF) {
-                return fail("saved-reg slot " + std::to_string(slotFromSp)
-                            + " exceeds the UWOP_SAVE_NONVOL u16 node range "
-                              "(UWOP_SAVE_NONVOL_FAR not emitted)");
+            // The short form states a multiple of 8 whose quotient fits one
+            // node; the FAR form states the slot UNSCALED, and the
+            // documentation names no alignment for it (it does for the vector
+            // forms, above), so it says every other slot exactly.
+            if (slotFromSp % 8 == 0 && slotFromSp / 8 <= 0xFFFF) {
+                codes.push_back(Code{
+                    static_cast<std::uint8_t>(op.pcOffset),
+                    static_cast<std::uint8_t>(kUwopSaveNonvol | (ri->hwEncoding << 4)),
+                    {static_cast<std::uint16_t>(slotFromSp / 8), 0u}, 1u});
+            } else {
+                codes.push_back(Code{
+                    static_cast<std::uint8_t>(op.pcOffset),
+                    static_cast<std::uint8_t>(kUwopSaveNonvolFar | (ri->hwEncoding << 4)),
+                    {static_cast<std::uint16_t>(slotFromSp & 0xFFFF),
+                     static_cast<std::uint16_t>((slotFromSp >> 16) & 0xFFFF)},
+                    2u});
             }
-            codes.push_back(Code{
-                static_cast<std::uint8_t>(op.pcOffset),
-                static_cast<std::uint8_t>(kUwopSaveNonvol | (ri->hwEncoding << 4)),
-                {static_cast<std::uint16_t>(slotFromSp / 8), 0u}, 1u});
             break;
         }
         default:
@@ -1087,6 +1132,12 @@ encode(AssembledModule const&    module,
                  + "' (kind="
                  + std::string{link::objectFormatBackendName(fmt.backend())}
                  + ")");
+        return {};
+    }
+    // The FIRST question about what the image holds, asked once for every kind: a program must hold the
+    // instruction it starts at; a DLL, whose document declares no entry, may hold its data alone, and is then
+    // written with NO code section, as link.exe `/DLL /NOENTRY` writes one (`encodeExec`'s `.text`).
+    if (!link::format::anImageThatStartsAProgramHoldsAnInstruction(module, fmt, "pe::encode", reporter)) {
         return {};
     }
 
@@ -1475,6 +1526,95 @@ encode(AssembledModule const&    module,
         if (isWeakDefinition(d.symbol)) weakDataItemIndices.push_back(i);
     }
 
+    // ── A SECTION GROUP, WRITTEN BACK (P69 fold 3d; the writer half of the COFF
+    //    reader's ASSOCIATIVE selection, `coff_object_reader.cpp` Gate 3) ─────
+    // A unit read from a COFF object states a SECTION GROUP for a select-any
+    // COMDAT and every section that goes with it
+    // (`AssembledModule::sectionGroupOfInputSection`): ✔MEASURED 2026-10-21,
+    // clang-cl 19.1.5 /O2 writes a C99 `inline` function's dense-switch jump
+    // table in an `.rdata` ASSOCIATIVE to the function's select-any `.text`. A
+    // relocatable artifact hands the kept group on AS a group, so the link that
+    // consumes it keeps the table iff it keeps the copy the table belongs to:
+    // the LEADER -- the select-any definition the signature names -- is its ANY
+    // COMDAT, as every select-any definition is, and every other member item is
+    // a COMDAT of its own, ASSOCIATIVE to the leader's section. Written into a
+    // shared section instead, the table would outlive a copy the next link
+    // discards, naming bytes that are not in the link -- which lld-link refuses
+    // ("relocation against symbol in discarded section"; the
+    // `supersededDefinition` key's select-any measurement,
+    // `object_format_schema.hpp`). Refused by name, each before a byte is laid out:
+    //   * a member item whose group's signature names no select-any definition
+    //     of the module: nothing would decide whether it is linked;
+    //   * a member that is a FUNCTION other than the leader: this writer places
+    //     a function in a section of its own only as a select-any copy, and no
+    //     producer measured writes such a member.
+    // `dataItems` indices of the members other than a leader, ascending, and the
+    // definition each goes with.
+    std::vector<std::size_t>                    groupMemberDataIndices;
+    std::unordered_map<std::size_t, SymbolId>   leaderOfGroupMember;
+    if (!module.sectionGroupOfInputSection.empty()) {
+        auto const groupOf = [&](std::optional<InputSectionSlice> const& slice) -> std::string_view {
+            if (!slice.has_value()) return {};
+            auto const it = module.sectionGroupOfInputSection.find(slice->section);
+            return it == module.sectionGroupOfInputSection.end() ? std::string_view{}
+                                                                 : std::string_view{it->second};
+        };
+        // The definition each name names: its first row, as every name lookup here reads it.
+        std::unordered_map<std::string_view, SymbolId> definitionNamed;
+        for (ModuleSymbol const& ms : module.symbols) {
+            if (!ms.name.empty()) definitionNamed.try_emplace(ms.name, ms.symbol);
+        }
+        // The select-any definition a signature names, when the module holds one.
+        auto const leaderOf = [&](std::string_view signature) -> std::optional<SymbolId> {
+            auto const it = definitionNamed.find(signature);
+            if (it == definitionNamed.end() || !isWeakDefinition(it->second)) return std::nullopt;
+            return it->second;
+        };
+        for (auto const& fn : module.functions) {
+            std::string_view const signature = groupOf(fn.inputSection);
+            if (signature.empty()) continue;
+            auto const leader = leaderOf(signature);
+            if (leader.has_value() && *leader == fn.symbol) continue;
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): function '{}' is a member of section group "
+                             "'{}' and not its select-any definition. This writer places a "
+                             "function in a section of its own only as a select-any copy, so "
+                             "it cannot write this one to go with its group's copy; refusing "
+                             "rather than write it into the shared section, where it would "
+                             "outlive a copy the next link discards.",
+                             objNames.definedName(fn.symbol, "sym_"), signature));
+            return {};
+        }
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            AssembledData const& d = module.dataItems[i];
+            std::string_view const signature = groupOf(d.inputSection);
+            if (signature.empty()) continue;
+            auto const leader = leaderOf(signature);
+            if (leader.has_value() && *leader == d.symbol) continue;   // the leader: its own ANY COMDAT
+            if (!leader.has_value()) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("pe::encode (Obj): data item '{}' is a member of section "
+                                 "group '{}', and no select-any definition of this object is "
+                                 "named '{}' -- nothing would decide whether the item is "
+                                 "linked; refusing rather than write it into a shared section.",
+                                 d.symbol == SymbolId{} ? std::string{"(anonymous)"}
+                                                        : objNames.definedName(d.symbol, "sym_"),
+                                 signature, signature));
+                return {};
+            }
+            groupMemberDataIndices.push_back(i);
+            leaderOfGroupMember.emplace(i, *leader);
+        }
+        // A member is written ASSOCIATIVE, never as a select-any copy of its own.
+        std::erase_if(weakDataItemIndices,
+                      [&](std::size_t i) { return leaderOfGroupMember.contains(i); });
+    }
+    // Every item laid out in a section of its own, ascending (the shared layouts skip them).
+    std::vector<std::size_t> ownSectionDataItemIndices = weakDataItemIndices;
+    ownSectionDataItemIndices.insert(ownSectionDataItemIndices.end(),
+                                     groupMemberDataIndices.begin(), groupMemberDataIndices.end());
+    std::sort(ownSectionDataItemIndices.begin(), ownSectionDataItemIndices.end());
+
     // Lay out each data-section kind via the shared kind-parameterized
     // substrate (`exec_data_section.hpp`) — the SAME helper the ELF /
     // Mach-O / PE-exec arms use. The alignment floor is 1 for every PE
@@ -1490,19 +1630,19 @@ encode(AssembledModule const&    module,
     auto const rodataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         /*alignFloor=*/1, "pe::encode (Obj)", reporter,
-        /*allowItemRelocations=*/false, weakDataItemIndices);
+        /*allowItemRelocations=*/false, ownSectionDataItemIndices);
     if (!rodataLayoutOpt.has_value()) return {};
     auto const& rodataLayout = *rodataLayoutOpt;
     auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         /*alignFloor=*/1, "pe::encode (Obj)", reporter,
-        /*allowItemRelocations=*/true, weakDataItemIndices);
+        /*allowItemRelocations=*/true, ownSectionDataItemIndices);
     if (!dataLayoutOpt.has_value()) return {};
     auto& dataLayout = *dataLayoutOpt;
     auto const bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
         /*alignFloor=*/1, "pe::encode (Obj)", reporter,
-        /*allowItemRelocations=*/false, weakDataItemIndices);
+        /*allowItemRelocations=*/false, ownSectionDataItemIndices);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
     // Unlike the PE-exec arm (which FOLDS relro into `.rdata` bytes), the
@@ -1513,7 +1653,7 @@ encode(AssembledModule const&    module,
     auto relroLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::RelRoConst,
         /*alignFloor=*/1, "pe::encode (Obj)", reporter,
-        /*allowItemRelocations=*/true, weakDataItemIndices);
+        /*allowItemRelocations=*/true, ownSectionDataItemIndices);
     if (!relroLayoutOpt.has_value()) return {};
     auto& relroLayout = *relroLayoutOpt;
 
@@ -1724,7 +1864,29 @@ encode(AssembledModule const&    module,
         std::uint32_t relocPointer = 0;
     };
     std::vector<ComdatSectionRecord> comdats;
-    comdats.reserve(weakFuncIndices.size() + weakDataItemIndices.size());
+    comdats.reserve(weakFuncIndices.size() + weakDataItemIndices.size()
+                    + groupMemberDataIndices.size());
+    // P69 fold 3d (D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION): the selection a
+    // select-any definition's COMDAT states -- the rule of the section group it
+    // leads, where the unit states one (a copy kept as the largest, or the first
+    // of equal bytes or of equal size), else ANY. Written back so the link that
+    // consumes this object keeps the copy the rule picks.
+    auto const selectionOf = [&](std::optional<InputSectionSlice> const& slice) -> std::uint8_t {
+        if (!slice.has_value()) return IMAGE_COMDAT_SELECT_ANY;
+        auto const group = module.sectionGroupOfInputSection.find(slice->section);
+        if (group == module.sectionGroupOfInputSection.end()) return IMAGE_COMDAT_SELECT_ANY;
+        auto const rule = module.sectionGroupRuleOf.find(group->second);
+        if (rule == module.sectionGroupRuleOf.end() || rule->second.leader != slice->section) {
+            return IMAGE_COMDAT_SELECT_ANY;
+        }
+        switch (rule->second.keep) {
+            case SectionGroupKeep::FirstInLinkOrder:  return IMAGE_COMDAT_SELECT_ANY;
+            case SectionGroupKeep::Largest:           return IMAGE_COMDAT_SELECT_LARGEST;
+            case SectionGroupKeep::FirstOfEqualBytes: return IMAGE_COMDAT_SELECT_EXACT_MATCH;
+            case SectionGroupKeep::FirstOfEqualSize:  return IMAGE_COMDAT_SELECT_SAME_SIZE;
+        }
+        return IMAGE_COMDAT_SELECT_ANY;
+    };
 
     // A weak FUNCTION's COMDAT carries the `.text` row's Characteristics
     // verbatim (that row declares its own align class -- see the
@@ -1740,6 +1902,7 @@ encode(AssembledModule const&    module,
             static_cast<std::uint64_t>(module.functions[fi].bytes.size());
         rec.fnIndex = fi;
         rec.fnBytes = module.functions[fi].bytes;
+        rec.selection = selectionOf(module.functions[fi].inputSection);
         comdats.push_back(std::move(rec));
     }
     // A weak DATA item's COMDAT is laid out by the SAME shared substrate the
@@ -1747,8 +1910,9 @@ encode(AssembledModule const&    module,
     // deliberate rather than a hand-rolled one-item layout: it inherits the
     // zero-fill rule, the reloc-bearing-rodata refusal and the alignment
     // arithmetic, so a weak item can never be validated by a weaker standard
-    // than its strong sibling one line away.
-    for (std::size_t const wi : weakDataItemIndices) {
+    // than its strong sibling one line away. A section group's member item
+    // (the block above) is laid out the same way, by the same lambda.
+    auto const dataComdatRecord = [&](std::size_t wi) -> std::optional<ComdatSectionRecord> {
         AssembledData const& di = module.dataItems[wi];
         std::vector<std::size_t> allButThis;
         allButThis.reserve(module.dataItems.size());
@@ -1780,7 +1944,43 @@ encode(AssembledModule const&    module,
         rec.zeroFill        = isZeroFill(di.section);
         rec.spanSize        = layoutOpt->spanSize;
         rec.dataLayout      = std::move(*layoutOpt);
-        comdats.push_back(std::move(rec));
+        return rec;
+    };
+    for (std::size_t const wi : weakDataItemIndices) {
+        auto rec = dataComdatRecord(wi);
+        if (!rec.has_value()) return {};
+        rec->selection = selectionOf(module.dataItems[wi].inputSection);
+        comdats.push_back(std::move(*rec));
+    }
+    // A section group's members, AFTER every select-any record: an associative
+    // COMDAT must follow the section it goes with (link.exe refuses a forward
+    // association, LNK1243 -- see the unwind ordinals below), and ordinals are
+    // assigned in this vector's order.
+    if (!groupMemberDataIndices.empty()) {
+        std::unordered_map<SymbolId, std::size_t> comdatOfDefinition;
+        for (std::size_t ci = 0; ci < comdats.size(); ++ci) {
+            comdatOfDefinition.emplace(comdats[ci].symId, ci);
+        }
+        for (std::size_t const mi : groupMemberDataIndices) {
+            auto const leader = comdatOfDefinition.find(leaderOfGroupMember.at(mi));
+            if (leader == comdatOfDefinition.end()) {
+                // The leader is a select-any definition (checked above), and every
+                // one is written as a COMDAT of its own -- unless it is no item.
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("pe::encode (Obj): the select-any definition '{}' that a "
+                                 "section group's member goes with is written in no COMDAT "
+                                 "section of this object, so the member has no section to "
+                                 "go with. Substrate-invariant violation.",
+                                 objNames.definedName(leaderOfGroupMember.at(mi), "sym_")));
+                return {};
+            }
+            auto rec = dataComdatRecord(mi);
+            if (!rec.has_value()) return {};
+            rec->selection          = IMAGE_COMDAT_SELECT_ASSOCIATIVE;
+            rec->associatedComdat   = leader->second;
+            rec->hasCanonicalSymbol = rec->symId != SymbolId{};
+            comdats.push_back(std::move(*rec));
+        }
     }
     // `module.functions` index -> its COMDAT record, for the walks that must
     // follow a weak function's body into its own section: the block symbols
@@ -2584,6 +2784,7 @@ encode(AssembledModule const&    module,
     // Appended BEFORE the extern scan so a relocation against a weak
     // definition resolves to it rather than fabricating an undefined symbol.
     for (auto& rec : comdats) {
+        if (rec.selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE) continue;   // a group member: the loop below
         if (symIdxBySymbol.contains(rec.symId)) {
             emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
                  std::format("pe::encode (Obj): weak definition "
@@ -2599,7 +2800,7 @@ encode(AssembledModule const&    module,
         secDef.storageClass     = IMAGE_SYM_CLASS_STATIC;
         secDef.hasSectionDefAux = true;
         secDef.auxLength        = static_cast<std::uint32_t>(rec.spanSize);
-        secDef.auxSelection     = IMAGE_COMDAT_SELECT_ANY;
+        secDef.auxSelection     = rec.selection;   // ANY, or the rule its group is kept by
         rec.sectionDefEntry     = symEntries.size();
         appendEntry(std::move(secDef));
 
@@ -2620,6 +2821,66 @@ encode(AssembledModule const&    module,
                                 canonicalIdx)) {
             return {};
         }
+    }
+    // A SECTION GROUP's members (P69 fold 3d; the group block at the data
+    // layouts): each one's section-definition record states ASSOCIATIVE and the
+    // ordinal of the select-any section it goes with, and its item -- a table,
+    // read from a section that held no name of its own -- keeps the record the
+    // shared sections would give it: STATIC for a module-private item, EXTERNAL
+    // otherwise, and none for an anonymous one. A member with more than one name
+    // is refused by name rather than written with one of them.
+    for (auto& rec : comdats) {
+        if (rec.selection != IMAGE_COMDAT_SELECT_ASSOCIATIVE) continue;
+        std::int16_t const parent = comdats.at(*rec.associatedComdat).sectionNumber;
+        if (parent >= rec.sectionNumber) {   // the ordinals are assigned leaders first
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): the section group member in section {} goes "
+                             "with COMDAT section {}, which does not precede it -- link.exe "
+                             "refuses such an object (LNK1243). Substrate-invariant violation.",
+                             rec.sectionNumber, parent));
+            return {};
+        }
+        CoffSymEntry secDef;
+        secDef.name             = rec.sectionName;
+        secDef.sectionNumber    = rec.sectionNumber;
+        secDef.storageClass     = IMAGE_SYM_CLASS_STATIC;
+        secDef.hasSectionDefAux = true;
+        secDef.auxLength        = static_cast<std::uint32_t>(rec.spanSize);
+        secDef.auxSelection     = IMAGE_COMDAT_SELECT_ASSOCIATIVE;
+        secDef.auxNumber        = static_cast<std::uint16_t>(parent);
+        rec.sectionDefEntry     = symEntries.size();
+        appendEntry(std::move(secDef));
+        if (!rec.hasCanonicalSymbol) continue;
+        if (symIdxBySymbol.contains(rec.symId)) {
+            emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                 std::format("pe::encode (Obj): section group member SymbolId={{ {} }} "
+                             "collides with an already-emitted symbol - a defined "
+                             "symbol's SymbolId must be unique.",
+                             rec.symId.v));
+            return {};
+        }
+        std::size_t names = 0;
+        for (ModuleSymbol const& ms : module.symbols) {
+            if (ms.symbol == rec.symId && !ms.name.empty()) ++names;
+        }
+        if (names > 1) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): the section group member '{}' carries {} "
+                             "names; this writer writes a member as one record in its "
+                             "associative section, so it would drop all but one -- refusing "
+                             "rather than lose a name.",
+                             objNames.definedName(rec.symId, "sym_"), names));
+            return {};
+        }
+        CoffSymEntry sym;
+        sym.name          = objNames.definedName(rec.symId, "sym_");
+        sym.value         = 0;   // the section holds the one item
+        sym.sectionNumber = rec.sectionNumber;
+        sym.type          = rec.symType;
+        sym.storageClass  = objNames.definedBinding(rec.symId) == SymbolBinding::Local
+                                ? IMAGE_SYM_CLASS_STATIC
+                                : IMAGE_SYM_CLASS_EXTERNAL;
+        symIdxBySymbol.emplace(rec.symId, appendEntry(std::move(sym)));
     }
 
     // ── Unwind sections' own STATIC section symbols ────────────
@@ -3318,21 +3579,23 @@ encode(AssembledModule const&    module,
                                      targetSchema.name()));
                     return false;
                 }
-                // A data pointer slot needs a plain LINEAR absolute fixup
-                // with a concrete width. `pcRelative` alone is NOT a
-                // sufficient discriminator (it is a Linear-only field —
-                // the loader forces every non-Linear formula row to
-                // pcRelative=false), so reject any non-Linear kind
-                // outright (the c147 Mach-O gate, copied verbatim).
+                // A data field is a LINEAR fixup with a concrete width: an
+                // absolute one (a pointer slot) or a PC-RELATIVE one — the
+                // self-relative entries of a jump table, which MinGW gcc -O0
+                // and -O1 keep in `.rdata` as REL32 (✔MEASURED 2026-10-21),
+                // and which a relocatable link of such an object hands on as
+                // REL32 against its target (P69 fold 3d; until then refused
+                // here). A non-Linear kind would apply instruction-formula
+                // semantics to data bytes (the c147 Mach-O gate).
                 if (tri->formulaKind != RelocFormulaKind::Linear
-                    || tri->pcRelative || tri->widthBytes == 0) {
+                    || tri->widthBytes == 0) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format("pe::encode (Obj): {} data item "
                                      "SymbolId={{ {} }} relocation '{}' "
-                                     "is pc-relative, zero-width, or a "
-                                     "non-linear instruction fixup - a "
-                                     "data pointer needs a plain absolute "
-                                     "fixup with a concrete write width.",
+                                     "is zero-width or a non-linear "
+                                     "instruction fixup - a data field is "
+                                     "a LINEAR fixup with a concrete write "
+                                     "width.",
                                      sectionLabel, di.symbol.v, tri->name));
                     return false;
                 }
@@ -3476,8 +3739,9 @@ encode(AssembledModule const&    module,
     // its header the flag and 0xFFFF (`numberOfRelocationsField`,
     // `relocationOverflowFlag`, where the headers are written). It used to be
     // REFUSED here as a capacity this writer did not have; ✔MEASURED
-    // 2026-10-20, mingw-w64 gcc -O0 writes a 98306-relocation `.text` for one
-    // example of this corpus, and GNU ld links it. The count record is laid
+    // 2026-10-20 (re-read 2026-10-21), mingw-w64 gcc -O0 writes a
+    // 98307-relocation `.text` for one example of this corpus, behind a count
+    // record of 98308, and GNU ld links it. The count record is laid
     // out with the table, so every pointer computed from `relocs.size()` below
     // already counts it. `count` keeps the RELOCATIONS' number.
     auto const prependCountRecord = [&](std::vector<std::uint8_t>& relocs,
@@ -4348,14 +4612,8 @@ encodeExec(AssembledModule const&    module,
         funcTextStart.push_back(start);
         text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
     }
-
-    if (text.empty()) {
-        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-             "pe::encodeExec: `.text` is empty — every "
-             "AssembledFunction contributed zero bytes. An exec "
-             "with no instructions would crash at entry.");
-        return {};
-    }
+    // (Whether this image may hold no instruction was `pe::encode`'s first question: a DLL of data alone reaches
+    // here with `text` empty and is written with no code section, `.text` below.)
 
     // ── (a2) Reserve the import-thunk block at the tail of .text ──
     // D-FFI-PE-IMPORT-THUNK: one code thunk per FUNCTION extern (`jmp
@@ -6041,8 +6299,12 @@ encodeExec(AssembledModule const&    module,
             // base-relocation form this writer emits and a 4-byte absolute
             // would need HIGHLOW -- shipping it uncollected is the silent
             // wrong-address this belt exists to stop.
+            // The field is one the loader must move only when it holds an
+            // address (`loaderRebasesTheField`): an image-relative field (an
+            // RVA, COFF's ADDR32NB — cl's jump tables in `.text`) does not
+            // move, and needs no row (P69 fold 3d, review F4).
             if (imageIsRelocatableAtLoad && tri != nullptr
-             && !tri->pcRelative && !tri->tls && tri->widthBytes != 8) {
+             && loaderRebasesTheField(*tri) && tri->widthBytes != 8) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format(
                          "pe::encodeExec: function SymbolId={{ {} }} "
@@ -6253,6 +6515,16 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
     }
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): each name the
+    // image defines (`AssembledModule::imageDefinedSymbols`), at its address of
+    // the image. `imageHeader` is the image's first byte -- the DOS header, at
+    // the image base -- so cl's `lea __ImageBase(%rip)` reaches it as every
+    // `.text` reference reaches a VA, an image-relative field reads it as RVA 0,
+    // and an absolute field is rebased with the image like every other.
+    if (!link::format::addImageDefinedSymbolVas(module.imageDefinedSymbols, oh.imageBase, symbolVa,
+                                                "pe::encodeExec", reporter)) {
+        return {};
+    }
     // ── ★ D-CSUBSET-THREAD-LOCAL backstop (audit CRIT-2): `symbolVa` is now
     // secrel-poisoned for `tlsSymbols` members (their entries are template
     // OFFSETS, not VAs). Police EVERY reloc BEFORE any patch — the exact
@@ -6321,9 +6593,11 @@ encodeExec(AssembledModule const&    module,
             "pe::encodeExec", reporter)) {
         return {};
     }
+    // An image-relative field (COFF's ADDR32NB) is measured from the image's
+    // base — the one this image states (P69 fold 3d, review F4).
     if (!link::format::applyExecRelocations(
             text, module, funcTextStart, symbolVa, targetSchema,
-            sectionVa, "pe::encodeExec", reporter)) {
+            sectionVa, "pe::encodeExec", reporter, oh.imageBase)) {
         return {};
     }
 
@@ -6373,9 +6647,12 @@ encodeExec(AssembledModule const&    module,
     // close.
     //
     // ★★ THE SITES COME FROM THE RELOCATION RECORDS, NEVER FROM SCANNING
-    // `.text`. The predicate is the schema's own `!pcRelative && !tls` -- the
-    // SAME one the belt above uses, so the two cannot disagree about what
-    // "absolute" means. Scanning code for plausible-looking addresses would be
+    // `.text`. The predicate is the schema's own `loaderRebasesTheField` -- the
+    // SAME one the belt above, the data-item collector below and the address
+    // slot (`addressSlotCandidates`) ask, so none of them can disagree about what
+    // "absolute" means. (Until P69 fold 3d this one and the belt asked
+    // `!pcRelative && !tls`, without `imageRelative`, while the address slot
+    // asked all three: review F4.) Scanning code for plausible-looking addresses would be
     // the opposite failure and a worse one: a base relocation applied to bytes
     // that are not an address CORRUPTS the instruction at load. Ask what the
     // value DECIDES, not what it looks like.
@@ -6387,7 +6664,7 @@ encodeExec(AssembledModule const&    module,
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
         for (auto const& rel : module.functions[fi].relocations) {
             auto const* tri = targetSchema.relocationInfo(rel.kind);
-            if (tri == nullptr || tri->pcRelative || tri->tls) continue;
+            if (tri == nullptr || !loaderRebasesTheField(*tri)) continue;
             if (tri->widthBytes != 8) continue;   // the belt above refused it
             baseRelocSiteRvas.push_back(
                 secText.virtualAddress
@@ -6543,12 +6820,24 @@ encodeExec(AssembledModule const&    module,
                      + " has no TargetRelocationInfo on the target schema.");
                 return {};
             }
-            if (tri->pcRelative || tri->widthBytes == 0) {
+            if (tri->formulaKind != RelocFormulaKind::Linear || tri->widthBytes == 0) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::string{"pe::encodeExec: data-item SymbolId #"}
                      + std::to_string(di.symbol.v) + " relocation '" + tri->name
-                     + "' is pc-relative or has widthBytes=0 — a data pointer requires an "
-                       "absolute fixup with a concrete write width.");
+                     + "' is zero-width or an instruction fixup — a data field is a "
+                       "LINEAR fixup with a concrete write width.");
+                return {};
+            }
+            // A thread-local kind states an offset into a thread's block, which
+            // no data item of this image holds: refused by name, never written
+            // as an address nor left unrebased.
+            if (tri->tls) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v) + " relocation '" + tri->name
+                     + "' is thread-local — a data item's field holds an address, a "
+                       "distance from itself, or an image-relative offset, never a "
+                       "thread-local one.");
                 return {};
             }
             std::size_t const itemBase = itemBaseOff;
@@ -6563,13 +6852,36 @@ encodeExec(AssembledModule const&    module,
                      + " bytes.");
                 return {};
             }
-            std::uint64_t const value =
-                static_cast<std::uint64_t>(
-                    static_cast<std::int64_t>(sIt->second) + rel.addend);
+            // The field's value is the schema formula's (`linearFieldValue`, the one
+            // every writer of a Linear field asks — P69 fold 3d): an absolute field
+            // holds the target's address; a PC-RELATIVE one its distance from the
+            // field itself (the self-relative entries of a jump table, which MinGW
+            // gcc -O0 and -O1 keep in `.rdata` as REL32 — ✔MEASURED 2026-10-21);
+            // an IMAGE-RELATIVE one its distance from the image's base (an RVA).
+            // Every field is checked against its row's range (`linearFieldHolds`):
+            // a REL32 entry reaching past ±2 GiB is refused, never wrapped.
+            std::uint64_t const fieldVa =
+                oh.imageBase + itemSecRva + static_cast<std::uint64_t>(patchOff);
+            // An image always states its base, so the value always exists.
+            std::int64_t const signedValue =
+                *linearFieldValue(*tri, sIt->second, rel.addend, fieldVa, oh.imageBase);
+            if (std::string why; !linearFieldHolds(*tri, signedValue, why)) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::string{"pe::encodeExec: data-item SymbolId #"}
+                     + std::to_string(di.symbol.v) + " relocation '"
+                     + tri->name + "' value " + std::to_string(signedValue) + " is outside "
+                     + why + " — would silently truncate.");
+                return {};
+            }
+            std::uint64_t const value = static_cast<std::uint64_t>(signedValue);
             for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
                 (*patchBuf)[patchOff + b] =
                     static_cast<std::uint8_t>((value >> (8u * b)) & 0xFFu);
             }
+            // A distance — from the field (pc-relative) or from the image's base
+            // (image-relative) — moves with neither end, so no rebase touches it
+            // (`loaderRebasesTheField`, the one predicate the `.text` half asks too).
+            if (!loaderRebasesTheField(*tri)) continue;
             // Record the base-relocation site. Only an 8-byte absolute fixup maps to
             // IMAGE_REL_BASED_DIR64; a different-width absolute data reloc has no DIR64
             // representation (HIGHLOW/etc. are anchored for when a 32-bit-abs data
@@ -6788,8 +7100,15 @@ encodeExec(AssembledModule const&    module,
         kDosHeaderSize + kDosStubSize + kPeSigSize
         + kFileHeaderSize + kOptionalHeader64Size;
 
-    // .text section header (always present).
-    {
+    // .text section header — present when the image holds a byte of code: a function's, or an import thunk's. A
+    // DLL of data alone has none and is written with NO code section, as link.exe `/DLL /NOENTRY` writes it
+    // (✔MEASURED, P69 fold 3d, cl /LD + link.exe 14.44 /NOENTRY: `.rdata` at 0x1000 and `.data`, SizeOfCode 0,
+    // BaseOfCode 0x1000, AddressOfEntryPoint 0, and a program reading the DLL's datum exits 42). The chain below
+    // then starts at the address `.text` would have held, as link.exe's `.rdata` does: `textVirtualSizeE` and
+    // `textRawSize` are 0, and BaseOfCode stays that address.
+    bool const writesACodeSection = !text.empty();
+    std::optional<std::size_t> textHdrIdx;
+    if (writesACodeSection) {
         PeSectionHeader hText{};
         hText.name                  = encodeSectionName(secText.name, 0);
         hText.virtualSize           = static_cast<std::uint32_t>(text.size());
@@ -6800,9 +7119,9 @@ encodeExec(AssembledModule const&    module,
         hText.numberOfRelocations   = 0;
         hText.numberOfLinenumbers   = 0;
         hText.characteristics       = secText.type;
+        textHdrIdx = sectionHeaders.size();
         sectionHeaders.push_back(hText);
     }
-    std::size_t const textHdrIdx = 0;
     // .rdata section header (when AssembledData has Rodata items).
     // Characteristics from the format schema's Rodata row
     // (0x40000040 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_
@@ -7019,8 +7338,10 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const textRawSize =
         static_cast<std::uint32_t>(alignUp(text.size(), fileAlign));
     std::uint32_t const textRawPointer = sizeOfHeaders;
-    sectionHeaders[textHdrIdx].sizeOfRawData    = textRawSize;
-    sectionHeaders[textHdrIdx].pointerToRawData = textRawPointer;
+    if (textHdrIdx.has_value()) {
+        sectionHeaders[*textHdrIdx].sizeOfRawData    = textRawSize;
+        sectionHeaders[*textHdrIdx].pointerToRawData = textRawPointer;
+    }
     // .rdata raw size + file pointer (D-LK2-RODATA): file-aligned,
     // placed immediately after .text. Indices captured at push
     // time (DataSectionLayout::headerIndex) — no magic-arithmetic

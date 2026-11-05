@@ -1372,14 +1372,130 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // -- (6.7) THE UNWIND SECTION, DECODED BEFORE ANY RELOCATION IS ROUTED, AND
+    //          THE DATA AREAS IT POINTS AT MADE ITEMS ------------------------
+    //
+    // P69 fold 3d. Step (8) binds each FDE to its function, its personality
+    // routine and its language-specific data area. The area lives in a section
+    // of its own -- `.gcc_except_table` from gcc and clang (✔MEASURED, the
+    // `elf_cleanup_handler_*.o` fixtures) -- that no symbol shapes and no
+    // document row names, so the passes above made NO item of it, and step (7)
+    // routes a relocation only into an item: a C++ type table's relocations
+    // would have gone nowhere. Each such section is therefore made ONE data
+    // item of its whole extent HERE, before (7). It is found by the ROLE the
+    // unwind table gives it -- an FDE's data-area field points into it -- and
+    // never by its name, and its kind is the one its flags give, through this
+    // reader's own `resolveSectionKind`. Its relocations then route like any
+    // datum's, and (8) binds the field to {that item, an offset in it}. Kept
+    // whole because nothing outside the area's own reader (the personality
+    // routine) knows where one function's area ends: the format's input
+    // sections are units of placement anyway.
+    //
+    // ★ THE SECTION IS FOUND BY ITS UNIVERSAL `kind`, NEVER BY THE NAME
+    //   `.eh_frame`. A format that declares no `unwind` row simply carries
+    //   nothing, exactly as it did before -- the vocabulary is the switch.
+    Shdr const* unwindSec = nullptr;
+    std::optional<link::format::DecodedEhFrame> decodedUnwind;
+    {
+        for (auto const& s : secs) {
+            if (!s.kind.has_value() || *s.kind != SectionKind::Unwind) continue;
+            if (s.size == 0u) continue;
+            if (unwindSec != nullptr) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: object carries TWO unwind "
+                    "sections ('" + unwindSec->name + "' and '" + s.name
+                    + "'); their records would have to be merged into one "
+                      "description per function and this reader has no rule "
+                      "for which wins.");
+            }
+            unwindSec = &s;
+        }
+        if (unwindSec != nullptr) {
+            if (rangeExceedsBuffer(unwindSec->offset, unwindSec->size,
+                                   bytes.size())) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: unwind section '"
+                    + unwindSec->name + "' body runs past the end of the file.");
+            }
+            decodedUnwind = link::format::decodeEhFrame(
+                bytes.subspan(static_cast<std::size_t>(unwindSec->offset),
+                              static_cast<std::size_t>(unwindSec->size)),
+                link::format::dwarfRegisterMappingOf(targetSchema),
+                "elf::readRelocatableObject", reporter);
+            if (!decodedUnwind.has_value()) return std::nullopt;  // already reported
+
+            std::unordered_set<std::uint64_t> areaFields;
+            for (auto const& fde : decodedUnwind->fdes) {
+                if (fde.dataArea.has_value()) areaFields.insert(fde.dataArea->fieldOffset);
+            }
+            std::uint16_t const unwindIdx = static_cast<std::uint16_t>(
+                static_cast<std::size_t>(unwindSec - secs.data()));
+            for (auto const& rela : secs) {
+                if (areaFields.empty()) break;
+                if (rela.type != kShtRela || rela.info != unwindIdx) continue;
+                std::size_t const n = static_cast<std::size_t>(rela.size / kRelaSz);
+                for (std::size_t e = 0; e < n; ++e) {
+                    std::size_t const ro = static_cast<std::size_t>(rela.offset) + e * kRelaSz;
+                    if (!areaFields.contains(rdU64(bytes, ro + 0))) continue;
+                    auto const symIdx = static_cast<std::uint32_t>(rdU64(bytes, ro + 8) >> 32);
+                    // Whatever names no section here is (8)'s to bind or refuse.
+                    if (symIdx >= syms.size()) continue;
+                    Sym const& tsym = syms[ownerOf(symIdx)];
+                    if (tsym.shndx == kShnUndef || tsym.shndx >= kShnLoReserve
+                        || tsym.shndx >= eShnum) {
+                        continue;
+                    }
+                    std::uint16_t const si = tsym.shndx;
+                    auto const hasAtoms = [si](auto const& bySec) {
+                        auto const it = bySec.find(si);
+                        return it != bySec.end() && !it->second.empty();
+                    };
+                    if (hasAtoms(funcIntervalsBySec) || hasAtoms(dataIntervalsBySec)) continue;
+                    Shdr const& area = secs[si];
+                    std::optional<SectionKind> const kind = resolveSectionKind(area);
+                    std::optional<DataSectionKind> const dk =
+                        kind.has_value() ? dataSectionKindOf(*kind) : std::nullopt;
+                    bool const fileBackedData =
+                        dk.has_value()
+                        && (*dk == DataSectionKind::Rodata || *dk == DataSectionKind::Data
+                            || *dk == DataSectionKind::RelRoConst);
+                    if (&area == unwindSec || (area.flags & kShfAlloc) == 0u
+                        || area.type == kShtNobits || area.size == 0u || !fileBackedData) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: an FDE's language-specific "
+                            "data area lies in section '" + area.name
+                            + "', which holds no file-backed data a function's "
+                              "handler could read (it must be an allocated, "
+                              "non-empty data section).");
+                    }
+                    if (rangeExceedsBuffer(area.offset, area.size, bytes.size())) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: data-area section '"
+                            + area.name + "' runs past the end of the file.");
+                    }
+                    AssembledData di;
+                    di.symbol    = symbolIds.fresh();
+                    di.section   = *dk;
+                    di.alignment = area.alignment;
+                    std::size_t const b0 = static_cast<std::size_t>(area.offset);
+                    di.bytes.assign(bytes.begin() + b0,
+                                    bytes.begin() + b0 + static_cast<std::size_t>(area.size));
+                    dataIntervalsBySec[si].push_back(Interval{0, area.size, mod.dataItems.size()});
+                    mod.dataItems.push_back(std::move(di));
+                }
+            }
+        }
+    }
+
     // -- (7) Reconstruct relocations from every SHT_RELA section -----
     //
     // A RELA's sh_info names the section its entries patch. We route each
     // entry to the reconstructed function / data item whose byte range
     // contains r_offset (offset made item-relative), un-baking the target
     // schema's addendBias so the reconstructed addend is DSS-native again.
-    // A RELA targeting a NON-reconstructed section (`.eh_frame`) is skipped
-    // (that section is not part of the mergeable body -- documented).
+    // A RELA whose section produced no item is skipped only for a reason the
+    // pass states (below: empty, the unwind section's, or a non-alloc section's)
+    // and refused otherwise.
     auto findInterval = [](std::vector<Interval> const& ivs, std::uint64_t off)
         -> Interval const* {
         for (auto const& iv : ivs) {
@@ -1425,11 +1541,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // Route each entry to whichever body kind was RECONSTRUCTED for the
         // patched section -- keyed on the interval maps the symbol loop built,
         // NOT on a re-derived section kind. A RELA whose target section
-        // produced NO reconstructed body (`.rela.eh_frame` / `.rela.debug_*` --
-        // unwind/debug metadata we deliberately do not model, and which the
-        // sh_flags fallback would otherwise mis-type as `.rodata`) is skipped:
-        // there is nothing to attach it to and it is not part of the mergeable
-        // module. A per-entry miss WITHIN a reconstructed section still fails
+        // produced NO reconstructed body is the case the block below decides
+        // (the unwind section's, a non-alloc section's, an empty table --
+        // skipped, each for its stated reason -- or refused by name). A per-entry miss WITHIN a reconstructed section still fails
         // loud below (the never-silently-drop-a-reloc guarantee for real code/
         // data). A `.text.<fn>` / `.data.*` (-ffunction-sections) section
         // reconstructs its bodies via resolveSectionKind in the symbol loop, so
@@ -1439,7 +1553,36 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         auto const dIt = dataIntervalsBySec.find(tgt);
         bool const patchesText = (fIt != funcIntervalsBySec.end() && !fIt->second.empty());
         bool const patchesData = (dIt != dataIntervalsBySec.end() && !dIt->second.empty());
-        if (!patchesText && !patchesData) continue;  // section not reconstructed
+        if (!patchesText && !patchesData) {
+            // ★ NO SILENT SKIP (P69 fold 3d). A table whose section produced no
+            // item drops every relocation in it, so each such table is one of
+            // these, and the code says which:
+            //   * a table with NO entries drops nothing;
+            //   * the unwind section's is step (8)'s, which claims every entry;
+            //   * a NON-ALLOC section's (debug information, a tracer's probe
+            //     notes -- `.note.stapsdt` in libc.a, ✔MEASURED P69 fold 3d) is
+            //     not in the process image -- the flag says the section occupies
+            //     no memory while the program runs -- and DSS does not carry a
+            //     foreign non-alloc section into its output
+            //     (D-LK-FOREIGN-NON-ALLOC-SECTIONS-ARE-NOT-CARRIED), so its
+            //     relocations go with it;
+            //   * anything else is an ALLOCATED section this reader made no item
+            //     of -- a constructor or destructor table (`.init_array`,
+            //     `.fini_array`, ✔MEASURED the only ones, over 1345 objects and
+            //     archive members of tests/ and lane `xa`'s probes and 4868 of
+            //     the WSL system archives) -- whose relocations dropped are code
+            //     the program never runs: REFUSED BY NAME
+            //     (D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN).
+            if (rela.size == 0u || &patched == unwindSec || (patched.flags & kShfAlloc) == 0u) continue;
+            return fail(DiagnosticCode::K_ObjectSectionNotModelled,
+                "elf::readRelocatableObject: relocation section '" + rela.name
+                + "' patches section '" + patched.name + "', which the program loads "
+                  "and of which this reader made no item, so its "
+                + std::to_string(rela.size / kRelaSz)
+                + " relocation(s) would be dropped. A constructor or destructor table "
+                  "is the measured case: dropped, its functions never run, and the "
+                  "program would look linked.");
+        }
         std::vector<Interval> const* ivs = patchesText ? &fIt->second : &dIt->second;
 
         std::size_t const nEntries = static_cast<std::size_t>(rela.size / kRelaSz);
@@ -1673,37 +1816,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     //   foreign `.eh_frame` BYTES instead would have been a per-format carry
     //   that bought nothing on the two formats whose encoding is not DWARF.
     //
-    // ★ THE SECTION IS FOUND BY ITS UNIVERSAL `kind`, NEVER BY THE NAME
-    //   `.eh_frame`. A format that declares no `unwind` row simply carries
-    //   nothing, exactly as it did before -- the vocabulary is the switch.
+    // The section was found, and decoded, at (6.7).
     {
-        Shdr const* unwindSec = nullptr;
-        for (auto const& s : secs) {
-            if (!s.kind.has_value() || *s.kind != SectionKind::Unwind) continue;
-            if (s.size == 0u) continue;
-            if (unwindSec != nullptr) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "elf::readRelocatableObject: object carries TWO unwind "
-                    "sections ('" + unwindSec->name + "' and '" + s.name
-                    + "'); their records would have to be merged into one "
-                      "description per function and this reader has no rule "
-                      "for which wins.");
-            }
-            unwindSec = &s;
-        }
         if (unwindSec != nullptr) {
-            if (rangeExceedsBuffer(unwindSec->offset, unwindSec->size,
-                                   bytes.size())) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "elf::readRelocatableObject: unwind section '"
-                    + unwindSec->name + "' body runs past the end of the file.");
-            }
-            auto const decoded = link::format::decodeEhFrame(
-                bytes.subspan(static_cast<std::size_t>(unwindSec->offset),
-                              static_cast<std::size_t>(unwindSec->size)),
-                link::format::dwarfRegisterMappingOf(targetSchema),
-                "elf::readRelocatableObject", reporter);
-            if (!decoded.has_value()) return std::nullopt;  // already reported
+            auto const& decoded = decodedUnwind;   // engaged: (6.7) returned otherwise
 
             // ── Bind each FDE to the function it describes ──
             //
@@ -1743,10 +1859,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 fdePtrNativeId = fmtRow->nativeId;
             }
 
-            // r_offset -> (symbol index, addend) for the unwind section's own
-            // RELA. Built once; an FDE looks its `initial_location` field up.
-            struct FdeRef { std::uint32_t symIdx; std::int64_t addend; };
+            // r_offset -> the entry, for the unwind section's own RELA. Built
+            // once; each field a record declares -- an FDE's `initial_location`
+            // and data area, a CIE's personality -- CLAIMS the entry at its
+            // offset, after its own check of the entry's type. An entry no
+            // field claims is refused below: a relocation this reader cannot
+            // account for means the section says something it is not reading,
+            // and dropping it would lose unwind information silently.
+            struct FdeRef {
+                std::uint32_t symIdx;
+                std::int64_t  addend;
+                std::uint32_t type;
+                std::string   where;   // "'<rela section>' entry #<n>", for a refusal
+            };
             std::unordered_map<std::uint64_t, FdeRef> unwindRelocs;
+            std::unordered_set<std::uint64_t>         claimed;
             std::uint16_t const unwindIdx = static_cast<std::uint16_t>(
                 static_cast<std::size_t>(unwindSec - secs.data()));
             for (auto const& rela : secs) {
@@ -1761,29 +1888,245 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                         static_cast<std::int64_t>(rdU64(bytes, ro + 16));
                     auto const rType =
                         static_cast<std::uint32_t>(rInfo & 0xFFFFFFFFu);
-                    if (rType != fdePtrNativeId) {
-                        return fail(DiagnosticCode::K_RelocationKindMismatch,
-                            "elf::readRelocatableObject: relocation section '"
-                            + rela.name + "' entry #" + std::to_string(e)
-                            + " patches the unwind section with ELF type "
-                            + std::to_string(rType) + ", but the only field an "
-                            "FDE has to relocate is its `initial_location`, "
-                            "whose relocation this target declares as type "
-                            + std::to_string(fdePtrNativeId)
-                            + ". A relocation this reader cannot account for "
-                              "means the section says something it is not "
-                              "reading, and dropping it would lose unwind "
-                              "information silently "
-                              "(D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).");
-                    }
-                    unwindRelocs.emplace(
+                    bool const fresh = unwindRelocs.emplace(
                         rOffset,
-                        FdeRef{static_cast<std::uint32_t>(rInfo >> 32), rAddend});
+                        FdeRef{static_cast<std::uint32_t>(rInfo >> 32), rAddend, rType,
+                               "'" + rela.name + "' entry #" + std::to_string(e)}).second;
+                    if (!fresh) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: two relocations patch "
+                            "byte offset " + std::to_string(rOffset) + " of '"
+                            + unwindSec->name + "'; one field has one reference, "
+                              "and nothing here can tell which is meant.");
+                    }
                 }
             }
 
+            // ★ A HANDLER FIELD'S RELOCATION MUST STATE EXACTLY THE FIELD
+            //   (P69 fold 3d): a LINEAR fixup of the field's width, pc-relative
+            //   exactly when the field's encoding is, neither thread-local nor
+            //   image-relative -- the field is a DATA word. A row's addend
+            //   bias does not move the target: a RELA entry's addend already
+            //   holds it (r_addend = addend + addendBias), so the field names
+            //   byte `S + r_addend` whatever the row (gcc writes
+            //   R_X86_64_PC32, the `riprel32` row, for a pc-relative field).
+            //   Any other row would bind the routine or the area at an
+            //   address the unwinder never reads. Returns the entry, or
+            //   nullopt when no relocation patches the field (the caller
+            //   decides what an unrelocated field means); `failed` is set
+            //   after a refusal has been reported.
+            bool failed = false;
+            auto const fieldEntry =
+                [&](link::format::DecodedPointerField const& field,
+                    std::string_view what) -> std::optional<FdeRef> {
+                auto const it = unwindRelocs.find(field.fieldOffset);
+                if (it == unwindRelocs.end()) return std::nullopt;
+                std::uint32_t const width = link::format::dwEhPeHandlerFieldWidth(field.encoding);
+                std::span<std::uint8_t const> site{};
+                if (!rangeExceedsBuffer(field.fieldOffset, width, unwindSec->size)) {
+                    site = std::span<std::uint8_t const>{
+                        bytes.data() + static_cast<std::size_t>(unwindSec->offset + field.fieldOffset),
+                        width};
+                }
+                auto const decodedKind = decode->decode(it->second.type, site);
+                TargetRelocationInfo const* tri =
+                    decodedKind.has_value() ? targetSchema.relocationInfo(*decodedKind) : nullptr;
+                if (tri == nullptr || tri->formulaKind != RelocFormulaKind::Linear
+                    || tri->widthBytes != width
+                    || tri->pcRelative != link::format::dwEhPeIsPcRelative(field.encoding)
+                    || tri->tls || tri->imageRelative) {
+                    failed = true;
+                    report(reporter, DiagnosticCode::K_RelocationKindMismatch, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: " + it->second.where
+                         + " patches the " + std::string(what) + " field at byte offset "
+                         + std::to_string(field.fieldOffset) + " of '" + unwindSec->name
+                         + "' with ELF type " + std::to_string(it->second.type)
+                         + ", which " + (tri == nullptr ? std::string{"this target declares no row for"}
+                                                        : "is '" + tri->name + "'")
+                         + "; the field's encoding (" + std::to_string(field.encoding)
+                         + ") is a " + std::to_string(width) + "-byte "
+                         + (link::format::dwEhPeIsPcRelative(field.encoding) ? "pc-relative" : "absolute")
+                         + " data word, and only a linear row of that width and "
+                           "application states it.");
+                    return std::nullopt;
+                }
+                claimed.insert(field.fieldOffset);
+                return it->second;
+            };
+
+            // Where a reference lands: the function or data item of THIS
+            // object holding byte `symbol value + addend` of the symbol's
+            // section, or the extern row of an undefined symbol (whose
+            // residual is the addend). A SECTION symbol and a named one are
+            // the same case: the sum is the offset in the section either way.
+            struct FieldTarget {
+                SymbolId     id{};
+                std::int64_t residual = 0;
+                bool         isFunction = false;
+                bool         isData = false;
+                std::size_t  index = 0;   // into functions, dataItems or externImports
+            };
+            auto const fieldTarget = [&](FdeRef const& ref,
+                                         std::string_view what) -> std::optional<FieldTarget> {
+                if (ref.symIdx >= syms.size()) {
+                    failed = true;
+                    report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: the " + std::string(what) + " field's relocation ("
+                         + ref.where + ") names symbol #" + std::to_string(ref.symIdx)
+                         + ", past the end of the symbol table.");
+                    return std::nullopt;
+                }
+                std::uint32_t const t = ownerOf(ref.symIdx);
+                Sym const& tsym = syms[t];
+                if (tsym.shndx == kShnUndef) {
+                    auto const ex = externBySym.find(t);
+                    if (ex != externBySym.end()) {
+                        return FieldTarget{mod.externImports[ex->second].symbol, ref.addend,
+                                           false, false, ex->second};
+                    }
+                } else if (tsym.shndx < kShnLoReserve && tsym.shndx < eShnum) {
+                    auto const off = static_cast<std::int64_t>(tsym.value) + ref.addend;
+                    for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
+                        auto const it = bySec->find(tsym.shndx);
+                        if (it == bySec->end()) continue;
+                        for (auto const& iv : it->second) {
+                            if (off < static_cast<std::int64_t>(iv.start)
+                                || off >= static_cast<std::int64_t>(iv.start + iv.len)) {
+                                continue;
+                            }
+                            bool const fn = bySec == &funcIntervalsBySec;
+                            return FieldTarget{fn ? mod.functions[iv.outIdx].symbol
+                                                  : mod.dataItems[iv.outIdx].symbol,
+                                               off - static_cast<std::int64_t>(iv.start), fn, !fn,
+                                               iv.outIdx};
+                        }
+                    }
+                }
+                failed = true;
+                report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                     "elf::readRelocatableObject: the " + std::string(what) + " field's relocation ("
+                     + ref.where + ") names '" + tsym.name + "' + "
+                     + std::to_string(ref.addend)
+                     + ", which is no function, data item or undefined symbol of this object.");
+                return std::nullopt;
+            };
+
+            // The personality ROUTINE a field names. A DIRECT field names it;
+            // an INDIRECT one names a SLOT holding its address -- gcc's and
+            // clang's `DW.ref.<routine>` under -fPIC, a hidden COMDAT datum
+            // (✔MEASURED, the fixtures) -- and the routine is what the slot's
+            // own relocation names. Either way the handler names the ROUTINE:
+            // how a writer reaches it is the writer's to state.
+            auto const personalityOf =
+                [&](link::format::DecodedPointerField const& field) -> std::optional<SymbolId> {
+                auto const entry = fieldEntry(field, "personality");
+                if (failed) return std::nullopt;
+                if (!entry.has_value()) {
+                    failed = true;
+                    report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: the personality field at byte offset "
+                         + std::to_string(field.fieldOffset) + " of '" + unwindSec->name
+                         + "' carries no relocation, so nothing names the routine. In a "
+                           "relocatable object that field has no address to hold.");
+                    return std::nullopt;
+                }
+                auto const target = fieldTarget(*entry, "personality");
+                if (!target.has_value()) return std::nullopt;
+                if (!link::format::dwEhPeIsIndirect(field.encoding)) {
+                    if (target->isData || target->residual != 0) {
+                        failed = true;
+                        report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                             "elf::readRelocatableObject: the personality field ("
+                             + entry->where + ") names a datum, or a byte inside a "
+                               "function, where its encoding states the routine's own "
+                               "address.");
+                        return std::nullopt;
+                    }
+                    if (!target->isFunction) {
+                        // An undefined routine: the table states it is CALLED.
+                        mod.externImports[target->index].isData     = false;
+                        mod.externImports[target->index].kindOrigin = ExternKindOrigin::Stated;
+                    }
+                    return target->id;
+                }
+                if (!target->isData) {
+                    failed = true;
+                    report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: the personality field ("
+                         + entry->where + ") is INDIRECT, so it names a slot holding "
+                           "the routine's address, but it names no data item of this "
+                           "object.");
+                    return std::nullopt;
+                }
+                AssembledData const& slot = mod.dataItems[target->index];
+                Relocation const*    held = nullptr;
+                for (auto const& rel : slot.relocations) {
+                    if (static_cast<std::int64_t>(rel.offset) != target->residual) continue;
+                    auto const* tri = targetSchema.relocationInfo(rel.kind);
+                    if (tri != nullptr && tri->formulaKind == RelocFormulaKind::Linear
+                        && !tri->pcRelative && !tri->tls && !tri->imageRelative
+                        && tri->widthBytes == 8u && rel.addend == 0) {
+                        held = &rel;
+                    }
+                }
+                if (held == nullptr) {
+                    failed = true;
+                    report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: the personality slot the field ("
+                         + entry->where + ") names holds no absolute 8-byte address of "
+                           "a routine at that offset, so nothing names the routine.");
+                    return std::nullopt;
+                }
+                for (auto& ext : mod.externImports) {
+                    if (ext.symbol != held->target) continue;
+                    ext.isData     = false;   // the table states the routine is CALLED
+                    ext.kindOrigin = ExternKindOrigin::Stated;
+                }
+                return held->target;
+            };
+
+            // The data area a field names: {the item holding it, the offset
+            // in that item}. An unrelocated field holding zero names NONE (a
+            // producer may state the field and leave it null); one holding
+            // anything else names an address nothing relocates.
+            auto const dataAreaOf = [&](link::format::DecodedPointerField const& field)
+                -> std::optional<std::optional<DataAreaRef>> {
+                auto const entry = fieldEntry(field, "language-specific data area");
+                if (failed) return std::nullopt;
+                if (!entry.has_value()) {
+                    if (field.stored == 0) return std::optional<DataAreaRef>{};
+                    failed = true;
+                    report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: the language-specific data-area "
+                         "field at byte offset " + std::to_string(field.fieldOffset)
+                         + " of '" + unwindSec->name + "' holds "
+                         + std::to_string(field.stored) + " and no relocation; in a "
+                           "relocatable object no address is known, so it names no area.");
+                    return std::nullopt;
+                }
+                auto const target = fieldTarget(*entry, "language-specific data area");
+                if (!target.has_value()) return std::nullopt;
+                if (!target->isData) {
+                    failed = true;
+                    report(reporter, DiagnosticCode::F_CorruptedBinary, DiagnosticSeverity::Error,
+                         "elf::readRelocatableObject: the language-specific data-area "
+                         "field (" + entry->where + ") names no data item of this object.");
+                    return std::nullopt;
+                }
+                return std::optional<DataAreaRef>{DataAreaRef{target->id, target->residual}};
+            };
+
             for (auto const& fde : decoded->fdes) {
                 auto const it = unwindRelocs.find(fde.initialLocationFieldOffset);
+                if (it != unwindRelocs.end() && it->second.type != fdePtrNativeId) {
+                    return fail(DiagnosticCode::K_RelocationKindMismatch,
+                        "elf::readRelocatableObject: " + it->second.where
+                        + " patches an FDE's `initial_location` with ELF type "
+                        + std::to_string(it->second.type) + ", but this target declares "
+                          "that field's relocation as type "
+                        + std::to_string(fdePtrNativeId) + ".");
+                }
+                if (it != unwindRelocs.end()) claimed.insert(fde.initialLocationFieldOffset);
                 if (it == unwindRelocs.end()) {
                     return fail(DiagnosticCode::F_CorruptedBinary,
                         "elf::readRelocatableObject: the FDE whose "
@@ -1854,6 +2197,62 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                           "which.");
                 }
                 mod.functions[hit->outIdx].cfi = fde.cfi;
+
+                // ── The handler the record names (P69 fold 3d) ──
+                //
+                // A CIE's personality is the routine an exception dispatcher
+                // calls for this frame, in BOTH of DWARF's phases (the search
+                // and the cleanup: the LSB's `_Unwind_RaiseException` calls it
+                // in each), and the FDE's data area is what that routine reads.
+                // Carried as a `LanguageHandler` of the DWARF shape: the routine
+                // and a reference to the area's item -- never zeroed, never
+                // dropped. An area with no routine to read it is a record no
+                // dispatcher would consult, and is refused.
+                if (fde.personality.has_value() || fde.dataArea.has_value()) {
+                    if (!fde.personality.has_value()) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: the FDE for the function at "
+                            "offset " + std::to_string(targetOff) + " of section #"
+                            + std::to_string(tsym.shndx) + " points at a language-"
+                              "specific data area, and its CIE names no personality "
+                              "routine to read it.");
+                    }
+                    auto const routine = personalityOf(*fde.personality);
+                    if (!routine.has_value()) return std::nullopt;   // reported
+                    std::optional<DataAreaRef> area;
+                    if (fde.dataArea.has_value()) {
+                        auto const bound = dataAreaOf(*fde.dataArea);
+                        if (!bound.has_value()) return std::nullopt;  // reported
+                        area = *bound;
+                    }
+                    LanguageHandler handler;
+                    handler.personality    = *routine;
+                    handler.exceptionPhase = true;
+                    handler.unwindPhase    = true;
+                    handler.dataArea       = area;
+                    mod.functions[hit->outIdx].languageHandler = std::move(handler);
+                }
+            }
+
+            // Every relocation of the unwind section is one a record's field
+            // claimed above; any other says something this reader is not
+            // reading, and dropping it would lose unwind information silently.
+            std::optional<std::uint64_t> firstUnclaimed;
+            for (auto const& [offset, ref] : unwindRelocs) {
+                if (claimed.contains(offset)) continue;
+                if (!firstUnclaimed.has_value() || offset < *firstUnclaimed) firstUnclaimed = offset;
+            }
+            if (firstUnclaimed.has_value()) {
+                std::uint64_t const offset = *firstUnclaimed;
+                FdeRef const&       ref    = unwindRelocs.at(offset);
+                return fail(DiagnosticCode::K_RelocationKindMismatch,
+                    "elf::readRelocatableObject: " + ref.where + " patches byte offset "
+                    + std::to_string(offset) + " of '" + unwindSec->name
+                    + "' (ELF type " + std::to_string(ref.type) + "), which is no "
+                      "field a CIE or an FDE of it declares -- neither an "
+                      "`initial_location`, a personality nor a data-area pointer. "
+                      "A relocation this reader cannot account for means the "
+                      "section says something it is not reading.");
             }
         }
     }

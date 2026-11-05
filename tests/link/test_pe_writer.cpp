@@ -38,6 +38,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -3525,9 +3526,11 @@ TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
     }
     mod.functions.push_back(std::move(parent));
     // Function 1: the FILTER FUNCLET, which guards nothing. Its one vector
-    // save sits 16 * 0x10000 bytes above RSP — a slot no shipped frame reaches
-    // (the allocation codes stop at 512 KiB), stated here because the rule is
-    // the builder's input and the quotient's bound is the builder's to honour.
+    // save sits 16 * 0x10000 bytes above RSP — far past its own 0x20-byte
+    // frame, stated here because the rule is the builder's input and the
+    // quotient's bound is the builder's to honour. (Frames that do reach it,
+    // past 1 MiB, are the references' and DSS's own `hugexmm`, read and
+    // written in `test_coff_foreign_unwind.cpp`.)
     AssembledFunction funclet;
     funclet.symbol = SymbolId{2};
     funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,
@@ -4087,6 +4090,181 @@ TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
         << "entry = (DIR64 << 12) | page-offset";
     EXPECT_EQ(readU16LE(bytes, reloc.second + 10), 0u)
         << "odd DIR64 entry count → one ABSOLUTE(0) u16 pad to 4-byte alignment";
+}
+
+namespace {
+
+// Every DIR64 site an image's `.reloc` table lists (DataDirectory[5] at 0x130), read block by block, as RVAs.
+[[nodiscard]] std::set<std::uint32_t> dir64SitesOf(std::vector<std::uint8_t> const& bytes) {
+    std::set<std::uint32_t> sites;
+    std::uint32_t const     relocRva = readU32LE(bytes, 0x130), relocSize = readU32LE(bytes, 0x134);
+    if (relocSize == 0u) return sites;
+    auto const reloc = findExecSection(bytes, {'.', 'r', 'e', 'l', 'o', 'c', 0, 0});
+    if (reloc.first != relocRva) {
+        ADD_FAILURE() << "DataDirectory[5] names RVA " << relocRva << ", the `.reloc` section is at " << reloc.first;
+        return sites;
+    }
+    for (std::uint32_t at = 0; at + 8u <= relocSize;) {
+        std::uint32_t const page = readU32LE(bytes, reloc.second + at), size = readU32LE(bytes, reloc.second + at + 4);
+        if (size < 8u) {
+            ADD_FAILURE() << "a `.reloc` block of " << size << " bytes";
+            return sites;
+        }
+        for (std::uint32_t e = 8; e + 2u <= size; e += 2) {
+            std::uint16_t const entry = readU16LE(bytes, reloc.second + at + e);
+            if ((entry >> 12) == 10u) sites.insert(page + (entry & 0x0FFFu));
+        }
+        at += size;
+    }
+    return sites;
+}
+
+}  // namespace
+
+// P69 fold 3d (review F4) — ONE "ABSOLUTE". An IMAGE-RELATIVE field (COFF's
+// ADDR32NB) holds the target's RVA, which no rebase moves: the image writes it as
+// the address less the image base and lists no base-relocation site for it, in
+// code and in data alike. ✔MEASURED 2026-10-21, cl 19.44 /O2 and /Od: a dense
+// switch keeps its jump table in `.text$mn` as ADDR32NB entries, read through an
+// ADDR32NB displacement, and link.exe links the object under DYNAMIC_BASE and it
+// runs to 42. An ABSOLUTE field of the same image is the control: it holds the VA
+// and takes its DIR64 site, in code and in data. Until this fold the `.text` belt
+// refused the image-relative field as an unrebased address, and the kernel would
+// have written the VA into it.
+// The shipped exec document declares the relocatable document's ADDR32NB row since
+// the same fold (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL: cl's switch objects
+// reach the image through it); until then this case added the row in memory.
+TEST(PeExecWriter, AnImageRelativeFieldHoldsItsRvaAndTakesNoBaseRelocation) {
+    auto const t = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(t.has_value());
+    TargetRelocationInfo const* imageRel = (*t)->relocationInfo(RelocationKind{6});
+    TargetRelocationInfo const* abs64    = (*t)->relocationInfo(RelocationKind{2});
+    ASSERT_TRUE(imageRel != nullptr && imageRel->imageRelative && imageRel->widthBytes == 4)
+        << "x86_64 kind 6 is the 4-byte image-relative row";
+    ASSERT_TRUE(abs64 != nullptr && loaderRebasesTheField(*abs64) && abs64->widthBytes == 8)
+        << "x86_64 kind 2 is the 8-byte absolute row";
+    EXPECT_FALSE(loaderRebasesTheField(*imageRel)) << "an RVA is not a field the loader moves";
+    auto const f = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(f.has_value());
+    auto const rows = (*f)->relocations();
+    EXPECT_TRUE(std::any_of(rows.begin(), rows.end(), [](ObjectFormatRelocationInfo const& r) {
+        return r.name == "IMAGE_REL_AMD64_ADDR32NB" && r.kind == RelocationKind{6} && r.nativeId == 3u;
+    })) << "the exec document declares the relocatable document's ADDR32NB row";
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // ret; int3 x3; a 4-byte image-relative field at 4 (a jump-table entry); an 8-byte absolute one at 8.
+    fn.bytes = {0xC3, 0xCC, 0xCC, 0xCC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    fn.relocations.push_back(Relocation{4, SymbolId{1}, RelocationKind{6}, 1});
+    fn.relocations.push_back(Relocation{8, SymbolId{1}, RelocationKind{2}, 0});
+    mod.functions.push_back(std::move(fn));
+    AssembledData rva;
+    rva.symbol  = SymbolId{2};
+    rva.section = DataSectionKind::Data;
+    rva.bytes.assign(4, std::uint8_t{0});
+    rva.relocations.push_back(Relocation{0, SymbolId{1}, RelocationKind{6}, 2});
+    mod.dataItems.push_back(std::move(rva));
+    AssembledData va;
+    va.symbol  = SymbolId{3};
+    va.section = DataSectionKind::Rodata;
+    va.bytes.assign(8, std::uint8_t{0});
+    va.relocations.push_back(Relocation{0, SymbolId{1}, RelocationKind{2}, 0});
+    mod.dataItems.push_back(std::move(va));
+
+    DiagnosticReporter rep;
+    auto const         bytes = encodeUntrampolined(mod, **t, **f, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_FALSE(bytes.empty()) << "an image-relative field in code is not an unrebased address";
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    EXPECT_NE(readU16LE(bytes, 0x98u + 70u) & 0x0040u, 0u) << "the image sets DYNAMIC_BASE: the loader may move it";
+    auto const text  = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const data  = findExecSection(bytes, {'.', 'd', 'a', 't', 'a', 0, 0, 0});
+    auto const rdata = findExecSection(bytes, {'.', 'r', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_TRUE(text.first != 0u && data.first != 0u && rdata.first != 0u);
+    EXPECT_EQ(readU32LE(bytes, text.second + 4), text.first + 1u) << "the code's image-relative field: the RVA + 1";
+    EXPECT_EQ(readU64LE(bytes, text.second + 8), kImageBase + text.first) << "the code's absolute field: the VA";
+    EXPECT_EQ(readU32LE(bytes, data.second), text.first + 2u) << "the data's image-relative field: the RVA + 2";
+    EXPECT_EQ(readU64LE(bytes, rdata.second), kImageBase + text.first) << "the data's absolute field: the VA";
+    EXPECT_EQ(dir64SitesOf(bytes), (std::set<std::uint32_t>{text.first + 8u, rdata.first}))
+        << "the two absolute fields, and neither image-relative one";
+}
+
+// P69 fold 3d (item 4) — a PC-RELATIVE data field. MinGW gcc -O0 and -O1, and clang-cl /O2, keep a dense switch's jump
+// table in `.rdata` as REL32 entries, each its case's distance from the table (✔MEASURED 2026-10-21: gcc's own
+// program, and link.exe 14.44's and lld-link 19.1.5's of the same objects, run to 42 — `CoffJumpTable` links those
+// objects themselves). The image writes the schema formula's value (`linearFieldValue`): S + A - P - 4, P the FIELD's
+// own address, and lists no base-relocation site for it — a distance moves with neither end. Until this fold the image
+// refused every such field ("is pc-relative"). An absolute field of the same item is the control: the VA and its
+// DIR64 site.
+TEST(PeExecWriter, APcRelativeDataFieldHoldsItsDistanceFromItselfAndTakesNoBaseRelocation) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    TargetRelocationInfo const* rel32 = loaded.target->relocationInfo(RelocationKind{1});
+    ASSERT_TRUE(rel32 != nullptr && rel32->pcRelative && rel32->widthBytes == 4 && rel32->addendBias == -4)
+        << "x86_64 kind 1 is REL32: pc-relative, 4 bytes, measured from the field's end";
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xC3};   // the "case" at +8
+    mod.functions.push_back(std::move(fn));
+    AssembledData table;
+    table.symbol  = SymbolId{2};
+    table.section = DataSectionKind::Rodata;
+    table.bytes.assign(16, std::uint8_t{0});
+    table.relocations.push_back(Relocation{4, SymbolId{1}, RelocationKind{1}, 8});   // the entry, at +4 of the table
+    table.relocations.push_back(Relocation{8, SymbolId{1}, RelocationKind{2}, 0});   // an address beside it
+    mod.dataItems.push_back(std::move(table));
+
+    DiagnosticReporter rep;
+    auto const         bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_FALSE(bytes.empty()) << "a pc-relative data field is a field the image writes";
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    auto const text  = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const rdata = findExecSection(bytes, {'.', 'r', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_TRUE(text.first != 0u && rdata.first != 0u);
+    std::int64_t const expected = static_cast<std::int64_t>(text.first) + 8 - (static_cast<std::int64_t>(rdata.first) + 4) - 4;
+    EXPECT_EQ(readU32LE(bytes, rdata.second + 4), static_cast<std::uint32_t>(expected))
+        << "S + A - P - 4: the case's distance from the field (P the field's RVA, not its section's)";
+    EXPECT_EQ(readU64LE(bytes, rdata.second + 8), kImageBase + text.first) << "the absolute field: the VA";
+    EXPECT_EQ(dir64SitesOf(bytes), (std::set<std::uint32_t>{rdata.first + 8u}))
+        << "the absolute field alone: a distance is not a field the loader moves";
+}
+
+// …and one reaching past ±2 GiB is refused by name, never wrapped into its 32 bits (the row's `fieldRange`, asked of
+// `linearFieldHolds` for every data field the image writes).
+TEST(PeExecWriter, APcRelativeDataFieldPastTwoGibIsRefusedNotWrapped) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The table sits within 64 KiB of the function, so these addends put S + A - P - 4 past each end of the range.
+    for (std::int64_t const addend : {(std::int64_t{1} << 31) + 0x10000, -(std::int64_t{1} << 31) - 0x10000}) {
+        SCOPED_TRACE(addend);
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+        AssembledData table;
+        table.symbol  = SymbolId{2};
+        table.section = DataSectionKind::Rodata;
+        table.bytes.assign(4, std::uint8_t{0});
+        table.relocations.push_back(Relocation{0, SymbolId{1}, RelocationKind{1}, addend});
+        mod.dataItems.push_back(std::move(table));
+        DiagnosticReporter rep;
+        auto const         bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        EXPECT_TRUE(bytes.empty()) << "a distance the field cannot hold is refused";
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            named = named
+                 || (d.actual.find("relocation 'rel32' value") != std::string::npos
+                     && d.actual.find("is outside the signed 32-bit range") != std::string::npos);
+        }
+        EXPECT_TRUE(named) << "the refusal names the row and its range";
+    }
 }
 
 // c145 (D-LK-RELRO-CONST-DATA-RELOCATABLE): a CONST symbol-address global (relro)
@@ -5092,7 +5270,16 @@ TEST(PeExecWriter, EmptyTextFailsLoud) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    // A PE executable whose one function holds no byte is a program with no
+    // instruction to start at: refused under K_ProgramEntryUndefined alone
+    // (P69 fold 3d; K_RelocationKindMismatch, "an exec with no instructions
+    // would crash at entry", before — the same words a data-only DLL got).
+    std::size_t entryUndefined = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ProgramEntryUndefined) ++entryUndefined;
+        EXPECT_NE(d.code, DiagnosticCode::K_RelocationKindMismatch) << d.actual;
+    }
+    EXPECT_EQ(entryUndefined, 1u);
 }
 
 TEST(PeExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {

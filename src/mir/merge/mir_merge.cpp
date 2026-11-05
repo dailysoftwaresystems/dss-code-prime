@@ -1432,6 +1432,15 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // ── (4) clone every SURVIVING function (skip a cross-CU loser whose name's
     // winner is a DIFFERENT (cuIdx, sym)) into ONE builder over the host lattice.
     MirBuilder builder;
+    // The unit each definition the merged module holds came from
+    // (`MergedMirModule::unitOfDefinition`, P69 fold 3d): stated at the ONE point
+    // each kind of definition is added -- a function's clone, a global, an alias
+    // -- so no definition reaches the builder without it. The driver turns it into
+    // the place of that unit's source among the operator's inputs.
+    std::unordered_map<std::uint32_t, std::size_t> unitOfDefinition;
+    auto const definedIn = [&unitOfDefinition](SymbolId merged, std::uint32_t ci) {
+        unitOfDefinition.emplace(merged.v, ci);
+    };
     // Carry CU0's module-level alias polarity (the driver merges homogeneous-
     // language CUs; CU0 is representative). Agnostic — a flag value, no branch.
     builder.setAliasingMode(cus[0].mir->aliasingMode());
@@ -1493,6 +1502,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
         SymbolId const fresh = alloc.mint();
         if (!name.empty()) plan.symbolNames.emplace(fresh.v, name);
         keptLoserBody.emplace(CuSymKey{ci, sym.v}, fresh);
+        definedIn(fresh, ci);
         return fresh;
     };
 
@@ -1519,6 +1529,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 mergedSymbolOf(plan, ci, m.funcSymbol(f));
             FunctionCloner cloner{m, *cus[ci].interner, ci, plan, host, builder};
             (void)cloner.clone(f, mergedSym);
+            definedIn(mergedSym, ci);
         }
     }
 
@@ -1593,6 +1604,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                     }
                 }
             }
+            definedIn(mergedSym, ci);
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
                                     // P69: the linkage crosses as its one
                                     // record — binding, visibility, the weak
@@ -1722,6 +1734,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 if (!winner.has_value()) continue;   // the election refused the target's name
                 SymbolId const privateName = alloc.mint();
                 plan.symbolNames.emplace(privateName.v, name);
+                definedIn(privateName, ci);
                 builder.addAlias(privateName, *winner,
                                  MirLinkage{SymbolBinding::Local, SymbolVisibility::Default});
                 continue;
@@ -1803,6 +1816,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                     continue;
                 }
             }
+            definedIn(mergedSymbolOf(plan, ci, a.alias), ci);
             builder.addAlias(mergedSymbolOf(plan, ci, a.alias), mergedTarget, a.linkage);
         }
     }
@@ -2031,7 +2045,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
 
     MergedMirModule out{
         std::move(merged), std::move(host), std::move(plan.symbolNames),
-        std::move(survivingExterns), userEntrySymbol};
+        std::move(survivingExterns), userEntrySymbol, std::move(unitOfDefinition)};
     return out;
 }
 

@@ -1,1 +1,1 @@
-                if (importTakesSlot(e.binding) && !e.isThreadLocal) {
+                if (importTakesSlot(e.binding) && !e.isThreadLocal && !imageDefines(e)) {

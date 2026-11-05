@@ -57,24 +57,41 @@
 //                               after it moves nothing an unwind reads)
 //   * UWOP_SET_FPREG         -> FP = RSP + 16F, so CFA = FP + (C - 16F):
 //                               def_cfa FP, C - 16F
-//   * UWOP_SAVE_NONVOL r, k  -> r at establisher frame + 8k:
-//                               offset r, 8k - B
-//   * UWOP_SAVE_XMM128 x, k  -> x at establisher frame + 16k:
-//                               offset x, 16k - B
+//   * UWOP_SAVE_NONVOL r, s  -> r at establisher frame + s:
+//                               offset r, s - B
+//   * UWOP_SAVE_XMM128 x, s  -> x at establisher frame + s:
+//                               offset x, s - B
+// n and s are in BYTES, read from the code's operand in one of two spellings,
+// which differ in reach and never in meaning (the x64 unwind-data
+// documentation): the short one is a slot scaled by the code's unit
+// (UWOP_ALLOC_LARGE op-info 0 and UWOP_SAVE_NONVOL by 8, UWOP_SAVE_XMM128 by
+// 16), and the long one is the unscaled byte count in two slots, low word
+// first (UWOP_ALLOC_LARGE op-info 1, UWOP_SAVE_NONVOL_FAR, UWOP_SAVE_XMM128_FAR).
 // B is the CFA's distance above the establisher frame: the RSP-based CFA
 // offset at the SET_FPREG code when there is a frame register, and at the end
 // of the prologue otherwise.
 //
+// ✔MEASURED P69 fold 3d (a 700000-byte frame and a 1200000-byte one, each
+//   with registers live across a call): cl 19.44 /Od and /O2, clang-cl 19.1.5
+//   /O2 and mingw-w64 gcc 13.2.0 -O2 all write UWOP_ALLOC_LARGE op-info 1 for a
+//   frame above 512 KiB - 8; cl /O2 writes UWOP_SAVE_NONVOL_FAR for a general
+//   register saved more than 512 KiB above the establisher frame, and all three
+//   write UWOP_SAVE_XMM128_FAR for a vector register saved more than 1 MiB
+//   above it. Each object, linked by its own toolchain, unwinds to its caller
+//   through those codes.
+//
 // ★ WHAT IS REFUSED, BY NAME: a version other than 1, chained unwind
-//   information, UWOP_PUSH_MACHFRAME, the two _FAR saves and UWOP_ALLOC_LARGE
-//   with op-info 1. ✔MEASURED P69 fold 3c: none of them appears in 31 objects
-//   written by cl 19.44 (/Od and /O2), clang-cl 19.1.5 /O2 and mingw-w64 gcc 13.2.0
-//   -O2, while every other code does. A form no reference wrote has no
+//   information, UWOP_PUSH_MACHFRAME, and the operations version 1 does not
+//   define (6 and 7). ✔MEASURED: none of them appears in the 43 objects of
+//   folds 3c and 3d, written by the four builds above for every C frame shape
+//   measured; MACHFRAME describes a frame the processor pushed (a trap
+//   handler's), which no C function has. A form no reference wrote has no
 //   measurement to decode against, and a guess would read as a carried frame.
-//   Also refused: a code past SizeOfProlog (the encoder cannot state one), a
-//   push after the frame register is set (the unwinder would read it at a
-//   moved RSP), a frame register named with no SET_FPREG code (or the
-//   reverse), and a register the target cannot name.
+//   Also refused: UWOP_ALLOC_LARGE with an op-info the format does not define,
+//   a code past SizeOfProlog (the encoder cannot state one), a push after the
+//   frame register is set (the unwinder would read it at a moved RSP), a frame
+//   register named with no SET_FPREG code (or the reverse), and a register the
+//   target cannot name.
 
 namespace dss::link::format {
 
@@ -228,37 +245,52 @@ decodeWin64UnwindInfo(std::span<std::uint8_t const> section,
         return static_cast<std::uint16_t>(section[at] | (section[at + 1u] << 8));
     };
 
-    // The codes in array order, each with its operand.
+    // The codes in array order, each with its operand in BYTES (n or s in the
+    // table above): an allocation's size, or a save's distance above the
+    // establisher frame.
     struct Code {
         std::uint8_t  codeOffset;
         std::uint8_t  op;
         std::uint8_t  info;
-        std::uint32_t operand;
+        std::int64_t  bytes;
     };
     std::vector<Code> codes;
     for (std::size_t k = 0; k < countOfCodes;) {
         std::uint16_t const head = node(k);
         Code c{static_cast<std::uint8_t>(head & 0xFFu),
                static_cast<std::uint8_t>((head >> 8) & 0x0Fu),
-               static_cast<std::uint8_t>(head >> 12), 0u};
-        std::size_t slots = 1;
+               static_cast<std::uint8_t>(head >> 12), 0};
+        // The operand: none, one slot scaled by `unit`, or two slots unscaled.
+        std::size_t  slots = 1;
+        std::int64_t unit  = 1;
         switch (c.op) {
             case win64::kUwopPushNonvol:
-            case win64::kUwopAllocSmall:
             case win64::kUwopSetFpReg:
                 break;
+            case win64::kUwopAllocSmall:
+                c.bytes = 8 * (static_cast<std::int64_t>(c.info) + 1);
+                break;
             case win64::kUwopAllocLarge:
-                if (c.info != 0u) {
-                    return refuse(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                if (c.info > 1u) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
                                   "states UWOP_ALLOC_LARGE with op-info " + std::to_string(c.info)
-                                      + " (an allocation in a 32-bit operand); no reference "
-                                        "compiler wrote one for any C function measured");
+                                      + "; the format defines 0 (the size divided by 8, in one "
+                                        "slot) and 1 (the size, in two)");
                 }
-                slots = 2;
+                slots = c.info == 0u ? 2 : 3;
+                unit  = 8;
                 break;
             case win64::kUwopSaveNonvol:
+                slots = 2;
+                unit  = 8;
+                break;
             case win64::kUwopSaveXmm128:
                 slots = 2;
+                unit  = 16;
+                break;
+            case win64::kUwopSaveNonvolFar:
+            case win64::kUwopSaveXmm128Far:
+                slots = 3;
                 break;
             default:
                 return refuse(DiagnosticCode::K_UnwindRuleUnrepresentable,
@@ -272,7 +304,11 @@ decodeWin64UnwindInfo(std::span<std::uint8_t const> section,
             return refuse(DiagnosticCode::F_CorruptedBinary,
                           "ends inside the operand of its last code");
         }
-        if (slots == 2) c.operand = node(k + 1);
+        if (slots == 2) c.bytes = unit * static_cast<std::int64_t>(node(k + 1));
+        if (slots == 3) {
+            c.bytes = static_cast<std::int64_t>(node(k + 1))
+                    | (static_cast<std::int64_t>(node(k + 2)) << 16);
+        }
         codes.push_back(c);
         k += slots;
     }
@@ -320,8 +356,7 @@ decodeWin64UnwindInfo(std::span<std::uint8_t const> section,
         }
         if (sawSetFp) continue;
         if (it->op == win64::kUwopPushNonvol) cfa += 8;
-        if (it->op == win64::kUwopAllocSmall) cfa += 8 * (static_cast<std::int64_t>(it->info) + 1);
-        if (it->op == win64::kUwopAllocLarge) cfa += 8 * static_cast<std::int64_t>(it->operand);
+        if (it->op == win64::kUwopAllocSmall || it->op == win64::kUwopAllocLarge) cfa += it->bytes;
     }
     if (!sawSetFp) base = cfa;
     if (sawSetFp != (frameRegister != 0u)) {
@@ -360,10 +395,7 @@ decodeWin64UnwindInfo(std::span<std::uint8_t const> section,
             }
             case win64::kUwopAllocSmall:
             case win64::kUwopAllocLarge: {
-                std::int64_t const n = c.op == win64::kUwopAllocSmall
-                                           ? 8 * (static_cast<std::int64_t>(c.info) + 1)
-                                           : 8 * static_cast<std::int64_t>(c.operand);
-                cfa += n;
+                cfa += c.bytes;
                 if (!framed) {
                     out.cfi.ops.push_back(CfiOp{pc, CfiOpKind::DefCfaOffset, {}, {}, cfa, 0u});
                 }
@@ -377,24 +409,26 @@ decodeWin64UnwindInfo(std::span<std::uint8_t const> section,
                                             cfa - 16 * static_cast<std::int64_t>(frameOffset), 0u});
                 break;
             }
-            case win64::kUwopSaveNonvol: {
-                auto const r = generalReg(c.info, "UWOP_SAVE_NONVOL");
+            case win64::kUwopSaveNonvol:
+            case win64::kUwopSaveNonvolFar: {
+                auto const r = generalReg(c.info, win64::unwindOpName(c.op));
                 if (!r.has_value()) return std::nullopt;
                 out.cfi.ops.push_back(CfiOp{pc, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(*r), {},
-                                            8 * static_cast<std::int64_t>(c.operand) - base, 0u});
+                                            c.bytes - base, 0u});
                 break;
             }
-            case win64::kUwopSaveXmm128: {
+            case win64::kUwopSaveXmm128:
+            case win64::kUwopSaveXmm128Far: {
                 if (regs.vectorAmbiguous[c.info] || !regs.vector[c.info].has_value()) {
                     return refuse(DiagnosticCode::K_UnwindRuleUnrepresentable,
-                                  "UWOP_SAVE_XMM128 names vector register number "
+                                  std::string{win64::unwindOpName(c.op)} + " names vector register number "
                                       + std::to_string(c.info)
                                       + ", which the target document does not name as exactly "
                                         "one 16-byte vector register");
                 }
                 out.cfi.ops.push_back(CfiOp{pc, CfiOpKind::RegAtCfaOffset,
                                             CfiRegRef::physical(*regs.vector[c.info]), {},
-                                            16 * static_cast<std::int64_t>(c.operand) - base, 0u});
+                                            c.bytes - base, 0u});
                 break;
             }
             default:

@@ -1,0 +1,2 @@
+            auto const linear = linearFieldValue(*tri, sIt->second, rel.addend, patchVa,
+                                                 std::optional<std::uint64_t>{0});

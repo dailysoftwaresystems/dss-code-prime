@@ -1,0 +1,2 @@
+                    if (false && defs[k].defaultRecord.has_value()) {
+                        alias.weakDefaultName = syms[*defs[k].defaultRecord].name;

@@ -25,6 +25,12 @@
     "storeMangledName": "___atomic_store",
     "compareExchangeMangledName": "___atomic_compare_exchange"
   },
+  "$imageDefinedSymbolsComment": "P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, its Mach-O neighbour; ledger 484): the names the IMAGE this object ends in will define -- `__mh_execute_header` in an executable, `__mh_dylib_header` in a dylib, `___dso_handle` in both -- stated here because the compile reads them: a reference to one is DIRECT (never an import's GOT slot), so the final link resolves it in the image it writes, and refuses the one its flavor does not define, as ld64 does. This document's link defines nothing itself; that is the image documents' rows.",
+  "imageDefinedSymbols": [
+    { "name": "__mh_execute_header", "address": "imageHeader" },
+    { "name": "__mh_dylib_header", "address": "imageHeader" },
+    { "name": "___dso_handle", "address": "imageHeader" }
+  ],
   "externCallDispatch": "direct-plt",
   "$externAddrBindingComment": "P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): an undefined extern's ADDRESS as a live VALUE in a Mach-O OBJECT is a GOT load (arm64 ARM64_RELOC_GOT_LOAD_PAGE21 + ARM64_RELOC_GOT_LOAD_PAGEOFF12, x86_64 X86_64_RELOC_GOT_LOAD) - what Apple clang writes (MEASURED 2026-09-30: `adrp x8, _puts@GOTPAGE; ldr x8, [x8, _puts@GOTPAGEOFF]`) and what Apple's ld binds to the function itself. A page-pair, or an x86_64 `lea` spelled as a BRANCH, against a dylib symbol is not.",
   "externAddrBinding": "got",

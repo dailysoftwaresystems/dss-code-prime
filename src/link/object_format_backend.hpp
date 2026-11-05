@@ -397,6 +397,23 @@ public:
         return false;
     }
 
+    // ── P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL) ───────────
+    //
+    // Does THIS backend's WRITER give each name the document states in
+    // `imageDefinedSymbols` the address it denotes
+    // (`AssembledModule::imageDefinedSymbols`) in an image of this schema?
+    // ★ A WALKER CAPABILITY, like the one above: the document states the names,
+    // and whether an address is then written is a property of the code that
+    // writes the image, so the loader refuses an IMAGE document that states one
+    // on a backend that answers false here. (A relocatable or archive document
+    // states them for its compile alone: the image it ends in defines them.)
+    // ★ DEFAULT FALSE: a writer that gives the symbol no address would refuse
+    // every reference to it loud, and the refusal at load says why.
+    [[nodiscard]] virtual bool
+    writesImageDefinedSymbols(detail::ObjectFormatData const& /*d*/) const noexcept {
+        return false;
+    }
+
     // ── D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4) ──
     //
     // Does THIS backend's image writer realize the image requests a link's units
