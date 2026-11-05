@@ -1,0 +1,3 @@
+            auto const fact =
+                resolveConstantSubobject(s, tree, *cfg, node, ScopeId{curScopeOpaque});
+            if (!fact.has_value() || node.valid()) return std::nullopt;

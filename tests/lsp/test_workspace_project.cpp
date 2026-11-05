@@ -17,6 +17,7 @@
 // pin whose subject is a struct literal tests the literal, and the whole claim
 // being made is about a file on disk.
 
+#include "core/substrate/path_identity.hpp"   // core::rootSpelling / core::genericSpelling: the one root parse and spelling
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/project_config.hpp"   // dss::loadProjectConfig — the SHARED
@@ -27,6 +28,7 @@
 #include "lsp/schema_cache.hpp"
 #include "lsp/workspace_project.hpp"
 #include "lsp_test_helpers.hpp"
+#include "os_link.hpp"   // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"
 // The ONE test-side env override, hoisted out of the hand-copied duplicates.
 // The local copy that used to sit below carried a note claiming the hoist was
@@ -137,18 +139,23 @@ TEST(WorkspaceProject, NonFileUriIsRefusedRatherThanGuessed) {
     // ⇒ Where UNC roots exist the URI NAMES A PATH and must round-trip; where
     // they do not, it names a remote HOST and accepting it would be the guess
     // this case is about. The expectation is derived from the SAME question the
-    // implementation asks — `root_name()` on a `//host/share` spelling — and the
+    // implementation asks — the substrate's parse of a `//host/share` spelling (since P69 H6; `root_name()` before it,
+    // which is empty under MinGW, so the MinGW build refused what Windows names a path by) — and the
     // two arms are named explicitly, exactly as `FileUriRoundTrip` names its
     // three renderings rather than widening to "anything goes".
-    const bool uncIsAPathHere =
-        !std::filesystem::path{"//dss-unc-probe/share"}.root_name().empty();
+    const bool uncIsAPathHere = dss::core::rootSpelling(std::filesystem::path{"//dss-unc-probe/share"}).kind
+                             == dss::core::RootSpelling::Kind::Share;
     auto const unc = pathFromFileUri("file://someremotehost/share/x");
     if (uncIsAPathHere) {
         ASSERT_TRUE(unc.has_value())
-            << "this platform models `//host/share` as a root name, so that URI "
+            << "this platform parses `//host/share` as a share, so that URI "
                "names a UNC PATH — refusing it is what breaks the round trip on "
                "our own emitted form";
-        EXPECT_EQ(unc->generic_string(), "//someremotehost/share/x")
+        // Read in the substrate's spelling, NOT `generic_string()`: on the MinGW model the library's generic rendering
+        // collapses the leading separator run to ONE slash (✔MEASURED, core/substrate/path_identity.hpp), so it would
+        // print the share as a path on the local drive's root whatever the path holds (✔MEASURED, P69 H6, MinGW
+        // g++ 13.2.0: "/someremotehost/share/x").
+        EXPECT_EQ(dss::core::genericSpelling(*unc), "//someremotehost/share/x")
             << "the authority must come back where it came from, unaltered";
     } else {
         EXPECT_FALSE(unc.has_value())
@@ -315,6 +322,51 @@ TEST(WorkspaceProject, EmptyWorkspaceReportsProjectFileNotFound) {
     EXPECT_NE(pref.error().detail.find(ws.path().string()), std::string::npos)
         << "the message must name the directory that was searched; got: "
         << pref.error().detail;
+}
+
+// A DANGLING LINK IS NO PROJECT FILE, on every build: a workspace whose one `.dss-project.json` entry is a
+// dangling link has no project file -- what the MSVC and POSIX builds always answered. libstdc++ on Windows reads
+// a dangling link's own attributes and calls it a regular file, so the MinGW build took it for a manifest and
+// failed to load it ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The link is made by the OS.
+TEST(WorkspaceProject, ADanglingManifestLinkIsNoProjectFile) {
+    ScratchDir ws{Location::Temp, "lsp-ws-dangling"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(ws.path() / "no-such.dss-project.json",
+                                                             ws.path() / "app.dss-project.json",
+                                                             dss::test_support::LinkTo::File));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto pref = resolveWorkspaceLanguagePreference(roots);
+    ASSERT_FALSE(pref.has_value());
+    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
+        << "the workspace whose one manifest is a dangling link answered "
+        << dss::lsp::workspaceProjectErrorName(pref.error().kind);
+}
+
+// A PROJECT FILE THAT CANNOT BE READ IS REFUSED, NAMING IT: a workspace whose `.dss-project.json` entry is a link
+// that names itself (a loop) has a project file the editor cannot read -- never "no project file". A looping link
+// named as no project file is none whatever it reaches, and the search answers as if it were not there.
+TEST(WorkspaceProject, AManifestLinkThatCannotBeReadIsRefusedNamingIt) {
+    ScratchDir ws{Location::Temp, "lsp-ws-loop"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(ws.path() / "app.dss-project.json",
+                                                             ws.path() / "app.dss-project.json",
+                                                             dss::test_support::LinkTo::File));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto pref = resolveWorkspaceLanguagePreference(roots);
+    ASSERT_FALSE(pref.has_value());
+    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::ProjectFileLoadFailed)
+        << "the workspace whose one manifest is a looping link answered "
+        << dss::lsp::workspaceProjectErrorName(pref.error().kind) << ": " << pref.error().detail;
+    EXPECT_NE(pref.error().detail.find("app.dss-project.json"), std::string::npos)
+        << "the refusal does not name the entry: " << pref.error().detail;
+
+    ScratchDir other{Location::Temp, "lsp-ws-loop-other"};
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(other.path() / "loop", other.path() / "loop",
+                                                             dss::test_support::LinkTo::File));
+    const std::array<fs::path, 1> otherRoots{other.path()};
+    auto none = resolveWorkspaceLanguagePreference(otherRoots);
+    ASSERT_FALSE(none.has_value());
+    EXPECT_EQ(none.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
+        << "a looping link named as no project file answered " << dss::lsp::workspaceProjectErrorName(none.error().kind)
+        << ": " << none.error().detail;
 }
 
 // ★ A MANIFEST NAMING NO TARGET IS REJECTED BY THE SHARED PARSER, NOT BY A
@@ -1092,57 +1144,53 @@ TEST(WorkspaceProject, FileUriRoundTrip) {
         ASSERT_TRUE(back.has_value());
         EXPECT_EQ(back->generic_string(), p.generic_string());
     }
-    // (4) A UNC-SHAPED PATH. ⚠ THE INVARIANT IS THE ROUND TRIP; THE EXACT URI
-    // TEXT IS PLATFORM-DEFINED, AND PINNING ONE PLATFORM'S TEXT WAS A DEFECT.
-    // ✔MEASURED on TWO legs, and they disagree for a good reason:
-    //   * MinGW/GCC on Windows — `fs::path{"//server/share/x.c"}` reports an
-    //     EMPTY `root_name()` and renders with a SINGLE leading slash: the path
-    //     type discards the UNC authority at construction, so this encodes as an
-    //     ordinary absolute path → `file:///server/share/x.c`.
-    //   * libc++ on Darwin — POSIX makes a leading `//` IMPLEMENTATION-DEFINED
-    //     and libc++ PRESERVES it, because `//server/share` there is a LOCAL
-    //     path, not a network authority. `root_name()` is still empty (POSIX has
-    //     none), so the generic string keeps both slashes →
-    //     `file:////server/share/x.c`, an empty authority plus that path.
-    // ★ BOTH ARE CORRECT FOR THEIR PLATFORM, and treating Darwin's `server` as
-    // a URI authority would be the actual bug — it is a directory there.
-    // ⚠ THIS ASSERTION USED TO HARDCODE THE FIRST FORM, and the macOS leg is
-    // what caught it: the lane that wrote it said, accurately, that it pinned
-    // "what THIS leg actually does rather than a portability claim it cannot
-    // keep" — but "this leg" is FOUR legs. The two known-correct renderings are
-    // named explicitly rather than derived from `p`, because deriving the
-    // expectation would make this test re-implement the function it tests and
-    // assert nothing; a THIRD rendering still fails loudly here.
+    // (4) A UNC-SHAPED PATH. ⚠ THE INVARIANT IS THE ROUND TRIP; THE URI TEXT IS THE HOST'S, AND THE HOST'S ROOT PARSE
+    // (`core::rootSpelling`, the one the encoder asks) SAYS WHICH OF TWO NAMED RENDERINGS IT OWES:
+    //   * a SHARE (the Win32 grammar: MS STL and MinGW alike) — the server IS the authority:
+    //     `file://server/share/x.c`, RFC 8089's spelling of a UNC share. ✔MEASURED 2026-08-28 (cycle P43) on the first
+    //     MSVC run of this suite, whose round trip is what caught `pathFromFileUri` refusing our own output,
+    //     [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]].
+    //   * a POSIX `//` AUTHORITY root — implementation-defined, and on Darwin a LOCAL directory, not a network host — so
+    //     it stays in the URI's PATH after an empty authority: `file:////server/share/x.c`. ✔MEASURED on the macOS leg,
+    //     which is what caught this assertion once hard-coding a single platform's text.
+    // ⚠ THE AUTHORITY-DISCARDING `file:///server/share/x.c` IS NO ARM. It was the MinGW build's until P69 H6: MinGW's
+    // library models no root name for `//server/share` and renders it with one leading slash, and the URI then named a
+    // path on the LOCAL drive's root, the file renamed. Accepting it here let that stand green; it now fails, as any
+    // third rendering does. The two renderings are NAMED, not derived from `p`, so this does not re-implement the
+    // function it tests; the parse only picks between them.
     {
         const std::filesystem::path p{"//server/share/x.c"};
         const std::string uri = dss::lsp::fileUriFromPath(p);
-        //   * MSVC STL on Windows — models `//server/share` as a REAL
-        //     `root_name()`, so the authority survives and this renders as
-        //     `file://server/share/x.c`, the RFC 8089 spelling of a UNC share.
-        //     ✔MEASURED 2026-08-28 (cycle P43) on the first MSVC run of this
-        //     suite. ★ THIS IS THE "third arm" THE PARAGRAPH ABOVE PREDICTED,
-        //     added as one rather than by widening the check — and the round
-        //     trip below is what caught that `pathFromFileUri` refused our own
-        //     output, [[D-LSP-FILE-URI-WITH-A-UNC-AUTHORITY-DOES-NOT-ROUND-TRIP]].
-        const bool knownForm = uri == "file:///server/share/x.c"
-                            || uri == "file:////server/share/x.c"
-                            || uri == "file://server/share/x.c";
-        EXPECT_TRUE(knownForm)
-            << "unexpected UNC rendering '" << uri << "' — neither the "
-               "authority-discarding form nor the POSIX `//`-preserving one. "
-               "If a platform models a real UNC root this needs a third arm, "
-               "NOT a widened check";
+        auto const root = dss::core::rootSpelling(p).kind;
+        ASSERT_TRUE(root == dss::core::RootSpelling::Kind::Share || root == dss::core::RootSpelling::Kind::Authority)
+            << "the host's parse of `//server/share` is neither a share nor a POSIX `//` root; a grammar that reads it "
+               "otherwise needs its own named rendering here, NOT a widened check";
+        EXPECT_EQ(uri, root == dss::core::RootSpelling::Kind::Share ? "file://server/share/x.c"
+                                                                     : "file:////server/share/x.c")
+            << "the UNC rendering does not follow the host's own root parse";
         auto back = dss::lsp::pathFromFileUri(uri);
         ASSERT_TRUE(back.has_value());
-        EXPECT_EQ(back->generic_string(), p.generic_string())
+        // In the substrate's spelling on both sides: `generic_string()` collapses the leading run on the MinGW model,
+        // so comparing it would call a trip that lost the authority lossless.
+        EXPECT_EQ(dss::core::genericSpelling(*back), dss::core::genericSpelling(p))
             << "whatever the platform makes of a UNC spelling, the trip must "
-               "be lossless in the form the path type actually holds — THIS is "
+               "be lossless in the form the path holds — THIS is "
                "the property, and it holds on every leg";
     }
-    // The inbound REFUSAL of a real remote authority is the property that
-    // matters for safety, and it is pinned separately by
-    // `NonFileUriIsRefusedRatherThanGuessed`: a network host is not a local
-    // directory to scan, so `file://someremotehost/share/x` yields nullopt.
+    // (5) A VERBATIM PREFIX NAMES NO MACHINE, SO IT IS NO AUTHORITY. MS STL's `root_name()` of `\\?\C:\x` is `\\?`
+    // (✔MEASURED, core/substrate/path_identity.hpp), and the encoder that asked it wrote a URI whose authority was `?`.
+    // The substrate's parse reads a verbatim prefix, and the spelling stays in the URI's PATH after an empty authority,
+    // its `?` percent-encoded. A Win32-grammar host only: under POSIX that text is one relative name, with no prefix.
+    {
+        const std::filesystem::path p{"\\\\?\\C:\\dev\\x.c"};
+        if (dss::core::rootSpelling(p).kind == dss::core::RootSpelling::Kind::Verbatim) {
+            EXPECT_EQ(dss::lsp::fileUriFromPath(p), "file:////%3F/C:/dev/x.c")
+                << "a verbatim prefix was rendered as a URI authority";
+        }
+    }
+    // Whether a NAMED authority on the way IN is a path or a remote host is the host's root parse again, pinned
+    // separately by `NonFileUriIsRefusedRatherThanGuessed`: where `//host/share` is a share it is that share; where it
+    // is not, a network host is not a local directory to scan, and `file://someremotehost/share/x` yields nullopt.
 }
 
 

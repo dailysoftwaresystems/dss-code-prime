@@ -1,0 +1,4 @@
+        for (auto const& r : target_.relocations()) {
+            if (r.widthBytes == widthBytes && !r.pcRelative && !r.tls && !r.imageRelative) return r.kind;
+        }
+        return std::nullopt;

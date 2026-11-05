@@ -1304,6 +1304,19 @@ public:
     // language.
     [[nodiscard]] bool commitAfterPrefix(RuleId rule) const noexcept;
 
+    // P69 (lane `cs`): the token kinds that must NOT follow a cleanly-closed speculative
+    // probe of `rule` (`notFollowedBy` on the shape body — a PEG not-predicate); when the
+    // next token is one, the probe is abandoned and the alt tries its next candidate.
+    // Sorted by `.v`; empty for every rule that declares none.
+    [[nodiscard]] std::span<SchemaTokenId const> notFollowedBy(RuleId rule) const noexcept;
+
+    // P69 round 4 (lane `cs`): the positive twin — the token kinds ONE of which MUST follow a
+    // cleanly-closed speculative probe of `rule` (`followedByFirstOf` on the shape body: the
+    // FIRST set of the shape it names — a PEG and-predicate); when the next token is none of
+    // them, the probe is abandoned and the alt tries its next candidate (or its skip). Sorted
+    // by `.v`; empty for every rule that declares none.
+    [[nodiscard]] std::span<SchemaTokenId const> followedBy(RuleId rule) const noexcept;
+
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and
     // validated all three were present, so for an `isExprRule(rule)`
@@ -1385,8 +1398,16 @@ public:
     [[nodiscard]] std::span<ConfigDiagnostic const> loadDiagnostics() const noexcept;
 
     // ── Scope rules ──
-    [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,
-                                           std::span<ScopeKind const> stack) const noexcept;
+    // Is `tok` valid where the scopes `open(ctx, kind)` says are open — false iff a scope of a
+    // kind whose `scopes.validity` row forbids `tok` is open. Asked of a PRESENCE oracle, one
+    // question per scope kind that forbids anything, in ascending kind order, never the stack's
+    // depth, and none for a grammar that declares no scope rules (P69 L2a2: a walk of the stack,
+    // once per token, made a parse cost Θ(tokens × nesting)). ★ P69 L2b1 (lane `lm`, the L2a2
+    // review's A4): there is no stack form of this question any more — the walk overload is
+    // deleted, so a resolution cannot call it, and its tests ask this one through a stack oracle.
+    using ScopeOpenFn = bool (*)(void const* ctx, ScopeKind kind) noexcept;
+    [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
+                                           void const* ctx) const noexcept;
 
     // ── Termination ──
     [[nodiscard]] bool canEndSource(SchemaCursor cur) const noexcept;
@@ -1435,6 +1456,10 @@ private:
     // Written ONLY by `loadFromText` (a static member, so no friend is
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
+
+    // The scope kinds a `scopes.validity` row forbids a token in, ascending (the ctor's sealing
+    // pass; see `isTokenValidInScope`).
+    std::vector<std::uint16_t> scopeForbidOrder_;
 
     detail::GrammarSchemaData d_;
 };

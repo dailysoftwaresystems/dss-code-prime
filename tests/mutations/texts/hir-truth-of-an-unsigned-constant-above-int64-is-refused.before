@@ -1,0 +1,3 @@
+    auto iv = asIntBits(v);
+    if (!iv.has_value()) return std::nullopt;
+    return *iv != 0;

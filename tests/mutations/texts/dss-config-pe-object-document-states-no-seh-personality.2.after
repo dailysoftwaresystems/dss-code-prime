@@ -1,0 +1,1 @@
+    { "role": "atomicsRuntime", "source": "runtime/platform/src/atomic.c" }

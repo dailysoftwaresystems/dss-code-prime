@@ -1,0 +1,1 @@
+            if (isComparison(*opK)) folded->core = TypeKind::I64;

@@ -1,0 +1,1 @@
+            folded.value = domain.has_value() ? wrapToIntTarget(raw, *domain) : raw;

@@ -9,6 +9,7 @@
 | | |
 |---|---|
 | Status        | 🔒 **reserved.** Triggered when a shipped language declares "needs GC" or "needs exceptions" or "needs coroutines." |
+| Scheduled | per [`30`](./30-pr-scope-plan%20-%20tbd.md) (2026-10-22): opens with the C++ PR, whose exceptions are its first consumer. |
 | Predecessors  | ⏳ v1 ship. |
 | Successors    | First-class consumer is [`20-custom-language-reserved-plan`](./20-custom-language-reserved-plan%20-%20tbd.md). |
 | Scope         | **Unspecified.** Three independent modules (GC / exceptions / coroutines), each with its own design when triggered. |

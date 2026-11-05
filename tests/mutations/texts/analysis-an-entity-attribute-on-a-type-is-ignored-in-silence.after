@@ -1,0 +1,1 @@
+        if (false) reportAt(cl, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,

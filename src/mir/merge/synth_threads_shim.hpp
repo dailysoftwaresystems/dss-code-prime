@@ -23,9 +23,9 @@
 // `recipeBySymbol` maps each shim function's PRE-MINTED SymbolId.v (minted at semantic
 // injection, seeded into HIR→MIR `functionSymbols` by the CST→HIR skip so the user call
 // already lowered to `GlobalAddr(sym)`) to its recipe id (== the C11 function name). For
-// each entry the pass emits `addFunction(sig, sym, Global, Default)` + a single-block
+// each entry the MODULE REFERENCES the pass emits `addFunction(sig, sym, Weak, Hidden)` + a
 // body from the recipe switch — the DEFINITION the user's not-yet-bound call resolves
-// to. Non-empty ONLY on a pe target (the descriptor tags the pe variants only), so the
+// to. Non-empty ONLY on pe and Mach-O (the descriptor tags those variants only), so the
 // pass keys on a DATA property (the map), never `if (format == pe)`.
 //
 // AGNOSTIC: lives in `src/mir/merge` (the opt-in format-specific-synthesis
@@ -50,21 +50,35 @@ class Mir;
 class TypeInterner;
 class DiagnosticReporter;
 
-// Synthesize a definition for every <threads.h> shim symbol in `recipeBySymbol`, over the
-// primitive family the format's `librarySynthesis` block declares. EMPTY map ⇒ clean no-op
-// (every elf + every non-threads TU). On success `mir` is REBUILT with the shim functions
-// appended and `externImports` carries the native helpers they call (deduped, imported from
-// `librarySynthesis->libraryPath`). Returns false (fail-loud, reported) on: (a) a non-empty
-// recipe map with NO `librarySynthesis` — a format carrying synthesize-tagged threads
-// symbols but declaring no vehicle (never silently assume one); or (b) a recipe id with no
-// switch arm for the active vehicle (the closed-vocab loader guard makes this unreachable
-// in practice, but the arm is the anti-silent-gap backstop).
+// Synthesize a definition for every <threads.h> shim symbol in `recipeBySymbol` that `mir`
+// REFERENCES, over the primitive family the format's `librarySynthesis` block declares —
+// a recipe nothing names is NOT synthesized (the referenced-only rule, read through
+// link/extern_reference_gate.hpp's `mirReferenceTargetIds`;
+// D-MIR-THREADS-SHIM-SYNTHESIZES-UNREFERENCED-RECIPES). ★ WHICH MODULE IT READS: `mir` as
+// the UNIT-stage optimize left it, before the PROGRAM-stage optimize runs
+// (`synthesizeLibraryShims`, both seams) — so a recipe named only by code the Program stage
+// later deletes is still synthesized, and its body stays (see the reference gate's
+// `mirReferenceTargetIds` for the measurement and why the rule is not tightened). No
+// referenced recipe ⇒ clean no-op (every elf TU, every TU that includes <threads.h> and
+// calls none of it). On success `mir`
+// is REBUILT with the shim functions appended and `externImports` carries the native helpers
+// they call (deduped, imported from `librarySynthesis->libraryPath`). Returns false
+// (fail-loud, reported) on: (a) a REFERENCED recipe with NO `librarySynthesis` — a format
+// carrying synthesize-tagged threads symbols but declaring no vehicle (never silently assume
+// one); or (b) a recipe id with no switch arm for the active vehicle (the closed-vocab loader
+// guard makes this unreachable in practice, but the arm is the anti-silent-gap backstop).
 //
-// ★★ LINKAGE: every function this pass defines (each shim and the once-adapter) is WEAK +
-// HIDDEN — the synthesis-once rule shared with `synthesizeStdioShim`: a synthesized library
-// body exists once per linked image however many separately compiled units carry a copy
-// (the linker's all-weak arm keeps one), and stays internal to that image (never exported,
-// never preemptible). tests/mir/test_synth_shim_collapse_linkage.cpp pins it.
+// ★★ LINKAGE: every function this pass defines is WEAK + HIDDEN — the synthesis-once rule
+// (the retired <stdio.h> shim family shared it until P69): a synthesized library body exists
+// once per linked image however many separately compiled units carry a copy (the linker's
+// all-weak arm keeps one), and stays internal to that image (never exported, never
+// preemptible). tests/mir/test_synth_shim_collapse_linkage.cpp pins it.
+//
+// Every helper import's symbol is minted by the MODULE (`Mir::symbolIdEnd`,
+// `MirBuilder::mintSymbolOrAbort` — see mir/merge/synth_symbol_floor.hpp): past every id
+// the module holds and every id the name table it was made from holds — and past every id
+// the recipe map holds — so no helper id is a name the table gives to something else. No
+// caller hands this pass an end; tests/mir/test_synth_symbol_floor.cpp pins the ids.
 [[nodiscard]] DSS_EXPORT bool
 synthesizeThreadsShim(Mir&                                                  mir,
                       TypeInterner&                                         interner,

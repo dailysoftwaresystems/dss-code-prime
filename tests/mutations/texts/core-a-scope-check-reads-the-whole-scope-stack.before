@@ -1,0 +1,1 @@
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : scopes_.back(),

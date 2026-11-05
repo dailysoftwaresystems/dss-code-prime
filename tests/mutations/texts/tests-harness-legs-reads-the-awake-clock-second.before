@@ -1,0 +1,2 @@
+            awake_first = gettime(corroboration[1])
+            recorded = round(gettime(corroboration[0]) - awake_first, 3)

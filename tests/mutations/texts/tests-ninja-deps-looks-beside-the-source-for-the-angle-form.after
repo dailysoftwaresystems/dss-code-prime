@@ -1,0 +1,1 @@
+            places = [os.path.dirname(path)] + dirs

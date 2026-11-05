@@ -1,0 +1,55 @@
+{
+  "$comment": "P69 (lane lm, D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS): a static-library member's hidden definitions belong to the IMAGE that links the member — the link that pulls it resolves them by name. Each arm's `dependsOn` builds lib.c (a hidden function, a hidden datum and one plain control, nothing in lib.c using the hidden pair) into the pair's static library; main.c links it and uses all three. Exit 42 iff they arrived (lib_version() == 1, 40 + 1 + 1). ✔MEASURED before the fix with the lane's dsscp: a release member (`elf64-x86_64-linux-staticlib`) defined the plain control ALONE — DCE rooted only `isExternallyVisible` definitions, an image question, while a member's definitions are named by the OTHER inputs of its link — where gcc 13.3.0 and clang 18.1.3 at `-O2 -c` keep both hidden definitions (probe-reference-cc run 20261001-152924-ba09ffc4). The fix: a static-archive member is optimized as a `opt::ModuleExtent::LinkInput`, which roots every external-linkage definition. The release arm builds the library under the release pipeline too, so it is the witness (the defect was release-only). lib_version's loop is there for the optimizer to fold: ✔MEASURED 2026-10-01 with the lane's dsscp, the release library and the release executable both differ from the baseline ones on all five pairs (without the loop the library did not — nothing in it was left to optimize once the hidden pair is kept), so both levels carry `mustDifferFromBaseline` and the arm proves the member WAS optimized and still kept the hidden pair.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "lib.lib", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "x86_64:macho64-x86_64-darwin-staticlib", "artifact": "lib.a", "mustDifferFromBaseline": true }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

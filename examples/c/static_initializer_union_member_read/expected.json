@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a static initializer may read the ACTIVE member of a const union — the member its initializer made current — and nothing else. DSS refused every such read with H_StaticInitializerNotFolded: HIR's union constant did not say which member it held (two members may share a type, so the field's type cannot), and the evaluator read no union member at all. Now a union aggregate names its member (the node's payload, `construct #N` in .dsshir v7) and the member read folds that member only. The exit code is a bitmask of the reads that did not fold (1 the first member, 2 a designated member of ANOTHER type than the first, also read back from the emitted object at run time, 4 a union inside a structure, 8 an element of an array member, 16 a designated member of the SAME type as the first, 32 a block-scope const union read in a static local, 64 a structure member of a union). Bit 2 joined in P69 when [[D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED]] closed: until then its read folded but its union OBJECT could not be emitted (the static-data encoder placed the one initialized member as if it were the FIRST member). MEASURED 2026-10-01 through `dssharness run probe-reference-cc`, the file without bit 2: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x build and run 42 (run 20261001-032457-1029bae3), mingw-w64 gcc 13.2.0 in both modes too (run 20261001-032524-278dd489); MSVC 19.51 /std:clatest and /std:c17 refuse (C2099, run 20261001-032527-3efb7211). MEASURED again 2026-10-07 with bit 2, the same way: gcc and clang build and run 42 in both modes (run 20261007-040425-b6f65fc0, host run 20261007-040415-7c231949), mingw-w64 gcc in both modes too (20261007-040443-f6068627), MSVC refuses at every read, the new one included (C2099, 20261007-040446-e0fb5677). Every read of an INACTIVE member — another type or the same — is refused by all of them (lane `cs`'s probe r68 u05-u08) and stays refused (MirLoweringC.AConstUnionsActiveMemberFoldsAndNoOtherDoes). The release arm is REPORT-ONLY: the reads are folded data either way.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+    c.orphans = [s for s in c.sources if s not in cleared]

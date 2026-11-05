@@ -123,19 +123,55 @@ decodeWhen(nlohmann::json const& when, WhenAxes axes, std::string_view whenCtx,
     return spec;
 }
 
-bool whenMatches(WhenSpec const& spec, WhenAxes axes, WhenFacts const& facts) noexcept {
+WhenVerdict whenVerdict(WhenSpec const& spec, WhenAxes axes, WhenFacts const& facts) noexcept {
     // LEGALITY AND PARTICIPATION ARE SEPARATE: `FormatReachability` validated every typed key at decode and lets
     // only `format` decide here, which is what makes it a strictly WEAKER test than `FullTarget`.
     bool const typedKeysParticipate = (axes == WhenAxes::FullTarget);
+    // A key the read has no fact for cannot fail the arm here; a key whose fact differs always does — so one
+    // differing fact is NoMatch whatever else is unknown, and only an arm with no such fact can be Undecided.
+    bool undecided = false;
+    auto test = [&](bool named, bool known, bool equal) {
+        if (!named) return true;
+        if (!known) {
+            undecided = true;
+            return true;
+        }
+        return equal;
+    };
     if (typedKeysParticipate) {
-        if (spec.dataModel.has_value() && facts.dataModelName != *spec.dataModel) return false;
-        if (spec.longDoubleFormat.has_value()
-            && (!facts.longDoubleFormatName.has_value() || *facts.longDoubleFormatName != *spec.longDoubleFormat))
-            return false;
-        if (spec.arch.has_value() && (!facts.arch.has_value() || *facts.arch != *spec.arch)) return false;
+        if (!test(spec.dataModel.has_value(), !facts.dataModelName.empty(),
+                  spec.dataModel.has_value() && facts.dataModelName == *spec.dataModel))
+            return WhenVerdict::NoMatch;
+        if (!test(spec.longDoubleFormat.has_value(), facts.longDoubleFormatName.has_value(),
+                  spec.longDoubleFormat.has_value() && facts.longDoubleFormatName.has_value()
+                      && *facts.longDoubleFormatName == *spec.longDoubleFormat))
+            return WhenVerdict::NoMatch;
+        if (!test(spec.arch.has_value(), facts.arch.has_value(),
+                  spec.arch.has_value() && facts.arch.has_value() && *facts.arch == *spec.arch))
+            return WhenVerdict::NoMatch;
     }
-    if (spec.format.has_value() && (!facts.format.has_value() || *facts.format != *spec.format)) return false;
-    return true;
+    if (!test(spec.format.has_value(), facts.format.has_value(),
+              spec.format.has_value() && facts.format.has_value() && *facts.format == *spec.format))
+        return WhenVerdict::NoMatch;
+    return undecided ? WhenVerdict::Undecided : WhenVerdict::Match;
+}
+
+bool whenMatches(WhenSpec const& spec, WhenAxes axes, WhenFacts const& facts) noexcept {
+    return whenVerdict(spec, axes, facts) == WhenVerdict::Match;
+}
+
+bool whensCanCoMatch(WhenSpec const& a, WhenSpec const& b, WhenAxes axes) noexcept {
+    // The SAME participation rule `whenVerdict` applies: the typed keys take part only under
+    // `FullTarget`; `format` always does.
+    auto const agree = [](auto const& x, auto const& y) {
+        return !x.has_value() || !y.has_value() || *x == *y;
+    };
+    if (axes == WhenAxes::FullTarget
+        && (!agree(a.arch, b.arch) || !agree(a.dataModel, b.dataModel)
+            || !agree(a.longDoubleFormat, b.longDoubleFormat))) {
+        return false;
+    }
+    return agree(a.format, b.format);
 }
 
 }  // namespace dss

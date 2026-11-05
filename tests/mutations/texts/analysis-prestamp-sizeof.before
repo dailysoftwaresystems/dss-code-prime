@@ -1,0 +1,2 @@
+                        preStampLiteralLeaves(s, *cfg, tree, operand);
+                        sized = subtreeType(s, tree, operand, fromScope);

@@ -125,12 +125,20 @@ struct BuiltArtifact {
 // performs, and an `ar` archive records no import — so the root would never
 // learn of it and the reference would be undefined TWO HOPS from its cause.
 //
-// The fork is on the format's declared container and on nothing else: an
-// image-flavor link resolves both kinds, so it absorbs everything.
+// The fork is on the format's declared flavor and on nothing else: an
+// IMAGE-flavor link resolves both kinds, so it absorbs everything; a static
+// archive absorbs archives; anything else -- a relocatable object, which
+// records no import and folds in no archive -- absorbs nothing, and every
+// artifact keeps travelling to a build that can. ★ KEYED ON `isImageFlavor()`,
+// the packaging gate's own predicate (P69 H6, the review of H5's N5): reading
+// `!isStaticArchive()` as "an image" is the image-vs-relocatable conflation
+// that gate's fix removed, and it was true here only because no relocatable
+// document serves a project profile (`artifactProfileSupported` fails closed
+// on an empty set).
 [[nodiscard]] bool absorbs(ObjectFormatSchema const& consumerFormat,
                            BuiltArtifact const&      art) noexcept {
-    if (!consumerFormat.isStaticArchive()) return true;
-    return art.isStaticArchive;
+    if (consumerFormat.isImageFlavor()) return true;
+    return consumerFormat.isStaticArchive() && art.isStaticArchive;
 }
 
 // ── the resolver ────────────────────────────────────────────────────────────
@@ -334,7 +342,7 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
         // consumer's DRIVE in front of another machine's authority).
         dir = canonicalize(resolveManifestPath(parent.dir, raw));
         std::error_code ec;
-        if (!fs::is_directory(dir, ec)) {
+        if (core::reachedKind(dir, ec) != core::EntryKind::Directory) {
             emitDriverError(
                 rep_, DiagnosticCode::D_FileNotFound,
                 "project 'dependsOn': path dependency '" + spelling
@@ -354,7 +362,7 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
 
     fs::path const manifest = dir / std::string{kDependencyManifestName};
     std::error_code ec;
-    if (!fs::is_regular_file(manifest, ec)) {
+    if (core::reachedKind(manifest, ec) != core::EntryKind::File) {
         emitGuaranteed(
             rep_, DiagnosticCode::D_DependencyManifestNotFound,
             "project 'dependsOn': '" + spelling + "' (declared by '"

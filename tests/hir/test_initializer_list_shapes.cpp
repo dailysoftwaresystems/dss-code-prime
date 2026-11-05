@@ -94,6 +94,7 @@ struct Lowered {
     std::size_t hirErrors = 0;
     std::size_t hirWarnings = 0;
     std::size_t hirExcess = 0;
+    std::size_t hirBraces = 0;   // S_BracesAroundScalarInitializer (P69: braces around a scalar)
     std::string diagnostics;   // every diagnostic both tiers reported, for the failure message
 };
 
@@ -160,6 +161,7 @@ using Inspect = std::function<void(SemanticModel const&, CstToHirResult const&)>
     out.hirErrors = countSeverity(r, DiagnosticSeverity::Error);
     out.hirWarnings = countSeverity(r, DiagnosticSeverity::Warning);
     out.hirExcess = countCode(r, kExcess);
+    out.hirBraces = countCode(r, DiagnosticCode::S_BracesAroundScalarInitializer);
     appendDiagnostics(out.diagnostics, r);
     if (inspect && res != nullptr && res->ok) inspect(model, *res);
     return out;
@@ -191,6 +193,9 @@ struct Case {
     char const* what;
     char const* src;
     std::size_t excessWarnings;   // S_ExcessInitializerElements expected from the walker
+    // S_BracesAroundScalarInitializer expected (P69, lane `lm`, the scalar brace closure):
+    // gcc 13.3.0 and clang 18.1.3 warn braces around a scalar member or element.
+    std::size_t bracesWarnings = 0;
 };
 
 void expectLowersCleanly(std::initializer_list<Case> cases) {
@@ -201,8 +206,10 @@ void expectLowersCleanly(std::initializer_list<Case> cases) {
         EXPECT_TRUE(l.lowered) << c.what << "\n" << c.src << l.diagnostics;
         EXPECT_EQ(l.hirErrors, 0u) << c.what << "\n" << c.src << l.diagnostics;
         EXPECT_EQ(l.hirExcess, c.excessWarnings) << c.what << "\n" << c.src << l.diagnostics;
-        EXPECT_EQ(l.hirWarnings, c.excessWarnings)
-            << c.what << " — no warning but the excess one\n" << c.src << l.diagnostics;
+        EXPECT_EQ(l.hirBraces, c.bracesWarnings) << c.what << "\n" << c.src << l.diagnostics;
+        EXPECT_EQ(l.hirWarnings, c.excessWarnings + c.bracesWarnings)
+            << c.what << " — no warning but the excess and the braces ones\n" << c.src
+            << l.diagnostics;
     }
 }
 
@@ -343,8 +350,10 @@ TEST(InitializerListShapes, BraceElisionFillsEachAggregateElementInOrder) {
          "  _Static_assert(sizeof(bs) == 2 * sizeof(struct B), \"2\"); return bs[1].b; }\n", 0},
         {"a braced row after elided ones",
          "int main(void) { int e[3][2] = { 1, 2, { 3, 4 }, 32 }; return e[2][0]; }\n", 0},
+        // ✔MEASURED 2026-10-16 (P69, lane `lm`, probes sb6): gcc 13.3.0 and clang 18.1.3 both
+        // warn "braces around scalar initializer" at `{ 2 }`, and both run it to 2.
         {"braces around an elided scalar",
-         "int main(void) { int a[2][2] = { 1, { 2 }, 3, 36 }; return a[0][1]; }\n", 0},
+         "int main(void) { int a[2][2] = { 1, { 2 }, 3, 36 }; return a[0][1]; }\n", 0, 1},
         {"file scope", "static int g[][2] = { 1, 2, 3, 36 };\n"
                        "_Static_assert(sizeof(g) == 4 * sizeof(int), \"4\");\n"
                        "int main(void) { return g[1][1]; }\n", 0},

@@ -70,8 +70,10 @@ struct DSS_EXPORT LinkedImage {
 
     // LK11a: the cross-CU symbol-resolution outcome — for each externally-visible
     // NAME defined across the linked CUs, the WINNING definition's compound key after
-    // weak-vs-strong resolution (a strong/Global def shadows weak; among all-weak the
-    // lowest (cuId, SymbolId) wins deterministically). Empty for single-CU links (no
+    // weak-vs-strong resolution (a strong/Global def shadows weak; among weak ones
+    // that rank alike the first in the link's order wins -- the operator's order of
+    // the inputs, `AssembledModule::linkPosition` -- and the compound key only at one
+    // place or at none, P69 fold 3d). Empty for single-CU links (no
     // cross-CU merge). Load-bearing for the OPT7 Weak-inline guard: the optimizer must
     // not inline a weak callee whose winning definition here is a DIFFERENT, strong one.
     std::unordered_map<std::string, LinkedSymbolKey> resolvedGlobalDefs;
@@ -87,6 +89,19 @@ struct DSS_EXPORT LinkedImage {
         LinkedSymbolKey definition;  // the winning sibling-CU definition's compound key
     };
     std::vector<CrossCuRef> resolvedCrossCuRefs;
+
+    // P69 fold 3c: the names a definition CARRIED that the link took from it. Where
+    // the link's document discards a superseded definition WHOLE, a copy that loses
+    // its own name loses every other name it carries too, and each of them is
+    // elected again without it (`linker::resolveSettlingCarriedNames`,
+    // link/common_yield.hpp). Such a name is no name of that definition any more:
+    // the merge never folds the losing copy through it, whichever definition won it
+    // afterwards. Empty for a relocatable link, which keeps every name.
+    struct WithdrawnName {
+        LinkedSymbolKey definition;  // the carrying definition, in its own unit
+        std::string     name;        // the name withdrawn from it
+    };
+    std::vector<WithdrawnName> withdrawnNames;
 
     // The mangled names of the extern imports the EMITTED image carries (its import-table
     // entries). A cross-CU reference that resolved to a sibling definition is STRIPPED

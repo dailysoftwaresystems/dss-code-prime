@@ -1,0 +1,2 @@
+    return c->isUnsigned
+        ? WideFloatValue::fromUint64(c->bits, /*sign=*/false, toK)

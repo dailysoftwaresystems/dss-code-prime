@@ -1,0 +1,4 @@
+        return interner.primitive(kindAtRank(intWidthRank(rules.minRank), /*isSigned=*/false));
+    }
+    return interner.primitive(rules.minRank);
+}

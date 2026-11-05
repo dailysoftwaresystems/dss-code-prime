@@ -263,7 +263,8 @@ TEST(DiagnosticBudgetThreading, BudgetDoesNotCarryPolicyIntoATier) {
 // one of the four that were missed was missed by reading rather than by
 // enumerating.
 //
-// The rule is INVERTED on purpose, exactly like `check-anchor-balance.py`:
+// The rule is INVERTED on purpose, exactly like `dssharness check-anchor-balance`,
+// which reads a row as open unless its Status cell starts with the closed mark:
 // a construction is a VIOLATION unless it is visibly budget-derived, so a
 // shape nobody has thought of yet counts as a violation, which is the safe
 // direction. Deliberately-unbudgeted throwaways are allowlisted BY THEIR EXACT

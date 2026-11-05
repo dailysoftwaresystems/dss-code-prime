@@ -1,0 +1,1 @@
+                disc = promoteSubIntArith(asBitFieldValue(c, raw)).id; continue;

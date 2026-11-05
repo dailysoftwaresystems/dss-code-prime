@@ -1,0 +1,2 @@
+                builder.addCondBr(*cond, blockOf.at(succs[0].v),
+                                  blockOf.at(succs[1].v));

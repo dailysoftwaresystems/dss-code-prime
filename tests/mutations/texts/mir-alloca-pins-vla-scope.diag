@@ -1,0 +1,1 @@
+the `continue` out of the unpinned inner array must free it (and the block's end too)

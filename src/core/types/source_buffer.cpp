@@ -72,7 +72,11 @@ std::shared_ptr<SourceBuffer> SourceBuffer::fromFile(std::filesystem::path const
     // `if (in.bad())` this replaces could not fire at all: `<< in.rdbuf()` goes
     // through the streambuf and never touches the istream's own state
     // (✔MEASURED). The helper compares BYTES against the size it measured.
-    auto text = core::readFileChecked(path);
+    // ★ BOUNDED BY WHAT A BUFFER CAN ADDRESS: a source or header may be a DEVICE or a NAMED PIPE (gcc and clang read
+    // both, ✔MEASURED -- `readFileChecked`), read to its end -- and one with no end (`/dev/zero`) is refused once
+    // it passes the ByteOffset limit, never read until the machine runs out; a regular file past it is refused
+    // before it is read.
+    auto text = core::readFileChecked(path, std::numeric_limits<std::uint32_t>::max());
     if (!text) {
         throw std::runtime_error("SourceBuffer::fromFile: "
                                  + std::move(text).error().message);

@@ -24,10 +24,12 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using dss::lsp::DocumentStore;
 using dss::lsp::testing::LspTestHarness;
@@ -487,4 +489,147 @@ TEST(LspSemantic, PublishDiagnosticsIncludesSemanticUndeclared) {
         }
     }
     EXPECT_TRUE(sawUndecl);
+}
+
+// ★★ [[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]] — THE
+// EDITOR'S ORDINARY CASE, THROUGH THE SHIPPED DOOR.
+//
+// A half-typed declaration is a language server's normal input, and the server
+// ANALYZES the tree its parse recovered (the CLI never does: it stops at the
+// parse error). Each document below leaves a parser recovery (Error) node where
+// a semantic scan tested ONE of NodeKind's three arms and read the node through
+// another arm's accessor — every non-Token child of a direct declarator as a
+// rule node (`directDeclaredType`), every non-Token node in an asm statement's
+// qualifier window as a rule node (`gatherInlineAsmFacts`), every non-Internal
+// child of an asm operand as a token (`captureOperand`), every non-Internal
+// child of a static initializer's leaf operand as a token (the static-initializer
+// constant walk's identifier scan — a stray character in `int w = @ 42;`, an
+// editor's most ordinary half-typed line), every non-Token operand of a
+// conditional's arm as a rule node (`expressionQualifierSpine`'s walk, reached
+// from `_Generic`, `typeof` and an overflow builtin's result pointer: an error
+// inside a conditional's arm is not backtracked). ✔MEASURED before the
+// fix, with the debug `dsscp --lsp`: each document KILLED the server (the
+// accessor's assertion, 0xc0000409) and nothing was published; a release build
+// read the node's payload field instead. The pin: the server SURVIVES each one,
+// publishes EXACTLY these diagnostics, and still answers the next request. One
+// TEST per site, so a process that dies names the site it died in.
+namespace {
+
+void expectARecoveredDocumentIsAnalyzed(std::string_view text,
+                                        std::vector<std::string> const& codes) {
+    // ★ FIRST IN A CHILD PROCESS. A scan that reads a recovery node through another
+    // arm's accessor ABORTS on that accessor's assertion — and an abort in THIS process
+    // ended the whole runner: every test after the site never ran and no report was
+    // written (✔MEASURED, the five mutation arms of these sites: "exited 134 and wrote no
+    // report"). In a death-test child the abort is THIS test's failure, named, and the
+    // runner goes on to the next. The child does all the server does here and exits with
+    // its answer; the checks of WHAT it published then run in this process.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    std::string const document{text};
+    EXPECT_EXIT(
+        {
+            LspTestHarness child;
+            child.push(lspInitialize(1));
+            child.push(didOpen("file:///recovered.c", document));
+            child.push(posRequest("textDocument/hover", 7, "file:///recovered.c", 0, 0));
+            child.push(lspShutdown(2));
+            child.push(std::string{lspExit});
+            std::exit(child.runUntilExit() == 0 ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "")
+        << "the server must still answer after the analysis: analyzing the recovered document "
+           "did not end in a clean exit";
+    if (::testing::Test::HasFailure()) return;
+
+    LspTestHarness h;
+    h.push(lspInitialize(1));
+    h.push(didOpen("file:///recovered.c", text));
+    h.push(posRequest("textDocument/hover", 7, "file:///recovered.c", 0, 0));
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    EXPECT_EQ(h.runUntilExit(), 0);
+
+    auto msgs = h.takeServerMessages();
+    // init-response, publishDiagnostics, the hover reply, shutdown-ack.
+    ASSERT_EQ(msgs.size(), 4u);
+    std::vector<std::string> published;
+    bool sawPublish = false;
+    bool sawHoverReply = false;
+    for (auto const& raw : msgs) {
+        auto const m = json::parse(raw);
+        if (m.contains("method")
+            && m.at("method") == "textDocument/publishDiagnostics") {
+            sawPublish = true;
+            EXPECT_EQ(m.at("params").at("uri"), "file:///recovered.c");
+            for (auto const& d : m.at("params").at("diagnostics"))
+                published.push_back(d.at("code").get<std::string>());
+        }
+        if (m.contains("id") && m.at("id") == 7) sawHoverReply = true;
+    }
+    EXPECT_TRUE(sawPublish);
+    EXPECT_TRUE(sawHoverReply) << "the server must still answer after the analysis";
+    EXPECT_EQ(published, codes);
+}
+
+} // namespace
+
+// `directDeclaredType`: a direct declarator whose array suffix the parser recovered.
+TEST(LspRecoveredTree, ADirectDeclaratorsRecoveryChildIsNotReadAsARule) {
+    // The two S_ codes are the bound's own (`sizeof` of the array of unknown size
+    // `int[]` is 0, said — cl's reading; `a` then has no constant bound, the
+    // recovered `7` beside it).
+    expectARecoveredDocumentIsAnalyzed(
+        "int a[sizeof (int[]) 7];\nint main(void) { return 0; }\n",
+        {"P_UnexpectedToken", "S_SizeofIncompleteArrayIsZero", "S_NonConstantArrayLength"});
+}
+
+// `gatherInlineAsmFacts`: a recovery node in an asm statement's qualifier window.
+TEST(LspRecoveredTree, AnAsmQualifierWindowsRecoveryNodeIsNotReadAsARule) {
+    expectARecoveredDocumentIsAnalyzed(
+        "void f(void) { __asm__ volatile @ (\"nop\"); }\nint main(void) { return 0; }\n",
+        {"P_IllegalChar", "P_NoAlternativeMatched"});
+    expectARecoveredDocumentIsAnalyzed(
+        "void f(void) { __asm__ + (\"nop\"); }\nint main(void) { return 0; }\n",
+        {"P_NoAlternativeMatched"});
+}
+
+// `captureOperand`: a recovery child of an asm operand (inside the value
+// parentheses, and between the constraint and the value).
+TEST(LspRecoveredTree, AnAsmOperandsRecoveryChildIsNotReadAsAToken) {
+    expectARecoveredDocumentIsAnalyzed(
+        "void f(void) { int x; __asm__(\"\" : \"=r\"(x @)); }\nint main(void) { return 0; }\n",
+        {"P_IllegalChar", "P_UnexpectedToken"});
+    // The operand the recovery left has no readable shape (S_InlineAsmExtendedUnsupported
+    // names it), so `x` is never used.
+    expectARecoveredDocumentIsAnalyzed(
+        "void f(void) { int x; __asm__(\"\" : \"=r\" @ (x)); }\nint main(void) { return 0; }\n",
+        {"P_IllegalChar", "P_UnexpectedToken", "S_InlineAsmExtendedUnsupported", "S_UnusedVariable"});
+}
+
+// The static-initializer constant walk's identifier scan: a recovery child of
+// an initializer's leaf operand.
+TEST(LspRecoveredTree, AStaticInitializersRecoveryChildIsNotReadAsAToken) {
+    expectARecoveredDocumentIsAnalyzed(
+        "int w = @ 42;\nint main(void) { return 0; }\n",
+        {"P_IllegalChar", "P_NoAlternativeMatched"});
+}
+
+// `expressionQualifierSpine`'s walk: a recovery operand inside a conditional's
+// arm, through three of the spine's callers.
+TEST(LspRecoveredTree, AQualifierSpinesRecoveryOperandIsNotReadAsARule) {
+    expectARecoveredDocumentIsAnalyzed(
+        "void f(void); void g(void);\n"
+        "int main(int argc, char **argv) { (void)argv; "
+        "return _Generic(argc > 0 ? f @ : g, default: 0); }\n",
+        {"P_IllegalChar", "P_MissingRequiredChild", "P_UnexpectedToken"});
+    expectARecoveredDocumentIsAnalyzed(
+        "int *xp, *yp;\n"
+        "int main(int argc, char **argv) { (void)argv; "
+        "typeof(argc ? xp @ : yp) r = 0; return r == 0; }\n",
+        {"P_IllegalChar", "P_MissingRequiredChild", "P_UnexpectedToken"});
+    expectARecoveredDocumentIsAnalyzed(
+        "int r;\n"
+        "int main(int argc, char **argv) { (void)argv; int *rp = &r; "
+        "return __builtin_add_overflow(argc, 1, argc ? rp @ : rp); }\n",
+        {"P_IllegalChar", "P_MissingRequiredChild", "P_MissingRequiredChild", "P_UnexpectedToken"});
 }

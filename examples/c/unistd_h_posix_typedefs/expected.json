@@ -1,0 +1,44 @@
+{
+  "$comment": "P69 (lane lm, D-C-UNISTD-H-LACKS-SEVEN-POSIX-TYPEDEFS): POSIX's <unistd.h> typedefs from <unistd.h> ALONE — each classified by _Generic (1 int, 2 unsigned int, 3 long, 4 unsigned long, 5 long long, 6 unsigned long long) and sized BEFORE any other header is included, then printed. DSS refused all seven names on ELF and Mach-O and six on pe. ✔MEASURED, this stdout and exit 42: gcc 13.3.0 and clang 18.1.3 on glibc 2.39 and aarch64-linux-gnu-gcc (default mode; probe-reference-cc run 20261001-021550-a3f1f402), Apple clang 21 on arm64 and x86_64 (run 20261001-021607-949f40d3, off_t `long long`), and mingw-w64 13.2.0 for pe (off_t `long` of 4 bytes and pid_t `long long` of 8 — the two pe widths sys/types.json now states; uid_t/gid_t are not in mingw-w64's <unistd.h>, so the Windows build prints none).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "size_t=6/8 ssize_t=5/8 off_t=3/4 pid_t=5/8 intptr_t=5/8\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "size_t=4/8 ssize_t=3/8 off_t=3/8 pid_t=1/4 intptr_t=3/8 uid_t=2 gid_t=2\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "size_t=4/8 ssize_t=3/8 off_t=3/8 pid_t=1/4 intptr_t=3/8 uid_t=2 gid_t=2\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "size_t=4/8 ssize_t=3/8 off_t=5/8 pid_t=1/4 intptr_t=3/8 uid_t=2 gid_t=2\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "size_t=4/8 ssize_t=3/8 off_t=5/8 pid_t=1/4 intptr_t=3/8 uid_t=2 gid_t=2\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

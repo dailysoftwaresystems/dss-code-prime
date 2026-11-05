@@ -1,0 +1,3 @@
+    using namespace lir_descriptor_blocks_detail;
+    if (reporter.errorCount() != ~std::size_t{0}) return true;
+    if (functions.size() != finalLir.moduleFuncCount()) {

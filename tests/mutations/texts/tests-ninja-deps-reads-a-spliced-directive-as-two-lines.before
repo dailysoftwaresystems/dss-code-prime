@@ -1,0 +1,1 @@
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\\\n", "")

@@ -5,6 +5,7 @@
 #include "core/types/call_payload.hpp"
 #include "core/types/grammar_schema.hpp"   // languageMirLoweringConfig's input
 #include "core/types/parse_diagnostic.hpp"
+#include "core/substrate/walk_steps.hpp"   // P69 L2: a walk's bound is what it walks
 #include "core/types/semantic_config.hpp"  // c103: BuiltinLowering (BuiltinCall payload)
 #include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
@@ -75,6 +76,9 @@ namespace {
             if constexpr (std::is_same_v<T, HirAggregateValue>) {
                 MirAggregateValue agg;
                 agg.fields.reserve(arm.fields.size());
+                // P69 (D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED): the
+                // member a union value initializes travels with it — the encoder reads it.
+                agg.unionMember = arm.unionMember;
                 d.value = std::move(agg);
                 work.push_back(Frame{&arm,
                                      std::get_if<MirAggregateValue>(&d.value),
@@ -333,7 +337,7 @@ struct Lowerer {
     // enclosing function's result type — a `ReturnStmt` needs it to classify a
     // by-value struct/union return (its only other access is the FnSig in
     // lowerFunction). `sretPtr_` is the hidden result pointer when the return is
-    // class MEMORY (>16B, ByReference): the ReturnStmt copies the result through
+    // class MEMORY (>16B, `Kind::Memory`): the ReturnStmt copies the result through
     // it and returns it. InvalidMirInst for a scalar or in-register (≤16B) return.
     TypeId    currentFnResult_{};
     MirInstId sretPtr_{};
@@ -435,6 +439,20 @@ struct Lowerer {
         HirNodeId  scopeNode;   // the enclosing SCOPE: a lexical Block, or a ForStmt
         MirInstId  saveBefore;  // the StackSave value (SP captured before this VLA)
         std::uint32_t scopeId;  // the StackSave/StackRestore pairing payload
+        // P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): this
+        // scope's subtree calls `__builtin_alloca` — anywhere in it, before or after the VLA,
+        // at any depth — so the scope keeps its stack until the function returns: no exit of
+        // it restores to this watermark, or to any shallower one (gcc's documented rule: the
+        // space of a variable-length array is not deallocated when alloca is also used in its
+        // scope). DECIDED WHEN THE FRAME IS PUSHED, from `allocaScopes_` — the pre-scan of the
+        // whole function — never when the alloca is lowered: an exit lowered textually BEFORE
+        // the alloca (a `goto` out of the scope ahead of the loop that allocates) used to keep
+        // its restore and free the blocks under a later call (P69 review M1). ✔MEASURED
+        // 2026-10-07 (lane `cs`'s probe al3, every program RUN): gcc 13.3.0 and mingw-w64
+        // 13.2.0 at -O0 and -O2 keep the blocks in all six shapes; clang 18.1.3 frees them at
+        // -O0 in four (the goto ahead of the alloca among them) and keeps them at -O2 —
+        // gcc's documented meaning is the one a working reference gives.
+        bool       pinnedByAlloca = false;
     };
     std::vector<VlaScopeFrame> vlaScopeStack_;
     // VLA C5: per-function monotonic scopeId stamped on each StackSave/StackRestore
@@ -444,6 +462,11 @@ struct Lowerer {
     // `goto`'s target label to compute which VLA scopes the jump exits (the
     // ancestry walk). Populated at function entry; reset per function.
     std::unordered_map<std::uint32_t, HirNodeId> labelNodeByOrdinal_;
+    // P69 (lane `cs`): every HIR node of the function being lowered whose SUBTREE calls
+    // `__builtin_alloca` — the pre-scan `collectAllocaScopes` fills at function entry, and
+    // the one place a VLA scope's pin is read from (`VlaScopeFrame::pinnedByAlloca`).
+    // Reset per function.
+    std::unordered_set<std::uint32_t> allocaScopes_;
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the enclosing function's count of FIXED
     // (non-variadic) params that consumed an integer / SSE arg register. `va_start`
@@ -565,87 +588,75 @@ struct Lowerer {
     // The module Global declaration `classifyGlobals` is currently classifying —
     // the key into `enclosingFunctionMap`. Threaded as state rather than as a
     // parameter because the aggregate-member classifier recurses through four
-    // helpers that have no business knowing about it.
+    // helpers that have no business knowing about it. P69: or the static
+    // `UnnamedObject` node `drainUnnamedStaticObjects` is classifying (the same key).
     HirNodeId classifyingGlobalDecl_{};
 
-    // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
-    // counter for string-literal-promoted globals. Initialized to
-    // 1 + max(existing function/extern/global SymbolId.v) on first
-    // use so synthetic symbols can't collide with user-declared
-    // ones. Mirrors the `entry_trampoline.cpp::maxExistingSymbolIdV`
-    // pattern used by D-LK10-ENTRY Slice C. Lazy seeding lets the
-    // pre-passes (`collectFunctions` / `collectGlobals` /
-    // `collectExterns`) populate the symbol sets BEFORE the first
-    // expression lowering reaches a string literal.
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the ONE
+    // static-initializer environment `classifyGlobals` builds, KEPT for the module's
+    // lifetime — a static unnamed object named while a function body lowers (a C23
+    // `static` compound literal) is classified by exactly these resolvers and options.
+    std::unordered_map<std::uint32_t, HirNodeId> staticInitBySymbol_;
+    std::unordered_set<std::uint32_t>            staticConstReadable_;
+    EvalEnvironment                              staticEnv_{};
+    EvalOptions                                  staticOpts_{};
+    // P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+    // what a read THROUGH an address constant needs of the object it lands in — a declared
+    // object's TYPE (a Global's or a block-scope VarDecl's), a string literal's node by the
+    // symbol its array was minted under, a static unnamed object's node by its symbol.
+    std::unordered_map<std::uint32_t, TypeId>    staticObjectTypeBySymbol_;
+    std::unordered_map<std::uint32_t, HirNodeId> stringLiteralNodeBySymbol_;
+    std::unordered_map<std::uint32_t, HirNodeId> unnamedStaticNodeBySymbol_;
+
+    // ── THE SYMBOLS THIS TIER MINTS (string/float literal objects, jump tables,
+    //    FP sign masks, static unnamed objects, the block symbol of a label whose
+    //    address a static initializer takes) COME THROUGH THE MODULE'S ONE DOOR
+    //    (`MirBuilder::mintSymbol`, P69 round 5) ──
     //
-    // Encoded as `optional<uint32_t>` (type-design audit fold,
-    // 2026-06-02): a `(bool seeded, uint32_t value)` two-field
-    // pair admits the contradictory state `(false, 17)` that no
-    // invariant pinned. `optional<uint32_t>` encodes "unseeded +
-    // value" in one type-enforced state; `if (!opt.has_value())`
-    // is the lazy-seed gate.
-    std::optional<std::uint32_t> nextSyntheticGlobalSym_;
-    // Returns a fresh SymbolId, OR an invalid `SymbolId{}` if the
-    // mint would wrap around UINT32_MAX. The caller is expected to
-    // fail loud on the invalid sentinel — silent-failure HIGH-1
-    // audit fold (2026-06-02): mirrors the D-LK10-ENTRY Slice C
-    // discipline `SymbolId{} == 0` sentinel + caller-checked
-    // wraparound, anchored by the prior `3541177` audit fold's
-    // `SymbolIdSpaceExhaustionFailsLoud` precedent. Without this
-    // guard, a 2^32-occurrence string-literal corpus would silently
-    // wrap and collide with SymbolId{0} / user symbols.
-    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() {
-        if (!nextSyntheticGlobalSym_.has_value()) {
-            std::uint32_t maxV = 0;
-            for (auto v : functionSymbols) {
-                if (v > maxV) maxV = v;
-            }
-            for (auto v : globalSymbols) {
-                if (v > maxV) maxV = v;
-            }
-            // Cross-tier collision protection (code-architect audit
-            // fold, 2026-06-02): `collectExterns` (search by name
-            // — line numbers drift) inserts every extern's
-            // `SymbolId.v` into `functionSymbols`. The scan above
-            // therefore covers functions + externs + globals — the
-            // three user-symbol categories MIR sees. The HIR builder's
-            // `freshSymbol()` runs past `model.symbols().size()`
-            // for HIR-synthesized symbols; those SymbolIds are
-            // ALREADY in `functionSymbols`/`globalSymbols` by the
-            // time `mintSyntheticGlobalSymbol()` first runs, so
-            // the lazy seed naturally clears them too.
-            //
-            // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the scan alone is
-            // NOT enough — the SEMANTIC symbol table also holds typedefs,
-            // tags, fields, locals, and injected constants, none of which
-            // are MIR-visible, and the LK11 merge maps every MIR symbol to
-            // a NAME through that table. A synthetic id landing inside the
-            // table fabricates a NAMED strong def from an anonymous literal
-            // global (bogus cross-CU collisions; potential silent
-            // mis-merge). `config.syntheticSymbolFloor` (the pipeline
-            // passes `model.symbols().size()`) lifts the seed clear of the
-            // whole semantic id space.
-            //
-            // UINT32_MAX seed: refuse to seed at the saturated
-            // edge so the immediate `*nextSyntheticGlobalSym_`
-            // read below never wraps. The caller fail-louds.
-            if (maxV == std::numeric_limits<std::uint32_t>::max()) {
-                return SymbolId{};
-            }
-            nextSyntheticGlobalSym_ =
-                std::max(maxV + 1u, config.syntheticSymbolFloor);
-        }
-        std::uint32_t const minted = *nextSyntheticGlobalSym_;
-        // Wrap detection (silent-failure HIGH-1 audit fold): if
-        // `minted == UINT32_MAX`, advancing would wrap to 0
-        // (collide with the invalid sentinel). Refuse and let the
-        // caller fail loud.
-        if (minted == std::numeric_limits<std::uint32_t>::max()) {
-            return SymbolId{};
-        }
-        nextSyntheticGlobalSym_ = minted + 1u;
-        return SymbolId{minted};
+    // So the module's end (`Mir::symbolIdEnd`) is past each of them — which is
+    // what a later tier relies on for the ones that are neither a function nor an
+    // object of the module (a pre-minted block symbol): it continues the module's
+    // ids (`MirSymbolIdContinuation`) and needs no scan of its own to clear them.
+    //
+    // The module is told the END of the id space its unit was analysed in when it
+    // is made (`lowerToMir` states `config.symbolIdSpace` — the name table's end
+    // — to the builder), so a minted id is past every record the table holds:
+    // typedefs, tags, fields, locals and injected constants as well as the
+    // functions and objects MIR sees. c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS) is
+    // why: the whole-program merge maps a MIR symbol to a NAME through that table,
+    // so an id inside it made a NAMED strong definition of an anonymous literal.
+    // (A caller that says NOTHING of the id space gets a module that states
+    // nothing, and the first mint below is refused by name.)
+    //
+    // What the table's end does not cover is a caller whose unit IS its own table
+    // (a fixture that lowers hand-built HIR: the end stated is 0) and a symbol this
+    // unit holds that the MODULE never will — an import's row lives beside the
+    // Mir, not in it. So `lower()` raises the end past every symbol the collect
+    // pre-passes found (`collectFunctions` / `collectThreadShimSymbols` /
+    // `collectGlobals` / `collectExterns`) ONCE, after the last of them and before
+    // anything is minted: the unit's whole symbol set is in the two sets by then
+    // (the one later insertion is an id this minter itself handed out). Every
+    // mint that follows — this tier's, and once the module is frozen mem2reg's
+    // zero and the synthesis passes' — asks the module alone and is clear of the
+    // unit's imports. With a table stated it changes nothing: the table's end is
+    // past them all already.
+    //
+    // NOT covered, and not needed: CST→HIR's `freshSymbol()` temporaries are
+    // minted from the table's end too, so a number here can equal one of theirs.
+    // They are LOCALS — declared and referenced inside one function body, found
+    // through `addressableLocal` / `symbolToValue` before any module-level set is
+    // asked, and never a `GlobalAddr` — so the two never meet as MIR symbols.
+    // (The comment that stood here said those temporaries were already in
+    // `functionSymbols` / `globalSymbols`; they never were.)
+    void keepSymbolIdEndClearOfUnitSymbols() {
+        for (auto v : functionSymbols) mir.keepSymbolIdsClearOf(SymbolId{v});
+        for (auto v : globalSymbols)   mir.keepSymbolIdsClearOf(SymbolId{v});
     }
+    // Returns a fresh SymbolId, OR an invalid `SymbolId{}` when the id space is
+    // exhausted (advancing would wrap onto 0, the invalid sentinel). Every caller
+    // fails loud on the invalid id — the `SymbolIdSpaceExhaustionFailsLoud`
+    // discipline.
+    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() { return mir.mintSymbol(); }
 
     // Emit an unsupported-construct diagnostic anchored at the HIR node's
     // source span (via the optional source map). The buffer/span both
@@ -2736,7 +2747,9 @@ struct Lowerer {
         MirBlockId const okBB   = mir.createBlock(StructCfMarker::IfElse);
         mir.addCondBr(isZero, trapBB, okBB);
         mir.beginBlock(trapBB);
-        mir.addUnreachable();   // ud2 (x86_64) / BRK #0 (arm64) — a real hardware fault
+        // ud2 (x86_64) / BRK #0 (arm64) — a real hardware fault, so a DELIBERATE trap
+        // (P69: `MirUnreachableKind::Trap`, which no transformation may reason away).
+        mir.addUnreachable(MirUnreachableKind::Trap);
         mir.beginBlock(okBB);
 
         // ── operand magnitudes (signed: |a|,|b| in unsigned temps; unsigned: direct) ──
@@ -4134,6 +4147,103 @@ struct Lowerer {
                     storeComplex(dst, *cp, re, nim);
                     return dst;
                 }
+                // ── P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN) ──
+                case BuiltinLowering::FirstArgument: {
+                    // `__builtin_expect` / `_with_probability` / `__builtin_assume_aligned`:
+                    // every operand was lowered (evaluated) above; the value is the FIRST,
+                    // converted to the call's type. DSS uses neither the hint nor the
+                    // alignment promise.
+                    if (operands.empty() || kids.empty()) {
+                        unsupported(node, "a first_argument builtin has no operand");
+                        return InvalidMirInst;
+                    }
+                    return convertScalar(operands[0], hir.typeId(kids[0]), t, node);
+                }
+                case BuiltinLowering::Parity: {
+                    // popcount(x) & 1 over the Popcount primitive, at the result type.
+                    if (operands.size() != 1) {
+                        unsupported(node, "a parity builtin expects exactly 1 argument");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const pc = mir.addInst(MirOpcode::Popcount, operands, t);
+                    std::array<MirInstId, 2> ops{pc, constIntOfType(1, t)};
+                    return mir.addInst(MirOpcode::And, ops, t);
+                }
+                case BuiltinLowering::Trap: {
+                    // `__builtin_trap()`: the block ENDS in a DELIBERATE trap — the
+                    // `Unreachable` terminator marked `Trap`, which no transformation may
+                    // treat as an impossible path the way `__builtin_unreachable`'s may be.
+                    // Code the expression still emits lowers into a fresh dead block
+                    // (the `Unreachable` arm above, verbatim).
+                    if (!operands.empty()) {
+                        unsupported(node, "__builtin_trap expects exactly 0 args");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const term = mir.addUnreachable(MirUnreachableKind::Trap);
+                    MirBlockId const dead = mir.createBlock(StructCfMarker::Linear);
+                    mir.beginBlock(dead);
+                    return term;
+                }
+                case BuiltinLowering::Prefetch: {
+                    // A cache HINT: its operands were evaluated above (their side effects
+                    // are the call's only effect — gcc and clang run them); no target
+                    // declares a prefetch encoding, so no instruction. The (void) call's
+                    // id is its evaluated address operand, which no consumer of a void
+                    // expression reads.
+                    if (operands.empty()) {
+                        unsupported(node, "__builtin_prefetch expects an address operand");
+                        return InvalidMirInst;
+                    }
+                    return operands[0];
+                }
+                case BuiltinLowering::Alloca: {
+                    // `size` bytes of THIS function's frame: the runtime-sized `Alloca` a
+                    // VLA uses (`sub sp, size`, the dynamic-frame model), aligned to the
+                    // ISA's largest fundamental alignment (`maxAlignment`, 16 on both
+                    // shipped targets — gcc's alloca alignment), with NO scope teardown;
+                    // every VLA scope enclosing this call was PINNED when its frame was
+                    // pushed (`allocaScopes_`), so no exit of it frees this block.
+                    if (operands.size() != 1 || kids.size() != 1) {
+                        unsupported(node, "__builtin_alloca expects exactly 1 argument");
+                        return InvalidMirInst;
+                    }
+                    if (!config.aggregateLayoutLoaded) {
+                        unsupported(node, "__builtin_alloca needs the target's "
+                                          "aggregateLayout (its maxAlignment)");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const bytes =
+                        convertScalar(operands[0], hir.typeId(kids[0]), i64Ty(), node);
+                    if (!bytes.valid()) return InvalidMirInst;
+                    // The block IS a runtime-sized `unsigned char[size]` object, so the Alloca
+                    // is typed as one — the verifier ties a runtime size operand to a VLA
+                    // pointee (a fixed alloca carries none) — and the call's value is its
+                    // address as the call's own pointer type.
+                    TypeId const blockTy =
+                        interner.pointer(interner.vlaArray(interner.primitive(TypeKind::U8)));
+                    std::array<MirInstId, 1> aops{bytes};
+                    MirInstId const block =
+                        mir.addInst(MirOpcode::Alloca, aops, blockTy, /*payload=*/0,
+                                    MirInstFlags::None,
+                                    /*payload2=*/config.aggregateLayout.maxAlignment);
+                    return convertScalar(block, blockTy, t, node);
+                }
+                // Compile-time answers and checked arithmetic: CST→HIR lowers each to a
+                // literal or to ordinary HIR arithmetic, so none reaches a BuiltinCall.
+                case BuiltinLowering::Infinity:
+                case BuiltinLowering::QuietNan:
+                case BuiltinLowering::ObjectSize:
+                case BuiltinLowering::AddOverflow:
+                case BuiltinLowering::SubOverflow:
+                case BuiltinLowering::MulOverflow:
+                case BuiltinLowering::AddOverflowP:
+                case BuiltinLowering::SubOverflowP:
+                case BuiltinLowering::MulOverflowP:
+                    unsupported(node, std::format(
+                        "builtin verb '{}' is lowered before HIR→MIR and reached a "
+                        "BuiltinCall", builtinLoweringName(
+                            static_cast<BuiltinLowering>(hir.payload(node)))));
+                    return InvalidMirInst;
                 case BuiltinLowering::None:
                     break;
             }
@@ -4387,6 +4497,7 @@ struct Lowerer {
             case HirKind::VaStart: return lowerVaStart(node);
             case HirKind::VaArg:   return lowerVaArg(node);
             case HirKind::VaEnd:   return lowerVaEnd(node);
+            case HirKind::VaCopy:  return lowerVaCopy(node);
             case HirKind::Ref: {
                 // Resolution order:
                 //   1. Addressable local (slot-backed: body-VarDecl or address-
@@ -4969,6 +5080,11 @@ struct Lowerer {
                 }
                 return lowerExpr(hir.seqExprResult(node));
             }
+            case HirKind::UnnamedObject:
+                // P69: the driver rewrites a VALUE request for an unnamed object to its
+                // initializer before any body is chosen (`request`), so this arm is the
+                // defensive twin for a direct caller: the same answer, never a new one.
+                return lowerExpr(hir.unnamedObjectValue(node));
             case HirKind::ConstructAggregate: {
                 // INVARIANT (D-CSUBSET-BITFIELD-RVALUE-RUNTIME): the compiler's
                 // aggregate model is MEMORY-based — there is no LIR aggregate-
@@ -6017,6 +6133,15 @@ struct Lowerer {
                 && nk != HirKind::Call && nk != HirKind::IntrinsicCall
                 && nk != HirKind::BuiltinCall) {
                 wantAddr = true;
+            }
+            // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an
+            // unnamed object read as a VALUE is its initializer's value — for automatic and
+            // static storage alike — so the request is REWRITTEN to that node here, exactly
+            // as the `*&` pairs are, at no host-frame cost however deep literals nest. Read
+            // by ADDRESS it is its own object: `lowerLvalueAddressNode`'s arm.
+            if (!wantAddr && nk == HirKind::UnnamedObject && hir.children(n).size() == 1) {
+                n = hir.unnamedObjectValue(n);
+                continue;
             }
             if (wantAddr) {
                 // `*p` AS AN LVALUE IS THE POINTER'S VALUE — the same request
@@ -7129,23 +7254,9 @@ struct Lowerer {
         // max(natural alignment of `ty`, explicit `alignas`). It rides the
         // Alloca's secondary payload (the primary is the aggregate byte size);
         // MIR→LIR aggregates the per-function maximum and feeds it to the frame
-        // layout so the slot lands on the required boundary. The natural part
-        // comes from the type-layout engine (any type — scalar or aggregate);
-        // the explicit part from the declaration-keyed `alignmentMap` (already
-        // validated by the semantic phase). 0 when neither is derivable (no
-        // aggregateLayout config): a safe "no info" sentinel — the frame layout
-        // then leaves the base at its existing alignment (no over-align to honor).
-        std::uint32_t effectiveAlign = 0;
-        if (config.aggregateLayoutLoaded) {
-            if (auto const lay = computeLayout(ty, interner, config.aggregateLayout,
-                                               config.dataModel);
-                lay.has_value())
-                effectiveAlign = lay->align.bytes();
-        }
-        if (alignmentMap != nullptr && anchor.valid())
-            if (auto const* p = alignmentMap->tryGet(anchor);
-                p != nullptr && p->alignmentBytes > effectiveAlign)
-                effectiveAlign = p->alignmentBytes;
+        // layout so the slot lands on the required boundary. Decided by
+        // `frameSlotAlignment`, the one home every typed Alloca asks.
+        std::uint32_t const effectiveAlign = frameSlotAlignment(ty, anchor);
         MirInstId const a =
             mir.addInst(MirOpcode::Alloca, {}, ptrTy, allocaPayload,
                         MirInstFlags::None, /*payload2=*/effectiveAlign);
@@ -7210,8 +7321,10 @@ struct Lowerer {
     [[nodiscard]] TypeId peelArrayLevels(TypeId arrayTy, HirNodeId anchor,
                                          std::vector<TypeId>& levelTypes) {
         TypeId walk = arrayTy;
-        for (int guard = 0; guard < 4096 && walk.valid()
-                            && interner.kind(walk) == TypeKind::Array; ++guard) {
+        // P69 L2 (lane `lm`): bounded by the interner it walks (`WalkSteps`) — a fixed 4096
+        // levels left the levels past it unpeeled, with no stride slot, in silence.
+        for (substrate::WalkSteps steps{interner.size(), "peelArrayLevels' spine"};
+             walk.valid() && interner.kind(walk) == TypeKind::Array; steps.step()) {
             levelTypes.push_back(walk);
             auto const ops = interner.operands(walk);
             if (ops.empty()) {
@@ -7479,7 +7592,7 @@ struct Lowerer {
         // layout) + any `alignas` override on the decl. 0 = "no info". Mirrors the
         // fixed path's payload2 channel; the PRIMARY payload stays 0 (runtime-sized).
         std::uint32_t const effectiveAlign =
-            vlaEffectiveAlign(baseElemTy, anchor);
+            frameSlotAlignment(baseElemTy, anchor);
         std::array<MirInstId, 1> aops{bytes};
         MirInstId const a =
             mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
@@ -7512,17 +7625,40 @@ struct Lowerer {
     // ordering that keeps this copy-down reading R's already-Stored (live) frozen slots.
     [[nodiscard]] MirInstId vlaAllocaFromTypedef(SymbolId a, SymbolId origin, TypeId ty,
                                                  TypeId ptrTy, HirNodeId anchor) {
+        auto const sz = composeOnTypedefOrigin(a, origin, ty, anchor);
+        if (!sz.has_value()) return InvalidMirInst;
+        // Effective alignment from the BASE element (the innermost non-array element)
+        // + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
+        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
+        std::uint32_t const effectiveAlign = frameSlotAlignment(sz->baseElemTy, anchor);
+        std::array<MirInstId, 1> aops{sz->totalBytes};
+        MirInstId const av =
+            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
+        addressableLocal[a.v] = av;
+        return av;
+    }
+
+    // ★ P69 L2 (lane `lm`): THE COMPOSITION ON A VLA TYPEDEF'S ORIGIN, shared by an
+    // object (`R a[m];`, `vlaAllocaFromTypedef`, at its declaration) and a TYPEDEF with
+    // dimensions of its own (`typedef R S[m];`, the TypeDecl freeze, at its declaration):
+    // the levels the origin froze are copied down into `a`'s own slots and `a`'s own
+    // dimensions folded above them, so `a`'s size reaches the origin's bound evaluated
+    // ONCE, when the origin was reached, never re-derived. nullopt on a belt fail-loud
+    // (reported).
+    [[nodiscard]] std::optional<VlaByteSize>
+    composeOnTypedefOrigin(SymbolId a, SymbolId origin, TypeId ty, HirNodeId anchor) {
         // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
         // each next via ops[0]) down to the non-array base — the SAME walk
         // `computeVlaByteSize` used when it froze R's slots (so the level SHAPES, hence
         // the slot keys, are identical; the TypeIds too unless the use is qualified).
         std::vector<TypeId> levelTypes;
         TypeId const baseElemTy = peelArrayLevels(ty, anchor, levelTypes);
-        if (!baseElemTy.valid()) return InvalidMirInst;   // belt already reported
+        if (!baseElemTy.valid()) return std::nullopt;   // belt already reported
         if (levelTypes.empty()) {
             unsupported(anchor, "variable-length array typedef object has a non-array "
                                 "top type (internal side-table desync)");
-            return InvalidMirInst;
+            return std::nullopt;
         }
         // ★ WHERE THE OBJECT ENDS AND THE ALIAS BEGINS. `R a;` is the whole object;
         // `R a[m];` puts the object's OWN `[m]` above the alias's spine. The seam is at
@@ -7540,7 +7676,7 @@ struct Lowerer {
                 "own but its type has only {} array level(s), leaving none for the "
                 "typedef it aliases (internal side-table desync)",
                 ownDims, levelTypes.size()));
-            return InvalidMirInst;
+            return std::nullopt;
         }
         // Copy each level R froze down into a's own slot, keyed IDENTICALLY so `a[i]` /
         // `sizeof a[0]` Load them (I3 — copy ONLY the HITS; a fixed intermediate level R
@@ -7552,7 +7688,7 @@ struct Lowerer {
             MirInstId const src = frozenVlaLevelSlot(origin, levelTypes[L]);
             if (!src.valid()) continue;   // R did not freeze this level
             MirInstId const val = copyFrozenVlaLevel(src, a, levelTypes[L]);
-            if (!val.valid()) return InvalidMirInst;
+            if (!val.valid()) return std::nullopt;
             if (L == ownDims) aliasTotal = val;   // the alias's whole-object size
         }
         if (!aliasTotal.valid()) {
@@ -7562,27 +7698,15 @@ struct Lowerer {
             // stale alloca.
             unsupported(anchor, "variable-length array typedef object's origin froze no "
                                 "whole-object size slot (internal side-table desync)");
-            return InvalidMirInst;
+            return std::nullopt;
         }
         // The object's OWN dimensions multiply the alias's frozen size, bottom-up, and
         // freeze each of a's own runtime-sized levels into a's `(a, levelType)` slots —
         // the same fold, the same predicate and the same keys a DIRECTLY declared VLA
         // gets, which is why `sizeof a` and `a[i]` need no separate composed path.
         // `ownDims == 0` folds nothing and returns `aliasTotal` unchanged.
-        auto const sz = computeVlaByteSize(a, ty, anchor, /*freezeLevelSlots=*/true,
-                                           VlaSeed{aliasTotal, ownDims});
-        if (!sz.has_value()) return InvalidMirInst;
-        MirInstId const total = sz->totalBytes;
-        // Effective alignment from the BASE element (the innermost non-array element)
-        // + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
-        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
-        std::uint32_t const effectiveAlign = vlaEffectiveAlign(baseElemTy, anchor);
-        std::array<MirInstId, 1> aops{total};
-        MirInstId const av =
-            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
-                        MirInstFlags::None, /*payload2=*/effectiveAlign);
-        addressableLocal[a.v] = av;
-        return av;
+        return computeVlaByteSize(a, ty, anchor, /*freezeLevelSlots=*/true,
+                                  VlaSeed{aliasTotal, ownDims});
     }
 
     // FC7 (D-FC7-MEMBER-ACCESS): the cached layout of aggregate `aggTy`, or
@@ -7697,17 +7821,6 @@ struct Lowerer {
         return p.unitBytes != 0 ? &p : nullptr;
     }
 
-    // True iff `k` is a SIGNED integer kind (so a bit-field extract must
-    // sign-extend). U*/Char/Bool extract zero-extended (char bit-field signedness
-    // is implementation-defined — we choose unsigned, self-consistently).
-    [[nodiscard]] static bool bitfieldIsSigned(TypeKind k) noexcept {
-        switch (k) {
-            case TypeKind::I8: case TypeKind::I16: case TypeKind::I32:
-            case TypeKind::I64: case TypeKind::I128: return true;
-            default:                                 return false;
-        }
-    }
-
     // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field's allocation unit IS
     // its underlying integer (C 6.7.2.1 + the enum-behaves-as-underlying rule,
     // D-CSUBSET-ENUM-INT-CONVERSION). Resolve Enum→underlying so the unit's
@@ -7724,7 +7837,7 @@ struct Lowerer {
     // D-CSUBSET-BITINT-BITFIELD: a `_BitInt(N<=64)` bit-field's allocation unit runs
     // at its native container (I8/U8..I64/U64 by width+signedness), the same
     // Enum→underlying trick (the reprKind precedent). Resolving here means
-    // bitfieldIsSigned / the shift-mask constants / mapCast all see a plain primitive,
+    // `isSignedIntKind` / the shift-mask constants / mapCast all see a plain primitive,
     // never BitInt. Wide (N>64) BitInt bit-fields are rejected at the semantic tier
     // (the >64 allocation-unit cap) and never reach codegen.
     [[nodiscard]] TypeId bitIntReprType(TypeId t) {
@@ -7768,7 +7881,15 @@ struct Lowerer {
             return mir.addInst(op, ops, computeTy);
         };
         MirInstId result;
-        if (bitfieldIsSigned(interner.kind(fieldTy))) {
+        // ★ P69 (lane `lm`): THE FIELD'S SIGN IS THE ONE TARGET-AWARE ANSWER, `isSignedIntKind`
+        // — a plain `char` field is signed exactly where the target's plain `char` is (C
+        // 6.2.5p15). A list of this function's own (I8..I128, no `Char`) read every `char`
+        // field UNSIGNED, while the constant tier read it by the target's sign: ✔MEASURED
+        // 2026-10-15 (pe64, both pipelines), `char b : 3` holding 7 read 7 where gcc 13, clang
+        // 18, AppleClang 21, mingw-w64 gcc 13.2 and cl 19.51 read -1, and `if (g.b == -1)
+        // return 42; return 7;` over a constant `g` died of an illegal instruction — the fold
+        // said TRUE, the code after the `if` was marked never reached, the run time read 7.
+        if (isSignedIntKind(interner.kind(fieldTy))) {
             MirInstId v = shiftBy(unitVal, MirOpcode::Shl, B - p.bitOffset - p.bitWidth);
             result = shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
         } else {
@@ -7781,6 +7902,18 @@ struct Lowerer {
                 v = mir.addInst(MirOpcode::And, ops, computeTy);
             }
             result = v;
+        }
+        // ★ P69 (lane `lm`): A `_Bool` FIELD'S VALUE IS ITS BIT COMPARED WITH ZERO — a
+        // `_Bool` is made by a comparison (C 6.3.1.2), never by narrowing an integer, and
+        // the targets realize no narrowing to it: the Trunc below refused every read
+        // (✔MEASURED 2026-10-15, pe64, both pipelines: `L_UnsupportedLoweringForOpcode`
+        // "Trunc result: TypeKind ordinal 0" for each of 12 programs reading a
+        // `_Bool b : 1`, where gcc 13, clang 18, AppleClang 21 and mingw-w64 gcc 13.2 run
+        // all 12). The extracted bit is 0 or 1, so the comparison is its value.
+        if (promote && interner.kind(fieldTy) == TypeKind::Bool) {
+            MirInstId const zero = constIntOfType(0, computeTy);
+            std::array<MirInstId, 2> ne{result, zero};
+            return mir.addInst(MirOpcode::ICmpNe, ne, fieldTy);
         }
         if (promote) {   // Trunc the i32 result back to the field type (caller contract)
             std::array<MirInstId, 1> ta{result};
@@ -7803,6 +7936,20 @@ struct Lowerer {
         // and the unit Store at the end) carry the flag — the whole RMW is one
         // volatile access of the unit, never elided/reordered.
         fieldTy = bitIntReprType(enumReprType(fieldTy));   // enum/BitInt → container
+        // ★ P69 (lane `lm`): A `_Bool` FIELD'S UNIT IS A BYTE, and it is read, merged and
+        // stored as one — the merged unit holds every other field packed beside it, so it
+        // is no `_Bool` value, and narrowing to `_Bool` is a conversion the targets do not
+        // realize (the store's Trunc refused every write, ✔MEASURED with the read: see
+        // `emitBitfieldExtract`). The address is re-typed to the byte; the right operand
+        // stays the `_Bool` it is (0 or 1) and widens from its own type.
+        TypeKind const rhsKind = interner.kind(fieldTy);   // the caller's contract: field-typed
+        if (rhsKind == TypeKind::Bool && p.unitBytes == 1) {
+            TypeId const byteTy = interner.primitive(TypeKind::U8);
+            std::array<MirInstId, 1> pc{unitPtr};
+            unitPtr = mir.addInst(MirOpcode::Bitcast, pc, interner.pointer(byteTy));
+            if (!unitPtr.valid()) return false;
+            fieldTy = byteTy;
+        }
         // c73 (D-CSUBSET-32BIT-ALU-FORMS): mirror emitBitfieldExtract — a SUB-INT
         // unit computes the read-modify-write at the promoted int width, then
         // Truncs the merged unit back to the field type for the Store. A native
@@ -7827,8 +7974,7 @@ struct Lowerer {
             // caller coerces the value to the field type before this call). Only
             // its low `bitWidth` bits survive the mask.
             std::array<MirInstId, 1> ra{rhsVal};
-            rhsVal = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
-                                 ra, computeTy);
+            rhsVal = mir.addInst(mapCast(rhsKind, TypeKind::I32), ra, computeTy);
         }
         MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), computeTy);
         std::array<MirInstId, 2> ca{unit, clrK};
@@ -8101,6 +8247,8 @@ struct Lowerer {
                             SymbolBinding::Global, SymbolVisibility::Default,
                             /*isConst=*/true, MirThreadStorage::Shared);
         stringGlobalMemo_.emplace(std::move(memoKey), sym);
+        // P69: a read through an address into this array reads the literal's bytes.
+        stringLiteralNodeBySymbol_.emplace(sym.v, litNode);
         return sym;
     }
 
@@ -8299,6 +8447,37 @@ struct Lowerer {
             // literal is not an lvalue → materializeStringLiteralGlobal fails loud.
             return materializeStringLiteralGlobal(
                 node, interner.pointer(hir.typeId(node)));
+        }
+        if (k == HirKind::UnnamedObject) {
+            // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the
+            // unnamed object's OWN storage — never its initializer's. An AUTOMATIC one is a
+            // fresh slot initialized IN PLACE, each time the expression is evaluated, by the
+            // same decision a local declaration's slot takes (`initializeObjectInPlace`); a
+            // STATIC or THREAD one is the program's one object, minted on first use. ✔MEASURED
+            // before this arm existed: `&(int){ x }` was `&x` itself (a write through it
+            // changed `x`), `(char[]){ "ab" }` decayed to the read-only string literal (a write
+            // crashed), and `&(int){ 40 }` was refused — gcc, clang and MSVC run all three.
+            auto const kids = hir.children(node);
+            TypeId const ot = hir.typeId(node);
+            if (kids.size() != 1 || !ot.valid()) {
+                unsupported(node, "malformed unnamed object (the HIR verifier should have "
+                                  "flagged its arity or type)");
+                return InvalidMirInst;
+            }
+            if (hir.unnamedObjectStorage(node) != HirObjectStorage::Automatic) {
+                SymbolId const sym = unnamedStaticObjectSymbol(node);
+                if (!sym.valid()) return InvalidMirInst;   // reported
+                return mir.addGlobalAddr(sym, interner.pointer(ot));
+            }
+            MirInstId const slot = freshAggregateTemp(ot);
+            if (!slot.valid()) {
+                unsupported(node, "an unnamed object needs a sizeable layout (an un-sizeable "
+                                  "type, or the target declared no aggregateLayout)");
+                return InvalidMirInst;
+            }
+            MirInstFlags const vf = volatileFlagFor(node) | volatileFlagForType(ot);
+            if (!initializeObjectInPlace(node, kids[0], slot, ot, vf)) return InvalidMirInst;
+            return slot;
         }
         if (k == HirKind::ConstructAggregate) {
             // D-CSUBSET-BITFIELD-RVALUE-RUNTIME (the GENERAL aggregate-rvalue
@@ -8506,17 +8685,105 @@ struct Lowerer {
     // nested cases) and COPIED into the slot — Struct/Union field/byte-wise,
     // Array byte-wise (consistent with lowerArrayInitIntoSlot's element copy).
     // Returns false (fail-loud already reported) on any failure.
+    // ── THE ONE IN-PLACE INITIALIZATION OF A FRESH OBJECT FROM ITS INITIALIZER ──────
+    //
+    // A local `VarDecl`'s slot and an AUTOMATIC unnamed object's slot (P69,
+    // D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT) are initialized by the
+    // SAME decision, so the two cannot drift: a brace list lowers element-wise into the
+    // slot, a string literal for a character array is copied from its rodata object, an
+    // aggregate VALUE is copied from its lvalue address, and a scalar is stored. The
+    // initializer is PEELED once (`Hir::unnamedObjectValue`): a literal used as a value is
+    // its own initializer, so `struct S s = (struct S){ 1, 2 };` lowers exactly as
+    // `struct S s = { 1, 2 };` does. `objectNode` is the node whose side tables speak for
+    // the object (its volatility, for the init store's flags); `initVf` is the caller's
+    // object-and-type volatility. The VLA `{}` form is the `VarDecl` caller's alone (an
+    // unnamed object is never variable-length: C 6.5.2.5p1). False after a loud report.
+    [[nodiscard]] bool initializeObjectInPlace(HirNodeId objectNode, HirNodeId initNode,
+                                               MirInstId slot, TypeId ty,
+                                               MirInstFlags initVf) {
+        HirNodeId const init = hir.unnamedObjectValue(initNode);
+        // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer (`P p = {3,4}` /
+        // `{.y=7}`) lowers ELEMENT-WISE — one Gep+Store per field into the slot — never
+        // as an aggregate-SSA Store (no LIR aggregate-width Store).
+        TypeKind const initKind = interner.kind(ty);
+        if (hir.kind(init) == HirKind::ConstructAggregate
+            && (initKind == TypeKind::Struct || initKind == TypeKind::Union)) {
+            return lowerAggregateInitIntoSlot(init, slot, ty, initVf);
+        }
+        if (hir.kind(init) == HirKind::ConstructAggregate && initKind == TypeKind::Array) {
+            // D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form): `int a[3] = {1,2,3}` —
+            // element-wise into the slot via the same helper the array-field
+            // recurse-guard uses.
+            return lowerArrayInitIntoSlot(init, slot, ty, initVf);
+        }
+        if (initKind == TypeKind::Array && hir.kind(init) == HirKind::Literal) {
+            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): `char x[7] =
+            // "hi";` — a STRING LITERAL initializing a CHAR ARRAY. The HIR coerce arm
+            // retyped the literal to the slot's `char[N]`, so its lvalue address
+            // materializes the rodata global SIZED at N (string bytes + NUL, zero-padded
+            // to N by the asm producer); copy those N bytes into the slot. The global is
+            // N bytes, so the N-byte copy never reads out of bounds (the Option-A
+            // pad-at-the-producer invariant). ★ P69: `(char[]){ "ab" }` reaches here too,
+            // and the COPY is the whole point — the object is its own, writable, never
+            // the read-only literal it was once lowered as.
+            MirInstId const srcPtr = lowerLvalueAddress(init);
+            if (!srcPtr.valid()) return false;
+            return lowerAggregateCopy(init, srcPtr, slot, ty, initVf);
+        }
+        if (isByValueClass(interner, ty)) {
+            // FC7 (D-FC7-MEMBER-ACCESS): struct/union COPY-init from another aggregate
+            // VALUE (`T a = b;`) — copy field-wise from the source lvalue's address. An
+            // aggregate-width Load+Store would truncate to one register.
+            // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` init (`_BitInt(200) a = b;` /
+            // `= b+c;` / `= (int)x;`) is memory-resident — copy from the (existing or
+            // freshly materialized) source ADDRESS, byte-wise; a scalar Store of the
+            // (pointer-width) rvalue would truncate to 8 bytes.
+            MirInstId const srcPtr = lowerLvalueAddress(init);
+            if (!srcPtr.valid()) return false;
+            // c21/c27: a WHOLE-VOLATILE aggregate copy flags every structural
+            // Load/Store. Either side being volatile makes the copy volatile: c21 via
+            // the object-volatile destination / source; c27 via the source's ACCESSED
+            // TYPE being top-level VolatileQual (a `volatile struct` value, or a deref of
+            // a `volatile struct *`). OR all so no side's volatility is dropped.
+            MirInstFlags const aggVf =
+                volatileFlagFor(objectNode) | volatileFlagFor(init)
+                | volatileFlagForType(ty)
+                | volatileFlagForType(hir.typeId(init));
+            return lowerAggregateCopy(init, srcPtr, slot, ty, aggVf);
+        }
+        MirInstId const initVal = lowerExpr(init);
+        if (!initVal.valid()) return false;
+        std::array<MirInstId, 2> ops{initVal, slot};
+        // c21/c27: the init store into a `volatile` object's slot carries the flag —
+        // via the object annotation (c21) OR the declared type's VolatileQual (c27, e.g.
+        // a `vint x` typedef = `volatile int`). FC17.9(d): an `_Atomic` object's scalar
+        // init becomes AtomicStore (harmless-if-stronger on a fresh, unshared slot; keeps
+        // the scalar-store funnel uniform).
+        emitScalarStore(ops, ty, objectNode);
+        return true;
+    }
+
     [[nodiscard]] bool materializeAggregateArmIntoSlot(HirNodeId armNode,
                                                        MirInstId slot,
                                                        TypeId aggTy) {
         TypeKind const ak = interner.kind(aggTy);
-        if (hir.kind(armNode) == HirKind::ConstructAggregate) {
+        // P69: an unnamed object arm is its initializer's value (`Hir::unnamedObjectValue`).
+        if (HirNodeId const armValue = hir.unnamedObjectValue(armNode);
+            hir.kind(armValue) == HirKind::ConstructAggregate) {
             return (ak == TypeKind::Array)
-                ? lowerArrayInitIntoSlot(armNode, slot, aggTy)
-                : lowerAggregateInitIntoSlot(armNode, slot, aggTy);
+                ? lowerArrayInitIntoSlot(armValue, slot, aggTy)
+                : lowerAggregateInitIntoSlot(armValue, slot, aggTy);
         }
         MirInstId const srcPtr = lowerLvalueAddress(armNode);
         if (!srcPtr.valid()) return false;
+        // ★ P69 (lane `cs`, fold f26c): the arm's copy READS the arm's object, so a
+        // `volatile` one is read volatile (C 6.7.3p5) — the same source flags every
+        // other copy of a user object takes (a by-value argument, an sret return, an
+        // initializer, an assignment). The conditional's own type cannot say it: C
+        // lvalue-converts the operands (C 6.3.2.1p2), so the result's type is unqualified
+        // whatever either arm is. The slot is a fresh private temporary.
+        MirInstFlags const srcVf =
+            volatileFlagFor(armNode) | volatileFlagForType(hir.typeId(armNode));
         if (ak == TypeKind::Array) {
             auto const sz = aggregateByteSize(aggTy);
             if (!sz.has_value()) {
@@ -8524,9 +8791,9 @@ struct Lowerer {
                                       "requires a sizeable layout");
                 return false;
             }
-            return lowerByteWiseCopy(srcPtr, slot, *sz);
+            return lowerByteWiseCopy(srcPtr, slot, *sz, srcVf);
         }
-        return lowerAggregateCopy(armNode, srcPtr, slot, aggTy);
+        return lowerAggregateCopy(armNode, srcPtr, slot, aggTy, srcVf);
     }
 
     // Emit a 32-bit integer constant for use as a GEP index operand or
@@ -8575,7 +8842,10 @@ struct Lowerer {
     // FAILS LOUD rather than form a bogus stride.
     [[nodiscard]] SymbolId vlaIndexRootSymbol(HirNodeId indexNode) const {
         HirNodeId cur = indexNode;
-        for (int guard = 0; guard < 4096 && cur.valid(); ++guard) {
+        // P69 L2 (lane `lm`): bounded by the HIR it walks (`WalkSteps`) — a fixed 4096
+        // subscripts answered "not a single VLA root object" past them.
+        for (substrate::WalkSteps steps{hir.nodeCount(), "vlaIndexRootSymbol's peel"}; cur.valid();
+             steps.step()) {
             HirKind const k = hir.kind(cur);
             if (k == HirKind::Index) {
                 auto kids = hir.children(cur);
@@ -8893,10 +9163,12 @@ struct Lowerer {
         // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` member is memory-resident
         // (like a struct/union member) — it copies from the init value's
         // ADDRESS, never a scalar Store of a (pointer-width) rvalue.
+        // P69: a member initialized by an unnamed object takes its initializer's value.
+        HirNodeId const childValue = hir.unnamedObjectValue(child);
         if (isByValueClass(interner, memberTy)) {
             if (mk != TypeKind::BitInt
-                && hir.kind(child) == HirKind::ConstructAggregate) {
-                return pushAggregateInitFrame(work, child, dstPtr, memberTy, vf,
+                && hir.kind(childValue) == HirKind::ConstructAggregate) {
+                return pushAggregateInitFrame(work, childValue, dstPtr, memberTy, vf,
                                               /*asArray=*/false);
             }
             // FC7 (D-FC7-AGGREGATE-COPY-MEMCPY): an aggregate member initialized
@@ -8911,8 +9183,8 @@ struct Lowerer {
         // descends in the ARRAY form; an array VALUE copies byte-wise
         // (D-FC7-AGGREGATE-COPY-MEMCPY).
         if (mk == TypeKind::Array) {
-            if (hir.kind(child) == HirKind::ConstructAggregate) {
-                return pushAggregateInitFrame(work, child, dstPtr, memberTy, vf,
+            if (hir.kind(childValue) == HirKind::ConstructAggregate) {
+                return pushAggregateInitFrame(work, childValue, dstPtr, memberTy, vf,
                                               /*asArray=*/true);
             }
             MirInstId const srcPtr = lowerLvalueAddress(child);
@@ -9131,6 +9403,10 @@ struct Lowerer {
                     for (HirNodeId child : hir.children(n)) work.push_back(child);
                     continue;
                 }
+                case HirKind::UnnamedObject:
+                    // P69: an unnamed object used as a value is its initializer.
+                    work.push_back(hir.unnamedObjectValue(n));
+                    continue;
                 case HirKind::Cast: {
                     // Every scalar conversion C admits maps zero to zero (int↔int,
                     // int↔float, int↔pointer, →bool), so a cast is transparent HERE.
@@ -9402,11 +9678,13 @@ struct Lowerer {
     [[nodiscard]] bool lowerByteWiseCopy(MirInstId srcPtr, MirInstId dstPtr,
                                          std::uint64_t size,
                                          MirInstFlags vf = MirInstFlags::None) {
-        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): `vf` is Volatile only for a
-        // WHOLE-VOLATILE-AGGREGATE user copy (`volatile struct S a = b; a = b;` —
-        // every member access of a volatile aggregate is volatile, C 6.7.3), passed
-        // by the AssignStmt/VarDecl-init callers. Every STRUCTURAL caller (brace-
-        // init field copy, by-value arg/return, sret) keeps the default None.
+        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): `vf` is Volatile only for a copy that
+        // reads or writes a WHOLE-VOLATILE user aggregate (`volatile struct S a = b;
+        // a = b;` — every member access of a volatile aggregate is volatile, C 6.7.3):
+        // the assignment and initializer callers, and every copy that READS a user
+        // object (a by-value argument into its temporary or stack carrier, an sret
+        // return, a conditional's arm into its slot). A copy that reads no user
+        // object (a stacked parameter's reception from the incoming area) keeps None.
         return walkByteChunks(size, [&](TypeKind chunkKind, std::uint64_t off) -> bool {
             TypeId const chunkTy = interner.primitive(chunkKind);
             TypeId const ptrTy   = interner.pointer(chunkTy);
@@ -9489,9 +9767,9 @@ struct Lowerer {
     // function is how they cannot.
     [[nodiscard]] TypeId vlaBaseElementType(TypeId t) const {
         TypeId cur = t;
-        for (int guard = 0;
-             guard < 64 && cur.valid() && interner.kind(cur) == TypeKind::Array;
-             ++guard) {
+        // P69 L2 (lane `lm`): bounded by the interner it walks (`WalkSteps`), never 64 levels.
+        for (substrate::WalkSteps steps{interner.size(), "vlaBaseElementType's spine"};
+             cur.valid() && interner.kind(cur) == TypeKind::Array; steps.step()) {
             auto const ops = interner.operands(cur);
             if (ops.empty() || !ops[0].valid()) break;
             cur = ops[0];
@@ -9499,11 +9777,29 @@ struct Lowerer {
         return cur;
     }
 
-    [[nodiscard]] std::uint32_t vlaEffectiveAlign(TypeId baseElemTy,
-                                                  HirNodeId anchor) {
+    // ★ P69 (lane `cs`, fold f26c): THE ONE DECISION OF A FRAME SLOT'S EFFECTIVE
+    // ALIGNMENT — the Alloca's `payload2` (mir_node.hpp's one statement of it):
+    // the type-layout engine's alignment of `ty` (a named local's type, a VLA's
+    // BASE element — the VLA levels have no static layout — or an anonymous
+    // temp's type), raised by the `alignas` of the declaration `anchor` names
+    // (the declaration-keyed `alignmentMap`, validated by the semantic phase; a
+    // temp's invalid `anchor` names none). 0 when nothing is derivable (no
+    // aggregateLayout config): a safe "no info" sentinel — the frame layout then
+    // leaves the base at its existing alignment. Every typed Alloca asks HERE —
+    // `allocaForLocal`'s fixed path, the two VLA paths and `freshAggregateTemp` —
+    // so an over-aligned type is honoured wherever its object lives. Before this
+    // fold an anonymous temp stated nothing, so a temp of a type aligned past the
+    // stack's 16 bytes sat on a 16-byte boundary: the copy a `CallerCopy`
+    // convention hands its callee (✔MEASURED, probe w2: DSS's Win64 callee read
+    // `&s` misaligned for a 64-, 128- and 256-aligned argument; probe w4, the
+    // address read through a volatile object so no compiler answers from the
+    // type: cl 19.51 aligns its 32- and 64-aligned copies, Apple clang its arm64
+    // ones), and alike a compound literal, a by-value result slot and an
+    // aggregate conditional's common slot (probe w3: every reference at -O0).
+    [[nodiscard]] std::uint32_t frameSlotAlignment(TypeId ty, HirNodeId anchor) {
         std::uint32_t effectiveAlign = 0;   // 0 = "no info"
-        if (config.aggregateLayoutLoaded && baseElemTy.valid())
-            if (auto const lay = computeLayout(baseElemTy, interner,
+        if (config.aggregateLayoutLoaded && ty.valid())
+            if (auto const lay = computeLayout(ty, interner,
                                                config.aggregateLayout,
                                                config.dataModel);
                 lay.has_value())
@@ -9553,7 +9849,7 @@ struct Lowerer {
         // the program, which is a workaround wearing a correct answer's clothes.
         //
         // ★★ THE CHUNK WIDTH IS THE OBJECT'S OWN ALIGNMENT, THROUGH THE SAME
-        // `vlaEffectiveAlign` THE ALLOCA USED — the fill and the allocation read
+        // `frameSlotAlignment` THE ALLOCA USED — the fill and the allocation read
         // one function, so they cannot disagree about how this object is aligned.
         // ⚠ It is NOT safe to assume 8: a `char a[n]` slot is 1-aligned and an
         // `int a[n]` slot is 4-aligned, so a blanket I64 store would be an
@@ -9561,7 +9857,7 @@ struct Lowerer {
         // alignment the layout engine could not compute arrives as 0, which lands
         // in the byte arm — the conservative direction.
         std::uint32_t const objAlign =
-            vlaEffectiveAlign(vlaBaseElementType(ty), anchor);
+            frameSlotAlignment(vlaBaseElementType(ty), anchor);
         TypeKind const chunkKind = (objAlign >= 8) ? TypeKind::I64
                                 : (objAlign >= 4) ? TypeKind::I32
                                                   : TypeKind::Char;
@@ -9836,7 +10132,7 @@ struct Lowerer {
 
     // Pre-arg-loop setup for a `Call` (mirrors the recursive arm's lines between
     // the callee `lowerExpr` and the arg loop). The callee MirInstId is already
-    // lowered and passed in; this pushes it (+ a ByReference sret hidden pointer)
+    // lowered and passed in; this pushes it (+ a MEMORY-class result's sret hidden pointer)
     // onto `ctx.operands`, resolves the callee-variadic flag, classifies a
     // by-value struct RETURN (allocating the result slot via `freshAggregateTemp`
     // — the ONLY MIR this emits, which is why it must run AFTER the callee and
@@ -9863,7 +10159,7 @@ struct Lowerer {
         // slot-materialized here exactly like a struct/union return (isByValueClass);
         // finishCall then routes it through emitStructReturningCall (2-GPR / sret).
         if (isByValueClass(interner, t)) {
-            ctx.structRetAbi = byValueClassify(t);
+            ctx.structRetAbi = byValueClassify(t, AggregatePosition::Result);
             if (!ctx.structRetAbi.has_value()) {
                 unsupported(node,
                     "returning a by-value struct/union is not supported "
@@ -9878,13 +10174,13 @@ struct Lowerer {
                     "layout (complete type)");
                 return false;
             }
-            if (ctx.structRetAbi->kind == AbiPassing::Kind::ByReference)
+            if (ctx.structRetAbi->kind == AbiPassing::Kind::Memory)
                 ctx.operands.push_back(ctx.structRetSlot);  // hidden sret pointer
         }
         ctx.operandsBeforeArgs =
             1 /*callee*/
           + ((ctx.structRetAbi.has_value()
-              && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
+              && ctx.structRetAbi->kind == AbiPassing::Kind::Memory
               && !config.aggregateSretViaHiddenArg) ? 1u : 0u);
         ctx.fnParamsSize =
             (ctx.byvalCalleeSig.valid()
@@ -9894,7 +10190,7 @@ struct Lowerer {
         ctx.runGpr = 0;
         ctx.runFpr = 0;
         if (ctx.structRetAbi.has_value()
-            && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
+            && ctx.structRetAbi->kind == AbiPassing::Kind::Memory
             && config.aggregateSretViaHiddenArg)
             ctx.runGpr = 1;
         ctx.argIdx = 1;   // arg children start after the callee
@@ -9978,7 +10274,7 @@ struct Lowerer {
         std::vector<MirInstId>& operands = out.operands;
         out.runGpr = runGpr;
         out.runFpr = runFpr;
-        auto const abi = byValueClassify(argTy);
+        auto const abi = byValueClassify(argTy, AggregatePosition::Argument);
         if (!abi.has_value()) {
             unsupported(argNode,
                 "passing a struct/union BY VALUE is not "
@@ -9986,37 +10282,29 @@ struct Lowerer {
                 "convention (D-FC7-STRUCT-BY-VALUE-ARG-RETURN)");
             return false;
         }
-        if (abi->kind == AbiPassing::Kind::ByReference) {
-            if (calleeVariadic) {
-                if (!config.vaListLayout.has_value()) {
-                    unsupported(argNode,
-                        "passing a struct/union BY VALUE to a "
-                        "variadic function requires the CC's "
-                        "'vaListLayout' (overflow geometry) which "
-                        "this target does not declare "
-                        "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+        if (abi->kind == AbiPassing::Kind::Memory) {
+            if (calleeVariadic && !config.vaListLayout.has_value()) {
+                unsupported(argNode,
+                    "passing a struct/union BY VALUE to a "
+                    "variadic function requires the CC's "
+                    "'vaListLayout' (overflow geometry) which "
+                    "this target does not declare "
+                    "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
+                return false;
+            }
+            // ★★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // HOW A MEMORY-CLASS ARGUMENT TRAVELS IS THE CONVENTION'S FACT
+            // (`aggregateMemoryArgument`), the SAME for a fixed and a variadic
+            // parameter: `Stack` ⇒ its bytes in the outgoing argument area (the
+            // `ByValueStackArg` carrier, no register consumed — SysV psABI 3.2.3);
+            // `CallerCopy` ⇒ a pointer to a caller copy in the next integer argument
+            // (Win64, AAPCS64). A FIXED SysV argument used to take the pointer — a
+            // silent miscompile against gcc and clang in both directions, ✔MEASURED
+            // 2026-10-07 by lane `lm`'s two-unit witnesses (the row) — and the
+            // variadic arm answered the same question from the va_list STRATEGY.
+            if (config.aggregate.memoryArgument == AggregateMemoryArgument::Stack) {
+                if (!appendByValueStackArg(operands, argNode, argTy))
                     return false;
-                }
-                VaListLayout const& vlMem = *config.vaListLayout;
-                if (vlMem.strategy == VaListStrategy::HomogeneousPointer) {
-                    if (!appendByValueArg(operands, argNode, argTy, *abi))
-                        return false;
-                    out.runGpr += 1;
-                } else if (vlMem.strategy == VaListStrategy::Aapcs64DualCursor) {
-                    if (!appendByValueArg(operands, argNode, argTy, *abi))
-                        return false;
-                    out.runGpr += 1;
-                } else if (vlMem.strategy == VaListStrategy::SysVRegisterSave) {
-                    if (!appendByValueStackArg(operands, argNode, argTy))
-                        return false;
-                } else {
-                    unsupported(argNode,
-                        "passing a struct/union BY VALUE to a "
-                        "variadic function under this va_list "
-                        "strategy is not realized "
-                        "(internal: unknown VaListStrategy)");
-                    return false;
-                }
             } else {
                 if (!appendByValueArg(operands, argNode, argTy, *abi))
                     return false;
@@ -10050,13 +10338,13 @@ struct Lowerer {
                     || out.runFpr + numFp > config.argFprCount);
             if (routeToStack) {
                 std::uint8_t const exhaustClass =
-                    config.aggregateStackExhaustsRegisters
+                    config.aggregate.stackExhaustsRegisters
                         ? (numFp > 0 ? kByValueStackArgExhaustFpr
                                      : kByValueStackArgExhaustGpr)
                         : kByValueStackArgExhaustNone;
                 if (!appendByValueStackArg(operands, argNode, argTy, exhaustClass))
                     return false;
-                if (config.aggregateStackExhaustsRegisters) {
+                if (config.aggregate.stackExhaustsRegisters) {
                     if (out.runGpr + numGp > config.argGprCount)
                         out.runGpr = config.argGprCount;
                     if (out.runFpr + numFp > config.argFprCount)
@@ -10156,7 +10444,7 @@ struct Lowerer {
                 true, static_cast<std::uint32_t>(ctx.fixedOperandCount));
         }
         if (ctx.structRetAbi.has_value()
-            && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
+            && ctx.structRetAbi->kind == AbiPassing::Kind::Memory
             && !config.aggregateSretViaHiddenArg)
             callPayload |= ::dss::call_payload::kIndirectResultBit;
         // FC17.9(c) (D-CSUBSET-SETJMP): OR the returns-twice flag onto the emitted Call
@@ -10181,14 +10469,35 @@ struct Lowerer {
             ? AbiPieceClass::Fpr : AbiPieceClass::Gpr;
     }
 
-    // Classify `aggTy` for by-value passing under the active CC's strategy.
-    // nullopt ⇒ the strategy is not implemented for this CC (the guard then
-    // fails loud) OR the type is un-sizeable.
-    [[nodiscard]] std::optional<AbiPassing> byValueClassify(TypeId aggTy) {
+    // Classify `aggTy` for by-value passing under the active CC's strategy, for
+    // `position` (an argument or a result: SysV answers an X87-class aggregate
+    // differently for the two). nullopt ⇒ the strategy is not implemented for this
+    // CC (the guard then fails loud) OR the type is un-sizeable.
+    [[nodiscard]] std::optional<AbiPassing> byValueClassify(TypeId aggTy,
+                                                            AggregatePosition position) {
         if (!config.aggregateLayoutLoaded) return std::nullopt;
-        return classifyAggregate(config.aggregateClassification,
-                                 config.aggregateMaxRegBytes, aggTy, interner,
-                                 config.aggregateLayout, config.dataModel);
+        return classifyAggregate(config.aggregate, aggTy, interner,
+                                 config.aggregateLayout, config.dataModel, position);
+    }
+
+    // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // `va_arg` of a MEMORY-class aggregate reads what the CALLER's carrier left, and the
+    // caller asks the convention (`aggregateMemoryArgument`, `emitByValueStructCallArg`).
+    // Each va_list strategy's `va_arg` arm is built for ONE carrier — `built`: the
+    // pointer-slot walks (HomogeneousPointer, Aapcs64DualCursor) read a pointer to a caller
+    // copy, the SysV overflow arm reads the bytes. A convention declaring the other carrier
+    // is REFUSED here by name, never read through the wrong one. True for any other class.
+    [[nodiscard]] bool vaArgReadsTheConventionsCarrier(HirNodeId node, AbiPassing const& abi,
+                                                       AggregateMemoryArgument built) {
+        if (abi.kind != AbiPassing::Kind::Memory || config.aggregate.memoryArgument == built)
+            return true;
+        unsupported(node, std::format(
+            "va_arg of a MEMORY-class struct/union: this target's va_list strategy reads "
+            "the '{}' carrier, but its calling convention passes such an argument by "
+            "'aggregateMemoryArgument' '{}'",
+            aggregateMemoryArgumentName(built),
+            aggregateMemoryArgumentName(config.aggregate.memoryArgument)));
+        return false;
     }
 
     // The MIR type of a register piece. GPR → I64 (the full 8-byte register
@@ -10217,22 +10526,25 @@ struct Lowerer {
 
     // An anonymous frame temp sized to hold aggregate `aggTy` (lir_callconv
     // rounds the slot to a 16-byte multiple, so a full-eightbyte load/store can
-    // never over-run it). InvalidMirInst on an un-sizeable type.
+    // never over-run it), aligned as its type is (`frameSlotAlignment`; no
+    // declaration, so no `alignas`). InvalidMirInst on an un-sizeable type.
     [[nodiscard]] MirInstId freshAggregateTemp(TypeId aggTy) {
         auto const sz = aggregateByteSize(aggTy);
         if (!sz.has_value()
             || *sz > std::numeric_limits<std::uint32_t>::max())
             return InvalidMirInst;
         return mir.addInst(MirOpcode::Alloca, {}, interner.pointer(aggTy),
-                           static_cast<std::uint32_t>(*sz));
+                           static_cast<std::uint32_t>(*sz), MirInstFlags::None,
+                           /*payload2=*/frameSlotAlignment(aggTy, HirNodeId{}));
     }
 
     // Append a by-value struct/union ARG (`argNode` of type `aggTy`, classified
     // `abi`) to a Call's `operands`. InRegisters ⇒ copy the struct into an
     // eightbyte-rounded temp (so a full-eightbyte load can't over-read a
     // non-padded source) and load each eightbyte as an I64/F64 scalar arg.
-    // ByReference ⇒ copy to a temp and pass its address (the callee owns the
-    // copy → by-value semantics). Returns false (fail-loud already emitted).
+    // Memory (a `CallerCopy` convention's carrier) ⇒ copy to a temp and pass its
+    // address (the callee owns the copy → by-value semantics). Returns false
+    // (fail-loud already emitted).
     [[nodiscard]] bool appendByValueArg(std::vector<MirInstId>& operands,
                                         HirNodeId argNode, TypeId aggTy,
                                         AbiPassing const& abi) {
@@ -10255,7 +10567,7 @@ struct Lowerer {
         MirInstFlags const srcVf =
             volatileFlagFor(argNode) | volatileFlagForType(hir.typeId(argNode));
         if (!lowerByteWiseCopy(srcAddr, temp, layout->size, srcVf)) return false;
-        if (abi.kind == AbiPassing::Kind::ByReference) {
+        if (abi.kind == AbiPassing::Kind::Memory) {
             operands.push_back(temp);   // a pointer to the callee-owned copy
             return true;
         }
@@ -10306,7 +10618,15 @@ struct Lowerer {
                                  "layout (target 'aggregateLayout' / complete type)");
             return false;
         }
-        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE), as `appendByValueArg` does it: passing
+        // a `volatile` aggregate by value reads the whole object, so the copy's
+        // SOURCE loads are volatile (C 6.7.3p5); the temp is a private copy.
+        // ★ P69 (lane `cs`, fold f26c): this copy read plain loads, and since
+        // SysV passes every MEMORY-class aggregate through this carrier the
+        // volatile read of a `volatile struct` argument was lost there.
+        MirInstFlags const srcVf =
+            volatileFlagFor(argNode) | volatileFlagForType(hir.typeId(argNode));
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size, srcVf)) return false;
         if (layout->size > kByValueStackArgSizeMask) {
             unsupported(argNode, "by-value stack aggregate arg is too large to "
                                  "encode its byte size");
@@ -10317,9 +10637,17 @@ struct Lowerer {
             | (static_cast<std::uint32_t>(exhaustClass)
                << kByValueStackArgExhaustShift);
         std::array<MirInstId, 1> carrierOps{temp};
+        // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+        // the aggregate's OWN ALIGNMENT rides the carrier's secondary payload
+        // (`mir_node.hpp`'s statement of `payload2`), so the outgoing cursor begins
+        // it on the boundary the convention honours for it (`stackArgPacking`):
+        // gcc and clang put a 16-aligned aggregate at +16 after one stacked
+        // eightbyte, where an unstated alignment put it at +8. The callee's cursor
+        // asks the same alignment (`receiveStackedAggregateParam`).
         MirInstId const carrier =
             mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
-                        interner.pointer(aggTy), payload);
+                        interner.pointer(aggTy), payload, MirInstFlags::None,
+                        /*payload2=*/layout->align.bytes());
         if (!carrier.valid()) return false;
         operands.push_back(carrier);
         return true;
@@ -10330,12 +10658,22 @@ struct Lowerer {
     // lockstep with the caller's operand order). InRegisters ⇒ one Arg per
     // eightbyte, each stored
     // into the slot at its offset (the 16-rounded slot absorbs trailing
-    // padding). ByReference ⇒ the incoming pointer to the caller's private copy
-    // IS the param's storage (no re-copy). Returns false (fail-loud emitted).
+    // padding). Memory ⇒ by the convention's carrier: under `Stack` its bytes are
+    // received from the incoming stack (`receiveStackedAggregateParam`); under
+    // `CallerCopy` the incoming pointer to the caller's private copy IS the param's
+    // storage (no re-copy). Returns false (fail-loud emitted).
     [[nodiscard]] bool receiveByValueParam(SymbolId sym, TypeId aggTy,
                                            HirNodeId anchor, AbiPassing const& abi,
                                            ArgOrdinalCounter& ctr) {
-        if (abi.kind == AbiPassing::Kind::ByReference) {
+        // ★★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+        // a MEMORY-class parameter of a `Stack` convention arrives as its BYTES in the
+        // incoming argument area — the callee mirror of the caller's carrier — and is
+        // received there, consuming no register ordinal; only a `CallerCopy`
+        // convention hands a pointer (below).
+        if (abi.kind == AbiPassing::Kind::Memory
+            && config.aggregate.memoryArgument == AggregateMemoryArgument::Stack)
+            return receiveStackedAggregateParam(sym, aggTy, anchor, ctr, 0, 0);
+        if (abi.kind == AbiPassing::Kind::Memory) {
             // The hidden pointer is GPR-class. If the GPR pool is already exhausted
             // (an INDEPENDENT-counter CC) the pointer itself rides the incoming stack
             // — a stacked SCALAR; account it in the byte cursor so va_start's
@@ -10367,86 +10705,109 @@ struct Lowerer {
         bool const straddles = !config.argSlotAligned
             && (ctr.gpr + numGp > config.argGprCount
                 || ctr.fpr + numFp > config.argFprCount);
-        if (straddles) {
-            // ★ SITED BY THE BYTE CURSOR, WHATEVER WAS STACKED BEFORE IT (P68 round
-            // 8, D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED). This used
-            // to refuse an aggregate that followed ANY stacked fixed parameter, on
-            // the ground that a stacked scalar was sited `(ord - pool) * slot` per
-            // class. That siting is gone: lir_callconv's incoming `StackArgCursor`
-            // places the stacked `arg` ops in parameter order with the same
-            // `StackArgPackingRules` calls this tier's byte cursor makes, so after
-            // stacked scalars the cursor below names exactly the byte the caller
-            // wrote; after an earlier stacked aggregate both are this cursor; and a
-            // scalar AFTER this aggregate is read at its byte offset
-            // (`receiveStackedScalarAt`), never through an `arg`.
-            StructLayout const* layout = cachedLayout(aggTy);
-            MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
-            if (layout == nullptr || !slot.valid()) {
-                unsupported(anchor, "by-value stacked aggregate parameter requires a "
-                                    "sizeable layout (complete type / target "
-                                    "'aggregateLayout')");
-                return false;
-            }
-            // Symmetric with the caller's appendByValueStackArg size guard: a stacked
-            // aggregate's rounded span accumulates into the uint32 byte cursor, so an
-            // absurd (>1 GiB) layout would overflow it. Fail loud (the type system
-            // bounds real aggregates far below this — defensive parity, not reachable).
-            if (layout->size > kByValueStackArgSizeMask) {
-                unsupported(anchor, "by-value stacked aggregate parameter is too large "
-                                    "to encode its incoming-stack byte span");
-                return false;
-            }
-            // The incoming ADDRESS of this whole aggregate = the overflow base + its
-            // byte offset within the incoming overflow area (the byte cursor, past
-            // every fixed param stacked before it). Byte-copy it into the param's
-            // local slot (by-value semantics, the by-reference reception precedent
-            // but reading from the stack).
-            // The straddled aggregate rides ONE `ByValueStackArg` carrier
-            // operand on the call side (no Arg here — RecvByValueStackParam) —
-            // advance the flat position past that operand so later params stay
-            // aligned to the operand list (arg_payload.hpp; this callee is
-            // inline-refused, but the positions must stay consistent).
-            (void)ctr.nextPosition();
-            // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: round the cursor to the
-            // boundary this CC honours for a stacked aggregate BEFORE taking the
-            // offset, with the SAME call the caller's cursor makes. An aggregate
-            // states NO own alignment (`0`) on either side — the LIR tier has no
-            // layout engine, so the caller cannot state one and the callee must
-            // therefore not USE one, or the two would round differently and the
-            // caller would write where this read does not look. That symmetry is
-            // the load-bearing part: after a naturally-packed narrower datum
-            // stacked before it (Apple arm64), this round-up is what puts the
-            // aggregate on the boundary the caller's cursor chose.
-            currentFnFixedStackBytes_ = roundUpToSlot(
-                currentFnFixedStackBytes_,
-                config.stackArgPacking.aggregateAlignment(0, stackSlotBytes()));
-            MirInstId const src =
-                mir.addInst(MirOpcode::RecvByValueStackParam, {},
-                            interner.pointer(aggTy),
-                            /*payload=*/currentFnFixedStackBytes_);
-            if (!src.valid()) return false;
-            if (!lowerByteWiseCopy(src, slot, layout->size)) return false;
-            addressableLocal[sym.v] = slot;
-            // Advance the byte cursor by this aggregate's rounded incoming-stack span,
-            // then EXHAUST-or-BACKFILL the overflowed per-class cursor: AAPCS64 sets
-            // NGRN/NSRN ← pool (clamp, no backfill); SysV leaves the cursor (backfill).
-            // Config-driven (gcc aarch64_layout_arg vs function_arg_advance_64), never
-            // an arch identity branch.
-            std::uint32_t const slot8 = stackSlotBytes();
-            currentFnFixedStackBytes_ += roundUpToSlot(
-                static_cast<std::uint32_t>(layout->size), slot8);
-            currentFnSawStackedAggregate_ = true;
-            currentFnSawFixedStackParam_  = true;
-            if (config.aggregateStackExhaustsRegisters) {
-                if (ctr.gpr + numGp > config.argGprCount)
-                    ctr.gpr = config.argGprCount;
-                if (ctr.fpr + numFp > config.argFprCount)
-                    ctr.fpr = config.argFprCount;
-            }
-            return true;
-        }
+        if (straddles) return receiveStackedAggregateParam(sym, aggTy, anchor, ctr, numGp, numFp);
         // Register-resident: receive each eightbyte from its arg register into the
         // 16-rounded slot at its offset (trailing padding absorbed).
+        return receiveRegisterAggregateParam(sym, aggTy, anchor, abi, ctr);
+    }
+
+    // A by-value aggregate PARAMETER received WHOLLY from the incoming stack: a
+    // MEMORY-class one under a `Stack` convention, or an InRegisters one whose
+    // `numGp`/`numFp` pieces did not all fit the remaining registers (the straddle).
+    // Byte-copies it from its incoming address into the parameter's own slot.
+    [[nodiscard]] bool receiveStackedAggregateParam(SymbolId sym, TypeId aggTy, HirNodeId anchor,
+                                                    ArgOrdinalCounter& ctr, std::uint32_t numGp,
+                                                    std::uint32_t numFp) {
+        // ★ SITED BY THE BYTE CURSOR, WHATEVER WAS STACKED BEFORE IT (P68 round
+        // 8, D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED). This used
+        // to refuse an aggregate that followed ANY stacked fixed parameter, on
+        // the ground that a stacked scalar was sited `(ord - pool) * slot` per
+        // class. That siting is gone: lir_callconv's incoming `StackArgCursor`
+        // places the stacked `arg` ops in parameter order with the same
+        // `StackArgPackingRules` calls this tier's byte cursor makes, so after
+        // stacked scalars the cursor below names exactly the byte the caller
+        // wrote; after an earlier stacked aggregate both are this cursor; and a
+        // scalar AFTER this aggregate is read at its byte offset
+        // (`receiveStackedScalarAt`), never through an `arg`.
+        StructLayout const* layout = cachedLayout(aggTy);
+        MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
+        if (layout == nullptr || !slot.valid()) {
+            unsupported(anchor, "by-value stacked aggregate parameter requires a "
+                                "sizeable layout (complete type / target "
+                                "'aggregateLayout')");
+            return false;
+        }
+        // Symmetric with the caller's appendByValueStackArg size guard: a stacked
+        // aggregate's rounded span accumulates into the uint32 byte cursor, so an
+        // absurd (>1 GiB) layout would overflow it. Fail loud (the type system
+        // bounds real aggregates far below this — defensive parity, not reachable).
+        if (layout->size > kByValueStackArgSizeMask) {
+            unsupported(anchor, "by-value stacked aggregate parameter is too large "
+                                "to encode its incoming-stack byte span");
+            return false;
+        }
+        // The incoming ADDRESS of this whole aggregate = the overflow base + its
+        // byte offset within the incoming overflow area (the byte cursor, past
+        // every fixed param stacked before it). Byte-copy it into the param's
+        // local slot (by-value semantics, the by-reference reception precedent
+        // but reading from the stack).
+        // The stacked aggregate rides ONE `ByValueStackArg` carrier
+        // operand on the call side (no Arg here — RecvByValueStackParam) —
+        // advance the flat position past that operand so later params stay
+        // aligned to the operand list (arg_payload.hpp). P69 (fold f26c): the
+        // position is STAMPED on the reception (payload2 = position + 1), so the
+        // inliner maps it to the call's carrier exactly as it maps an `Arg`.
+        std::uint32_t const position = ctr.nextPosition();
+        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: round the cursor to the
+        // boundary this CC honours for a stacked aggregate BEFORE taking the
+        // offset, with the SAME call the caller's cursor makes ON THE SAME
+        // ALIGNMENT — the aggregate's own, which the caller's `ByValueStackArg`
+        // carrier states in its secondary payload (`appendByValueStackArg`).
+        // That symmetry is the load-bearing part: were the two to round on
+        // different alignments, the caller would write where this read does not
+        // look. After a naturally-packed narrower datum stacked before it (Apple
+        // arm64), or after an odd number of stacked eightbytes under SysV (gcc and
+        // clang put a 16-aligned aggregate at +16, not +8), this round-up is what
+        // puts the aggregate on the boundary the caller's cursor chose.
+        // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+        // before this fold NEITHER side stated an aggregate's alignment (the LIR
+        // tier has no layout engine to derive one), so both used the slot — and a
+        // 16-aligned aggregate landed 8 bytes from where gcc and clang put it.
+        currentFnFixedStackBytes_ = roundUpToSlot(
+            currentFnFixedStackBytes_,
+            config.stackArgPacking.aggregateAlignment(layout->align.bytes(),
+                                                      stackSlotBytes()));
+        MirInstId const src =
+            mir.addInst(MirOpcode::RecvByValueStackParam, {},
+                        interner.pointer(aggTy),
+                        /*payload=*/currentFnFixedStackBytes_, MirInstFlags::None,
+                        /*payload2=*/position + 1u);
+        if (!src.valid()) return false;
+        if (!lowerByteWiseCopy(src, slot, layout->size)) return false;
+        addressableLocal[sym.v] = slot;
+        // Advance the byte cursor by this aggregate's rounded incoming-stack span,
+        // then EXHAUST-or-BACKFILL the overflowed per-class cursor: AAPCS64 sets
+        // NGRN/NSRN ← pool (clamp, no backfill); SysV leaves the cursor (backfill).
+        // Config-driven (gcc aarch64_layout_arg vs function_arg_advance_64), never
+        // an arch identity branch.
+        std::uint32_t const slot8 = stackSlotBytes();
+        currentFnFixedStackBytes_ += roundUpToSlot(
+            static_cast<std::uint32_t>(layout->size), slot8);
+        currentFnSawStackedAggregate_ = true;
+        currentFnSawFixedStackParam_  = true;
+        if (config.aggregate.stackExhaustsRegisters) {
+            if (ctr.gpr + numGp > config.argGprCount)
+                ctr.gpr = config.argGprCount;
+            if (ctr.fpr + numFp > config.argFprCount)
+                ctr.fpr = config.argFprCount;
+        }
+        return true;
+    }
+
+    // An InRegisters by-value aggregate PARAMETER whose pieces all fit: each
+    // eightbyte from its arg register into the 16-rounded slot at its offset.
+    [[nodiscard]] bool receiveRegisterAggregateParam(SymbolId sym, TypeId aggTy, HirNodeId anchor,
+                                                     AbiPassing const& abi, ArgOrdinalCounter& ctr) {
         MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
         if (!slot.valid()) return false;
         for (AbiPiece const& p : abi.pieces) {
@@ -10496,7 +10857,7 @@ struct Lowerer {
     }
 
     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: account ONE stacked fixed
-    // SCALAR (or a ByReference aggregate's stacked hidden pointer) in the byte cursor
+    // SCALAR (or a `CallerCopy` MEMORY-class aggregate's stacked hidden pointer) in the byte cursor
     // and return the byte offset it occupies in the incoming overflow area.
     // INDEPENDENT-counter CCs only (the caller gates on !argSlotAligned).
     //
@@ -10608,7 +10969,7 @@ struct Lowerer {
     // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): emit a by-value struct/union-
     // returning Call into its result slot `slot` and yield `slot` (the aggregate
     // is accessed by address). `operands` already carries [callee, (sret slot,)
-    // args...]. ByReference (sret) ⇒ the call is void and the callee writes
+    // args...]. Memory (sret) ⇒ the call is void and the callee writes
     // through the hidden pointer → `slot` already holds the result. InRegisters ⇒
     // the call's result IS piece 0 (lir_callconv captures it from return-register
     // ordinal 0 of its class) and each further eightbyte is a
@@ -10624,11 +10985,32 @@ struct Lowerer {
         // function does (setjmp returns int) — but threading it here keeps the carrier
         // complete for EVERY Call shape rather than only the scalar/void path (no
         // silent-drop seam if a future returns-twice extern returns an aggregate).
-        if (abi.kind == AbiPassing::Kind::ByReference) {
+        if (abi.kind == AbiPassing::Kind::Memory) {
             MirInstId const call =
                 mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload,
                             /*flags=*/callFlags);
             if (!call.valid()) return InvalidMirInst;
+            return slot;
+        }
+        // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+        // an X87-class result (`struct { long double x; }`) comes back in the x87
+        // return register exactly as a scalar `long double` does: the Call is typed
+        // F80 (the st0 capture `mir_to_lir` makes for one) and the value is stored at
+        // offset 0 of the result slot. It used to come back through sret, where gcc
+        // and clang leave it on the x87 stack.
+        if (abi.kind == AbiPassing::Kind::X87) {
+            TypeId const f80 = interner.primitive(TypeKind::F80);
+            MirInstId const call =
+                mir.addInst(MirOpcode::Call, operands, f80, callPayload,
+                            /*flags=*/callFlags);
+            if (!call.valid()) return InvalidMirInst;
+            MirInstId const offK = constInt(0);
+            if (!offK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> g{slot, offK};
+            MirInstId const gp = mir.addInst(MirOpcode::Gep, g, interner.pointer(f80));
+            if (!gp.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> st{call, gp};
+            mir.addInst(MirOpcode::Store, st);
             return slot;
         }
         if (abi.pieces.empty()) {
@@ -10690,11 +11072,12 @@ struct Lowerer {
 
     // FC7 C1c: lower `return <struct-expr>;` for a by-value struct/union-returning
     // function. The returned aggregate is an lvalue/temp; take its ADDRESS and
-    // either copy it through the sret hidden pointer (ByReference) or load its
-    // eightbyte pieces into a multi-operand Return (InRegisters). Mirror of the
-    // caller's `emitStructReturningCall`.
+    // either copy it through the sret hidden pointer (Memory), load its eightbyte
+    // pieces into a multi-operand Return (InRegisters), or return its one x87
+    // value as a scalar `long double` (X87). Mirror of the caller's
+    // `emitStructReturningCall`.
     [[nodiscard]] bool lowerStructReturn(HirNodeId valNode) {
-        auto const abi = byValueClassify(currentFnResult_);
+        auto const abi = byValueClassify(currentFnResult_, AggregatePosition::Result);
         if (!abi.has_value()) {
             unsupported(valNode,
                 "returning a by-value struct/union is not supported by this "
@@ -10718,7 +11101,7 @@ struct Lowerer {
         // dest-store flag matches the conservative whole-aggregate-copy convention.
         MirInstFlags const srcVf =
             volatileFlagFor(valNode) | volatileFlagForType(hir.typeId(valNode));
-        if (abi->kind == AbiPassing::Kind::ByReference) {
+        if (abi->kind == AbiPassing::Kind::Memory) {
             if (!sretPtr_.valid()) {
                 unsupported(valNode, "sret return reached without a hidden result "
                                      "pointer (lowerFunction setup invariant)");
@@ -10730,6 +11113,22 @@ struct Lowerer {
             // the storage it points at; the callee must NOT also place it in x0.
             if (config.aggregateSretViaHiddenArg) mir.addReturn(sretPtr_);
             else                                  mir.addReturn();
+            return true;
+        }
+        // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+        // an X87-class result is returned as the scalar `long double` at its offset 0
+        // — the st0 return the F80 path makes (`mir_to_lir`'s Return of an F80).
+        if (abi->kind == AbiPassing::Kind::X87) {
+            TypeId const f80 = interner.primitive(TypeKind::F80);
+            MirInstId const offK = constInt(0);
+            if (!offK.valid()) return false;
+            std::array<MirInstId, 2> g{srcAddr, offK};
+            MirInstId const gp = mir.addInst(MirOpcode::Gep, g, interner.pointer(f80));
+            if (!gp.valid()) return false;
+            std::array<MirInstId, 1> l{gp};
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, f80, /*payload=*/0, srcVf);
+            if (!v.valid()) return false;
+            mir.addReturn(v);
             return true;
         }
         std::vector<MirInstId> pieces;
@@ -10925,6 +11324,13 @@ struct Lowerer {
             if (!kids.empty()) {
                 if (auto s = refSymOf(kids[0]); s.has_value()) out.insert(*s);
             }
+        } else if (k == HirKind::VaCopy) {
+            // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): va_copy addresses BOTH of its
+            // va_lists — the destination is written, the source read in place — so each
+            // bare `Ref` operand must be slot-backed, for the reason the arm above states.
+            for (HirNodeId kid : hir.children(node)) {
+                if (auto s = refSymOf(kid); s.has_value()) out.insert(*s);
+            }
         }
         });
     }
@@ -10984,6 +11390,21 @@ struct Lowerer {
         forEachHirNodeUnder(root, [&](HirNodeId node) {
             if (hir.kind(node) == HirKind::LabelStmt)
                 labelNodeByOrdinal_[hir.labelOrdinal(node)] = node;
+        });
+    }
+    // P69 (lane `cs`, review M1): mark every ancestor of every `__builtin_alloca` call, up
+    // to the function's root, so a VLA scope knows BEFORE any of it is lowered whether an
+    // alloca runs inside it. Each ancestor chain stops at the first node already marked
+    // (everything above it is marked too), so the scan is linear in the body however many
+    // allocas it holds.
+    void collectAllocaScopes(HirNodeId root) {
+        forEachHirNodeUnder(root, [&](HirNodeId node) {
+            if (hir.kind(node) != HirKind::BuiltinCall
+                || static_cast<BuiltinLowering>(hir.payload(node)) != BuiltinLowering::Alloca)
+                return;
+            for (HirNodeId cur = hir.parent(node);
+                 cur.valid() && allocaScopes_.insert(cur.v).second; cur = hir.parent(cur)) {
+            }
         });
     }
     [[nodiscard]] HirNodeId resolveLabelNode(std::uint32_t ordinal) const {
@@ -11108,7 +11529,8 @@ struct Lowerer {
         MirInstId const save =
             mir.addInst(MirOpcode::StackSave, {}, i64Ty(), scopeId);
         if (!save.valid()) return false;
-        vlaScopeStack_.push_back({site.anchor, scopeNode, save, scopeId});
+        vlaScopeStack_.push_back({site.anchor, scopeNode, save, scopeId,
+                                  /*pinnedByAlloca=*/allocaScopes_.contains(scopeNode.v)});
         return true;
     }
 
@@ -11116,7 +11538,21 @@ struct Lowerer {
     // that scope's VLA + every DEEPER one — the stack grows down, so a shallower
     // watermark reclaims all below it). scopeId payload pairs it to its StackSave.
     void emitVlaRestore(std::size_t frameIdx) {
-        VlaScopeFrame const& fr = vlaScopeStack_[frameIdx];
+        // P69 (lane `cs`): the exit leaves frames [frameIdx, end). A PINNED one keeps its
+        // stack (see the field), and so does every shallower one — restoring to a watermark
+        // above alloca'd memory frees it. So the restore goes to the first frame PAST the
+        // deepest pinned one it leaves: that frame's scope runs no alloca, so everything
+        // below its watermark is VLA space this exit ends (P69 review M1: a `continue` out of
+        // an unpinned inner VLA of a pinned loop body freed nothing, and every iteration
+        // leaked the inner array — ✔MEASURED 2026-10-07, probe al4 a7: a 64 KiB inner array
+        // over 2000 iterations overflowed the stack, PE 0xC0000005 and ELF SIGSEGV, where
+        // gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 at -O0 and -O2 free it and exit 42).
+        // No such frame: nothing is restored.
+        std::size_t target = frameIdx;
+        for (std::size_t k = frameIdx; k < vlaScopeStack_.size(); ++k)
+            if (vlaScopeStack_[k].pinnedByAlloca) target = k + 1;
+        if (target >= vlaScopeStack_.size()) return;
+        VlaScopeFrame const& fr = vlaScopeStack_[target];
         std::array<MirInstId, 1> ops{fr.saveBefore};
         mir.addInst(MirOpcode::StackRestore, ops, InvalidType, fr.scopeId);
     }
@@ -11311,10 +11747,22 @@ struct Lowerer {
     // VaOverflowArgAreaAddr that the LIR callconv pass fills in once it owns the
     // frame layout (the ReadIndirectResult precedent).
 
-    // The `__va_list_tag*` base address of a va_list lvalue `apChild`. `ap` is
-    // `__va_list_tag[1]`, so its lvalue address IS the address of its first (only)
-    // tag element — the base every field-Gep indexes from.
+    // The base address of the va_list OBJECT operand `apChild` names — the base every
+    // field-Gep indexes from. An operand of the list's own type (a local; a va_list
+    // PARAMETER, whose array type c82 keeps, received as its incoming pointer) IS the
+    // object: its lvalue address. On SysV the list is an ARRAY (`__va_list_tag[1]`), so an
+    // operand may also be the list DECAYED — a pointer to the tag (`__typeof__(&ap[0]) p
+    // = ap`, a parameter of that type, a conditional of two lists): the pointer's VALUE is
+    // the tag's address, never the pointer variable's own slot (P69, lane `cs`,
+    // D-C-A-VA-LIST-REACHED-THROUGH-ITS-DECAYED-POINTER-READS-THE-POINTER-VARIABLE).
+    // Win64's and Apple's list IS a `char *`, so there a pointer-typed operand is the
+    // object itself; AAPCS64's is a structure, which the semantic tier never decays.
     [[nodiscard]] MirInstId vaTagBase(HirNodeId apChild) {
+        if (config.vaListLayout.has_value()
+            && config.vaListLayout->strategy == VaListStrategy::SysVRegisterSave) {
+            TypeId const t = interner.stripVolatile(hir.typeId(apChild));
+            if (t.valid() && interner.kind(t) == TypeKind::Ptr) return lowerExpr(apChild);
+        }
         return lowerLvalueAddress(apChild);
     }
 
@@ -11590,12 +12038,142 @@ struct Lowerer {
         return InvalidMirInst;
     }
 
+    // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` (C 7.16.1.2) →
+    // the SOURCE va_list object's bytes copied over the DESTINATION's. Both objects are
+    // found exactly where va_start and va_arg find theirs (`vaTagBase`: a local's slot, a
+    // SysV `va_list` PARAMETER's incoming pointer to the caller's tag, a decayed list's
+    // pointer value), so a copy made anywhere walks the list the way its source would
+    // have. WHAT is copied is the va_list OBJECT, read off the DESTINATION's type: an
+    // array (SysV `__va_list_tag[1]`, a va_list parameter's too — c82 keeps its array
+    // type) byte-wise, a struct (AAPCS64 `__va_list`) as an aggregate, a scalar (the
+    // Win64 / Apple `char *`) as one Load and one Store — and on SysV a destination that
+    // is the list DECAYED, a `Ptr<__va_list_tag>` (`__typeof__(&ap[0])`, a conditional of
+    // two lists), points AT the object, so its pointee is copied: copying the pointer
+    // itself would move eight bytes of the source's cursors and leave the tag's two area
+    // pointers stale. ✔MEASURED (lane `cs`'s va_copy_objects and
+    // va_list_through_its_decayed_pointer, every build RUN): gcc 13.3.0 and clang 18.1.3
+    // exit 42 on every shape, MSVC 19.51 on every shape its `char *` list can spell.
+    [[nodiscard]] MirInstId lowerVaCopy(HirNodeId node) {
+        if (!config.vaListLayout.has_value()) {
+            unsupported(node, "variadic callee (va_copy) is unsupported for this "
+                              "target's calling convention — it declares no "
+                              "'vaListLayout'");
+            return InvalidMirInst;
+        }
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed VaCopy (expect [dest, src])");
+            return InvalidMirInst;
+        }
+        TypeId objTy = interner.stripVolatile(hir.typeId(kids[0]));
+        if (!objTy.valid()) {
+            unsupported(node, "va_copy's destination has no type");
+            return InvalidMirInst;
+        }
+        // Strategy-dispatch with the fail-loud tail the va_end arm uses (no `default:`,
+        // so a new strategy is a -Wswitch stop here rather than a silent SysV reading).
+        bool strategyKnown = false;
+        switch (config.vaListLayout->strategy) {
+        case VaListStrategy::SysVRegisterSave:
+            // The list is an ARRAY of one tag; a destination that is the list DECAYED
+            // (a Ptr<__va_list_tag>, whose value `vaTagBase` reads) points at the
+            // object to copy, its pointee.
+            if (interner.kind(objTy) == TypeKind::Ptr) {
+                auto const ops = interner.operands(objTy);
+                if (ops.empty()) {
+                    unsupported(node, "va_copy: a pointer va_list with no pointee");
+                    return InvalidMirInst;
+                }
+                objTy = ops[0];
+            }
+            strategyKnown = true;
+            break;
+        case VaListStrategy::HomogeneousPointer:
+        case VaListStrategy::Aapcs64DualCursor:
+            strategyKnown = true;   // the operand's own type IS the list object
+            break;
+        }
+        if (!strategyKnown) {
+            unsupported(node, "internal: unknown VaListStrategy in va_copy");
+            return InvalidMirInst;
+        }
+        MirInstId const dst = vaTagBase(kids[0]);
+        if (!dst.valid()) return InvalidMirInst;
+        MirInstId const src = vaTagBase(kids[1]);
+        if (!src.valid()) return InvalidMirInst;
+        TypeKind const objKind = interner.kind(objTy);
+        if (objKind == TypeKind::Array || isByValueClass(interner, objTy)) {
+            if (!lowerAggregateCopy(node, src, dst, objTy)) return InvalidMirInst;
+            return constInt(0);   // a valid placeholder for the discard chokepoint
+        }
+        std::array<MirInstId, 1> loadOps{src};
+        MirInstId const value = mir.addInst(MirOpcode::Load, loadOps, objTy);
+        std::array<MirInstId, 2> st{value, dst};
+        return mir.addInst(MirOpcode::Store, st);
+    }
+
     // `va_arg(ap, T)` for a SCALAR T → the reg-vs-overflow diamond (SysV §3.5.7).
     // STRUCT/UNION T STAYS FAIL-LOUD this cycle (the FC12a-struct boundary). The
     // diamond mirrors the Ternary value-diamond: classify T (GPR vs SSE) → pick the
     // gp_offset/fp_offset cursor → if cursor < limit, read reg_save_area+cursor &
     // bump the cursor by the slot stride; else read overflow_arg_area & bump it by a
     // stack slot → Phi the two address arms → Load the value.
+    // ★ P69 (D-CODEGEN-LONG-DOUBLE-VA-ARG-READS-THE-WRONG-SLOT): WHERE a variadic SCALAR
+    // of type `t` sits in the stack overflow area whose cursor (a `void*`) is `cursor`, and
+    // how far the cursor then advances. A scalar no wider than the stack slot takes the
+    // slot at the cursor and advances one slot — the arithmetic every overflow arm below
+    // always used. A WIDER one (SysV's x87 `long double`, AAPCS64's binary128 past v7)
+    // is aligned by the convention's SCALAR cap and occupies its own size rounded to the
+    // slot: the SAME `stackArgPacking.scalarAlignment` question `StackArgCursor::place` asks
+    // when the caller stacks that argument, and `accountFixedStackScalar` asks for a named
+    // one, so the two sides of the call cannot answer differently. ✔MEASURED before this
+    // existed: a 16-byte variadic read from an 8-byte-stepped cursor read its tail as the
+    // next argument.
+    struct StackedVarargScalar {
+        MirInstId     addr;
+        std::uint64_t step = 0;
+    };
+    [[nodiscard]] std::optional<StackedVarargScalar>
+    placeStackedVarargScalar(HirNodeId node, MirInstId cursor, TypeId t, std::uint32_t slot) {
+        std::uint32_t const own = static_cast<std::uint32_t>(
+            scalarByteSize(interner.kind(t), config.dataModel).value_or(0));
+        if (slot == 0) {
+            unsupported(node, "internal: the calling convention's vaListLayout declares a "
+                              "zero-byte stack slot");
+            return std::nullopt;
+        }
+        if (own <= slot) return StackedVarargScalar{cursor, slot};
+        std::uint32_t const natural = naturalAlignOfType(t);
+        std::uint32_t const align =
+            config.stackArgPacking.scalarAlignment(natural != 0 ? natural : own, slot);
+        MirInstId const addr = alignedOverflowCursor(cursor, align, slot);
+        std::uint64_t const step =
+            ((static_cast<std::uint64_t>(own) + slot - 1u) / slot) * slot;
+        return StackedVarargScalar{addr, step};
+    }
+
+    // The overflow cursor `cursor` (only slot-aligned) rounded up to `align` when that
+    // exceeds the slot — (p + align-1) & -align — else `cursor` itself. The ONE rounding
+    // a stacked vararg scalar and (P69 fold f26c, D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET)
+    // a stacked by-value aggregate read through `va_arg` take, with the alignment the
+    // caller's cursor honoured for each.
+    [[nodiscard]] MirInstId alignedOverflowCursor(MirInstId cursor, std::uint32_t align,
+                                                  std::uint32_t slot) {
+        if (align <= slot) return cursor;
+        TypeId const i64     = interner.primitive(TypeKind::I64);
+        TypeId const voidPtr = interner.pointer(interner.primitive(TypeKind::Void));
+        std::array<MirInstId, 1> p2iOps{cursor};
+        MirInstId const asInt = mir.addInst(MirOpcode::PtrToInt, p2iOps, i64);
+        MirInstId const biasK = constIntOfType(static_cast<std::int64_t>(align) - 1, i64);
+        MirInstId const maskK = constIntOfType(-static_cast<std::int64_t>(align), i64);
+        std::array<MirInstId, 2> addOps{asInt, biasK};
+        MirInstId const biased = mir.addInst(MirOpcode::Add, addOps, i64);
+        std::array<MirInstId, 2> andOps{biased, maskK};
+        MirInstId const rounded = mir.addInst(MirOpcode::And, andOps, i64);
+        std::array<MirInstId, 1> i2pOps{rounded};
+        return mir.addInst(MirOpcode::IntToPtr, i2pOps, voidPtr);
+    }
+
     [[nodiscard]] MirInstId lowerVaArg(HirNodeId node) {
         if (!config.vaListLayout.has_value()) {
             unsupported(node, "variadic callee (va_arg) is unsupported for this "
@@ -11724,16 +12302,19 @@ struct Lowerer {
 
             // ── overflow arm: addr = __stack; __stack += gpSlotBytes. ──
             // The stack bump is the NSAA round-up-to-8 quantum (gpSlotBytes=8) even for
-            // a double on the stack — NOT fpSlotBytes=16.
+            // a double on the stack — NOT fpSlotBytes=16. ★ P69: a scalar WIDER than
+            // that quantum — binary128 `long double` past v7 — is 16-aligned and steps
+            // 16 (`placeStackedVarargScalar`, the caller's own placement rule).
             mir.beginBlock(ovfBB);
             MirInstId const stackPtr = vaFieldPtr(tagBase, vl.stackField, voidPtrPtr);
             if (!stackPtr.valid()) return InvalidMirInst;
             std::array<MirInstId, 1> loadStackOps{stackPtr};
             MirInstId const stack = mir.addInst(MirOpcode::Load, loadStackOps, voidPtr);
-            MirInstId const stepK =
-                constInt(static_cast<std::int64_t>(vl.gpSlotBytes));
+            auto const stacked = placeStackedVarargScalar(node, stack, t, vl.gpSlotBytes);
+            if (!stacked.has_value()) return InvalidMirInst;
+            MirInstId const stepK = constInt(static_cast<std::int64_t>(stacked->step));
             if (!stepK.valid()) return InvalidMirInst;
-            std::array<MirInstId, 2> stackGepOps{stack, stepK};
+            std::array<MirInstId, 2> stackGepOps{stacked->addr, stepK};
             MirInstId const stackNext = mir.addInst(MirOpcode::Gep, stackGepOps, voidPtr);
             std::array<MirInstId, 2> stackStore{stackNext, stackPtr};
             mir.addInst(MirOpcode::Store, stackStore);
@@ -11743,8 +12324,8 @@ struct Lowerer {
             // ── join: pick the address, then Load the value. ──
             mir.beginBlock(joinBB);
             std::array<MirPhiIncoming, 2> incomings{
-                MirPhiIncoming{regAddr, regPred},
-                MirPhiIncoming{stack,   ovfPred},
+                MirPhiIncoming{regAddr,       regPred},
+                MirPhiIncoming{stacked->addr, ovfPred},
             };
             MirInstId const argPtr = mir.addPhi(voidPtr, incomings);
             std::array<MirInstId, 1> finalLoad{argPtr};
@@ -11753,6 +12334,35 @@ struct Lowerer {
         if (vl.strategy != VaListStrategy::SysVRegisterSave) {
             unsupported(node, "internal: unknown VaListStrategy in va_arg");
             return InvalidMirInst;
+        }
+
+        // ★ P69 (D-CODEGEN-LONG-DOUBLE-VA-ARG-READS-THE-WRONG-SLOT): a scalar this
+        // convention passes in MEMORY has no register alternative, so it must not enter the
+        // diamond below. SysV's x87 80-bit `long double` is one — class X87, which §3.5.7's
+        // va_arg fetches from `overflow_arg_area` — and the caller stacks it
+        // (`finishScalarCallArg`'s F80 carrier, keyed on the same kind). `scalarArgClass`
+        // calls every float kind FPR, so the diamond's SSE arm read the fp save area instead:
+        // ✔MEASURED (P69 lane lm, examples/c/variadic_forwarding_to_the_platform) —
+        // `va_arg(ap, long double)` returned the double a previous call had left in the xmm0
+        // save slot on ELF x86_64, silently. Straight-line: the datum's address in the
+        // overflow area (16-aligned, `placeStackedVarargScalar`), the cursor past it, a read.
+        if (interner.kind(t) == TypeKind::F80) {
+            TypeId const voidPtr    = interner.pointer(interner.primitive(TypeKind::Void));
+            TypeId const voidPtrPtr = interner.pointer(voidPtr);
+            MirInstId const ovfPtr = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
+            if (!ovfPtr.valid()) return InvalidMirInst;
+            std::array<MirInstId, 1> loadOvfOps{ovfPtr};
+            MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+            auto const stacked = placeStackedVarargScalar(node, ovfArea, t, vl.gpSlotBytes);
+            if (!stacked.has_value()) return InvalidMirInst;
+            MirInstId const stepK = constInt(static_cast<std::int64_t>(stacked->step));
+            if (!stepK.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> nextOps{stacked->addr, stepK};
+            MirInstId const ovfNext = mir.addInst(MirOpcode::Gep, nextOps, voidPtr);
+            std::array<MirInstId, 2> ovfStore{ovfNext, ovfPtr};
+            mir.addInst(MirOpcode::Store, ovfStore);
+            std::array<MirInstId, 1> readOps{stacked->addr};
+            return mir.addInst(MirOpcode::Load, readOps, t);
         }
 
         // ── SysVRegisterSave: the reg-vs-overflow diamond (SysV §3.5.7) ──
@@ -11883,7 +12493,7 @@ struct Lowerer {
             // meaning — the read-side mirror of the caller's `appendByValueArg`. A
             // pow2-≤8B struct sits in the slot(s) BY VALUE (InRegisters); a >16B struct
             // (and, for Win64, any non-pow2/>8B) rides as a hidden POINTER to a caller
-            // copy (ByReference). The size-aware InRegisters bump below (Step 2.0) is
+            // copy (Memory, the `CallerCopy` carrier). The size-aware InRegisters bump below (Step 2.0) is
             // what makes Apple's 16B HFA — which spans TWO 8-byte slots — advance the
             // cursor correctly (Win64 InRegisters structs are pow2-≤8B ⇒ one slot).
             // `ap` is the `char*` cursor; tagBase is its lvalue address (`char**`).
@@ -11894,7 +12504,7 @@ struct Lowerer {
                 unsupported(node, "VaArg has no result type");
                 return InvalidMirInst;
             }
-            auto const abi = byValueClassify(t);
+            auto const abi = byValueClassify(t, AggregatePosition::Argument);
             if (!abi.has_value()) {
                 unsupported(node,
                     "va_arg of a struct/union is not supported by this target's "
@@ -11910,6 +12520,8 @@ struct Lowerer {
                                   "(target 'aggregateLayout' / complete type)");
                 return InvalidMirInst;
             }
+            if (!vaArgReadsTheConventionsCarrier(node, *abi, AggregateMemoryArgument::CallerCopy))
+                return InvalidMirInst;
             auto kids = hir.children(node);
             if (kids.size() != 2) {
                 unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
@@ -11924,7 +12536,7 @@ struct Lowerer {
             std::array<MirInstId, 1> loadApOps{tagBase};
             MirInstId const apVal = mir.addInst(MirOpcode::Load, loadApOps, voidPtr);
             MirInstId structAddr;
-            if (abi->kind == AbiPassing::Kind::ByReference) {
+            if (abi->kind == AbiPassing::Kind::Memory) {
                 // The slot HOLDS A POINTER to the caller's by-value copy: deref it.
                 // apVal is the slot's address (void*); Load the stored pointer (the
                 // Load's void* result width reads the pointer, agnostic to pointee).
@@ -11940,7 +12552,7 @@ struct Lowerer {
             }
             // Bump the cursor by the slot(s) this struct occupied. The advance is a
             // function of `abi->kind` ONLY (NOT the strategy — agnostic):
-            //   * ByReference  → ONE slot (namedArgSlotBytes): the slot holds a single
+            //   * Memory       → ONE slot (namedArgSlotBytes): the slot holds a single
             //     hidden POINTER to the caller copy, regardless of the pointee size.
             //   * InRegisters  → roundUp(sizeof T, namedArgSlotBytes): as MANY 8-byte
             //     slots as the struct's bytes need. For Win64 every InRegisters struct
@@ -11951,7 +12563,7 @@ struct Lowerer {
             std::uint64_t const slotQ =
                 static_cast<std::uint64_t>(vl.namedArgSlotBytes);
             std::uint64_t const stepBytes =
-                (abi->kind == AbiPassing::Kind::ByReference)
+                (abi->kind == AbiPassing::Kind::Memory)
                     ? slotQ
                     : ((hpLayout->size + slotQ - 1u) / slotQ) * slotQ;
             MirInstId const stepK =
@@ -11968,7 +12580,7 @@ struct Lowerer {
             // ── AAPCS64 §B.6 va_arg(struct): the per-class dual-cursor GATHER ──
             // (D-FC12C-AAPCS64-HFA-STRUCT-VARARG). The aggregate ABI splits into THREE
             // shapes (the Aapcs64Hfa classifier never mixes piece classes):
-            //   * ByReference (>16B): the caller placed a hidden POINTER in ONE GR slot
+            //   * Memory (>16B): the caller placed a hidden POINTER in ONE GR slot
             //     — read that slot (GR cursor), deref it. Result = the caller's copy.
             //   * InRegisters HFA (1-4 pure-FPR pieces): gather each piece from the VR
             //     save block (`__vr_top`/`__vr_offs`, 16B stride) into a fresh temp.
@@ -11985,7 +12597,7 @@ struct Lowerer {
                 unsupported(node, "VaArg has no result type");
                 return InvalidMirInst;
             }
-            auto const abi = byValueClassify(t);
+            auto const abi = byValueClassify(t, AggregatePosition::Argument);
             if (!abi.has_value()) {
                 unsupported(node,
                     "va_arg of a struct/union is not supported by this target's "
@@ -11998,6 +12610,8 @@ struct Lowerer {
                                   "(target 'aggregateLayout' / complete type)");
                 return InvalidMirInst;
             }
+            if (!vaArgReadsTheConventionsCarrier(node, *abi, AggregateMemoryArgument::CallerCopy))
+                return InvalidMirInst;
             auto kids = hir.children(node);
             if (kids.size() != 2) {
                 unsupported(node, "malformed VaArg (expect [apExpr, TypeRef])");
@@ -12035,12 +12649,12 @@ struct Lowerer {
 
             // The overflow (`__stack`) bump quantum: AAPCS64 §B.4 rounds EVERY stack
             // vararg up to an 8-byte NSAA slot — gpSlotBytes (NOT fpSlotBytes, even for
-            // an HFA; hazard H6). A ByReference struct on the stack occupies ONE 8-byte
+            // an HFA; hazard H6). A Memory-class struct on the stack occupies ONE 8-byte
             // pointer slot; an InRegisters struct occupies roundUp(size,8) bytes.
             std::uint64_t const stackQ = static_cast<std::uint64_t>(vl.gpSlotBytes);
 
-            // ── Path A1: ByReference (>16B) — ONE GR slot holds a hidden pointer ──
-            if (abi->kind == AbiPassing::Kind::ByReference) {
+            // ── Path A1: Memory (>16B) — ONE GR slot holds a hidden pointer ──
+            if (abi->kind == AbiPassing::Kind::Memory) {
                 MirInstId const offPtr = vaFieldPtr(tagBase, vl.grOffsField, i32Ptr);
                 if (!offPtr.valid()) return InvalidMirInst;
                 std::array<MirInstId, 1> loadOffOps{offPtr};
@@ -12241,7 +12855,7 @@ struct Lowerer {
             unsupported(node, "VaArg has no result type");
             return InvalidMirInst;
         }
-        auto const abi = byValueClassify(t);
+        auto const abi = byValueClassify(t, AggregatePosition::Argument);
         if (!abi.has_value()) {
             unsupported(node,
                 "va_arg of a struct/union is not supported by this target's calling "
@@ -12254,6 +12868,8 @@ struct Lowerer {
                               "(target 'aggregateLayout' / complete type)");
             return InvalidMirInst;
         }
+        if (!vaArgReadsTheConventionsCarrier(node, *abi, AggregateMemoryArgument::Stack))
+            return InvalidMirInst;
         // Count the eightbyte pieces per class (1-2 total for SysV).
         std::uint32_t numGp = 0, numFp = 0;
         for (AbiPiece const& p : abi->pieces) {
@@ -12284,12 +12900,17 @@ struct Lowerer {
         // (a >16B struct occupies multiple stack eightbytes). Straight-line (no
         // branch) since there is no register alternative. This is the read-side mirror
         // of the caller's appendByValueStackArg overflow placement.
-        if (abi->kind == AbiPassing::Kind::ByReference) {
+        if (abi->kind == AbiPassing::Kind::Memory) {
             MirInstId const ovfPtr =
                 vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
             if (!ovfPtr.valid()) return InvalidMirInst;
             std::array<MirInstId, 1> loadOvfOps{ovfPtr};
-            MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+            // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // begun on the aggregate's own alignment, as the caller's carrier states it.
+            MirInstId const ovfArea = alignedOverflowCursor(
+                mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr),
+                config.stackArgPacking.aggregateAlignment(layout->align.bytes(), vl.gpSlotBytes),
+                vl.gpSlotBytes);
             // Round the struct up to a whole stack slot — the CC's pointer-width arg
             // slot `vl.gpSlotBytes` (the same quantum the scalar/InRegisters overflow
             // arms bump by), read from config, never a hardcoded 8 (agnostic).
@@ -12407,7 +13028,12 @@ struct Lowerer {
         MirInstId const ovfPtr = vaFieldPtr(tagBase, vl.overflowArgAreaField, voidPtrPtr);
         if (!ovfPtr.valid()) return InvalidMirInst;
         std::array<MirInstId, 1> loadOvfOps{ovfPtr};
-        MirInstId const ovfArea = mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr);
+        // P69 (lane `cs`, fold f26c): begun on the aggregate's own alignment, as the
+        // caller's carrier states it (`appendByValueStackArg`).
+        MirInstId const ovfArea = alignedOverflowCursor(
+            mir.addInst(MirOpcode::Load, loadOvfOps, voidPtr),
+            config.stackArgPacking.aggregateAlignment(layout->align.bytes(), vl.gpSlotBytes),
+            vl.gpSlotBytes);
         // Round the struct up to a whole stack slot. The stack-slot quantum is the
         // CC's pointer-width arg slot — `vl.gpSlotBytes` (the same field the scalar
         // overflow arm bumps by) — read from config, never a hardcoded 8 (agnostic).
@@ -14353,11 +14979,6 @@ struct Lowerer {
                     }
                 }
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
-                    // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer
-                    // (`P p = {3,4}` / `{.y=7}`) lowers ELEMENT-WISE — one
-                    // Gep+Store per field into the slot — never as an
-                    // aggregate-SSA Store (no LIR aggregate-width Store).
-                    TypeKind const initKind = interner.kind(ty);
                     // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile`-qualified
                     // aggregate's brace-init (`volatile struct S s = {…}`) writes
                     // every field as a volatile access (C 6.7.3p5). The dest's
@@ -14391,72 +15012,8 @@ struct Lowerer {
                         }
                         if (!lowerVlaZeroFill(node, sym, ty, alloca, initVf))
                             return false;
-                    } else if (hir.kind(*initN) == HirKind::ConstructAggregate
-                        && (initKind == TypeKind::Struct
-                            || initKind == TypeKind::Union)) {
-                        if (!lowerAggregateInitIntoSlot(*initN, alloca, ty, initVf))
-                            return false;
-                    } else if (hir.kind(*initN) == HirKind::ConstructAggregate
-                               && initKind == TypeKind::Array) {
-                        // D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form):
-                        // `int a[3] = {1,2,3}` — element-wise into the slot via
-                        // the same helper the array-field recurse-guard uses.
-                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty, initVf))
-                            return false;
-                    } else if (initKind == TypeKind::Array
-                               && hir.kind(*initN) == HirKind::Literal) {
-                        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL):
-                        // `char x[7] = "hi";` — a STRING LITERAL initializing a CHAR
-                        // ARRAY local. The HIR coerce arm retyped the literal to the
-                        // slot's `char[N]`, so its lvalue address materializes the
-                        // rodata global SIZED at N (string bytes + NUL, zero-padded to
-                        // N by the asm producer); copy those N bytes into the stack
-                        // slot. This is the array-COPY twin of the `int a[3]={…}`
-                        // element-wise arm above and the struct-field string arm —
-                        // the global is N bytes so the N-byte copy never reads OOB
-                        // (the Option-A pad-at-the-producer invariant).
-                        MirInstId const srcPtr = lowerLvalueAddress(*initN);
-                        if (!srcPtr.valid()) return false;
-                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, initVf))
-                            return false;
-                    } else if (isByValueClass(interner, ty)) {
-                        // FC7 (D-FC7-MEMBER-ACCESS): struct/union COPY-init
-                        // from another aggregate VALUE (`T a = b;`) — copy
-                        // field-wise from the source lvalue's address. An
-                        // aggregate-width Load+Store would truncate to one
-                        // register. D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt`
-                        // init (`_BitInt(200) a = b;` / `= b+c;` / `= (int)x;`)
-                        // is memory-resident — copy from the (existing or freshly
-                        // materialized) source ADDRESS, byte-wise; a scalar Store
-                        // of the (pointer-width) rvalue would truncate to 8 bytes.
-                        MirInstId const srcPtr = lowerLvalueAddress(*initN);
-                        if (!srcPtr.valid()) return false;
-                        // c21/c27: a WHOLE-VOLATILE aggregate copy flags every
-                        // structural Load/Store. Either side being volatile makes
-                        // the copy volatile: c21 via the object-volatile dest local
-                        // `node` / source `*initN`; c27 via the source's ACCESSED
-                        // TYPE being top-level VolatileQual (a `volatile struct`
-                        // value, or a deref of a `volatile struct *`). OR all so no
-                        // side's volatility is dropped (safe-conservative).
-                        MirInstFlags const aggVf =
-                            volatileFlagFor(node) | volatileFlagFor(*initN)
-                            | volatileFlagForType(ty)
-                            | volatileFlagForType(hir.typeId(*initN));
-                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, aggVf))
-                            return false;
-                    } else {
-                        MirInstId const initVal = lowerExpr(*initN);
-                        if (!initVal.valid()) return false;
-                        std::array<MirInstId, 2> ops{initVal, alloca};
-                        // c21/c27: the init store into a `volatile` local's slot
-                        // carries the flag — via the VarDecl object annotation (c21)
-                        // OR the declared type's VolatileQual (c27, e.g. a `vint x`
-                        // typedef = `volatile int`). OR both so neither is missed.
-                        // FC17.9(d): an `_Atomic` local's scalar init becomes
-                        // AtomicStore (harmless-if-stronger on a fresh, unshared
-                        // slot; keeps the scalar-store funnel uniform — the DISTINCT
-                        // param/global runtime-init paths stay plain + belt-exempt).
-                        emitScalarStore(ops, ty, node);
+                    } else if (!initializeObjectInPlace(node, *initN, alloca, ty, initVf)) {
+                        return false;
                     }
                 }
                 return true;
@@ -15113,7 +15670,22 @@ struct Lowerer {
                 if (R.valid() && ty.valid()) {
                     bool ok = true;
                     if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
-                        ok = computeVlaByteSize(R, ty, node, /*freezeLevelSlots=*/true)
+                        // ★ P69 L2 (lane `lm`): a typedef with dimensions of its own over
+                        // a VLA typedef or a `typeof` VLA head (`typedef R S[m];`,
+                        // `typedef typeof(int[n]) R, S[m];`) has an origin
+                        // (CST→HIR records it): its levels below its own are the
+                        // origin's, frozen when the origin was reached — composed here as
+                        // an object's are at its declaration (`composeOnTypedefOrigin`).
+                        SymbolId origin{};
+                        if (typedefVlaOriginMap != nullptr
+                            && interner.kind(ty) == TypeKind::Array)
+                            if (auto it = typedefVlaOriginMap->find(R.v);
+                                it != typedefVlaOriginMap->end())
+                                origin = SymbolId{it->second};
+                        ok = (origin.valid()
+                                  ? composeOnTypedefOrigin(R, origin, ty, node)
+                                  : computeVlaByteSize(R, ty, node,
+                                                       /*freezeLevelSlots=*/true))
                                  .has_value();
                     } else if (interner.kind(ty) == TypeKind::Ptr) {
                         auto const pops = interner.operands(ty);
@@ -15194,6 +15766,7 @@ struct Lowerer {
         vlaScopeStack_.clear();
         vlaScopeCounter_ = 0;
         labelNodeByOrdinal_.clear();
+        allocaScopes_.clear();   // P69: the alloca pre-scan is per-function too
         // FC7 C1c: per-function by-value return state.
         currentFnResult_ = interner.fnResult(signature);
         sretPtr_         = InvalidMirInst;
@@ -15220,6 +15793,9 @@ struct Lowerer {
         // VLA C5 (D-CSUBSET-VLA): map every LabelStmt ordinal → node so a `goto`
         // inside a VLA scope can resolve its target and compute the exited scopes.
         collectLabelNodes(body);
+        // P69 (lane `cs`, review M1): which scopes run an alloca — read by every VLA frame
+        // pushed below, so the pin is decided before any exit of the scope is lowered.
+        collectAllocaScopes(body);
 
         // From here on a block is open — any return-false MUST seal it.
         // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING
@@ -15275,7 +15851,10 @@ struct Lowerer {
         // feature dead in the shipped pipeline while hand-built unit tests stayed
         // green. `la` is already threaded, so the schedule travels with the
         // linkage it belongs beside.
-        mir.addFunction(signature, symbol, la.binding, la.visibility, noInline,
+        // P69 (lane `xa`): the linkage goes down as ONE record — binding,
+        // visibility and the weak definition's KIND (`la.weakKind`), which had
+        // no reader below this tier (`mirLinkageFrom`, mir/mir_node.hpp).
+        mir.addFunction(signature, symbol, mirLinkageFrom(la), noInline,
                         alwaysInline, noOptimize, noSanitizeThread,
                         la.staticInit);
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
@@ -15301,7 +15880,7 @@ struct Lowerer {
         currentFnSawFixedStackParam_  = false;
 
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union
-        // RETURN. Classify under the active CC's strategy. ByReference (class
+        // RETURN. Classify under the active CC's strategy. Memory (class
         // MEMORY, >16B) ⇒ sret: prepend a hidden result-pointer `Arg` (consuming
         // the first INTEGER ordinal); the `ReturnStmt` copies the result through
         // it and returns it. InRegisters (≤16B) ⇒ no hidden arg; the `ReturnStmt`
@@ -15311,7 +15890,7 @@ struct Lowerer {
             // D-CSUBSET-BITINT-C2-WIDE: a wide-`_BitInt` return uses the SAME sret /
             // 2-GPR-piece prologue as a by-value struct/union (isByValueClass).
             if (isByValueClass(interner, currentFnResult_)) {
-                auto const abi = byValueClassify(currentFnResult_);
+                auto const abi = byValueClassify(currentFnResult_, AggregatePosition::Result);
                 if (!abi.has_value()) {
                     unsupported(node,
                         "returning a by-value struct/union is not supported by "
@@ -15320,7 +15899,7 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
-                if (abi->kind == AbiPassing::Kind::ByReference) {
+                if (abi->kind == AbiPassing::Kind::Memory) {
                     // SysV/Win64 ⇒ the result pointer is a hidden first INTEGER arg
                     // (consumes the first GPR ordinal, shifting real args by one).
                     // AAPCS64/Apple x8-sret ⇒ it arrives in the dedicated indirect-
@@ -15359,10 +15938,16 @@ struct Lowerer {
         // mixed int/float signature now lands each arg in its own class (fixes
         // D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA). `argCtr` is hoisted above (shared with the sret arg).
         // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): is `t` a SysV `va_list` PARAM — an
-        // `__va_list_tag[1]` array (or, defensively, a Ptr<__va_list_tag>) — under the
-        // SysVRegisterSave strategy? Such a param's incoming GPR is a POINTER to the
+        // `__va_list_tag[1]` array (c82 keeps a va_list parameter's array type) — under
+        // the SysVRegisterSave strategy? Such a param's incoming GPR is a POINTER to the
         // caller's tag (C 6.7.6.3p7 array-param adjustment); a dedicated arm below
-        // registers that pointer. Win64/Apple (`char*`) + AAPCS64 (`__va_list` struct)
+        // registers that pointer. A parameter declared as the list DECAYED — a
+        // Ptr<__va_list_tag> — is NOT this: it is an ordinary pointer parameter, and
+        // `vaTagBase` reads its VALUE as the tag's address. Registering that value as the
+        // parameter's ADDRESS, as this arm once did "defensively", conflated the pointer
+        // variable with the tag it points at (P69, lane `cs`,
+        // D-C-A-VA-LIST-REACHED-THROUGH-ITS-DECAYED-POINTER-READS-THE-POINTER-VARIABLE).
+        // Win64/Apple (`char*`) + AAPCS64 (`__va_list` struct)
         // va_list params are NOT this — they ride the addressTaken-scalar / by-value-
         // struct arms (the former marked address-taken by va_arg usage, since their
         // Ptr<I8> type is indistinguishable from a plain char*).
@@ -15372,8 +15957,7 @@ struct Lowerer {
                        != VaListStrategy::SysVRegisterSave)
                 return false;
             if (!t.valid()) return false;
-            TypeKind const tk = interner.kind(t);
-            if (tk != TypeKind::Array && tk != TypeKind::Ptr) return false;
+            if (interner.kind(t) != TypeKind::Array) return false;
             auto const ops = interner.operands(t);
             return !ops.empty() && ops[0].valid()
                 && interner.kind(ops[0]) == TypeKind::Struct
@@ -15394,7 +15978,7 @@ struct Lowerer {
                 // a variadic function is fine — receiveByValueParam advances argCtr
                 // per-class per piece, so currentFnFixedGpr_/Fpr_ (stamped below)
                 // include the struct's pieces and va_start's cursors reflect them.
-                auto const abi = byValueClassify(ty);
+                auto const abi = byValueClassify(ty, AggregatePosition::Argument);
                 if (!abi.has_value()) {
                     unsupported(p, "a by-value struct/union parameter is not "
                                    "supported by this target's calling "
@@ -15402,19 +15986,22 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
-                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a ByReference
-                // (MEMORY class, >16B) FIXED param in a variadic fn uses the hidden-
-                // pointer convention — receiveByValueParam's ByReference arm receives
-                // it as ONE GPR arg (counted in argCtr.gpr → currentFnFixedGpr_), so
-                // va_start's gp_offset starts past it correctly, exactly like any
-                // other fixed GPR param. The SEPARATE fixed-params-OVERFLOW-to-stack
+                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a MEMORY-class
+                // (>16B) FIXED param in a variadic fn travels by the convention's
+                // carrier (`aggregateMemoryArgument`). Under `CallerCopy`
+                // receiveByValueParam receives the hidden pointer as ONE GPR arg
+                // (counted in argCtr.gpr → currentFnFixedGpr_), so va_start's gp_offset
+                // starts past it like any other fixed GPR param; under `Stack` (P69
+                // fold f26c) it is received from the incoming stack and its bytes are
+                // accounted in `currentFnFixedStackBytes_`, so va_start's overflow base
+                // starts past it. The SEPARATE fixed-params-OVERFLOW-to-stack
                 // case (≥7 fixed integer regs of THIS class → the va_start guard fires
                 // D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS) is unchanged; the common
                 // case (one >16B fixed param = 1 GPR + ≤5 scalars → currentFnFixedGpr_
                 // ≤ 6) lowers cleanly.
                 // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS:
                 // receiveByValueParam now PLACES the aggregate (InRegisters pieces, a
-                // ByReference hidden pointer, OR — when it straddles the reg/stack
+                // `CallerCopy` hidden pointer, a `Stack` MEMORY-class aggregate, OR — when it straddles the reg/stack
                 // boundary — all-or-nothing from the incoming stack via a
                 // RecvByValueStackParam) AND accounts any stacked bytes in
                 // `currentFnFixedStackBytes_` for va_start's overflow base. No
@@ -15430,7 +16017,7 @@ struct Lowerer {
             // `__va_list_tag` in one GPR; `va_arg` must advance the CALLER's tag
             // (forwarding semantics), so register that incoming pointer AS the symbol's
             // address — NO alloca, NO 24-byte copy (a copy reads a stale tag = a silent
-            // miscompile). Mirrors receiveByValueParam's ByReference precedent ("the
+            // miscompile). Mirrors receiveByValueParam's `CallerCopy` precedent ("the
             // caller's copy is the param"). Consumes ONE GPR ordinal — exactly what the
             // scalar arm would for this array-decayed pointer — so the remaining params'
             // ordinals + the fixed-arg count stay correct. (Win64/Apple `char*` va_list
@@ -16174,7 +16761,8 @@ struct Lowerer {
     // pointer, so it is the SAME link-time address.
     [[nodiscard]] std::optional<MirLiteralValue>
     tryClassifyAsLabelAddr(HirNodeId initNode) {
-        HirNodeId n = initNode;
+        // P69: an unnamed object used as a value is its initializer's value.
+        HirNodeId n = hir.unnamedObjectValue(initNode);
         while (n.valid() && hir.kind(n) == HirKind::Cast) {
             TypeId const ct = hir.typeId(n);
             if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr) return std::nullopt;
@@ -16341,16 +16929,23 @@ struct Lowerer {
     // vector is reserved to its final size up front; a `pop_back` + later
     // `emplace_back` reuses that capacity and cannot reallocate.
     [[nodiscard]] std::optional<MirLiteralValue>
-    tryClassifyAggregateConst(HirNodeId initNode, EvalEnvironment const& env,
+    tryClassifyAggregateConst(HirNodeId initNodeIn, EvalEnvironment const& env,
                               EvalOptions const& opts) {
+        // P69: an unnamed object used as an initializer is its initializer's value.
+        HirNodeId const initNode = hir.unnamedObjectValue(initNodeIn);
         if (hir.kind(initNode) != HirKind::ConstructAggregate)
             return std::nullopt;
 
         // Seed one aggregate node: an empty, fully-reserved destination whose
-        // `core` is the declared Struct / Union / Array kind.
+        // `core` is the declared Struct / Union / Array kind — and, for a union,
+        // the member its one child initializes: the node's payload, the same fact
+        // the constant evaluator reads for a union value it folds whole
+        // (D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED).
         auto seedAggregate = [this](HirNodeId n, MirLiteralValue& slot) {
             MirAggregateValue agg;
             agg.fields.reserve(hir.children(n).size());
+            if (interner.kind(hir.typeId(n)) == TypeKind::Union)
+                agg.unionMember = hir.payload(n);
             slot.value = std::move(agg);
             slot.core  = interner.kind(hir.typeId(n));
         };
@@ -16383,7 +16978,9 @@ struct Lowerer {
                 }
                 continue;
             }
-            HirNodeId const          child      = kids[work[top].next];
+            // P69: a member initialized by an unnamed object is initialized by its value.
+            HirNodeId const          child      =
+                hir.unnamedObjectValue(kids[work[top].next]);
             MirAggregateValue* const dst        = work[top].dst;
             bool const               skipNested = work[top].retry;
             work[top].retry = false;
@@ -16848,6 +17445,11 @@ struct Lowerer {
         // left one pops first and the two values land in operand order).
         if (!combine) {
             switch (hir.kind(n)) {
+                case HirKind::UnnamedObject:
+                    // P69: an unnamed object is its initializer's value — the fold
+                    // continues from that node, with no combine step of its own.
+                    work.push_back(CxStep{hir.unnamedObjectValue(n), false});
+                    return true;
                 case HirKind::Cast:
                 case HirKind::UnaryOp: {
                     if (kids.size() != 1) return false;
@@ -17025,14 +17627,44 @@ struct Lowerer {
         // Pre-pass: build symbol → init-expr map for ALL globals first,
         // so a global initializer that forward-references a later global
         // still resolves.
-        std::unordered_map<std::uint32_t, HirNodeId> initBySymbol;
+        // P69: the maps, the environment and the options are MEMBERS (`staticInitBySymbol_`
+        // …) — a static unnamed object minted while a function body lowers (C23 `static`
+        // compound literal) is classified by the SAME resolvers, later.
+        std::unordered_map<std::uint32_t, HirNodeId>& initBySymbol = staticInitBySymbol_;
+        initBySymbol.clear();
+        staticObjectTypeBySymbol_.clear();
+        // The objects whose const-ness decides whether their value may be read (below).
+        std::vector<HirNodeId> readCandidates;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             SymbolId const sym = hir.globalSymbol(decl);
             if (!sym.valid()) continue;
+            staticObjectTypeBySymbol_[sym.v] = hir.globalType(decl);
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
                 initBySymbol[sym.v] = *initN;
+                readCandidates.push_back(decl);
             }
+        }
+        // P69 (lane `cs`, D-C-A-BLOCK-SCOPE-CONST-OBJECTS-VALUE-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+        // a BLOCK-SCOPE object's value is read exactly as a module object's is. ✔MEASURED
+        // (lane `cs`'s probe r1, runs 20260930-163851-7a22a326, -164041-c5d7bdd2): gcc 13.3.0
+        // and clang 18.1.3 build `static int x = k;` for a `const int k = 42;` in the same
+        // function — its value, an element, a member, a nested block, a shadowed name, a
+        // whole-structure copy; clang also a chain `b = a + 2`, gcc also a volatile MEMBER of a
+        // const local — and every one refuses a non-const, a `const volatile`, or a const
+        // local initialized from a parameter (whose initializer is not a constant here). So
+        // every initialized VarDecl joins the SAME map, judged by the SAME const + non-volatile
+        // rule below. ONE linear sweep of the frozen HIR's nodes — no walk, no recursion; a
+        // VarDecl's symbol is its own declaration's, so a shadowed name is never another's.
+        for (std::size_t i = 1; i < hir.nodeCount(); ++i) {
+            HirNodeId const n{static_cast<std::uint32_t>(i)};
+            if (hir.kind(n) != HirKind::VarDecl) continue;
+            SymbolId const sym = hir.varDeclSymbol(n);
+            std::optional<HirNodeId> const initN = hir.varDeclInit(n);
+            if (!sym.valid() || !initN.has_value()) continue;
+            initBySymbol[sym.v] = *initN;
+            staticObjectTypeBySymbol_[sym.v] = hir.varDeclType(n);
+            readCandidates.push_back(n);
         }
         // P68 round 13 (lane `cs`, the static-initializer item): a READ of another
         // object folds only under the language's `constObjectRead` form, and only for a
@@ -17049,26 +17681,67 @@ struct Lowerer {
         // the ELEMENT type, and the access-volatility attribute this read before answers the
         // top level only), where every reference refuses it; `cs.v` of `static const struct {
         // volatile int v; } cs` still folds — gcc and mingw-w64 build it.
-        std::unordered_set<std::uint32_t> constReadableSymbols;
+        std::unordered_set<std::uint32_t>& constReadableSymbols = staticConstReadable_;
+        constReadableSymbols.clear();
         ConstantForms const forms = config.globalsConstantForms.value_or(ConstantForms{});
         if (forms.admits(ConstantForm::ConstObjectRead)) {
-            for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
-                if (hir.kind(decl) != HirKind::Global) continue;
-                SymbolId const sym = hir.globalSymbol(decl);
-                if (!sym.valid()) continue;
+            for (HirNodeId decl : readCandidates) {
+                bool const isGlobal = hir.kind(decl) == HirKind::Global;
+                SymbolId const sym = isGlobal ? hir.globalSymbol(decl) : hir.varDeclSymbol(decl);
                 bool const isConst = mutabilityMap != nullptr
                     && mutabilityMap->tryGet(decl) != nullptr
                     && mutabilityMap->tryGet(decl)->isConst;
-                bool const isVolatile = interner.isVolatileObjectType(hir.globalType(decl));
+                bool const isVolatile = interner.isVolatileObjectType(
+                    isGlobal ? hir.globalType(decl) : hir.varDeclType(decl));
                 if (isConst && !isVolatile) constReadableSymbols.insert(sym.v);
             }
         }
-        EvalEnvironment env;
-        env.resolveConstSymbol = [&initBySymbol, &constReadableSymbols](SymbolId s)
-                -> std::optional<HirNodeId> {
-            if (!constReadableSymbols.contains(s.v)) return std::nullopt;
-            if (auto it = initBySymbol.find(s.v); it != initBySymbol.end()) {
+        EvalEnvironment& env = staticEnv_;
+        env = EvalEnvironment{};
+        env.resolveConstSymbol = [this](SymbolId s) -> std::optional<HirNodeId> {
+            if (!staticConstReadable_.contains(s.v)) return std::nullopt;
+            if (auto it = staticInitBySymbol_.find(s.v); it != staticInitBySymbol_.end()) {
                 return it->second;
+            }
+            return std::nullopt;
+        };
+        // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the object a
+        // STATIC or THREAD unnamed object IS — one symbol per node, minted on first use and
+        // classified from `unnamedStaticQueue_` by this same environment. An automatic one
+        // has no link-time address (the semantic tier refuses taking it first).
+        env.resolveUnnamedObject = [this](HirNodeId n) -> std::optional<SymbolId> {
+            if (!n.valid() || hir.kind(n) != HirKind::UnnamedObject
+                || hir.unnamedObjectStorage(n) == HirObjectStorage::Automatic) {
+                return std::nullopt;
+            }
+            SymbolId const s = unnamedStaticObjectSymbol(n);
+            if (!s.valid()) return std::nullopt;
+            return s;
+        };
+        // P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED):
+        // the objects whose value a read THROUGH an address constant may see — const and not
+        // volatile, with a visible value: a declared object (the `resolveConstSymbol` set), a
+        // string literal's array (never modifiable; its bytes are its value), a CONST static
+        // unnamed object. A NON-const compound literal's object is not one: every reference
+        // refuses `*((int[]){ 1, 42 } + 1)` (lane `cs`'s probe r2o).
+        env.resolveReadableObject = [this](SymbolId s) -> std::optional<ReadableObject> {
+            if (staticConstReadable_.contains(s.v)) {
+                auto const init = staticInitBySymbol_.find(s.v);
+                auto const type = staticObjectTypeBySymbol_.find(s.v);
+                if (init == staticInitBySymbol_.end() || type == staticObjectTypeBySymbol_.end())
+                    return std::nullopt;
+                return ReadableObject{init->second, type->second};
+            }
+            if (auto const it = stringLiteralNodeBySymbol_.find(s.v);
+                it != stringLiteralNodeBySymbol_.end())
+                return ReadableObject{it->second, hir.typeId(it->second)};
+            if (auto const it = unnamedStaticNodeBySymbol_.find(s.v);
+                it != unnamedStaticNodeBySymbol_.end()) {
+                HirNodeId const n = it->second;
+                bool const isConst = mutabilityMap != nullptr
+                    && mutabilityMap->tryGet(n) != nullptr && mutabilityMap->tryGet(n)->isConst;
+                if (isConst && !interner.isVolatileObjectType(hir.typeId(n)))
+                    return ReadableObject{hir.unnamedObjectInit(n), hir.typeId(n)};
             }
             return std::nullopt;
         };
@@ -17119,7 +17792,8 @@ struct Lowerer {
             if (!layout) return std::nullopt;
             return layout->align.bytes();
         };
-        EvalOptions opts;
+        EvalOptions& opts = staticOpts_;
+        opts = EvalOptions{};
         // MIR-globals matches runtime behaviour: a narrowing initializer
         // wraps modularly (the runtime path would wrap too). Refusing to
         // fold here would only lose an optimization; the value installed
@@ -17153,99 +17827,179 @@ struct Lowerer {
             PendingGlobal pg;
             pg.symbol = hir.globalSymbol(decl);
             pg.type   = hir.globalType(decl);
-            if (linkageMap != nullptr)
-                if (auto const* p = linkageMap->tryGet(decl)) pg.linkage = *p;
-            if (mutabilityMap != nullptr)
-                if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
-            if (threadLocalMap != nullptr)   // TLS C1 — the isConst mirror
-                if (auto const* p = threadLocalMap->tryGet(decl))
-                    pg.isThreadLocal = p->isThreadLocal;
-            if (volatileMap != nullptr)
-                if (auto const* p = volatileMap->tryGet(decl)) pg.isVolatile = p->isVolatile;
-            if (alignmentMap != nullptr)
-                if (auto const* p = alignmentMap->tryGet(decl))
-                    pg.explicitAlignment = p->alignmentBytes;
+            readStaticObjectSideTables(decl, pg);
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
-                // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the TOP-LEVEL
-                // scalar `static void *p = &&L;`. Before every other arm for the
-                // same reason as the aggregate member: const-eval cannot fold a
-                // label address, and without this the initializer fell through to
-                // `runtimeInit` — which lowered the `&&label` inside the synthesized
-                // `__module_init__`, where the ordinal names no block, aborting the
-                // MirBuilder with "created but never filled".
-                if (auto la = tryClassifyAsLabelAddr(*initN)) {
-                    pg.constInit = std::move(*la);
-                } else {
-                    // The ONE fold: arithmetic constants, address constants (a
-                    // symbol's address plus an addend becomes a MirSymbolAddrValue /
-                    // abs64 relocation; a NULL-base one its integer bytes) and the
-                    // language's 6.6p10 forms.
-                    ConstEvalResult const r = evaluateConstant(
-                        hir, interner, literals, *initN, env, opts);
-                    if (r.value.has_value()) {
-                        pg.constInit = toMirLiteral(*r.value);
-                        // TLS C1 (★CRIT-1): an address leaf naming a
-                        // thread-local object is refused by its own code.
-                        rejectTlsAddressesInFoldedLiteral(*pg.constInit,
-                                                          *initN);
-                    } else if (auto aggC =
-                                   tryClassifyAggregateConst(*initN, env, opts)) {
-                        // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an
-                        // aggregate whose initializer has a link-time-constant
-                        // member (a fn/`&global`/string address) — const-eval
-                        // can't fold the address, but the aggregate is still
-                        // STATIC DATA (reloc leaves at the member offsets), NOT
-                        // a runtime store-chain. Routes to constInit (the
-                        // assembler's aggregate arm encodes the relocs) instead
-                        // of runtimeInit. A fully-foldable aggregate already
-                        // folded above; only the address-bearing case reaches
-                        // here.
-                        pg.constInit = std::move(*aggC);
-                    } else if (auto cx = tryClassifyComplexConst(*initN, pg.type,
-                                                                 env, opts)) {
-                        // D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE:
-                        // a `_Complex` initializer is STATIC DATA, not a load-time
-                        // store-chain. LAST of the classifiers, immediately before
-                        // the runtimeInit fallback, because it is the only one keyed
-                        // on the DECLARED type rather than on a recognizable
-                        // initializer SHAPE — every arm above gets first refusal on
-                        // its own shape, exactly as the aggregate member loop orders
-                        // its handlers.
-                        pg.constInit = std::move(*cx);
-                    } else if (config.globalsConstantForms.has_value()) {
-                        // P68 round 13 (lane `cs`, the static-initializer item): the
-                        // language's static objects cannot be initialized at run time
-                        // (C 6.7.9p4), so an initializer no fold above lays down is REFUSED
-                        // HERE, where it is known — never handed on as a runtime initializer
-                        // for the static-data producer to refuse under an object-format code
-                        // ("has a runtime initializer"), and never lowered into a module
-                        // initializer (where a static local's initializer once reached
-                        // another function's operand and aborted dsscp). Its semantic tier
-                        // has already refused every initializer that PROVABLY is not a
-                        // constant; what reaches here is either one it could not prove or a
-                        // constant form this compiler does not fold yet, so the code says
-                        // exactly that and no more.
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::H_StaticInitializerNotFolded;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.actual   = "the initializer of this object of static storage "
-                                     "duration is not a constant DSS lays down as static "
-                                     "data: either it is not a constant expression (C "
-                                     "6.7.9p4), or it is a constant form this compiler does "
-                                     "not fold yet";
-                        if (sourceMap != nullptr) {
-                            if (auto const* loc = sourceMap->tryGet(*initN); loc != nullptr) {
-                                d.buffer = loc->buffer;
-                                d.span   = loc->span;
-                            }
-                        }
-                        reporter.report(std::move(d));
-                    } else {
-                        pg.runtimeInit = *initN;
-                    }
-                }
+                classifyStaticInitializer(*initN, pg);
             }
             classifyingGlobalDecl_ = HirNodeId{};
+            pendingGlobals.push_back(std::move(pg));
+        }
+        // P69: the static unnamed objects the initializers above named (a file-scope
+        // compound literal's address) — and every one THEIR initializers name in turn.
+        drainUnnamedStaticObjects();
+    }
+
+    // ── P69: ONE static object's facts and ONE static initializer's classification ──
+    //
+    // A module `Global` and a static / thread UNNAMED object
+    // (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT)
+    // are the same kind of object: the side tables
+    // cst_to_hir records on the node (linkage, const-ness, thread storage, volatility,
+    // alignment) are read here by ONE reader, and the initializer is laid down by ONE
+    // classification — so an unnamed object can never be placed or folded differently
+    // from the global it would be if it had a name.
+    void readStaticObjectSideTables(HirNodeId node, PendingGlobal& pg) {
+        if (linkageMap != nullptr)
+            if (auto const* p = linkageMap->tryGet(node)) pg.linkage = *p;
+        if (mutabilityMap != nullptr)
+            if (auto const* p = mutabilityMap->tryGet(node)) pg.isConst = p->isConst;
+        if (threadLocalMap != nullptr)   // TLS C1 — the isConst mirror
+            if (auto const* p = threadLocalMap->tryGet(node))
+                pg.isThreadLocal = p->isThreadLocal;
+        if (volatileMap != nullptr)
+            if (auto const* p = volatileMap->tryGet(node)) pg.isVolatile = p->isVolatile;
+        if (alignmentMap != nullptr)
+            if (auto const* p = alignmentMap->tryGet(node))
+                pg.explicitAlignment = p->alignmentBytes;
+    }
+
+    void classifyStaticInitializer(HirNodeId initN, PendingGlobal& pg) {
+        EvalEnvironment const& env  = staticEnv_;
+        EvalOptions const&     opts = staticOpts_;
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the TOP-LEVEL
+        // scalar `static void *p = &&L;`. Before every other arm for the
+        // same reason as the aggregate member: const-eval cannot fold a
+        // label address, and without this the initializer fell through to
+        // `runtimeInit` — which lowered the `&&label` inside the synthesized
+        // `__module_init__`, where the ordinal names no block, aborting the
+        // MirBuilder with "created but never filled".
+        if (auto la = tryClassifyAsLabelAddr(initN)) {
+            pg.constInit = std::move(*la);
+        } else {
+            // The ONE fold: arithmetic constants, address constants (a
+            // symbol's address plus an addend becomes a MirSymbolAddrValue /
+            // abs64 relocation; a NULL-base one its integer bytes) and the
+            // language's 6.6p10 forms.
+            ConstEvalResult const r = evaluateConstant(
+                hir, interner, literals, initN, env, opts);
+            if (r.value.has_value()) {
+                pg.constInit = toMirLiteral(*r.value);
+                // TLS C1 (★CRIT-1): an address leaf naming a
+                // thread-local object is refused by its own code.
+                rejectTlsAddressesInFoldedLiteral(*pg.constInit,
+                                                  initN);
+            } else if (auto aggC =
+                           tryClassifyAggregateConst(initN, env, opts)) {
+                // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an
+                // aggregate whose initializer has a link-time-constant
+                // member (a fn/`&global`/string address) — const-eval
+                // can't fold the address, but the aggregate is still
+                // STATIC DATA (reloc leaves at the member offsets), NOT
+                // a runtime store-chain. Routes to constInit (the
+                // assembler's aggregate arm encodes the relocs) instead
+                // of runtimeInit. A fully-foldable aggregate already
+                // folded above; only the address-bearing case reaches
+                // here.
+                pg.constInit = std::move(*aggC);
+            } else if (auto cx = tryClassifyComplexConst(initN, pg.type,
+                                                         env, opts)) {
+                // D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE:
+                // a `_Complex` initializer is STATIC DATA, not a load-time
+                // store-chain. LAST of the classifiers, immediately before
+                // the runtimeInit fallback, because it is the only one keyed
+                // on the DECLARED type rather than on a recognizable
+                // initializer SHAPE — every arm above gets first refusal on
+                // its own shape, exactly as the aggregate member loop orders
+                // its handlers.
+                pg.constInit = std::move(*cx);
+            } else if (config.globalsConstantForms.has_value()) {
+                // P68 round 13 (lane `cs`, the static-initializer item): the
+                // language's static objects cannot be initialized at run time
+                // (C 6.7.9p4), so an initializer no fold above lays down is REFUSED
+                // HERE, where it is known — never handed on as a runtime initializer
+                // for the static-data producer to refuse under an object-format code
+                // ("has a runtime initializer"), and never lowered into a module
+                // initializer (where a static local's initializer once reached
+                // another function's operand and aborted dsscp). Its semantic tier
+                // has already refused every initializer that PROVABLY is not a
+                // constant; what reaches here is either one it could not prove or a
+                // constant form this compiler does not fold yet, so the code says
+                // exactly that and no more.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::H_StaticInitializerNotFolded;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = "the initializer of this object of static storage "
+                             "duration is not a constant DSS lays down as static "
+                             "data: either it is not a constant expression (C "
+                             "6.7.9p4), or it is a constant form this compiler does "
+                             "not fold yet";
+                if (sourceMap != nullptr) {
+                    if (auto const* loc = sourceMap->tryGet(initN); loc != nullptr) {
+                        d.buffer = loc->buffer;
+                        d.span   = loc->span;
+                    }
+                }
+                reporter.report(std::move(d));
+            } else {
+                pg.runtimeInit = initN;
+            }
+        }
+    }
+
+    // ── P69: STATIC / THREAD UNNAMED OBJECTS (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT) ──
+    //
+    // A compound literal outside every function body (C 6.5.2.5p5), or one that declares
+    // static or thread storage (C23), is ONE object for the whole program: one symbol per
+    // `UnnamedObject` node — never memoized by CONTENT the way a string literal's rodata
+    // object is, because two literals are two objects (6.5.2.5p6 lets only a CONST pair
+    // share, and nothing here decides to) — minted through the same synthetic-symbol
+    // allocator the string-literal globals use (`mintSyntheticGlobalSymbol`), registered as
+    // an addressable global, and QUEUED: its initializer is classified by the one static
+    // environment when the queue drains, never inside the fold that named its address, so
+    // literals nested in literals cost a queue entry each and no host recursion.
+    std::unordered_map<std::uint32_t, SymbolId> unnamedStaticObjects_;   // HirNodeId.v → symbol
+    std::vector<HirNodeId>                      unnamedStaticQueue_;
+
+    [[nodiscard]] SymbolId unnamedStaticObjectSymbol(HirNodeId node) {
+        if (auto it = unnamedStaticObjects_.find(node.v); it != unnamedStaticObjects_.end())
+            return it->second;
+        SymbolId const sym = mintSyntheticGlobalSymbol();
+        if (!sym.valid()) {
+            unsupported(node,
+                "an unnamed object of static storage duration needs a symbol, and the "
+                "synthetic SymbolId space is exhausted (UINT32_MAX wraparound)");
+            return SymbolId{};
+        }
+        unnamedStaticObjects_.emplace(node.v, sym);
+        unnamedStaticNodeBySymbol_.emplace(sym.v, node);
+        globalSymbols.insert(sym.v);
+        // A THREAD unnamed object's address is not an address constant (6.6p9): the same
+        // screen a declared thread-local object's address meets.
+        if (hir.unnamedObjectStorage(node) == HirObjectStorage::Thread)
+            threadLocalTargetSymbols.insert(sym.v);
+        unnamedStaticQueue_.push_back(node);
+        return sym;
+    }
+
+    // Classify every queued static unnamed object — the ones a global initializer named
+    // (drained at the end of `classifyGlobals`) and the ones a function body named (drained
+    // before `emitGlobals_`). A drained object's initializer may name another; the loop
+    // takes it in the same pass.
+    void drainUnnamedStaticObjects() {
+        while (!unnamedStaticQueue_.empty()) {
+            HirNodeId const node = unnamedStaticQueue_.back();
+            unnamedStaticQueue_.pop_back();
+            PendingGlobal pg;
+            pg.symbol = unnamedStaticObjects_.at(node.v);
+            pg.type   = hir.typeId(node);
+            readStaticObjectSideTables(node, pg);
+            // `&&label` in its initializer names a label of the function the literal sits
+            // in — the enclosing-function side table cst_to_hir records on the node, read
+            // through the same key a static local's Global offers.
+            HirNodeId const outer = classifyingGlobalDecl_;
+            classifyingGlobalDecl_ = node;
+            classifyStaticInitializer(hir.unnamedObjectInit(node), pg);
+            classifyingGlobalDecl_ = outer;
             pendingGlobals.push_back(std::move(pg));
         }
     }
@@ -17295,20 +18049,25 @@ struct Lowerer {
                 ok = false;
                 continue;
             }
+            // P69 (lane `xa`): the linkage goes down as ONE record at each of
+            // the three arms — binding, visibility, the weak definition's KIND
+            // and the TENTATIVE mark (`pg.linkage.weakKind` / `.tentative`),
+            // neither of which had a reader below this tier (`mirLinkageFrom`,
+            // mir/mir_node.hpp).
             if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
-                              pg.linkage.binding, pg.linkage.visibility,
+                              mirLinkageFrom(pg.linkage),
                               pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
                               pg.explicitAlignment);
             } else if (pg.runtimeInit.valid()) {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
-                              pg.linkage.binding, pg.linkage.visibility,
+                              mirLinkageFrom(pg.linkage),
                               pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
                               pg.explicitAlignment);
             } else {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
-                              pg.linkage.binding, pg.linkage.visibility,
+                              mirLinkageFrom(pg.linkage),
                               pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
                               pg.explicitAlignment);
             }
@@ -17332,6 +18091,7 @@ struct Lowerer {
             labelBlocks_.clear();
             labelNodeByOrdinal_.clear();
             addressTakenLabelOrdinals_.clear();
+            allocaScopes_.clear();
             // P68 round 13 (lane `cs`, the static-initializer item): the same holds for
             // the VALUE bindings. `symbolToValue` / `addressableLocal` still named the
             // last lowered function's locals, so `int main(void) { int l = 42; static
@@ -17439,6 +18199,12 @@ struct Lowerer {
         collectThreadShimSymbols();   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
         collectGlobals(root);
         collectExterns(root);
+        // Every symbol the UNIT holds is collected now — its functions, its
+        // objects, its shim symbols, its imports — and nothing has been minted:
+        // carry them into the module's symbol-id end, once (see
+        // `mintSyntheticGlobalSymbol`). `classifyGlobals` is the first thing that
+        // can mint (a string literal a static initializer points at).
+        keepSymbolIdEndClearOfUnitSymbols();
         classifyGlobals(root);
         for (HirNodeId decl : hir.moduleDecls(root)) {
             HirKind const dk = hir.kind(decl);
@@ -17492,6 +18258,12 @@ struct Lowerer {
                     return;
             }
         }
+        // P69: a static unnamed object a function body named (a C23 `static` compound
+        // literal's address) joins the pending globals. Drained BEFORE the label-export
+        // check below: such an object's initializer that names a label of a function
+        // already lowered registers an export no function will drain, and that check is
+        // what says so, loud, instead of a dangling relocation at link time.
+        drainUnnamedStaticObjects();
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: every export must have
         // been drained by ITS function. A leftover means a static initializer took
         // the address of a label in a function this module never lowered — the data
@@ -17559,7 +18331,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirNoSanitizeThreadMap const* noSanitizeThreadMap,
                           HirInlineAsmPool const*  inlineAsmPool,
                           HirInlineDefinitionMap const* inlineDefinitionMap,
-                          HirEnclosingFunctionMap const* enclosingFunctionMap) {
+                          HirEnclosingFunctionMap const* enclosingFunctionMap,
+                          std::span<HirSymbolAlias const> symbolAliases) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -17603,7 +18376,28 @@ HirToMirResult lowerToMir(Hir const&               hir,
         ? MirAliasingMode::StrictTBAA
         : MirAliasingMode::Permissive);
     lwr.mir.setCharTypesAliasAll(config.charTypesAliasAll);
+    // The END of the id space this unit was analysed in — its name table's end,
+    // or the unit's own symbols where it is its own table. Stated ONCE, here,
+    // where the module is made from the model; every minter of the module asks
+    // the module from now on (`MirBuilder::mintSymbol`) and none is handed the
+    // number again.
+    //
+    // ★ ONLY WHAT THE CALLER SAID IS STATED. A caller that said nothing of the id
+    // space (`symbolIdSpace` absent — the default argument) gets a module whose
+    // end is COUNTED, which the door refuses to mint past, by name, like every
+    // other module nobody stated: this entrance used to state a defaulted 0, so
+    // forgetting the statement here was silent where it is loud everywhere else.
+    if (config.symbolIdSpace.has_value()) {
+        lwr.mir.stateSymbolIdEnd(config.symbolIdSpace->statedEnd());
+    }
     lwr.lower();
+    // P69 (lane `cs`): the unit's symbol aliases — one more NAME on a definition
+    // this module just lowered, with the alias's own linkage. The record is the
+    // module's (`MirBuilder::addAlias`), so it rides every rebuild with the module,
+    // roots its target against dead-code removal, and reaches the object producer as
+    // one more symbol row on the target's definition.
+    for (HirSymbolAlias const& alias : symbolAliases)
+        lwr.mir.addAlias(alias.alias, alias.target, mirLinkageFrom(alias.linkage));
     HirToMirResult result;
     result.mir = std::move(lwr.mir).finish();
     // Canonical-marker stamping (D-OPT4-1): the creation-time

@@ -1,0 +1,1 @@
+    if (rebuilt.symbolIdEndIsStated()) symbolIdEndStated_ = true;

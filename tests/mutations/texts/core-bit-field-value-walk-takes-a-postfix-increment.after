@@ -1,0 +1,2 @@
+            HirOperatorEntry const* const e = entryOf(n, hirCfg.postfixOps);
+            if (e != nullptr && e->target == "PostInc") { n = operand(n, 0); continue; }

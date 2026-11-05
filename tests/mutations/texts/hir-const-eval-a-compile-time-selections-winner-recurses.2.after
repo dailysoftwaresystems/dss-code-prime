@@ -1,0 +1,5 @@
+[[nodiscard]] ConstEvalResult evalImpl(NodeId, CstEvalContext const&, CstEvalEnvironment const&,
+                                       EvalOptions const&, std::uint32_t,
+                                       std::unordered_set<std::uint32_t>&);
+[[nodiscard]] ConstEvalResult
+evalNode(NodeId                              expr,

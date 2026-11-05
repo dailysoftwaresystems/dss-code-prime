@@ -1,0 +1,5 @@
+        // on the toy document's row (that document states neither).
+        body = maybeAppendImplicitReturnZero(
+            node, body, sym, retType, decl);
+        body = maybeCompleteReachableNonVoidEnd(
+            node, bodyNode, body, sym, retType, decl);

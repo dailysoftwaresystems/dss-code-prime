@@ -1,0 +1,1 @@
+the condition is false in C: nothing after the `if` may be marked never reached

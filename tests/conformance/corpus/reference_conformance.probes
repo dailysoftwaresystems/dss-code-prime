@@ -218,7 +218,7 @@ extern int dss_asm_order_probe(void) __asm__("dss_first") __attribute__((weak)) 
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@why /shapes/arrayDeclSuffix takes the full `expression` (comma at operator precedence 10) where ISO C 6.7.6.2 requires a constant-expression, which excludes the comma operator. DSS has a comma-free `assignmentExpr` shape and deliberately does not use it here.
+@why C 6.7.6.2 admits an assignment-expression as an array bound, so the comma operator is a SYNTAX error there on every reference. DSS's /shapes/arrayDeclSuffix takes `assignmentExpr` since cycle P69 L2 (it took the full `expression`, the comma at precedence 10).
 @code
 int dss_comma_array_probe[1, 2];
 @end
@@ -229,7 +229,6 @@ int dss_comma_array_probe[1, 2];
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap The BLOCK-SCOPE twin of b_comma_operator_in_array_size, and the sharper of the two. At file scope DSS rejects for an incidental reason ("a file-scope array requires a constant length"), which hides whether the COMMA was ever refused; inside a function there is no constant-length requirement to hide behind, so this row measures the grammar over-admission itself. Every reference compiler stops at the `,` with a pure SYNTAX error, at every -std level, because C 6.7.6.2 admits an assignment-expression there and not an expression.
 @why gcc/clang: `expected ']' before ',' token`; MSVC: `syntax error: missing ']' before ','`.
 @code
 int dss_comma_block_array_probe(int n) { int a[1, 2]; a[0] = n; return a[0]; }
@@ -241,8 +240,7 @@ int dss_comma_block_array_probe(int n) { int a[1, 2]; a[0] = n; return a[0]; }
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap MEASURED: DSS ACCEPTS `case 1, 2:` while all five oracles refuse it with a pure SYNTAX error (gcc `expected ':' or '...' before ','`, clang `expected ':' after 'case'`, cl `C2051 case expression not constant`). /shapes/caseLabel takes the full `expression`, so the comma operator is admitted where C 6.8.4.2 requires a constant-expression -- and the shape it most resembles is the multi-value case label that no C compiler has, so a reader could reasonably believe `case 1, 2:` matches both values. ✔MEASURED 2026-08-24 that the reader is WRONG AT RUNTIME, which makes this a SILENT MISCOMPILE and not merely a permissive accept: for elf64-x86_64-linux the arm lowers to `cmp $0x2,%r15d` / `je` (the left operand becomes a dead `mov $0x1` overwritten by `mov $0x2` on the next instruction), and linking the DSS object against a gcc driver and RUNNING it prints `sel(0)=0 sel(1)=0 sel(2)=7 sel(3)=0` -- the label matches ONLY 2, so the value the author wrote FIRST is the one silently discarded.
-@why /shapes/caseLabel takes the full `expression`; C 6.8.4.2 requires a constant-expression. `case 1, 2:` reads to a reference compiler as an attempt at the (non-existent) multi-value case label.
+@why C 6.8.1 makes a case label's value a constant-expression, so `case 1, 2:` is a SYNTAX error on every reference; it reads as an attempt at the (non-existent) multi-value case label. DSS's /shapes/caseLabel takes `constantExpr` since cycle P69 L2 (it took the full `expression`: DSS ACCEPTED the label and matched only its last value, a silent miscompile MEASURED 2026-08-24).
 @code
 int dss_comma_case_probe(int x) { switch (x) { case 1, 2: return 7; } return 0; }
 @end
@@ -253,7 +251,7 @@ int dss_comma_case_probe(int x) { switch (x) { case 1, 2: return 7; } return 0; 
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@why /shapes/designatedIndex is `[ expression ]` where C 6.7.9 requires a constant-expression.
+@why C 6.7.9 makes an index designator a constant-expression, so `[0, 1] =` is a SYNTAX error on every reference. DSS's /shapes/designatedIndex takes `constantExpr` since cycle P69 L2 (it was `[ expression ]`).
 @code
 int dss_comma_designator_probe[3] = {[0, 1] = 5};
 @end
@@ -911,7 +909,6 @@ int dss_stmt_expr_probe(int n) { return ({ int t = n; t + 1; }); }
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `__builtin_expect` is an unknown identifier to DSS (S0001) and accepted by all four gnu oracles. It appears throughout real C corpora, sqlite included.
 @why GNU __builtin_expect — pervasive in real C corpora (sqlite, glibc headers).
 @code
 int dss_builtin_expect_probe(int n) { return __builtin_expect(n != 0, 1) ? 1 : 0; }
@@ -1009,8 +1006,7 @@ __declspec(dllimport) int dss_declspec_probe;
 @min-stdc 0
 @families msvc
 @expect-ref accept
-@acknowledged-gap NOT a front-end gap, and the distinction is the whole value of this row. DSS PARSES `__try`/`__except` (it reaches lowering) and then refuses at `synthesizeSehFunclets` because neither fixed probe target declares a `sehPersonality` block: the pe64 RELOCATABLE-OBJECT arm emits no unwind info, so accepting would be a silent miscompile in which `__except` can never run (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO, D-WIN64-SEH-FUNCLETS). It is a LOUD, CORRECT format-capability refusal. It is censused rather than dropped because the user-visible fact is real — you cannot compile `__try` into a pe64 .obj with DSS while cl.exe can — and because this harness compiles to relocatable objects on purpose (the exact `-c` / `/c` stage the reference compilers are held to). ⚠ Do NOT "close" this by adding a personality block to an object format; that is the refusal's own documented trap.
-@why MSVC structured exception handling __try / __except. DSS implements SEH .pdata/.xdata for the pe64 exec and dll formats, so this is squarely in scope.
+@why MSVC structured exception handling __try / __except, compiled to a pe64 RELOCATABLE OBJECT — the `-c` / `/c` stage this harness holds every compiler to. Since P69 fold 3c DSS writes it as cl /c does: both pe64 object documents state the `__C_specific_handler` personality, the object's `.pdata`/`.xdata` carry the function's unwind record and its scope table, the personality stands as an undefined external, and a link of the object — DSS's own, which reads `.pdata`/`.xdata` back into the one unwind model, link.exe's and GNU ld's — runs the `__except` (PeObjSeh in tests/link/test_pe_object_unwind_reference_link.cpp; D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO, D-LK-COFF-FOREIGN-UNWIND-DROP). Until then DSS refused it at `synthesizeSehFunclets`, the object documents declaring no personality, and this probe carried an acknowledged gap.
 @code
 int dss_seh_probe(int n) { int r = 0; __try { r = 1 / n; } __except (1) { r = -1; } return r; }
 @end

@@ -23,6 +23,7 @@
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lir_verifier.hpp"
+#include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
@@ -34,10 +35,13 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <ios>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -55,6 +59,9 @@ struct RewrittenBundle {
     DiagnosticReporter       regallocRep;
     LirRewriteResult         rewritten;
     DiagnosticReporter       rewriteRep;
+    // Set only by `lowerThroughWideCallArgsAndRewrite`: the module the
+    // allocator and the rewrite were run over.
+    LirWideCallResult        wide;
 
     RewrittenBundle(test_support::LoweredLir l) : lowered(std::move(l)) {}
 };
@@ -84,6 +91,33 @@ lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
     out.rewritten = rewriteWithAllocation(out.lowered.lir.lir,
                                           *out.lowered.target, out.alloc,
                                           out.rewriteRep);
+    return out;
+}
+
+// THE PIPELINE'S ORDER, for a source whose call passes a wholly-stacked by-value
+// aggregate. MIR->LIR hands such an aggregate to its Call as the
+// `(Reg, ByValueStackAgg)` carrier, which lives only until `lowerWideCallArgs`:
+// that pass copies the aggregate into its outgoing bytes before allocation and
+// takes the carrier off the Call, and the LIR verifier's stage rule
+// (`verifyLirStackedAggregatesLowered`) is why the allocator, the rewrite and
+// callconv hold no arm for one. `lowerThroughRewrite` above skips that pass, so a
+// test of what callconv makes of such a call runs it here, as
+// `compile_pipeline` does.
+[[nodiscard]] RewrittenBundle
+lowerThroughWideCallArgsAndRewrite(std::string src, std::uint16_t ccIndex = 0,
+                                   std::string targetName = "x86_64") {
+    RewrittenBundle out{lowerCToLir(std::move(src), std::move(targetName),
+                                    ccIndex)};
+    if (!out.lowered.lir.ok) return out;
+    out.wide = lowerWideCallArgs(out.lowered.lir.lir, *out.lowered.target,
+                                 ccIndex, out.regallocRep);
+    if (!out.wide.ok) return out;
+    out.liveness = analyzeLiveness(out.wide.lir);
+    out.alloc = allocateRegisters(out.wide.lir, *out.lowered.target,
+                                  out.liveness, ccIndex, out.regallocRep);
+    if (!out.alloc.ok()) return out;
+    out.rewritten = rewriteWithAllocation(out.wide.lir, *out.lowered.target,
+                                          out.alloc, out.rewriteRep);
     return out;
 }
 
@@ -260,6 +294,1039 @@ TEST(LirCallconv, SysVLargeFrameEmitsPlainSubNotStackProbe) {
         << "sysv (stackProbePageBytes=0) must NEVER emit stack_probe";
 }
 
+// ── D-CSUBSET-VLA-WIN64-STACK-PROBE: the DYNAMIC guard-page walk ──────────────────
+//
+// Under a cc that declares a guard page (ms_x64, stackProbePageBytes 4096) every
+// RUNTIME descent `sub_sp_reg SP, size` becomes `___chkstk_ms`'s loop: touch the word
+// just below SP; while more than a page remains, step SP down a page and touch it;
+// then descend by the remainder and touch the new bottom (the design note above
+// `DynamicProbeBlocks` in lir_callconv.cpp). A cc that declares no page (sysv_amd64)
+// keeps the bare descent. The runtime witness is
+// examples/c/vla_and_alloca_past_the_guard_page, where a bare descent faults with
+// 0xC0000005 on the far end of a block; these pin the SHAPE, which that example only
+// sees in aggregate — touch (1) above all, which DSS's own frames seldom need (their
+// saved-register stores usually touch the page SP sits in already).
+
+namespace {
+
+// `sub_sp_reg SP, <size> ; ret` — the descent with its size already in a register, as
+// regalloc leaves it — as a one-block function whose one allocation names `ccIndex`.
+struct DescentModule {
+    Lir           lir;
+    LirAllocation alloc;
+};
+
+[[nodiscard]] DescentModule
+descentOnlyModule(TargetSchema const& sch, std::uint16_t ccIndex,
+                  std::uint16_t spOrd, std::uint16_t sizeOrd) {
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 2> ops{
+        LirOperand::makeReg(makePhysicalReg(spOrd, LirRegClass::GPR)),
+        LirOperand::makeReg(makePhysicalReg(sizeOrd, LirRegClass::GPR))};
+    b.addInst(*sch.opcodeByMnemonic("sub_sp_reg"), InvalidLirReg, ops);
+    b.addReturn(*sch.opcodeByMnemonic("ret"), std::span<LirOperand const>{});
+    DescentModule out{std::move(b).finish(), {}};
+    out.alloc.perFunc.emplace_back();
+    out.alloc.perFunc.back().ok                     = true;
+    out.alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    out.alloc.perFunc.back().callingConventionIndex = ccIndex;
+    out.alloc.perFunc.back().numSpillSlots          = 0;
+    return out;
+}
+
+// `or_mem [SP + offset], 0` — one page touch.
+[[nodiscard]] bool
+isProbeTouch(Lir const& lir, LirInstId inst, std::uint16_t orMem,
+             std::uint16_t spOrd, std::int32_t offset) {
+    auto const o = lir.instOperands(inst);
+    return lir.instOpcode(inst) == orMem && o.size() == 4
+        && o[0].kind == LirOperandKind::ImmInt && o[0].immInt32 == 0
+        && o[1].kind == LirOperandKind::Reg && o[1].reg.isPhysical != 0
+        && o[1].reg.id == spOrd
+        && o[2].kind == LirOperandKind::MemBase
+        && o[3].kind == LirOperandKind::MemOffset && o[3].offset == offset;
+}
+
+// `<op> reg, imm` over a physical register.
+[[nodiscard]] bool
+isRegImm(Lir const& lir, LirInstId inst, std::uint16_t op, std::uint16_t regOrd,
+         std::int32_t imm) {
+    auto const o = lir.instOperands(inst);
+    return lir.instOpcode(inst) == op && o.size() == 2
+        && o[0].kind == LirOperandKind::Reg && o[0].reg.isPhysical != 0
+        && o[0].reg.id == regOrd
+        && o[1].kind == LirOperandKind::ImmInt && o[1].immInt32 == imm;
+}
+
+// Does `blk` end in `jcc cond → ifTrue | ifFalse`?
+[[nodiscard]] bool
+endsInCondBr(Lir const& lir, LirBlockId blk, std::uint16_t jcc, TargetCondCode cond,
+             LirBlockId ifTrue, LirBlockId ifFalse) {
+    std::uint32_t const n = lir.blockInstCount(blk);
+    if (n == 0) return false;
+    LirInstId const t = lir.blockInstAt(blk, n - 1);
+    auto const succs = lir.blockSuccessors(blk);
+    return lir.instOpcode(t) == jcc
+        && lir.instPayload(t) == static_cast<std::uint32_t>(cond)
+        && succs.size() == 2 && succs[0].v == ifTrue.v && succs[1].v == ifFalse.v;
+}
+
+} // namespace
+
+TEST(LirCallconv, MsX64RuntimeDescentWalksEveryPageTopDown) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const* cc = sch.callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_STREQ(cc->name.c_str(), "ms_x64");
+    ASSERT_GT(cc->stackProbePageBytes, 0u) << "the walk's premise: ms_x64 declares a page";
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    std::uint16_t const spOrd = cc->stackPointer->ordinal;
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+    auto const orMem    = sch.opcodeByMnemonic("or_mem");
+    auto const cmp      = sch.opcodeByMnemonic("cmp");
+    auto const jcc      = sch.opcodeByMnemonic("jcc");
+    auto const sub      = sch.opcodeByMnemonic("sub");
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    auto const ret      = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(orMem.has_value() && cmp.has_value() && jcc.has_value()
+                && sub.has_value() && subSpReg.has_value() && ret.has_value());
+    std::int32_t const page = static_cast<std::int32_t>(cc->stackProbePageBytes);
+
+    auto m = descentOnlyModule(sch, /*ccIndex=*/1, spOrd, rax);
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& out = result.lir;
+    LirFuncId const fn = out.funcAt(0);
+    // The source block, then the walk's step and tail, in THAT layout order: the tail
+    // inherits the source block's terminator, so it must be laid out where the
+    // source block's successors expect it.
+    ASSERT_EQ(out.funcBlockCount(fn), 3u)
+        << "one source block + the walk's two, laid out right after it";
+    LirBlockId const entry = out.funcBlockAt(fn, 0);
+    LirBlockId const step  = out.funcBlockAt(fn, 1);
+    LirBlockId const tail  = out.funcBlockAt(fn, 2);
+
+    // The source block ends: touch (1) at [SP-8], `cmp size, page`, `jcc ule → tail |
+    // step` — a descent of at most a page skips the loop.
+    std::uint32_t const en = out.blockInstCount(entry);
+    ASSERT_GE(en, 3u);
+    EXPECT_TRUE(isProbeTouch(out, out.blockInstAt(entry, en - 3), *orMem, spOrd, -8))
+        << "touch (1): the word just below SP, before anything descends — the touch "
+           "a helper's CALL makes with its return-address push";
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(entry, en - 2), *cmp, rax, page))
+        << "the walk counts the descent's own size register against the cc's page";
+    EXPECT_TRUE(endsInCondBr(out, entry, *jcc, TargetCondCode::Ule, tail, step))
+        << "at most one page left: straight to the descent";
+
+    // The step is exactly one page: SP down a page, touch it, count it, test again.
+    ASSERT_EQ(out.blockInstCount(step), 5u);
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(step, 0), *sub, spOrd, page));
+    EXPECT_TRUE(isProbeTouch(out, out.blockInstAt(step, 1), *orMem, spOrd, 0))
+        << "touch (2): every page the descent crosses, top-down";
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(step, 2), *sub, rax, page));
+    EXPECT_TRUE(isRegImm(out, out.blockInstAt(step, 3), *cmp, rax, page));
+    EXPECT_TRUE(endsInCondBr(out, step, *jcc, TargetCondCode::Ugt, step, tail))
+        << "more than a page left: another step";
+
+    // The tail: the ORIGINAL descent by the remainder, then touch (3), then the rest
+    // of the source block (here the epilogue and the `ret`).
+    std::uint32_t const tn = out.blockInstCount(tail);
+    ASSERT_GE(tn, 3u);
+    LirInstId const descent = out.blockInstAt(tail, 0);
+    ASSERT_EQ(out.instOpcode(descent), *subSpReg);
+    auto const dOps = out.instOperands(descent);
+    ASSERT_EQ(dOps.size(), 2u);
+    EXPECT_EQ(static_cast<std::uint32_t>(dOps[0].reg.id), spOrd);
+    EXPECT_EQ(static_cast<std::uint32_t>(dOps[1].reg.id), rax)
+        << "the descent by the register the loop counted down";
+    EXPECT_TRUE(isProbeTouch(out, out.blockInstAt(tail, 1), *orMem, spOrd, 0))
+        << "touch (3): the new bottom, so what follows starts from a committed page";
+    EXPECT_EQ(out.instOpcode(out.blockInstAt(tail, tn - 1)), *ret);
+    EXPECT_EQ(countOpcodeInModule(out, *orMem), 3u);
+    EXPECT_EQ(countOpcodeInModule(out, *subSpReg), 1u);
+
+    // The epilogue's `restore_state` re-arms the frame PAST the `ret` — at the end of
+    // the block the `ret` landed in, which the walk made the tail.
+    ASSERT_EQ(result.perFuncCfi.size(), 1u);
+    bool sawRestore = false;
+    for (LirCfiOp const& op : result.perFuncCfi[0].ops) {
+        if (op.kind != CfiOpKind::RestoreState) continue;
+        sawRestore = true;
+        EXPECT_TRUE(op.atBlockEnd);
+        EXPECT_EQ(op.block.v, tail.v)
+            << "restore_state names the block that holds the ret, not the source "
+               "block's first part";
+    }
+    EXPECT_TRUE(sawRestore) << "precondition: the epilogue brackets its teardown";
+}
+
+// The control: the SAME descent under a cc that declares no page is the bare `sub`.
+TEST(LirCallconv, SysVRuntimeDescentStaysTheBareDescent) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const* cc = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_EQ(cc->stackProbePageBytes, 0u) << "the control's premise: sysv declares no page";
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    auto m = descentOnlyModule(sch, /*ccIndex=*/0, cc->stackPointer->ordinal,
+                               static_cast<std::uint16_t>(*raxOrd));
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_EQ(result.lir.funcBlockCount(result.lir.funcAt(0)), 1u);
+    EXPECT_EQ(countOpcodeInModule(result.lir, *sch.opcodeByMnemonic("or_mem")), 0u);
+    EXPECT_EQ(countOpcodeInModule(result.lir, *sch.opcodeByMnemonic("cmp")), 0u);
+    EXPECT_EQ(countOpcodeInModule(result.lir, *sch.opcodeByMnemonic("sub_sp_reg")), 1u);
+}
+
+// A schema that declares the page but not one of the walk's verbs refuses by name
+// rather than leave a descent unwalked; the same schema still materializes a descent
+// under the cc that declares no page, so the refusal is the PAGE's, not the verb's.
+TEST(LirCallconvAbi, RuntimeDescentUnderAPageWithoutTheTouchVerbFailsLoud) {
+    auto mutatedR = ::dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"or_mem"});
+    ASSERT_TRUE(mutatedR.has_value());
+    TargetSchema const& sch = **mutatedR;
+    ASSERT_FALSE(sch.opcodeByMnemonic("or_mem").has_value())
+        << "mutateShippedTargetSchemaJson contract violated: `or_mem` survived";
+    auto const* ms = sch.callingConvention(1);
+    auto const* sysv = sch.callingConvention(0);
+    ASSERT_TRUE(ms != nullptr && sysv != nullptr);
+    ASSERT_GT(ms->stackProbePageBytes, 0u);
+    ASSERT_TRUE(ms->stackPointer.has_value());
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+
+    auto m = descentOnlyModule(sch, /*ccIndex=*/1, ms->stackPointer->ordinal, rax);
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::L_RequiredLirOpcodeMissing), 1u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("'or_mem'") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named) << "the refusal names the missing verb";
+
+    auto c = descentOnlyModule(sch, /*ccIndex=*/0, sysv->stackPointer->ordinal, rax);
+    DiagnosticReporter crep;
+    auto control = materializeCallingConvention(c.lir, sch, c.alloc, crep);
+    EXPECT_TRUE(control.ok()) << "no page, no walk, no verb needed";
+}
+
+// From C source: a VLA and `__builtin_alloca` are walked ALIKE under ms_x64 (both are
+// the one `sub_sp_reg` MIR→LIR lowers a runtime-sized Alloca to) and neither under
+// sysv. Also pinned here, because the walk COUNTS THE SIZE REGISTER DOWN: MIR→LIR's
+// descent operand is a register defined for it alone — exactly one use, the descent
+// (`lowerVlaAlloca`'s contract) — and each walk's blocks sit in layout right after the
+// block that holds the descent. The third source puts the descent in a block that is
+// NOT the function's last (a VLA inside an `if`), so blocks appended after the whole
+// function instead of after their own block are told apart from the right layout.
+TEST(LirCallconv, MsX64WalksAVlaAndAnAllocaAlikeAndSysVWalksNeither) {
+    std::array<char const*, 3> const sources{
+        "int f(int n) { volatile char a[n]; a[0] = 1; return a[0] + (n > 1); }\n",
+        "int f(int n) { volatile char *p = __builtin_alloca(n); p[0] = 1;"
+        " return p[0] + (n > 1); }\n",
+        "int f(int n) { int r = 0; if (n > 0) { volatile char a[n]; a[0] = 1; r = a[0]; }"
+        " return r + 1; }\n"};
+    for (char const* src : sources) {
+        for (std::uint16_t const ccIndex : {std::uint16_t{1}, std::uint16_t{0}}) {
+            SCOPED_TRACE(std::format("cc {}: {}", ccIndex, src));
+            auto bundle = lowerThroughRewrite(src, ccIndex);
+            ASSERT_TRUE(bundle.lowered.lir.ok);
+            ASSERT_TRUE(bundle.rewritten.ok);
+            TargetSchema const& sch = *bundle.lowered.target;
+            auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+            auto const orMem    = sch.opcodeByMnemonic("or_mem");
+            auto const jcc      = sch.opcodeByMnemonic("jcc");
+            ASSERT_TRUE(subSpReg.has_value() && orMem.has_value() && jcc.has_value());
+
+            // The producer contract, read off the PRE-allocation module.
+            {
+                Lir const& pre = bundle.lowered.lir.lir;
+                LirFuncId const pf = pre.funcAt(0);
+                std::optional<LirReg> size;
+                std::uint32_t descents = 0;
+                for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pf); ++bi) {
+                    LirBlockId const blk = pre.funcBlockAt(pf, bi);
+                    for (std::uint32_t k = 0; k < pre.blockInstCount(blk); ++k) {
+                        LirInstId const in = pre.blockInstAt(blk, k);
+                        if (pre.instOpcode(in) != *subSpReg) continue;
+                        ++descents;
+                        auto const o = pre.instOperands(in);
+                        ASSERT_EQ(o.size(), 2u);
+                        ASSERT_EQ(o[1].kind, LirOperandKind::Reg);
+                        size = o[1].reg;
+                    }
+                }
+                ASSERT_EQ(descents, 1u);
+                ASSERT_TRUE(size.has_value());
+                ASSERT_EQ(static_cast<std::uint32_t>(size->isPhysical), 0u)
+                    << "the size is a virtual register";
+                std::uint32_t uses = 0;
+                for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pf); ++bi) {
+                    LirBlockId const blk = pre.funcBlockAt(pf, bi);
+                    for (std::uint32_t k = 0; k < pre.blockInstCount(blk); ++k) {
+                        for (auto const& o : pre.instOperands(pre.blockInstAt(blk, k))) {
+                            if (o.kind == LirOperandKind::Reg && o.reg == *size) ++uses;
+                        }
+                    }
+                }
+                EXPECT_EQ(uses, 1u)
+                    << "the descent's size register has one use, the descent, so the "
+                       "walk may count it down";
+            }
+
+            DiagnosticReporter ccRep;
+            auto result = materializeCallingConvention(bundle.rewritten.lir, sch,
+                                                       bundle.alloc, ccRep);
+            ASSERT_TRUE(result.ok())
+                << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+            auto const* cc = sch.callingConvention(ccIndex);
+            ASSERT_NE(cc, nullptr);
+            EXPECT_EQ(countOpcodeInModule(result.lir, *subSpReg), 1u);
+            EXPECT_EQ(countOpcodeInModule(result.lir, *orMem),
+                      cc->stackProbePageBytes > 0 ? 3u : 0u);
+            if (cc->stackProbePageBytes == 0) continue;
+            // Layout: [B, step, tail] — B ends in the walk's first test (→ tail |
+            // step), and the step and the tail follow it immediately.
+            Lir const& out = result.lir;
+            LirFuncId const fn = out.funcAt(0);
+            std::optional<std::uint32_t> bIndex;
+            for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn); ++bi) {
+                LirBlockId const blk = out.funcBlockAt(fn, bi);
+                std::uint32_t const n = out.blockInstCount(blk);
+                if (n == 0) continue;
+                LirInstId const t = out.blockInstAt(blk, n - 1);
+                if (out.instOpcode(t) == *jcc
+                    && out.instPayload(t)
+                           == static_cast<std::uint32_t>(TargetCondCode::Ule)
+                    && n >= 3
+                    && out.instOpcode(out.blockInstAt(blk, n - 3)) == *orMem) {
+                    bIndex = bi;
+                }
+            }
+            ASSERT_TRUE(bIndex.has_value()) << "the block that opens the walk";
+            ASSERT_LT(*bIndex + 2, out.funcBlockCount(fn));
+            LirBlockId const b    = out.funcBlockAt(fn, *bIndex);
+            LirBlockId const step = out.funcBlockAt(fn, *bIndex + 1);
+            LirBlockId const tail = out.funcBlockAt(fn, *bIndex + 2);
+            auto const succs = out.blockSuccessors(b);
+            ASSERT_EQ(succs.size(), 2u);
+            EXPECT_EQ(succs[0].v, tail.v) << "the tail is laid out two after the source block";
+            EXPECT_EQ(succs[1].v, step.v) << "the step is laid out right after it";
+            EXPECT_EQ(out.instOpcode(out.blockInstAt(tail, 0)), *subSpReg);
+        }
+    }
+}
+
+// The same producer contract where the round-up is the IDENTITY. `lowerVlaAlloca` rounds the
+// runtime size up to the stack alignment, which defines a fresh register — except under a
+// convention that aligns its stack to 1, where the round-up hands back its input: the
+// PROGRAM'S OWN size value, which other instructions still read and which the guard-page walk
+// would count down under them. That one case gets a copy of its own. No shipped convention
+// aligns its stack to 1, so the negative is synthesized: cc 0 (the convention
+// `lowerVlaAlloca` reads the alignment from) with `stackAlignment` 1 — and `callPushBytes`
+// 0, which the loader holds below the alignment. The source reads its size again AFTER the
+// allocation, so the value the descent must not consume is provably still wanted.
+TEST(LirCallconv, ADescentUnderAStackAlignedToOneGetsASizeRegisterOfItsOwn) {
+    auto mutated = ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto& cc0 = doc.at("callingConventions").at(0);
+            cc0["stackAlignment"] = 1;
+            cc0["callPushBytes"]  = 0;
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "a convention that aligns its stack to 1 must still LOAD";
+    TargetSchema const& sch = **mutated;
+    ASSERT_NE(sch.callingConvention(0), nullptr);
+    ASSERT_EQ(static_cast<std::uint32_t>(sch.callingConvention(0)->stackAlignment), 1u);
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    auto const mov      = sch.opcodeByMnemonic("mov");
+    ASSERT_TRUE(subSpReg.has_value() && mov.has_value());
+
+    // A VLA of `char`: an element aligned to 1 needs no rounding headroom under a stack aligned
+    // to 1, so nothing but the round-up stands between the program's size and the descent.
+    // (`__builtin_alloca` is NOT this shape: its 16-byte element alignment exceeds 1, and the
+    // headroom `add` already defines a register of its own.)
+    auto lowered = lowerCToLir(
+        "long f(unsigned long n) { volatile char a[n]; a[0] = 1; return a[0] + (long)n; }\n",
+        *mutated, /*mirCcIndex=*/0);
+    ASSERT_TRUE(lowered.lir.ok);
+    Lir const& pre = lowered.lir.lir;
+    LirFuncId const pf = pre.funcAt(0);
+
+    // The function as text, for the failure messages below.
+    std::string text;
+    auto const forEachInst = [&](auto&& visit) {
+        for (std::uint32_t bi = 0; bi < pre.funcBlockCount(pf); ++bi) {
+            LirBlockId const blk = pre.funcBlockAt(pf, bi);
+            for (std::uint32_t k = 0; k < pre.blockInstCount(blk); ++k) {
+                visit(pre.blockInstAt(blk, k));
+            }
+        }
+    };
+    forEachInst([&](LirInstId in) {
+        auto const* info = sch.opcodeInfo(pre.instOpcode(in));
+        auto const name = [](LirReg const reg) {
+            if (!reg.valid()) return std::string{"-"};
+            return std::string{reg.isPhysical != 0 ? "p" : "v"}
+                 + std::to_string(static_cast<std::uint32_t>(reg.id));
+        };
+        text += "  " + name(pre.instResult(in)) + " <- "
+              + (info != nullptr ? std::string{info->mnemonic} : std::string{"?"});
+        for (auto const& o : pre.instOperands(in)) {
+            if (o.kind == LirOperandKind::Reg) text += " " + name(o.reg);
+        }
+        text += "\n";
+    });
+    auto const usesOf = [&](LirReg reg) {
+        std::uint32_t n = 0;
+        forEachInst([&](LirInstId in) {
+            for (auto const& o : pre.instOperands(in)) {
+                if (o.kind == LirOperandKind::Reg && o.reg == reg) ++n;
+            }
+        });
+        return n;
+    };
+
+    std::optional<LirReg> size;
+    std::uint32_t descents = 0;
+    forEachInst([&](LirInstId in) {
+        if (pre.instOpcode(in) != *subSpReg) return;
+        ++descents;
+        auto const o = pre.instOperands(in);
+        if (o.size() == 2 && o[1].kind == LirOperandKind::Reg) size = o[1].reg;
+    });
+    ASSERT_EQ(descents, 1u) << text;
+    ASSERT_TRUE(size.has_value()) << text;
+    ASSERT_EQ(static_cast<std::uint32_t>(size->isPhysical), 0u) << text;
+    EXPECT_EQ(usesOf(*size), 1u)
+        << "the descent's size register has one use, the descent, so the walk may count it "
+           "down\n" << text;
+
+    // It is a COPY of the value the program computed — and that value is read again.
+    std::optional<LirReg> programValue;
+    std::uint32_t defs = 0;
+    forEachInst([&](LirInstId in) {
+        if (!(pre.instResult(in) == *size)) return;
+        ++defs;
+        auto const o = pre.instOperands(in);
+        if (pre.instOpcode(in) == *mov && o.size() == 1 && o[0].kind == LirOperandKind::Reg
+            && o[0].reg.isPhysical == 0) {
+            programValue = o[0].reg;
+        }
+    });
+    ASSERT_EQ(defs, 1u) << text;
+    ASSERT_TRUE(programValue.has_value())
+        << "the descent's size register is defined by a copy of the program's own size "
+           "value, made for the descent alone\n" << text;
+    EXPECT_FALSE(*programValue == *size) << text;
+    EXPECT_GE(usesOf(*programValue), 2u)
+        << "the pin's premise: the program's own size value is read by the copy AND again "
+           "after the allocation, so a descent that consumed it would have destroyed a "
+           "value still wanted\n" << text;
+}
+
+// ── D-CSUBSET-VLA-WIN64-STACK-PROBE: THE FOOTING ──────────────────────────────────
+//
+// What a function may reach below its settled SP before any probe of its own is DERIVED
+// from the convention's own numbers (the FOOTING paragraph of the design note above
+// `DynamicProbeBlocks` in lir_callconv.cpp): it is entered with the page that holds the byte
+// at its SP committed — by the call's push, or, when the call pushes nothing, by its caller.
+// ms_x64 (a call pushes 8 onto a 16-aligned SP) reaches everything it needs from there for
+// EVERY frame, so its code carries no extra touch. The SAME convention with `callPushBytes`
+// 0 — the shipped document mutated into a link-register machine's shape, the negative no
+// shipped target can synthesize — does not: its leaf with a frame of exactly a page would
+// put touch (1) one word PAST the guard page, and its caller owes its callee the page its
+// own SP lands in. Each gets ONE landing touch, `or_mem [SP + 0], 0`, the first thing after
+// the prologue. Every arm runs the shipped convention over the same function as its control.
+
+namespace {
+
+// One block — an optional body-local of `localBytes`, an optional runtime descent, an
+// optional call, `ret` — as regalloc leaves it (every register physical).
+struct FootingShape {
+    std::uint32_t localBytes = 0;
+    bool          descent    = false;
+    bool          call       = false;
+};
+
+[[nodiscard]] DescentModule
+footingModule(TargetSchema const& sch, std::uint16_t ccIndex, std::uint16_t spOrd,
+              std::uint16_t regOrd, FootingShape const& shape) {
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    LirReg const reg = makePhysicalReg(regOrd, LirRegClass::GPR);
+    if (shape.localBytes > 0) {
+        b.addInst(*sch.opcodeByMnemonic("alloca"), reg, std::span<LirOperand const>{},
+                  /*payload=*/shape.localBytes);
+    }
+    if (shape.descent) {
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeReg(makePhysicalReg(spOrd, LirRegClass::GPR)),
+            LirOperand::makeReg(reg)};
+        b.addInst(*sch.opcodeByMnemonic("sub_sp_reg"), InvalidLirReg, ops);
+    }
+    if (shape.call) {
+        std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(13)};
+        b.addInst(*sch.opcodeByMnemonic("call"), InvalidLirReg, callOps);
+    }
+    b.addReturn(*sch.opcodeByMnemonic("ret"), std::span<LirOperand const>{});
+    DescentModule out{std::move(b).finish(), {}};
+    out.alloc.perFunc.emplace_back();
+    out.alloc.perFunc.back().ok                     = true;
+    out.alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    out.alloc.perFunc.back().callingConventionIndex = ccIndex;
+    out.alloc.perFunc.back().numSpillSlots          = 0;
+    return out;
+}
+
+// The shipped x86_64 document with ONE number changed: ms_x64's call pushes nothing.
+[[nodiscard]] auto x8664WhoseMsX64CallPushesNothing() {
+    return ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& cc : doc.at("callingConventions")) {
+                if (cc.is_object() && cc.value("name", std::string{}) == "ms_x64") {
+                    cc["callPushBytes"] = 0;
+                }
+            }
+        });
+}
+
+// The index, in `blk`, of the first instruction `pred` accepts.
+template <typename Pred>
+[[nodiscard]] std::optional<std::uint32_t>
+firstInBlock(Lir const& lir, LirBlockId blk, Pred pred) {
+    for (std::uint32_t k = 0; k < lir.blockInstCount(blk); ++k) {
+        if (pred(lir.blockInstAt(blk, k))) return k;
+    }
+    return std::nullopt;
+}
+
+// What the footing pins read off a schema: ms_x64 (cc 1), its stack pointer, a general
+// register for the function's own value, and the opcodes they look for.
+struct FootingTarget {
+    TargetCallingConvention const* cc = nullptr;
+    std::uint16_t spOrd = 0;
+    std::uint16_t rax   = 0;
+    std::uint16_t orMem = 0, probe = 0, lea = 0, call = 0;
+    std::uint32_t page  = 0;
+};
+
+[[nodiscard]] std::optional<FootingTarget> footingTargetOf(TargetSchema const& sch) {
+    FootingTarget t;
+    t.cc = sch.callingConvention(1);
+    auto const raxOrd = sch.registerByName("rax");
+    auto const orMem  = sch.opcodeByMnemonic("or_mem");
+    auto const probe  = sch.opcodeByMnemonic("stack_probe");
+    auto const lea    = sch.opcodeByMnemonic("lea");
+    auto const call   = sch.opcodeByMnemonic("call");
+    if (t.cc == nullptr || t.cc->name != "ms_x64" || !t.cc->stackPointer.has_value()
+        || !raxOrd.has_value() || !orMem.has_value() || !probe.has_value()
+        || !lea.has_value() || !call.has_value()) {
+        return std::nullopt;
+    }
+    t.spOrd = t.cc->stackPointer->ordinal;
+    t.rax   = static_cast<std::uint16_t>(*raxOrd);
+    t.orMem = *orMem;
+    t.probe = *probe;
+    t.lea   = *lea;
+    t.call  = *call;
+    t.page  = t.cc->stackProbePageBytes;
+    return t;
+}
+
+} // namespace
+
+// The reviewer's shape: a LEAF whose frame is exactly one page, with a runtime descent.
+// Entered at a page boundary under a call that pushes nothing, its SP settles on the base of
+// the still-untouched guard page and touch (1), one word lower, would fall past it — so it
+// is landed first. One alignment quantum less (the frame leaves room for that word) it is
+// not; and under the shipped convention, whose call's push keeps the entry SP 8 bytes into
+// its page, the very same frame is not either.
+TEST(LirCallconv, ALeafWhoseFrameIsExactlyAPageIsLandedBeforeItsDescentWhenTheCallPushesNothing) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto mutated = x8664WhoseMsX64CallPushesNothing();
+    ASSERT_TRUE(mutated.has_value())
+        << "a convention whose call pushes nothing must still LOAD: the pin is the "
+           "materialization's, not the loader's";
+    for (bool const pushesNothing : {true, false}) {
+        TargetSchema const& sch = pushesNothing ? **mutated : **shipped;
+        auto const t = footingTargetOf(sch);
+        ASSERT_TRUE(t.has_value());
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->callPushBytes), pushesNothing ? 0u : 8u);
+        ASSERT_GT(t->page, 0u);
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->stackAlignment), 16u)
+            << "the pin's arithmetic: one alignment quantum below a page";
+
+        // The frame the descent alone gives, then the local that makes it what the arm wants.
+        std::uint32_t bare = 0;
+        {
+            auto m = footingModule(sch, 1, t->spOrd, t->rax, {.descent = true});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            bare = result.perFunc[0].totalFrameSize;
+            ASSERT_LT(bare, t->page - 16u);
+        }
+        for (std::uint32_t const frame : {t->page, t->page - 16u}) {
+            SCOPED_TRACE(std::format("callPushBytes {} frame {}",
+                                     static_cast<std::uint32_t>(t->cc->callPushBytes), frame));
+            auto m = footingModule(sch, 1, t->spOrd, t->rax,
+                                   {.localBytes = frame - bare, .descent = true});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            ASSERT_EQ(result.perFunc[0].totalFrameSize, frame)
+                << "the pin's premise: the frame is exactly what the arm names";
+            Lir const& out = result.lir;
+            EXPECT_EQ(countOpcodeInModule(out, t->probe), 0u)
+                << "a frame of at most a page is not walked";
+            LirBlockId const entry = out.funcBlockAt(out.funcAt(0), 0);
+            auto const landing = firstInBlock(out, entry, [&](LirInstId i) {
+                return isProbeTouch(out, i, t->orMem, t->spOrd, 0); });
+            auto const touchOne = firstInBlock(out, entry, [&](LirInstId i) {
+                return isProbeTouch(out, i, t->orMem, t->spOrd, -8); });
+            auto const local = firstInBlock(out, entry, [&](LirInstId i) {
+                return out.instOpcode(i) == t->lea; });
+            ASSERT_TRUE(touchOne.has_value()) << "the descent's own touch (1)";
+            ASSERT_TRUE(local.has_value()) << "the body's first instruction: the local's address";
+            bool const owed = pushesNothing && frame == t->page;
+            EXPECT_EQ(landing.has_value(), owed)
+                << (owed ? "SP settles a full page below a page boundary it may have been "
+                           "entered at, and nothing committed that page: touch (1) would "
+                           "fall past the guard page"
+                         : "touch (1) still lands on the guard page from here: no landing "
+                           "touch, the code is what it was");
+            EXPECT_EQ(countOpcodeInModule(out, t->orMem), owed ? 4u : 3u);
+            if (owed && landing.has_value()) {
+                EXPECT_LT(*landing, *local) << "the first thing after the prologue";
+                EXPECT_LT(*landing, *touchOne) << "and before the descent's first touch";
+            }
+        }
+    }
+}
+
+// A function that CALLS under a convention whose call pushes nothing hands its callee its own
+// SP as the footing, so it touches the page that SP lands in; the shipped convention's call
+// commits it with its push and needs nothing. A function that neither calls nor descends
+// reaches nothing below its SP under either.
+TEST(LirCallconv, ACallerWhoseCallPushesNothingTouchesThePageItsStackPointerLandsIn) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto mutated = x8664WhoseMsX64CallPushesNothing();
+    ASSERT_TRUE(mutated.has_value());
+    for (bool const pushesNothing : {true, false}) {
+        TargetSchema const& sch = pushesNothing ? **mutated : **shipped;
+        auto const t = footingTargetOf(sch);
+        ASSERT_TRUE(t.has_value());
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->callPushBytes), pushesNothing ? 0u : 8u);
+        SCOPED_TRACE(std::format("callPushBytes {}",
+                                 static_cast<std::uint32_t>(t->cc->callPushBytes)));
+        {
+            auto m = footingModule(sch, 1, t->spOrd, t->rax, {.localBytes = 64, .call = true});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            ASSERT_GT(result.perFunc[0].totalFrameSize, 0u);
+            ASSERT_LE(result.perFunc[0].totalFrameSize, t->page) << "an unwalked frame";
+            Lir const& out = result.lir;
+            LirBlockId const entry = out.funcBlockAt(out.funcAt(0), 0);
+            auto const landing = firstInBlock(out, entry, [&](LirInstId i) {
+                return isProbeTouch(out, i, t->orMem, t->spOrd, 0); });
+            auto const local = firstInBlock(out, entry, [&](LirInstId i) {
+                return out.instOpcode(i) == t->lea; });
+            auto const callAt = firstInBlock(out, entry, [&](LirInstId i) {
+                return out.instOpcode(i) == t->call; });
+            ASSERT_TRUE(local.has_value() && callAt.has_value());
+            EXPECT_EQ(countOpcodeInModule(out, t->orMem), pushesNothing ? 1u : 0u);
+            EXPECT_EQ(landing.has_value(), pushesNothing);
+            if (pushesNothing && landing.has_value()) {
+                EXPECT_LT(*landing, *local) << "the first thing after the prologue";
+                EXPECT_LT(*landing, *callAt) << "before the call that relies on it";
+            }
+        }
+        {
+            auto m = footingModule(sch, 1, t->spOrd, t->rax, {.localBytes = 64});
+            DiagnosticReporter rep;
+            auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+            ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+            EXPECT_EQ(countOpcodeInModule(result.lir, t->orMem), 0u)
+                << "a leaf with no runtime descent reaches nothing below its SP";
+        }
+    }
+}
+
+// ── THE MATERIALIZATION PUBLISHES WHERE EACH SOURCE BLOCK LANDED ──────────────────
+//
+// The guard-page walk INSERTS blocks: its step and its tail are created right after the
+// block that descends, so every source block laid out AFTER that one has another id in the
+// output. The pass says where each landed — `LirCallconvResult::blockEntryImage`, indexed
+// by the SOURCE block's id — and everything that names a block as data follows it (a
+// label's address, a switch table, a guarded region, the unwind rows:
+// `lir/lir_descriptor_blocks.hpp`). Until this case the image of THIS pass was read only
+// by programs that had to RUN on a pe host (examples/c/c99_vla_win64_unwind_walk and the
+// three "…_after_an_asm_label_function" examples): on a leg that cannot run pe, nothing
+// looked at it.
+//
+// Three source blocks — one before the descent, the block that descends, the block that
+// returns — so there is a block on each side of the insertion. The witness is not the
+// image: the output block that holds `ret` is found BY ITS OPCODE, and the source block
+// that returns must be published as that block. A pass that published its SOURCE ids
+// would be right about the first two blocks and wrong about the third, which is why the
+// function has a block after the descent.
+TEST(LirCallconv, TheMaterializationPublishesWhereEachSourceBlockLanded) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const t = footingTargetOf(sch);
+    ASSERT_TRUE(t.has_value());
+    ASSERT_GT(t->page, 0u) << "the premise: ms_x64 walks a runtime descent";
+    auto const jmp      = sch.opcodeByMnemonic("jmp");
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    auto const ret      = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(jmp.has_value() && subSpReg.has_value() && ret.has_value());
+
+    LirBuilder b{sch};
+    (void)b.addFunction(SymbolId{77});
+    LirBlockId const first    = b.createBlock();
+    LirBlockId const descends = b.createBlock();
+    LirBlockId const returns  = b.createBlock();
+    b.beginBlock(first);
+    (void)b.addBr(*jmp, descends);
+    b.beginBlock(descends);
+    {
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeReg(makePhysicalReg(t->spOrd, LirRegClass::GPR)),
+            LirOperand::makeReg(makePhysicalReg(t->rax, LirRegClass::GPR))};
+        (void)b.addInst(*subSpReg, InvalidLirReg, ops);
+        (void)b.addBr(*jmp, returns);
+    }
+    b.beginBlock(returns);
+    (void)b.addReturn(*ret, std::span<LirOperand const>{});
+    Lir const src = std::move(b).finish();
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 1;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(src, sch, alloc, rep);
+    ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& out = result.lir;
+    LirFuncId const srcFn = src.funcAt(0);
+    LirFuncId const outFn = out.funcAt(0);
+    ASSERT_EQ(src.funcBlockCount(srcFn), 3u);
+    ASSERT_EQ(result.blockEntryImage.size(), src.blockCount())
+        << "the image is indexed by the SOURCE module's block arena";
+    // CONTROL: the walk did insert blocks — otherwise the identity would be the right
+    // answer and the case would prove nothing.
+    std::uint32_t const outBlocks = out.funcBlockCount(outFn);
+    ASSERT_EQ(outBlocks, 5u) << "three source blocks and the walk's step and tail";
+
+    // Where, in the output function's layout, a block holds a given opcode.
+    auto const positionsHolding = [&](std::uint16_t opcode) {
+        std::vector<std::uint32_t> at;
+        for (std::uint32_t k = 0; k < outBlocks; ++k) {
+            LirBlockId const blk = out.funcBlockAt(outFn, k);
+            for (std::uint32_t i = 0; i < out.blockInstCount(blk); ++i) {
+                if (out.instOpcode(out.blockInstAt(blk, i)) == opcode) {
+                    at.push_back(k);
+                    break;
+                }
+            }
+        }
+        return at;
+    };
+    auto const retAt   = positionsHolding(*ret);
+    auto const touchAt = positionsHolding(t->orMem);
+    ASSERT_EQ(retAt.size(), 1u) << "the function returns in one place";
+    ASSERT_FALSE(touchAt.empty()) << "the walk's first touch closes the block that descends";
+
+    // The block that returns: the last of the layout, two blocks later than it was.
+    EXPECT_EQ(retAt.front(), 4u);
+    EXPECT_EQ(result.blockEntryImage[returns.v], out.funcBlockAt(outFn, retAt.front()).v)
+        << "the source block that returns was published somewhere else than the block "
+           "that returns in the materialized function";
+    EXPECT_NE(out.funcBlockAt(outFn, retAt.front()).v, out.funcBlockAt(outFn, 2).v)
+        << "CONTROL: the block that returns is not the block that sits at the returning "
+           "block's old place in the layout (the walk's step)";
+
+    // The two blocks up to the insertion keep their places.
+    EXPECT_EQ(result.blockEntryImage[first.v], out.funcBlockAt(outFn, 0).v);
+    EXPECT_EQ(touchAt.front(), 1u) << "touch (1) is in the first piece of the descending block";
+    EXPECT_EQ(result.blockEntryImage[descends.v], out.funcBlockAt(outFn, 1).v);
+}
+
+// A WALKED frame: the walk's last touch is up to a page above the settled SP, so under a
+// call that pushes nothing touch (1) may again fall past the guard page — the landing touch
+// follows the walk and precedes the descent. The shipped convention's walk keeps the entry
+// SP's 8 bytes of offset in every page it touches, and needs none.
+TEST(LirCallconv, AWalkedFrameIsLandedAfterItsWalkWhenTheCallPushesNothing) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto mutated = x8664WhoseMsX64CallPushesNothing();
+    ASSERT_TRUE(mutated.has_value());
+    for (bool const pushesNothing : {true, false}) {
+        TargetSchema const& sch = pushesNothing ? **mutated : **shipped;
+        auto const t = footingTargetOf(sch);
+        ASSERT_TRUE(t.has_value());
+        ASSERT_EQ(static_cast<std::uint32_t>(t->cc->callPushBytes), pushesNothing ? 0u : 8u);
+        SCOPED_TRACE(std::format("callPushBytes {}",
+                                 static_cast<std::uint32_t>(t->cc->callPushBytes)));
+        auto m = footingModule(sch, 1, t->spOrd, t->rax,
+                               {.localBytes = 2u * t->page, .descent = true});
+        DiagnosticReporter rep;
+        auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+        ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+        ASSERT_GT(result.perFunc[0].totalFrameSize, t->page) << "the pin's premise: a walked frame";
+        Lir const& out = result.lir;
+        EXPECT_EQ(countOpcodeInModule(out, t->probe), 1u);
+        LirBlockId const entry = out.funcBlockAt(out.funcAt(0), 0);
+        auto const walk = firstInBlock(out, entry, [&](LirInstId i) {
+            return out.instOpcode(i) == t->probe; });
+        auto const landing = firstInBlock(out, entry, [&](LirInstId i) {
+            return isProbeTouch(out, i, t->orMem, t->spOrd, 0); });
+        auto const touchOne = firstInBlock(out, entry, [&](LirInstId i) {
+            return isProbeTouch(out, i, t->orMem, t->spOrd, -8); });
+        ASSERT_TRUE(walk.has_value() && touchOne.has_value());
+        EXPECT_EQ(landing.has_value(), pushesNothing);
+        EXPECT_EQ(countOpcodeInModule(out, t->orMem), pushesNothing ? 4u : 3u);
+        if (pushesNothing && landing.has_value()) {
+            EXPECT_LT(*walk, *landing) << "after the walk: it touches the settled SP";
+            EXPECT_LT(*landing, *touchOne) << "and before the descent's first touch";
+        }
+    }
+}
+
+// A schema that owes a landing touch and declares no verb to make it with refuses by name;
+// the same function under the convention that declares no page needs no verb at all.
+TEST(LirCallconvAbi, ALandingTouchOwedWithoutTheTouchVerbFailsLoud) {
+    auto mutated = ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& cc : doc.at("callingConventions")) {
+                if (cc.is_object() && cc.value("name", std::string{}) == "ms_x64") {
+                    cc["callPushBytes"] = 0;
+                }
+            }
+            ::dss::test_support::detail::eraseOpcodeRows(doc, {"or_mem"}, "x86_64");
+        });
+    ASSERT_TRUE(mutated.has_value());
+    TargetSchema const& sch = **mutated;
+    ASSERT_FALSE(sch.opcodeByMnemonic("or_mem").has_value());
+    auto const* ms   = sch.callingConvention(1);
+    auto const* sysv = sch.callingConvention(0);
+    ASSERT_TRUE(ms != nullptr && sysv != nullptr);
+    ASSERT_EQ(static_cast<std::uint32_t>(ms->callPushBytes), 0u);
+    ASSERT_GT(ms->stackProbePageBytes, 0u);
+    ASSERT_EQ(sysv->stackProbePageBytes, 0u);
+    ASSERT_TRUE(ms->stackPointer.has_value() && sysv->stackPointer.has_value());
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+
+    auto m = footingModule(sch, 1, ms->stackPointer->ordinal, rax,
+                           {.localBytes = 64, .call = true});
+    // THE REFUSAL IS READ FIRST IN A PROCESS OF ITS OWN. Behind it stands the builder's own
+    // check: a pass that went on past the refusal would emit the touch with no opcode, and
+    // `LirBuilder::addInst` ends the process on one — right for the builder, and the end of
+    // this BINARY's report if the refusal were only read here. A child that dies fails this
+    // statement, the case stops before the in-process reading below, and the binary goes on
+    // to report it by name. (Arm `lir-landing-touch-owed-without-the-verb-not-refused` —
+    // WRITTEN, NOT READ in this form: its first sweep, when this case read the refusal only
+    // in the binary's own process, read a binary that exited 134 and wrote no report.)
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    enum : int { kRefusedByItsCode = 43, kAccepted = 44, kRefusedOtherwise = 45 };
+    ASSERT_EXIT({
+            DiagnosticReporter childRep;
+            auto const childResult =
+                materializeCallingConvention(m.lir, sch, m.alloc, childRep);
+            std::exit(childResult.ok() ? kAccepted
+                      : ::dss::test_support::countCode(
+                            childRep, DiagnosticCode::L_RequiredLirOpcodeMissing) == 1u
+                            ? kRefusedByItsCode : kRefusedOtherwise);
+        }, ::testing::ExitedWithCode(kRefusedByItsCode), "")
+        << "a landing touch owed with no verb to make it must END IN A REFUSAL — the child "
+           "exits 43 refused with the one missing-opcode diagnostic, 44 accepted, 45 refused "
+           "otherwise; any other end is a process that died past the refusal";
+
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::L_RequiredLirOpcodeMissing), 1u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("'or_mem'") != std::string::npos
+            && d.actual.find("callPushBytes=0") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named) << "the refusal names the missing verb and the number that owes it";
+
+    auto c = footingModule(sch, 0, sysv->stackPointer->ordinal, rax,
+                           {.localBytes = 64, .call = true});
+    DiagnosticReporter crep;
+    auto control = materializeCallingConvention(c.lir, sch, c.alloc, crep);
+    EXPECT_TRUE(control.ok()) << "no page, no footing to keep, no verb needed";
+}
+
+// ONE TOUCH IS ONE WHOLE GENERAL REGISTER — a word of the stack pointer's own class — and
+// its width is ASKED of the target document (`wholeRegisterAccessFlags`, over the full rows
+// of `registers[]`), written nowhere in the pass. Under the shipped x86_64 that is 8 bytes:
+// an `or_mem` at the default width, touch (1) at [SP - 8]. Declare every general register 4
+// bytes wide instead and every touch of the walk is 4 bytes wide, touch (1) at [SP - 4] — the
+// pass PRODUCES the narrower touch (whether an encoder can emit it is the assembler's
+// question, not asked here). A general register whose width no LIR instruction can state is
+// refused by name — by the owner of that question — in a function that touches the guard
+// page, and only there. (A page too small for one touch never reaches the pass: the LOADER
+// refuses it — tests/core/test_target_schema.cpp.)
+namespace {
+
+// The shipped x86_64 document with every FULL general register declared `bytes` wide. The
+// views that would no longer be strictly narrower than their register go with it (a view
+// asserts containment); nothing else in the document names them.
+[[nodiscard]] auto x8664WhoseGeneralRegistersAreDeclared(std::uint32_t bytes) {
+    return ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [bytes](nlohmann::json& doc) {
+            auto const isGpr = [](nlohmann::json const& r) {
+                return r.is_object() && r.value("class", std::string{}) == "gpr";
+            };
+            auto& regs = doc.at("registers");
+            regs.erase(std::remove_if(regs.begin(), regs.end(),
+                                      [&](nlohmann::json const& r) {
+                                          return isGpr(r) && r.contains("subOf")
+                                              && r.value("widthBytes", 0u) >= bytes;
+                                      }),
+                       regs.end());
+            for (auto& r : regs) {
+                if (isGpr(r) && !r.contains("subOf")) r["widthBytes"] = bytes;
+            }
+        });
+}
+
+} // namespace
+
+TEST(LirCallconv, AGuardPageTouchIsOneWholeGeneralRegister) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto narrow = x8664WhoseGeneralRegistersAreDeclared(4u);
+    ASSERT_TRUE(narrow.has_value())
+        << "a target whose general registers are 4 bytes wide must still LOAD";
+    struct Arm {
+        TargetSchema const* sch;
+        char const*         what;
+        std::int32_t        wordBytes;
+    };
+    for (Arm const arm : {Arm{shipped->get(), "general registers as shipped", 8},
+                          Arm{narrow->get(), "general registers declared 4 bytes wide", 4}}) {
+        SCOPED_TRACE(arm.what);
+        TargetSchema const& sch = *arm.sch;
+        auto const* cc = sch.callingConvention(1);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->stackPointer.has_value());
+        ASSERT_STREQ(cc->stackPointer->name.c_str(), "rsp");
+        std::uint16_t const spOrd = cc->stackPointer->ordinal;
+        auto const natural = sch.registerClassNaturalWidthBits(TargetRegClass::GPR);
+        ASSERT_TRUE(natural.has_value());
+        ASSERT_EQ(static_cast<std::int32_t>(*natural), arm.wordBytes * 8)
+            << "the pin's premise: the document states this width for a whole general "
+               "register";
+        auto const* spInfo = sch.registerInfo(spOrd);
+        ASSERT_NE(spInfo, nullptr);
+        ASSERT_EQ(static_cast<std::int32_t>(spInfo->widthBytes), arm.wordBytes)
+            << "and the stack pointer, a full register of that class, is as wide — the "
+               "row the loader's validator reads";
+        auto const raxOrd = sch.registerByName("rax");
+        auto const orMem  = sch.opcodeByMnemonic("or_mem");
+        ASSERT_TRUE(raxOrd.has_value() && orMem.has_value());
+
+        auto m = descentOnlyModule(sch, /*ccIndex=*/1, spOrd,
+                                   static_cast<std::uint16_t>(*raxOrd));
+        DiagnosticReporter rep;
+        auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+        ASSERT_TRUE(result.ok()) << (rep.all().empty() ? "" : rep.all()[0].actual);
+        Lir const& out = result.lir;
+        LirFuncId const fn = out.funcAt(0);
+        ASSERT_EQ(out.funcBlockCount(fn), 3u);
+        LirBlockId const entry = out.funcBlockAt(fn, 0);
+        LirBlockId const step  = out.funcBlockAt(fn, 1);
+        LirBlockId const tail  = out.funcBlockAt(fn, 2);
+        std::uint32_t const en = out.blockInstCount(entry);
+        ASSERT_GE(en, 3u);
+        LirInstId const one   = out.blockInstAt(entry, en - 3);
+        LirInstId const two   = out.blockInstAt(step, 1);
+        LirInstId const three = out.blockInstAt(tail, 1);
+        EXPECT_TRUE(isProbeTouch(out, one, *orMem, spOrd, -arm.wordBytes))
+            << "touch (1) reaches exactly one stack-pointer word below SP";
+        EXPECT_TRUE(isProbeTouch(out, two, *orMem, spOrd, 0));
+        EXPECT_TRUE(isProbeTouch(out, three, *orMem, spOrd, 0));
+        for (LirInstId const touch : {one, two, three}) {
+            EXPECT_EQ(static_cast<std::int32_t>(lirInstWidthBits(out.instFlags(touch))),
+                      arm.wordBytes * 8)
+                << "every touch is as wide as the stack pointer the document declares";
+        }
+        EXPECT_EQ(countOpcodeInModule(out, *orMem), 3u);
+    }
+}
+
+TEST(LirCallconvAbi, AGeneralRegisterNoInstructionCanStateRefusesTheTouchByName) {
+    auto mutated = x8664WhoseGeneralRegistersAreDeclared(3u);
+    ASSERT_TRUE(mutated.has_value())
+        << "the loader holds a register's width to no instruction vocabulary: that is "
+           "this tier's, so the refusal under test is the pass's";
+    TargetSchema const& sch = **mutated;
+    auto const* ms = sch.callingConvention(1);
+    ASSERT_NE(ms, nullptr);
+    ASSERT_TRUE(ms->stackPointer.has_value());
+    ASSERT_GT(ms->stackProbePageBytes, 0u);
+    auto const natural = sch.registerClassNaturalWidthBits(TargetRegClass::GPR);
+    ASSERT_TRUE(natural.has_value());
+    ASSERT_EQ(*natural, 24u) << "the pin's premise: a whole general register is 3 bytes";
+    auto const raxOrd = sch.registerByName("rax");
+    ASSERT_TRUE(raxOrd.has_value());
+    std::uint16_t const rax = static_cast<std::uint16_t>(*raxOrd);
+
+    // The touch is the FIRST thing a function with a runtime descent asks a width for —
+    // before its prologue's own register saves — so the one refusal is the touch's.
+    auto m = footingModule(sch, 1, ms->stackPointer->ordinal, rax, {.descent = true});
+    DiagnosticReporter rep;
+    auto result = materializeCallingConvention(m.lir, sch, m.alloc, rep);
+    EXPECT_FALSE(result.ok());
+    ASSERT_EQ(rep.all().size(), 1u);
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::L_RequiredLirOpcodeMissing), 1u);
+    EXPECT_NE(rep.all()[0].actual.find("guard-page touch"), std::string::npos)
+        << rep.all()[0].actual;
+    EXPECT_NE(rep.all()[0].actual.find("24 bits"), std::string::npos)
+        << rep.all()[0].actual;
+
+    // A function that touches no guard page needs no touch, so no width to state.
+    auto leaf = footingModule(sch, 1, ms->stackPointer->ordinal, rax, {.localBytes = 64});
+    DiagnosticReporter lrep;
+    auto leafResult = materializeCallingConvention(leaf.lir, sch, leaf.alloc, lrep);
+    EXPECT_TRUE(leafResult.ok()) << (lrep.all().empty() ? "" : lrep.all()[0].actual);
+}
+
 TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
     auto bundle = lowerThroughRewrite("int f(int x) { return x + x; }");
     ASSERT_TRUE(bundle.lowered.lir.ok);
@@ -347,8 +1414,8 @@ TEST(LirCallconv, VlaLeafFunctionMaterializesFramePointerModel) {
 // and asserted `EXPECT_FALSE(result.ok())` — the C1b LEAF gate. That gate is gone:
 // a VLA function may now make calls, with the outgoing-args area TRAVELLING WITH SP
 // at [SP+0..outgoingArgAreaSize) and every dynamic object lifted above it, so a
-// captured stack watermark means `SP + outgoingArgAreaSize`. The two sibling gates
-// (`usesVaStart`, `isSehParent`) below are UNCHANGED and still fail loud.
+// captured stack watermark means `SP + outgoingArgAreaSize`. Of the two sibling gates
+// below, `isSehParent` still fails loud; `usesVaStart` was built in P69 fold f26c.
 //
 // The property under test is the BIAS, not merely that the pass succeeds: a pass
 // that succeeded and captured a bare SP would place the VLA object exactly on top of
@@ -495,35 +1562,84 @@ TEST(LirCallconv, VlaLeafFunctionWatermarkCarriesNoBias) {
            "would move every leaf VLA object off its own allocation";
 }
 
-// D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate, va-arm): a VLA function that ALSO
-// calls va_start FAILS LOUD — its va-area address leas are SP-relative body refs the
-// runtime `sub sp` invalidates (and the va-overflow area lives ABOVE the entry SP,
-// outside the frame-pointer switch). RED-ON-DISABLE for the `usesVaStart` gate (a
-// refactor could silently drop the va-arm, which is separate from the call-arm).
-TEST(LirCallconv, VlaVariadicFunctionWithVaStartFailsLoud) {
-    auto bundle = lowerThroughRewrite(
-        "int f(int n, ...) {\n"
-        "  int a[n];\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  va_end(ap);\n"
-        "  return a[0];\n"
-        "}\n");
-    ASSERT_TRUE(bundle.lowered.lir.ok);
-    ASSERT_TRUE(bundle.rewritten.ok);
-    DiagnosticReporter ccRep;
-    auto result = materializeCallingConvention(bundle.rewritten.lir,
-                                               *bundle.lowered.target,
-                                               bundle.alloc, ccRep);
-    EXPECT_FALSE(result.ok())
-        << "a VLA function that calls va_start must fail the callconv pass";
-    bool sawNonLeaf = false;
-    for (auto const& d : ccRep.all()) {
-        if (d.code == DiagnosticCode::L_VlaNonLeafFrameUnsupported)
-            sawNonLeaf = true;
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME, the va-arm -- ⚠ THIS PIN WAS DELIBERATELY INVERTED
+// (P69 fold f26c, main's ledger 495). It read `VlaVariadicFunctionWithVaStartFailsLoud`:
+// a VLA function that called va_start was refused, its va-area address leas being
+// SP-relative body references the runtime `sub sp` invalidates. A frame whose SP moves at
+// run time now also realigns for an over-aligned stacked argument, and a variadic such
+// function must work, so the arm is BUILT, not re-worded: the prologue's variadic spill
+// runs after the frame-pointer capture and off the frame base, and every va-area lea is
+// the frame base's. The property under test is WHERE the leas address -- off the frame
+// pointer, and the incoming one (the overflow area / Win64 home space) at or past the
+// fixed frame's top -- on all three conventions that declare a va_list: sysv_amd64's
+// register-save area, ms_x64's home space, aapcs64's dual cursor. A lea left SP-relative
+// would read the save area through a stack pointer the VLA moved.
+[[nodiscard]] std::vector<std::pair<std::uint16_t, std::int64_t>>
+leaBasesAndOffsets(Lir const& lir, TargetSchema const& schema, std::uint32_t funcIndex) {
+    std::vector<std::pair<std::uint16_t, std::int64_t>> out;
+    auto const lea = schema.opcodeByMnemonic("lea");
+    if (!lea.has_value()) return out;
+    LirFuncId const fn = lir.funcAt(funcIndex);
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+            LirInstId const inst = lir.blockInstAt(blk, i);
+            if (lir.instOpcode(inst) != *lea) continue;
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() < 3 || ops[0].kind != LirOperandKind::Reg || ops[0].reg.isPhysical == 0
+                || ops[2].kind != LirOperandKind::MemOffset) continue;
+            out.emplace_back(static_cast<std::uint16_t>(ops[0].reg.id), ops[2].offset);
+        }
     }
-    EXPECT_TRUE(sawNonLeaf)
-        << "a VLA + va_start function must surface L_VlaNonLeafFrameUnsupported";
+    return out;
+}
+
+TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
+    struct Arm { char const* target; std::uint16_t cc; };
+    for (Arm const arm : {Arm{"x86_64", 0}, Arm{"x86_64", 1}, Arm{"arm64", 0}}) {
+        SCOPED_TRACE(std::string{arm.target} + " cc " + std::to_string(arm.cc));
+        auto bundle = lowerThroughRewrite(
+            "int f(int n, ...) {\n"
+            "  int a[n];\n"
+            "  va_list ap;\n"
+            "  va_start(ap, n);\n"
+            "  a[0] = va_arg(ap, int);\n"
+            "  va_end(ap);\n"
+            "  return a[0];\n"
+            "}\n",
+            arm.cc, arm.target);
+        ASSERT_TRUE(bundle.lowered.lir.ok);
+        ASSERT_TRUE(bundle.rewritten.ok);
+        DiagnosticReporter ccRep;
+        auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                                   *bundle.lowered.target,
+                                                   bundle.alloc, ccRep);
+        ASSERT_TRUE(result.ok())
+            << "a VLA function that calls va_start must materialize: "
+            << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+        for (auto const& d : ccRep.all())
+            EXPECT_NE(d.code, DiagnosticCode::L_VlaNonLeafFrameUnsupported)
+                << "the va-arm of the non-leaf VLA gate must be gone, not re-worded";
+        ASSERT_EQ(result.perFunc.size(), 1u);
+        auto const* cc = bundle.lowered.target->callingConvention(arm.cc);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->framePointer.has_value());
+        ASSERT_TRUE(cc->stackPointer.has_value());
+        FrameLayout const& layout = result.perFunc[0];
+        auto const leas = leaBasesAndOffsets(result.lir, *bundle.lowered.target, 0);
+        bool incomingOffFp = false;
+        for (auto const& [base, offset] : leas) {
+            EXPECT_NE(base, cc->stackPointer->ordinal)
+                << "a lea at [SP+" << offset << "] in a frame whose SP moved: the va areas (and every "
+                   "fixed-frame address) are the frame pointer's";
+            if (base == cc->framePointer->ordinal
+                && offset >= static_cast<std::int64_t>(layout.totalFrameSize))
+                incomingOffFp = true;
+        }
+        EXPECT_TRUE(incomingOffFp)
+            << "the incoming va area (the overflow area, or the Win64 home space) is addressed off the "
+               "frame pointer at or past the fixed frame's top";
+    }
 }
 
 // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that is a SEH PARENT (guards a
@@ -1277,6 +2393,146 @@ TEST(LirCallconv, MultiFunctionModuleMaterializesEachFunction) {
     EXPECT_EQ(result.perFunc.size(), 2u);
 }
 
+// ── THE SAVED-REGISTER AREA BEGINS AT A MULTIPLE OF THE WIDEST REGISTER IT SAVES ──
+//
+// A rule of the LAYOUT, stated with no convention and no format named
+// (`FrameLayout::savedRegAreaOffset`, `FrameLayout::savedRegAreaAlign`). The
+// area sits above the outgoing-argument area, which is counted in pointer-width
+// slots: an odd count of them ends 8 bytes off a multiple of 16, and a register
+// saved WHOLE at 16 bytes would then sit in an unaligned slot — which an unwind
+// format may be unable to state at all (both vector save codes of Win64
+// UNWIND_INFO say a multiple of 16, by the format's documentation:
+// D-WIN64-XMM-UNWIND-RESTORE).
+//
+// ★ BOTH HALVES ARE THE RULE. (1) Every saved register sits at a multiple of the
+// width its convention saves it at. (2) A frame that saves nothing wider than a
+// pointer IS WHERE IT ALWAYS WAS: its saved-register area begins exactly where
+// the outgoing area ends. Rounding to the area's stride instead — 16 bytes on a
+// target whose widest float register is 16, whatever the function saves — gives
+// (1) and breaks (2): it moves the frame of every function whose widest call
+// passes an odd count of stack slots and grows most of them by 16 bytes.
+//
+// Pinned where it is made, for EVERY shipped convention of EVERY target, with
+// callers whose widest call passes 0, 1, 2 and 3 arguments beyond what the
+// convention passes in registers, each once keeping an INTEGER across that call
+// and once keeping a DOUBLE across it (which a convention that preserves a
+// vector register whole keeps in one, and therefore saves). The widths are asked
+// of the owner the prologue asks (`calleeSavedAccessFlags`), never written here.
+TEST(LirCallconv, SavedRegisterAreaBeginsAtAMultipleOfTheWidestRegisterItSaves) {
+    std::size_t movedOntoABoundary = 0;   // over every convention of every target
+    std::size_t leftWhereItWas     = 0;   // off the stride, nothing wide saved
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto target = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(target.has_value()) << targetName;
+        std::size_t const conventions = (*target)->callingConventions().size();
+        ASSERT_GE(conventions, 1u) << targetName;
+        for (std::uint16_t ccIndex = 0; ccIndex < conventions; ++ccIndex) {
+            auto const* cc = (*target)->callingConvention(ccIndex);
+            ASSERT_NE(cc, nullptr);
+            SCOPED_TRACE(std::string{targetName} + " / " + cc->name);
+            std::size_t const inRegisters = cc->argGprs.size();
+            ASSERT_GE(inRegisters, 1u);
+            std::string src;
+            for (std::size_t extra = 0; extra <= 3; ++extra) {
+                std::size_t const args = inRegisters + extra;
+                std::string params;
+                std::string values;
+                for (std::size_t a = 0; a < args; ++a) {
+                    params += std::format("{}long long a{}", a == 0 ? "" : ", ", a);
+                    values += std::format("{}{}", a == 0 ? "" : ", ", a + 1);
+                }
+                src += std::format("long long g{}({}) {{ return a0 + a{}; }}\n",
+                                   extra, params, args - 1);
+                src += std::format("long long f{}(long long keep) {{ return g{}({}) + keep; }}\n",
+                                   extra, extra, values);
+                src += std::format("double h{}(double keep) {{ return (double)g{}({}) + keep; }}\n",
+                                   extra, extra, values);
+            }
+            auto bundle = lowerThroughRewrite(src, ccIndex, targetName);
+            ASSERT_TRUE(bundle.lowered.lir.ok);
+            ASSERT_TRUE(bundle.rewritten.ok);
+            DiagnosticReporter ccRep;
+            auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                                       *bundle.lowered.target,
+                                                       bundle.alloc, ccRep);
+            ASSERT_TRUE(result.ok());
+            std::size_t onTheStride  = 0;   // callers whose outgoing area ends on it
+            std::size_t offTheStride = 0;   // … and off it
+            for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
+                FrameLayout const& layout = result.perFunc[i];
+                ASSERT_GT(layout.slotSize, 0u);
+                ASSERT_GT(layout.outgoingSlotSize, 0u);
+                std::uint32_t const base = layout.savedRegAreaOffset();
+                // (1) EVERY SAVED REGISTER AT A MULTIPLE OF ITS OWN SAVE WIDTH.
+                std::uint32_t widest = 0;
+                for (std::size_t r = 0; r < layout.savedRegs.size(); ++r) {
+                    DiagnosticReporter widthRep;
+                    auto const flags = calleeSavedAccessFlags(
+                        *bundle.lowered.target, *cc, layout.savedRegs[r].regClass(),
+                        "t", widthRep);
+                    ASSERT_TRUE(flags.has_value());
+                    std::uint32_t const bytes = lirInstWidthBits(*flags) / 8u;
+                    ASSERT_GT(bytes, 0u);
+                    widest = std::max(widest, bytes);
+                    std::uint32_t const slot =
+                        base + static_cast<std::uint32_t>(r) * layout.slotSize;
+                    EXPECT_EQ(slot % bytes, 0u)
+                        << "function #" << i << ": saved register #" << r << " is "
+                        << bytes << " bytes wide and sits at " << slot
+                        << " (the area begins at " << base
+                        << ", the outgoing area ends at "
+                        << layout.outgoingArgAreaSize << ")";
+                }
+                EXPECT_EQ(layout.savedRegAreaAlign, widest)
+                    << "function #" << i << ": the area's alignment is the widest "
+                       "save it holds";
+                // (2) NOTHING WIDER THAN A POINTER SAVED: THE FRAME IS WHERE IT WAS.
+                if (widest <= layout.outgoingSlotSize) {
+                    EXPECT_EQ(base, layout.outgoingArgAreaSize)
+                        << "function #" << i << " saves nothing wider than "
+                        << layout.outgoingSlotSize << " bytes (widest " << widest
+                        << "), so its saved-register area begins where its outgoing "
+                           "area ends";
+                } else {
+                    EXPECT_GE(base, layout.outgoingArgAreaSize);
+                    EXPECT_LT(base - layout.outgoingArgAreaSize, widest);
+                }
+                // Everything above goes through that base, and the frame holds it.
+                EXPECT_EQ(layout.spillAreaOffset(), base + layout.savedRegAreaSize);
+                EXPECT_GE(layout.localAreaOffset(),
+                          layout.spillAreaOffset() + layout.spillAreaSize);
+                EXPECT_GE(layout.totalFrameSize,
+                          layout.localAreaOffset() + layout.localAreaSize);
+                if (!layout.hasCalls) continue;
+                if (layout.outgoingArgAreaSize % layout.slotSize == 0u) {
+                    ++onTheStride;
+                    continue;
+                }
+                ++offTheStride;
+                if (base > layout.outgoingArgAreaSize) {
+                    ++movedOntoABoundary;
+                } else if (layout.savedRegAreaSize + layout.spillAreaSize > 0u) {
+                    ++leftWhereItWas;
+                }
+            }
+            EXPECT_GE(onTheStride, 1u)
+                << "no caller's outgoing area ended on the stride: the even case was "
+                   "not read";
+            EXPECT_GE(offTheStride, 1u)
+                << "no caller's outgoing area ended off the stride: the odd case, the "
+                   "one the rule exists for, was not read";
+        }
+    }
+    // The premises: both halves of the rule were MET, somewhere in the matrix.
+    EXPECT_GE(movedOntoABoundary, 1u)
+        << "no frame saved a register wider than a pointer above an off-stride "
+           "outgoing area: half (1) of the rule was never exercised";
+    EXPECT_GE(leftWhereItWas, 1u)
+        << "no frame with an off-stride outgoing area and nothing wide saved owned "
+           "a saved register or a spill slot: half (2) of the rule was never "
+           "exercised";
+}
+
 TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     // Lock the FrameLayout substrate contract: spillAreaOffset ==
     // savedRegAreaSize; savedRegAreaSize == savedRegs.size() * slotSize;
@@ -1303,12 +2559,20 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     ASSERT_NE(cc, nullptr);
     for (std::size_t i = 0; i < result.perFunc.size(); ++i) {
         auto const& layout = result.perFunc[i];
-        // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (2026-06-02): spillAreaOffset is now
-        // outgoingArgAreaSize + savedRegAreaSize (outgoing area is
-        // the new SP+0 zone; saved regs sit above it).
+        // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (2026-06-02): the outgoing area is
+        // the SP+0 zone and the saved regs sit above it — at the first
+        // multiple of the widest register the area saves at or above its
+        // end, which is its end when nothing wider than a pointer is saved
+        // (the rule `SavedRegisterAreaBeginsAtAMultipleOfTheWidestRegisterItSaves`
+        // pins for every convention); the spill area follows the saved regs.
+        ASSERT_GT(layout.slotSize, 0u);
+        std::uint32_t const savedAlign =
+            layout.savedRegAreaAlign <= 1u ? 1u : layout.savedRegAreaAlign;
+        EXPECT_EQ(layout.savedRegAreaOffset(),
+                  (layout.outgoingArgAreaSize + savedAlign - 1u)
+                      / savedAlign * savedAlign);
         EXPECT_EQ(layout.spillAreaOffset(),
-                  layout.outgoingArgAreaSize + layout.savedRegAreaSize);
-        EXPECT_EQ(layout.savedRegAreaOffset(), layout.outgoingArgAreaSize);
+                  layout.savedRegAreaOffset() + layout.savedRegAreaSize);
         EXPECT_EQ(layout.savedRegAreaSize,
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
@@ -1320,15 +2584,13 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
         EXPECT_EQ(layout.localAreaSize,
                   layout.numLocalAllocas * layout.slotSize);
         EXPECT_EQ(layout.localAreaOffset(),
-                  layout.outgoingArgAreaSize + layout.savedRegAreaSize
-                      + layout.spillAreaSize);
+                  layout.spillAreaOffset() + layout.spillAreaSize);
         // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7
         // (2026-06-02) + the local-alloca area (2026-06-02):
         // expected formula incorporates outgoingArgAreaSize directly
         // (already includes the callee's shadow-space when hasCalls)
         // AND the new localAreaSize above the spill area.
-        std::uint32_t const raw = layout.outgoingArgAreaSize
-                                + layout.savedRegAreaSize
+        std::uint32_t const raw = layout.spillAreaOffset()
                                 + layout.spillAreaSize
                                 + layout.localAreaSize;
         std::uint32_t expected;
@@ -4743,7 +6005,7 @@ countSpStoresInOffsetRange(Lir const& lir, LirFuncId fn, std::uint16_t storeOp,
 // pieces — the silent split — would land the struct bytes in rsi/rdx/rcx, NOT the
 // outgoing area, so countStoresInOffsetRange would see 0 → red.)
 TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs) {
-    auto bundle = lowerThroughRewrite(
+    auto bundle = lowerThroughWideCallArgsAndRewrite(
         "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
         "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
         "long use(void) {\n"
@@ -4753,6 +6015,9 @@ TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs
     ASSERT_TRUE(bundle.lowered.lir.ok)
         << (bundle.lowered.lirReporter.all().empty()
                 ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.wide.ok)
+        << (bundle.regallocRep.all().empty()
+                ? "" : bundle.regallocRep.all()[0].actual);
     ASSERT_TRUE(bundle.alloc.ok());
     ASSERT_TRUE(bundle.rewritten.ok);
     DiagnosticReporter ccRep;
@@ -4770,14 +6035,15 @@ TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs
     EXPECT_EQ(cc->shadowSpaceBytes, 0u);
 
     // BLOCKER-2: the caller's outgoing-args area is sized for the 24B struct =
-    // ceil(24/8)*8 = 24 bytes. The naive pre-scan (counting the carrier's address
-    // Reg as ONE GPR arg → 0 overflow) would under-reserve to 0 → this goes red.
+    // ceil(24/8)*8 = 24 bytes — the furthest byte the wide-call pass's copy
+    // stores reach. A pre-scan that counted none of them would under-reserve to
+    // 0 → this goes red.
     FrameLayout const* callerLayout = soleCallerLayout(result);
     ASSERT_NE(callerLayout, nullptr);
     EXPECT_GE(callerLayout->outgoingArgAreaSize, 24u)
         << "BLOCKER-2: the outgoing-args area must reserve ceil(24/8)*8 = 24 bytes "
-           "for the by-value-stack aggregate (computeMaxOutgoingStackArgs accounts "
-           "for the carrier's overflow slots)";
+           "for the by-value-stack aggregate (computeMaxOutgoingStackArgs counts "
+           "the bytes the wide-call pass's copy stores reach)";
 
     // BLOCKER-1: the struct's bytes are byte-COPIED into the outgoing area at
     // [sp + 0 .. 24) (shadowSpaceBytes=0) — three 8-byte SP-relative stores. NO
@@ -4805,7 +6071,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs
 // register pieces lands the first piece in a register + splits → the 16B contiguous
 // stack copy vanishes → red.
 TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOverflow) {
-    auto bundle = lowerThroughRewrite(
+    auto bundle = lowerThroughWideCallArgsAndRewrite(
         "struct LL { long a; long b; };\n"            // 16B → InRegisters (2 GPR)
         "long combine(int n, ...) { return n; }\n"
         "long use(void) {\n"
@@ -4813,6 +6079,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOver
         "  return combine(1, 100L, 200L, 300L, 400L, 500L, p);\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.wide.ok);
     ASSERT_TRUE(bundle.alloc.ok());
     ASSERT_TRUE(bundle.rewritten.ok);
     DiagnosticReporter ccRep;
@@ -4848,41 +6115,28 @@ TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOver
            "SP-relative stores [sp+0,sp+8] — never a register/stack split";
 }
 
-// FOLD (adversarial-review BLOCKER-3, silent miscompile) red-on-disable: the by-value-
-// stack aggregate byte-copy scratch GPR must AVOID the SOURCE registers of the pending
-// register arg-moves. The byte-copies are emitted in the stack-store phase BEFORE the
-// register arg-moves read their `.src` (lir_callconv.cpp: copies ~line 2300 vs arg-moves
-// ~line 2310); if an outgoing scalar arg VALUE lives in the chosen scratch, the byte-copy
-// clobbers it before its `mov dest, src` reads it → that argument SILENTLY receives the
-// struct's bytes.
+// FOLD (adversarial-review BLOCKER-3, silent miscompile) — REBUILT IN THE POST-PASS
+// FORM by the carrier's stage rule (P69, lane `cs`, fold f26c). The hazard this pin
+// was written for: callconv used to byte-copy a stacked by-value aggregate into the
+// outgoing area AFTER allocation, through a caller-saved scratch register it picked
+// itself, in the stack-store phase BEFORE the register arg-moves read their `.src` —
+// so a scratch that coincided with an argument's source clobbered that argument with
+// the struct's bytes (the fold added an avoid-set of arg-move sources). That copy no
+// longer exists: `lowerWideCallArgs` copies the aggregate BEFORE allocation, in
+// virtual registers whose live ranges end at their `store_outgoing_arg`, and takes
+// the carrier off the Call; the LIR verifier refuses a post-pass module that still
+// carries one, so callconv holds no copy and picks no scratch.
 //
-// This is a SYNTHETIC-LIR pin (not driven through regalloc) for full control over which
-// physical register is a live arg-move source — the hazard requires an arg-move SOURCE to
-// coincide with the scratch picker's choice, and the register allocator systematically
-// parks call-surviving arg sources in callee-saved registers (away from the caller-saved
-// scratch pool), so a regalloc-driven C shape cannot deterministically force the collision.
-// Here we hand-build a variadic call whose arg 1 source is rcx — the FIRST caller-saved
-// GPR the (reverted) scratch picker would choose after skipping the variadic-count reg
-// (rax) — so reverting the avoid-set deterministically aliases the scratch with a live
-// source.
-//
-// The invariant pinned is the PRECISE one the fix enforces: the byte-copy scratch ∉
-// {sources of the arg-passing moves}. (We deliberately do NOT assert ∉ cc.argGprs — an
-// argGpr that is only an arg-move DEST is written AFTER the copy stores to memory, so the
-// copy's transient write to it is dead; blanket-rejecting the whole argGpr pool would
-// falsely fail-loud on the legitimate register-exhaustion carrier — see
-// examples/c/varargs_struct_split — so the fix and this pin both track only the
-// live SOURCE set.)
-//
-// RED-ON-DISABLE: revert the avoid-set extension in lir_callconv.cpp (the `liveArgSrc`
-// build + the `liveArgSrc.contains(*ord)` rejection). The scratch picker walks
-// cc.callerSaved = [rax, rcx, ...] and chooses the first GPR not in {rax (variadic count),
-// callee, carrier addr} → rcx. But rcx is arg 1's source (`mov rsi, rcx`), so the byte-
-// copy `load rcx,[addr]; store [sp],rcx` clobbers it before the arg-move reads it: the
-// silent arg-clobber miscompile, and the load-bearing assertion (scratch ∉ arg-move
-// sources) goes red. With the fix, rcx ∈ liveArgSrc is rejected and the scratch falls
-// through to rdx (a non-source) → green.
-TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
+// What the pin asserts now is the same property over the module callconv is
+// actually handed: a post-allocation call whose stacked 24-byte aggregate is the
+// pass's copy — three `load rdx, [r12 + k]` / `store_outgoing_arg rdx @k` pairs, the
+// chunk register an allocator gives a value live from its load to its store — with
+// arg 0 in r13 and arg 1 in rcx (rcx is the register the old scratch picker chose
+// first). callconv must accept it (the verifier's stage rule holds), write the three
+// eightbytes at [sp+0, 24) from rdx and from nothing else (it adds no copy of its
+// own), and write NEITHER argument's source register anywhere between its first
+// outgoing store and the call (no argument receives the struct's bytes).
+TEST(LirCallconvAbi, SysVStackedAggregateCopyIsTheWideCallPassesAndClobbersNoArgumentSource) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     TargetSchema const& sch = **target;
@@ -4890,57 +6144,64 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
     auto const callOp = sch.opcodeByMnemonic("call");
     auto const retOp  = sch.opcodeByMnemonic("ret");
     auto const storeOpId = sch.opcodeByMnemonic("store");
+    auto const storeOutOp = sch.opcodeByMnemonic("store_outgoing_arg");
+    auto const gprLoadOp =
+        sch.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load);
     ASSERT_TRUE(callOp.has_value());
     ASSERT_TRUE(retOp.has_value());
     ASSERT_TRUE(storeOpId.has_value());
+    ASSERT_TRUE(storeOutOp.has_value());
+    ASSERT_TRUE(gprLoadOp.has_value());
 
     auto const* cc = sch.callingConvention(0);
     ASSERT_NE(cc, nullptr);
     ASSERT_EQ(cc->name, "sysv_amd64");
-    ASSERT_FALSE(cc->slotAligned);
     ASSERT_TRUE(cc->stackPointer.has_value());
-    ASSERT_TRUE(cc->variadicVectorCountReg.has_value());  // SysV rax (AL)
     std::uint16_t const spOrd = cc->stackPointer->ordinal;
 
-    // Pin the register roles the scenario depends on. r12/r13 are callee-saved (stable
-    // arg-source homes that the scratch picker WOULD pass over anyway); rcx is the
-    // critical one — it is BOTH a live arg-move source here AND the first caller-saved GPR
-    // the reverted scratch picker selects (after the rax variadic-count reg).
-    auto const rcxOrd = sch.registerByName("rcx");
-    auto const r12Ord = sch.registerByName("r12");   // carrier address reg
+    auto const rcxOrd = sch.registerByName("rcx");   // arg 1 source
+    auto const rdxOrd = sch.registerByName("rdx");   // the copy's chunk register
+    auto const r12Ord = sch.registerByName("r12");   // the aggregate's temp address
     auto const r13Ord = sch.registerByName("r13");   // arg 0 source
-    ASSERT_TRUE(rcxOrd.has_value());
-    ASSERT_TRUE(r12Ord.has_value());
-    ASSERT_TRUE(r13Ord.has_value());
+    ASSERT_TRUE(rcxOrd.has_value() && rdxOrd.has_value());
+    ASSERT_TRUE(r12Ord.has_value() && r13Ord.has_value());
     LirReg const rcx = makePhysicalReg(*rcxOrd, LirRegClass::GPR);
+    LirReg const rdx = makePhysicalReg(*rdxOrd, LirRegClass::GPR);
     LirReg const r12 = makePhysicalReg(*r12Ord, LirRegClass::GPR);
     LirReg const r13 = makePhysicalReg(*r13Ord, LirRegClass::GPR);
+    auto const chunkWidth = lirInstWidthFlagForBits(64);
+    ASSERT_TRUE(chunkWidth.has_value());
 
     LirBuilder b{sch};
     b.addFunction(SymbolId{71});
     LirBlockId const block = b.createBlock();
     b.beginBlock(block);
-    // A variadic call:
-    //   call <sym>, r13, rcx, r12, byval#24
-    //     arg 0 (fixed)  src = r13          -> dest argGprs[0] = rdi  : mov rdi, r13
-    //     arg 1 (vararg) src = rcx          -> dest argGprs[1] = rsi  : mov rsi, rcx
-    //     arg 2 (vararg) = (r12, byval#24)  -> 24B by-value-stack carrier, byte-copied
-    //                                          from [r12] into the outgoing area
-    // fixedOperandCount = 1 (only arg 0 is a named param). The carrier address r12 and the
-    // arg sources {r13, rcx} are all distinct; the arg-moves {rdi<-r13, rsi<-rcx} form no
-    // cycle (no source equals a dest), so materialization emits them in order.
+    for (std::int32_t off = 0; off < 24; off += 8) {
+        std::array<LirOperand, 3> const ld{LirOperand::makeReg(r12),
+                                           LirOperand::makeMemBase(1),
+                                           LirOperand::makeMemOffset(off)};
+        b.addInst(*gprLoadOp, rdx, ld, /*payload=*/0, *chunkWidth);
+        std::array<LirOperand, 1> const so{LirOperand::makeReg(rdx)};
+        b.addInst(*storeOutOp, InvalidLirReg, so,
+                  static_cast<std::uint32_t>(off), *chunkWidth);
+    }
+    // The shrunken, placed variadic Call: arg 0 (fixed) = r13, arg 1 (vararg) = rcx.
     std::uint32_t const variadicPayload =
         call_payload::encode(/*isVariadic=*/true, /*fixedOperandCount=*/1u);
-    std::array<LirOperand, 5> callOps{
+    std::array<LirOperand, 3> callOps{
         LirOperand::makeSymbolRef(13),
         LirOperand::makeReg(r13),
         LirOperand::makeReg(rcx),
-        LirOperand::makeReg(r12),
-        LirOperand::makeByValueStackAgg(24),
     };
-    b.addInst(*callOp, InvalidLirReg, callOps, variadicPayload);
+    b.addInst(*callOp, InvalidLirReg, callOps, variadicPayload,
+              kLirInstFlagOutgoingArgsPlaced);
     b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
     Lir lir = std::move(b).finish();
+
+    DiagnosticReporter verifyRep;
+    EXPECT_TRUE(verifyLirPostRegalloc(lir, sch, verifyRep))
+        << "the post-pass form must satisfy the carrier's stage rule: "
+        << (verifyRep.all().empty() ? "" : verifyRep.all()[0].actual);
 
     LirAllocation alloc;
     alloc.perFunc.emplace_back();
@@ -4952,56 +6213,55 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
     DiagnosticReporter ccRep;
     auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
     ASSERT_TRUE(result.ok())
-        << "the by-value-stack carrier must materialize cleanly: "
+        << "the post-pass aggregate copy must materialize cleanly: "
         << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
     EXPECT_EQ(ccRep.errorCount(), 0u);
 
-    // The byte-copy scratch is the VALUE register of each SP-relative store into the
-    // outgoing area [sp+0, 24). store layout: [value_reg, base_reg, MemBase, MemOffset].
-    // (The carrier pins above already prove a 24B carrier emits exactly these SP stores.)
+    // Walk the caller in order: the outgoing-area stores [sp+0, 24) and their value
+    // registers, and every register an instruction WRITES from the first such store
+    // up to the call. store layout: [value_reg, base_reg, MemBase, MemOffset].
     LirFuncId const fn = result.lir.funcAt(0);
     Lir const& out = result.lir;
-    std::unordered_set<std::uint16_t> scratchOrds;
-    for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn); ++bi) {
+    std::vector<std::int32_t> outgoingOffsets;
+    std::unordered_set<std::uint16_t> outgoingValueOrds;
+    std::unordered_set<std::uint16_t> writtenBeforeTheCall;
+    bool inArgSetup = false;
+    bool sawCall = false;
+    for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn) && !sawCall; ++bi) {
         LirBlockId const blk = out.funcBlockAt(fn, bi);
         for (std::uint32_t i = 0; i < out.blockInstCount(blk); ++i) {
             LirInstId const inst = out.blockInstAt(blk, i);
-            if (out.instOpcode(inst) != *storeOpId) continue;
+            std::uint16_t const op = out.instOpcode(inst);
+            if (op == *callOp) { sawCall = true; break; }
             auto const ops = out.instOperands(inst);
-            if (ops.size() == 4
+            if (op == *storeOpId && ops.size() == 4
                 && ops[0].kind == LirOperandKind::Reg && ops[0].reg.isPhysical != 0
                 && ops[1].kind == LirOperandKind::Reg && ops[1].reg.isPhysical != 0
                 && ops[1].reg.id == spOrd
                 && ops[3].kind == LirOperandKind::MemOffset
-                && ops[3].offset >= 0 && ops[3].offset < 24)
-                scratchOrds.insert(ops[0].reg.id);
+                && ops[3].offset >= 0 && ops[3].offset < 24) {
+                outgoingOffsets.push_back(ops[3].offset);
+                outgoingValueOrds.insert(ops[0].reg.id);
+                inArgSetup = true;
+            }
+            LirReg const res = out.instResult(inst);
+            if (inArgSetup && res.valid() && res.isPhysical != 0)
+                writtenBeforeTheCall.insert(res.id);
         }
     }
-    ASSERT_FALSE(scratchOrds.empty())
-        << "precondition: the 24B struct carrier must byte-copy into [sp+0,24) — the "
-           "scratch value-reg is read from those SP stores (else the pin is vacuous)";
-
-    // The arg-move SOURCE set: rcx (arg 1) and r13 (arg 0) are the registers the arg-
-    // passing moves READ after the byte-copy. We assert against rcx by name (the one the
-    // reverted scratch picker collides with) plus the structural source set for breadth.
-    std::unordered_set<std::uint16_t> argMoveSrcOrds{*rcxOrd, *r13Ord};
-
-    // THE LOAD-BEARING ASSERTION (red-on-disable): the byte-copy scratch must NOT be a
-    // source of any arg-passing move. Reverting the liveArgSrc avoid-set lands the scratch
-    // on rcx (arg 1's source) → the byte-copy clobbers it before `mov rsi, rcx` reads it:
-    // the silent arg-clobber miscompile.
-    for (std::uint16_t const ord : scratchOrds) {
-        EXPECT_FALSE(argMoveSrcOrds.contains(ord))
-            << "the by-value-stack byte-copy scratch must not be a SOURCE of any arg-"
-               "passing move — the copy clobbers it before the arg-move reads it, so that "
-               "outgoing scalar arg silently receives the struct's bytes "
-               "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
-    }
-    // Specifically: rcx (the reverted picker's first choice + arg 1's source) must have
-    // been rejected in favor of a non-source scratch.
-    EXPECT_EQ(scratchOrds.count(*rcxOrd), 0u)
-        << "the scratch must not be rcx — rcx is arg 1's live source; choosing it (the "
-           "reverted behavior) corrupts the rsi argument with the struct's bytes";
+    ASSERT_TRUE(sawCall) << "the caller must still make its call";
+    EXPECT_EQ(outgoingOffsets, (std::vector<std::int32_t>{0, 8, 16}))
+        << "the three eightbytes are written once each, at the offsets the wide-call "
+           "pass placed them at — callconv places and copies nothing of its own";
+    EXPECT_EQ(outgoingValueOrds, (std::unordered_set<std::uint16_t>{*rdxOrd}))
+        << "every outgoing eightbyte comes from the copy's own chunk register; another "
+           "value register means callconv made a copy of its own through a scratch";
+    EXPECT_FALSE(writtenBeforeTheCall.contains(*rcxOrd))
+        << "rcx is arg 1's source: written between the outgoing stores and the call, "
+           "the rsi argument receives something else (the silent arg-clobber)";
+    EXPECT_FALSE(writtenBeforeTheCall.contains(*r13Ord))
+        << "r13 is arg 0's source: written between the outgoing stores and the call, "
+           "the rdi argument receives something else";
 }
 
 // D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 5.1, LIR) — an HFA `{double,double}` vararg
@@ -5079,7 +6339,8 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
     // The CALLER `use` is declared FIRST (function index 0 for the layout query);
     // `sink` is DEFINED after via a forward reference that merges with the leading
     // prototype (D-CSUBSET-FN-PROTOTYPE) — a real defined function so the call binds.
-    auto bundle = lowerThroughRewrite(
+    // The pipeline's order: the carrier lives only until the wide-call pass.
+    auto bundle = lowerThroughWideCallArgsAndRewrite(
         "struct LL { long a; long b; };\n"
         "long sink(int n, ...);\n"                     // forward prototype (merges below)
         "long use(void) {\n"                            // the caller — function 0
@@ -5091,6 +6352,7 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
     ASSERT_TRUE(bundle.lowered.lir.ok)
         << (bundle.lowered.lirReporter.all().empty()
                 ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.wide.ok);
     ASSERT_TRUE(bundle.alloc.ok());
     ASSERT_TRUE(bundle.rewritten.ok);
 

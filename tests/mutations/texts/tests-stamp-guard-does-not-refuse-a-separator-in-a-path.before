@@ -1,0 +1,1 @@
+            if("${_dss_name}=${_dss_abs}" MATCHES "[,;]" OR _dss_abs MATCHES "=")

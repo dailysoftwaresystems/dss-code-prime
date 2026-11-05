@@ -236,6 +236,7 @@ void TreeBuilder::discardTrailsIfIdle_() noexcept {
     pendingChildren_.discardJournal();
     open_.discardJournal();
     scopes_.discardJournal();
+    scopeKindCounts_.discardJournal();
     closedCookies_.discardJournal();
     nodeWrites_.discardJournal();
     childIndex_.discardJournal();
@@ -565,7 +566,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         //     grammar that splits an opener from its closer across two rules,
         //     or a builder bug — never user input, so it stays an internal
         //     invariant (repaired where it can be, so it is reported once).
-        // `scopes_.pop()`, not `popScope()`: `finish()` closes frames after
+        // `popScopeEntry_()`, not `popScope()`: `finish()` closes frames after
         // `finished_` is set, and `popScope` refuses to run then.
         {
             auto const depth = static_cast<std::size_t>(fr.scopeDepth);
@@ -580,7 +581,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
                                 depth),
                     frameSpan);
             }
-            while (scopes_.size() > depth) scopes_.pop();
+            while (scopes_.size() > depth) popScopeEntry_();
         }
 
         const bool isTarget = (fr.cookie == cookie);
@@ -630,32 +631,49 @@ struct ResolvedMeaning {
 // Distinct from `schema.isTokenValidInScope` which enforces the schema's
 // top-level `scopes.validity[].forbid` rules (per-scope, not per-token).
 // Both checks are AND'd in `resolveMeaning`.
+// P69 L2a2 (lane `lm`): what a token's resolution knows of the scope stack — its two ENDS (for
+// `topMustBe` / `outermost`) and a PRESENCE oracle (`open`) for every other question, so no
+// check reads the stack's depth: it did, once per token, and a parse cost Θ(tokens × nesting).
+// `work` counts the resolution and every presence question (`TreeBuilder::scopeWork`).
+// P69 L2b1 (lane `lm`, the L2a2 review's A4): the view holds the two ends as VALUES, not the
+// stack — a resolution has no stack to walk — and the stack's own reads count into the same
+// `scopeWork` (`TrailedStack::reads`), so a walk written anywhere in the builder is seen.
+struct ScopeView {
+    ScopeKind                  top     = ScopeKind::None;
+    ScopeKind                  bottom  = ScopeKind::None;
+    bool                       empty   = true;
+    GrammarSchema::ScopeOpenFn open    = nullptr;
+    void const*                builder = nullptr;
+    std::uint64_t*             work    = nullptr;
+};
+
+bool askScopeOpen(void const* view, ScopeKind kind) noexcept {
+    auto const& sv = *static_cast<ScopeView const*>(view);
+    ++*sv.work;   // a presence question
+    return sv.open(sv.builder, kind);
+}
+
 [[nodiscard]] bool meaningAllowedByScopeRequire(
     LexemeMeaning const& m,
-    std::span<ScopeKind const> scopes) noexcept {
+    ScopeView const& sv) noexcept {
     auto const& sr = m.scopeRequire;
     // forbid
     for (ScopeKind f : sr.forbid) {
-        for (ScopeKind active : scopes) {
-            if (f == active) return false;
-        }
+        if (askScopeOpen(&sv, f)) return false;
     }
     // topMustBe — innermost is the last element (stack grows back).
     if (sr.topMustBe.has_value()) {
-        if (scopes.empty() || scopes.back() != *sr.topMustBe) return false;
+        if (sv.empty || sv.top != *sr.topMustBe) return false;
     }
     // outermost — bottom-of-stack is the first element.
     if (sr.outermost.has_value()) {
-        if (scopes.empty() || scopes.front() != *sr.outermost) return false;
+        if (sv.empty || sv.bottom != *sr.outermost) return false;
     }
     // anyOf — at least one of the listed must be active.
     if (!sr.anyOf.empty()) {
         bool any = false;
         for (ScopeKind required : sr.anyOf) {
-            for (ScopeKind active : scopes) {
-                if (required == active) { any = true; break; }
-            }
-            if (any) break;
+            if (askScopeOpen(&sv, required)) { any = true; break; }
         }
         if (!any) return false;
     }
@@ -721,7 +739,7 @@ struct ResolvedMeaning {
     GrammarSchema const& schema,
     SchemaTokenId preResolved,
     std::unordered_set<SchemaTokenId> const& bodyKinds,
-    std::span<ScopeKind const> scopes) noexcept {
+    ScopeView const& sv) noexcept {
     if (!(bodyKinds.contains(preResolved)
           || isBuiltinLiteralKind(schema, preResolved)
           || isBuiltinTriviaKind(schema, preResolved)
@@ -730,7 +748,7 @@ struct ResolvedMeaning {
                 "a body-mode defaultToken, a built-in literal, nor a "
                 "mode-introduced kind — likely a tokenizer/schema drift bug");
     }
-    if (!schema.isTokenValidInScope(preResolved, scopes)) {
+    if (!schema.isTokenValidInScope(preResolved, &askScopeOpen, &sv)) {
         return ResolvedMeaning{};
     }
     ResolvedMeaning out;
@@ -743,10 +761,11 @@ struct ResolvedMeaning {
 
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                std::string_view lexeme,
-                               std::span<ScopeKind const> scopes,
+                               ScopeView const& sv,
                                std::unordered_set<SchemaTokenId> const& bodyKinds,
                                SchemaTokenId errorKind,
                                SchemaTokenId preResolved = InvalidSchemaToken) {
+    ++*sv.work;   // a resolution
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
 
@@ -757,7 +776,7 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     // recovery flows through P_UnknownToken.
     if (candidates.empty() && preResolved.valid()) {
         if (preResolved != errorKind) {
-            return makeSyntheticMeaning(schema, preResolved, bodyKinds, scopes);
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds, sv);
         }
         return out;
     }
@@ -766,8 +785,8 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     // A candidate survives iff BOTH the schema's per-scope forbid rules
     // AND the candidate's per-meaning scopeRequire allow it.
     auto candidateAllowed = [&](LexemeMeaning const& m) {
-        return schema.isTokenValidInScope(m.id, scopes)
-            && meaningAllowedByScopeRequire(m, scopes);
+        return schema.isTokenValidInScope(m.id, &askScopeOpen, &sv)
+            && meaningAllowedByScopeRequire(m, sv);
     };
 
     // Fast path: tokenizer pre-resolved a `schemaKind`. Find the named
@@ -809,7 +828,7 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
             if (m.id == preResolved) { preResolvedInCandidates = true; break; }
         }
         if (!preResolvedInCandidates && preResolved != errorKind) {
-            return makeSyntheticMeaning(schema, preResolved, bodyKinds, scopes);
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds, sv);
         }
     }
 
@@ -882,8 +901,15 @@ void TreeBuilder::pushToken(Token const& tok) {
     //     resolveMeaning fast-path short-circuits the priority scan.
     //  2. Word fallback to Identifier when the lexeme isn't a keyword.
     //  3. No match at all → Error leaf + P_UnknownToken.
+    bool const noScope = scopes_.empty();
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : scopes_.back(),
+                              .bottom  = noScope ? ScopeKind::None : scopes_[0],
+                              .empty   = noScope,
+                              .open    = &TreeBuilder::scopeKindOpenThunk_,
+                              .builder = this,
+                              .work    = &scopeWork_};
     ResolvedMeaning resolved = resolveMeaning(
-        *schema_, lexeme, std::span<ScopeKind const>{scopes_},
+        *schema_, lexeme, scopeView,
         *bodyDefaultTokenKinds_, errorKind_, tok.schemaKind);
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
@@ -1112,7 +1138,45 @@ void TreeBuilder::pushScope(ScopeKind kind) {
         addBuilderInvariant_("pushScope after finish()", SourceSpan::empty(0));
         return;
     }
+    pushScopeEntry_(kind);
+}
+
+// P69 L2a2 (lane `lm`): the per-kind counts move with `scopes_` — every push and pop goes
+// through these two (see `scopeKindCounts_`).
+std::uint32_t TreeBuilder::scopeKindSlot_(ScopeKind kind) {
+    auto const key = static_cast<std::uint16_t>(kind);
+    auto it = scopeKindSlots_.find(key);
+    if (it == scopeKindSlots_.end()) {
+        it = scopeKindSlots_.emplace(key, static_cast<std::uint32_t>(scopeKindSlots_.size())).first;
+    }
+    while (scopeKindCounts_.size() <= it->second) scopeKindCounts_.push(0);
+    return it->second;
+}
+
+void TreeBuilder::pushScopeEntry_(ScopeKind kind) {
+    std::uint32_t const slot = scopeKindSlot_(kind);
+    scopeKindCounts_.assign(slot, scopeKindCounts_[slot] + 1);
     scopes_.push(kind);
+}
+
+void TreeBuilder::popScopeEntry_() {
+    std::uint32_t const slot = scopeKindSlot_(scopes_.back());
+    if (scopeKindCounts_[slot] == 0) {
+        tbFatal("a scope's kind count is 0 while the stack holds it — the counts and the "
+                "scope stack disagree");
+    }
+    scopeKindCounts_.assign(slot, scopeKindCounts_[slot] - 1);
+    scopes_.pop();
+}
+
+bool TreeBuilder::scopeKindOpen_(ScopeKind kind) const noexcept {
+    auto const it = scopeKindSlots_.find(static_cast<std::uint16_t>(kind));
+    return it != scopeKindSlots_.end() && it->second < scopeKindCounts_.size()
+        && scopeKindCounts_[it->second] > 0;
+}
+
+bool TreeBuilder::scopeKindOpenThunk_(void const* builder, ScopeKind kind) noexcept {
+    return static_cast<TreeBuilder const*>(builder)->scopeKindOpen_(kind);
 }
 
 void TreeBuilder::popScope() {
@@ -1134,7 +1198,7 @@ void TreeBuilder::popScope() {
         addBuilderInvariant_("popScope on empty scope stack", at);
         return;
     }
-    scopes_.pop();
+    popScopeEntry_();
 }
 
 ScopeKind TreeBuilder::currentScope() const noexcept {
@@ -1341,6 +1405,7 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
     snap.pendingChildren            = pendingChildren_.mark();
     snap.openFrames                 = open_.mark();
     snap.scopes                     = scopes_.mark();
+    snap.scopeKindCounts            = scopeKindCounts_.mark();
     snap.closedCookies              = closedCookies_.mark();
     snap.nodeWrites                 = nodeWrites_.mark();
     snap.walker                     = walker_.snapshot();
@@ -1453,6 +1518,7 @@ void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
     pendingChildren_.rewindTo(snap.pendingChildren);
     open_.rewindTo(snap.openFrames);
     scopes_.rewindTo(snap.scopes);
+    scopeKindCounts_.rewindTo(snap.scopeKindCounts);
     walker_.restore(std::move(*snap.walker));
     nextCookie_                 = snap.nextCookie;
     closedCookies_.rewindTo(snap.closedCookies);

@@ -1,0 +1,1 @@
+    if not _within(os.path.normcase(os.path.realpath(build_dir)), os.path.normcase(tree)):

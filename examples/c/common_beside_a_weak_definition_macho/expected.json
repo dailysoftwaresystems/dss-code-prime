@@ -1,0 +1,45 @@
+{
+  "$comment": "★★ A COMMON BESIDE A WEAK DEFINITION OF ITS NAME ON MACH-O: THE DEFINITION REPLACES THE COMMON (P69 send-back 5, review-xa4 MINOR 4; D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT) -- the Mach-O documents' `commonYieldsTo: anyDefinition`, on the reference compiler's own objects. The two objects named to the link are Apple clang's builds of `int dss_tentative; int dss_read_tentative(void) { return dss_tentative; }` under `-fcommon` (`(common) (alignment 2^2) external _dss_tentative`) and of `__attribute__((weak)) int dss_tentative = 5;` (`(__DATA,__data) weak external _dss_tentative`). ✔MEASURED 2026-10-08 (the same main.c built by Apple clang 21.0.0, ld-1267; arm64 and x86_64): in both object orders the weak definition replaces the common and the program reads 5, exit 42; the common object alone reads 0, exit 37. GNU ld answers the opposite on ELF and for MinGW's spelling on PE -- the common outranks a weak definition, 0 (`examples/c/common_beside_a_weak_definition_elf`, `examples/c/common_beside_a_weak_definition_pe_mingw`) -- which is why the answer is a key of the format document rather than a rule of the link. main.c is DSS's; the 37 it adds keeps either answer apart from the exit code of a program that did nothing -- a link that kept the common would exit 37. The `release` arm pins that optimizing the DSS half changes nothing about which of the two the program reads.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The COMMON, and the function that reads it -- through an ADRP page and a GOT load, the access Apple clang writes for a tentative definition. Source and rebuild command: `tests/link/data/tentative_common.source.c` (Apple clang 21.0.0 `-arch arm64 -O2 -fcommon -c`; md5 ede088accd5f727be3cb826aec633815). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the reader's (Mach-O) name.",
+          "path": "tests/link/data/tentative_common_arm64_macho.o",
+          "containerWitness": "_dss_read_tentative"
+        },
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (Apple clang 21.0.0 `-arch arm64 -O2 -c`; md5 ddb223ef44c3d7971dcafe81f971024d). The witness is the name both objects state.",
+          "path": "tests/link/data/tentative_weak_arm64_macho.o",
+          "containerWitness": "_dss_tentative"
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The COMMON, and the function that reads it. Source and rebuild command: `tests/link/data/tentative_common.source.c` (Apple clang 21.0.0 `-arch x86_64 -O2 -fcommon -c`; md5 4dd7411a1e1019288f0a2f34ae0170e7).",
+          "path": "tests/link/data/tentative_common_x86_64_macho.o",
+          "containerWitness": "_dss_read_tentative"
+        },
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (Apple clang 21.0.0 `-arch x86_64 -O2 -c`; md5 988aacd65a721cc55b60fbf2041199ec).",
+          "path": "tests/link/data/tentative_weak_x86_64_macho.o",
+          "containerWitness": "_dss_tentative"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

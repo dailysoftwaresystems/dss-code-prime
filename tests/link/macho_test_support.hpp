@@ -207,6 +207,7 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "apple_arm64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -242,6 +243,7 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "entryPoint": "",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {

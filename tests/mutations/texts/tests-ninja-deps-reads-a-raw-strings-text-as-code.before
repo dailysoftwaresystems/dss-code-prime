@@ -1,0 +1,1 @@
+        elif m.group() == '"' and _raw_string_at(text, i):

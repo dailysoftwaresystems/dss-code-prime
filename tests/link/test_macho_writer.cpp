@@ -1819,9 +1819,11 @@ TEST(MachOFormatJson, Arm64ObjectDeclaresDataSectionRows) {
     EXPECT_EQ(bss->type, 1u);                // S_ZEROFILL
 }
 
-// (6) A reloc-bearing RODATA item stays fail-loud (allow=false — the
-// RodataDataItemWithRelocationFailsLoud discipline shared with ELF): a
-// relocated slot cannot live in never-written `__TEXT,__const`.
+// (6) A reloc-bearing RODATA item stays fail-loud (allow=false): Mach-O's
+// object reader puts a read-only item that carries relocations in relro
+// (`__DATA,__const`), so this writer is never handed one and refuses it,
+// naming that rule. (ELF's reader does produce one — a jump table — and the
+// ELF writers take it: ElfExecWriter.RodataDataItemWithRelocationIsPatchedInPlace.)
 TEST(MachOWriter, Arm64ObjectRodataItemWithRelocationFailsLoud) {
     auto loaded = loadShippedArm64();
     AssembledModule mod;
@@ -2164,6 +2166,7 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2850,6 +2853,7 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
@@ -2928,6 +2932,7 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
@@ -2968,6 +2973,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
@@ -2992,7 +2998,15 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    // An MH_EXECUTE whose one function holds no byte is a program with no
+    // instruction to start at: refused under K_ProgramEntryUndefined alone
+    // (P69 fold 3d; K_RelocationKindMismatch before).
+    std::size_t entryUndefined = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ProgramEntryUndefined) ++entryUndefined;
+        EXPECT_NE(d.code, DiagnosticCode::K_RelocationKindMismatch) << d.actual;
+    }
+    EXPECT_EQ(entryUndefined, 1u);
 }
 
 TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
@@ -3448,6 +3462,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3512,6 +3527,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3542,6 +3558,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3577,6 +3594,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3638,6 +3656,7 @@ loadChainedFixupsExecFormat() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3698,6 +3717,7 @@ loadChainedFixupsExecFormatWithData() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3924,6 +3944,7 @@ loadLegacyBindingExecFormat() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4128,6 +4149,7 @@ loadDataImportExecFormat(bool useChainedFixups) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "dataImportBinding": "got-indirect",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -4745,6 +4767,7 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4784,6 +4807,7 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 12884901888,
@@ -4933,6 +4957,7 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4976,6 +5001,7 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,

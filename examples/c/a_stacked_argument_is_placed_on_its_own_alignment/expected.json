@@ -1,0 +1,17 @@
+{
+  "$comment": "A STACKED ARGUMENT IS PLACED ON ITS OWN ALIGNMENT, WHATEVER THE STACK POINTER'S IS AT THE CALL (P69 round 1, lane cs, fold f26c). SysV passes a by-value aggregate over 16 bytes as its bytes on the stack, begun on its own alignment, and gcc's and clang's callees use them in place; DSS placed them at their alignment relative to a stack pointer promised only 16 (measured by the native witness in run f26c-s22: misplaced for 32, 64 and 256, every value right). A caller that passes one now realigns its stack pointer once on the dynamic (VLA) frame. A variadic callee reads each argument where the caller put it -- the caller's bytes under SysV, the caller's copy under a pointer convention -- through a volatile object, after five named long longs that take the integer registers, so the long long passed after the aggregates is stacked too and the caller's outgoing area is a multiple of 256 only once the caller rounds it; the callers are a plain one, one with a VLA, one that is itself variadic, and one that is both; a VLA in a variadic function that passes nothing over-aligned (refused before, its va_start areas then stack-pointer-relative) reads its own arguments. The release arm inlines what it can. Each return before 42 names the first that failed: 10 * caller + the alignment's index (1, 2, 3) for a misplaced argument, 9 for a wrong value, 49 for the VLA-and-variadic function's values.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

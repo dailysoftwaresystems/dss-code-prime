@@ -1477,12 +1477,15 @@ TEST(StaticArchive, ReleaseMemberIsProgramStageOptimized) {
 // DEFENSIBLE, as an EXTRA, never as the case's reason to exist.
 //
 // ⓘ WHERE THE TWO FAMILIES NOW STAND — ✔MEASURED over the shipped documents:
-//   * ELF x86_64 STILL DIVERGES, structurally: `elf64-x86_64-linux{,-staticlib}`
-//     declare `pltNativeId: 4` (R_X86_64_PLT32) and an `emitOnly` PC32 alias
-//     (`R_X86_64_PC32_UNBIASED`); `-exec` declares NEITHER, and its only extra
-//     row is a TLS one. A member that CALLS a library function emits wire 4,
-//     which no image document has a row for. That is a real difference in what
-//     the two artifacts can contain, so the ELF case keeps its discriminator.
+//   * ELF x86_64 NO LONGER DIVERGES ON A CALL EITHER (P69,
+//     D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB). Until then
+//     `elf64-x86_64-linux{,-staticlib}` spelled a call as a second wire id on
+//     the PC32 row (`pltNativeId: 4`, R_X86_64_PLT32) and no image document had
+//     a row for wire 4, so a member that CALLS a library function could not be
+//     read through `-exec`, and the ELF case kept a discriminator for it. Since
+//     P69 every ELF x86_64 document declares the CALL as a row of its own
+//     (`rel32` = R_X86_64_PLT32, `isCall`), the key is retired, and that
+//     discriminator is deleted below, as it asked to be.
 //   * MACH-O x86_64 NO LONGER DIVERGES AT ALL: all four documents declare the
 //     same three rows with the same wire values. Its discriminator is gone, and
 //     its absence is correct rather than a gap — the resolution pin is what that
@@ -1561,32 +1564,15 @@ TEST(ArchiveMemberObjectFormat,
     // ── THE CONTRACT: the member resolves to the document that WROTE it ─────
     expectMemberFormatResolvesToTheWriterDocument(s, "elf64-x86_64");
 
-    // ── THE DIVERGENCE DISCRIMINATOR — KEPT HERE BECAUSE IT IS GENUINE ──────
-    // These exact bytes must be REFUSED by the image vocabulary, and on THIS
-    // family that refusal is structural rather than incidental: a member that
-    // calls a library function emits R_X86_64_PLT32 (wire 4), which
-    // `elf64-x86_64-linux{,-staticlib}` declare as `pltNativeId` and no image
-    // document declares at all. It is an EXTRA assertion on top of the
-    // resolution pin above, never this case's reason to exist.
-    // ⚠ IF THIS EVER GOES GREEN-SIDE — i.e. the image format legitimately gains
-    // a PLT32 row — DELETE THIS BLOCK, do not re-derive it onto some other
-    // coincidence. The contract is already pinned above, and a discriminator
-    // that has to be hunted for a fresh divergence every time the corpus
-    // converges is asserting the corpus, not the compiler. That mistake is on
-    // the record: the Mach-O sibling below carried exactly such a block until
-    // the typo it depended on was fixed (see this section's docblock).
-    {
-        DiagnosticReporter imageRep;
-        auto const throughImage = elf::readRelocatableObject(
-            std::span<std::uint8_t const>{memberBytes}, *s.target, *s.exec,
-            imageRep);
-        EXPECT_FALSE(throughImage.has_value())
-            << "the image format '" << s.exec->name() << "' ACCEPTED a "
-               "relocatable member carrying R_X86_64_PLT32 — the ELF x86_64 "
-               "vocabularies no longer divide here, so this EXTRA block should "
-               "be DELETED (the resolution pin above carries the contract)";
-        EXPECT_GT(imageRep.errorCount(), 0u);
-    }
+    // ⓘ THE DIVERGENCE DISCRIMINATOR THAT STOOD HERE IS DELETED, AS IT ASKED TO
+    // BE. It pinned that the IMAGE vocabulary refused R_X86_64_PLT32 (wire 4),
+    // which only the relocatable documents declared, and said: if the image
+    // format legitimately gains a PLT32 row, delete this block rather than
+    // re-derive it onto another coincidence. P69
+    // (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) gave every ELF x86_64
+    // document the same CALL row — `rel32` IS R_X86_64_PLT32, `isCall` — so the
+    // two vocabularies no longer divide on this member, and the contract stays
+    // pinned by the resolution assertion above.
     {
         DiagnosticReporter objRep;
         auto const throughObject = elf::readRelocatableObject(

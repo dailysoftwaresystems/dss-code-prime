@@ -1,0 +1,1 @@
+    if (false && !link::format::requireOneInstancePerProcessSpelling(module, fmt, "pe::encode", reporter)) {

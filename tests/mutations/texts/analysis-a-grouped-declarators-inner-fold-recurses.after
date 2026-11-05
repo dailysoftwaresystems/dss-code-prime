@@ -1,0 +1,5 @@
+        if (!step.innerDeclarator.valid()) return step.type;
+        return declaratorDeclaredType(s, cfg, tree, step.innerDeclarator, step.type, scope,
+                                      emitOnMiss, false, allowInitInferredArray, false,
+                                      typeAliasRow);
+        node               = step.innerDeclarator;

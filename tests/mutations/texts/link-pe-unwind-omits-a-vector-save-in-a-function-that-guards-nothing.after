@@ -1,0 +1,2 @@
+            if (ri->regClass != TargetRegClass::GPR && !guardsSeh) break;
+            if (ri->regClass != TargetRegClass::GPR) {

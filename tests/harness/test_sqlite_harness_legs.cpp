@@ -56,6 +56,8 @@
 // structural pins below (`pythonInspection`: Python's own tokenizer and parser
 // decide what is a comment, a docstring or code).
 
+#include "dss_sqlite_harness_legs_selftest_command.hpp"   // the interpreter the configure chose
+
 #include "arm_verdict_ledger.hpp"
 #include "repo_root.hpp"
 #include "run_binary.hpp"
@@ -87,7 +89,6 @@
 namespace fs = std::filesystem;
 using dss::test_support::ArmVerdict;
 using dss::test_support::armVerdictName;
-using dss::test_support::findOnPath;
 using dss::test_support::kAllArmVerdicts;
 using json = nlohmann::json;
 
@@ -120,14 +121,28 @@ using dss::test::repoRoot;
     return actionsDir() / "real-examples" / "c" / "sqlite";
 }
 
-// The interpreter. Resolved to a FULL PATH because `runBinary`'s Windows arm
-// passes it as CreateProcessW's lpApplicationName, which does not search PATH.
+// The interpreter: the one find_package chose at or above the repository's Python floor
+// (cmake/DssPython.cmake reads it from config.json), handed in as a literal by the build --
+// the top-level CMakeLists's declaration `sqlite_harness_legs`, the first argument of its
+// command line. Never a `python3` looked up on the PATH ctest runs under: on a host whose own
+// python is older than the floor (the Mac's Command Line Tools python), that lookup finds an
+// interpreter below it, and this file then measures the resolver under a Python the
+// repository does not support. A FULL PATH, which `runBinary`'s Windows arm needs: it passes
+// it as CreateProcessW's lpApplicationName, which does not search PATH. Empty when that path
+// is no file any more (a build configured on another tree, an interpreter removed since).
 [[nodiscard]] std::string pythonPath() {
-    for (char const* name : {"python3", "python"}) {
-        auto const p = findOnPath(name);
-        if (!p.empty()) return p;
-    }
-    return {};
+    std::string const configured = dss::sqlite_harness_legs_selftest::kCommand[0];
+    std::error_code   ec;
+    return fs::is_regular_file(fs::u8path(configured), ec) ? configured : std::string{};
+}
+
+// What every case says when that interpreter is not there -- a real unmet dependency, never a
+// reason to skip: the driver, its resolver and its stagers ARE Python programs.
+[[nodiscard]] std::string noInterpreter() {
+    return std::string{"the Python interpreter this build was configured with ("}
+           + dss::sqlite_harness_legs_selftest::kCommand[0]
+           + ") is not a file: reconfigure, which asks find_package for one at or above the"
+             " repository's floor. The driver IS Python, so this is no reason to skip.";
 }
 
 struct PyRun {
@@ -150,10 +165,7 @@ struct PyRun {
     PyRun out;
     auto const py = pythonPath();
     if (py.empty()) {
-        out.diagnostic =
-            "python3 (or python) is not on PATH. The sqlite harness driver"
-            " (build_and_test.py) and its resolver ARE Python programs, so this"
-            " is a real unmet dependency and not a reason to skip the check.";
+        out.diagnostic = noInterpreter();
         return out;
     }
     std::vector<std::string> prefix{py,
@@ -482,6 +494,10 @@ import sys
 import tokenize
 
 WSL_NAMES = ("wsl", "wsl.exe")
+# The wsl.exe options that take ONE value and may stand before `-e`: `--cd <dir>` (the resolver's working-
+# directory splice) and `-d`/`--distribution <name>` (since 2026-09-30 every WSL-entering argv names the
+# distribution the WSL legs declare). Each is skipped WITH its value, so an `-e` taken as a value is no `-e`.
+VALUE_OPTIONS = ("--cd", "-d", "--distribution")
 WSL_WORD = re.compile(r"(?<![\w./\\$-])wsl(?:\.exe)?(?![\w.-])")
 SHELL_FUNCS = {("os", "system"), ("os", "popen"), ("subprocess", "getoutput"),
                ("subprocess", "getstatusoutput")}
@@ -532,7 +548,7 @@ def is_refusal(node):
 
 def argv_verdict(elts):
     i = 1
-    while i < len(elts) and const_str(elts[i]) == "--cd":
+    while i < len(elts) and const_str(elts[i]) in VALUE_OPTIONS:
         i += 2
     if i >= len(elts):
         return "the argv literal ends before `-e`: nothing in it says the command is EXECUTED"
@@ -579,6 +595,12 @@ def inspect(path):
     tree = ast.parse(src, filename=path)
     members = {id(c) for n in ast.walk(tree) if isinstance(n, ast.Compare)
                for op, c in zip(n.ops, n.comparators) if isinstance(op, (ast.In, ast.NotIn))}
+    # the literal a loop or a comprehension iterates, when it holds only strings, is a DOMAIN of names
+    # (`for k in ("wsl", "ssh")`), never an argv it spawns
+    members |= {id(n.iter) for n in ast.walk(tree)
+                if isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension))
+                and isinstance(n.iter, (ast.List, ast.Tuple))
+                and all(const_str(e) is not None for e in n.iter.elts)}
     inv, wsl, guards = 0, [], []
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
@@ -688,10 +710,9 @@ public:
         auto const py = pythonPath();
         if (py.empty()) {
             throw std::runtime_error(
-                "python3 (or python) is not on PATH, so the Python driver's code cannot be"
-                " read: this file asks Python's own tokenizer and parser what is a comment,"
-                " a docstring or code. The driver itself IS Python, so this is a real unmet"
-                " dependency and not a reason to skip.");
+                "the Python driver's code cannot be read -- this file asks Python's own"
+                " tokenizer and parser what is a comment, a docstring or code -- because "
+                + noInterpreter());
         }
         auto const helper = dir_.path() / "pyinspect.py";
         if (!fs::exists(helper)) {
@@ -1184,6 +1205,109 @@ TEST_F(HarnessLegs, TheLegCatalogueLintsClean) {
     EXPECT_NE(r.output.find("findings=0"), std::string::npos) << r.output;
 }
 
+// ── EVERY PYTHON RUN OF THIS FILE IS THE INTERPRETER THE CONFIGURE CHOSE ───
+//
+// The resolver, the stagers and the inspector are all started with `pythonPath()`: the
+// interpreter find_package chose at or above the floor config.json states (cmake/DssPython.cmake),
+// handed in by the build, never the first `python3` of the PATH ctest runs under. This case holds
+// it to that: `pythonPath()` is the build's own literal, that interpreter runs, and the version it
+// reports is at or above the floor -- read here from config.json, the one statement of it -- so a
+// host whose own python is older (the Mac's Command Line Tools python) reds naming both versions
+// rather than measuring the resolver under a Python the repository does not support.
+TEST_F(HarnessLegs, EveryPythonRunIsTheInterpreterTheConfigureChoseAtOrAboveTheFloor) {
+    auto const py = pythonPath();
+    ASSERT_FALSE(py.empty()) << noInterpreter();
+    EXPECT_EQ(py, std::string{dss::sqlite_harness_legs_selftest::kCommand[0]})
+        << "a Python run of this file starts something other than the configured interpreter";
+
+    json const config = json::parse(fileText(repoRoot() / ".harness-config" / "config.json"), nullptr,
+                                    /*allow_exceptions=*/true, /*ignore_comments=*/true);
+    std::string floor;
+    for (auto const& tool : config.at("tools")) {
+        if (tool.value("name", std::string{}) == "python3") floor = tool.value("minVersion", std::string{});
+    }
+    ASSERT_FALSE(floor.empty()) << "config.json states no minVersion for python3: there is no floor to hold";
+
+    // `runBinary` chmods its LAST argument on POSIX, so a scratch script rides last.
+    dss::test_support::ScratchDir work{dss::test_support::Location::Temp, "harness_legs_interpreter"};
+    auto const probe = work.path() / "version.py";
+    {
+        std::ofstream out(probe, std::ios::binary);
+        out << "import sys\nprint('%d.%d.%d' % sys.version_info[:3])\n";
+    }
+    auto const res = dss::test_support::runBinary(probe, dss::test_support::kHelperScriptBudget,
+                                                  /*captureStdout=*/true, {py, "-B"});
+    ASSERT_TRUE(res.spawned && !res.timedOut && res.exitCode == 0u)
+        << py << " did not run: " << res.diagnostic << res.capturedStdout;
+    std::string ran = res.capturedStdout;
+    while (!ran.empty() && (ran.back() == '\n' || ran.back() == '\r')) ran.pop_back();
+    auto const numbers = [](std::string const& version) {
+        std::vector<int>   out;
+        std::istringstream in(version);
+        std::string        part;
+        while (std::getline(in, part, '.')) out.push_back(std::stoi(part));
+        return out;
+    };
+    EXPECT_GE(numbers(ran), numbers(floor))
+        << "the configured interpreter " << py << " is Python " << ran << ", below the floor " << floor;
+}
+
+// ── A PYTHON CHILD RUNS ITS PARENT'S INTERPRETER ON THIS HOST ──────────────
+//
+// `sqlite_common.PosixSide.python_argv` is the one spelling of a Python program run on the POSIX side.
+// On a POSIX host that side IS this host, so the child is THIS interpreter (`sys.executable`): never
+// `python3` by name, which there can be an older interpreter than the run's own. Inside WSL it is the
+// distribution's own `python3`, entered as every command into WSL is -- the parent's interpreter is a
+// Windows program, which no other kernel runs. Asked of the module itself, under the configured
+// interpreter, once for both cases.
+namespace {
+[[nodiscard]] json const& pythonChildArgvs() {
+    static json const answer = [] {
+        auto const py = pythonPath();
+        if (py.empty()) throw std::runtime_error(noInterpreter());
+        static dss::test_support::ScratchDir work{dss::test_support::Location::Temp, "harness_legs_python_child"};
+        auto const probe = work.path() / "python_child.py";
+        {
+            std::ofstream out(probe, std::ios::binary);
+            out << "import json, sys\n"
+                   "sys.dont_write_bytecode = True\n"
+                   "sys.path.insert(0, "
+                << json(harnessDir().string()).dump()
+                << ")\n"
+                   "import sqlite_common as C\n"
+                   "print(json.dumps({'executable': sys.executable,\n"
+                   "                  'posix': C.PosixSide('linux').python_argv('s.py', 'a'),\n"
+                   "                  'wsl': C.PosixSide('windows', distribution='d').python_argv('s.py', 'a')}))\n";
+        }
+        // `runBinary` chmods its LAST argument on POSIX, so the scratch probe rides last.
+        auto const res = dss::test_support::runBinary(probe, dss::test_support::kHelperScriptBudget,
+                                                      /*captureStdout=*/true, {py, "-B"});
+        if (!res.spawned || res.timedOut || res.exitCode != 0u) {
+            throw std::runtime_error("the sqlite_common probe did not run: " + res.diagnostic + "\n"
+                                     + res.capturedStdout);
+        }
+        std::string text = res.capturedStdout;
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+        return json::parse(text.substr(text.rfind('\n') == std::string::npos ? 0 : text.rfind('\n') + 1));
+    }();
+    return answer;
+}
+}  // namespace
+
+TEST_F(HarnessLegs, APythonChildOnAPosixHostRunsItsParentsInterpreter) {
+    json const& doc = pythonChildArgvs();
+    EXPECT_EQ(doc.at("posix").get<std::vector<std::string>>(),
+              (std::vector<std::string>{doc.at("executable").get<std::string>(), "s.py", "a"}))
+        << "a Python child on a POSIX host is started with another interpreter than its parent";
+}
+
+TEST_F(HarnessLegs, APythonChildInsideWslRunsTheDistributionsPython3) {
+    json const& doc = pythonChildArgvs();
+    EXPECT_EQ(doc.at("wsl").get<std::vector<std::string>>(),
+              (std::vector<std::string>{"wsl.exe", "-d", "d", "-e", "python3", "s.py", "a"}))
+        << "a Python child inside WSL is not entered as every command into WSL is, or names another interpreter";
+}
+
 // ── The SMOKE GATE's own self-test, run by the gate ────────────────────────
 //
 // `cli-smoke.py` is the file that decides whether a sqlite3 CLI failure is
@@ -1213,9 +1337,7 @@ TEST_F(HarnessLegs, TheLegCatalogueLintsClean) {
 // will not.
 TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
     auto const py = pythonPath();
-    ASSERT_FALSE(py.empty())
-        << "python3 (or python) is not on PATH. The driver IS Python, so this is a"
-           " real unmet dependency and not a reason to skip the check.";
+    ASSERT_FALSE(py.empty()) << noInterpreter();
     auto const script = harnessDir() / "cli-smoke.py";
     ASSERT_TRUE(fs::exists(script))
         << "the sqlite3 CLI smoke gate is missing: " << script;
@@ -1249,12 +1371,22 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
                                        "sqlite-cli-smoke-selftest"};
     // Copied under its OWN NAME: the gate prints `cli-smoke.py --self-test: …`
     // from a literal, but argv[0] and any traceback the self-test emits read as
-    // the real script only if the basename survives the staging.
-    auto const staged = work.path() / "cli-smoke.py";
+    // the real script only if the basename survives the staging. And at its OWN
+    // PLACE in the actions layout, with the tree's owner beside it: the gate loads
+    // `owning-tree.py` by path from the actions directory four levels up (a path
+    // it writes is `written_path`'s to judge, and it fails loud without the owner).
+    auto const stagedActions = work.path() / "actions";
+    auto const staged = stagedActions / "real-examples" / "c" / "sqlite" / "cli-smoke.py";
+    auto const stagedOwner = stagedActions / "owning-tree" / "owning-tree.py";
     std::error_code stageEc;
-    fs::copy_file(script, staged, fs::copy_options::overwrite_existing, stageEc);
+    fs::create_directories(staged.parent_path(), stageEc);
+    if (!stageEc) fs::create_directories(stagedOwner.parent_path(), stageEc);
+    if (!stageEc) fs::copy_file(script, staged, fs::copy_options::overwrite_existing, stageEc);
+    if (!stageEc)
+        fs::copy_file(actionsDir() / "owning-tree" / "owning-tree.py", stagedOwner,
+                      fs::copy_options::overwrite_existing, stageEc);
     ASSERT_FALSE(stageEc) << "could not stage the smoke gate at " << staged
-                          << ": " << stageEc.message();
+                          << " with its owner beside it: " << stageEc.message();
     auto const modeBefore = fs::status(script).permissions();
     static constexpr char const* kSelfTestShim =
         "import runpy,sys;p=sys.argv[1];sys.argv=[p,'--self-test'];"
@@ -1866,9 +1998,7 @@ TEST_F(HarnessLegs, StageZincWritesOneHeaderPerTargetAndEveryLegGetsItsOwn) {
     auto const dest = work.path() / "zinc";
 
     auto const py = pythonPath();
-    ASSERT_FALSE(py.empty())
-        << "python3 is a hard dependency of the driver (it IS Python); a skip here"
-           " would be the no-verdict defect this file exists to end.";
+    ASSERT_FALSE(py.empty()) << noInterpreter();
     std::vector<std::string> argv{
         py,
         (harnessDir() / "stage-zinc.py").string(),
@@ -4548,7 +4678,7 @@ TEST_F(HarnessLegs, BothDriversRefuseAnUnimplementedProviderWithTheSameVerdict) 
         " bug. Known providers: host-system pinned-archive search-paths (printed by"
         " harness_legs.py --library-providers, never copied here).";
     auto const py = pythonPath();
-    ASSERT_FALSE(py.empty()) << "python3 (or python) is not on PATH; the driver IS Python.";
+    ASSERT_FALSE(py.empty()) << noInterpreter();
     auto const request = scratch_->path() / "unknown-provider-request.json";
     {
         json req = json::object();
@@ -4663,7 +4793,7 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
     // stand-in is the python interpreter: a real executable whose help text
     // certainly lacks it, so the probe is exercised rather than mocked.
     auto const py = pythonPath();
-    ASSERT_FALSE(py.empty());
+    ASSERT_FALSE(py.empty()) << noInterpreter();
     auto const refused = run({"--resolve-library-argv", "/tmp/libz.1.dylib",
                               "--import-name", "@loader_path/libz.1.dylib",
                               "--dss", py});
@@ -4780,15 +4910,19 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 //     its arm reads the syntax tree (`pythonInspection`). Every list or tuple
 //     literal whose FIRST element names wsl/wsl.exe (bare, or as a path's last
 //     part) is an invocation, and its next element must be `-e`/`--exec` — after
-//     any `--cd <dir>` pair, the one wsl.exe option that takes a value and may
-//     precede `-e` (the resolver's own `workingDirArgv`; its self-test measured
-//     `wsl.exe --cd /tmp -e pwd` -> /tmp). `--` there, a starred splice, a
+//     any `--cd <dir>` or `-d`/`--distribution <name>` pair, the wsl.exe options
+//     that take a value and may precede `-e` (the resolver's own `workingDirArgv`,
+//     and since 2026-09-30 the distribution every WSL-entering argv names; ✔MEASURED
+//     `wsl.exe --cd /tmp -e pwd`, `wsl.exe --cd /tmp -d <d> -e pwd` and
+//     `wsl.exe -d <d> --cd /tmp -e pwd` -> /tmp). `--` there, a starred splice, a
 //     computed value, or a literal that ENDS before `-e` is refused. A command
 //     LINE naming wsl handed to a SHELL (`shell=True`, `os.system`, `os.popen`,
 //     `subprocess.getoutput`/`getstatusoutput`) is refused whatever it says,
 //     because a shell parses it before wsl.exe runs. A membership operand
-//     (`x in ("wsl", "wsl.exe")`) and a tuple made only of launcher names are
-//     NAMES, not argv. And `wsl.exe --` written in any string of LIVE code is
+//     (`x in ("wsl", "wsl.exe")`), the literal a loop iterates when it holds only
+//     strings (`for k in ("wsl", "ssh")`: a domain of names) and a tuple made only
+//     of launcher names are NAMES, not argv. And `wsl.exe --` written in any
+//     string of LIVE code is
 //     refused exactly as the shell rule refuses it: as advice a reader pastes.
 //
 // COVERAGE IS BY DIRECTORY, NOT BY LIST: every `.py`, `.ps1` and `.sh` anywhere
@@ -5211,12 +5345,22 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
     // `build-and-test.ps1`, which supplied three and always had. That driver is
     // retired, and the capability moved: the Python driver AND the speedtest1
     // benchmark reach WSL through ONE door, `sqlite_common.PosixSide`, whose three
-    // argv literals (`argv`, `to_posix`, `to_host`) are the invocations the
+    // argv literals (`argv`, `to_posix`, `to_host`) were the invocations the
     // harness cannot lose (✔MEASURED 2026-09-22: 3 in sqlite_common.py; the
     // benchmark holds none outside a self-test stand-in, and `build_and_test.py`
     // one more of its own). The number is not lowered — it moved with the door.
+    // ★ AND IT MOVED AGAIN WITH THE ENTRY (2026-09-30, the round-12 audit's S8): the
+    // three doors now all begin with ONE entry, `PosixSide.entry` — `wsl.exe -d
+    // <the WSL legs' distribution> -e`, the one spelling that names the distribution
+    // — so the file holds ONE wsl argv literal (✔MEASURED 2026-09-30), the one a
+    // door cannot bypass without dropping the distribution the contract suite pins
+    // (MS18: every door enters it). One spelling of one entry is the fix, not a loss.
     // Programs that shell out to WSL may come and go; this module is the one the
     // harness cannot lose.
+    // ★ SO THE COUNT IS EXACT, NOT A FLOOR (2026-10-06, the P69 re-review's NIT 12):
+    // a SECOND wsl literal in the door is a second spelling of the entry, the one
+    // shape a door could take to bypass the distribution, so it is refused like
+    // the recogniser going blind is.
     //
     // ★ AND THE RECOGNISER'S COVERAGE IS NO LONGER PROVED BY A CENSUS AT ALL —
     // TheWslExecRuleJudgesEverySyntheticShape below drives every shape, accepted
@@ -5224,13 +5368,16 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
     // prove that the tree still happens to contain an example.
     auto const door     = harnessDir() / "sqlite_common.py";
     auto const doorScan = scanForWslExec({{door, Dialect::Python}});
-    EXPECT_GE(doorScan.invocations, 3u)
-        << "only " << doorScan.invocations
+    EXPECT_EQ(doorScan.invocations, 1u)
+        << doorScan.invocations
         << " wsl invocation(s) were RECOGNISED in " << door.string()
-        << ", the one door through which the driver and the benchmark reach WSL"
-           " (PosixSide: argv, to_posix, to_host). The rule has stopped seeing the"
-           " shape it governs in the one file that cannot stop using it. Fix the"
-           " recogniser, do not lower this number.";
+        << ", the one door through which the driver and the benchmark reach WSL;"
+           " it holds exactly ONE (PosixSide.entry, which argv, to_posix and"
+           " to_host all begin with). None: the rule has stopped seeing the shape"
+           " it governs in the one file that cannot stop using it -- fix the"
+           " recogniser, or the rule governs nothing. More: a second spelling of"
+           " the entry, which a door could take to bypass the distribution --"
+           " route it through PosixSide.entry.";
 }
 
 // ── The rule's own arms, synthesized — including the one the tree stopped
@@ -5345,6 +5492,23 @@ TEST_F(HarnessLegs, TheWslExecRuleJudgesEverySyntheticShape) {
          false, 1,
          "`--cd <dir>` is wsl.exe's own option and takes one value; `-e` after it is"
          " the resolver's own working-directory launcher"},
+        {"argv-distribution-then-exec-accepted.py",
+         "def argv(d):\n    return [\"wsl.exe\", \"-d\", d, \"-e\", \"pwd\"]\n",
+         false, 1,
+         "`-d <name>` is wsl.exe's own option and takes one value: the distribution every"
+         " WSL-entering argv names since 2026-09-30, `-e` after it"},
+        {"argv-cd-and-distribution-accepted.py",
+         "ARGV = [\"wsl.exe\", \"--cd\", \"/tmp\", \"--distribution\", \"X\", \"-e\", \"pwd\"]\n",
+         false, 1,
+         "the two value options in either order (the resolver splices `--cd` first), then `-e`"},
+        {"argv-distribution-swallows-exec-refused.py",
+         "ARGV = [\"wsl.exe\", \"-d\", \"-e\", \"pwd\"]\n",
+         true, 1,
+         "`-d` takes the NEXT element as its value, so this `-e` is a distribution's name and"
+         " `pwd` runs through the shell"},
+        {"argv-distribution-only-refused.py",
+         "def argv(d):\n    return [\"wsl.exe\", \"-d\", d]\n",
+         true, 1, "a literal that ENDS after its options proves nothing about the argv it starts"},
         {"argv-bare-refused.py",
          "import subprocess\nsubprocess.run([\"wsl.exe\", \"bash\", \"-lc\", \"x\"])\n",
          true, 1,
@@ -5383,6 +5547,14 @@ TEST_F(HarnessLegs, TheWslExecRuleJudgesEverySyntheticShape) {
          false, 0, "a membership operand is a set of NAMES, not an argv"},
         {"name-set-accepted.py", "WSL_NAMES = (\"wsl\", \"wsl.exe\")\n",
          false, 0, "a tuple made only of launcher names is not an argv"},
+        {"loop-names-accepted.py",
+         "def remote(leg):\n    return any(k in leg for k in (\"wsl\", \"ssh\"))\n",
+         false, 0, "the literal a loop iterates, strings only, is a domain of NAMES, never an argv"},
+        {"loop-of-argv-refused.py",
+         "import subprocess\nfor argv in ([\"wsl.exe\", \"bash\"],):\n    subprocess.run(argv)\n",
+         true, 1,
+         "an argv literal INSIDE a loop's domain is still an argv: only a domain of plain names is"
+         " exempt"},
         {"comment-accepted.py", "# subprocess.run([\"wsl.exe\", \"bash\"])\nX = 1\n",
          false, 0, "comments are prose ABOUT the code"},
     };
@@ -5433,6 +5605,18 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
         return tail == "wsl" || tail == "wsl.exe";
     };
 
+    // Where `-e` must stand: after the wsl.exe options that take ONE value -- `--cd <dir>` and, since
+    // 2026-09-30, `-d`/`--distribution <name>` -- each skipped WITH its value (the Python rule's
+    // VALUE_OPTIONS, section 9; the same three spellings).
+    auto const execAt = [](std::vector<std::string> const& argv) {
+        std::size_t i = 1;
+        while (i < argv.size()
+               && (argv[i] == "--cd" || argv[i] == "-d" || argv[i] == "--distribution")) {
+            i += 2;
+        }
+        return i;
+    };
+
     std::size_t launchers = 0;
     auto const  doc       = json::parse(fileText(catalogue_));
     for (auto const& leg : doc.at("legs")) {
@@ -5441,14 +5625,15 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
             auto const cmd = entry.at("command").get<std::vector<std::string>>();
             if (cmd.empty() || !isWsl(cmd.front())) continue;
             ++launchers;
-            ASSERT_GE(cmd.size(), 2u)
+            auto const at = execAt(cmd);
+            ASSERT_LT(at, cmd.size())
                 << "leg '" << label << "': launcher for ("
                 << entry.at("hostOs") << ", " << entry.at("hostArch")
-                << ") is a bare `" << cmd.front() << "` with no `-e`.";
-            EXPECT_TRUE(cmd[1] == "-e" || cmd[1] == "--exec")
+                << ") is `" << cmd.front() << "` and its options, with no `-e`.";
+            EXPECT_TRUE(cmd[at] == "-e" || cmd[at] == "--exec")
                 << "leg '" << label << "': launcher for ("
                 << entry.at("hostOs") << ", " << entry.at("hostArch")
-                << ") is declared as `" << cmd.front() << ' ' << cmd[1]
+                << ") is declared as `" << cmd.front() << " ... " << cmd[at]
                 << "`. Only `-e`/`--exec` EXECUTES the fixture; anything else"
                    " (including `--`) hands the whole argv to the distro's"
                    " default shell, which re-expands it. MEASURED: one argument"
@@ -5473,7 +5658,8 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
         auto const argv = splitWords(line.substr(tab + 1));
         if (argv.empty() || !isWsl(argv.front())) continue;
         ++translators;
-        EXPECT_TRUE(argv.size() >= 2 && (argv[1] == "-e" || argv[1] == "--exec"))
+        auto const at = execAt(argv);
+        EXPECT_TRUE(at < argv.size() && (argv[at] == "-e" || argv[at] == "--exec"))
             << "pathTranslation '" << verb << "' declares translator argv `"
             << line.substr(tab + 1)
             << "`. Without `-e` the path is parsed by WSL's default shell before"

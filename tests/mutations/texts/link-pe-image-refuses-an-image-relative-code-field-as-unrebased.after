@@ -1,0 +1,1 @@
+             && !tri->pcRelative && !tri->tls && tri->widthBytes != 8) {

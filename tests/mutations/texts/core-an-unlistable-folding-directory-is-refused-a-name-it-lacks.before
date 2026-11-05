@@ -1,0 +1,1 @@
+        if (folds.value_or(false)) return {HeaderSearchResult::notFound()};

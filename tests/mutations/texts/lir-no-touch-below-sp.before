@@ -1,0 +1,3 @@
+    touches.insert(emitProbeTouch(b, h.orMem, sp,
+                                  -static_cast<std::int32_t>(touch.bytes), touch).v);
+    emitProbeTest(b, h, size, page, TargetCondCode::Ule, blocks.tail, blocks.step);

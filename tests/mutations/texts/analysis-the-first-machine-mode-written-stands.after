@@ -1,0 +1,2 @@
+                if (out.machineModeRow == nullptr) out.machineModeClause = clauseNode;
+                if (out.machineModeRow == nullptr) out.machineModeRow    = row;

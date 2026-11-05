@@ -1,0 +1,1 @@
+                if (false && !externSurvivesReferenceGate(ext, usedByTheUnit)) continue;

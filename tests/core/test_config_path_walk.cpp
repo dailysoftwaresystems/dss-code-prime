@@ -16,6 +16,7 @@
 
 #include "core/substrate/path_identity.hpp"  // genericSpelling — the spelling the note prints
 #include "core/types/config_path_walk.hpp"
+#include "os_link.hpp"       // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"     // the repo-root VERSION — the compiler's own identity
 #include "unc_spelling.hpp"  // the ONE multi-separator-root fixture
 #include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
@@ -285,6 +286,26 @@ TEST(ConfigPathWalk, DirEnvRootRejectsNonDirectoryCandidate) {
 // perfectly valid env override. The LSP's discovery fixtures point at a scratch
 // dir; honouring the ambient environment over the caller's argument would make
 // them untestable (and would have hidden the LSP segfault this cycle fixed).
+// A DANGLING LINK IS NO CONFIG DIRECTORY, on every build: the walk passes a candidate that reaches nothing and goes
+// on up to the real one -- what the MSVC and POSIX builds always did. libstdc++ on Windows reads a dangling
+// directory link's own attributes and calls it a directory, so the MinGW build stopped the walk at the link
+// ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The link is made by the OS.
+TEST(ConfigPathWalk, DirWalkPassesADanglingLinkAndFindsTheRealDirectory) {
+    ScratchDir     scratch(Location::Temp, "config-walk-dir");
+    plantConfigDir(scratch.path(), "sources");   // the real one, at the top of the walk
+    fs::path const start = makeNestedStart(scratch.path());
+    std::error_code ec;
+    fs::create_directories(start / "src" / "dss-config", ec);
+    ASSERT_FALSE(ec) << ec.message();
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(start / "no-such-dir", start / "src" / "dss-config" / "sources",
+                                                             dss::test_support::LinkTo::Directory));
+
+    auto const got = findShippedConfigDir("sources", start);
+    ASSERT_TRUE(got.has_value()) << "the walk found no config directory at all";
+    std::string const took = got->lexically_relative(scratch.path()).generic_string();
+    EXPECT_EQ(took, "src/dss-config/sources") << "the walk took " << took;
+}
+
 TEST(ConfigPathWalk, DirExplicitStartPathOutranksEnvRoot) {
     ScratchDir viaEnv(Location::Temp, "config-walk-dir");
     ScratchDir viaStart(Location::Temp, "config-walk-dir");

@@ -1,0 +1,2 @@
+    readWeakKindStatement("weakDefinitionBesideWeak", kWeakBesideWeakTable,
+                          data.weakDefinitionBesideWeak);

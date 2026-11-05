@@ -12,3 +12,35 @@ steps:
       python3 ./check-guard-output-encoding.py
     successPattern: 'guard-output-encoding: OK'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-guard-output-encoding --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-guard-output-encoding.py --self-test
+    successPattern: '^guard-output-encoding: self-test OK - \d+ arm\(s\)'
+    requireInputsUnmoved: true
+
+  # Every subject and its verdict, the inventory ignored -- a READING verb.
+
+  - name: list
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-guard-output-encoding.py --list
+    successPattern: '^guard-output-encoding: \d+ subject\(s\) listed$'
+    requireInputsUnmoved: true
+
+  # The BURN-DOWN verb: it may only SHORTEN the inventory -- a TREE WRITER, run only where a run names it: `dssharness run check-guard-output-encoding-write`, the runner that runs it on
+  # ONE leg, this machine's own tree (config.json). It moves a tracked file by design, so it cannot carry
+  # requireInputsUnmoved; a plain run afterwards verifies.
+
+  - name: write
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-guard-output-encoding.py --write
+    successPattern: '^guard-output-encoding: inventory rewritten, \d+ entr\(y/ies\) remain\.$'

@@ -28,6 +28,54 @@ dss_add_test(NAME hir/test_brace_element_diagnosed_conversion
 # elements warn S_ExcessInitializerElements and are dropped unevaluated (6.7.9p2).
 dss_add_test(NAME hir/test_initializer_list_shapes
              SOURCES test_initializer_list_shapes.cpp)
+# P69 (lane `lm`): a brace element is the expression that was written. An operator over
+# a string is an element, not the braced string (the lowering's own peel took the
+# operand for the element); a whole structure written as an index, a dereference, a
+# conditional, a comma expression or a call is placed whole — the analyzer's answer,
+# handed to the lowering as a fact instead of derived again from the type stamps.
+dss_add_test(NAME hir/test_brace_element_as_written
+             SOURCES test_brace_element_as_written.cpp)
+# P69 (lane `cs`): a second name of a definition (`alias`) stated by the lowering once, with its target and its own
+# linkage (a `static` alias module-private, a weak one of C's `weak` kind, never a common); and `sizeof` of an array
+# of unknown size lowered to the language's stated value, never a `SizeOf` of a type with no size.
+dss_add_test(NAME hir/test_hir_symbol_alias
+             SOURCES test_hir_symbol_alias.cpp)
+
+# A `__try` FILTER IS LEFT ONLY BY ITS VALUE, AND GUARDS NOTHING (P69, lane `lm`): a jump
+# out of a filter's statement expression and a `__try` inside it, refused by the HIR
+# verifier by the construct. A binary of its own: `hir/test_hir_lowering_c` is the claim
+# runner of many mutation arms, whose case counts a new case moves.
+dss_add_test(NAME hir/test_seh_filter_is_left_by_its_value
+             SOURCES test_seh_filter_is_left_by_its_value.cpp)
+target_include_directories(dss_hir_test_seh_filter_is_left_by_its_value
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+# P69 (lane `cs`): a value-returning function whose end is reached is a language
+# rule (`nonVoidFunctionEndReached`); under C's the lowering completes the body
+# and warns once. Separate from test_hir_lowering_c.cpp because half of it runs
+# under the shipped C document with that ONE key rewritten, which needs the JSON
+# document in hand and a fixture of its own.
+dss_add_test(NAME hir/test_non_void_function_end_reached
+             SOURCES test_non_void_function_end_reached.cpp)
+target_link_libraries(dss_hir_test_non_void_function_end_reached
+                      PRIVATE nlohmann_json::nlohmann_json)
+# P69 (lane `lm`, the scalar brace closure): a scalar's initializer in more braces than
+# C 6.7.9p11's one pair, or with more than one element — the innermost first value with
+# the warning the language declares, in the lowering, the semantic tier's element walks
+# and the constant evaluator alike; a document that declares none refuses the shape.
+# A binary of its own: it reads the shipped C document with that ONE key rewritten, and
+# `hir/test_hir_lowering_c` is the claim runner of many mutation arms.
+dss_add_test(NAME hir/test_scalar_brace_initializer
+             SOURCES test_scalar_brace_initializer.cpp)
+target_link_libraries(dss_hir_test_scalar_brace_initializer
+                      PRIVATE nlohmann_json::nlohmann_json)
+# P69 L2 (lane `lm`): the comma operator in an integer constant expression — admitted per
+# position (`semantics.integerConstantExpressions`), warned once per comma, refused by name where
+# no reference folds it; a bare top-level comma is no bound, case or designator. A binary of its
+# own: it reads the shipped C document with that block erased or malformed.
+dss_add_test(NAME hir/test_constant_expression_comma_operator
+             SOURCES test_constant_expression_comma_operator.cpp)
+target_link_libraries(dss_hir_test_constant_expression_comma_operator
+                      PRIVATE nlohmann_json::nlohmann_json)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of
@@ -112,3 +160,8 @@ dss_add_test(NAME hir/test_frontend_deep_nesting_probe
              SOURCES test_frontend_deep_nesting_probe.cpp)
 dss_add_test(NAME hir/test_frontend_deep_nesting_costs_heap
              SOURCES test_frontend_deep_nesting_costs_heap.cpp)
+# A `typeof` of a variable-length array type (P69 L2, lane `lm`): the head's bound is captured
+# once, under the first name it declares; every later name reaches that size.
+dss_add_test(NAME hir/test_typeof_of_a_vla SOURCES test_typeof_of_a_vla.cpp)
+dss_add_test(NAME hir/test_a_variable_length_operand_is_evaluated
+             SOURCES test_a_variable_length_operand_is_evaluated.cpp)

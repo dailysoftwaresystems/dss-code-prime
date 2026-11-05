@@ -1,0 +1,70 @@
+{
+  "$comment": "D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB (P69): one address per library function across the process, equal to what the dynamic linker answers for the name. main.c compares the address of `puts` spelled five ways (code, a static initializer, a const one, a struct member, an array element) with dlsym(dlopen(NULL), \"puts\"), and calls through one of them. ✔MEASURED 2026-09-30 BEFORE the fix, through this tree's own dsscp: ELF x86_64 and aarch64 EXECUTABLES named the image's PLT stub everywhere (addr_equal 0, init_equal 0), and ELF PIEs disagreed with THEMSELVES — code named the stub, the initializer's symbolic row the library (exit 2 in the probe that preceded this example); the arm64 Mach-O image likewise (code `adrp/add` to `__stubs`, the `__data` initializer a dyld BIND to `_puts`). References, each exit 42: gcc 13.3 and clang 18 -no-pie and -pie on x86_64 (GNU ld; the -no-pie JUMP_SLOT row carries the PLT address as the symbol's value), gcc 13.3 -no-pie and -pie natively on aarch64, clang -fuse-ld=lld -pie with a `.s` `leaq puts(%rip)` (lld makes the stub canonical in a PIE too), and Apple clang 21 on the Mac, arm64 natively and x86_64 under Rosetta (the address LOADED from the GOT). THE MECHANISM PER IMAGE KIND: an ELF executable or PIE states the address-taken import STT_FUNC with st_value = its stub in `.dynsym`, the stub's own slot a JUMP_SLOT (elf.dynamicRelocationTypes.jumpSlot); a Mach-O image loads the address from a slot the link mints and binds (externAddrBinding: got). The PE twin is its own example: PE has no interposition, and its answer is the IAT value.",
+  "$commentSharedLibrary": "P69 review M5 — THE SHARED-LIBRARY HALF, which until this arm never RAN. Every target's `dependsOn` builds `dsssubject.c` into a DSS shared library FOR THAT TARGET (`-dyn` on ELF, `-dylib` on Mach-O), and the executable links it: the library hands back its own five forms of `&puts`, and main.c requires each to equal dlsym's answer too, plus `&g` and `&v` of the library's own definitions taken in the executable's code and statics. A shared library can never make its stub the function's address — on ELF the executable's canonical stub is (`puts` STT_FUNC with a value in the executable's `.dynsym`), on Mach-O the dylib's own definition is — so the library's forms are LOADED from slots the link mints (`externAddrBinding: got` on the `-dyn` and `-dylib` documents) and filled by a symbolic row naming `puts`, which the dynamic linker resolves to that one address. The library is found at run time through the executable's own runpath (`runpaths: [\"${ORIGIN}\"]`: DT_RUNPATH $ORIGIN on ELF, LC_RPATH @loader_path on Mach-O, where the dylib's install name is `@rpath/<file>`), so no loader search variable is set. The Mach-O arms RUN on the Mac (`runOn: [\"darwin\"]`, the x86_64 one under Rosetta) — the first corpus example whose DSS-built dylib a DSS executable LOADS. Exit 42, or 1 after printing `bad=<bitset>` (see main.c).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "one address\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        { "sources": ["dsssubject.c"], "spec": "x86_64:elf64-x86_64-linux-dyn", "artifact": "dsssubject.so" }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        { "sources": ["dsssubject.c"], "spec": "x86_64:elf64-x86_64-linux-dyn", "artifact": "dsssubject.so" }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        { "sources": ["dsssubject.c"], "spec": "arm64:elf64-aarch64-linux-dyn", "artifact": "dsssubject.so" }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        { "sources": ["dsssubject.c"], "spec": "arm64:elf64-aarch64-linux-dyn", "artifact": "dsssubject.so" }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        { "sources": ["dsssubject.c"], "spec": "arm64:macho64-arm64-darwin-dylib", "artifact": "dsssubject.dylib" }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "runpaths": ["${ORIGIN}"],
+      "dependsOn": [
+        { "sources": ["dsssubject.c"], "spec": "x86_64:macho64-x86_64-darwin-dylib", "artifact": "dsssubject.dylib" }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

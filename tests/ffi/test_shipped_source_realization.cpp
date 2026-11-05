@@ -60,6 +60,8 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_registry.hpp"
 
 #include "repo_root.hpp"
 
@@ -176,7 +178,7 @@ void forEachDescriptor(std::function<void(fs::path const&, json const&)> const& 
 // ── THE SECOND KIND OF DECLARER ──────────────────────────────────────────────
 //
 // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: an object format's
-// `runtimeLibraries[].source` names a file in this SAME tree, for a runtime role
+// `runtimeLibraries[].source` / `.sources` names a file in this SAME tree, for a runtime role
 // whose entry points the COMPILER MINTS — so there is no descriptor row to hang
 // the realization off, and R1/R2 must see the format documents or the sweep
 // refuses a file the config legitimately names.
@@ -202,6 +204,41 @@ void forEachDescriptor(std::function<void(fs::path const&, json const&)> const& 
 // pe64 flavours (✔MEASURED), and folding them to one entry would have made a
 // refusal name one arbitrary document while the other three went unmentioned.
 // R1 resolving the same path four times is four `is_regular_file` calls.
+// P69 H5: a row's units in the LOADER's shapes (src/link/object_format_schema_json.cpp, `runtimeLibraries`): one
+// unit is `source`; a body of several is `sources`, an array of TWO OR MORE non-empty paths; never both. A row in
+// another shape is one the loader refuses, so the reader says why (`refusal`) instead of reading it some way of its
+// own -- a second reader that accepted more than the first is how the sweep would come to guard a document the
+// compiler refuses.
+[[nodiscard]] std::vector<std::string> formatRowUnits(nlohmann::json const& row, std::string& refusal) {
+    std::vector<std::string> units;
+    if (!row.is_object()) return units;
+    bool const one  = row.contains("source");
+    bool const many = row.contains("sources");
+    if (one && many) {
+        refusal = "names both `source` and `sources`";
+        return {};
+    }
+    if (one) {
+        if (row.at("source").is_string() && !row.at("source").get<std::string>().empty())
+            units.push_back(row.at("source").get<std::string>());
+        return units;
+    }
+    if (!many) return units;
+    auto const& list = row.at("sources");
+    if (!list.is_array() || list.size() < 2) {
+        refusal = "`sources` must be an array of two or more units (one unit is `source`)";
+        return {};
+    }
+    for (auto const& s : list) {
+        if (!s.is_string() || s.get<std::string>().empty()) {
+            refusal = "`sources` holds a unit that is not a non-empty path";
+            return {};
+        }
+        units.push_back(s.get<std::string>());
+    }
+    return units;
+}
+
 [[nodiscard]] std::vector<dss::ffi::ShippedSourceDeclaration>
 formatRealizedSources() {
     std::vector<dss::ffi::ShippedSourceDeclaration> out;
@@ -225,17 +262,22 @@ formatRealizedSources() {
         if (!doc.at("runtimeLibraries").is_array()) continue;
         std::string const document = it->path().filename().generic_string();
         for (auto const& row : doc.at("runtimeLibraries")) {
-            if (!row.is_object() || !row.contains("source")) continue;
-            if (!row.at("source").is_string()) continue;
-            auto src = row.at("source").get<std::string>();
-            if (src.empty()) continue;
+            std::string refusal;
+            auto units = formatRowUnits(row, refusal);
+            if (!refusal.empty()) {
+                ADD_FAILURE() << "object format document '" << document << "': a runtimeLibraries row " << refusal
+                              << " -- the loader refuses that shape, so no reader may take it";
+                continue;
+            }
             std::string role = "<no role>";
             if (row.contains("role") && row.at("role").is_string())
                 role = row.at("role").get<std::string>();
-            out.push_back(dss::ffi::ShippedSourceDeclaration{
-                "object format document '" + document
-                    + "' runtimeLibraries[" + role + "]",
-                std::move(src)});
+            for (auto& src : units) {
+                out.push_back(dss::ffi::ShippedSourceDeclaration{
+                    "object format document '" + document
+                        + "' runtimeLibraries[" + role + "]",
+                    std::move(src)});
+            }
         }
     }
     std::sort(out.begin(), out.end(),
@@ -328,8 +370,8 @@ TEST(ShippedSourceRealization, EveryRuntimeFileIsNamedByADescriptor) {
         std::string const p = it->path().lexically_normal().generic_string();
         EXPECT_NE(std::find(claimed.begin(), claimed.end(), p), claimed.end())
             << "R2/R4: '" << p << "' is named by NO descriptor's 'realization' "
-               "map and by no object format's runtimeLibraries[].source, "
-               "map, so nothing can ever add it to a build graph. In particular "
+               "map and by no object format's runtimeLibraries[].source / .sources, "
+               "so nothing can ever add it to a build graph. In particular "
                "a HEADER here would sit at an INCLUDE PATH and silently shadow "
                "the descriptor a unit exists to consume.";
     }
@@ -337,20 +379,25 @@ TEST(ShippedSourceRealization, EveryRuntimeFileIsNamedByADescriptor) {
 }
 
 // ── R3 ───────────────────────────────────────────────────────────────────────
-// No format carries BOTH an image and a source, at the EFFECTIVE (merged) level
-// — the per-symbol override merged over the descriptor's, exactly as the
-// injector and the realization oracle merge them. Checking only the raw override
-// would miss the commonest shape: a descriptor-level image plus a per-symbol
-// source.
+// No format carries BOTH an image and a source AT ONE LEVEL — the descriptor's own
+// pair, or one symbol's own pair — and no symbol re-imports a format its
+// descriptor realizes from source. ★ P69 (the R3 precedence): a symbol's OWN
+// source over the image it INHERITS is ONE owner, not two — the row names its body,
+// as a per-symbol `library` override names its image — and the reader records it by
+// giving the symbol an empty image there (see `ShippedSymbol::library`), which the
+// last arm below checks through the real reader.
 TEST(ShippedSourceRealization, NoFormatDeclaresBothAnImageAndASource) {
     forEachDescriptor([&](fs::path const& p, json const& doc) {
         auto const docLib  = formatKeysOf(doc, "library");
         auto const docReal = formatKeysOf(doc, "realization");
+        auto contains = [](std::vector<std::string> const& v, std::string const& f) {
+            return std::find(v.begin(), v.end(), f) != v.end();
+        };
         auto check = [&](std::vector<std::string> const& lib,
                          std::vector<std::string> const& real,
                          std::string const& ctx) {
             for (auto const& f : real)
-                EXPECT_EQ(std::find(lib.begin(), lib.end(), f), lib.end())
+                EXPECT_FALSE(contains(lib, f))
                     << "R3: " << p.filename().generic_string() << ' ' << ctx
                     << " declares BOTH 'library." << f << "' and 'realization."
                     << f << "' — two owners for one body. Preferring either "
@@ -363,17 +410,107 @@ TEST(ShippedSourceRealization, NoFormatDeclaresBothAnImageAndASource) {
         for (auto const& sym : doc.at("symbols")) {
             std::string const ctx = "symbols[" + std::to_string(i++) + "]";
             if (!sym.is_object()) continue;
-            auto lib  = docLib;
-            auto real = docReal;
-            for (auto const& f : formatKeysOf(sym, "library"))
-                if (std::find(lib.begin(), lib.end(), f) == lib.end())
-                    lib.push_back(f);
-            for (auto const& f : formatKeysOf(sym, "realization"))
-                if (std::find(real.begin(), real.end(), f) == real.end())
-                    real.push_back(f);
-            check(lib, real, ctx);
+            auto const symLib  = formatKeysOf(sym, "library");
+            auto const symReal = formatKeysOf(sym, "realization");
+            check(symLib, symReal, ctx);
+            for (auto const& f : docReal)
+                if (!contains(symReal, f))
+                    EXPECT_FALSE(contains(symLib, f))
+                        << "R3: " << p.filename().generic_string() << ' ' << ctx
+                        << " imports on '" << f << "' where its descriptor realizes "
+                           "every symbol from source — two owners for one body.";
         }
     });
+}
+
+// ★ The precedence, THROUGH THE READER (P69). A symbol's own source on a format
+// whose import it would inherit reads clean, is realized from the source there,
+// carries an EMPTY image there (what every binder fold routes unbound), and keeps
+// the inherited image on every other format. The three refusals of the same rule —
+// both at the root, both on the symbol, the symbol's import under the
+// descriptor's source — each fail to read, naming the two owners and where.
+TEST(ShippedSourceRealization, ASymbolsOwnSourceSupersedesTheImportItInherits) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const dir = fs::temp_directory_path() / "dss-r3-precedence";
+    fs::create_directories(dir);
+    auto write = [&](std::string const& name, std::string const& text) {
+        fs::path const at = dir / name;
+        std::ofstream(at, std::ios::binary) << text;
+        return at;
+    };
+    auto read = [&](fs::path const& at, dss::DiagnosticReporter& rep) {
+        dss::TypeInterner interner{dss::CompilationUnitId{1}};
+        dss::TypeRegistry typeReg;
+        return dss::ffi::readShippedLibDescriptor(at, interner, typeReg, rep);
+    };
+    {
+        auto const at = write("precedence_ok.json", R"JSON({
+            "header": "precedence_ok.h",
+            "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+            "symbols": [
+              { "name": "shipped_fn", "signature": "fn() -> i32",
+                "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } } },
+              { "name": "imported_fn", "signature": "fn() -> i32" }
+            ]
+        })JSON");
+        dss::DiagnosticReporter rep;
+        auto const desc = read(at, rep);
+        ASSERT_TRUE(desc.has_value()) << (rep.all().empty() ? std::string{} : rep.all().front().actual);
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(desc->symbols.size(), 2u);
+        auto const& shipped = desc->symbols.at(0);
+        ASSERT_EQ(shipped.name, "shipped_fn");
+        ASSERT_EQ(shipped.library.count("pe"), 1u) << "the supersession must be recorded on the symbol";
+        EXPECT_EQ(shipped.library.at("pe"), "") << "an EMPTY image: the source, not ucrtbase, owns the body";
+        EXPECT_EQ(shipped.library.count("elf"), 0u) << "the other formats keep the inherited import";
+        EXPECT_EQ(desc->symbols.at(1).library.size(), 0u) << "a row without its own source is untouched";
+        ASSERT_EQ(shipped.realization.count("pe"), 1u);
+        EXPECT_EQ(shipped.realization.at("pe"), "runtime/platform/src/atomic.c");
+        EXPECT_EQ(desc->library.at("pe"), "ucrtbase.dll") << "the descriptor's own map is not rewritten";
+    }
+    struct Refusal {
+        char const* file;
+        char const* text;
+        char const* names;
+    };
+    Refusal const refusals[] = {
+        {"precedence_root_both.json", R"JSON({
+            "header": "rb.h",
+            "library": { "pe": "ucrtbase.dll" },
+            "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } },
+            "symbols": [ { "name": "rb_fn", "signature": "fn() -> i32" } ]
+        })JSON", "(root)"},
+        {"precedence_symbol_both.json", R"JSON({
+            "header": "sb.h",
+            "symbols": [ { "name": "sb_fn", "signature": "fn() -> i32",
+                           "library": { "pe": "ucrtbase.dll" },
+                           "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } } } ]
+        })JSON", "symbols[0] ('sb_fn')"},
+        {"precedence_symbol_import_under_source.json", R"JSON({
+            "header": "su.h",
+            "realization": { "pe": { "source": "runtime/platform/src/atomic.c" } },
+            "symbols": [ { "name": "su_fn", "signature": "fn() -> i32",
+                           "library": { "pe": "ucrtbase.dll" } } ]
+        })JSON", "symbols[0] ('su_fn')"},
+    };
+    for (Refusal const& r : refusals) {
+        SCOPED_TRACE(r.file);
+        dss::DiagnosticReporter rep;
+        EXPECT_FALSE(read(write(r.file, r.text), rep).has_value());
+        // The refusal states R3's CONDITION — two owners for one body — and where; an
+        // anchor id is bookkeeping for a comment, not compiler output (the
+        // emitted-anchor-ids guard), so the message is matched by what it says.
+        bool namedTwoOwners = false, namedWhere = false;
+        for (auto const& d : rep.all()) {
+            namedTwoOwners = namedTwoOwners || d.actual.find("two owners for one body") != std::string::npos;
+            namedWhere     = namedWhere || d.actual.find(r.names) != std::string::npos;
+        }
+        EXPECT_TRUE(namedTwoOwners);
+        EXPECT_TRUE(namedWhere) << "the refusal must name " << r.names;
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 // ── THE TREE'S OWN SHAPE ─────────────────────────────────────────────────────
@@ -429,4 +566,52 @@ TEST(ShippedSourceRealization, FastReaderAgreesWithTheDeclaredClaims) {
                 << ": the driver's fast reader disagrees with the descriptor.";
         }
     });
+}
+
+// ── P69 H5: A BODY OF SEVERAL UNITS ─────────────────────────────────────────
+//
+// The reader takes a row's units in the loader's shapes and no other: `source` (one), `sources` (two or more), never
+// both. Each refused shape is the loader's own refusal (tests/link/test_runtime_library_roles.cpp,
+// `RuntimeLibraryRoles.ARowOfSeveralUnitsHasOneSpellingAndTheOthersAreRefused`), so the sweep cannot guard a row the
+// compiler would never load.
+TEST(ShippedSourceRealization, AFormatRowsUnitsAreReadInTheLoadersShapesOnly) {
+    struct Case { char const* row; std::vector<std::string> units; bool refused; };
+    Case const cases[] = {
+        {R"({"role": "atomicsRuntime", "source": "runtime/platform/src/atomic.c"})",
+         {"runtime/platform/src/atomic.c"}, false},
+        {R"({"role": "compilerSupport", "sources": ["a.c", "b.s"]})", {"a.c", "b.s"}, false},
+        {R"({"role": "cLibrary", "image": "ucrtbase.dll"})", {}, false},
+        {R"({"role": "compilerSupport", "sources": ["a.c"]})", {}, true},
+        {R"({"role": "compilerSupport", "sources": "a.c"})", {}, true},
+        {R"({"role": "compilerSupport", "sources": ["a.c", ""]})", {}, true},
+        {R"({"role": "compilerSupport", "source": "a.c", "sources": ["b.c", "c.s"]})", {}, true},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(c.row);
+        std::string refusal;
+        auto const units = formatRowUnits(nlohmann::json::parse(c.row), refusal);
+        EXPECT_EQ(units, c.units);
+        EXPECT_EQ(!refusal.empty(), c.refused) << refusal;
+    }
+}
+
+// The three units of the pe `compilerSupport` row are named by NO `source` key and by no descriptor -- only by the
+// four pe64 documents' `sources` arrays -- and each is a declaration of each document, so the R2/R4 sweep sees them.
+TEST(ShippedSourceRealization, AUnitNamedOnlyInASourcesArrayIsDeclaredByEachPeDocument) {
+    std::vector<std::string> const units{"runtime/platform/src/pe_compiler_support.c",
+                                         "runtime/platform/src/pe_compiler_support_x86_64.s",
+                                         "runtime/platform/src/pe_gcc_unwind.c"};
+    auto const declared = formatRealizedSources();
+    for (auto const& unit : units) {
+        SCOPED_TRACE(unit);
+        std::size_t documents = 0;
+        for (auto const& d : declared) {
+            if (d.source != unit) continue;
+            EXPECT_NE(d.declarer.find("runtimeLibraries[compilerSupport]"), std::string::npos) << d.declarer;
+            EXPECT_NE(d.declarer.find("pe64-x86_64-windows"), std::string::npos) << d.declarer;
+            ++documents;
+        }
+        EXPECT_EQ(documents, 4u) << "each of the four pe64 documents declares the unit";
+        for (auto const& c : allClaims()) EXPECT_NE(c.source, unit) << "no descriptor names it: " << c.descriptor;
+    }
 }

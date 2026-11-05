@@ -10,6 +10,7 @@
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/integer_literal_ladder.hpp"  // preprocessorLiteralSignedness (the ONE phase-4 signedness rule the shipped-constant spelling is verified against)
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
+#include "core/types/number_decode.hpp"   // decodeFloatLiteralAtKind (a spliced float constant read back, P69 round 4)
 #include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -17,6 +18,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +29,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>        // kUnreadPipeBytes: the width an unopened pipe is handed as
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -539,8 +544,11 @@ verifiedLiteralSuffix(GrammarSchema const& schema, std::uint64_t magnitude,
             for (DataModel const m : models) {
                 IntegerLadderResult const t =
                     typeIntegerLiteral(text, ns, rules, m, magnitude);
-                if (t.status != IntegerLadderStatus::Typed || t.kind != core
-                    || t.vocabularyName != vocabularyName) {
+                // P69 (lane `cs`): a spelling the ladder only READS AS unsigned past its
+                // signed list (`decimalPastRange`) is diagnosed at every use, so it is
+                // never the spelling a shipped constant is spliced as.
+                if (t.status != IntegerLadderStatus::Typed || t.reinterpretedUnsigned
+                    || t.kind != core || t.vocabularyName != vocabularyName) {
                     typed = false;
                     break;
                 }
@@ -606,6 +614,123 @@ spellIntegerConstant(GrammarSchema const& schema, ffi::ShippedPpConstant const& 
     std::string body = "-" + std::to_string(spelled) + *sfx;
     if (mostNegative) body += " - 1";
     return {SpellOutcome::Spelled, "(" + body + ")"};
+}
+
+// ══ THE TYPED SPLICE — A FLOAT CONSTANT AS THE LANGUAGE'S OWN CONSTANT OF ITS TYPE ══
+// (P69 round 4, D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR.) The
+// float sibling of `spellIntegerConstant`: a descriptor `floatConstants` row becomes a
+// `#define` whose body IS a constant of the row's declared type, so `#ifdef INFINITY`
+// holds after `#include <math.h>` (C 7.12p3-5 make `INFINITY`, `NAN` and `HUGE_VAL`
+// MACROS, and every reference defines them) while `sizeof INFINITY` and
+// `_Generic(INFINITY, …)` see the declared `float`. Before this splice the rows
+// reached the semantic tier only, so the macro was missing on every pair and a
+// program's own `#ifndef INFINITY` fallback silently took over.
+//
+// THREE FORMS, each SEARCHED in the language's own configuration and VERIFIED, never
+// tabulated (the integer splice's rule):
+//   * a FINITE value — a hexadecimal floating constant, exact by construction, with
+//     the suffix whose `semantics.floatLiteralTyping` rule types it to the declared
+//     core, read back through the front end's own decoder (`decodeFloatLiteralAtKind`)
+//     to the same bits; a negative value is `(-<constant>)`;
+//   * ±INFINITY — a call of the FIRST builtin (config order) whose `lowering` is
+//     `infinity`, taking no operand and returning the declared core:
+//     `(__builtin_inff())`, `(__builtin_inf())` — the shape gcc's, clang's and
+//     Apple's own headers use (`(__builtin_inff ())`, `(__builtin_huge_val ())`;
+//     there is no literal for an infinity in C);
+//   * a QUIET NaN with the empty payload — the `quiet_nan` builtin of the declared
+//     core, whose one operand is the empty string: `(__builtin_nanf(""))`, glibc's and
+//     Apple's own `NAN`. Negated for a negative one.
+// The builtin's result core is read from its declared signature through the ONE
+// type-text codec (`ffi::readFunctionTypeShape`), so the builtin spelled here and the
+// one the semantic tier binds cannot disagree on a type. A float constant's type
+// depends on no data model, so there is no `Unrealized`: `Unspellable` when no form
+// verifies, and the caller refuses the descriptor on a live include. (The result is
+// the integer splice's own {outcome, text} shape.)
+[[nodiscard]] IntegerConstantSpelling
+spellFloatConstant(GrammarSchema const& schema, ffi::ShippedPpFloatConstant const& k,
+                   std::optional<LongDoubleFormat> longDoubleFormat) {
+    IntegerConstantSpelling const none{SpellOutcome::Unspellable, {}};
+    double const v = k.value;
+    bool const negative = std::signbit(v);
+    auto const negated = [&](std::string body) {
+        return IntegerConstantSpelling{SpellOutcome::Spelled,
+                                       negative ? "(-" + body + ")" : "(" + body + ")"};
+    };
+    if (std::isinf(v) || std::isnan(v)) {
+        // A NaN with a payload, or a signaling one, has no spelling here: the
+        // `quiet_nan` builtin's empty operand is the empty payload. The double carrier
+        // of an F32 constant keeps neither the payload nor the quiet bit across
+        // narrowing, so the descriptor cannot state one today (see its value decode).
+        std::uint64_t const bits = std::bit_cast<std::uint64_t>(v);
+        if (std::isnan(v)
+            && ((bits & 0x0008000000000000ull) == 0          // signaling: the quiet bit clear
+                || (bits & 0x0007FFFFFFFFFFFFull) != 0)) {   // or a payload below it
+            return none;
+        }
+        BuiltinLowering const verb =
+            std::isinf(v) ? BuiltinLowering::Infinity : BuiltinLowering::QuietNan;
+        std::size_t const operands = std::isinf(v) ? 0u : 1u;
+        for (BuiltinFunctionMapping const& b : schema.semantics().builtinFunctions) {
+            if (b.lowering != verb || b.signatureIsPerPair || b.genericPointee.has_value()) {
+                continue;
+            }
+            TypeKind result = b.resultCore;
+            std::size_t arity = b.paramCores.size();
+            bool variadic = b.variadic;
+            if (!b.signatureText.empty()) {
+                auto const shape = ffi::readFunctionTypeShape(b.signatureText);
+                if (!shape.has_value()) continue;
+                result   = shape->result;
+                arity    = shape->operandCores.size();
+                variadic = shape->variadic;
+            }
+            if (result != k.core || arity != operands || variadic) continue;
+            return negated(b.name + (operands == 0u ? std::string{"()"} : std::string{"(\"\")"}));
+        }
+        return none;
+    }
+    // A finite value: the suffix of the first `floatLiteralTyping` rule (config order:
+    // the least-decorated spelling that works wins) whose type is the declared core
+    // under the pair's long-double format, then the literal read back exactly.
+    auto const& rules = schema.semantics().floatLiteralTyping;
+    NumberStyle const* const ns = schema.numberStyle();
+    LongDoubleFormat const ldf = longDoubleFormat.value_or(LongDoubleFormat::None);
+    // The magnitude, narrowed to the declared core's own width first so the digits
+    // spelled are that type's value (an F32 constant's `0.1` is the float nearest 0.1).
+    double magnitude = std::fabs(v);
+    if (k.core == TypeKind::F32) magnitude = static_cast<double>(static_cast<float>(magnitude));
+    else if (k.core != TypeKind::F64) return none;   // a wider carrier than a double states
+    std::array<char, 64> buf{};
+    auto const [end, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), magnitude,
+                                         std::chars_format::hex);
+    if (ec != std::errc{}) return none;
+    std::string const digits = "0x" + std::string{buf.data(), end};
+    // A floating type's width is no data model's to decide, and the rule's type must
+    // say so: it is verified under EVERY model of the closed table, the integer
+    // splice's no-pair rule, rather than under one assumed model.
+    std::vector<DataModel> const models = spellingModels(std::nullopt);
+    for (FloatLiteralTypingRule const& r : rules) {
+        std::vector<std::string> spellings;
+        if (r.suffixes.empty()) spellings.emplace_back();
+        else for (auto const& s : r.suffixes) spellings.push_back(s);
+        bool const typed = std::ranges::all_of(models, [&](DataModel m) {
+            auto const core = r.type.resolveCore(m, ldf);
+            return core.has_value() && *core == k.core;
+        });
+        if (!typed) continue;
+        for (auto const& sfx : spellings) {
+            std::string const text = digits + sfx;
+            FloatLiteralDecode const back = decodeFloatLiteralAtKind(text, ns, k.core);
+            if (!back.ok || back.wide.has_value()
+                || std::bit_cast<std::uint64_t>(back.narrow)
+                       != std::bit_cast<std::uint64_t>(magnitude)) {
+                continue;
+            }
+            return negative ? IntegerConstantSpelling{SpellOutcome::Spelled, "(-" + text + ")"}
+                            : IntegerConstantSpelling{SpellOutcome::Spelled, text};
+        }
+    }
+    return none;
 }
 
 // ══ THE TYPE-DERIVED PREDEFINED MACROS — (LANGUAGE × PAIR) REALIZATION ═════════
@@ -804,6 +929,21 @@ realizeTypeDerivedPredefine(PredefinedMacroDef const&                 pm,
             // `name(c)` → `c ## sfx` (C 7.22.4.1's `INTN_C`); with no suffix, `c`.
             std::string const& param = pm.params.front();
             return {Outcome::Realized, sfx->empty() ? param : param + " ## " + *sfx};
+        }
+        case PredefinedMacroKind::TypeFormat: {
+            // P69 (M4): the format string a conversion of this type is written
+            // with — the language's length modifier for the type the pair realizes,
+            // then the row's conversion letter, as a C string literal (`"ld"`), the
+            // shape every reference's `__INT64_FMTd__` has.
+            auto const mod = formatModifierFor(language.preprocess().typeFormatModifiers,
+                                               *id, facts.dataModel);
+            if (!mod.has_value()) {
+                return refused("'preprocess.typeFormatModifiers' names no length "
+                               "modifier for that type — add the type to the entry "
+                               "C's formatted I/O gives it");
+            }
+            return {Outcome::Realized,
+                    "\"" + std::string{*mod} + pm.formatConversion + "\""};
         }
         default:
             return {};   // not a type-derived kind: nothing to realize here
@@ -1400,17 +1540,33 @@ std::atomic<std::uint64_t>& preScanHitCount() {
 }
 
 // Look the file up, or read + splice + tokenize it and publish the result.
-// Returns null EXACTLY when `SourceBuffer::fromFile` would have — the callers'
-// unreadable-include diagnostics are unchanged.
+// Returns null when the file cannot be read, `unreadable` then saying why in the
+// read's own words (the path and the OS's reason): the callers' unreadable-
+// include diagnostic.
+//
+// ★ IT NEVER THROWS, AND THAT IS THE FIX. `SourceBuffer::fromFile` throws for a
+// file it cannot read and never returns null, so the callers' diagnostic was dead
+// code and a header found but unreadable -- mode 0, a pipe that errs, a file past
+// what a buffer can address -- escaped the preprocessor as a C++ exception
+// (✔MEASURED on the Mac, run 20261029-002544-d3909fed: an angle include found as
+// a directory), where gcc and clang give a fatal error naming it with the OS's
+// reason (✔MEASURED, linux-x86_64-debug, run 20261028-211717-91ff7388, gcc 13.3.0
+// and clang 18.1.3). The read is the checked one, under the bound `fromFile`
+// passes: a device or a named pipe is read as those compilers read one.
 [[nodiscard]] std::shared_ptr<PreScannedFile const>
 preScanIncludeFile(fs::path const& path,
-                   std::shared_ptr<GrammarSchema const> const& schema) {
+                   std::shared_ptr<GrammarSchema const> const& schema,
+                   std::string& unreadable) {
     // ⚠ THE READ COMES FIRST, AND IT HAS TO. The key's second term is the
     // digest of the bytes, so there is nothing to look up until the bytes are
     // in hand. A lookup that could be answered without reading would be a
     // lookup answered by a heuristic — the defect this shape exists to remove.
-    auto buf = SourceBuffer::fromFile(path);
-    if (!buf) return nullptr;   // caller emits the unreadable-include diagnostic
+    auto text = core::readFileChecked(path, std::numeric_limits<std::uint32_t>::max());
+    if (!text) {
+        unreadable = std::move(text).error().message;
+        return nullptr;   // caller emits the unreadable-include diagnostic
+    }
+    auto buf = SourceBuffer::fromString(*std::move(text), path.string());
     PreScanKey key{core::PathIdentity::of(path),
                    crypto::sha256OfText(buf->text())};
     {
@@ -1504,7 +1660,10 @@ preScanIncludeFile(fs::path const& path,
 // dedup — a bug whose only symptom was a correct-looking redefinition error.
 // The lesson is the one this project keeps paying for: an invariant that "cannot"
 // break is a claim about a platform, and it is worth exactly what it was measured
-// on. The scan below consults `fs::equivalent` and nothing else.
+// on. The scan below asks `core::reachedSameFile` -- `equivalent`'s question, asked
+// of the substrate, because libstdc++ on Windows answers it of a dangling link
+// with no error where MS STL and libc++ report one (✔MEASURED 2026-10-21, the
+// substrate's header) -- and nothing else.
 //
 // ★★ IT IS STILL NOT O(n^2), FOR A REASON THAT IS MEASURED RATHER THAN HOPED.
 // `files_` counts only files that ACTUALLY FIRED an include-once pragma — not
@@ -1535,7 +1694,7 @@ public:
         std::size_t& from = checkedUpTo_[canon];
         for (std::size_t k = from; k < files_.size(); ++k) {
             std::error_code ec;
-            if (fs::equivalent(p, files_[k], ec) && !ec) {
+            if (core::reachedSameFile(p, files_[k], ec) && !ec) {
                 from = files_.size();
                 spellings_.insert(canon);   // memoise: hash hit from now on
                 return true;
@@ -1643,6 +1802,13 @@ struct SynthBuilder {
     // the semantic `#include` gate use — an unavailable-on-this-format header is
     // treated like "no descriptor on the path" (left verbatim), all three agreeing.
     std::optional<ObjectFormatKind>      activeFormat;
+    // The active pair's TARGET name (the `when.arch` vocabulary), when known —
+    // what a descriptor `constants` arm keyed on `arch` is selected by in the
+    // splice below, so `#if O_NOFOLLOW` sees the value the semantic tier injects
+    // (D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES). Placed here, not after
+    // `pairFacts`, so a construction site that forgets it fails to compile
+    // instead of silently selecting no arch.
+    std::optional<std::string_view>      activeTarget;
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the ACTIVE FORMAT's header-NAME case
     // rule, applied by EVERY include search this builder performs. A SEPARATE
     // input from `activeFormat` (a KIND): deriving the rule from the kind would
@@ -1738,10 +1904,9 @@ struct SynthBuilder {
     // FC15c shared funnel; it now routes every candidate through the shared
     // `resolveInDir`, so the pre-scan can never disagree with the authoritative
     // pass about which file a name denotes -- including on the CASE question
-    // (D-PP-HEADER-CASE-INSENSITIVE-PE). What stays local is only the
-    // `is_regular_file` filter and the resulting "keep searching the next dir"
-    // behaviour, which the shared `resolveIncludePath` deliberately does not
-    // have (it stops at the first existing entry, directory or not).
+    // (D-PP-HEADER-CASE-INSENSITIVE-PE) and on what a header may be: the search
+    // itself passes over a directory and takes anything else (`descend`), so
+    // nothing here filters what it found.
     //
     // ★ RETURNS THE TRI-STATE, NOT AN OPTIONAL, AND THE REASON IS A BLOCKER
     // THIS FUNCTION ONCE SHIPPED. It used to flatten `AmbiguousCase` to
@@ -1764,25 +1929,20 @@ struct SynthBuilder {
     HeaderSearchResult resolveQuote(std::string_view filename,
                                     fs::path const& includingDir) const {
         // An empty include target names nothing -- fail loud (the caller
-        // emits P_PreprocessorIncludeError). Only a REGULAR file is a valid
-        // include target; `is_regular_file` excludes a directory (so
-        // `#include ""` cannot resolve to the including dir itself, which
-        // would later throw in SourceBuffer::fromFile).
+        // emits P_PreprocessorIncludeError).
         if (filename.empty()) return HeaderSearchResult::notFound();
-        std::error_code ec;
-        // Per candidate dir: the shared policy-aware atom, then the local
-        // `is_regular_file` filter. A COLLISION is returned as-is and STOPS the
-        // search -- the same rule `resolveIncludePath` states in its header
-        // comment ("continuing to a later dir would make the answer depend on
-        // whether the host could even represent the collision"). The earlier
-        // cut of this function continued to the next dir here, quietly
-        // disagreeing with the shared resolver about the same question.
+        // Per candidate dir: the shared policy-aware atom, which passes over a
+        // directory (so `#include "."` cannot resolve to the including dir
+        // itself) and takes a device or a named pipe, as gcc and clang do
+        // (`descend`). A COLLISION is returned as-is and STOPS the search -- the
+        // same rule `resolveIncludePath` states in its header comment
+        // ("continuing to a later dir would make the answer depend on whether the
+        // host could even represent the collision"). ★ A HIT WHOSE REACH CANNOT BE
+        // EXAMINED (a looping link, a refusal) is no absence: it ENDS the search,
+        // named (`HeaderSearchStatus::Unexaminable` -- gcc and clang both stop
+        // there, fatal, ✔MEASURED 2026-10-28).
         auto const tryDir = [&](fs::path const& dir) -> HeaderSearchResult {
-            HeaderSearchResult r =
-                resolveInDir(dir, filename, headerNameMatching, headerSearch);
-            if (r.status != HeaderSearchStatus::Found) return r;
-            if (!fs::is_regular_file(r.path, ec)) return HeaderSearchResult::notFound();
-            return r;
+            return resolveInDir(dir, filename, headerNameMatching, headerSearch);
         };
         // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `isRootedPath`, the
         // ONE exported predicate, never a second bare `is_absolute()`. ✔MEASURED
@@ -2076,12 +2236,14 @@ struct SynthBuilder {
                 // above, so the two surfaces of one descriptor can never reach
                 // the TU under different conditions.
                 //
-                // ⓘ NO ACTIVE TARGET IS THREADED, and the loader makes that
-                // safe rather than lucky: a `preprocessorVisible` constant may
-                // key its `variants` on `format` ONLY (refused at load
-                // otherwise), and the format IS threaded. That refusal is what
-                // stops an arch-keyed constant from being silently absent from
-                // `#if` on every target.
+                // ★ THE WHOLE PAIR IS THREADED — target, format and the pair
+                // facts (data model, long-double format) — so a visible
+                // constant selects here exactly the arm the semantic tier
+                // injects. It used to be the format alone, with a load refusal
+                // of every other axis to keep that safe; that refusal made a
+                // per-ARCH value inexpressible, and Linux aarch64's O_DIRECTORY
+                // and O_NOFOLLOW (which override x86_64's) shipped with
+                // x86_64's bits (D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES).
                 // ⓘ REUSES `macroRep` rather than constructing a second
                 // throwaway. Not merely tidy: the reporter-enumeration pin
                 // (anchor
@@ -2093,7 +2255,7 @@ struct SynthBuilder {
                 // correct answer anyway: they share the same discard discipline
                 // and the same owner downstream.
                 auto consts = ffi::readShippedLibConstants(
-                    p, macroRep, std::nullopt, activeFormat, &pairFacts);
+                    p, macroRep, activeTarget, activeFormat, &pairFacts);
                 if (!consts) {
                     // The macros read above already decides Malformed for the
                     // parent; a constants-only defect is surfaced by the
@@ -2133,6 +2295,35 @@ struct SynthBuilder {
                         continue;
                     }
                     out.append("#define " + k.name + " " + spelled.text + "\n");
+                }
+
+                // P69 round 4, D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR:
+                // the THIRD surface — every float constant is a C MACRO (7.12p3-5),
+                // spelled as the language's own constant of its declared type
+                // (`spellFloatConstant`). The same walk, gate and throwaway reporter
+                // as the integer constants above, and the same refusal on a live
+                // include when no spelling verifies.
+                auto fconsts = ffi::readShippedLibFloatConstants(p, macroRep);
+                if (!fconsts) return;   // surfaced by the semantic read, like a constants defect
+                for (auto const& fk : *fconsts) {
+                    IntegerConstantSpelling const spelled =
+                        spellFloatConstant(*schema, fk, pairFacts.longDoubleFormat);
+                    if (spelled.outcome != SpellOutcome::Spelled) {
+                        if (reportMalformed) {
+                            emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                                   BufferId{}, SourceSpan::empty(0),
+                                   std::string{"shipped-header descriptor float constant '"}
+                                       + fk.name + "' has no spelling this language "
+                                         "verifies as its declared type ("
+                                       + std::string{typeKindNameOrEmpty(fk.core)}
+                                       + "): no 'floatLiteralTyping' suffix for a finite "
+                                         "value, or no 'infinity' / 'quiet_nan' builtin of "
+                                         "that type (descriptor "
+                                       + core::genericSpelling(p) + ")");
+                        }
+                        continue;
+                    }
+                    out.append("#define " + fk.name + " " + spelled.text + "\n");
                 }
             },
             [&](std::string const&, HeaderSearchResult const&) {
@@ -3286,6 +3477,19 @@ struct SynthBuilder {
                     normalizeComputedAngleLine(toks[i].tok.span.start());
                     continue;   // left verbatim; the macro pass elides it
                 }
+                // The same ownership for an -I candidate nobody could examine: the
+                // import resolver never re-resolves the source half, so THIS tier
+                // reports it (an unexaminable DESCRIPTOR flows the verbatim path
+                // below, and the import resolver reports it).
+                if (angleRes.kind == AngleIncludeKind::UnexaminableSource
+                    && includeResolvable()) {
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"system include "} + angleName + ": "
+                               + describeUnexaminable(angleRes.unexaminable));
+                    normalizeComputedAngleLine(toks[i].tok.span.start());
+                    continue;   // left verbatim; the macro pass elides it
+                }
 
                 // SOURCE fallback: a no-descriptor angle header that IS a real source
                 // file on the -I path — splice it TEXTUALLY and DROP the directive,
@@ -3317,13 +3521,14 @@ struct SynthBuilder {
                     // was readable when it was pushed.
                     // The load now goes through the shared per-file pre-scan, so
                     // the read + splice + tokenize happen once per FILE rather
-                    // than once per OCCURRENCE; a null return means exactly what
-                    // a null `SourceBuffer::fromFile` meant.
-                    auto headerPre = preScanIncludeFile(angleRes.path, schema);
+                    // than once per OCCURRENCE; a null return is a header that
+                    // could not be read, `unreadable` saying why.
+                    std::string unreadable;
+                    auto        headerPre = preScanIncludeFile(angleRes.path, schema, unreadable);
                     if (!headerPre) {
                         emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                                BufferId{}, SourceSpan::empty(0),
-                               std::string{"system include unreadable: "} + angleName);
+                               std::string{"system include unreadable: "} + angleName + ": " + unreadable);
                         normalizeComputedAngleLine(dStart);
                         continue;
                     }
@@ -3349,7 +3554,7 @@ struct SynthBuilder {
                     copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
-                                       headerNameMatching, headerSearch,
+                                       activeTarget, headerNameMatching, headerSearch,
                                        rep, depth + 1, includeStack,
                                        includeOnce, fatal,
                                        preScanDefinePrefix, oracle,
@@ -3481,6 +3686,10 @@ struct SynthBuilder {
             // with the unsuppressable `F_HeaderNameCaseAmbiguous`, and must NOT
             // be allowed to fall through to the quote->angle fallback and out
             // the suppressable `P_PreprocessorIncludeError` exit below.
+            // A candidate nobody could EXAMINE (a looping link, a refusal) is the
+            // same kind of stop: the search ended at it, so the quote->angle
+            // fallback below is never tried past it -- gcc and clang end the
+            // search there with a fatal error naming it (✔MEASURED 2026-10-28).
             bool quoteCollision = false;
             auto resolved = takeFound(
                 resolveQuote(filename, includingDir),
@@ -3489,6 +3698,13 @@ struct SynthBuilder {
                     reportHeaderCaseAmbiguity(rep, BufferId{},
                                               SourceSpan::empty(0), filename,
                                               candidates);
+                },
+                [&](HeaderSearchResult const& unexaminable) {
+                    quoteCollision = true;
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"quote include "} + filename + ": "
+                               + describeUnexaminable(unexaminable));
                 });
             if (quoteCollision) {
                 // Sole reporter (the TF-C60 Finding-5 discipline): DROP the
@@ -3560,13 +3776,14 @@ struct SynthBuilder {
             // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
             // the header's own text) — see the angle arm's note. Routed through
             // the shared per-file pre-scan for the same reason it is there.
-            auto headerPre = preScanIncludeFile(*resolved, schema);
+            std::string unreadable;
+            auto        headerPre = preScanIncludeFile(*resolved, schema, unreadable);
             std::shared_ptr<SourceBuffer> const headerBuf =
                 headerPre ? headerPre->source : nullptr;
             if (!headerBuf) {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
-                       std::string{"quote include unreadable: "} + filename);
+                       std::string{"quote include unreadable: "} + filename + ": " + unreadable);
                 copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
                 copiedUpTo = dirEnd;   // Finding 5: sole reporter, drop the line
                 continue;
@@ -3594,7 +3811,7 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
-                               headerNameMatching, headerSearch, rep,
+                               activeTarget, headerNameMatching, headerSearch, rep,
                                depth + 1, includeStack, includeOnce, fatal,
                                preScanDefinePrefix, oracle,
                                resolvedDescriptorsOut, pairFacts};
@@ -5723,10 +5940,26 @@ private:
         PpProductText     product;
         PpHasEmbed        hasEmbed;
         PpOperatorRevoked revoked;
+        PpPlatformFacts   platform;   // P69 review M3; fold f26b
     };
     [[nodiscard]] IfCallbacks makeIfCallbacks() {
         IfCallbacks cb;
         cb.defined = [this](std::string_view n) { return isDefined(n); };
+        // ★ P69 (lane `cs`, review M3): the platform half of `__has_builtin` for a LIBRARY
+        // builtin — the active object format's shipped corpus, through the predicate that
+        // reads the realization oracle's own rows, so the operator answers 1 exactly where
+        // the semantic tier's binder binds the call. No active format: unset, so 0 — the
+        // binder provides no library function without one either.
+        if (activeFormat_.has_value()) {
+            cb.platform.libraryFunctionProvided =
+                [fmt = *activeFormat_](std::string_view lib) {
+                    return ffi::shippedLibraryFunctionProvidedOnFormat(lib, fmt)
+                        .value_or(false);
+                };
+        }
+        // ★ P69 (lane `cs`, fold f26b): and the format itself, which `__has_attribute`
+        // reads for an attribute row gated to some formats (`PpPlatformFacts`).
+        cb.platform.activeFormat = activeFormat_;
         // FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK: `__has_include` resolves a
         // header EXACTLY as the include machinery would. This is the AUTHORITATIVE
         // pass's callback (it decides the FINAL `#if` branch); it MUST agree with
@@ -5757,6 +5990,18 @@ private:
                         return true;
                     case AngleIncludeKind::NotFound:
                         return false;
+                    case AngleIncludeKind::UnexaminableDescriptor:
+                    case AngleIncludeKind::UnexaminableSource:
+                        // A candidate nobody could examine ends the search, and the
+                        // operator REFUSES it -- gcc and clang answer
+                        // `__has_include` of one with a fatal error naming it
+                        // (✔MEASURED 2026-10-28), never with 0. Both halves report
+                        // here, as for a collision: no later tier sees this operand.
+                        emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError,
+                               BufferId{}, SourceSpan::empty(0),
+                               std::string{"__has_include(<"} + std::string{filename} + ">): "
+                                   + describeUnexaminable(ar.unexaminable));
+                        return false;
                     case AngleIncludeKind::AmbiguousDescriptor:
                     case AngleIncludeKind::AmbiguousSource:
                         // D-PP-HEADER-CASE-INSENSITIVE-PE: this is the
@@ -5781,6 +6026,13 @@ private:
             if (q.status == HeaderSearchStatus::AmbiguousCase) {
                 reportHeaderCaseAmbiguity(rep_, BufferId{}, SourceSpan::empty(0),
                                           filename, q.ambiguousCandidates);
+                return false;
+            }
+            if (q.status == HeaderSearchStatus::Unexaminable) {   // refused, as the angle form is
+                emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"__has_include(\""} + std::string{filename} + "\"): "
+                           + describeUnexaminable(q));
                 return false;
             }
             return q.status == HeaderSearchStatus::Found;
@@ -5811,11 +6063,28 @@ private:
                                           filename, r.ambiguousCandidates);
                 return std::nullopt;
             }
+            if (r.status == HeaderSearchStatus::Unexaminable) {   // the search ended: refused, never "not found"
+                emitPP(rep_, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                       SourceSpan::empty(0),
+                       std::string{"__has_embed of "} + std::string{filename} + ": "
+                           + describeUnexaminable(r));
+                return std::nullopt;
+            }
             if (r.status != HeaderSearchStatus::Found) return std::nullopt;
-            // The SAME measurement the directive takes (`resourceByteCount`:
-            // regular-file check + `file_size`), so "how big is this resource"
-            // has one owner and the operator cannot drift from the splice.
-            return resourceByteCount(r.path);
+            // The SAME measurement the directive takes (`resourceSize`), so "how
+            // big is this resource" has one owner and the operator cannot drift
+            // from the splice -- except where no one can know it unread: a NAMED
+            // PIPE answers FOUND (and EMPTY under `limit(0)`, which empties any
+            // resource) WITHOUT being opened, its bytes left for the directive.
+            // ⚠ A STATED DIVERGENCE, ✔MEASURED 2026-10-28 (macos-arm64-debug, run
+            // 20261029-004015-0104a8a8, Apple clang 21.0.0): clang answers EMPTY (2)
+            // for every pipe, unopened -- a fed pipe, an empty one, one nobody
+            // writes -- and its own `#embed` then embeds the fed pipe's bytes. DSS
+            // keeps its operator agreeing with its directive: 2 would make
+            // `#if __has_embed(p) == __STDC_EMBED_FOUND__` skip a pipe that has bytes.
+            auto const size = resourceSize(r.path);
+            if (!size) return std::nullopt;
+            return size->pipe ? kUnreadPipeBytes : size->bytes;
         };
         // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the revocation oracle. THIS
         // expander's set, so the `#if` fold and `#ifdef` cannot disagree about
@@ -5852,7 +6121,8 @@ private:
         IfCallbacks const cb = makeIfCallbacks();
         auto v = evaluateIfExpression(operand, *schema_, expandCb, cb.defined,
                                       cb.hasInclude, *synth_, cb.product, rep_,
-                                      cb.hasEmbed, cb.revoked, charFacts_);
+                                      cb.hasEmbed, cb.revoked, charFacts_,
+                                      cb.platform);
         return v.has_value() && *v;
     }
 
@@ -5954,22 +6224,42 @@ private:
 
     // FC17.9(h): the resource's byte COUNT (its implementation resource width in
     // octets, C23 6.10.4.1p1), measured from the FILESYSTEM rather than from a
-    // buffer. nullopt when the path is not a readable regular file -> the
-    // caller's loud unreadable diagnostic.
+    // buffer -- or, for a NAMED PIPE, the fact that it is one: a pipe has no
+    // width until it is read (`pipe`, `bytes` 0). nullopt when the path is
+    // neither a readable regular file nor a pipe -> the caller's loud
+    // unreadable diagnostic.
     //
     // ★ IT IS A SEPARATE STEP FROM THE READ BECAUSE THE SIZE DECIDES WHETHER
     // THE READ MAY HAPPEN AT ALL: `limit` narrows it (6.10.4.2p4) and the splice
     // budget gates it, and both must be answerable BEFORE the bytes are in RAM.
-    static std::optional<std::uint64_t> resourceByteCount(fs::path const& path) {
-        // The shared `resolveIncludePath` matches any directory ENTRY, so it can
-        // hand back a DIRECTORY. Require a regular file (nullopt -> the caller's
-        // loud unreadable diagnostic) so a directory-named resource fails LOUD,
-        // never reads as a silently-empty embed.
+    // A pipe answers them by being read at most that far (`readResourceBytes`).
+    struct ResourceSize {
+        std::uint64_t bytes = 0;       // a regular file's size
+        bool          pipe  = false;   // a named pipe: its width is what reading it gives
+    };
+    // What `__has_embed` is handed for a pipe it does not open: "as wide as any
+    // `limit`", so the ONE width formula answers FOUND, and EMPTY at `limit(0)`.
+    static constexpr std::uint64_t kUnreadPipeBytes = std::numeric_limits<std::uint64_t>::max();
+    static std::optional<ResourceSize> resourceSize(fs::path const& path) {
+        // The shared search passes over a DIRECTORY (`descend`) and hands back a
+        // device or a named pipe. A pipe is read (Apple clang embeds a fed one); a
+        // DEVICE stays refused -- nullopt, the caller's loud unreadable diagnostic
+        // -- as Apple clang refuses one ("device files are not yet supported by
+        // '#embed' directive", ✔MEASURED 2026-10-28, macos-arm64-debug, run
+        // 20261029-002044-5101633a, Apple clang 21.0.0; gcc 13.3 and clang 18.1.3,
+        // the Linux leg's, have no #embed): no working reference embeds one.
+        //
+        // ★ THE SUBSTRATE IS ASKED, NEVER THE LIBRARY: a resource reached through a link is the bytes
+        // the link reaches, and a dangling one is none. libstdc++ on Windows sizes a file link by the
+        // LINK's own attributes (`fs::file_size` of a symlinked file: 0), so the MinGW build measured
+        // an EMPTY resource there -- `__has_embed` answered empty and the directive spliced nothing
+        // ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]).
         std::error_code ec;
-        if (!fs::is_regular_file(path, ec)) return std::nullopt;
-        auto const size = fs::file_size(path, ec);
+        auto const size = core::reachedFileSize(path, ec);
         if (ec) return std::nullopt;
-        return static_cast<std::uint64_t>(size);
+        if (size) return ResourceSize{static_cast<std::uint64_t>(*size), false};
+        if (core::reachedPipe(path, ec) && !ec) return ResourceSize{0, true};
+        return std::nullopt;
     }
 
     // FC17.9(h): read AT MOST `maxBytes` of `path` BINARY-exact into a string,
@@ -5986,11 +6276,26 @@ private:
     // with `limit(0)`). Reading the whole file and then discarding the tail
     // would make `limit` a formatting option instead of the resource bound the
     // standard designed it as.
+    //
+    // ★ A NAMED PIPE (`pipe`) is read ONCE, at most `maxBytes`, its end -- the
+    // writer closing -- ending the read early: the bytes it gave ARE its width.
+    // Nothing past `maxBytes` is ever read, so `limit(513)` over an endless
+    // stream reads 513 bytes (6.10.4.2 EXAMPLE 4).
     static std::optional<std::string> readResourceBytes(fs::path const& path,
-                                                        std::uint64_t maxBytes) {
-        auto const size = resourceByteCount(path);
-        if (!size) return std::nullopt;
-        if (maxBytes >= *size) {
+                                                        std::uint64_t maxBytes,
+                                                        bool pipe = false) {
+        if (pipe) {
+            std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
+            if (!in) return std::nullopt;
+            std::string out(static_cast<std::size_t>(maxBytes), '\0');
+            in.read(out.data(), static_cast<std::streamsize>(maxBytes));
+            if (in.bad()) return std::nullopt;
+            out.resize(static_cast<std::size_t>(in.gcount()));
+            return out;
+        }
+        auto const size = resourceSize(path);
+        if (!size || size->pipe) return std::nullopt;
+        if (maxBytes >= size->bytes) {
             // A mid-stream IO error (disk/share failure) can silently truncate
             // the read, and a truncated `#embed` is a SILENT MISCOMPILE — the
             // program gets fewer bytes than the resource holds and nothing says
@@ -6008,7 +6313,7 @@ private:
         // The BOUNDED arm keeps the same short-read detector: `gcount()` must
         // deliver exactly the bytes asked for, or the read failed and the
         // caller refuses LOUD rather than embedding a shorter resource.
-        std::ifstream in(path, std::ios::binary);
+        std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
         if (!in) return std::nullopt;
         std::string out(static_cast<std::size_t>(maxBytes), '\0');
         in.read(out.data(), static_cast<std::streamsize>(maxBytes));
@@ -6308,7 +6613,7 @@ private:
                 lineSpan.subspan(lim->clauseBegin, lim->clauseEnd - lim->clauseBegin),
                 line[lim->nameIndex], *schema_, expandCb, cb.defined,
                 cb.hasInclude, *synth_, cb.product, rep_, cb.hasEmbed, cb.revoked,
-                charFacts_, textOf, failParam);
+                charFacts_, cb.platform, textOf, failParam);
             if (!limit.has_value()) return;   // reported through failParam
         }
 
@@ -6318,6 +6623,11 @@ private:
         if (rr.status == HeaderSearchStatus::AmbiguousCase) {
             reportHeaderCaseAmbiguity(rep_, synth_->id(), dirSpan, filename,
                                       rr.ambiguousCandidates);
+            return;
+        }
+        if (rr.status == HeaderSearchStatus::Unexaminable) {   // the search ended there: no later directory is asked
+            failAt(dirSpan, std::string{"#embed resource "} + filename + ": "
+                                + describeUnexaminable(rr));
             return;
         }
         if (rr.status != HeaderSearchStatus::Found) {
@@ -6333,17 +6643,39 @@ private:
         auto const* resolved = &rr.path;
 
         // ── 6.10.4.1p1: the IMPLEMENTATION RESOURCE WIDTH, measured from the
-        // filesystem so nothing is in RAM yet. ──
-        auto const fileBytes = resourceByteCount(*resolved);
-        if (!fileBytes) {
+        // filesystem so nothing is in RAM yet -- except a NAMED PIPE's, which only
+        // reading it tells: it is read here, ONCE, at most one byte past what the
+        // directive may splice (`limit`, else the splice budget), so the gate
+        // below still answers before anything past the budget is held. ──
+        auto const size = resourceSize(*resolved);
+        if (!size) {
             failAt(dirSpan, std::string{"#embed resource could not be read: "}
                                 + resolved->string());
             return;
         }
+        std::optional<std::string> piped;   // a pipe's bytes, read before its width is known
+        if (size->pipe) {
+            std::uint64_t const budget = static_cast<std::uint64_t>(kEmbedMaxResourceBytes);
+            piped = readResourceBytes(*resolved, limit ? std::min(*limit, budget + 1) : budget + 1,
+                                      /*pipe=*/true);
+            if (!piped) {
+                failAt(dirSpan, std::string{"#embed resource could not be read: "}
+                                    + resolved->string());
+                return;
+            }
+            if (piped->size() > kEmbedMaxResourceBytes) {
+                failAt(dirSpan, std::string{"#embed resource "} + resolved->string()
+                                    + " is a named pipe that gave more than "
+                                    + std::to_string(kEmbedMaxResourceBytes)
+                                    + " bytes, the cycle-1 splice budget; bound it with limit(...)");
+                return;
+            }
+        }
 
         // ── 6.10.4.1p1/p5 + 6.10.4.2p4: the resource WIDTH -- the directive's
         // and `__has_embed`'s ONE formula, so the two agree on emptiness. ──
-        std::uint64_t const width = embedResourceWidthBytes(*fileBytes, limit);
+        std::uint64_t const width =
+            embedResourceWidthBytes(size->pipe ? piped->size() : size->bytes, limit);
 
         // ── (D-PP-EMBED-STREAMING, the splice boundary): gate the byte count
         // this directive will MATERIALIZE through the pure size helper -- a
@@ -6392,8 +6724,9 @@ private:
         }
 
         // ── Read the bytes BINARY-exact (CRLF/SUB/NUL/0xFF preserved), bounded
-        // by the resource width so nothing past the `limit` is ever read. ──
-        auto bytes = readResourceBytes(*resolved, width);
+        // by the resource width so nothing past the `limit` is ever read (a
+        // pipe's were read above, no further than that). ──
+        auto bytes = size->pipe ? std::move(piped) : readResourceBytes(*resolved, width);
         if (!bytes || bytes->size() < static_cast<std::size_t>(width)) {
             // A short read is a SILENT MISCOMPILE if accepted: the program would
             // get fewer bytes than the resource holds. Loud, always -- including
@@ -8681,13 +9014,15 @@ private:
             return materializeSignificant(def.value);
         case PredefinedMacroKind::TypeName:
         case PredefinedMacroKind::TypeLimit:
-            // P68 round 9: a spelling or a spelled limit, written by
-            // `mergePredefinedMacros` — never empty when realized, so an empty
-            // one bypassed the merge: the same fatal as above.
+        case PredefinedMacroKind::TypeFormat:
+            // P68 round 9: a spelling or a spelled limit — and, P69, a format
+            // string literal — written by `mergePredefinedMacros`: never empty
+            // when realized, so an empty one bypassed the merge: the same fatal.
             if (def.value.empty()) {
-                ppFatal("materializePredefined: a 'type-name' or 'type-limit' "
-                        "predefined macro reached expansion unrealized — only "
-                        "mergePredefinedMacros may produce the effective list");
+                ppFatal("materializePredefined: a 'type-name', 'type-limit' or "
+                        "'type-format' predefined macro reached expansion "
+                        "unrealized — only mergePredefinedMacros may produce the "
+                        "effective list");
             }
             return materializeSignificant(def.value);
         case PredefinedMacroKind::TypeSuffix:
@@ -10114,7 +10449,7 @@ PreprocessResult preprocessRun(
     // ORDINARY directive handler seeds them in stream order (the gcc model:
     // "as if #define appeared before the first source line"). Two origins:
     //   "<built-in>"     — config predefinedMacros WITH `params` (function-like,
-    //                      e.g. the MSVC-profile `__declspec(x)` → empty erase),
+    //                      e.g. the pe-profile `_declspec(x)` → `__declspec(x)`),
     //                      format-filtered exactly like the predefined_ seed.
     //   "<command-line>" — the CLI `--define NAME[=VALUE]` entries (VALUE
     //                      defaults to 1). Because these become ORDINARY
@@ -10383,8 +10718,16 @@ PreprocessResult preprocessRun(
         // `when: { "longDoubleFormat": … }` arm is selected by.
         typeFacts != nullptr ? std::optional<LongDoubleFormat>{typeFacts->longDoubleFormat}
                              : std::optional<LongDoubleFormat>{}};
+    // The pair's target name, the `when.arch` fact — the SAME name the typedef
+    // read in `shippedTypedefsForPredefines` selects by. No pair ⇒ no arch, so an
+    // arch-keyed arm then matches nothing, exactly as a format-keyed one does
+    // without a format.
+    std::optional<std::string_view> const activeTarget =
+        typeFacts != nullptr && !typeFacts->targetName.empty()
+            ? std::optional<std::string_view>{typeFacts->targetName}
+            : std::optional<std::string_view>{};
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
-                         headerNameMatching, headerSearch,
+                         activeTarget, headerNameMatching, headerSearch,
                          *result.diagnostics, 0, includeStack, includeOnce,
                          result.fatal,
                          preScanDefinePrefix, preScanOracle,

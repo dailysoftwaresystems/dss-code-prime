@@ -1,0 +1,1 @@
+            shown = _redact().lazy_redactor(tree=tree, places={"<temp>": tempfile.gettempdir()})

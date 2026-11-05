@@ -65,6 +65,7 @@
 #include "opt/passes/inlining.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/simplify_cfg.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: mergeCuMirs reads the link's document)
 
 #include <gtest/gtest.h>
 
@@ -507,7 +508,7 @@ TEST(InlineAsmRebuildCarriage, Site4CrossCuMergeReAddsTheDescriptor) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     auto const id = soleAsm(merged->mir);
@@ -574,7 +575,7 @@ TEST(InlineAsmRebuildCarriage, Site4CrossCuMergeKeepsEachCusDescriptorWithItsOwn
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1077,7 +1078,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite4CrossCuMergeKeepsTheAsmGotoPieceAnchor
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     expectPieceAnchoredToTheGoto(merged->mir, "after the cross-CU merge");

@@ -1,0 +1,6 @@
+        srcToDst[srcBlock.v] = b.createBlock();
+        outBlockEntryImage[srcBlock.v] = srcToDst[srcBlock.v].v;
+    }
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
+        if (!walkDynamicDescents) continue;

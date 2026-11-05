@@ -1,0 +1,46 @@
+{
+  "$comment": "D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT (P69, lane lm): C 6.3.1.1p2 promotes a bit-field by its WIDTH - an `unsigned b : 3` is an `int` in an expression, an `unsigned x : 32` an `unsigned int`, an `unsigned long long q : 3` an `int`. DSS read every bit-field at its declared type, at run time, in the constant evaluator and in the semantic typer alike. MEASURED 2026-10-15 (17 fields x 51 programs, pe64, both pipelines, images run; the references gcc 13, clang 18, AppleClang 21, mingw-w64 gcc 13.2): 305 cells off the four - `v.b - 6 < 0` over a field holding 5 ran 0 where they run 1, `_Generic(v.b + 0, ...)` chose `unsigned int`, `x /= v.b` (x = -6, the field 3) left 1431655763 where they leave -2, and the static initializer `(long long)(g.b - 6)` was 4294967295 where they build -1. Every check of this program is a cell the four answer alike (the forked cells - a postfix `E++`, a statement expression, a field wider than `int` - are pinned in tests/analysis/semantic/test_bit_field_value_is_promoted_by_its_width.cpp); each returns its own code and the program exits 42 when all hold, on the four. The `volatile` objects are computed at run time, the `const` one by the compiler (static initializers, and `if` conditions the lowering folds to decide reachability): the two must agree. RED-ON-DISABLE: take the bit-field arm out of the lowering's operators (`asBitFieldValue` answering the operand unchanged) -> exit 7; out of the constant evaluator (`readThroughBitField` at the declared type) -> exit 23. The release arm reads the same objects through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

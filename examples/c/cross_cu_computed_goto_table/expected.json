@@ -1,6 +1,8 @@
 {
   "$comment": "D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS (cycle P37). A function-static computed-goto jump table in a SEPARATE translation unit from its caller. The table is a DATA item whose relocations name SYNTHETIC BLOCK SYMBOLS; the whole-program merge remapped the owning function's symbol and every relocation target but copied `blockSymbols` verbatim, so the declaration kept its per-CU id while the reference got a freshly minted merged one and the link failed with 1313 K_SymbolUndefined on the sqlite3 CLI for pe64. TWO CUs are the precondition, not decoration: in a single-CU build the id mint is the identity, the two ids coincide, and the defect cannot fire -- which is why a 103-TU program found it and no single-CU pin did. The exit code witnesses the RELOCATION VALUES, not merely that the link succeeded: 10+20+30+40-58 = 42, so a slot bound to the wrong block changes it.",
   "language": "c",
+  "$commentForbidDiagnostics": "P69: this example holds a value-returning function whose last statement is not a plain `return` (found by a mechanical scan of the corpus for exactly that shape), so the function is complete only because DSS SEES that control never arrives at its closing brace. Until P69 losing that sight REFUSED the compile. Under C it no longer does: C23 6.9.2p13 accepts a non-void function whose end is reached, so the compile succeeds with the warning H_NonVoidFunctionEndReachable and the program may run unchanged. This key keeps the red: the arm fails when that code is reported, in both runners, where the exit code could not see the regression.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
   "sources": ["main.c", "dispatch.c"],
   "exitCode": 42,
   "expectedStdout": "",

@@ -1,4 +1,4 @@
-# PURPOSE: stage, check and apply one fold's deferred-anchor rows as a batch through the door, rehearsed in a throwaway repository first, all or nothing, every row read back.
+# PURPOSE: stage, check and apply a batch of the orchestrator's own deferred-anchor rows through the door, rehearsed in a throwaway repository first, all or nothing, every row read back.
 name: anchor-rows
 description: >-
   The self-test drives the rows batch through git fixture repositories and the REAL door (a host
@@ -8,11 +8,11 @@ description: >-
   path the program has; the arms are the list. Each verb runs as a MANUAL step. The program documents
   itself in its own header; this file declares only how a runner starts it and what witnesses that it
   ran. Gated by ctest as `anchor_rows_selftest_guard`.
-  ⚠ THE MANUAL STEPS ACT ON THE TREE ITSELF -- its registries, and a lane's rows directory under its
-  worktrees or scratch -- so they run through the `rows` runner, whose one leg is this machine's own
-  tree. Through the `anchor-rows` runner they would also run on a host's synced copy, which holds no
-  lane's rows directory (`.worktrees` and `.temp` are ignored, and only what git does not ignore
-  travels): there a step refuses for want of its rows.
+  ⚠ THE MANUAL STEPS ACT ON THE TREE ITSELF -- its registries, and the orchestrator's rows directory in
+  the main checkout -- so they run through the `rows` runner, whose one leg is this machine's own tree.
+  Through the `anchor-rows` runner they would also run on a host's synced copy, which holds no rows
+  directory (`.orchestrators`, `.worktrees` and `.temp` are ignored, and only what git does not ignore
+  travels): there a step refuses for want of its rows. A lane's rows go in with its fold (`fold-agent`).
   Every input of a step is handed over as `<input>=<value>`, defaults included, and `anchor-rows.py
   --step` turns them into the verb's own arguments; its STEP_INPUTS table is the one statement of each
   step's inputs, and the self-test holds this file to it. A list input is comma-separated, or
@@ -32,7 +32,7 @@ steps:
     workingDirectoryRoot: action
     inputs:
       rows:
-        description: "the lane's rows directory, <rows dir>/<ANCHOR ID>/<cell>.txt; the lane's files are never edited"
+        description: "the rows directory, <rows dir>/<ANCHOR ID>/<cell>.txt; its files are never edited"
       staged:
         description: "a NEW directory the named rows are copied into -- the fold's record of what it carried"
       only:
@@ -60,9 +60,9 @@ steps:
     requireInputsUnmoved: true
 
   # `apply` writes the two registries -- tracked files -- by design, so it cannot carry requireInputsUnmoved.
-  # The door resolves no cited id, and no guard reads the registries' own citations (`check-anchor-citations`
-  # reads `anchors.citationRoots`, which holds no `.plans`): `check` and `apply` resolve every id the batch
-  # newly cites themselves, against both registries and the batch.
+  # The door resolves every id a value newly cites and refuses a value it would store cut (since 2026-09-30):
+  # `check` and `apply` meet both refusals at the rehearsal, which writes the batch -- new rows first -- through
+  # the real door in a throwaway repository before the real registries are opened.
   - name: apply
     manual: true
     workingDirectoryRoot: action

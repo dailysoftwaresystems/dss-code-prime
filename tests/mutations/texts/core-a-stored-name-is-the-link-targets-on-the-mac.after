@@ -1,0 +1,1 @@
+    if (::getattrlist(p.c_str(), &request, reply, sizeof reply, 0) != 0) {

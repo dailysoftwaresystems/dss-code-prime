@@ -197,12 +197,38 @@ struct EhFramePcRelPatch {
     std::size_t   funcIndex  = 0;  // index into the caller's function array
 };
 
+// ── A HANDLER, AS `buildEhFrame` STATES IT (P69 fold 3d) ────────────────
+//
+// The routine an exception dispatcher calls for a function's frame, and
+// whether the function has a language-specific data area for it to read.
+// `personality` is the CALLER's identity for the routine -- the key the FDEs
+// naming one routine share a CIE by -- never an address: the field is filled
+// after layout, as `initial_location` is.
+struct EhFrameHandler {
+    std::uint32_t personality = 0;
+    bool          hasDataArea = false;
+};
+
+// One handler field -- a CIE's personality pointer or an FDE's data-area
+// pointer -- recorded for the post-layout patch or the relocation. A
+// personality field's `funcIndex` is a function of that CIE (they all name
+// one routine); a data-area field's is the FDE's own function.
+struct EhFrameHandlerPatch {
+    enum class Field : std::uint8_t { Personality, DataArea };
+    std::uint32_t byteOffset = 0;   // offset within `.eh_frame` of the 4-byte field
+    std::size_t   funcIndex  = 0;
+    Field         field      = Field::Personality;
+};
+
 struct EhFrameSection {
     std::vector<std::uint8_t>      bytes;
     std::vector<EhFramePcRelPatch> patches;
     // Byte offset within `.eh_frame` of each emitted FDE's first byte,
     // parallel with `patches`. `.eh_frame_hdr`'s search table needs it.
     std::vector<std::uint32_t>     fdeOffsets;
+    // Every personality and data-area field (P69 fold 3d). Empty when no
+    // function names a handler.
+    std::vector<EhFrameHandlerPatch> handlerPatches;
 };
 
 namespace detail {
@@ -398,12 +424,27 @@ encodeCfiInstructions(CfiFunction const& fn, DwarfRegisterMapping const& regs,
     return {};
 }
 
-// Build the whole `.eh_frame` section: one CIE followed by one FDE per
-// function that has call-frame information.
+// Build the whole `.eh_frame` section: one FDE per function that has
+// call-frame information, each after the CIE it names.
 //
-// `codeLengths[i]` / `hasCfi` come from the caller's function array;
 // `addressSize` is the target pointer width (CIE/FDE records are padded to
 // it). Returns nullopt after reporting a refusal.
+//
+// ★ ONE CIE PER HANDLER SHAPE (P69 fold 3d). A CIE states the personality
+//   routine and whether its FDEs carry a data-area pointer, so the functions
+//   share a CIE exactly when they name the same routine (or none) and agree on
+//   having an area: "zR" for no handler, "zPR" for a routine and no area,
+//   "zPLR" for both -- the three shapes gcc and clang write. `perFuncHandler`
+//   is empty (no function names a handler) or parallel with `perFunc`. Both
+//   fields are pc-relative sdata4, filled by `applyEhFrameHandlerFields`: the
+//   routine's own address (an image's function, or an import's call stub),
+//   and the area's. That is an IMAGE's form. A relocatable object needs the
+//   indirect one -- the address of a slot holding the routine's -- because the
+//   direct one is refused by the reference linkers (✔MEASURED P69 fold 3d: by
+//   GNU ld for a PIE and a shared object and by lld for a shared object, on
+//   x86_64 and aarch64; the indirect one links in all twelve modes); no
+//   writer here states a handler in a relocatable object yet, and each
+//   refuses one by name.
 //
 // ★ REFUSES, never degrades: a function whose rules cannot be encoded
 //   fails the whole section rather than being skipped. A `.eh_frame` that
@@ -413,12 +454,26 @@ encodeCfiInstructions(CfiFunction const& fn, DwarfRegisterMapping const& regs,
 [[nodiscard]] inline std::optional<EhFrameSection>
 buildEhFrame(std::span<std::optional<CfiFunction> const> perFunc,
              DwarfRegisterMapping const& regs, std::uint32_t addressSize,
-             DiagnosticReporter& reporter) {
+             DiagnosticReporter& reporter,
+             std::span<std::optional<EhFrameHandler> const> perFuncHandler = {}) {
     auto fail = [&](std::string const& msg) -> std::optional<EhFrameSection> {
         emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
              "dwarf_cfi::buildEhFrame: " + msg);
         return std::nullopt;
     };
+    if (!perFuncHandler.empty() && perFuncHandler.size() != perFunc.size()) {
+        return fail("the handlers name " + std::to_string(perFuncHandler.size())
+                    + " functions and the frame descriptions "
+                    + std::to_string(perFunc.size()) + "; a handler would be "
+                      "stated for the wrong function");
+    }
+    for (std::size_t fi = 0; fi < perFuncHandler.size(); ++fi) {
+        if (perFuncHandler[fi].has_value() && !perFunc[fi].has_value()) {
+            return fail("function #" + std::to_string(fi) + " names a handler and "
+                        "carries no call-frame information; a handler is reached "
+                        "only through its function's frame description");
+        }
+    }
     // ★ NOTHING TO DESCRIBE COMES FIRST, AND THE ORDER IS THE WHOLE POINT.
     //   The numbering check below is a REFUSAL, and a refusal must fire only
     //   when information would actually be LOST. A module in which no
@@ -451,30 +506,11 @@ buildEhFrame(std::span<std::optional<CfiFunction> const> perFunc,
             "(D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO)");
     }
 
-    // ── CIE ──
-    std::size_t const cieStart = sec.bytes.size();
-    appendU32LE(sec.bytes, 0);                       // length — back-patched
-    std::size_t const cieBody = sec.bytes.size();
-    appendU32LE(sec.bytes, 0);                       // CIE_id (0 in .eh_frame)
-    sec.bytes.push_back(1);                          // version
-    sec.bytes.push_back('z');                        // augmentation "zR"
-    sec.bytes.push_back('R');
-    sec.bytes.push_back(0);
-    detail::appendULeb(sec.bytes, kCodeAlignmentFactor);
-    detail::appendSLeb(sec.bytes, kDataAlignmentFactor);
-    detail::appendULeb(sec.bytes, *regs.returnAddressColumn);
-    detail::appendULeb(sec.bytes, 1);                // augmentation data length
-    sec.bytes.push_back(kDwEhPePcRel4);              // FDE pointer encoding
-
-    // Initial instructions: the entry state every function starts in.
-    // `initial` was resolved above (it is what decides whether there is
-    // anything to describe at all); they are all the same by construction —
-    // one calling convention per module — and the CIE is DWARF's own
-    // recognition of that fact.
-
     // ★ The entry state must be uniform. If two functions disagree, one of
     //   them would be described by a CIE that is not theirs — a table that
-    //   is confidently wrong for half the image.
+    //   is confidently wrong for half the image. (Every CIE below carries the
+    //   same initial instructions: one calling convention per module, and the
+    //   CIE is DWARF's own recognition of that fact.)
     for (auto const& f : perFunc) {
         if (f.has_value() && !(f->initial == *initial)) {
             return fail("two functions in one module declare different frame "
@@ -483,6 +519,9 @@ buildEhFrame(std::span<std::optional<CfiFunction> const> perFunc,
                         "function that does not match it");
         }
     }
+    // The initial instructions: the entry state every function starts in,
+    // encoded once and written into each CIE.
+    std::vector<std::uint8_t> entryInstructions;
     {
         CfiFunction entry;
         entry.codeLength = 0;
@@ -499,27 +538,82 @@ buildEhFrame(std::span<std::optional<CfiFunction> const> perFunc,
                 CfiOp{0, CfiOpKind::RegInRegister, CfiRegRef::returnAddress(),
                       CfiRegRef::physical(*initial->returnAddressRegister), 0});
         }
-        if (auto e = encodeCfiInstructions(entry, regs, sec.bytes); !e.empty()) {
+        if (auto e = encodeCfiInstructions(entry, regs, entryInstructions); !e.empty()) {
             return fail("the shared frame entry state cannot be encoded: " + e);
         }
     }
-    // Pad so the WHOLE RECORD (its 4-byte length field included) is a
-    // multiple of the address size -- padding only the body leaves every
-    // following record 4 bytes off the alignment the readers expect.
-    detail::padToMultiple(sec.bytes, cieStart, addressSize);
-    {
-        std::uint32_t const len =
-            static_cast<std::uint32_t>(sec.bytes.size() - cieBody);
-        sec.bytes[cieStart + 0] = static_cast<std::uint8_t>(len & 0xFFu);
-        sec.bytes[cieStart + 1] = static_cast<std::uint8_t>((len >> 8) & 0xFFu);
-        sec.bytes[cieStart + 2] = static_cast<std::uint8_t>((len >> 16) & 0xFFu);
-        sec.bytes[cieStart + 3] = static_cast<std::uint8_t>((len >> 24) & 0xFFu);
-    }
+
+    auto const backPatchLength = [&](std::size_t start, std::size_t body) {
+        std::uint32_t const len = static_cast<std::uint32_t>(sec.bytes.size() - body);
+        sec.bytes[start + 0] = static_cast<std::uint8_t>(len & 0xFFu);
+        sec.bytes[start + 1] = static_cast<std::uint8_t>((len >> 8) & 0xFFu);
+        sec.bytes[start + 2] = static_cast<std::uint8_t>((len >> 16) & 0xFFu);
+        sec.bytes[start + 3] = static_cast<std::uint8_t>((len >> 24) & 0xFFu);
+    };
+
+    // ── CIEs, one per handler shape, each written before its first FDE (an
+    //    FDE's CIE pointer is a distance BACK) ──
+    struct CieShape {
+        bool          hasPersonality = false;
+        std::uint32_t personality    = 0;
+        bool          hasDataArea    = false;
+        std::size_t   start          = 0;
+    };
+    std::vector<CieShape> cies;
+    auto const cieFor = [&](std::optional<EhFrameHandler> const& handler,
+                            std::size_t fi) -> CieShape const& {
+        CieShape key;
+        key.hasPersonality = handler.has_value();
+        key.personality    = handler.has_value() ? handler->personality : 0;
+        key.hasDataArea    = handler.has_value() && handler->hasDataArea;
+        for (auto const& c : cies) {
+            if (c.hasPersonality == key.hasPersonality && c.personality == key.personality
+                && c.hasDataArea == key.hasDataArea) {
+                return c;
+            }
+        }
+        key.start = sec.bytes.size();
+        appendU32LE(sec.bytes, 0);                       // length — back-patched
+        std::size_t const cieBody = sec.bytes.size();
+        appendU32LE(sec.bytes, 0);                       // CIE_id (0 in .eh_frame)
+        sec.bytes.push_back(1);                          // version
+        sec.bytes.push_back('z');                        // "zR", "zPR" or "zPLR"
+        if (key.hasPersonality) sec.bytes.push_back('P');
+        if (key.hasDataArea) sec.bytes.push_back('L');
+        sec.bytes.push_back('R');
+        sec.bytes.push_back(0);
+        detail::appendULeb(sec.bytes, kCodeAlignmentFactor);
+        detail::appendSLeb(sec.bytes, kDataAlignmentFactor);
+        detail::appendULeb(sec.bytes, *regs.returnAddressColumn);
+        // Augmentation data: P = its encoding + a 4-byte field, L = its
+        // encoding, R = its encoding.
+        detail::appendULeb(sec.bytes, (key.hasPersonality ? 5u : 0u) + (key.hasDataArea ? 1u : 0u) + 1u);
+        if (key.hasPersonality) {
+            sec.bytes.push_back(kDwEhPePcRel4);
+            sec.handlerPatches.push_back(EhFrameHandlerPatch{
+                static_cast<std::uint32_t>(sec.bytes.size()), fi,
+                EhFrameHandlerPatch::Field::Personality});
+            appendU32LE(sec.bytes, 0);                   // the routine — patched
+        }
+        if (key.hasDataArea) sec.bytes.push_back(kDwEhPePcRel4);   // each FDE's area
+        sec.bytes.push_back(kDwEhPePcRel4);              // FDE pointer encoding
+        sec.bytes.insert(sec.bytes.end(), entryInstructions.begin(), entryInstructions.end());
+        // Pad so the WHOLE RECORD (its 4-byte length field included) is a
+        // multiple of the address size -- padding only the body leaves every
+        // following record 4 bytes off the alignment the readers expect.
+        detail::padToMultiple(sec.bytes, key.start, addressSize);
+        backPatchLength(key.start, cieBody);
+        cies.push_back(key);
+        return cies.back();
+    };
 
     // ── FDEs ──
     for (std::size_t fi = 0; fi < perFunc.size(); ++fi) {
         if (!perFunc[fi].has_value()) continue;
         CfiFunction const& fn = *perFunc[fi];
+        std::optional<EhFrameHandler> const handler =
+            perFuncHandler.empty() ? std::nullopt : perFuncHandler[fi];
+        std::size_t const cieStart = cieFor(handler, fi).start;
         std::size_t const fdeStart = sec.bytes.size();
         sec.fdeOffsets.push_back(static_cast<std::uint32_t>(fdeStart));
         appendU32LE(sec.bytes, 0);                   // length — back-patched
@@ -534,7 +628,15 @@ buildEhFrame(std::span<std::optional<CfiFunction> const> perFunc,
             static_cast<std::uint32_t>(sec.bytes.size()), fi});
         appendU32LE(sec.bytes, 0);                   // initial_location — patched
         appendU32LE(sec.bytes, fn.codeLength);       // address_range
-        detail::appendULeb(sec.bytes, 0);            // augmentation data length
+        if (handler.has_value() && handler->hasDataArea) {
+            detail::appendULeb(sec.bytes, 4);        // augmentation data: the area's field
+            sec.handlerPatches.push_back(EhFrameHandlerPatch{
+                static_cast<std::uint32_t>(sec.bytes.size()), fi,
+                EhFrameHandlerPatch::Field::DataArea});
+            appendU32LE(sec.bytes, 0);               // the data area — patched
+        } else {
+            detail::appendULeb(sec.bytes, 0);        // augmentation data length
+        }
         if (auto e = encodeCfiInstructions(fn, regs, sec.bytes); !e.empty()) {
             return fail("function #" + std::to_string(fi) + ": " + e);
         }
@@ -566,6 +668,35 @@ inline void applyEhFramePcRel(EhFrameSection& sec, std::uint64_t ehFrameVa,
         sec.bytes[p.byteOffset + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
         sec.bytes[p.byteOffset + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
     }
+}
+
+// Fill every handler field (P69 fold 3d) once the section and its targets have
+// addresses: `targetVa(patch)` returns the address the field names -- the
+// personality routine's for a Personality field, the data area's first byte
+// for a DataArea field. Each
+// field is pc-relative sdata4. Returns empty, or the refusal's text when a
+// distance does not fit 32 signed bits (the field would name another address,
+// and the dispatcher would call it).
+template <typename TargetVaFn>
+[[nodiscard]] inline std::string applyEhFrameHandlerFields(EhFrameSection& sec, std::uint64_t ehFrameVa,
+                                                           TargetVaFn const& targetVa) {
+    for (auto const& p : sec.handlerPatches) {
+        std::uint64_t const target = targetVa(p);
+        std::int64_t const  rel =
+            static_cast<std::int64_t>(target) - static_cast<std::int64_t>(ehFrameVa + p.byteOffset);
+        if (rel < static_cast<std::int64_t>(INT32_MIN) || rel > static_cast<std::int64_t>(INT32_MAX)) {
+            return std::string{p.field == EhFrameHandlerPatch::Field::Personality ? "the personality field"
+                                                                                  : "the data-area field"}
+                 + " of function #" + std::to_string(p.funcIndex) + " lies " + std::to_string(rel)
+                 + " bytes from the address it names, which a pc-relative 32-bit field cannot hold";
+        }
+        auto const v = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel));
+        sec.bytes[p.byteOffset + 0] = static_cast<std::uint8_t>(v & 0xFFu);
+        sec.bytes[p.byteOffset + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+        sec.bytes[p.byteOffset + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+        sec.bytes[p.byteOffset + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+    }
+    return {};
 }
 
 // Build `.eh_frame_hdr` — the sorted binary-search index a runtime unwinder

@@ -1,0 +1,1 @@
+                sec.alignment = declared.value_or(Alignment{});   // the degrade: no alignment read as one byte

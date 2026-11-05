@@ -1,0 +1,2 @@
+            // A file-scope prototype never reaches the sweep: its scope IS the file's.
+            if (!(rec.isExternDeclaration || rec.isProtoDeclaration) || rec.isAbsorbedProto)

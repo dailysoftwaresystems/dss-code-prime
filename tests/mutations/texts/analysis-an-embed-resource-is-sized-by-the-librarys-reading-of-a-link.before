@@ -1,0 +1,1 @@
+        auto const size = core::reachedFileSize(path, ec);

@@ -1,0 +1,2 @@
+                            if (ksc.nameToken.valid())
+                                s.attributeNamesIgnoredForKind.set(ksc.nameToken,

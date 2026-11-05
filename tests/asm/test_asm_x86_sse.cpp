@@ -380,9 +380,12 @@ TEST(X86Sse, MovsdLoadRipRelEmits_F2_0F_10_05_Rel32Reloc) {
     ASSERT_EQ(relocs.size(), 1u);
     EXPECT_EQ(relocs[0].offset, 4u);
     EXPECT_EQ(relocs[0].target, SymbolId{77});
-    auto const rel32 = f.schema->relocationByName("rel32");
-    ASSERT_NE(rel32, nullptr);
-    EXPECT_EQ(relocs[0].kind, rel32->kind);
+    // A MEMORY operand's displacement: `riprel32` since P69 — `rel32` is the
+    // CALL kind (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB); same
+    // arithmetic, so the bytes above are unchanged.
+    auto const riprel32 = f.schema->relocationByName("riprel32");
+    ASSERT_NE(riprel32, nullptr);
+    EXPECT_EQ(relocs[0].kind, riprel32->kind);
     EXPECT_EQ(relocs[0].addend, 0);
 }
 
@@ -775,14 +778,17 @@ TEST(X86Sse, FullPipelineDoublePlusRodataConstFoldsToRipRelMovsd) {
         << "must contain ADDSD";
     EXPECT_TRUE(containsSseOp(out.bytes, 0xF2, 0x2C))
         << "must contain CVTTSD2SI";
-    // Exactly ONE rel32 relocation to the promoted global — now
+    // Exactly ONE RIP-relative relocation to the promoted global — now
     // emitted by the movsd_load riprel wire (pre-fold it came from
-    // the lea; the fold preserves the reloc count and target).
+    // the lea; the fold preserves the reloc count and target). Its kind
+    // is `riprel32`, the memory/address kind (P69,
+    // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB: `rel32` is the CALL
+    // kind now, and both the lea and the load are addresses).
     ASSERT_EQ(out.relocs.size(), 1u);
     EXPECT_EQ(out.relocs[0].target, SymbolId{500});
-    auto const rel32 = (*target)->relocationByName("rel32");
-    ASSERT_NE(rel32, nullptr);
-    EXPECT_EQ(out.relocs[0].kind, rel32->kind);
+    auto const riprel32 = (*target)->relocationByName("riprel32");
+    ASSERT_NE(riprel32, nullptr);
+    EXPECT_EQ(out.relocs[0].kind, riprel32->kind);
 }
 
 TEST(X86Sse, FullPipelineRodataConstTwoLoadsKeepsLeaPlusBaseForm) {

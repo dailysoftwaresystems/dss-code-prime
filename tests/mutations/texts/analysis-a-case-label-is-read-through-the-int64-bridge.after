@@ -1,0 +1,1 @@
+                    && (std::holds_alternative<std::int64_t>(folded->value)

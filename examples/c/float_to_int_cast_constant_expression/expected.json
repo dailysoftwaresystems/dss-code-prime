@@ -1,6 +1,8 @@
 {
   "$comment": "C23 6.6 + 6.3.1.2 + 6.3.1.4 ([[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]): a cast of a floating constant to an integer type is an integer constant expression and folds in every ICE position — array bound, enumerator, bit-field width, static assertion, case label and index designator — plus the reverse direction, a cast whose target is a float. Every one of these was REFUSED by DSS before this example existed. The EXIT CODE is the instrument, not the assertions: the array bound, the bit-field width and the designated slot are all built from the folded casts, and each remaining fold is written into a guard line that cancels to zero, so a fold with the wrong VALUE exits with a number other than 42 instead of compiling quietly. ✔MEASURED: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 all accept this file, and gcc and mingw each run it to 42.",
   "language": "c",
+  "$commentForbidDiagnostics": "P69: this example holds a value-returning function whose last statement is not a plain `return` (found by a mechanical scan of the corpus for exactly that shape), so the function is complete only because DSS SEES that control never arrives at its closing brace. Until P69 losing that sight REFUSED the compile. Under C it no longer does: C23 6.9.2p13 accepts a non-void function whose end is reached, so the compile succeeds with the warning H_NonVoidFunctionEndReachable and the program may run unchanged. This key keeps the red: the arm fails when that code is reported, in both runners, where the exit code could not see the regression.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
   "source": "main.c",
   "exitCode": 42,
   "targets": [

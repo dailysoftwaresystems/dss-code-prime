@@ -1,0 +1,6 @@
+            // A parser recovery (Error) node: no base, so no claim
+            // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+            std::optional<RuleId> const scanned = tree.ruleIfInternal(cur);
+            if (!scanned.has_value()) return out;
+            std::uint32_t const r = scanned->v;
+            auto const ops = internals(cur);

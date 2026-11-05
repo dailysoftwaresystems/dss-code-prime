@@ -1,0 +1,3 @@
+            if (false) {
+                std::vector<AssembledModule> units;
+                units.reserve(cus.size());

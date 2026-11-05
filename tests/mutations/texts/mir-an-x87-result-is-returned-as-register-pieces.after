@@ -1,0 +1,2 @@
+        if (abi->kind == AbiPassing::Kind::X87 && abi->pieces.size() > 2u) {
+            TypeId const f80 = interner.primitive(TypeKind::F80);

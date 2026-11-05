@@ -1,0 +1,3 @@
+    fs::path const           base{spelled.substr(0, root.volume)};
+    if (root.kind != core::RootSpelling::Kind::Verbatim)
+        return descend(base, fs::path{spelled.substr(root.volume)}, matching, cache);

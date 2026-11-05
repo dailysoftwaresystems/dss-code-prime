@@ -1,0 +1,1 @@
+                (void)foldAlignmentOperand(s, cfg, tree, operand, /*diagNode=*/cl,

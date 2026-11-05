@@ -1,0 +1,2 @@
+            if (compileOpts.archiveDefinitionVisibility.has_value()) {
+                for (ModuleSymbol& ms : mod->symbols) {

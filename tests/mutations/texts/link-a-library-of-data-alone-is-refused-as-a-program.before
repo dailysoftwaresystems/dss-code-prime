@@ -1,0 +1,1 @@
+    if (holdsCode || format.entryVerbs().empty()) return true;

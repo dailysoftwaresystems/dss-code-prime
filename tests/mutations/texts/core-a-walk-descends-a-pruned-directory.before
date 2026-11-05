@@ -1,0 +1,1 @@
+        if (step == WalkStep::Prune || entry.kind != EntryKind::Directory) continue;

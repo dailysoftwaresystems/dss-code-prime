@@ -1,0 +1,1 @@
+        reporter.report(std::move(d));

@@ -1,0 +1,1 @@
+    if (entryLinkName.empty() || true) return true;   // no entry: nothing to materialize

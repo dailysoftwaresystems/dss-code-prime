@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/aggregate_layout.hpp"      // AggregateLayoutParams (MergeCuInput::aggregateLayout)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"        // ExternImport
 #include "core/types/strong_ids.hpp"
@@ -9,6 +10,7 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 #include "mir/mir.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -44,6 +46,8 @@
 // mis-merge.
 
 namespace dss {
+
+class ObjectFormatSchema;   // link/object_format_schema.hpp — the link's document (`mergeCuMirs`)
 
 // One CU's decomposed inputs to the merge. DECOMPOSED (not a `CuMirModule`) so a
 // MIR-tier unit test can hand-build each field without a real `SemanticModel`:
@@ -109,6 +113,28 @@ struct MergeCuInput {
     //
     // NOT OWNED — the span/vector outlives the call, like every other field here.
     std::vector<std::string> const* importOnly = nullptr;
+
+    // ★★ THE LAYOUT RULE THIS UNIT WAS ANALYZED UNDER (P69 fold 3, lane `xa`) —
+    // what its semantic model answered `sizeof` from
+    // (`SemanticModel::aggregateLayout`). The merge SIZES a tentative definition
+    // with it where it must: two units' tentative definitions of one name are
+    // ONE object, the larger, and "larger" is the layout engine's word
+    // (`computeLayout`, the rule `sizeof` asks).
+    //
+    // ★ PER UNIT, AND THAT IS THE POINT. A size is a fact of the unit that
+    // compiled the definition, so each definition is sized under ITS OWN unit's
+    // rule and never under "unit 0's" — and where two units that define one
+    // name tentatively were analyzed under DIFFERENT rules, their sizes are not
+    // comparable and the merge refuses the name rather than pick one. (The
+    // driver analyzes every unit of a link under one target and one format, so
+    // its units agree by construction; the refusal is what makes that a checked
+    // fact instead of an assumed one.)
+    //
+    // Asked ONLY for a name two or more units define tentatively: a merge that
+    // meets none needs none, which is why it is optional and why a test that
+    // folds no tentative pair leaves it empty. A merge that meets one and was
+    // handed none refuses the name.
+    std::optional<AggregateLayoutParams> aggregateLayout;
 };
 
 // The merged whole-program module + the unified state the lower half consumes.
@@ -121,12 +147,22 @@ struct MergeCuInput {
 //                        stripped), with each `symbol` unified-remapped.
 //   * `userEntrySymbol`— the merged symbol of the function whose name is in the
 //                        grammar's entry-name list (e.g. "main"), or nullopt.
+//   * `unitOfDefinition` — merged-symbol id (`.v`) → the index in `cus` of the
+//                        unit whose definition of it the merge KEPT, for every
+//                        function, global and alias the merged module defines
+//                        (P69 fold 3d, D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER):
+//                        the driver turns it into the place of that unit's
+//                        source among the operator's inputs
+//                        (`AssembledModule::linkPositionOfDefinition`), so a
+//                        definition of the merged module meets a named object's
+//                        in the link's order, not as one unit standing first.
 struct MergedMirModule {
     Mir                                            mir;
     TypeLattice                                    host;
     std::unordered_map<std::uint32_t, std::string> symbolNames;
     std::vector<ExternImport>                      externImports;
     std::optional<SymbolId>                        userEntrySymbol;
+    std::unordered_map<std::uint32_t, std::size_t> unitOfDefinition;
 };
 
 // Merge `cus` into one module. `host` is MOVED in — the driver moves CU0's
@@ -137,8 +173,22 @@ struct MergedMirModule {
 // reported but the merge still proceeds with the lowest-key winner; nullopt is
 // returned only on a structural failure (the merged module fails `MirVerifier`,
 // or an internal invariant is breached). Correct for `cus.size() >= 1`.
+//
+// ★★ `linkFormat` — THE DOCUMENT OF THE LINK THE MERGE MERGES FOR (P69 fold 3,
+// lane `xa`). The merge decides which definition of a name survives, and until
+// this argument it decided with the binding alone: every weak definition at one
+// rank, a strong one replacing any of them, two tentative ones (`int x;` in two
+// units) refused as two strong definitions. Each of those is a FORMAT's
+// statement, and the merge now asks the same reader the unit linker asks
+// (`link/common_yield.hpp`) of the same document: the rank among the kinds of
+// weak definition and what a common is beside one (`commonYieldsTo`), and what
+// a weak definition is beside a strong one (`weakDefinitionBesideStrong`). It
+// is also the document whose data model every unit of this link was analyzed
+// under, which is the model a tentative definition is sized with (see
+// `MergeCuInput::aggregateLayout`). Held for the call only.
 [[nodiscard]] DSS_EXPORT std::optional<MergedMirModule>
 mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
-            std::span<std::string const> entryNames, DiagnosticReporter& reporter);
+            std::span<std::string const> entryNames,
+            ObjectFormatSchema const& linkFormat, DiagnosticReporter& reporter);
 
 } // namespace dss

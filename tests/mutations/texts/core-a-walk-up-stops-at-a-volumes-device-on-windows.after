@@ -1,0 +1,1 @@
+        std::wstring const head    = w.substr(0, headEnd == root.volume && headEnd > 0 ? headEnd - 1 : headEnd);

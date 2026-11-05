@@ -1,0 +1,27 @@
+{
+  "$comment": "A SECOND NAME OF A DEFINITION (P69, lane cs): the GNU `alias(\"target\")` attribute, compiled. Each alias is one more symbol row on its target's definition (the shape every object reader makes of a foreign alias), and the unit refers to an external alias by NAME, so a call, a read, a write and an address taken through it are the target's: an external alias of a function (called through a volatile pointer so the address compare is a runtime one), a weak one nothing replaces, an external alias of an object written through, a module-private alias (its uses bound to the target by the semantic tier), a GLOBAL alias of a `static` body (return 7: gcc 13.3.0 and clang 18.1.3 on x86_64 Linux and mingw-w64 gcc 13.2.0 build and run that pair at -O0 and -O2, MEASURED by lane cs's probe al2 cell 3; the PE writer refused it until P69 gave the alias a record of its own), and an alias of a TENTATIVE definition, which makes it a definition of the unit, never a common. Since the review of the alias fold (P69, lane cs, probes rv, rv3 and fk; gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 run each line they accept): OBJECT aliases written `static` (of a `static` object, of an external one) and an external one of a `static` object, a thread-local alias of a thread-local object, a hidden alias, a `static` `unsigned char` alias of an `int` (its first byte on these little-endian targets), and a FUNCTION name on an object -- a pair gcc refuses and clang builds, decided clang's: one storage under two names. Its recorded cost is return 14: clang's constant folder answers `(void*)f == (void*)&g` false where nothing hides the two (through volatile storage, return 13's comparison, it answers equal), and this compiler answers both equal. Every return before 42 names the first fact that failed. No Mach-O target: every Apple clang refuses an alias, and the Mach-O documents refuse it by name (`symbolAliasUnsupportedReason`). The `release` arm pins that dead-code removal keeps every definition an alias names (DCE roots each target) and that the optimizer carries the aliases through every rebuild.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

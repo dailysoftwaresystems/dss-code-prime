@@ -1,0 +1,1 @@
+    preStampLiteralLeaves(s, cfg, tree, kids[cfg.genericControlChild]);

@@ -1,0 +1,1 @@
+                auto const fromSize = std::optional<std::uint64_t>{s.value <= 4u ? 4u : 32u};

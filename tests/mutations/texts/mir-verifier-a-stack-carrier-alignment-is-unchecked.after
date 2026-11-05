@@ -1,0 +1,2 @@
+            if (a != 0 && !Alignment::fromBytes(a).has_value() && a == 0u) {
+                reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,

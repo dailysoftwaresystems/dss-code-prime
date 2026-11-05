@@ -1,0 +1,24 @@
+{
+  "$comment": "★★ A LINKED OBJECT'S `/SECTION:` SETS A SECTION'S ATTRIBUTES (P69 round 4, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). The archive's one member is cl 19.44's `/c /O2 /MD /GS-` build of `#pragma comment(linker, \"/SECTION:.rdata,RW\")`, a `const int dss_rdata_table[4]` and `dss_rdata_poke`, which writes 40 into the table through a volatile pointer and reads it back. The table lives in `.rdata`, so the write faults in an image whose `.rdata` is read-only. main.c first reads `.rdata`'s Characteristics back from its own image (2 if not writable, 3 if not readable, 4 if there is no `.rdata`), then returns the poke's 40 + 2. ✔MEASURED 2026-10-07, and again on this fixture as rebuilt 2026-10-08: the same main.c built by cl and linked against this archive runs to 42 under link.exe 14.44 and lld-link 19.1.5. The `release` arm pins that optimizing the DSS half leaves the foreign write where it is.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-10-07 (lane `xa`, ledger id `r4-SECTION`): in `encodeExec` (`src/link/format/pe.cpp`), the loop over the units' `/SECTION:` requests runs over none (`for (auto const& want : request.directives.sections) {` becomes `for (auto const& want : std::vector<SectionAttributeRequest>{}) {`), so `.rdata` keeps its read-only Characteristics. Built and run through ctest by one harness call, source md5 a1922da3 -> bab0b5bb -> a1922da3, run 20261007-092015-fdf64c55 (windows-x86_64-debug): this example RED in BOTH runners, `CoffDirectiveImageRequests.ASectionRequestRewritesTheNamedSectionInOrder` with it. CONTROL: the restored bytes, green in the row's final runs.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "Source and rebuild commands: `tests/link/data/libpe_directive_section_x86_64_pe.source.c` (cl 19.44.35228 `/c /O2 /MD /GS- /experimental:deterministic /pathmap:` + llvm-ar 19.1.5 `rcs --format=gnu`; member md5 fe4461be486bb8549c7c9e416249a753, archive md5 ba9b3b4d837be0b49c8ca6e01121c6d9). The witness is the directive itself.",
+          "path": "tests/link/data/libpe_directive_section_x86_64_pe.a",
+          "containerWitness": "/SECTION:.rdata,RW"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

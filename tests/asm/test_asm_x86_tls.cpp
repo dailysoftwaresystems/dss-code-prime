@@ -367,7 +367,7 @@ namespace {
         "relocations": [
             { "name": "tls-tpoff32", "kind": 4, "formula": "linear",
               "pcRelative": false, "addendBias": 0, "widthBytes": 4,
-              "tls": true }
+              "tls": true, "fieldRange": "signed" }
         ],
         "opcodes": [
             { "mnemonic": "invalid", "result": "none" },

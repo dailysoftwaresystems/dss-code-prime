@@ -1,0 +1,35 @@
+# PURPOSE: report the registry's DEBT the balance gate does not -- a closure verdict under a non-closure marker, a gated row with no open opener, a blocker already discharged, an unclassifiable closing-work marker, OPEN-vs-GATED prose, a `[[...]]` pointer that names no row -- and refuse what a change introduced that way.
+name: anchor-debt
+description: >-
+  The self-test proves each debt arm can fail, and the row vocabulary the anchors family loads from this
+  program by path (`is_closed`, `split_row`, `scan_worktree` and the rest) reads the shapes its cases name.
+  The balance itself, the registry partition and the Status/Trigger split are DssHarness's
+  (`dssharness check-anchor-balance`, `read-anchors --lint`, the door), not this action's. `debt` is a
+  MANUAL step and reads only: it scans the registries at `base` and now, prints every row that was already
+  in debt at `base`, and fails on what the change introduced -- a row it added or edited into debt, a
+  `[[...]]` pointer it left naming no row, its own or one whose target it deleted. A row lost from both
+  registries, open or closed at `base`, is the balance's to refuse. A bookkeeping closure `✅🧾`
+  since `base` is the balance's to report: DssHarness 0.6.7 counts it and credits nothing. It reads `base` through git,
+  which only this machine's own tree carries, so it runs as `dssharness run anchor-debt-debt --input
+  base=<ref>` (the round close passes the cycle's start). The program documents itself
+  in its own header; this file declares only how a runner starts it and what witnesses that it ran. Gated
+  by ctest as `anchor_debt_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./anchor-debt.py --self-test
+    successPattern: '^self-test: \d+ case\(s\), 0 failed$'
+    requireInputsUnmoved: true
+
+  - name: debt
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      base:
+        description: "the git ref a change is judged against: a row already in debt there is reported, one the change added or edited into debt is refused"
+        default: 'HEAD'
+    run: |
+      python3 ./anchor-debt.py "--base={base}"
+    successPattern: '^anchor-debt: OK\b'
+    requireInputsUnmoved: true

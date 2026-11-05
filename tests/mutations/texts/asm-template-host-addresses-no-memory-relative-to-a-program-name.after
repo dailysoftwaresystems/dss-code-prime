@@ -1,0 +1,2 @@
+        if (false && namesProgramSymbol(symbol, at)) {
+            return programSymbolOf(symbol, at, mnemonic, AsmTemplateNameUse::Address);

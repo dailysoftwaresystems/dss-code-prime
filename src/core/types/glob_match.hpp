@@ -66,8 +66,23 @@ namespace dss {
 // joined to `baseDir` by the caller first: a `[` in the manifest's own directory
 // name must stay a character, not become a metacharacter.
 //
-// Returns false and sets `ec` ONLY on a genuine filesystem I/O error (a directory
-// that cannot be read during the walk — FAIL LOUD). A pattern that simply matches
+// Why an expansion failed: the OS's reason AND the path it could not read, in the
+// one error the expansion hands back -- so a caller reporting the reason has the
+// path in hand, and none can drop it by omission.
+struct GlobError {
+    std::error_code       code;    // the reason; clear when the expansion did not fail
+    std::filesystem::path where;   // the directory it could not list, or the entry it could not examine
+    [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(code); }
+    [[nodiscard]] std::string message() const { return code.message(); }
+};
+
+// Returns false and sets `error` ONLY on a genuine filesystem I/O error -- a
+// directory under the base that cannot be listed, the base or a literal pattern
+// whose reach cannot be examined, or an entry the pattern MATCHES whose reach
+// cannot be examined (a looping link, a refusal) -- FAIL LOUD, `error.where`
+// naming it. An entry the pattern does NOT match is never asked about: an
+// unrelated looping or dangling link leaves the expansion whole, as bash, Python's
+// glob and CMake's GLOB_RECURSE list such a tree. A pattern that simply matches
 // NOTHING (including a base directory that does not exist / is not a directory) is
 // NOT an error here: it returns true and appends nothing — the CALLER owns the
 // zero-match policy (the driver fails that loud with a pattern-naming
@@ -75,7 +90,7 @@ namespace dss {
 // convention.
 [[nodiscard]] DSS_EXPORT bool expandGlob(std::string_view pattern,
                                          std::vector<std::string>& out,
-                                         std::error_code& ec,
+                                         GlobError& error,
                                          std::filesystem::path const& baseDir = {});
 
 } // namespace dss

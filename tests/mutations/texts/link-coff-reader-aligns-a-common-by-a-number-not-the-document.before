@@ -1,0 +1,1 @@
+                auto const fromSize = objectFormatSchema.commonsStatement().alignmentFromSize(s.value);

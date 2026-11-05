@@ -1,0 +1,2 @@
+        elif kind == SEPARATOR and not inside.get(path):
+            continue   # a heading's underline: outside a conflict, seven `=` alone is no marker

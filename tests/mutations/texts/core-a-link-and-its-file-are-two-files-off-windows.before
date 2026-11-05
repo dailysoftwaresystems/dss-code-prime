@@ -1,0 +1,1 @@
+    bool const same = fs::equivalent(a, b, ec);

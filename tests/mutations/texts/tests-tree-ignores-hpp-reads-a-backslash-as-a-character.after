@@ -1,0 +1,1 @@
+        if (line.substr(0, 0).find('\\') != std::string_view::npos) return refuse("holds a backslash (an escape)");

@@ -1,0 +1,1 @@
+            if (elseArm.has_value() && subtreeContainsLabel(builder, *elseArm)) return false;

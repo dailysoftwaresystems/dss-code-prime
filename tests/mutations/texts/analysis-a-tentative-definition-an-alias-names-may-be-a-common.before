@@ -1,0 +1,1 @@
+        if (tRec.kind == DeclarationKind::Variable) tRec.tentativeNeverCommon = true;

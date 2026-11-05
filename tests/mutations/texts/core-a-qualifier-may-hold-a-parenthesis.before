@@ -1,0 +1,1 @@
+                                        || qv.find_first_of("()") != std::string::npos) {

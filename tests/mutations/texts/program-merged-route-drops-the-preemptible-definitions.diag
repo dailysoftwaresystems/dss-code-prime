@@ -1,0 +1,1 @@
+a call to the shared object's own default-visibility function must be resolved by the loader

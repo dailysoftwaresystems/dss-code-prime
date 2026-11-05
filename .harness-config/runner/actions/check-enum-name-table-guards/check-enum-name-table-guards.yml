@@ -12,3 +12,14 @@ steps:
       python3 ./check-enum-name-table-guards.py
     successPattern: 'check-enum-name-table-guards: self-test OK'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-enum-name-table-guards --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-enum-name-table-guards.py --self-test
+    successPattern: '^check-enum-name-table-guards: self-test OK - \d+ arms'
+    requireInputsUnmoved: true

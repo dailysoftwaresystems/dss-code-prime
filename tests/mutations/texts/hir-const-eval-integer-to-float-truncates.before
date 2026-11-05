@@ -1,0 +1,1 @@
+        magnitude = kept + ((rest > half || (rest == half && (kept & 1u) != 0u)) ? 1u : 0u);

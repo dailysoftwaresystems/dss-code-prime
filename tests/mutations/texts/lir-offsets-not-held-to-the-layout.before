@@ -1,0 +1,2 @@
+    using namespace lir_descriptor_blocks_detail;
+    if (functions.size() != finalLir.moduleFuncCount()) {

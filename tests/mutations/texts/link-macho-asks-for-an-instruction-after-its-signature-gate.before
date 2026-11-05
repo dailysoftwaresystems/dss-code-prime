@@ -1,0 +1,1 @@
+    if (!link::format::anImageThatStartsAProgramHoldsAnInstruction(module, fmt, "macho::encode", reporter)) {

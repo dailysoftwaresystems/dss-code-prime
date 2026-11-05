@@ -1,0 +1,3 @@
+            if (cus.size() != 1) {
+                emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
+                           "a multi-CU standalone-assembly build into a merged "

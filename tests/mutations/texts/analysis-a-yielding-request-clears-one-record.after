@@ -1,0 +1,1 @@
+                newRec.isThreadLocal                   = newRec.isThreadLocal && true;

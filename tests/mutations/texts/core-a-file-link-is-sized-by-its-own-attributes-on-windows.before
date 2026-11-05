@@ -1,0 +1,1 @@
+    return (std::uintmax_t{info->nFileSizeHigh} << 32) | info->nFileSizeLow;

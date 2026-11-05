@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <utility>
 
 using namespace dss;
@@ -160,4 +161,80 @@ TEST(TreeDeathTest, InvalidNodeIdAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_DEATH({ (void)t.kind(NodeId{9999}); }, "Tree::node_: NodeId out of range");
     EXPECT_DEATH({ (void)t.kind(InvalidNode);  }, "Tree::node_: NodeId out of range");
+}
+
+// ── D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE ──
+//
+// NodeKind has THREE arms. A tree the parser RECOVERED — the language server
+// analyzes those — holds Error nodes beside Internal and Token ones, and a scan
+// that tested ONE arm and then read the node through another arm's accessor
+// read the half of the node's payload its kind does not own: a debug build's
+// assert killed the server, a release build answered the stored field.
+//
+// Every node below stores a MISLEADING value in the field its kind does not
+// own, so an answer taken from the field instead of from the kind is a visible
+// wrong answer here, never a default that happens to compare equal.
+namespace {
+
+struct ThreeArmTree {
+    Tree   tree;
+    RuleId programRule;
+    RuleId strayRule;
+};
+
+ThreeArmTree makeThreeArmTree() {
+    RawTreeBuilder rb{"x @", "<test>"};
+    RuleId const programRule = rb.internRule("program");
+    RuleId const strayRule   = rb.internRule("stray");
+    // (1) Internal: owns its rule; a stray token kind sits in the token field.
+    rb.addNode(NodeKind::Internal, programRule, SourceSpan::of(0, 3),
+               NodeFlags::HasError, /*parent=*/ InvalidNode,
+               /*children=*/ { NodeId{2}, NodeId{3} }, /*tokenKind=*/ SchemaTokenId{9});
+    // (2) Token `x`: owns its token kind; a stray rule sits in the rule field.
+    rb.addNode(NodeKind::Token, strayRule, SourceSpan::of(0, 1),
+               NodeFlags::None, /*parent=*/ NodeId{1},
+               /*children=*/ {}, /*tokenKind=*/ SchemaTokenId{3});
+    // (3) Error `@` — a parser recovery node: owns NEITHER field, both stray.
+    rb.addNode(NodeKind::Error, strayRule, SourceSpan::of(2, 3),
+               NodeFlags::HasError, /*parent=*/ NodeId{1},
+               /*children=*/ {}, /*tokenKind=*/ SchemaTokenId{5});
+    Tree t = std::move(rb).finish(/*root=*/ NodeId{1});
+    return ThreeArmTree{std::move(t), programRule, strayRule};
+}
+
+} // namespace
+
+TEST(TreeKindCheckedQueries, AnswerFromTheNodesKindForEveryArm) {
+    ThreeArmTree const f = makeThreeArmTree();
+    Tree const& t = f.tree;
+    ASSERT_EQ(t.kind(NodeId{1}), NodeKind::Internal);
+    ASSERT_EQ(t.kind(NodeId{2}), NodeKind::Token);
+    ASSERT_EQ(t.kind(NodeId{3}), NodeKind::Error);
+
+    std::optional<RuleId> const internalRule = t.ruleIfInternal(NodeId{1});
+    ASSERT_TRUE(internalRule.has_value());
+    EXPECT_EQ(*internalRule, f.programRule);
+    EXPECT_FALSE(t.ruleIfInternal(NodeId{2}).has_value());   // not its stray rule
+    EXPECT_FALSE(t.ruleIfInternal(NodeId{3}).has_value());   // a recovery node
+
+    std::optional<SchemaTokenId> const tokenKind = t.tokenKindIfToken(NodeId{2});
+    ASSERT_TRUE(tokenKind.has_value());
+    EXPECT_EQ(*tokenKind, SchemaTokenId{3});
+    EXPECT_FALSE(t.tokenKindIfToken(NodeId{1}).has_value());  // not its stray kind
+    EXPECT_FALSE(t.tokenKindIfToken(NodeId{3}).has_value());  // a recovery node
+}
+
+// No NDEBUG guard, on purpose: the precondition is fatal in a RELEASE build too.
+TEST(TreeDeathTest, TheDiscriminantCheckedAccessorsAreFatalOnAnotherKindInEveryBuild) {
+    ThreeArmTree const f = makeThreeArmTree();
+    Tree const& t = f.tree;
+    // The owned arm answers.
+    EXPECT_EQ(t.rule(NodeId{1}), f.programRule);
+    EXPECT_EQ(t.tokenKind(NodeId{2}), SchemaTokenId{3});
+
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH({ (void)t.rule(NodeId{2}); },      "Tree::rule on non-Internal node");
+    EXPECT_DEATH({ (void)t.rule(NodeId{3}); },      "Tree::rule on non-Internal node");
+    EXPECT_DEATH({ (void)t.tokenKind(NodeId{1}); }, "Tree::tokenKind on non-Token node");
+    EXPECT_DEATH({ (void)t.tokenKind(NodeId{3}); }, "Tree::tokenKind on non-Token node");
 }

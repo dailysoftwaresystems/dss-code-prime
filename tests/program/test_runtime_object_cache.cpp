@@ -74,9 +74,11 @@
 //       33   +      17       + G+1  +    8    + 3+   42  +   6    +  31  + T+1
 //
 // The three biggest components are the SUBJECT and cannot be shrunk: the
-// build-stamp segment is 41 (a dirty tree stamps `0.0.2+g<12>.dirty<16>`), the
-// target slug is 30, and the LONGEST NAME is a temp file — the destination's own
-// name plus `.` plus `.tmp-<pid>-<n>`, thirteen characters more.
+// build-stamp segment is 41 here (a dirty tree stamps `0.0.2+g<12>.dirty<16>`)
+// and AT MOST 62 (a build HANDED its dependencies' sources appends
+// `.deps<16>`, 21 more — ✔RE-MEASURED 2026-10-10, when the stamp gained that
+// component), the target slug is 30, and the LONGEST NAME is a temp file — the
+// destination's own name plus `.` plus `.tmp-<pid>-<n>`, thirteen characters more.
 //
 //   BEFORE (`<stem>-<64 hex>.a`)     artifact 71, longest temp 84
 //   AFTER  (`<stem>-<16 base32>.a`   artifact 23, key document 25,
@@ -94,8 +96,10 @@
 // INSTALLED compiler on Windows, and that is the number that matters. With the
 // default `%LOCALAPPDATA%` root, a 5-character username, a 4-character unit
 // stem, `release` and the arm64 elf slug, the longest composed path was 223
-// (37 characters of headroom) and is now 168 — **92 characters of headroom**.
-// ★ THE LAST 9 OF THOSE 92 WERE BOUGHT BY A RENAME THAT WAS NOT ABOUT PATH
+// (37 characters of headroom) and became 168 with the 41-character stamp. With
+// the LONGEST stamp a build can carry — 62, a dirty work tree handed its
+// dependencies' sources — it is 189: **71 characters of headroom**.
+// ★ THE LAST 9 OF THAT HEADROOM WERE BOUGHT BY A RENAME THAT WAS NOT ABOUT PATH
 // LENGTH AT ALL: the vendor directory went from `dss-code-prime/runtime-cache`
 // to `dsscp/runtime-cache` (2026-08-24, cycle P32), and this case is what
 // MEASURED it — it red on the SHORTENING, which is the direction nobody
@@ -127,6 +131,8 @@
 #include "link/writer.hpp"
 #include "program/runtime_object_cache.hpp"
 
+#include "core/substrate/path_identity.hpp"   // entryKind / reachedKind: what a planted link IS
+#include "os_link.hpp"                         // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"
 #include "scoped_env.hpp"
 #include "scratch_dir.hpp"
@@ -1085,6 +1091,67 @@ TEST(RuntimeObjectCacheStore, LookupMissesBeforeStoreAndHitsAfter) {
            "its key document — a temporary file was left behind.";
 }
 
+// What the artifact path REACHES, for a message: a file, nothing, or something else.
+[[nodiscard]] static std::string reachedAt(fs::path const& p) {
+    std::error_code       ec;
+    dss::core::EntryKind const k = dss::core::reachedKind(p, ec);
+    if (ec) return "an error: " + ec.message();
+    return k == dss::core::EntryKind::File ? "a file" : k == dss::core::EntryKind::Absent ? "nothing" : "something else";
+}
+
+// A DANGLING LINK IS NO ARTIFACT, on every build. At the SHIPPED artifact path it is passed over and the user
+// cache answers -- what the MSVC and POSIX builds always did. libstdc++ on Windows calls a dangling link a regular
+// file, so the MinGW build took it for a shipped artifact and refused the lookup over the key document beside it
+// ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The link is made by the OS.
+TEST(RuntimeObjectCacheStore, ADanglingLinkAtTheShippedArtifactIsPassedOver) {
+    ScratchDir scratch{Location::Temp, "roc-dangling-shipped"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    ScopedUserCacheRoot userRoot{scratch.path() / "uc"};
+    auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
+    ASSERT_TRUE(key.has_value()) << key.error();
+    ASSERT_FALSE(key->shippedArtifactPath.empty());
+    auto const stored = storeRuntimeObject(*key, kBytesA);
+    ASSERT_TRUE(stored.has_value()) << stored.error();
+    std::error_code ec;
+    fs::create_directories(key->shippedArtifactPath.parent_path(), ec);
+    ASSERT_FALSE(ec) << ec.message();
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(key->shippedArtifactPath.parent_path() / "no-such.o",
+                                                             key->shippedArtifactPath, dss::test_support::LinkTo::File));
+
+    auto const        found = lookupRuntimeObject(*key);
+    std::string const answered =
+        !found.has_value()
+            ? (found.error().find("key document is MISSING") != std::string::npos
+                   ? "a refusal: its key document is MISSING"
+                   : "a refusal")
+        : !found->has_value()                                                         ? "a miss"
+        : (*found)->generic_string() == key->userArtifactPath.generic_string() ? "the user artifact"
+                                                                                : "another path";
+    EXPECT_EQ(answered, "the user artifact") << "the lookup answered " << answered;
+}
+
+// At the artifact path a store LANDS on, a dangling link is no landed artifact: the store replaces it, and the path
+// reaches the bytes stored -- what the MSVC and POSIX builds always did. The MinGW build's library called the link
+// present, so the store reported success and left the link, and every later lookup found nothing there.
+TEST(RuntimeObjectCacheStore, ADanglingLinkAtTheArtifactPathIsNoLandedArtifact) {
+    ScratchDir scratch{Location::Temp, "roc-dangling-landing"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    ScopedUserCacheRoot userRoot{scratch.path() / "uc"};
+    auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
+    ASSERT_TRUE(key.has_value()) << key.error();
+    ASSERT_FALSE(key->userArtifactPath.empty());
+    std::error_code ec;
+    fs::create_directories(key->userArtifactPath.parent_path(), ec);
+    ASSERT_FALSE(ec) << ec.message();
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(key->userArtifactPath.parent_path() / "no-such.o",
+                                                             key->userArtifactPath, dss::test_support::LinkTo::File));
+
+    auto const stored = storeRuntimeObject(*key, kBytesA);
+    ASSERT_TRUE(stored.has_value()) << stored.error();
+    std::string const reached = reachedAt(key->userArtifactPath);
+    EXPECT_EQ(reached, "a file") << "after the store the artifact path reaches " << reached;
+}
+
 TEST(RuntimeObjectCacheStore, StoringTheSameKeyTwiceSucceedsAndLeavesOneFile) {
     ScratchDir scratch{Location::Temp, "roc-store-twice"};
     ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
@@ -1997,25 +2064,27 @@ TEST(RuntimeObjectCachePathBudget, TheLongestComposedNameFitsWindowsMaxPath) {
            "this file's docblock is now wrong.";
 
     // The INSTALLED worst case, spelled out: the default %LOCALAPPDATA% root,
-    // a 5-character username, the 41-character dirty build stamp, `release`,
-    // and the 30-character arm64 elf slug.
+    // a 5-character username, the LONGEST build stamp — 62 characters, a dirty
+    // work tree that was handed its dependencies' sources
+    // (`0.0.2+g<12>.dirty<16>.deps<16>`) — `release`, and the 30-character
+    // arm64 elf slug.
     std::string const stamp = runtimeCacheBuildStampSegment();
     std::size_t const installed =
         std::string_view{"C:/Users/"}.size() + 5u
         + std::string_view{"/AppData/Local"}.size()
         + std::string_view{"/dsscp/runtime-cache"}.size()
-        + 1u + 41u          // the build-stamp segment
+        + 1u + 62u          // the build-stamp segment
         + 1u + std::string_view{"release"}.size()
         + 1u + std::string_view{"arm64_elf64-aarch64-linux-exec"}.size()
         + 1u + longestName;
-    EXPECT_EQ(installed, 168u);
-    EXPECT_EQ(260u - installed, 92u)
+    EXPECT_EQ(installed, 189u);
+    EXPECT_EQ(260u - installed, 71u)
         << "the Windows MAX_PATH headroom for an installed compiler changed; "
            "re-measure and update this file's docblock.";
 
-    // The stamp segment this host actually renders must not exceed the 41 the
+    // The stamp segment this host actually renders must not exceed the 62 the
     // figure above assumes — a longer one silently eats the headroom.
-    EXPECT_LE(stamp.size(), 41u)
+    EXPECT_LE(stamp.size(), 62u)
         << "the build-stamp segment is longer than the arithmetic assumes: "
         << stamp;
 
@@ -2111,21 +2180,33 @@ TEST(RuntimeObjectCachePathBudget, AnOverlongNameRefusesNamingThePathAndItsLengt
 // so the wrong branch was taken but NOTHING WAS WRITTEN. A truncating open
 // destroys before it can fail.
 //
-// ⚠⚠ POSIX ONLY, AND THE SKIP IS LOUD RATHER THAN SILENT. Creating a symlink on
-// Windows needs Developer Mode or elevation, so on the Windows leg this case
-// cannot construct its subject at all. It says so, by name, instead of passing
-// as though it had checked something — a vacuous green here would be worse than
-// no test, because the property it covers is a write escaping its directory.
+// ★ EVERY LEG, AND THE LINK IS THE OS'S. These cases used to skip where
+// `std::filesystem::create_symlink` could not make a link -- the MinGW build,
+// whose libstdc++ fails it "Function not implemented" whatever the privilege
+// (✔MEASURED 2026-08-26 and again 2026-10-20). The link is now made by the OS's
+// own call (`tests/test_support/os_link.hpp`), which needs no elevation on a host
+// in developer mode, and what a planted entry IS is asked of the substrate
+// (`dss::core::entryKind`), never of a library that cannot tell a link there. A
+// host whose OS refuses the link FAILS the case: a vacuous green here would be
+// worse than no test, because the property it covers is a write escaping its
+// directory.
 
 namespace {
 
 // A dangling symlink: the LINK exists as a directory entry, its TARGET does not.
-// Returns false if the platform refused to create it at all.
+// Returns false if the OS refused to make it, or did not record it so.
 [[nodiscard]] bool plantDanglingSymlink(fs::path const& link,
                                         fs::path const& missingTarget) {
+    if (dss::test_support::makeSymbolicLink(missingTarget, link, dss::test_support::LinkTo::File)) return false;
+    std::error_code kec;
+    std::error_code rec;
+    return dss::core::entryKind(link, kec) == dss::core::EntryKind::Link && !kec
+        && dss::core::reachedKind(link, rec) == dss::core::EntryKind::Absent && !rec;
+}
+
+[[nodiscard]] bool isLinkEntry(fs::path const& p) {
     std::error_code ec;
-    fs::create_symlink(missingTarget, link, ec);
-    return !ec && fs::is_symlink(fs::symlink_status(link, ec));
+    return dss::core::entryKind(p, ec) == dss::core::EntryKind::Link && !ec;
 }
 
 } // namespace
@@ -2151,21 +2232,24 @@ TEST(RuntimeObjectCacheStore, TempClaimNeverEscapesThroughADanglingSymlink) {
     fs::path const linkA   = inside / ".victim.a.tmp-1-0";
     fs::path const linkB   = inside / ".victim.a.tmp-1-1";
 
-    if (!plantDanglingSymlink(linkA, canaryA)
-        || !plantDanglingSymlink(linkB, canaryB)) {
-        GTEST_SKIP() << "this platform refused to create a symlink, so the "
-                        "dangling-symlink claim hazard cannot be constructed "
-                        "here. On Windows that needs Developer Mode or "
-                        "elevation; the property is covered on the POSIX legs. "
-                        "This is a STATED scope limit, not a pass.";
-    }
+    ASSERT_TRUE(plantDanglingSymlink(linkA, canaryA) && plantDanglingSymlink(linkB, canaryB))
+        << "the OS refused to make a dangling symbolic link here, so the "
+           "dangling-symlink claim hazard could not be constructed: nothing was "
+           "asserted, which is no pass";
 
     // ── CONTROL: the OLD primitive pair, on this host, right now ────────────
+    // `fs::exists` is blind to the link wherever the library can tell a link at
+    // all (it follows it to the missing target). A library that cannot (libstdc++
+    // on Windows: `is_symlink` is never true there) reads the link's own entry,
+    // so it is not blind in that way -- asked by what the library ANSWERS, never
+    // by its name. The truncating open below is the escape either way.
     std::error_code ec;
-    EXPECT_FALSE(fs::exists(linkA, ec))
-        << "`fs::exists` reported a DANGLING symlink as existing, so this host "
-           "does not exhibit the blindness the fix exists to close and the "
-           "assertions below would prove nothing";
+    if (fs::is_symlink(fs::symlink_status(linkA, ec))) {
+        EXPECT_FALSE(fs::exists(linkA, ec))
+            << "`fs::exists` reported a DANGLING symlink as existing, so this host "
+               "does not exhibit the blindness the fix exists to close and the "
+               "assertions below would prove nothing";
+    }
     {
         std::ofstream out(linkA, std::ios::binary | std::ios::trunc);
         EXPECT_TRUE(out.good())
@@ -2190,7 +2274,7 @@ TEST(RuntimeObjectCacheStore, TempClaimNeverEscapesThroughADanglingSymlink) {
         << "THE WRITE ESCAPED: the claim created the symlink's TARGET, which "
            "is outside the directory the cache thought it had claimed "
            "(D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK)";
-    EXPECT_TRUE(fs::is_symlink(fs::symlink_status(linkB, ec)))
+    EXPECT_TRUE(isLinkEntry(linkB))
         << "a refused claim must leave the existing entry untouched";
 }
 
@@ -2243,12 +2327,10 @@ TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
             fs::path const link =
                 dir / ("." + dest.filename().string() + ".tmp-"
                        + std::to_string(pid) + "-" + std::to_string(n));
-            if (!plantDanglingSymlink(link, outside / ("escaped-" + std::to_string(n)))) {
-                GTEST_SKIP() << "this platform refused to create a symlink, so "
-                                "the planted-window arm cannot be constructed "
-                                "here (Windows needs Developer Mode or "
-                                "elevation). STATED scope limit, not a pass.";
-            }
+            ASSERT_TRUE(plantDanglingSymlink(link, outside / ("escaped-" + std::to_string(n))))
+                << "the OS refused to make a dangling symbolic link here, so the "
+                   "planted-window arm could not be constructed: nothing was "
+                   "asserted, which is no pass";
             planted.push_back(link);
         }
     }
@@ -2258,7 +2340,7 @@ TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
         << "the store refused outright — the loop must STEP OVER occupied "
            "candidate names, not exhaust itself on them: " << stored.error();
 
-    EXPECT_FALSE(fs::is_symlink(fs::symlink_status(*stored, ec)))
+    EXPECT_FALSE(isLinkEntry(*stored))
         << "the cache entry IS A SYMLINK: the claim followed a planted link and "
            "renamed it into place, so the entry's bytes live outside the cache "
            "(D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK)";
@@ -2278,7 +2360,7 @@ TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
 
     std::size_t survivors = 0;
     for (auto const& link : planted) {
-        if (fs::is_symlink(fs::symlink_status(link, ec))) ++survivors;
+        if (isLinkEntry(link)) ++survivors;
     }
     EXPECT_EQ(survivors, planted.size())
         << "the claim consumed " << (planted.size() - survivors)

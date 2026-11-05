@@ -1,0 +1,8 @@
+                if (false && scope.filterFuncletSymbol.valid()) {
+                    scope.filterFuncletSymbol =
+                        SymbolId{mergedIdFor(i, scope.filterFuncletSymbol)};
+                }
+                if (false && scope.personalitySymbol.valid()) {
+                    scope.personalitySymbol =
+                        SymbolId{mergedIdFor(i, scope.personalitySymbol)};
+                }

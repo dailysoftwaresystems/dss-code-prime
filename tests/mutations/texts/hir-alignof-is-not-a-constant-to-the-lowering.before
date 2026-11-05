@@ -1,0 +1,1 @@
+            return foldLayoutQuery(alignofNode, sem.alignofValueRule, /*alignment*/ true);

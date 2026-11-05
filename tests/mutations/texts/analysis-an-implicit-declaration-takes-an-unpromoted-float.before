@@ -1,0 +1,1 @@
+        if (in.kind(t) == TypeKind::F32) t = in.primitive(TypeKind::F64);

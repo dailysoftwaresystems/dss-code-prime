@@ -1,0 +1,2 @@
+        if (!model.hasErrors())
+            emitH(DiagnosticCode::S_StatementExprAtFileScope, node,

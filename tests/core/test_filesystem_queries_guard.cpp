@@ -1,0 +1,486 @@
+// THE SOURCE TREE ASKS THE SUBSTRATE EVERY FILESYSTEM QUESTION WHOSE ANSWER DEPENDS ON HOW A LINK IS READ -- the
+// closure of [[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]].
+//
+// ★ THE CLASS. ✔MEASURED 2026-10-20 and 2026-10-21 (probe-reference-cc, every link made by the OS; runs named in
+// the row): the libraries that build DSS answer a LINK differently. libstdc++ on Windows (MinGW-w64) reads a link's
+// OWN attributes -- a dangling link is a regular file there, a link to a file is 0 bytes long and was written when
+// the link was made, `is_symlink` is never true, `read_symlink` is "not implemented" -- and resolves no link
+// (`canonical`, `weakly_canonical` and so `relative` / `proximate` hand it back unchanged); `remove_all` of a
+// directory link EMPTIES ITS TARGET there, `permissions` through a link changes the link, and a copy told how to
+// treat links (`copy_symlinks`, `skip_symlinks`, `create_symlinks`) reads the link's own kind; of a dangling link,
+// `is_other` / `is_fifo` / `is_socket` / `is_block_file` / `is_character_file` / `is_empty` / `equivalent` /
+// `hard_link_count` / `last_write_time` answer with no error where MS STL and libc++ report one. MS STL and every
+// POSIX library follow the link. So one source gave two answers, and every such question in the scope below is
+// asked of the substrate (src/core/substrate/path_identity.hpp), which asks the OS on Windows.
+//
+// ★ OUTSIDE THE CLASS, MEASURED THE SAME on both Windows libraries (and not refused): `remove` and `rename` (they
+// act on the entry itself), `directory_iterator` (its listing; the questions its entries answer ARE refused, as
+// members), `create_directory` / `create_directories`, `copy_file`, `copy` with no link option, and the questions
+// that read no entry at all (`absolute`, `current_path`, `temp_directory_path`, `space`).
+//
+// THE FORMS REFUSED, each naming the substrate call to ask instead:
+//   * a refused name MENTIONED through a qualifier that is `std::filesystem` -- in any spelling: `::std::filesystem`,
+//     any qualifier ending in `filesystem` -- or any ALIAS of it declared anywhere in the scanned tree, an alias of
+//     an alias included (a header's alias reaches every file that includes it). A mention, not only a call: taking
+//     its address or a using-declaration of it is the same question waiting to be asked;
+//   * the same question asked of a `directory_entry` (`.is_directory(`, `->last_write_time(`, ...), or named
+//     through it -- a pointer to the member, a ranges projection (`&fs::directory_entry::is_regular_file`);
+//   * a MACRO naming `std::filesystem` (`#define FS std::filesystem`): an alias the scan cannot follow;
+//   * a `copy_options` that reads a link (`copy_symlinks`, `skip_symlinks`, `create_symlinks`);
+//   * a using-directive of `std::filesystem` or of an alias of it;
+//   * an UNQUALIFIED call of a refused function -- one argument at least, so argument-dependent lookup can reach
+//     `std::filesystem` -- WHEREVER it stands. Whether it does depends on the argument's type, which a scan of
+//     text cannot read, and on what every header the file includes declares, which the scan does not read either
+//     (a C++ library spelled `.h`, `<gtest/gtest.h>`, declares namespaces as `<nlohmann/json.hpp>` does). So the
+//     form is keyed on the CALL, never on the include (P69 fold H6, the review of H5's N9 and the ruling on H4b's
+//     N1): a function of the tree's own that shares a refused name is called qualified, or named otherwise.
+// It has no exemption list: the substrate is the one directory left out.
+//
+// SCOPE: every *.cpp and *.hpp under src/ (src/dss-config's C runtime holds no std::filesystem) outside
+// src/core/substrate/, under integrated_tests/ (whose runner compiles the substrate's unit beside it), and under
+// tests/examples/ (the in-process examples runner, the CLI runner's twin: the scope is the RUNNERS, not one of
+// them -- P69 fold H5, the review of H4b's F4). The scan also reads tests/test_support/, which both runners
+// include, for the aliases its headers declare. Comments and string literals are not code, and are not read.
+
+#include "core/substrate/path_identity.hpp"   // walkTree: the substrate's own walk, never through a link
+#include "repo_root.hpp"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+// Each refused name and the substrate's answer to it.
+std::map<std::string, std::string> const kAsk = {
+    {"file_size", "core::reachedFileSize(p, ec)"},
+    {"is_regular_file", "core::reachedKind(p, ec) == core::EntryKind::File"},
+    {"is_directory", "core::reachedKind(p, ec) == core::EntryKind::Directory"},
+    {"exists", "core::reachedKind(p, ec) != core::EntryKind::Absent (the entry itself: core::entryKind)"},
+    {"status", "core::reachedKind(p, ec)"},
+    {"symlink_status", "core::entryKind(p, ec)"},
+    {"canonical", "core::reachedPath(p, ec), or core::PathIdentity for an identity"},
+    {"weakly_canonical", "core::reachedPath(p, ec), or core::PathIdentity for an identity"},
+    {"is_symlink", "core::entryKind(p, ec) == core::EntryKind::Link"},
+    {"is_other", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_fifo", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_socket", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_block_file", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_character_file", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_empty", "core::reachedFileSize(p, ec) for a file, core::walkTree for a directory"},
+    {"equivalent", "core::reachedSameFile(a, b, ec)"},
+    {"last_write_time", "core::reachedWriteTime(p, ec)"},
+    {"hard_link_count", "a substrate question (core:: asks none yet): add it to path_identity.hpp"},
+    {"read_symlink", "core::reachedPath(p, ec)"},
+    {"remove_all", "core::removeTree(p)"},
+    {"permissions", "core::addReachedPermissions(p, perms, ec)"},
+    {"relative", "core::reachedRelative(p, base, ec)"},
+    {"proximate", "core::reachedRelative(p, base, ec), or p where that is empty"},
+    {"recursive_directory_iterator", "core::walkTree(root, visit)"},
+    {"copy_symlinks", "a copy that asks the library no link question: copy_file of what core::walkTree hands out"},
+    {"skip_symlinks", "a copy that asks the library no link question: copy_file of what core::walkTree hands out"},
+    {"create_symlinks", "a copy that asks the library no link question: copy_file of what core::walkTree hands out"},
+};
+
+// The refused names that are FUNCTIONS: what an unqualified call can reach by argument-dependent lookup.
+std::set<std::string> const kFunctions = {
+    "file_size",      "is_regular_file", "is_directory",   "exists",          "status",
+    "symlink_status", "canonical",       "weakly_canonical", "is_symlink",    "is_other",
+    "is_fifo",        "is_socket",       "is_block_file",  "is_character_file", "is_empty",
+    "equivalent",     "last_write_time", "hard_link_count", "read_symlink",   "remove_all",
+    "permissions",    "relative",        "proximate"};
+
+// The questions a `directory_entry` answers itself.
+std::set<std::string> const kEntryMembers = {
+    "file_size", "is_regular_file", "is_directory",      "exists",          "status",
+    "symlink_status", "is_symlink", "is_other",          "is_fifo",         "is_socket",
+    "is_block_file",  "is_character_file", "last_write_time", "hard_link_count"};
+
+// The `copy_options` that read a link.
+std::set<std::string> const kLinkOptions = {"copy_symlinks", "skip_symlinks", "create_symlinks"};
+
+// Whether the `R` at `i` opens a raw string literal: it begins a token, alone or after an encoding prefix.
+[[nodiscard]] bool opensRawLiteral(std::string const& text, std::size_t i) {
+    auto const ident = [&](std::size_t k) {
+        unsigned char const ch = static_cast<unsigned char>(text[k]);
+        return std::isalnum(ch) != 0 || ch == '_';
+    };
+    std::size_t start = i;
+    if (start >= 2 && text.compare(start - 2, 2, "u8") == 0) start -= 2;
+    else if (start >= 1 && (text[start - 1] == 'u' || text[start - 1] == 'U' || text[start - 1] == 'L')) start -= 1;
+    return start == 0 || !ident(start - 1);
+}
+
+// `text` with every comment and every string or character literal blanked to spaces, its newlines kept -- so a
+// line number still names the source line, an offset still names the same character, and prose that names a call
+// is never read as one.
+[[nodiscard]] std::string codeOnly(std::string const& text) {
+    std::string out = text;
+    std::size_t i   = 0;
+    auto const  blank = [&](std::size_t from, std::size_t to) {
+        for (std::size_t k = from; k < to && k < out.size(); ++k)
+            if (out[k] != '\n') out[k] = ' ';
+    };
+    while (i < text.size()) {
+        char const c = text[i];
+        if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+            std::size_t const end = text.find('\n', i);
+            std::size_t const stop = end == std::string::npos ? text.size() : end;
+            blank(i, stop);
+            i = stop;
+        } else if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+            std::size_t const end = text.find("*/", i + 2);
+            std::size_t const stop = end == std::string::npos ? text.size() : end + 2;
+            blank(i, stop);
+            i = stop;
+        } else if (c == 'R' && i + 1 < text.size() && text[i + 1] == '"' && opensRawLiteral(text, i)) {
+            // A raw string: R"delim( ... )delim"
+            std::size_t const open = text.find('(', i + 2);
+            if (open == std::string::npos) break;
+            std::string const delim = ")" + text.substr(i + 2, open - (i + 2)) + "\"";
+            std::size_t const end = text.find(delim, open + 1);
+            std::size_t const stop = end == std::string::npos ? text.size() : end + delim.size();
+            blank(i, stop);
+            i = stop;
+        } else if (c == '"' || (c == '\'' && !(i > 0 && std::isalnum(static_cast<unsigned char>(text[i - 1])) != 0))) {
+            // (A `'` right after a digit or a letter is a digit separator or a prefixed literal's quote, not
+            // the start of a character literal to blank.)
+            std::size_t k = i + 1;
+            while (k < text.size() && text[k] != c && text[k] != '\n') k += text[k] == '\\' ? 2 : 1;
+            std::size_t const stop = std::min(text.size(), k + 1);
+            blank(i, stop);
+            i = stop;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::vector<std::string> linesOf(std::string const& text) {
+    std::vector<std::string> lines;
+    std::istringstream       in{text};
+    for (std::string line; std::getline(in, line);) lines.push_back(std::move(line));
+    return lines;
+}
+
+// One source the guard reads: where it lies under the repository (generic spelling), its text, and its code.
+struct Source {
+    std::string relative;
+    std::string text;
+    std::string code;
+};
+
+[[nodiscard]] Source sourceOf(std::string relative, std::string text) {
+    std::string code = codeOnly(text);
+    return Source{std::move(relative), std::move(text), std::move(code)};
+}
+
+// The last `::`-separated component of a qualifier as written (`::std :: filesystem` -> `filesystem`).
+[[nodiscard]] std::string lastComponent(std::string const& qualifier) {
+    std::string squeezed;
+    for (char const c : qualifier)
+        if (std::isspace(static_cast<unsigned char>(c)) == 0) squeezed += c;
+    std::size_t const at = squeezed.rfind("::");
+    return at == std::string::npos ? squeezed : squeezed.substr(at + 2);
+}
+
+// Every name `std::filesystem` goes by in the tree: every namespace alias of it, and of an alias of it, wherever it
+// is declared -- to a fixed point, so the order the files are read in decides nothing.
+[[nodiscard]] std::set<std::string> aliasesIn(std::vector<Source> const& sources) {
+    static std::regex const alias{R"(\bnamespace\s+(\w+)\s*=\s*((?:::\s*)?\w+(?:\s*::\s*\w+)*)\s*;)"};
+    std::vector<std::pair<std::string, std::string>> declared;   // (alias, last component of what it names)
+    for (auto const& s : sources) {
+        if (s.code.find("namespace") == std::string::npos) continue;
+        for (std::sregex_iterator it{s.code.begin(), s.code.end(), alias}, end; it != end; ++it)
+            declared.emplace_back((*it)[1].str(), lastComponent((*it)[2].str()));
+    }
+    std::set<std::string> aliases;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (auto const& [name, names] : declared) {
+            if ((names == "filesystem" || aliases.count(names) != 0) && aliases.insert(name).second) grew = true;
+        }
+    }
+    return aliases;
+}
+
+struct Finding {
+    std::string where;   // `<file>:<line>`
+    std::string call;    // what was written
+    std::string ask;     // the substrate call to use
+};
+
+[[nodiscard]] std::string alternation(std::set<std::string> const& names) {
+    std::string out;
+    for (auto const& n : names) out += (out.empty() ? "" : "|") + n;
+    return out;
+}
+
+// The scan's patterns, built ONCE for a set of sources: `aliases` are that set's names for `std::filesystem`.
+struct Scanner {
+    explicit Scanner(std::set<std::string> aliasNames) : aliases{std::move(aliasNames)} {
+        for (auto const& entry : kAsk) names.insert(entry.first);
+        std::set<std::string> qualifiers = aliases;
+        qualifiers.insert("filesystem");
+        qualified   = std::regex{R"re((?:^|[^\w])(?:)re" + alternation(qualifiers) + R"re()\s*::\s*()re"
+                               + alternation(names) + R"re()\b)re"};
+        member      = std::regex{R"re((?:\.|->)\s*()re" + alternation(kEntryMembers) + R"re()\s*\()re"};
+        option      = std::regex{R"re(\bcopy_options\s*::\s*()re" + alternation(kLinkOptions) + R"re()\b)re"};
+        unqualified = std::regex{R"re(\b()re" + alternation(kFunctions) + R"re()\s*\(\s*[^\s)])re"};
+        directive   = std::regex{R"(\busing\s+namespace\s+((?:::\s*)?\w+(?:\s*::\s*\w+)*))"};
+        projection  = std::regex{R"re(\bdirectory_entry\s*::\s*()re" + alternation(kEntryMembers) + R"re()\b)re"};
+        macro       = std::regex{R"(^\s*#\s*define\s+(\w+)\b.*\bfilesystem\b)"};
+    }
+    std::set<std::string> aliases;
+    std::set<std::string> names;
+    std::regex            qualified, member, option, unqualified, directive, projection, macro;
+};
+
+// Every refused form in one source's code.
+[[nodiscard]] std::vector<Finding> refusedIn(Source const& source, Scanner const& scan) {
+    auto const& aliases     = scan.aliases;
+    auto const& names       = scan.names;
+    auto const& qualified   = scan.qualified;
+    auto const& member      = scan.member;
+    auto const& option      = scan.option;
+    auto const& unqualified = scan.unqualified;
+    auto const& directive   = scan.directive;
+    auto const& projection  = scan.projection;
+    auto const& macro       = scan.macro;
+
+    // A line where no refused name and no `using` appears holds no refused form: only the rest are matched, which
+    // keeps a scan of the whole tree to the few lines that can hold one.
+    auto const mayHold = [&](std::string const& line) {
+        if (line.find("using") != std::string::npos || line.find("filesystem") != std::string::npos) return true;
+        for (auto const& n : names)
+            if (line.find(n) != std::string::npos) return true;
+        return false;
+    };
+    std::vector<Finding> out;
+    auto const           lines = linesOf(source.code);
+    for (std::size_t n = 0; n < lines.size(); ++n) {
+        std::string const& line = lines[n];
+        if (!mayHold(line)) continue;
+        std::string const where = source.relative + ":" + std::to_string(n + 1);
+        for (auto const* re : {&qualified, &member, &option, &projection}) {
+            for (std::sregex_iterator it{line.begin(), line.end(), *re}, end; it != end; ++it) {
+                std::string const name = (*it)[1].str();
+                out.push_back({where, name, kAsk.at(name)});
+            }
+        }
+        for (std::sregex_iterator it{line.begin(), line.end(), directive}, end; it != end; ++it) {
+            std::string const last = lastComponent((*it)[1].str());
+            if (last == "filesystem" || aliases.count(last) != 0)
+                out.push_back({where, "using namespace " + last, "a qualified call, asked of the substrate"});
+        }
+        if (std::smatch m; std::regex_search(line, m, macro))
+            out.push_back({where, "#define " + m[1].str() + " naming filesystem",
+                           "a namespace alias (`namespace x = std::filesystem;`), which the scan follows"});
+        // Keyed on the CALL, wherever it stands (the scope note): whether argument-dependent lookup reaches
+        // std::filesystem from here is a question of types and of unread headers, which this scan cannot answer.
+        for (std::sregex_iterator it{line.begin(), line.end(), unqualified}, end; it != end; ++it) {
+            // Qualified or a member: not argument-dependent lookup (a qualified mention is refused above).
+            std::string before = line.substr(0, static_cast<std::size_t>(it->position(0)));
+            while (!before.empty() && std::isspace(static_cast<unsigned char>(before.back())) != 0) before.pop_back();
+            auto const endsWith = [&](char const* tail) {
+                std::string const t{tail};
+                return before.size() >= t.size() && before.compare(before.size() - t.size(), t.size(), t) == 0;
+            };
+            if (endsWith(".") || endsWith("->") || endsWith("::")) continue;
+            std::string const name = (*it)[1].str();
+            out.push_back(
+                {where, name + " (unqualified: argument-dependent lookup may reach std::filesystem)", kAsk.at(name)});
+        }
+    }
+    return out;
+}
+
+// Whether `relative` (a generic path under the repository) is a source this guard judges.
+[[nodiscard]] bool isGuarded(std::string const& relative) {
+    std::string const ext = fs::path{relative}.extension().string();
+    if (ext != ".cpp" && ext != ".hpp") return false;
+    if (relative.rfind("integrated_tests/", 0) == 0) return true;
+    if (relative.rfind("tests/examples/", 0) == 0) return true;
+    return relative.rfind("src/", 0) == 0 && relative.rfind("src/core/substrate/", 0) != 0;
+}
+
+// Every finding over a set of sources: the aliases are the whole set's, the findings the guarded sources' alone.
+[[nodiscard]] std::vector<Finding> refusedAcross(std::vector<Source> const& sources) {
+    Scanner const        scan{aliasesIn(sources)};
+    std::vector<Finding> found;
+    for (auto const& s : sources) {
+        if (!isGuarded(s.relative)) continue;
+        auto more = refusedIn(s, scan);
+        found.insert(found.end(), more.begin(), more.end());
+    }
+    return found;
+}
+
+[[nodiscard]] std::string readAll(fs::path const& p) {
+    std::ifstream in{p, std::ios::binary};
+    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+// `found` as `<line>=<call>` words, or `<file> line <line>=<call>` when `withFile` -- the file and its line
+// spelled apart, as words, so the expectations below cite no position in any file.
+[[nodiscard]] std::string spelled(std::vector<Finding> const& found, bool withFile) {
+    std::string got;
+    for (auto const& f : found) {
+        std::size_t const colon = f.where.find(':');
+        std::string const line  = f.where.substr(colon + 1);
+        got += " " + (withFile ? f.where.substr(0, colon) + " line " + line : line) + "=" + f.call;
+    }
+    return got;
+}
+
+} // namespace
+
+// THE TREE: no source in scope asks the library a question its answer to depends on how it reads a link.
+TEST(FilesystemQueriesGuard, TheSourceTreeAsksTheSubstrateForEveryFilesystemQuery) {
+    fs::path const      root = dss::test::repoRoot();
+    std::vector<Source> sources;
+    for (char const* top : {"src", "integrated_tests", "tests/examples", "tests/test_support"}) {
+        auto const walk = dss::core::walkTree(root / top, [&](dss::core::TreeEntry const& entry) {
+            if (entry.kind != dss::core::EntryKind::File) return dss::core::WalkStep::Continue;
+            std::string const relative = entry.path.lexically_relative(root).generic_string();
+            std::string const ext      = entry.path.extension().string();
+            if (ext == ".cpp" || ext == ".hpp") sources.push_back(sourceOf(relative, readAll(entry.path)));
+            return dss::core::WalkStep::Continue;
+        });
+        ASSERT_FALSE(walk.error) << "the walk of " << top << "/ stopped at " << walk.where.generic_string() << ": "
+                                 << walk.error.message();
+    }
+    std::size_t const judged =
+        static_cast<std::size_t>(std::count_if(sources.begin(), sources.end(), [](Source const& s) {
+            return isGuarded(s.relative);
+        }));
+    // Not a vacuous pass: the tree holds hundreds of sources in scope (535 under src/ at the guard's birth,
+    // 2026-10-20), and integrated_tests/ is read too.
+    EXPECT_GE(judged, 400u) << "the guard judged only " << judged << " sources";
+    EXPECT_TRUE(std::any_of(sources.begin(), sources.end(), [](Source const& s) {
+        return s.relative == "integrated_tests/runner.cpp";
+    })) << "integrated_tests/runner.cpp was not read: the scope is short";
+    EXPECT_TRUE(std::any_of(sources.begin(), sources.end(), [](Source const& s) {
+        return s.relative == "tests/examples/examples_runner.cpp";
+    })) << "tests/examples/examples_runner.cpp was not read: the scope is short";
+    auto const  found = refusedAcross(sources);
+    std::string listed;
+    for (auto const& f : found) listed += "\n  " + f.where + ": `" + f.call + "` -- ask the substrate: " + f.ask;
+    EXPECT_TRUE(found.empty()) << found.size() << " filesystem question(s) asked of the library outside "
+                               << "src/core/substrate/:" << listed;
+}
+
+// THE SCAN ITSELF, on synthetic sources holding every refused form once, each in a context it must and must not
+// read: every qualifier spelling (std::filesystem, ::std::filesystem, an alias, an alias of an alias declared in a
+// header), a mention that is no call, an entry's member, a link option, a using-declaration and the
+// using-directives -- and the same words inside a comment, a string and a raw string, plus calls the guard does not
+// refuse.
+TEST(FilesystemQueriesGuard, TheScanRefusesEveryFormItNamesAndNothingElse) {
+    std::vector<Source> const sources = {
+        sourceOf("src/x/aliases.hpp",
+                 "#include <filesystem>\n"
+                 "namespace stdfs = std::filesystem;\n"
+                 "namespace fsx = stdfs;\n"),
+        sourceOf("src/x/user.cpp",
+                 "#include \"aliases.hpp\"\n"
+                 "bool a(std::filesystem::path const& p) { return std::filesystem::exists(p); }\n"   // 2
+                 "auto b(stdfs::path const& p) { return ::std::filesystem::file_size(p); }\n"         // 3
+                 "bool c(fsx::path const& p) { return fsx::is_regular_file(p); }\n"                   // 4
+                 "auto d = &stdfs::is_symlink;\n"                                                      // 5
+                 "auto e(stdfs::path const& p) { return stdfs::last_write_time(p); }\n"               // 6
+                 "bool f(stdfs::path const& a, stdfs::path const& b) { return fsx::equivalent(a, b); }\n"   // 7
+                 "auto g(stdfs::path const& p) { return stdfs::relative(p, p); }\n"                   // 8
+                 "void h(stdfs::path const& p) { stdfs::permissions(p, stdfs::perms::all); }\n"       // 9
+                 "void i(stdfs::path const& p) { stdfs::remove_all(p); }\n"                           // 10
+                 "using It = stdfs::recursive_directory_iterator;\n"                                  // 11
+                 "bool j(stdfs::directory_entry const& e) { return e.is_regular_file(); }\n"         // 12
+                 "auto k(stdfs::directory_iterator const& it) { return it->last_write_time(); }\n"   // 13
+                 "auto l = stdfs::copy_options::copy_symlinks;\n"                                      // 14
+                 "using std::filesystem::exists;\n"                                                    // 15
+                 "using namespace std::filesystem;\n"                                                  // 16
+                 "using namespace fsx;\n"                                                              // 17
+                 "bool m(stdfs::path const& p) { return exists(p); }\n"                               // 18
+                 "// stdfs::exists(p) in a comment, /* fs::status(p) */ too\n"
+                 "char const* n = \"std::filesystem::exists(p) in a string\";\n"
+                 "char const* o = R\"x(stdfs::file_size(p) in a raw string)x\";\n"
+                 "void q(stdfs::path const& p) { stdfs::create_directories(p); stdfs::absolute(p); stdfs::remove(p); }\n"
+                 "bool r(Cache& c) { return c.contains(1) && myexists(2) && ns::exists_like(3) && x.exists_in(4); }\n"
+                 "auto s = stdfs::copy_options::recursive; auto t = stdfs::file_status{};\n"
+                 "auto u = std::ranges::count_if(stdfs::directory_iterator{p}, &stdfs::directory_entry::is_regular_file);\n"   // 25
+                 "#define FSYS std::filesystem\n"),                                                   // 26
+    };
+    auto const        found = refusedAcross(sources);
+    std::string const got   = spelled(found, /*withFile=*/false);
+    std::string const want =
+        " 2=exists 3=file_size 4=is_regular_file 5=is_symlink 6=last_write_time 7=equivalent 8=relative "
+        "9=permissions 10=remove_all 11=recursive_directory_iterator 12=is_regular_file 13=last_write_time "
+        "14=copy_symlinks 15=exists 16=using namespace filesystem 17=using namespace fsx "
+        "18=exists (unqualified: argument-dependent lookup may reach std::filesystem) 25=is_regular_file "
+        "26=#define FSYS naming filesystem";
+    EXPECT_EQ(got, want) << "the scan refused " << found.size() << " form(s):" << got;
+}
+
+// AN UNQUALIFIED CALL IS REFUSED WHEREVER IT STANDS (P69 fold H6, the review of H5's N9): whether argument-dependent
+// lookup reaches `std::filesystem` depends on the argument's type and on every header the file includes -- a C++
+// library spelled `.h` among them -- which no scan of text reads. So, unqualified and with an argument, a refused
+// name is refused in every judged file whatever it includes; with no argument, or with a qualifier of its own, it
+// is no argument-dependent lookup of a filesystem function and passes; a qualified mention is refused everywhere.
+TEST(FilesystemQueriesGuard, AnUnqualifiedCallIsRefusedWhereverItStands) {
+    std::vector<Source> const sources = {
+        sourceOf("src/a/paths.hpp", "#pragma once\n#include <filesystem>\n"),
+        sourceOf("src/c/near.cpp", "#include \"a/paths.hpp\"\nbool f(P const& p) { return exists(p); }\n"),
+        sourceOf("integrated_tests/far.cpp", "#include <string>\nauto g(P const& p) { return status(p); }\n"),
+        sourceOf("src/d/apart.cpp",
+                 "#include <string>\n"
+                 "bool h(P const& p) { return exists(p) && status(p); }\n"
+                 "auto i(P const& p) { return std::filesystem::status(p); }\n"),
+        // In a comment a call is not code.
+        sourceOf("src/e/commented.cpp", "// bool j(P const& p) { return exists(p); }\nint j2();\n"),
+        // No argument, or a qualifier of its own: not argument-dependent lookup of a filesystem function.
+        sourceOf("src/f/nullary.cpp", "#include <filesystem>\nint k() { return status() + n::exists(2); }\n"),
+        // A C++ library spelled `.h`, which declares namespaces: refused as anywhere else.
+        sourceOf("src/h/library.cpp", "#include <gtest/gtest.h>\nbool n(P const& p) { return exists(p); }\n"),
+        // A C or OS header alone: refused the same -- the scan reads no header, so it assumes none.
+        sourceOf("src/i/os.cpp", "#include <sys/stat.h>\nbool o(P const& p) { return exists(p); }\n"),
+        // Read for its aliases, never judged.
+        sourceOf("tests/test_support/helper.hpp", "#pragma once\ninline bool q(P const& p) { return exists(p); }\n"),
+    };
+    std::string const got = spelled(refusedAcross(sources), /*withFile=*/true);
+    std::string const want =
+        " src/c/near.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " integrated_tests/far.cpp line 2=status (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/d/apart.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/d/apart.cpp line 2=status (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/d/apart.cpp line 3=status"
+        " src/h/library.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)"
+        " src/i/os.cpp line 2=exists (unqualified: argument-dependent lookup may reach std::filesystem)";
+    EXPECT_EQ(got, want);
+}
+
+// THE ONE DIRECTORY LEFT OUT is the substrate; C++ sources under src/ and integrated_tests/ are judged.
+TEST(FilesystemQueriesGuard, TheSubstrateIsTheOneDirectoryLeftOut) {
+    EXPECT_TRUE(isGuarded("src/core/types/glob_match.cpp"));
+    EXPECT_TRUE(isGuarded("src/program/program.hpp"));
+    EXPECT_TRUE(isGuarded("integrated_tests/runner.cpp")) << "the CLI runner is judged too";
+    EXPECT_TRUE(isGuarded("tests/examples/examples_runner.cpp")) << "and the in-process runner, its twin";
+    EXPECT_FALSE(isGuarded("src/core/substrate/path_identity.cpp")) << "the substrate is where the OS is asked";
+    EXPECT_FALSE(isGuarded("src/dss-config/runtime/platform/src/dirent.c"));
+    EXPECT_FALSE(isGuarded("tests/core/test_header_name_matching.cpp"));
+    EXPECT_FALSE(isGuarded("tests/test_support/stage_tree.hpp")) << "read for its aliases, not judged";
+    EXPECT_TRUE(isGuarded("src/core/substrate_like/x.cpp")) << "only the substrate directory itself is left out";
+}

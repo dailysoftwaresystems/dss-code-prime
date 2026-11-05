@@ -1,0 +1,1 @@
+                decided = None if rule.negated else rule

@@ -1,0 +1,1 @@
+    ++work_; (void)std::vector<LiveScope>(liveScopes_.begin(), liveScopes_.end());

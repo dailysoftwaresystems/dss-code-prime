@@ -121,6 +121,8 @@ struct Lowered {
     // The language's policy through the pipeline's ONE assembly (P68 round 13 fold F7: by hand,
     // this fixture missed `globalsConstantForms` and lowered C with 6.7.9p4's constraint off).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(out.model.symbols().size()));
     mirCfg.aggregateLayout       = target->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target->aggregateLayoutLoaded();
     out.mir = lowerToMir(out.hir->hir, out.hir->literalPool, out.model.lattice().interner(),

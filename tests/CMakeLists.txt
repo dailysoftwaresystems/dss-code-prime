@@ -58,6 +58,10 @@ function(dss_add_test)
         DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})
+    # The entry this target runs, kept ON the target: a helper handed the target -- the script
+    # self-test's opt-in, `dss_use_script_selftest`, which gives the entry its `self-test` label --
+    # reads it here rather than spelling the name a second time.
+    set_property(TARGET ${target} PROPERTY DSS_TEST_NAME "${DSS_NAME}")
 
     # Shipped-config discovery: findShippedConfig() — and, since TF-C118, the
     # test-side resolver in tests/test_support/repo_root.hpp — prefers

@@ -1,0 +1,1 @@
+    std::uint64_t const ofOffset = std::uint64_t{1} << std::countr_zero(item.inputSection->offset);

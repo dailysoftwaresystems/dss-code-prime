@@ -1,0 +1,2 @@
+        format.dataImportBinding(),
+        // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): capture the format's

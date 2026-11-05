@@ -31,11 +31,14 @@
 // WHICH AXES OF THE SELECTOR PARTICIPATE — one evaluator, three modes:
 //
 //  • `FormatOnly`     — `{format}` is the WHOLE legal key vocabulary; any other
-//                       key FAILS LOUD. The preprocessor-facing surfaces
-//                       (`macros`, the `includes` edge gate) live here: neither
-//                       arch, the data model nor the long-double format is
-//                       threaded into preprocess, so a key naming them could
-//                       only ever be a config author's mistake.
+//                       key FAILS LOUD. The `macros` surface and the `includes`
+//                       edge gate live here: a header's existence is a format
+//                       fact, and a value that differs by ARCH is an integer,
+//                       which ships as a preprocessor-visible `constants` row —
+//                       the splice reads THAT surface with the full pair (P69:
+//                       Linux aarch64's <fcntl.h> overrides O_DIRECTORY and
+//                       O_NOFOLLOW, which a format-only selector gave x86_64's
+//                       bits).
 //  • `FullTarget`     — `{arch, format, dataModel, longDoubleFormat}` are all
 //                       legal and all participate. The TYPED surfaces (structs,
 //                       constants, typedefs, per-target `value` variants and
@@ -89,7 +92,34 @@ struct DSS_EXPORT WhenFacts {
 // `WhenSpec` in `semantic_config.hpp`, which half the tree includes.
 
 // Match a decoded `when` against the pair, by the mode's participation rule.
+// Exactly `whenVerdict(...) == WhenVerdict::Match`.
 [[nodiscard]] DSS_EXPORT bool
 whenMatches(WhenSpec const& spec, WhenAxes axes, WhenFacts const& facts) noexcept;
+
+// ★ P69 (lane lm): WHETHER THIS READ CAN DECIDE A `when` AT ALL. `whenMatches` answers
+// no for a key tested against an ABSENT fact, which is right for SELECTION — an arm
+// whose fact is unknown is never chosen — but it folds two different answers into one,
+// and a caller whose rule REFUSES a pair no arm selects must tell them apart: "this pair
+// is not that arm's" (a fact the read carries differs: `NoMatch`) and "this read cannot
+// say" (the arm names a fact the read does not carry — no object format on a pair-less
+// read, no long-double axis on a direct-API read: `Undecided`). Undecided means every
+// participating key whose fact the read carries agrees, and at least one names a fact it
+// does not. ONE evaluator: `whenMatches` is this verdict's `Match`.
+enum class WhenVerdict { Match, NoMatch, Undecided };
+[[nodiscard]] DSS_EXPORT WhenVerdict
+whenVerdict(WhenSpec const& spec, WhenAxes axes, WhenFacts const& facts) noexcept;
+
+// ★ P69 round 4 (lane lm): WHETHER TWO ARMS CAN BOTH MATCH ONE PAIR — a property of the
+// two `when`s, decided with no pair at all. Under match-all-specified two arms both match a
+// pair iff every PARTICIPATING key both name holds the same value: a key only one arm names
+// constrains that arm alone, and some pair supplies whatever it names. A block two of whose
+// arms can co-match is AMBIGUOUS on every pair where both do, and every reader of it refuses
+// it on EVERY read. Counting matches per read refused it only where a read could DECIDE both
+// arms, so a read missing the fact one of them names (`Undecided`) selected the other, where
+// a read that carries it refused both — the review's NIT 14. ✔MEASURED P69 round 4: no
+// shipped document holds such a block (533 `variants` arrays across src/dss-config, 201 with
+// more than one guarded arm, 0 co-matching pairs). The arch name is open and compared as text.
+[[nodiscard]] DSS_EXPORT bool
+whensCanCoMatch(WhenSpec const& a, WhenSpec const& b, WhenAxes axes) noexcept;
 
 }  // namespace dss

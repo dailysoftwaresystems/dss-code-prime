@@ -1,0 +1,2 @@
+            // `isAttributeSpecifierNode`).
+            if (false && isAttributeSpecifierNode(tree, cur)) {

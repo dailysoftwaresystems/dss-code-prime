@@ -1,0 +1,2 @@
+                            preStampLiteralLeaves(s, *cfg, tree, opnd);
+                            queried = subtreeType(s, tree, opnd, fromScope);

@@ -1,0 +1,2 @@
+        if (!wide.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        if (toK == TypeKind::Bool) return ok(makeBoolLiteral(wide->isZero() ? 0 : 1));

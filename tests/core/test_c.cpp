@@ -327,7 +327,8 @@ TEST(CEndToEnd, SwitchStmtParsesAllArmKinds) {
             auto lbl  = b.open(h.schema->rules().find("caseLabel"));
             pushNext(b, h.stream);
             {
-                auto expr = b.open(h.schema->rules().find("expression"));
+                // A case label's value is c's `constantExpr` (C 6.8.1p1; P69 L2).
+                auto expr = b.open(h.schema->rules().find("constantExpr"));
                 auto opr  = b.open(h.schema->rules().find("operand"));
                 b.pushToken(h.stream.advance());
             }
@@ -393,7 +394,7 @@ TEST(CEndToEnd, SwitchStmtParsesAllArmKinds) {
         "      rule:switchBodyItem\n"
         "        rule:caseLabel\n"
         "          tok:\"case\"\n"
-        "          rule:expression\n"
+        "          rule:constantExpr\n"
         "            rule:operand\n"
         "              tok:\"1\"\n"
         "          tok:\":\"\n"

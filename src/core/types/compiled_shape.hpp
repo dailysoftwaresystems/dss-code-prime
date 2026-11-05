@@ -387,6 +387,24 @@ struct CompiledRule {
     // rule, or language. Default false ⇒ standard rollback-on-failure
     // speculation.
     bool                       commitAfterPrefix = false;
+
+    // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a PEG NOT-PREDICATE
+    // on the rule's FOLLOWER (`notFollowedBy` on the shape body): a speculative probe of this
+    // rule that CLOSES cleanly is abandoned — the enclosing alt tries its next candidate —
+    // when the next token is one of these kinds. Sorted by `SchemaTokenId.v`. Config-sourced;
+    // the engine names no token. Empty (the default) ⇒ no predicate.
+    std::vector<SchemaTokenId> notFollowedBy;
+
+    // P69 round 4 (lane `cs`): the POSITIVE twin — a PEG AND-PREDICATE on the rule's FOLLOWER
+    // (`followedByFirstOf` on the shape body, naming a declared shape): a speculative probe of
+    // this rule that CLOSES cleanly is abandoned UNLESS the next token can START the named shape
+    // (is in its FIRST set). `followedByFirstOf` is the shape named; `followedBy` is its FIRST
+    // set, resolved once FIRST sets exist and sorted by `SchemaTokenId.v`. Naming a SHAPE rather
+    // than listing tokens is the point: the set is the grammar's own, so a keyword added to that
+    // shape is admitted here by construction instead of by a second list kept in step by hand.
+    // Config-sourced; the engine names no token and no rule. Invalid / empty ⇒ no predicate.
+    RuleId                     followedByFirstOf{};
+    std::vector<SchemaTokenId> followedBy;
 };
 
 } // namespace dss::detail

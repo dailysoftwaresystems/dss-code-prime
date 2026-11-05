@@ -9,7 +9,7 @@
 This file numbers the steps the older way; the crosswalk to `SKILL.md`'s 0–12 is at the top of
 `workflow-steps.md`.
 
-AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the session now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never the session's decision (see SKILL.md, the decision gate)
 
 ## F. Deferral & anchor pinning discipline
 
@@ -89,9 +89,10 @@ deferral is the rare exception that must earn its place, not the convenient way 
 
    `set-anchor` patches only the fields you name, preserves the rest byte-for-byte, deletes the row
    from its working registry and appends it to the archive's matching table. Reopening (`--status
-   open`) moves it back. `check-anchor-balance` fails the tree for a closed row left in a working
-   registry, for an open row filed in the archive, and for a `Status` column that contradicts the
-   verdict leading its own `Trigger` prose.
+   open`) moves it back. `dssharness check-anchor-balance` fails the tree for a closed row left in a
+   working registry and for an open row filed in the archive; a `Status` column that contradicts the
+   verdict leading its own `Trigger` prose is refused by the door and reported by
+   `dssharness read-anchors --lint`.
 3. **State its priority explicitly** in the row's `Priority` cell — `P0`..`P5`, the bands defined in
    `registry-and-priority.md`, a declaration `burndown-queue` seeds and then reads. A row waiting on a
    named trigger carries `⏳ GATED` in its `Status` cell: do not build until the trigger fires. Work that
@@ -121,7 +122,8 @@ deferral is the rare exception that must earn its place, not the convenient way 
 | List anchors — name, priority, status | `dssharness read-anchors --pending [--band P0]` [→ the listing ends with its count, so `--open --band <P>` gives a band's](registry-and-priority.md) |
 | Write a NEW row from fields | `dssharness write-anchor <ANCHOR> --trigger '...' --closing '...'` — ⚠ it WRITES; `--anchor-dry-run` is how you look first |
 | Change a row — **closing MOVES it to the archive** | `dssharness set-anchor <ANCHOR> --status closed --closing '...'` — ⚠ it WRITES |
-| Apply a lane's rows directory, as one batch | `dssharness run rows --manual-step stage --input rows=<lane rows> --input staged=<staged> --input only=<ID>,...` (or `only=@<file>`, one id a line) `--input new=<ID>,...` (the ids the batch may CREATE: a row no registry holds that `new` does not name is refused as a typo), then `--manual-step check --input staged=<staged>` (read-only: each supplied cell SAME, RESPACED, KEPT, FILLED or LOST, status and priority SAME or CHANGED, with a word diff of each LOST cell; every id a row newly cites must be a row of a registry or of the batch, because no guard reads the registries' own citations, `check-anchor-citations` included), then `--manual-step apply --input staged=<staged>` (`--input acceptLost=<ID>:<cell>,...` for each LOST cell read) — rehearsed in a throwaway repository first, all or nothing, every row read back; a failure restores both registries unless another writer changed them meanwhile, which it says |
+| Apply a LANE's rows | `dssharness fold-agent <o> <a>`, read the dry run — it refuses a cut id or path, a citation no row holds and a new id not named, and shows each lost cell as a word diff — then `--apply --new <ID>…` for the ids the lane's report names as new `[--accept-lost <ID>:<cell>]…` for each lost cell read — its files, then its rows all or nothing; a row applied before and declared anew with changed cells is applied again, refused where the registries changed it since; `delete-agent` applies every row still differing from what was applied (orchestration.md) |
+| Apply a directory of cell files the orchestrator wrote, as one batch | `dssharness run rows --manual-step stage --input rows=<rows dir> --input staged=<staged> --input only=<ID>,...` (or `only=@<file>`, one id a line) `--input new=<ID>,...` (the ids the batch may CREATE: a row no registry holds that `new` does not name is refused as a typo), then `--manual-step check --input staged=<staged>` (read-only: each supplied cell SAME, RESPACED, KEPT, FILLED or LOST, status and priority SAME or CHANGED, with a word diff of each LOST cell; every id a row newly cites must be a row of a registry or of the batch, because no guard reads the registries' own citations, `check-anchor-citations` included), then `--manual-step apply --input staged=<staged>` (`--input acceptLost=<ID>:<cell>,...` for each LOST cell read) — rehearsed in a throwaway repository first, all or nothing, every row read back; a failure restores both registries unless another writer changed them meanwhile, which it says. A lane's rows are never `apply`-ed here: its fold applies them |
 | Lint every row a reader cannot key on | `dssharness read-anchors --lint` |
 
 ⛔⛔ **THE DEFAULT INVERTED WHEN THE DOOR MOVED, AND A COPIED IDIOM NOW WRITES.** The retired

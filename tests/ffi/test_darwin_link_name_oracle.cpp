@@ -54,8 +54,10 @@
 //
 // That measurement is `tests/ffi/data/darwin-link-names.tsv`, taken on the
 // operator's Mac — 236 identifiers x 2 arches on macOS 26.5.2 (2026-08-25), ELEVEN
-// more on macOS 26.6.2 (2026-08-31) and THREE more (the getopt family, 2026-09-23),
-// 250 identifiers today. The dates and host versions live in that file's header
+// more on macOS 26.6.2 (2026-08-31), THREE more (the getopt family, 2026-09-23),
+// TWELVE more (2026-09-24) and, in P69, TWENTY-EIGHT more with TEN left (their
+// names became DSS's own C23 entry points) — 280 identifiers on 2026-10-01, every
+// one a Mach-O import of today's descriptors. The dates and host versions live in that file's header
 // rather than here, because a
 // TABLE's provenance belongs with the table. This file is the machinery that
 // holds the descriptors to it on every gate, on every host — the table is DATA,
@@ -94,10 +96,13 @@
 // `test_pe_crt_costate_binding.cpp` idiom). The real-tree arms were also
 // exercised by mutation — see this cycle's report.
 
+#include "analysis/compilation_unit/compilation_unit.hpp"   // predefinedTypeFactsFor — the pair's own facts
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/grammar_schema.hpp"
 #include "core/types/named_type_binding.hpp"
 #include "core/types/object_format_kind.hpp"
+#include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 #include "ffi/mangling/c_mangle.hpp"
@@ -115,6 +120,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -335,6 +342,26 @@ sysvVaListBinding(TypeInterner& interner) {
 // The `linkName` the REAL READER resolves for one descriptor on one arch. Keyed
 // per (descriptor, arch) and cached, because a descriptor read is not free and
 // the census walks 288 rows twice.
+// The Mach-O pair's own facts, from their one owner — a row's signature may key
+// an arm on the pair's LONG-DOUBLE FORMAT (`stdlib.json`'s strtold and strfroml,
+// P69), which no reader argument but these facts carries; read without them, such
+// a row's arms cannot be decided, the row is absent from the read, and this census
+// would silently skip its link name.
+[[nodiscard]] std::optional<ShippedPairFacts> machoPairFacts(std::string_view arch) {
+    static std::shared_ptr<GrammarSchema const> const c = [] {
+        auto loaded = GrammarSchema::loadShipped("c");
+        return loaded.has_value() ? *loaded : std::shared_ptr<GrammarSchema const>{};
+    }();
+    auto target = TargetSchema::loadShipped(std::string{arch});
+    auto format = ObjectFormatSchema::loadShipped("macho64-" + std::string{arch} + "-darwin-exec");
+    if (c == nullptr || !target.has_value() || !format.has_value()) {
+        ADD_FAILURE() << "the Mach-O " << arch << " pair's language, target or format does not load";
+        return std::nullopt;
+    }
+    PredefinedTypeFacts const f = predefinedTypeFactsFor(**target, **format);
+    return ShippedPairFacts{c.get(), f.dataModel, f.charIsUnsigned, f.abiTypedefs, f.longDoubleFormat};
+}
+
 [[nodiscard]] std::map<std::string, std::string>
 readLinkNames(fs::path const& descriptor, std::string_view arch) {
     std::map<std::string, std::string> out;
@@ -342,15 +369,28 @@ readLinkNames(fs::path const& descriptor, std::string_view arch) {
     TypeRegistry       typeReg;
     DiagnosticReporter rep;
     auto const namedTypes = sysvVaListBinding(interner);
+    auto const facts      = machoPairFacts(arch);
+    if (!facts.has_value()) return out;
     auto const desc = readShippedLibDescriptor(descriptor, interner, typeReg, rep,
                                                DataModel::Lp64, arch,
-                                               ObjectFormatKind::MachO, namedTypes);
+                                               ObjectFormatKind::MachO, namedTypes,
+                                               nullptr, &*facts);
     if (!desc.has_value()) {
         ADD_FAILURE() << descriptor.generic_string()
                       << " failed to read for arch " << arch;
         return out;
     }
-    for (auto const& s : desc->symbols) out.emplace(s.name, s.linkName);
+    // ★ P69: a name may have one row PER FORMAT (threads.json's call_once: a pe
+    // realization, an elf import, the macho `pthread_once` linkName), and a read
+    // returns every row whatever its availability — injection is what gates it. The
+    // census asks what Darwin binds, so only a row available on Mach-O answers.
+    for (auto const& s : desc->symbols) {
+        if (!s.availableObjectFormats.empty()
+            && std::find(s.availableObjectFormats.begin(), s.availableObjectFormats.end(),
+                         "macho") == s.availableObjectFormats.end())
+            continue;
+        out.emplace(s.name, s.linkName);
+    }
     return out;
 }
 
@@ -363,7 +403,7 @@ readLinkNames(fs::path const& descriptor, std::string_view arch) {
 TEST(DarwinLinkNameOracle, TableLoadsAndIsSubstantial) {
     auto const oracle = loadOracle();
     ASSERT_GE(oracle.size(), 200u)
-        << "the measured table holds 250 identifiers; a much smaller one means "
+        << "the measured table holds 280 identifiers; a much smaller one means "
            "it was truncated or the parser stopped early, and every census "
            "below would then pass by measuring nothing";
     // The eight MEASURED divergences, spelled out — the table is data, and this
@@ -459,7 +499,8 @@ TEST(DarwinLinkNameOracle, EveryMachOImportedFunctionHasAMeasuredRow) {
     auto const oracle = loadOracle();
     auto const fns    = machOImportedFunctions();
     ASSERT_GE(fns.size(), 250u)
-        << "the Mach-O import surface is 288 declared functions; a much smaller "
+        << "the Mach-O import surface is 323 declared function rows (280 identifiers, "
+           "✔counted 2026-10-01); a much smaller "
            "sweep means the enumeration broke and this census is vacuous";
     for (auto const& f : fns) {
         EXPECT_NE(oracle.find(f.symbol), oracle.end())
@@ -604,10 +645,11 @@ TEST(DarwinLinkNameOracle, ConfigSideDecorationIsCaught) {
 // set is CLOSED: `rejectUnknownKeys` refuses any key not on the list, and the
 // refusal fails the WHOLE descriptor read. So an author who adds a descriptor
 // key WITHOUT registering it does not get "the key is ignored" — every shipped
-// descriptor that carries it stops loading, which under
-// D-FFI-DESCRIPTOR-EAGER-IMPORT breaks every `#include` of those headers.
-// EIGHT descriptors carry `linkName` today (dirent, io, process, setjmp,
-// stdlib, sys/stat, time, unistd), 33 rows between them.
+// descriptor that carries it stops loading, which breaks every `#include` of
+// those headers. ELEVEN descriptors carry `linkName` (dirent, inttypes, io,
+// process, setjmp, stdio, stdlib, sys/stat, threads, time, unistd), 79 rows
+// between them (✔counted 2026-10-01, P69; it was eight and 33 before P69's C23
+// entry points and private platform rows).
 //
 // The negative arm is NOT optional: "a document carrying `linkName` reads clean"
 // is ALSO true of a reader that accepts every key, which is the failure the
@@ -641,7 +683,7 @@ TEST(DarwinLinkNameOracle, LinkNameIsRegisteredInTheClosedPerSymbolKeySet) {
     EXPECT_TRUE(read("registered.json", good))
         << "`linkName` must be a REGISTERED member of the per-symbol key set in "
            "`readShippedLibDescriptor`. Unregistered, this read FAILS — and it "
-           "fails for every shipped descriptor that carries the key (eight "
+           "fails for every shipped descriptor that carries the key (eleven "
            "today), so every binary that #includes one of those headers stops "
            "building. Adding a descriptor key is a two-part edit and this is "
            "the second part.";

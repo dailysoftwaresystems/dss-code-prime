@@ -1,0 +1,1 @@
+        return discarded.value.has_value() ? std::move(rest) : std::move(discarded);

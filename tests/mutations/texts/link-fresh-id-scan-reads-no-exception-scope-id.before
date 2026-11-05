@@ -1,0 +1,2 @@
+            if (scope.filterFuncletSymbol.v > maxV) maxV = scope.filterFuncletSymbol.v;
+            if (scope.personalitySymbol.v > maxV) maxV = scope.personalitySymbol.v;

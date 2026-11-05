@@ -1,0 +1,1 @@
+    fs::permissions(p, add, fs::perm_options::add | fs::perm_options::nofollow, ec);

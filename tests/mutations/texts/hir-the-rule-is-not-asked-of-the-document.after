@@ -1,0 +1,2 @@
+        if (false && decl.nonVoidFunctionEndReached
+            != NonVoidFunctionEndRule::ReturnsUnspecifiedValue)

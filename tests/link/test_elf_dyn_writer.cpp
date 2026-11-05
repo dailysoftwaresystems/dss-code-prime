@@ -423,7 +423,7 @@ TEST(ElfDynFormatJson, InterpreterOnDynRejectedAtLoad) {
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-interp","kind":"elf"},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
@@ -445,7 +445,7 @@ TEST(ElfDynFormatJson, EntryPointOnDynRejectedAtLoad) {
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-entry","kind":"elf"},
       "entryPoint": "main",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
@@ -464,7 +464,7 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-exec-va","kind":"elf"},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
@@ -502,7 +502,7 @@ TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) 
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-copy-reloc","kind":"elf"},
       "dataImportBinding": "copy-relocation",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(dyn.has_value())
@@ -528,7 +528,8 @@ TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) 
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(exec.has_value())
@@ -548,7 +549,7 @@ TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) 
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-got-indirect","kind":"elf"},
       "dataImportBinding": "got-indirect",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     EXPECT_TRUE(good.has_value())
@@ -570,6 +571,7 @@ TEST(ElfDynFormatJson, SonameOnNonDynRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "soname": "libx.so.1" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -629,7 +631,7 @@ TEST(ElfDynWriter, SonameEmittedWhenConfigured) {
       "format": {"name":"dyn-with-soname","kind":"elf"},
       "externCallDispatch": "direct-plt",
       "supportedDataSections": ["rodata", "data", "bss", "relro"],
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "soname": "libdss.so.1" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "soname": "libdss.so.1", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[
         {"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096},
         {"kind":"data","name":".data","type":1,"flags":3,"addrAlign":8,"entrySize":0,"virtualAddress":0},
@@ -1145,7 +1147,7 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-interp","kind":"elf"},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(a.has_value())
@@ -1170,8 +1172,9 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
       "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processArgs": {"mechanism":"stack-vector","argcStackOffset":0,"argvStackOffset":8},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(b.has_value())
@@ -1206,7 +1209,8 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
       "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(c.has_value())
@@ -1243,8 +1247,9 @@ TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "processArgs": {"mechanism":"stack-vector","argcStackOffset":0,"argvStackOffset":8},
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "soname": "libnot-a-lib.so.1" },
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "soname": "libnot-a-lib.so.1", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value())

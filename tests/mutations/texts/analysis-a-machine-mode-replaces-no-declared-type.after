@@ -1,0 +1,3 @@
+    (void)machineModeType(s, cfg, tree, facts.machineModeClause,
+                          *facts.machineModeRow, ty, say);
+    return ty;

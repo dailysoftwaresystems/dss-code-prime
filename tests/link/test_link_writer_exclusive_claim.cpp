@@ -94,7 +94,9 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/substrate/path_identity.hpp"   // entryKind / reachedKind: what a planted link IS
 #include "link/writer.hpp"
+#include "os_link.hpp"                         // links made by the OS: MinGW's library makes none
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -799,34 +801,41 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverStaleTempsAndNeverAdoptsOne) {
 // questions have different answers, and before the repair the loop took the
 // "this is a real error" arm and refused to emit the artifact at all.
 //
-// ⚠ POSIX LEG ONLY, AND THE REASON IS THE LIBRARY, NOT THE PRIVILEGE. The
-// anchor predicted a Windows skip because creating a symlink there needs
-// Developer Mode or elevation. ✔MEASURED 2026-08-26 on the shipping Windows
-// toolchain (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
-// fails with `ENOSYS` — "Function not implemented" (40) — in a directory where
-// `mklink` succeeds in the same session, so libstdc++ never even attempts the
-// call and no privilege can change that. The tests below therefore SAY they
-// skipped and WHY rather than silently passing: an instrument that does not
-// state what it did NOT cover gets read as having covered everything.
-// ⚠ THEY MUST SKIP BEFORE CONSUMING A SLOT: the ledger above is
-// audited by the integration test, so a skip that had already called
+// ★ EVERY LEG, AND THE LINK IS THE OS'S. ✔MEASURED 2026-08-26 on the MinGW-W64
+// UCRT g++ 13.2.0 build: `std::filesystem::create_symlink` fails with `ENOSYS` —
+// "Function not implemented" (40) — in a directory where `mklink` succeeds in the
+// same session: libstdc++ on Windows never asks the OS, and no privilege changes
+// that. These cases used to SKIP there, saying so; the link is now made by the
+// OS's own call (`tests/test_support/os_link.hpp`), so they run on that build too
+// — the build whose library also cannot SEE a link (✔MEASURED 2026-10-20: its
+// `symlink_status` and `status` both read a dangling file link's OWN attributes,
+// `regular`), which is exactly where the claim loop's probe most needs measuring.
+// What a planted entry IS is asked of the substrate (`dss::core::entryKind`,
+// `reachedKind`), which asks the OS there; never of the library.
+// ⚠ A PLANT THAT FAILS FAILS BEFORE CONSUMING A SLOT: the ledger above is
+// audited by the integration test, so a case that had already called
 // `writeBytes` would desynchronise it.
 namespace {
 
-// Plant a dangling symlink at `p`. Returns false having ALREADY issued the
-// skip reason when the platform cannot make one.
+// Plant a dangling symlink at `p`. Returns false with `why` when the OS refused.
 [[nodiscard]] bool plantDanglingSymlink(fs::path const& p, std::string& why) {
-    std::error_code ec;
-    fs::create_symlink(p.parent_path() / "no-such-target-dss", p, ec);
+    std::error_code const ec = dss::test_support::makeSymbolicLink(
+        p.parent_path() / "no-such-target-dss", p, dss::test_support::LinkTo::File);
     if (ec) {
-        why = "std::filesystem::create_symlink failed: " + ec.message() + " ("
+        why = "the OS refused to make a symbolic link: " + ec.message() + " ("
             + std::to_string(ec.value())
             + "). This leg cannot construct the input this test is about, so "
-              "nothing was asserted. On MinGW/libstdc++ the value is ENOSYS "
-              "and no privilege changes it.";
+              "nothing was asserted, which is no pass.";
         return false;
     }
     return true;
+}
+
+[[nodiscard]] bool isDanglingLink(fs::path const& p) {
+    std::error_code kec;
+    std::error_code rec;
+    return dss::core::entryKind(p, kec) == dss::core::EntryKind::Link && !kec
+        && dss::core::reachedKind(p, rec) == dss::core::EntryKind::Absent && !rec;
 }
 
 } // namespace
@@ -843,7 +852,8 @@ TEST(LinkWriterExclusiveClaim, ADanglingSymlinkRefusesTheClaimButExistsSaysNo) {
     auto const p = scratch.path() / "candidate.dsstmp-probe";
 
     std::string why;
-    if (!plantDanglingSymlink(p, why)) { GTEST_SKIP() << why; }
+    ASSERT_TRUE(plantDanglingSymlink(p, why)) << why;
+    ASSERT_TRUE(isDanglingLink(p)) << "the OS does not record the planted entry as a dangling link";
 
     // The claim refuses it — the entry exists, so exclusive create cannot win.
     EXPECT_FALSE(static_cast<bool>(claim(p)))
@@ -852,17 +862,29 @@ TEST(LinkWriterExclusiveClaim, ADanglingSymlinkRefusesTheClaimButExistsSaysNo) {
            "disambiguation below is moot and this file must be re-measured "
            "rather than the assertion relaxed.";
 
-    // ...and the two probes disagree. This is the defect in one line.
-    std::error_code ecFollow;
+    // The probe the claim loop relies on sees the ENTRY, on every build.
     std::error_code ecEntry;
-    EXPECT_FALSE(fs::exists(p, ecFollow))
-        << "`exists()` was expected to FOLLOW the link and report the missing "
-           "TARGET; it did not, so this platform cannot exhibit the misroute";
     EXPECT_TRUE(fs::exists(fs::symlink_status(p, ecEntry)))
         << "`symlink_status()` must see the ENTRY — this is the probe the "
            "claim loop relies on";
     EXPECT_FALSE(static_cast<bool>(ecEntry))
         << "symlink_status reported an error: " << ecEntry.message();
+
+    // ...and where this build's library can tell a link at all, `exists()`
+    // FOLLOWS it and reports the missing TARGET: the two probes disagree, the
+    // defect in one line. A library that cannot tell a link (libstdc++ on
+    // Windows: `is_symlink` is never true there) reads the link's own entry for
+    // both, so on that build the misroute cannot happen and (b) pins the plain
+    // outcome; asked by what the library ANSWERS, never by its name.
+    std::error_code ecLink;
+    if (fs::is_symlink(fs::symlink_status(p, ecLink))) {
+        std::error_code ecFollow;
+        EXPECT_FALSE(fs::exists(p, ecFollow))
+            << "`exists()` was expected to FOLLOW the link and report the missing "
+               "TARGET; it did not, so this platform cannot exhibit the misroute";
+    } else {
+        RecordProperty("library_sees_links", "no: exists() and symlink_status() both read the entry");
+    }
 }
 
 // (b) THE ROUTING ITSELF, through `writeBytes`.
@@ -882,8 +904,8 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverDanglingSymlinkCandidates) {
     auto const out     = scratch.path() / "artifact.bin";
     auto const payload = bytesOf("the artifact that must still land");
 
-    // Plant BEFORE any `writeBytes` call, so a platform that cannot make a
-    // symlink skips without touching the staging-slot ledger.
+    // Plant BEFORE any `writeBytes` call, so a host whose OS refuses a link
+    // fails without touching the staging-slot ledger.
     std::vector<fs::path> links;
     links.reserve(kDanglingAhead);
     for (std::uint64_t i = 0; i < kDanglingAhead; ++i) {
@@ -891,7 +913,7 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverDanglingSymlinkCandidates) {
         std::string why;
         if (!plantDanglingSymlink(p, why)) {
             for (auto const& done : links) { fs::remove(done); }
-            GTEST_SKIP() << why;
+            FAIL() << why;
         }
         links.push_back(p);
     }
@@ -915,12 +937,13 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverDanglingSymlinkCandidates) {
     // would pass the assertion above and fail here.
     for (std::uint64_t i = 0; i < kDanglingAhead; ++i) {
         auto const& p = links[static_cast<std::size_t>(i)];
-        std::error_code ec;
-        EXPECT_TRUE(fs::is_symlink(fs::symlink_status(p, ec)))
+        std::error_code kec;
+        EXPECT_EQ(dss::core::entryKind(p, kec), dss::core::EntryKind::Link)
             << "candidate #" << (nextSlot + i)
             << " is no longer a symlink — the writer consumed a slot it did "
                "not create";
-        EXPECT_FALSE(fs::exists(p))
+        std::error_code rec;
+        EXPECT_EQ(dss::core::reachedKind(p, rec), dss::core::EntryKind::Absent)
             << "candidate #" << (nextSlot + i)
             << " now resolves — the writer wrote THROUGH the link and created "
                "its target, which is the other way this misroute can go wrong";

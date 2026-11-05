@@ -1,0 +1,1 @@
+        case HirOpKind::Add: folded.value = av + bv; return folded;

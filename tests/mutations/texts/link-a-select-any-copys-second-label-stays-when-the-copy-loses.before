@@ -1,0 +1,2 @@
+    return linkFormat.supersededDefinition().answerFor(kind)
+           == std::optional<SupersededDefinition>{SupersededDefinition::DiscardedWhole};

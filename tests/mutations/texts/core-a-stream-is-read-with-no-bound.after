@@ -1,0 +1,1 @@
+    return readChecked(path, std::numeric_limits<std::uintmax_t>::max());

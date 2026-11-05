@@ -1,0 +1,1 @@
+                result = evalImpl(initN, ctx, env, options, initScope, visitedInitNodes);

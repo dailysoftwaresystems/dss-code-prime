@@ -1,0 +1,2 @@
+    symbolIdEndStated_ = other.symbolIdEndStated_;
+    other.symbolIdEndStated_ = false;

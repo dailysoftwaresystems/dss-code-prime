@@ -1,0 +1,31 @@
+{
+  "$comment": "★★ ONLY THE `/ENTRY:` THAT STANDS IS A REFERENCE (P69 fold 2, the review of fold 1, NIT 6; D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE). Two objects NAMED to the link each state an entry: the first is cl 19.44's `/c /O2 /MD /GS-` build of `#pragma comment(linker, \"/ENTRY:dss_member_entry\") int dss_member_entry(void) { return 42; }`, the second of `#pragma comment(linker, \"/ENTRY:dss_archived_entry\") int dss_entry_ref_marker(void) { return 3; }` -- and NOTHING in this link defines `dss_archived_entry`. ✔MEASURED 2026-10-10 on these very fixtures (md5 2b93f0bddabed2603b694eae43e437d1 and a12aeb09b00410b879bc390e2f43579e) under a clang 19.1.5 `main`, `/subsystem:console /nodefaultlib`: link.exe 14.44.35228 takes the FIRST entry, drops the second with a warning (LNK4258) and requires nothing for it -- the image links, starts at `dss_member_entry` and exits 42; with the two objects in the other order the entry that stands is the undefined one and link.exe refuses the link (LNK2001). lld-link 19.1.5 requires every stated entry and refuses both orders (`undefined symbol: dss_archived_entry`) -- a link one reference runs is one DSS must link. Until fold 2 a DSS link made the entry of EVERY stating object a required reference as the object was read, before the precedence was asked, and refused this program as link.exe never does (`undefined symbol 'dss_archived_entry'`). The dropped request is said, `K_LinkerDirectiveIgnored`, as link.exe says it. `main` is the witness that the process did not start in the C runtime's startup: it would exit 7. The `release` arm pins that optimizing the DSS half changes nothing: the image never runs it.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "K_LinkerDirectiveIgnored", "line": 0, "col": 0, "positioned": false }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The object whose entry STANDS: it is named first. Source and rebuild commands: `tests/link/data/pe_directive_entry_member_x86_64_pe.source.c` (cl 19.44.35228 `/c /O2 /MD /GS- /experimental:deterministic /pathmap:`; md5 2b93f0bddabed2603b694eae43e437d1). A relocatable object named to the link is an OBJECT INPUT, linked eagerly, as link.exe links one named on its command line. The witness is the directive itself.",
+          "path": "tests/link/data/pe_directive_entry_member_x86_64_pe.obj",
+          "containerWitness": "/ENTRY:dss_member_entry"
+        },
+        {
+          "$comment": "The object whose entry is DROPPED: it is named second, and nothing defines the entry it states. Source and rebuild commands: `tests/link/data/pe_directive_entry_reference_x86_64_pe.source.c` (the same cl build; md5 a12aeb09b00410b879bc390e2f43579e). The witness is the directive itself.",
+          "path": "tests/link/data/pe_directive_entry_reference_x86_64_pe.obj",
+          "containerWitness": "/ENTRY:dss_archived_entry"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

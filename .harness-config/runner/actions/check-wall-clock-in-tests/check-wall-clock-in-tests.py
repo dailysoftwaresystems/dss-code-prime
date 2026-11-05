@@ -35,7 +35,7 @@ idiom `runBinary(exe, std::chrono::milliseconds{5000})`, which is none of the
 three and is the identical hazard, accounts for TWENTY-SIX. A guard keyed on the three named spellings would have measured green
 over the whole live population. So the rule is: a numeric `chrono` duration
 literal is a wall-clock literal WHEREVER it appears, unless it is a sleep. That is
-the same inversion `check-anchor-balance` uses for its closed-marker rule —
+the same inversion `anchor-debt` uses for its closed-marker rule —
 define the complement, never the variants — and it errs in the same safe
 direction: an unenumerated new spelling is caught rather than waved through.
 ⓘ It therefore also catches an assertion BOUND (`EXPECT_LT(elapsed, seconds{10})`).

@@ -35,6 +35,7 @@
 #include "program/program.hpp"          // Program, routesToMultiUnit
 #include "core/types/project_sources.hpp"  // AP6 M4: expandAndDedupProjectSources
 #include "host_native_target.hpp"       // hostNativeTarget (build-and-spawn on EVERY leg)
+#include "os_link.hpp"                  // links made by the OS: MinGW's library makes none
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
 #include "unc_spelling.hpp"             // the ONE multi-separator-root fixture
@@ -3134,7 +3135,7 @@ TEST(ExpandGlob, TwoMatchesSortedDedupedRoutesMulti) {
     writeText(dir / "note.txt", "not a source\n");   // must NOT match *.c
 
     std::vector<std::string> out;
-    std::error_code ec;
+    GlobError       ec;
     ASSERT_TRUE(expandGlob((dir / "*.c").generic_string(), out, ec));
     EXPECT_FALSE(ec);
     ASSERT_EQ(out.size(), 2u) << "the glob matches a.c + b.c, excludes note.txt";
@@ -3143,6 +3144,122 @@ TEST(ExpandGlob, TwoMatchesSortedDedupedRoutesMulti) {
     EXPECT_EQ(std::filesystem::path{out[1]}.filename().string(), "b.c");
     EXPECT_TRUE(routesToMultiUnit(out.size()))
         << "2 matches → the multi-CU route, exactly as two literal sources would";
+}
+
+// A GLOB NEVER WALKS THROUGH A DIRECTORY LINK AND MATCHES A LINK BY WHAT IT
+// REACHES, on every build. ✔MEASURED 2026-10-20 (src/core/substrate/path_identity.hpp):
+// libstdc++ on Windows cannot tell a link from what it reaches, so the MinGW
+// build's `**` DESCENDED a directory link the MSVC build's did not — one glob, two
+// source lists — and matched a dangling `.c` link as a source. The links are made
+// by the OS (`os_link.hpp`): that build's library makes none.
+TEST(ExpandGlob, ARecursiveGlobNeverWalksThroughALinkAndMatchesALinkByWhatItReaches) {
+    using dss::test_support::LinkTo;
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    ScratchDir elsewhere{Location::Temp, "program-elsewhere"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "src");   // writeText makes no directory
+    writeText(dir / "src" / "a.c", "int a(void){return 0;}\n");
+    writeText(elsewhere.path() / "beyond.c", "int beyond(void){return 0;}\n");
+    writeText(elsewhere.path() / "named.c", "int named(void){return 0;}\n");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path(), dir / "src" / "linked", LinkTo::Directory));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", dir / "src" / "via-link.c",
+                                                             LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c",
+                                                             LinkTo::File));
+
+    std::vector<std::string> out;
+    GlobError       ec;
+    ASSERT_TRUE(expandGlob((dir / "src" / "**" / "*.c").generic_string(), out, ec)) << ec.message();
+    std::vector<std::string> names;
+    std::string              matched;
+    for (auto const& s : out) {
+        names.push_back(std::filesystem::path{s}.lexically_relative(dir / "src").generic_string());
+        matched += " " + names.back();
+    }
+    EXPECT_EQ(names, (std::vector<std::string>{"a.c", "via-link.c"}))
+        << "the glob matched " << names.size() << " sources:" << matched
+        << " -- a directory link was walked through, or a dangling link was matched as a source";
+}
+
+// A LINK WHOSE REACH CANNOT BE EXAMINED IS ASKED ABOUT ONLY WHEN THE PATTERN MATCHES ITS NAME -- this file's own
+// rule (glob_match.cpp: an entry unrelated to the pattern must not fail the whole glob): a looping link named
+// nothing like a source leaves `src/**/*.c` whole, as bash, Python's glob and CMake's GLOB_RECURSE list such a tree;
+// a looping link the pattern matches is a source nobody can read, refused (what gcc and clang answer for a looping
+// include candidate, ✔MEASURED 2026-10-28). The links are made by the OS and name themselves, which loops on every
+// host.
+TEST(ExpandGlob, AnUnrelatedLoopingLinkLeavesTheGlobWholeAndOneThePatternMatchesIsRefused) {
+    using dss::test_support::LinkTo;
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "src" / "docs");
+    writeText(dir / "src" / "a.c", "int a(void){return 0;}\n");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "docs" / "self", dir / "src" / "docs" / "self",
+                                                             LinkTo::File));
+    std::string const pattern = (dir / "src" / "**" / "*.c").generic_string();
+    {
+        GlobError                ec;
+        std::vector<std::string> out;
+        EXPECT_TRUE(expandGlob(pattern, out, ec)) << "an unrelated looping link failed the glob: " << ec.message();
+        EXPECT_EQ(out.size(), 1u) << "the glob matched " << out.size() << " sources";
+    }
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "b.c", dir / "src" / "b.c", LinkTo::File));
+    {
+        GlobError                ec;
+        std::vector<std::string> out;
+        EXPECT_FALSE(expandGlob(pattern, out, ec))
+            << "a looping link the pattern matches was passed over in silence; matched " << out.size();
+        EXPECT_TRUE(ec) << "the refusal carries no reason";
+        EXPECT_NE(ec.where.generic_string().find("b.c"), std::string::npos)
+            << "the refusal does not name the link: " << ec.where.generic_string();
+    }
+}
+
+// A LITERAL PATTERN names what it REACHES: a link to a source is that source, and a DANGLING link matches nothing --
+// what the MSVC and POSIX builds always answered. libstdc++ on Windows reads a dangling link's own attributes, so
+// the MinGW build matched it and handed the compile a source it could not read
+// ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The links are made by the OS.
+TEST(ExpandGlob, ALiteralPatternNamingADanglingLinkMatchesNothing) {
+    using dss::test_support::LinkTo;
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "src");   // writeText makes no directory
+    writeText(dir / "src" / "real.c", "int r(void){return 0;}\n");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "real.c", dir / "src" / "via-link.c", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "gone.c", dir / "src" / "dangling.c", LinkTo::File));
+
+    GlobError                ec;
+    std::vector<std::string> viaLink;
+    ASSERT_TRUE(expandGlob((dir / "src" / "via-link.c").generic_string(), viaLink, ec)) << ec.message();
+    EXPECT_EQ(viaLink.size(), 1u) << "the literal naming the live link matched " << viaLink.size() << " source(s)";
+    std::vector<std::string> dangling;
+    ASSERT_TRUE(expandGlob((dir / "src" / "dangling.c").generic_string(), dangling, ec)) << ec.message();
+    EXPECT_EQ(dangling.size(), 0u) << "the literal naming the dangling link matched " << dangling.size()
+                                   << " source(s)";
+}
+
+// A LITERAL PATTERN WHOSE REACH CANNOT BE EXAMINED IS REFUSED, NAMED: a looping link named as a source is no absence
+// -- "matched nothing" would send the reader after a typo -- so the expansion fails, `where` naming it. The link
+// names itself, which loops on every host. The checkpoint-34 bytes matched nothing, in silence.
+TEST(ExpandGlob, ALiteralPatternNamingALoopingLinkIsRefusedNamingIt) {
+    using dss::test_support::LinkTo;
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::Temp, "program"};
+    auto const dir = scratch.path();
+    std::filesystem::create_directories(dir / "src");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "src" / "self.c", dir / "src" / "self.c", LinkTo::File));
+    GlobError                ec;
+    std::vector<std::string> out;
+    EXPECT_FALSE(expandGlob((dir / "src" / "self.c").generic_string(), out, ec))
+        << "a literal naming a looping link matched " << out.size() << " source(s), and nothing was refused";
+    EXPECT_TRUE(ec) << "the refusal carries no reason";
+    EXPECT_EQ(ec.where.filename(), std::filesystem::path{"self.c"}) << "the refusal named " << ec.where.generic_string();
 }
 
 // ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
@@ -3183,7 +3300,7 @@ TEST(ExpandGlob, MatchKeepsAMultiSeparatorRoot) {
     ASSERT_GE(dss::test_support::leadingSeparatorRun(uncDir), 2u);
 
     std::vector<std::string> out;
-    std::error_code          ec;
+    GlobError                ec;
     ASSERT_TRUE(expandGlob(dss::core::genericSpelling(uncDir / "*.c"), out, ec));
     EXPECT_FALSE(ec) << ec.message();
     ASSERT_EQ(out.size(), 1u)
@@ -3204,7 +3321,7 @@ TEST(ExpandGlob, MatchKeepsAMultiSeparatorRoot) {
     // where re-basing happens AND the result carries an authority. Without this
     // the fix on that line would be untested and would read as covered.
     std::vector<std::string> lit;
-    std::error_code          litEc;
+    GlobError                litEc;
     ASSERT_TRUE(expandGlob("a.c", lit, litEc, uncDir));
     EXPECT_FALSE(litEc) << litEc.message();
     ASSERT_EQ(lit.size(), 1u);
@@ -3315,7 +3432,7 @@ TEST(ExpandGlob, RecursiveDoubleStarDescendsSubdirs) {
     writeText(dir / "sub" / "deep" / "low.c", "int l(void){return 0;}\n");
 
     std::vector<std::string> out;
-    std::error_code ec;
+    GlobError       ec;
     ASSERT_TRUE(expandGlob((dir / "**" / "*.c").generic_string(), out, ec));
     EXPECT_FALSE(ec);
     EXPECT_EQ(out.size(), 3u)
@@ -3333,7 +3450,7 @@ TEST(ExpandGlob, SingleStarDoesNotDescend) {
     writeText(dir / "sub" / "nested.c", "int n(void){return 0;}\n");
 
     std::vector<std::string> out;
-    std::error_code ec;
+    GlobError       ec;
     ASSERT_TRUE(expandGlob((dir / "*.c").generic_string(), out, ec));
     EXPECT_FALSE(ec);
     ASSERT_EQ(out.size(), 1u)
@@ -3351,7 +3468,7 @@ TEST(ExpandGlob, ZeroMatchAppendsNothingNotAnError) {
     auto const dir = scratch.path();
     writeText(dir / "a.c", "int a(void){return 0;}\n");
     std::vector<std::string> out;
-    std::error_code ec;
+    GlobError       ec;
     ASSERT_TRUE(expandGlob((dir / "*.cpp").generic_string(), out, ec));
     EXPECT_FALSE(ec);
     EXPECT_TRUE(out.empty()) << "no .cpp files ⇒ nothing appended, no I/O error";
@@ -3365,7 +3482,7 @@ TEST(ExpandGlob, NonexistentBaseIsZeroMatchNotError) {
     ScratchDir scratch{Location::Temp, "program"};
     auto const dir = scratch.path();
     std::vector<std::string> out;
-    std::error_code ec;
+    GlobError       ec;
     ASSERT_TRUE(expandGlob((dir / "nope" / "*.c").generic_string(), out, ec));
     EXPECT_FALSE(ec);
     EXPECT_TRUE(out.empty());
@@ -3379,7 +3496,7 @@ TEST(ExpandGlob, AppendsToExistingOutput) {
     auto const dir = scratch.path();
     writeText(dir / "one.c", "int one(void){return 0;}\n");
     std::vector<std::string> out{"pre-existing.c"};
-    std::error_code ec;
+    GlobError       ec;
     ASSERT_TRUE(expandGlob((dir / "*.c").generic_string(), out, ec));
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(out[0], "pre-existing.c") << "the pre-existing entry is preserved";

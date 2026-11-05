@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN, review M5(a)): the ISO C <string.h> and <ctype.h> functions DSS's shipped descriptors lacked -- strcoll, strxfrm, strpbrk, strtok (C89), isblank (C99), memccpy, strdup, strndup and memset_explicit (C23) -- each called through its header and checked against C's meaning, and `__builtin_strndup` wherever `__has_builtin` answers 1 for it (it binds the very function strndup names); exit 42, or 100 plus the first check that fails (see main.c). Each is PROVIDED differently and the example runs every provider: the C library's export on every format for strcoll, strxfrm, strpbrk, strtok and isblank (glibc, ucrtbase.dll, libSystem), and for memccpy / strdup / strndup on elf and macho; ucrtbase.dll's `_memccpy` and `_strdup` on pe, its only spellings (lane `cs`'s probe iso2w); a body DSS's platform runtime ships for strndup on pe (ucrtbase exports none), reached through the header and through the library builtin alike, and for memset_explicit on every format (no shipped C library has one: glibc 2.39, ucrtbase.dll and libSystem export none, probes iso2g / iso2w / mac1). MEASURED 2026-10-07 through `dssharness run probe-reference-cc`, this file's final bytes -- a reference runs the checks ITS library provides in that mode (main.c's HAVE_ macros), DSS every one: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x exit 42 (run 20261007-192348-e14f7e2b, host run -192342-51c9c32a) and at -std=c2x -O2 (run 20261007-192414-afe6696a, host run -192401-0041ecf1); mingw-w64 gcc 13.2.0 exits 42 at -std=c17 -pedantic-errors and -std=c2x (run 20261007-192431-0809b561) and at -std=c2x -O2 (run 20261007-192434-48255a90); MSVC 19.51 at /std:clatest and /std:c17 exits 42 (run 20261007-192436-1a139633); Apple clang 21.0.0 at -std=c17 -pedantic-errors, -std=c2x and -std=c2x -O2 exits 42 (run 20261007-192503-f4730785, host run -192451-4f0ca06c). The darwin target imports libSystem's seven, each measured by the Darwin link-name oracle's method on x86_64 and arm64 (lane `cs`'s probe mac1, run 20261007-191714-ceb4dcc2, host run -191707-f962555c; tests/ffi/data/darwin-link-names.tsv). The release arm is REPORT-ONLY: its value is that the optimized program keeps every call's answer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

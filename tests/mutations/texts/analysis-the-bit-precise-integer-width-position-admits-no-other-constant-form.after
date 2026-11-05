@@ -1,0 +1,2 @@
+                    constIntExpr(s, tree, bitKids[cfg.bitIntWidthChild], scope, &cfg,
+                                 std::nullopt);

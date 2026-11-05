@@ -1,12 +1,8 @@
 #include "lir/lir_rewrite.hpp"
 
+#include "core/substrate/path_identity.hpp"   // openFileStream: the env-gated dump opens at any length
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
-// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the by-value-stack-arg exhaust-class
-// constants — the rewriter's call-arg classifier advances the arg cursors past a
-// by-value aggregate carrier EXACTLY as lir_callconv / lir_wide_call_args do, so a
-// spilled scalar arg's register-vs-overflow decision matches theirs.
-#include "mir/mir_opcode.hpp"
 #include "lir/lir_asm_region.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_callconv.hpp"
@@ -230,14 +226,16 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
 // instruction as a REGISTER-PASSED scalar arg (→ its LirRegClass) or not
 // (→ nullopt). Only a register-passed scalar arg is eligible to be DEFERRED to
 // callconv as a `SpillSlotRef` when spilled — the callee (ops[0]), the sret
-// pointer (ops[1] when hasIrr), a by-value-aggregate carrier (Reg + marker), the
-// marker itself, and any overflow scalar arg (already removed pre-regalloc by
-// lowerWideCallArgs) all keep the ordinary scratch-reload path.
+// pointer (ops[1] when hasIrr) and any overflow scalar arg (already removed
+// pre-regalloc by lowerWideCallArgs) keep the ordinary scratch-reload path. No
+// by-value stacked-aggregate carrier reaches here: `lowerWideCallArgs` took
+// each one off its Call (the LIR verifier's stage rule,
+// `verifyLirStackedAggregatesLowered`).
 //
 // This MIRRORS the arg-placement cursor of lir_callconv / lir_wide_call_args
 // EXACTLY (same monotonic NSAA cursor, same slot-aligned vs independent-counter
-// pool logic, same ByValueStackAgg-carrier skip + class-exhaust clamp, same
-// hasIndirectResult / firstArgIdx / variadicForcesStack handling) so the
+// pool logic, same hasIndirectResult / firstArgIdx / variadicForcesStack
+// handling) so the
 // register-vs-overflow verdict here is byte-identical to the one callconv reaches
 // — a spilled arg the rewriter defers is exactly one callconv will arg-move.
 // Config-driven from the cc descriptor; no arch/format branch.
@@ -264,21 +262,6 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
-        // The marker, and the MemOffset stating where its aggregate was placed,
-        // are consumed WITH the carrier below — never argument positions of their
-        // own (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES).
-        if (lirIsByValueStackAggDescriptor(ops, k)) continue;
-        if (lirIsByValueStackAggCarrier(ops, k)) {
-            // Wholly-stacked aggregate — NOT a register arg (keep scratch path).
-            // Advance the shared cursors + class-exhaust clamp as callconv does.
-            std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
-            if (ex == kByValueStackArgExhaustGpr)
-                argCursors.exhaust(LirRegClass::GPR);
-            else if (ex == kByValueStackArgExhaustFpr)
-                argCursors.exhaust(LirRegClass::FPR);
-            ++argRegionIdx;
-            continue;
-        }
         if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
         LirRegClass const cls = argOp.reg.regClass();
         // ⚠ A class with no pool row gets index 0 / poolSize 0, i.e. NOT
@@ -307,6 +290,9 @@ rewriteOneFunc(Lir const&               src,
                TargetSchema const&      schema,
                LirFuncAllocation const& alloc,
                LirBuilder&              b,
+               // `LirRewriteResult::blockEntryImage`, sized to the source block
+               // arena: this function writes the entry of each of its blocks.
+               std::vector<std::uint32_t>& entryImage,
                DiagnosticReporter&      reporter) {
     bool scratchOk = true;
     // Non-const: resolveReg's FC4 c2 forbidden-filter may rotate a
@@ -533,6 +519,9 @@ rewriteOneFunc(Lir const&               src,
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         LirBlockId const dstBlock = srcToDst.at(srcBlock.v);
         b.beginBlock(dstBlock);
+        // The block image this rebuild publishes: this source block's instructions
+        // begin in the block just begun.
+        entryImage[srcBlock.v] = dstBlock.v;
         if (auto const it = edgeStores.find(dstBlock.v); it != edgeStores.end()) {
             for (auto const& st : it->second) {
                 std::array<LirOperand, 1> storeOps{LirOperand::makeReg(st.scratch)};
@@ -1084,8 +1073,8 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
     auto const minInsts =
         static_cast<std::uint32_t>(std::strtoul(minEnv, nullptr, 10));
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
-    std::FILE* const f =
-        std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a");
+    std::FILE* const f = core::openFileStream(
+        std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a");   // at any length
     if (f == nullptr) return;
     for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
         LirFuncId const fn = lir.funcAt(i);
@@ -1147,8 +1136,8 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
 void dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage) {
     if (std::getenv("DSS_DUMP_LIR_MIN_INSTS") == nullptr) return;
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
-    if (std::FILE* const f =
-            std::fopen(path != nullptr ? path : "dss_lir_dump.txt", "a")) {
+    if (std::FILE* const f = core::openFileStream(
+            std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a")) {   // at any length
         auto const c = lir_pass_util::censusIdentityClassMoves(lir, schema);
         std::fprintf(f,
                      "########## STAGE %s ##########"
@@ -1294,6 +1283,9 @@ rewriteWithAllocation(Lir const&           src,
     lir_pass_util::copyModuleSideStructures(src, b);
     auto const baseline = reporter.errorCount();
     bool anyFunctionFailed = false;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every source
+    // block's entry in the output, one slot per source block id (0 = the sentinel).
+    std::vector<std::uint32_t> blockEntryImage(src.blockCount(), 0u);
 
     std::size_t const fnCount = src.moduleFuncCount();
     for (std::uint32_t i = 0; i < fnCount; ++i) {
@@ -1307,18 +1299,20 @@ rewriteWithAllocation(Lir const&           src,
             anyFunctionFailed = true;
             continue;
         }
-        if (!rewriteOneFunc(src, fn, schema, *funcAlloc, b, reporter)) {
+        if (!rewriteOneFunc(src, fn, schema, *funcAlloc, b, blockEntryImage,
+                            reporter)) {
             // Mid-failure: the builder may have a half-open function.
             // Bail without calling `finish()` (which would fatal on
             // the unterminated open block). The output module is
             // intentionally empty — callers MUST check `ok` to decide
             // whether to consume the result.
-            return LirRewriteResult{Lir{}, false};
+            return LirRewriteResult{Lir{}, false, {}};
         }
     }
 
     LirRewriteResult out;
     out.lir = std::move(b).finish();
+    out.blockEntryImage = std::move(blockEntryImage);
     out.ok  = !anyFunctionFailed && (reporter.errorCount() == baseline);
     dumpLirFuncs(out.lir, schema, "post-rewrite");
     checkLoopCarriedSpills(out.lir, schema, "post-rewrite");

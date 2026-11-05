@@ -1,0 +1,1 @@
+    return lo != landingEntryPositions.end() && *lo <= r.end;

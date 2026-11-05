@@ -1,0 +1,1 @@
+        for dirpath, dirnames, filenames in ignores.walk(top):

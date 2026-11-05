@@ -80,9 +80,14 @@
 // every declared target, including the ones this host can never spawn, and its
 // header states why that half is the only witness a cross-host spec has.
 #include "coverage_boundary.hpp"
+// The judgement of `forbidDiagnostics` — ONE home, shared with the CLI-subprocess
+// sibling; this runner hands it what a reporter said (`diagnosticCodesSaid`).
+#include "forbidden_diagnostics.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/substrate/path_identity.hpp"  // walkTree: the artifact sweep never follows a link
+#include "reached_path.hpp"  // what a path REACHES -- the one copy both runners ask
 #include "host_native_target.hpp"  // the loader-search-path spawn pin BUILDS AND
                                    // SPAWNS its own output, so it builds for this
                                    // machine (do not rely on a transitive include)
@@ -149,6 +154,11 @@ using ::dss::test_support::currentHostOs;
 using ::dss::test_support::findOnPath;
 using ::dss::test_support::qemuSysrootHint;
 using ::dss::test_support::specTargetArch;
+// Every question this runner asks of a path is asked of the SUBSTRATE, through the primitives the two corpus
+// runners share (reached_path.hpp says why: the MinGW library answers a link from the link's own attributes).
+using ::dss::test_support::reachedSize;
+using ::dss::test_support::reachesKind;
+using ::dss::test_support::reachesSomething;
 
 // THE RUNNER'S MULTI-ARTIFACT MODE (c171): one PREREQUISITE artifact a
 // target build depends on — a LIBRARY the runner builds FIRST, then threads
@@ -518,6 +528,17 @@ struct ExampleManifest {
     // hold both halves of it. NOT mutually exclusive with `exitCode` — it
     // REQUIRES it, because the program still runs.
     std::vector<ExpectedDiagnostic> expectWarnings;
+    // P69 (lane `cs`): the FOURTH thing a manifest can say — that a NAMED
+    // diagnostic code is ABSENT from the compile, at any severity, in every arm.
+    // `expectWarnings` is exact over the codes it DECLARES and silent about every
+    // other (deliberately — see its check below), so until this key an entry
+    // could say "this warning is emitted here" and could not say "this warning
+    // is NOT emitted". That is the red-on-disable of every example whose point
+    // is that a construct is seen to terminate, to be constant, to be declared:
+    // when the feature regresses the program still builds and runs, and what
+    // changes is that the compiler starts saying something. Code NAMES, not
+    // entries: an absence has no position.
+    std::vector<std::string> forbidDiagnostics;
 };
 
 // THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: parse ONE
@@ -879,6 +900,74 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
     return true;
 }
 
+// Is `name` the name of a diagnostic code this build can emit? The closed-enum
+// scan the CLI's `--suppress` parser runs over the same table (`diagnosticCodeName`
+// is the one name home; `Unknown` is its answer for a value that names nothing,
+// and `None` is the no-diagnostic zero — neither is a code a compile can emit).
+[[nodiscard]] bool isKnownDiagnosticCodeName(std::string_view name) {
+    if (name.empty() || name == "Unknown" || name == "None") return false;
+    for (std::uint32_t v = 0; v < 0x10000u; ++v) {
+        if (diagnosticCodeName(static_cast<DiagnosticCode>(v)) == name) return true;
+    }
+    return false;
+}
+
+// Parse `forbidDiagnostics`: a non-empty array of diagnostic-code NAMES, each a
+// code this build knows, none twice. Returns false (ADD_FAILURE already fired)
+// on any malformed field.
+//
+// ★ AN UNKNOWN NAME IS REFUSED BY NAME, and that is the half that makes the key
+// worth having. An absence assertion is satisfied by nothing happening, so a
+// misspelt code — `H_NonVoidFunctionEndReachble` — would pass on every run for
+// the rest of the corpus's life, asserting nothing. The name must resolve.
+[[nodiscard]] bool
+parseForbiddenDiagnostics(nlohmann::json const& arr, fs::path const& path,
+                          std::vector<std::string>& out) {
+    if (!arr.is_array() || arr.empty()) {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " 'forbidDiagnostics' must be a non-empty array of"
+                         " diagnostic-code names";
+        return false;
+    }
+    for (auto const& e : arr) {
+        if (!e.is_string()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " each 'forbidDiagnostics' entry must be a string —"
+                             " a diagnostic-code NAME (an absence has no position,"
+                             " so there is no {code, line, col} form)";
+            return false;
+        }
+        std::string name = e.get<std::string>();
+        if (!isKnownDiagnosticCodeName(name)) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'forbidDiagnostics' names '" << name
+                          << "', which is not a diagnostic code this build knows."
+                             " A misspelt code would be absent from every compile"
+                             " and the entry would pass asserting nothing.";
+            return false;
+        }
+        if (std::find(out.begin(), out.end(), name) != out.end()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'forbidDiagnostics' names '" << name << "' twice";
+            return false;
+        }
+        out.push_back(std::move(name));
+    }
+    return true;
+}
+
+// WHAT A COMPILE SAID, as the judgement of `forbidDiagnostics` reads it: every
+// diagnostic's code NAME, in report order, repeats kept, at ANY severity. The
+// judgement itself is the one both runners ask (tests/test_support/
+// forbidden_diagnostics.hpp); this is the in-process runner's half of handing it
+// what a reporter holds, as `diagnosticCodesInCliLog` is the CLI sibling's.
+[[nodiscard]] std::vector<std::string> diagnosticCodesSaid(DiagnosticReporter const& rep) {
+    std::vector<std::string> codes;
+    codes.reserve(rep.all().size());
+    for (auto const& d : rep.all()) codes.emplace_back(diagnosticCodeName(d.code));
+    return codes;
+}
+
 [[nodiscard]] ExampleManifest readManifest(fs::path const& path) {
     std::ifstream in(path);
     if (!in) {
@@ -1007,6 +1096,37 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " codes that must refuse in the first and the codes"
                          " that must warn in the second, in two entries.";
         return m;
+    }
+    // `forbidDiagnostics` — the absence assertion. The key literal stays at the
+    // accessor sites for the cross-runner vocabulary pin, like its two siblings.
+    if (j.contains("forbidDiagnostics")
+        && !parseForbiddenDiagnostics(j.at("forbidDiagnostics"), path,
+                                      m.forbidDiagnostics)) {
+        return m;
+    }
+    // INERT beside `expectDiagnostics`, and an inert declaration is refused: a
+    // refusal entry's WHOLE diagnostic set is already asserted exactly, so a
+    // code it does not declare is absent by that assertion and a code it does
+    // declare cannot also be forbidden. The key could only ever say nothing.
+    if (!m.forbidDiagnostics.empty() && !m.expectDiagnostics.empty()) {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " declares BOTH 'expectDiagnostics' and"
+                         " 'forbidDiagnostics'. The first already asserts the"
+                         " compile's WHOLE diagnostic set exactly, so every code"
+                         " it does not declare is absent by that assertion; the"
+                         " second could assert nothing there.";
+        return m;
+    }
+    // A code cannot be both REQUIRED and FORBIDDEN.
+    for (auto const& e : m.expectWarnings) {
+        if (std::find(m.forbidDiagnostics.begin(), m.forbidDiagnostics.end(), e.code)
+            != m.forbidDiagnostics.end()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " names '" << e.code << "' in BOTH 'expectWarnings'"
+                             " (it must be emitted) and 'forbidDiagnostics' (it"
+                             " must not).";
+            return m;
+        }
     }
     // PROJECT MODE has no expect-error branch, and saying so LOUDLY is the
     // point: `runErrorTarget` reads `m.sources.front()`, which a project
@@ -1440,7 +1560,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             || k == "project" || k == "exitCode" || k == "expectedStdout"
             || k == "targets" || k == "optimizedPipelines"
             || k == "optimizationObservable" || k == "expectDiagnostics"
-            || k == "expectWarnings"
+            || k == "expectWarnings" || k == "forbidDiagnostics"
             || k.starts_with("$")) {
             continue;
         }
@@ -1449,7 +1569,8 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                       << "' — the runner reads language / source / sources /"
                          " project / exitCode / expectedStdout / targets /"
                          " optimizedPipelines / optimizationObservable /"
-                         " expectDiagnostics / expectWarnings (plus $comment"
+                         " expectDiagnostics / expectWarnings /"
+                         " forbidDiagnostics (plus $comment"
                          " keys). An expectation the runner does not read is an"
                          " assertion that never fires.";
         return m;
@@ -1620,7 +1741,7 @@ readProjectFacts(fs::path const& projectPath) {
     if (argv0.find('/') != std::string::npos
         || argv0.find('\\') != std::string::npos) {
         std::error_code ec;
-        bool const there = fs::exists(fs::path{argv0}, ec);
+        bool const there = reachesSomething(fs::path{argv0}, ec);
         return there && !ec;
     }
     return !findOnPath(argv0).empty();
@@ -2012,7 +2133,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
     }
     auto const resolved = root / lib.path;
     std::error_code ec;
-    if (!fs::is_regular_file(resolved, ec) || ec) {
+    if (!reachesKind(resolved, dss::core::EntryKind::File, ec) || ec) {
         ADD_FAILURE() << "prebuiltLibraries: '" << lib.path
                       << "' declared by " << exampleDir.generic_string()
                       << " is not a regular file at "
@@ -2023,7 +2144,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
         return std::nullopt;
     }
     std::error_code sizeEc;
-    auto const declaredSize = fs::file_size(resolved, sizeEc);
+    auto const declaredSize = reachedSize(resolved, sizeEc);
     auto const bytes        = readArtifactBytes(resolved);
     // Cross-checked against `file_size` and required non-empty, the SAME rule
     // the dependency-image capture applies: a short read reaches the witness
@@ -2103,6 +2224,11 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
 // can go back to being built at the baseline with nothing reporting it. The
 // durable witness is `DependsOnArtifact::mustDifferFromBaseline`, which makes
 // the prerequisite its own subject.
+//
+// `compilesSaid` (null when the manifest forbids nothing) is where this build
+// RECORDS what its reporter said: a prerequisite this arm BUILDS FROM SOURCE is
+// part of the example's compile, so the arm judges it with its own compile, by
+// the one list — see the ★ note where it is recorded.
 [[nodiscard]] std::optional<fs::path>
 buildDependencyArtifact(DependsOnArtifact const& dep,
                         fs::path const&          scratchPath,
@@ -2111,6 +2237,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
                         std::string const&       language,
                         ::dss::opt::OptPipeline const* pipelineOverride,
                         CompileConfig const*           configOverride,
+                        std::vector<CompileSaid>* compilesSaid,
                         std::map<std::string, std::string>* capturedImages) {
     // Nested prerequisites FIRST (order-correct): each nested artifact must
     // exist on disk before this dep's own build resolves against it.
@@ -2121,6 +2248,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
                                                   exampleDir, language,
                                                   pipelineOverride,
                                                   configOverride,
+                                                  compilesSaid,
                                                   capturedImages);
         if (!nestedPath.has_value()) return std::nullopt;  // already reported
         nestedLibs.push_back(std::move(*nestedPath));
@@ -2131,11 +2259,12 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
     std::vector<std::string> depSrcPaths;
     depSrcPaths.reserve(dep.sources.size());
     for (auto const& s : dep.sources) {
-        auto const sp = scratchPath / s;
-        if (!fs::exists(sp)) {
+        auto const      sp = scratchPath / s;
+        std::error_code spEc;
+        if (!reachesSomething(sp, spEc) || spEc) {
             ADD_FAILURE() << "dependsOn source '" << s
                           << "' not found in example dir "
-                          << exampleDir.generic_string();
+                          << exampleDir.generic_string() << (spEc ? " (" + spEc.message() + ")" : std::string{});
             return std::nullopt;
         }
         depSrcPaths.push_back(sp.generic_string());
@@ -2175,11 +2304,24 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
                       << depDump.str();
         return std::nullopt;
     }
+    // ★ `forbidDiagnostics` REACHES THE PREREQUISITE. The key says what the
+    // example's compile must not report, and a library this arm builds from the
+    // example's own sources is that compile — a function in `lib.c` is as much
+    // the example's as one in `main.c`. Its build has its own reporter, so what it
+    // said is RECORDED here, and the arm judges it beside its own compile, in ONE
+    // verdict (`forbiddenDiagnosticsOfAnArm`, tests/test_support/
+    // forbidden_diagnostics.hpp) — a prerequisite's report never hides the arm's.
+    if (compilesSaid != nullptr) {
+        compilesSaid->push_back(CompileSaid{"the build of its dependsOn artifact " + dep.artifact
+                                                + " (spec=" + dep.spec + ")",
+                                            diagnosticCodesSaid(depRep)});
+    }
     auto const depArtifact = outDir / dep.artifact;
-    if (!fs::exists(depArtifact)) {
+    std::error_code depArtifactEc;
+    if (!reachesSomething(depArtifact, depArtifactEc) || depArtifactEc) {
         ADD_FAILURE() << "dependsOn artifact missing at "
                       << depArtifact.generic_string() << " (spec=" << dep.spec
-                      << ")";
+                      << ")" << (depArtifactEc ? " (" + depArtifactEc.message() + ")" : std::string{});
         return std::nullopt;
     }
     // CAPTURE THE PREREQUISITE'S IMAGE NOW, for the same forced reason the
@@ -2204,7 +2346,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
             return std::nullopt;
         }
         std::error_code sizeEc;
-        auto const depSz = fs::file_size(depArtifact, sizeEc);
+        auto const depSz = reachedSize(depArtifact, sizeEc);
         auto       bytes = readArtifactBytes(depArtifact);
         // Cross-checked against `file_size` and required non-empty, the SAME
         // rule the executable capture applies and for the same reason: a short
@@ -2309,11 +2451,12 @@ compileAndRunArm(fs::path const& exampleDir,
     std::vector<std::string> srcPaths;
     srcPaths.reserve(m.sources.size());
     for (auto const& s : m.sources) {
-        auto const sp = scratch.path() / s;
-        if (!fs::exists(sp)) {
+        auto const      sp = scratch.path() / s;
+        std::error_code spEc;
+        if (!reachesSomething(sp, spEc) || spEc) {
             ADD_FAILURE() << "manifest source '" << s
                           << "' not found in example dir "
-                          << exampleDir.generic_string();
+                          << exampleDir.generic_string() << (spEc ? " (" + spEc.message() + ")" : std::string{});
             armResult.verdict = ArmVerdict::Poisoned;
             return armResult;
         }
@@ -2337,10 +2480,11 @@ compileAndRunArm(fs::path const& exampleDir,
     fs::path projectPath;
     if (m.project.has_value()) {
         projectPath = scratch.path() / *m.project;
-        if (!fs::exists(projectPath)) {
+        std::error_code projectEc;
+        if (!reachesSomething(projectPath, projectEc) || projectEc) {
             ADD_FAILURE() << "manifest 'project' file '" << *m.project
                           << "' not found in example dir "
-                          << exampleDir.generic_string()
+                          << exampleDir.generic_string() << (projectEc ? " (" + projectEc.message() + ")" : std::string{})
                           << " — the mirror above is RECURSIVE and preserves"
                              " relative subpaths, so a project manifest in a"
                              " SUBDIRECTORY does reach the scratch tree; an"
@@ -2434,11 +2578,16 @@ compileAndRunArm(fs::path const& exampleDir,
         }
         resolveLibs.push_back(std::move(*resolved));
     }
+    // EVERY compile of this arm, as `forbidDiagnostics` judges it: each prerequisite
+    // recorded as it is built, this arm's own compile LAST (the forbid block below).
+    std::vector<CompileSaid> compilesSaid;
     for (auto const& dep : t.dependsOn) {
         auto depArtifact = buildDependencyArtifact(dep, scratch.path(), outDir,
                                                    exampleDir, m.language,
                                                    pipelineOverride,
                                                    configOverride,
+                                                   m.forbidDiagnostics.empty()
+                                                       ? nullptr : &compilesSaid,
                                                    &armResult.dependencyBytes);
         if (!depArtifact.has_value()) {
             armResult.verdict = ArmVerdict::Poisoned;
@@ -2502,6 +2651,33 @@ compileAndRunArm(fs::path const& exampleDir,
     if (rc != 0 || rep.errorCount() != 0u) {
         armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
+    }
+
+    // ★★★ `forbidDiagnostics` — THE ABSENCE ASSERTION, ON EVERY ARM.
+    //
+    // The compile succeeded; what this asks is what it did NOT say. Checked
+    // here, on the path every arm (baseline and each optimized pipeline) takes,
+    // because a diagnostic can be an arm's own — a warning only the release
+    // pipeline's lowering produces is still a warning the entry forbade.
+    // SEVERITY IS NOT READ: the key names a code that must not appear at all.
+    // (An Error would already have reddened the arm above; a Warning, an Info
+    // and a Hint are what reach this line.) Each `dependsOn` artifact this arm
+    // built was recorded where it was built (`buildDependencyArtifact`) — it is
+    // the example's compile too — and this arm's own compile is recorded LAST:
+    // ONE verdict, the one both runners ask (tests/test_support/
+    // forbidden_diagnostics.hpp), naming every compile that said a forbidden code.
+    if (!m.forbidDiagnostics.empty()) {
+        compilesSaid.push_back(CompileSaid{"the compile", diagnosticCodesSaid(rep)});
+        auto const forbidden = forbiddenDiagnosticsOfAnArm(m.forbidDiagnostics, compilesSaid);
+        EXPECT_TRUE(forbidden.empty())
+            << "FORBIDDEN DIAGNOSTIC: example " << exampleDir.generic_string()
+            << " spec=" << t.spec << " arm=" << armLabel
+            << " declares `forbidDiagnostics` and " << describeForbiddenSaid(forbidden)
+            << ". All diagnostics of its own compile:" << diagDump.str();
+        if (!forbidden.empty()) {
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
     }
 
     // ★★★ `expectWarnings` — A DIAGNOSTIC ASSERTION ON A COMPILE THAT SUCCEEDS.
@@ -2607,9 +2783,10 @@ compileAndRunArm(fs::path const& exampleDir,
     auto const artifactPath = m.project.has_value()
         ? outDir / specFormatName(t.spec) / t.artifact
         : outDir / t.artifact;
-    if (!fs::exists(artifactPath)) {
+    std::error_code artifactEc;
+    if (!reachesSomething(artifactPath, artifactEc) || artifactEc) {
         ADD_FAILURE() << "artifact missing at " << artifactPath.generic_string()
-                      << " (arm=" << armLabel << ")";
+                      << " (arm=" << armLabel << ")" << (artifactEc ? " (" + artifactEc.message() + ")" : std::string{});
         armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
     }
@@ -2621,7 +2798,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // spuriously PASS on file_size failure. Gate on sz_ec to make
     // both checks honest.
     std::error_code sz_ec;
-    auto const sz = fs::file_size(artifactPath, sz_ec);
+    auto const sz = reachedSize(artifactPath, sz_ec);
     if (sz_ec) {
         ADD_FAILURE() << "file_size failed: " << sz_ec.message()
                       << " (arm=" << armLabel << ")";
@@ -3303,15 +3480,26 @@ void runErrorTarget(fs::path const&        exampleDir,
     // now witnesses the invariant, not only the one written for it — which is
     // the difference between a pin and a census.
     std::vector<std::string> leftovers;
-    {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(outDir, ec);
-             !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
-            if (it->is_regular_file(ec)) {
-                leftovers.push_back(it->path().generic_string());
-            }
-        }
+    // The substrate's walk (`dss::core::walkTree`), as the CLI runner's twin of
+    // this arm walks: it never descends a link on any build (libstdc++ on Windows
+    // cannot tell one from what it reaches -- the substrate's header), and a file
+    // reached through a link is still a file the build left.
+    // A walk that could not read the whole directory did not look for leftovers
+    // there: it FAILS the case, naming where it stopped. An output directory the
+    // refused build never made holds nothing, and is no walk to fail.
+    std::error_code    outKindEc;
+    bool const         outDirMade = dss::core::entryKind(outDir, outKindEc) != dss::core::EntryKind::Absent
+                                 || outKindEc;
+    dss::core::TreeWalk walk;
+    if (outDirMade) {
+        walk = dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
+            if (entry.reaches == dss::core::EntryKind::File) leftovers.push_back(entry.path.generic_string());
+            return dss::core::WalkStep::Continue;
+        });
     }
+    EXPECT_FALSE(walk.error) << "expect-error example " << exampleDir.generic_string() << ": the walk of "
+                             << outDir.generic_string() << " stopped at " << walk.where.generic_string() << ": "
+                             << walk.error.message() << " -- no leftover artifact was ruled out there";
     EXPECT_TRUE(leftovers.empty())
         << "expect-error example " << exampleDir.generic_string()
         << " REPORTED FAILURE AND STILL WROTE AN ARTIFACT ("
@@ -3425,7 +3613,7 @@ void runErrorTarget(fs::path const&        exampleDir,
                " so this check refuses rather than assumes";
     }
     std::error_code markerEc;
-    if (!fs::is_directory(cwd / "src" / "dss-config", markerEc) || markerEc) {
+    if (!reachesKind(cwd / "src" / "dss-config", dss::core::EntryKind::Directory, markerEc) || markerEc) {
         return {};  // not a checkout root — isolated per build tree
     }
     return "this corpus entry's working directory IS a repository checkout root"
@@ -3459,11 +3647,13 @@ TEST(Examples, RunFromManifest) {
     ASSERT_GE(argv0Dir.size(), 2u)
         << "examples_runner needs the example directory as argv[1]";
     fs::path const exampleDir = argv0Dir[1];
-    ASSERT_TRUE(fs::is_directory(exampleDir))
-        << "argv[1] is not a directory: " << exampleDir.generic_string();
-    auto const manifestPath = exampleDir / "expected.json";
-    ASSERT_TRUE(fs::exists(manifestPath))
-        << "expected.json missing in " << exampleDir.generic_string();
+    std::error_code exampleDirEc;
+    ASSERT_TRUE(reachesKind(exampleDir, dss::core::EntryKind::Directory, exampleDirEc))
+        << "argv[1] is not a directory: " << exampleDir.generic_string() << (exampleDirEc ? " (" + exampleDirEc.message() + ")" : std::string{});
+    auto const      manifestPath = exampleDir / "expected.json";
+    std::error_code manifestEc;
+    ASSERT_TRUE(reachesSomething(manifestPath, manifestEc) && !manifestEc)
+        << "expected.json missing in " << exampleDir.generic_string() << (manifestEc ? " (" + manifestEc.message() + ")" : std::string{});
     auto const m = readManifest(manifestPath);
     ASSERT_FALSE(m.targets.empty()) << "manifest declared no targets";
 
@@ -3680,17 +3870,31 @@ TEST(ExamplesCorpusLint, EveryArmAgreesWithItsSiblingsOnTheEmulator) {
     ASSERT_GE(argv.size(), 2u)
         << "the corpus lint entry needs the examples ROOT as argv[1]";
     fs::path const corpusRoot = argv[1];
-    ASSERT_TRUE(fs::is_directory(corpusRoot))
-        << "argv[1] is not a directory: " << corpusRoot.generic_string();
+    std::error_code corpusRootEc;
+    ASSERT_TRUE(reachesKind(corpusRoot, dss::core::EntryKind::Directory, corpusRootEc))
+        << "argv[1] is not a directory: " << corpusRoot.generic_string() << (corpusRootEc ? " (" + corpusRootEc.message() + ")" : std::string{});
 
     std::vector<::dss::test_support::DeclaredArm> arms;
     std::size_t manifestCount = 0;
     for (auto const& langEntry : fs::directory_iterator(corpusRoot)) {
-        if (!langEntry.is_directory()) continue;
+        // What each entry REACHES, asked of the substrate with the error kept apart, as the CLI runner's walk
+        // asks it: an entry nobody could examine is reported, never taken for "not an example".
+        std::error_code langEc;
+        bool const      langIsDir = reachesKind(langEntry.path(), dss::core::EntryKind::Directory, langEc);
+        EXPECT_FALSE(langEc) << "cannot examine corpus entry " << langEntry.path().generic_string() << ": "
+                             << langEc.message();
+        if (!langIsDir) continue;
         for (auto const& nameEntry : fs::directory_iterator(langEntry.path())) {
-            if (!nameEntry.is_directory()) continue;
-            auto const mp = nameEntry.path() / "expected.json";
-            if (!fs::exists(mp)) continue;
+            std::error_code nameEc;
+            bool const      nameIsDir = reachesKind(nameEntry.path(), dss::core::EntryKind::Directory, nameEc);
+            EXPECT_FALSE(nameEc) << "cannot examine corpus entry " << nameEntry.path().generic_string() << ": "
+                                 << nameEc.message();
+            if (!nameIsDir) continue;
+            auto const      mp = nameEntry.path() / "expected.json";
+            std::error_code mpEc;
+            bool const      manifest = reachesSomething(mp, mpEc);
+            EXPECT_FALSE(mpEc) << "cannot examine " << mp.generic_string() << ": " << mpEc.message();
+            if (!manifest || mpEc) continue;
             ++manifestCount;
             auto const m = readManifest(mp);
             auto const exampleId =
@@ -4712,8 +4916,9 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
     ASSERT_GE(argv.size(), 2u)
         << "the corpus lint entry needs the examples ROOT as argv[1]";
     fs::path const corpusRoot = argv[1];
-    ASSERT_TRUE(fs::is_directory(corpusRoot))
-        << "argv[1] is not a directory: " << corpusRoot.generic_string();
+    std::error_code corpusRootEc;
+    ASSERT_TRUE(reachesKind(corpusRoot, dss::core::EntryKind::Directory, corpusRootEc))
+        << "argv[1] is not a directory: " << corpusRoot.generic_string() << (corpusRootEc ? " (" + corpusRootEc.message() + ")" : std::string{});
 
     // The COMPLETE set of examples licensed to have an optimized arm whose exit
     // code differs from its baseline, each with the clause that licenses it.
@@ -4724,11 +4929,24 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
     std::vector<std::pair<std::string, std::string>> found;
     std::size_t manifestCount = 0;
     for (auto const& langEntry : fs::directory_iterator(corpusRoot)) {
-        if (!langEntry.is_directory()) continue;
+        // What each entry REACHES, asked of the substrate with the error kept apart, as the CLI runner's walk
+        // asks it: an entry nobody could examine is reported, never taken for "not an example".
+        std::error_code langEc;
+        bool const      langIsDir = reachesKind(langEntry.path(), dss::core::EntryKind::Directory, langEc);
+        EXPECT_FALSE(langEc) << "cannot examine corpus entry " << langEntry.path().generic_string() << ": "
+                             << langEc.message();
+        if (!langIsDir) continue;
         for (auto const& nameEntry : fs::directory_iterator(langEntry.path())) {
-            if (!nameEntry.is_directory()) continue;
-            auto const mp = nameEntry.path() / "expected.json";
-            if (!fs::exists(mp)) continue;
+            std::error_code nameEc;
+            bool const      nameIsDir = reachesKind(nameEntry.path(), dss::core::EntryKind::Directory, nameEc);
+            EXPECT_FALSE(nameEc) << "cannot examine corpus entry " << nameEntry.path().generic_string() << ": "
+                                 << nameEc.message();
+            if (!nameIsDir) continue;
+            auto const      mp = nameEntry.path() / "expected.json";
+            std::error_code mpEc;
+            bool const      manifest = reachesSomething(mp, mpEc);
+            EXPECT_FALSE(mpEc) << "cannot examine " << mp.generic_string() << ": " << mpEc.message();
+            if (!manifest || mpEc) continue;
             ++manifestCount;
             auto const m = readManifest(mp);
             if (!m.optimizationObservable.has_value()) continue;
@@ -4851,6 +5069,262 @@ TEST(ExamplesCorpusLint, BuildOnlyTargetsOptimizedArmIsCompiledAndJudged) {
             << "the phantom's own words are back in the ledger: " << r.detail;
     }
     EXPECT_EQ(armRows, 2u) << "every declared arm owes a ledger row";
+}
+
+// ── `forbidDiagnostics`: THE PARSE, THE JUDGEMENT, AND THE RED ──────────────
+//
+// The key that lets an entry assert a diagnostic's ABSENCE (P69). Three
+// altitudes, because each can break while the other two stay green:
+//   1. the PARSE refuses every declaration that could only pass by saying
+//      nothing — an unknown code name above all (an absence is satisfied by
+//      nothing happening, so a misspelt code would be green forever);
+//   2. the READING of a reporter — every report, in order, at every severity —
+//      is what this runner hands the judgement both runners share (tests/
+//      test_support/forbidden_diagnostics.hpp, pinned by its own self-test,
+//      test_support/test_forbidden_diagnostics), asked in both directions;
+//   3. the ARM goes RED: `runOneTarget` on a fixture whose compile emits the
+//      code its manifest forbids produces exactly one failure, saying so — and
+//      the SAME fixture forbidding a code the compile does not emit produces
+//      none and still runs to its exit code. That pair is the red-on-disable
+//      of the key itself: remove the check from the arm and the first half
+//      stops failing.
+//
+// The fixture is C because it needs a program this build compiles with a
+// warning and without one; the warning is the one a value-returning function
+// whose end is reached draws, and its absence is what the key was added to say.
+TEST(ExamplesCorpusLint, ForbidDiagnosticsIsParsedJudgedAndRedsTheArm) {
+    ScratchDir sandbox{Location::Temp, "forbid-diagnostics-pin"};
+    auto const dir = sandbox.path();
+    std::string const spec{hostNativeTarget().execTarget};
+    std::string const artifact = hostExeArtifact("main");
+    // Qualified: `using namespace dss` also reaches the driver's own
+    // `dss::currentHostOs()`, and the harness spelling is the one wanted.
+    auto const host = ::dss::test_support::currentHostOs();
+    constexpr char const* kWarned  = "H_NonVoidFunctionEndReachable";
+    constexpr char const* kNotSaid = "H_UnreachableCode";
+
+    // `extra` splices in beside the required keys (empty, or ending in a comma).
+    auto const plant = [&](std::string const& extra) {
+        fs::path const mp = dir / "expected.json";
+        std::ofstream mf(mp, std::ios::binary);
+        mf << R"({
+  "language": "c",
+  "source": "main.c",
+  )" << extra << R"(
+  "targets": [{"spec": ")" << spec << R"(", "artifact": ")" << artifact
+           << R"(", "runOn": [")" << host << R"("]}]
+})";
+        mf.close();
+        EXPECT_TRUE(mf.good()) << "could not plant " << mp.generic_string();
+        return mp;
+    };
+    {
+        std::ofstream src(dir / "main.c", std::ios::binary);
+        // `helper` reaches its closing brace: one warning, and the program is
+        // conforming — the value is not used.
+        src << "int helper(void) { }\nint main(void) { helper(); return 42; }\n";
+        src.close();
+        ASSERT_TRUE(src.good()) << "could not plant the fixture source";
+    }
+
+    // ── 1. THE PARSE ────────────────────────────────────────────────────────
+    {
+        auto const m = readManifest(plant(
+            std::string{R"("exitCode": 42, "forbidDiagnostics": [")"} + kWarned + R"(", ")"
+            + kNotSaid + R"("],)"));
+        ASSERT_EQ(m.targets.size(), 1u) << "a well-formed declaration must parse";
+        EXPECT_EQ(m.forbidDiagnostics,
+                  (std::vector<std::string>{kWarned, kNotSaid}));
+    }
+    // An UNKNOWN code is refused BY NAME.
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              R"("exitCode": 42, "forbidDiagnostics": ["H_NonVoidFunctionEndReachble"],)")); },
+        "H_NonVoidFunctionEndReachble");
+    // The two sentinel names are not codes a compile can emit.
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              R"("exitCode": 42, "forbidDiagnostics": ["Unknown"],)")); },
+        "not a diagnostic code this build knows");
+    // Shape: non-empty array of strings, no name twice.
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(R"("exitCode": 42, "forbidDiagnostics": [],)")); },
+        "non-empty array");
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              std::string{R"("exitCode": 42, "forbidDiagnostics": ")"} + kWarned + R"(",)")); },
+        "non-empty array");
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              std::string{R"("exitCode": 42, "forbidDiagnostics": [{"code": ")"} + kWarned
+              + R"(", "line": 1, "col": 1}],)")); },
+        "must be a string");
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              std::string{R"("exitCode": 42, "forbidDiagnostics": [")"} + kWarned + R"(", ")"
+              + kWarned + R"("],)")); },
+        "twice");
+    // INERT beside a refusal entry, and CONTRADICTORY beside the same code
+    // required: both refused.
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              std::string{R"("expectDiagnostics": [{"code": "S_TypeMismatch", "line": 1, "col": 1}],)"}
+              + R"( "forbidDiagnostics": [")" + kWarned + R"("],)")); },
+        "BOTH 'expectDiagnostics' and 'forbidDiagnostics'");
+    EXPECT_NONFATAL_FAILURE(
+        { (void)readManifest(plant(
+              std::string{R"("exitCode": 42, "expectWarnings": [{"code": ")"} + kWarned
+              + R"(", "line": 1, "col": 20}], "forbidDiagnostics": [")" + kWarned + R"("],)")); },
+        "BOTH 'expectWarnings'");
+
+    // ── 3. THE ARM, RED — the compile emits the code the manifest forbids ────
+    {
+        auto const m = readManifest(plant(
+            std::string{R"("exitCode": 42, "forbidDiagnostics": [")"} + kWarned + R"("],)"));
+        ASSERT_EQ(m.targets.size(), 1u) << "the fixture manifest did not parse";
+        ArmVerdictLedger      ledger;
+        ArtifactIdentityTally identity;
+        CoverageReport        coverage;
+        // EXACTLY ONE non-fatal failure, and it is this key's: a compile failure
+        // or a wrong exit code would each add their own and fail this
+        // expectation for the reason that happened.
+        EXPECT_NONFATAL_FAILURE(
+            runOneTarget(dir, m, m.targets[0], "c/forbid-diagnostics-pin", ledger,
+                         identity, coverage),
+            "FORBIDDEN DIAGNOSTIC");
+        EXPECT_NONFATAL_FAILURE(
+            runOneTarget(dir, m, m.targets[0], "c/forbid-diagnostics-pin", ledger,
+                         identity, coverage),
+            kWarned);
+        // …and the arm did not go on to run: a forbidden diagnostic poisons it.
+        EXPECT_TRUE(coverage.spawned.empty())
+            << "an arm whose compile said what the manifest forbids must not be"
+               " spawned as if it had passed";
+    }
+
+    // ── 3'. THE ARM, GREEN — the control that makes the red mean something ───
+    //
+    // The same source, the same target, the key still declared — naming a code
+    // this compile does NOT emit. No failure, the program is built and run, and
+    // it exits 42. Without this arm the red above could be the fixture's.
+    {
+        auto const m = readManifest(plant(
+            std::string{R"("exitCode": 42, "forbidDiagnostics": [")"} + kNotSaid + R"("],)"));
+        ASSERT_EQ(m.targets.size(), 1u) << "the control manifest did not parse";
+        ArmVerdictLedger      ledger;
+        ArtifactIdentityTally identity;
+        CoverageReport        coverage;
+        runOneTarget(dir, m, m.targets[0], "c/forbid-diagnostics-pin", ledger, identity,
+                     coverage);
+        EXPECT_EQ(coverage.spawned.size(), 1u)
+            << "the control arm must be built AND run — a key that poisoned an arm"
+               " for a code the compile never emitted would red the corpus";
+    }
+
+    // ── 3''. THE PREREQUISITE — a `dependsOn` artifact is the example's compile ─
+    //
+    // The function that reaches its end is in the LIBRARY the arm builds from the
+    // example's own `forbid_lib.c`; `main.c` is clean. The key must see it: a
+    // manifest that forbids a code speaks for every source the arm compiles, and
+    // the prerequisite has its own reporter, which the arm RECORDS beside its own
+    // compile and judges with it. Red, then the same fixture forbidding a code
+    // nothing emits — built, linked, run.
+    {
+        ScratchDir depSandbox{Location::Temp, "forbid-diagnostics-dep-pin"};
+        auto const depDir  = depSandbox.path();
+        auto const native  = hostNativeTarget();
+        auto const libFile = hostLibArtifact("forbid_lib");
+        {
+            std::ofstream lib(depDir / "forbid_lib.c", std::ios::binary);
+            lib << "int dss_forbid_lib_reaches_its_end(void) { }\n";
+            lib.close();
+            ASSERT_TRUE(lib.good()) << "could not plant the prerequisite's source";
+            std::ofstream src(depDir / "main.c", std::ios::binary);
+            src << "int main(void) { return 42; }\n";
+            src.close();
+            ASSERT_TRUE(src.good()) << "could not plant the fixture source";
+        }
+        auto const plantDep = [&](char const* forbidden) {
+            fs::path const mp = depDir / "expected.json";
+            std::ofstream mf(mp, std::ios::binary);
+            mf << R"({
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "forbidDiagnostics": [")" << forbidden << R"("],
+  "targets": [{"spec": ")" << native.execTarget << R"(",
+               "artifact": ")" << artifact << R"(",
+               "runOn": [")" << host << R"("],
+               "dependsOn": [{"sources": ["forbid_lib.c"],
+                              "spec": ")" << native.libTarget << R"(",
+                              "artifact": ")" << libFile << R"("}]}]
+})";
+            mf.close();
+            EXPECT_TRUE(mf.good()) << "could not plant " << mp.generic_string();
+            return mp;
+        };
+        {
+            auto const m = readManifest(plantDep(kWarned));
+            ASSERT_EQ(m.targets.size(), 1u) << "the prerequisite fixture did not parse";
+            ArmVerdictLedger      ledger;
+            ArtifactIdentityTally identity;
+            CoverageReport        coverage;
+            EXPECT_NONFATAL_FAILURE(
+                runOneTarget(depDir, m, m.targets[0], "c/forbid-diagnostics-dep-pin",
+                             ledger, identity, coverage),
+                "the build of its dependsOn artifact");
+            EXPECT_TRUE(coverage.spawned.empty())
+                << "an arm whose prerequisite said what the manifest forbids must"
+                   " not be spawned as if it had passed";
+        }
+        {
+            auto const m = readManifest(plantDep(kNotSaid));
+            ASSERT_EQ(m.targets.size(), 1u) << "the prerequisite control did not parse";
+            ArmVerdictLedger      ledger;
+            ArtifactIdentityTally identity;
+            CoverageReport        coverage;
+            runOneTarget(depDir, m, m.targets[0], "c/forbid-diagnostics-dep-pin", ledger,
+                         identity, coverage);
+            EXPECT_EQ(coverage.spawned.size(), 1u)
+                << "the prerequisite control must be built, linked AND run";
+        }
+    }
+
+    // ── 2. THE READING — what a reporter said, as the judgement is handed it ──
+    //
+    // A reporter built by hand: the forbidden code TWICE (it is named once),
+    // at Warning and at Info severity (severity is not read), beside a code
+    // nobody forbade. The reading keeps every report, in order; the shared
+    // judgement over it names the forbidden code once. The two reports of the
+    // code say different things: the reporter drops an identical one as a recent
+    // duplicate (and says so, `P_DiagnosticsElided`), which is not this reading's
+    // question.
+    {
+        DiagnosticReporter rep;
+        for (DiagnosticSeverity const sev :
+             {DiagnosticSeverity::Warning, DiagnosticSeverity::Info}) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::H_NonVoidFunctionEndReachable;
+            d.severity = sev;
+            d.actual   = sev == DiagnosticSeverity::Warning ? "the first report"
+                                                            : "the second report";
+            rep.report(d);
+        }
+        {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_UnknownAttribute;
+            d.severity = DiagnosticSeverity::Warning;
+            rep.report(d);
+        }
+        EXPECT_EQ(diagnosticCodesSaid(rep),
+                  (std::vector<std::string>{kWarned, kWarned, "S_UnknownAttribute"}))
+            << "every report is read, in order, at every severity";
+        EXPECT_EQ(forbiddenCodesSaid({kNotSaid, kWarned}, diagnosticCodesSaid(rep)),
+                  (std::vector<std::string>{kWarned}))
+            << "the emitted code is named, once; the other is not";
+        EXPECT_TRUE(forbiddenCodesSaid({kNotSaid}, diagnosticCodesSaid(rep)).empty());
+        EXPECT_TRUE(forbiddenCodesSaid({}, diagnosticCodesSaid(rep)).empty());
+    }
 }
 
 // ── THE LOADER'S SEARCH PATH: THE VALUE, THE PARSE, AND THE SPAWN ───────────

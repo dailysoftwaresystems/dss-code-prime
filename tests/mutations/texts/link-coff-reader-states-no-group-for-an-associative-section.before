@@ -1,0 +1,2 @@
+                        if (auto signature = copiesSignatureOf(rootDefinition)) {
+                            groupOfComdatSection.emplace(ordinal, std::move(*signature));

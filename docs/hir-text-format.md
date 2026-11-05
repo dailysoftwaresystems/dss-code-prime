@@ -150,8 +150,8 @@ int sum_fields(struct Point *p) {
 ```
 
 ```
-dsshir 6
-producer "0.5.0+nogit20260919T193847Z.5"
+dsshir 9
+producer "0.5.0+src8d396dcb22f081cf"
 buffers {
   buf 1 "/tmp/ht-doc/doc_example.c"
   buf 2 "<built-in>"
@@ -194,8 +194,11 @@ Whitespace-insignificant. **LF only** — the writer never emits `\r`, and a `.d
 legitimate carriage return. UTF-8. Strings are double-quoted with `\"` and `\\` escapes.
 
 ```
-file       := "dsshir" INT "producer" STR preamble module
+file       := "dsshir" INT "producer" STR preamble module aliases?   (and nothing after it)
 preamble   := ext_kinds? ext_ops? intrinsics? buffers? types? symbols?   (non-empty sections only)
+aliases    := "aliases" "{" ("alias" SYM ("[" lword ("," lword)* "]")? "=" SYM)* "}"   (§4.8)
+lword      := "local" | "weak" "(" ("overridable" | "select-any") ")"
+            | "hidden" | "protected" | "internal"
 types      := "types" "{" ("type" INT "=" composite)* "}"
 composite  := ("struct" | "union") STR
               ( "opaque"
@@ -211,11 +214,20 @@ return     := "return" flags? ("void" | expr)
 expr       := lit | ref | call | intrinsic | binop | unop | cast | member
             | index | swizzle | construct | ternary | logical_and
             | logical_or | sizeof | alignof | addressof | deref | typeref
-            | rmw | ext_node | error
+            | rmw | unnamed | ext_node | error
 rmw        := "rmw" flags? SYM ":" type "(" expr "," expr ")"
               (an indivisible read-modify-write: the object's lvalue, then the
                update, which reads the observed value as `ref SYM`; yields the
                value the object held before the replacement that took effect)
+unnamed    := "unnamed" flags? ("automatic" | "static" | "thread") ":" type "(" expr ")"
+              (an unnamed OBJECT — C's compound literal — of that storage duration,
+               initialized by the one child; read as a value it is that child's value,
+               read as an object it is its own storage, never the child's)
+construct  := "construct" flags? ("#" INT)? ":" type "(" (expr ("," expr)*)? ")"
+              (an aggregate value, its children positional; for a UNION, the one child
+               initializes the member `#INT` names — its index among the union's members,
+               spelled only when it is not 0 — and a read of any other member is not a
+               constant)
 type       := (see docs/ir-type-text.md — one grammar, one decoder), where a
               COMPOSITE is always `"type" INT`, naming an entry of `types` (§4.7)
 ```
@@ -240,11 +252,13 @@ by name, rather than building one there.
 ```
 
 Sections are emitted **only when non-empty**, in the order shown. The two header lines are
-**always** emitted, including for an empty module.
+**always** emitted, including for an empty module. **Nothing follows the last section**: a token after
+the module (or after its `aliases` section) is refused by name — a v8 reader stopped at the module's `}`
+and took a text that went on as if it ended there.
 
 ### 4.1 `dsshir <version>` — the format version
 
-The first line. **Currently `6`.** A reader that does not understand the version must **refuse**,
+The first line. **Currently `9`.** A reader that does not understand the version must **refuse**,
 not guess. Our own parser does exactly that: a version it does not know is a hard
 `H_TextVersionMismatch` error and no module is produced.
 
@@ -254,14 +268,15 @@ The second line, and **mandatory**: a file without it is malformed, and our pars
 value is the compiler's build stamp:
 
 ```
-0.5.0                                        version only (clean tree, no git)
-0.5.0+g90e0014fd50d                          …plus the commit it was built from
-0.5.0+g90e0014fd50d.dirtyd20789119c8c91de    …plus a digest of uncommitted changes
-0.5.0+nogit20260919T193847Z.5                no git or no work tree
+0.5.0+g90e0014fd50d                          a work tree whose compiler inputs match its commit
+0.5.0+g90e0014fd50d.dirtyd20789119c8c91de    …plus a digest of those inputs' uncommitted changes
+0.5.0+src8d396dcb22f081cf                    no git or no work tree: a digest of the inputs' content
 ```
 
-(The third and fourth are stamps two real builds printed — a work tree with uncommitted changes, and
-a copy of the sources with no `.git`; the first two are the same stamp's forms on a clean tree.)
+(The second and third are stamps real builds printed — a work tree with uncommitted changes, and a
+copy of the sources with no `.git`; the first is the same stamp's form on a clean tree. The
+compiler's inputs are what the top-level `CMakeLists.txt` declares: `DSS_BUILD_STAMP_INPUTS` and
+`DSS_BUILD_STAMP_SCRIPT_DIRS`.)
 
 It contains no whitespace, so the whole stamp is one token.
 
@@ -370,6 +385,40 @@ markers that cannot be combined (explicit offsets with member alignments, with `
 bit-field widths); and, anywhere in the module, an inline `struct "N" { … }` / `union …` or a v3
 `rec <H>` — a module has exactly one spelling of each composite.
 
+### 4.8 `aliases { … }` — second names of the module's definitions (new in v9)
+
+```c
+int g(void) { return 1; }
+int f(void) __attribute__((weak, alias("g")));
+static int t = 5;
+static int a __attribute__((alias("t")));
+```
+```
+aliases {
+  alias %2 [weak(overridable)] = %1
+  alias %4 [local] = %3
+}
+```
+
+Each item is one **alias** — GNU C's `alias("target")`: the name `%A` is one more name of the
+definition `%T`, never a body or storage of its own. It follows the module, whose `function` or
+`global` declaration binds `%T` (the declaration of `%A` itself, when it has external linkage, is an
+`extern_function` / `extern_global` — a reference to its name; a module-private alias has no node at
+all). The list in brackets is the alias's **own** linkage, in the words the MIR text `.dssir` spells
+its `alias %A [linkage] = %T` item with (`src/mir/mir_text.cpp`, since its version 7): its binding
+unless it is `global` — `local` for a module-private alias, `weak(<kind>)` for a weak one, where the
+kind is `overridable` (`__attribute__((weak))`) or `select-any` (one of several interchangeable
+copies) — and its visibility unless it is `default`. Both default ⇒ no list. Items are in the order
+the lowering states them (declaration order), and an alias's two symbols take their `symbols` handles
+after every symbol a node names.
+
+Refused, each by name: an item that is not `alias`; a handle `symbols` does not declare; a word no
+binding or visibility table names; `global` or `default` spelled out (the default is stated by leaving it
+out, so that an alias has one text); a binding or a visibility stated twice, an argument on a binding
+that is not `weak`, a kind that is neither of the two, and `weak` with no kind; an alias that names
+itself; one name stated twice; a target no `function` or `global` of the module defines; and an alias
+whose own name a `function` or `global` defines.
+
 ---
 
 ## 5. Self-containment: what a reader can reconstruct from the bytes alone
@@ -403,7 +452,15 @@ This is the property the format is built around, so here is exactly how far it g
   ```
   (`packed` is the whole-composite marker, `~N` a per-member alignment, `@N` an explicit offset.)
 - **Every source-level name**, in `symbols`.
-- **Every literal value**, inline (`lit int 42 : i32`, `lit str "hi" : arr<char, 3>`).
+- **Every symbol alias** (`alias("target")`), with its target and its own linkage, in `aliases` (v9).
+- **Every literal value**, inline (`lit int 42 : i32`, `lit str "hi" : arr<char, 3>`). A NaN other
+  than the canonical quiet one — a payload, as `__builtin_nan("1")` makes, or a sign — is written by
+  its 64-bit pattern, `lit float nanbits 9221120237041090561 : f64` (v7), because `nan` reads back as
+  the canonical quiet NaN: a different value through a clean reader. A folded aggregate is
+  `lit agg {<value> : <core>, …} : <type>`, each field carrying its own core; a **union** value
+  names the member its one field initializes, `lit agg member 1 {int 7 : i32} : type 3` (v8) — the
+  field's type cannot say which member, since two may share one — and a union-typed `agg` that has
+  a field and names no member is refused at read, as is `member` on a value that is not a union's.
 - **The format version and the producer revision.**
 - **Source spans**, with their buffer named and classified.
 
@@ -552,9 +609,9 @@ program. Output:
 
 ```
 dsshir-kinds 1
-dsshir-format-version 6
-producer "0.5.0+nogit20260919T193847Z.5"
-core-kind-count 54
+dsshir-format-version 9
+producer "0.5.0+src8d396dcb22f081cf"
+core-kind-count 56
 kind "Module" position non-expr typed no symbol no
 kind "Function" position non-expr typed yes symbol yes
 ...
@@ -562,6 +619,8 @@ kind "Literal" position expr keyword "lit" typed yes symbol no
 kind "Ref" position expr keyword "ref" typed yes symbol yes
 ...
 kind "ReadModifyWrite" position expr keyword "rmw" typed yes symbol yes
+kind "UnnamedObject" position expr keyword "unnamed" typed yes symbol no
+kind "VaCopy" position expr keyword "va_copy" typed yes symbol no
 stmt-keyword-count 28
 stmt-keyword "block"
 ...
@@ -623,7 +682,26 @@ window.** Concretely:
    types (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. The same version spelled the compatible
    type a language CHOSE for an enumeration without a fixed one, `enum "E" chosen u32 "unsigned int"`
    (C23 6.7.3.3p13). A v5 reader meeting either spelling reads `enum "E"` and then meets `fixed` or
-   `chosen` with no rule for it.
+   `chosen` with no rule for it. **v7** added the `unnamed` expression (§4): an unnamed OBJECT —
+   C's compound literal — of automatic, static or thread storage. Before it the literal was its
+   initializer's value, so `&(int){ x }` addressed `x` itself; a v6 reader meets `unnamed` with no
+   rule for it, and one that skipped it would rebuild exactly that aliasing. The same version added
+   `va_copy : void (<dest>, <src>)`, C's `va_copy` — the fourth variadic intrinsic beside `va_start`,
+   `va_arg` and `va_end`, which a v6 file could not spell at all — and a union `construct`'s member
+   index, `construct #N : …`: a v6 reader meeting `#N` there has no rule for it, and one that dropped
+   it would read every union as initialized through its first member. And it spelled a NaN other
+   than the canonical quiet one by its 64-bit pattern, `float nanbits <u64>`: a v6 writer spelled
+   every NaN `nan`, which reads back as the canonical quiet NaN, so a payload (`__builtin_nan("1")`)
+   came back as a different value with no diagnostic. **v8** spelled the member a union literal
+   value's one field initializes, `lit agg member N {…}` (§5) — the spelling the MIR text has for
+   the same value. The member decides which bytes the value is: v7 wrote `agg {…}` for every
+   aggregate and dropped it, so a union value read back naming no member. A v7 reader meeting
+   `member` has no rule for the word, and one that skipped it would rebuild that member-less value;
+   a v8 reader refuses a union-typed `agg` that has a field and names no member. **v9** stated a
+   module's symbol aliases, the `aliases` section after the module (§4.8): v8 had no form for them, so
+   the artifact of a unit with an `alias("target")` read back as the unit without it. A v8 reader stopped
+   at the module's `}` and never read what followed, so it would have taken a v9 text whole and dropped
+   the section in silence — and a v9 reader refuses by name any token after the last section.
 3. **We do not maintain a compatibility window.** This build understands **one** version and refuses
    every other, in both directions — a v1 file is refused by a v2 parser just as a v3 file is. One
    grammar, no conditional parsing, no "mostly works".
@@ -632,7 +710,7 @@ window.** Concretely:
    and plan to re-emit rather than to migrate files.
 5. **After C++ lands the format is expected to stabilise** and bumps to become rare.
 
-**What is stable today** (as stable as anything in a `6`): the mode and its exit-code contract, the
+**What is stable today** (as stable as anything in a `9`): the mode and its exit-code contract, the
 two header lines and their order, the section order, the type syntax (shared with FFI descriptors,
 see [`ir-type-text.md`](./ir-type-text.md) — a module differs only in naming every composite through
 its `types` table), and the self-containment rules in §5.
@@ -671,7 +749,8 @@ Our own parser is `dss::parseHir` ([`src/hir/hir_text.hpp`](../src/hir/hir_text.
 - re-interns every type into a fresh interner — each `types` entry as ONE composite keyed on its
   handle, so two entries with identical bodies stay two types,
 - re-registers extension kinds / ops / intrinsics from the preamble,
-- rebuilds the symbol names, buffer table, literal pool and per-node side-tables,
+- rebuilds the symbol names, buffer table, literal pool, per-node side-tables and the module's
+  aliases (`HirParseResult::symbolAliases`, v9),
 - and runs **`HirVerifier` on load** — on a module it ACCEPTED. A file the reader refuses is refused
   by the reader's own diagnostics alone: the tree its error recovery built is never verified, so no
   verifier line follows the one that names the cause. (Verifying such a tree used to kill the

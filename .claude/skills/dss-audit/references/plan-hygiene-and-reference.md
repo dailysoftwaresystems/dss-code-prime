@@ -25,11 +25,11 @@ when-unsure-don't discipline, applied to that skill's standing test-discipline p
 
 | Need | Command / path |
 |---|---|
-| Build | `cmake --build build` |
-| Full suite | `ctest --test-dir build --output-on-failure` |
-| Anchor guard | `python .harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py` (ctest `anchor_registry_guard`) |
+| Build | `dssharness build --legs <leg>` |
+| Full suite | `dssharness test --legs <leg>`; the round's gate is `dssharness test --legs gate` (eight runs) |
+| Anchor guard | `dssharness run check-anchor-registry` (ctest `anchor_registry_guard`) |
 | Delta since baseline | `git log --oneline <baseline>..HEAD` |
-| CI legs (unverifiable locally) | `gh run list` — flag, don't claim |
+| CI legs | `dssharness check-ci-legs` — a leg it cannot read is flagged, never claimed |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0 / §0.1 |
 | Deferral registry + triggers — both documents | `.plans/_deferred-anchor-registry*.md` (`-production` holds OPEN rows; `-done` is the archive a closed row is MOVED to). ⚠ There were three until the harness registry retired on 2026-09-16 |
 | The implementer it checks | the `dss-cycle` skill |

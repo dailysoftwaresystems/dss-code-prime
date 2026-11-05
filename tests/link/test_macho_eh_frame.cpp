@@ -130,6 +130,7 @@ ordinalOf(TargetSchema const& t, std::string_view name) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute",
                  "flags": 2097285 },
       "image": {
@@ -633,11 +634,11 @@ namespace {
       "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
       "relocations": [
         { "name":"rel32", "kind":1, "pcRelative":true, "addendBias":-4,
-          "widthBytes":4 },
+          "widthBytes":4, "fieldRange":"signed" },
         { "name":"abs64", "kind":2, "pcRelative":false, "addendBias":0,
           "widthBytes":8 },
         { "name":"abs32", "kind":3, "pcRelative":false, "addendBias":0,
-          "widthBytes":4 }
+          "widthBytes":4, "fieldRange":"unsigned" }
       ]
     })";
 }

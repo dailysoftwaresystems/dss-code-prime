@@ -1,0 +1,2 @@
+                        if (nodeIsASelection(cfg, tree, probe)) {
+                            probe = selectionResultOf(s, cfg, tree, probe, scope);

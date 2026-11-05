@@ -1,0 +1,1 @@
+    if (win32 && root.kind == Kind::Share && kept.empty() && sawComponent && !trailing && out.size() > 2

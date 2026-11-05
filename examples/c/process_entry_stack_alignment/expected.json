@@ -1,0 +1,44 @@
+{
+  "$comment": "P69 (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION): where the stack stands in DSS code three frames below the process entry, on every exec pair. A `_Alignas(16)` local's address mod 16 (through a volatile, so nothing folds it from the declared alignment) is 0 exactly when the stack holds the ABI's 16-byte alignment — which depends on the entry trampoline starting from the right place, and THAT on whether the platform's loader CALLED the entry (a return address pushed: dyld's LC_MAIN, Windows' BaseThreadInitThunk) or JUMPED to it (the ELF kernel / ld.so). Each exec format declares its `entryTransition` and the trampoline derives its bias from it (the convention's callPushBytes when called, 0 when jumped). Before P69 the bias was the calling convention's own, and sysv_amd64's 0 — ELF's answer — ran every DSS frame on Mach-O x86_64 8 bytes off: this program printed main=8 there (the earlier diagnostic's reading, Mac run 20260930-230035-5411fb08), and libSystem's va_arg read a DSS caller's stacked long double 8 bytes off. The expected line is every reference's: gcc 13.3.0, clang 18.1.3 -O2 and aarch64-linux-gnu-gcc -static (run 20261001-033841-1eacc595), Apple clang 21 arm64 and x86_64 -O2 (run 20261001-033919-6ef7f20c), MSVC 19.51 /std:clatest and mingw-w64 13.2.0 -O2 (run 20261001-033959-ce3f8ec9) — all \"main=0 middle=0 leaf=0\", exit 42. RED-ON-DISABLE: declare the Mach-O x86_64 exec format's entryTransition `jumped` and its arm prints main=8 middle=8 leaf=8, exit 1.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "main=0 middle=0 leaf=0\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "main=0 middle=0 leaf=0\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "main=0 middle=0 leaf=0\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "main=0 middle=0 leaf=0\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "main=0 middle=0 leaf=0\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

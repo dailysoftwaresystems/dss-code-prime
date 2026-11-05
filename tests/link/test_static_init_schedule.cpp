@@ -87,11 +87,13 @@ makeElfExecFormat(std::string const& staticInitBlock) {
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
         "type": "exec", "pageAlign": 4096,
         "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
       },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "entryVerbs": ["none","argc-argv"],
       "processExit": {
         "mechanism": "syscall",

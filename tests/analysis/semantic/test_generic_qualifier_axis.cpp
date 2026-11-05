@@ -345,3 +345,197 @@ TEST(GenericQualifierAxis, AQualifierInsideAnAbstractGroupStaysInItsLayer) {
     EXPECT_FALSE(hasDiagnosedPointerConversion(m.diagnostics()))
         << "the cast's type IS the declared type — nothing converts";
 }
+
+// ── P69 (lane `cs`): `typeof` names its operand's QUALIFIED type, and a function
+//    typedef carries its parameters' qualifiers ────────────────────────────────────
+// D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST and its two riders,
+// D-C-TYPEOF-DROPS-ITS-OPERAND-QUALIFIERS and
+// D-C-A-FUNCTION-TYPEDEFS-PARAMETER-QUALIFIERS-ARE-NOT-CLAIMED: a `typeof` head claimed no
+// qualifier at all and a function typedef claimed no parameter, so an association
+// spelled through either one matched a controlling expression C calls incompatible
+// with it. ✔MEASURED (lane `cs`'s probes r4 and r4g, every build RUN): gcc 13.3.0 and
+// clang 18.1.3 at `-std=c17 -pedantic-errors` and `-std=c2x`, MSVC 19.51 at
+// `/std:clatest` — every case exits 42. DSS at HEAD took the `1` on r4a, r4b, r4i, r4j,
+// r4k, r4p, r4r and r4v.
+TEST(GenericQualifierAxis, TypeofAndAFunctionTypedefCarryTheirQualifiers) {
+    expectSelects42({
+        {"r4a __typeof__(&f_const) beside &f_plain",
+         "void f_plain(char *p) { (void)p; }\nvoid f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, __typeof__(&f_const): 1, default: 42); }\n"},
+        {"r4b __typeof__(&f_plain) beside &f_const",
+         "void f_plain(char *p) { (void)p; }\nvoid f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_const, __typeof__(&f_plain): 1, default: 42); }\n"},
+        {"r4i __typeof__(cx) of a const int names a qualified type",
+         "int main(void) { const int cx = 1; (void)cx;\n"
+         "  return _Generic(0, __typeof__(cx): 1, default: 42); }\n"},
+        {"r4j __typeof__(char *) beside a const char *",
+         "int main(void) { return _Generic((const char *)0, __typeof__(char *): 1, default: 42); }\n"},
+        {"r4k FC * — a function typedef with a const parameter",
+         "void f_plain(char *p) { (void)p; }\ntypedef void FC(const char *);\n"
+         "int main(void) { return _Generic(&f_plain, FC *: 1, default: 42); }\n"},
+        {"r4p __typeof__ of a function-pointer object",
+         "void f_plain(char *p) { (void)p; }\nvoid f_const(const char *p) { (void)p; }\n"
+         "int main(void) { void (*fc)(const char *) = f_const;\n"
+         "  return _Generic(&f_plain, __typeof__(fc): 1, default: 42); }\n"},
+        {"r4r a char ** parameter beside a char *const * one",
+         "void g1(char **p) { (void)p; }\nvoid g2(char *const *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&g1, __typeof__(&g2): 1, default: 42); }\n"},
+        {"r4v __typeof__(t) of a const char * beside a char *",
+         "int main(void) { char *s = 0; const char *t = 0; (void)s; (void)t;\n"
+         "  return _Generic(s, __typeof__(t): 1, default: 42); }\n"},
+        // THE CONTROLS: the same type spelled through `typeof` or a function typedef,
+        // and a parameter's own top-level const, which is not part of the type.
+        {"r4h a parameter's own top-level const",
+         "void f_plain(char *p) { (void)p; }\nvoid f_top(char *const p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, __typeof__(&f_top): 42, default: 1); }\n"},
+        {"r4m __typeof__ of the controlling expression itself",
+         "void f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_const, __typeof__(&f_const): 42, default: 1); }\n"},
+        {"r4s __typeof__ of a type name",
+         "void f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_const, __typeof__(void (*)(const char *)): 42, default: 1); }\n"},
+        {"r4t __typeof__(s) of the controlling object",
+         "int main(void) { const char *s = 0; (void)s; return _Generic(s, __typeof__(s): 42, default: 1); }\n"},
+        {"r4u __typeof__(&s)",
+         "int main(void) { const char *s = 0; (void)s; return _Generic(&s, __typeof__(&s): 42, default: 1); }\n"},
+        {"w01 the matching function typedef",
+         "void f_const(const char *p) { (void)p; }\ntypedef void FC(const char *);\n"
+         "int main(void) { return _Generic(&f_const, FC *: 42, default: 1); }\n"},
+        {"w03 a function declared through the typedef keeps its parameters",
+         "typedef int F(const char *);\nF h;\nint h(const char *s) { return s[0]; }\n"
+         "int main(void) { return _Generic(&h, int (*)(const char *): 42, int (*)(char *): 2, default: 1); }\n"},
+    });
+}
+
+// ── `typeof` of a FUNCTION type reads as a function typedef does ────────────────
+// A function type name spells its Fn level first (the designator's shape), and a head
+// naming a function type — a typedef or a `typeof` — gets that level back beneath a
+// derivation, carrying the parameter claims. ✔MEASURED (lane `cs`'s probe r4k, every
+// build RUN): gcc 13.3.0 and clang 18.1.3 at `-std=c2x` exit 42 on every case (k07 is
+// prototype-census's own judge shape); MSVC 19.51 refuses `typeof(<function type name>)`
+// (C2066) and builds the rest.
+TEST(GenericQualifierAxis, TypeofOfAFunctionTypeCarriesItsParameters) {
+    expectSelects42({
+        {"k01 typeof(void (const char *)) * beside &f_plain",
+         "void f_plain(char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, typeof(void (const char *)) *: 1, default: 42); }\n"},
+        {"k02 typeof(void (char *)) * matches it",
+         "void f_plain(char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, typeof(void (char *)) *: 42, default: 1); }\n"},
+        {"k03 typeof(f_const) * beside &f_plain",
+         "void f_plain(char *p) { (void)p; }\nvoid f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, typeof(f_const) *: 1, default: 42); }\n"},
+        {"k04 a function declared `typeof(f_const) h;` keeps the const parameter",
+         "void f_const(const char *p) { (void)p; }\ntypeof(f_const) h;\nvoid h(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&h, void (*)(const char *): 42, void (*)(char *): 1, default: 2); }\n"},
+        {"k06 an object declared `typeof(f_const) *fp`",
+         "void f_const(const char *p) { (void)p; }\n"
+         "int main(void) { typeof(f_const) *fp = f_const;\n"
+         "  return _Generic(fp, void (*)(const char *): 42, void (*)(char *): 1, default: 2); }\n"},
+        {"k07 prototype-census's judge shape",
+         "char *strcpy_like(char *restrict d, const char *restrict s) { (void)s; return d; }\n"
+         "int main(void) { return _Generic(&strcpy_like,\n"
+         "  typeof(char *(char *restrict, const char *restrict)) *: 42, default: 1); }\n"},
+    });
+}
+
+// ── `typeof_unqual` drops the operand's OWN qualifiers and keeps the rest ───────
+// ✔MEASURED (probes r4d t07-t10 and r4g w02, every build RUN): gcc 13.3.0 and clang
+// 18.1.3 at `-std=c2x` (C17 has no `typeof`), MSVC 19.51 at `/std:clatest` — 42 on
+// every one. The operands are declared at FILE scope, the section the block-scope pins
+// above do not reach.
+TEST(GenericQualifierAxis, TypeofUnqualDropsOnlyTheOperandsOwnQualifiers) {
+    expectSelects42({
+        {"t07 typeof_unqual(cx) of a const int is int",
+         "const int cx = 3;\n"
+         "int main(void) { return _Generic((typeof_unqual(cx) *)0, int *: 42, default: 1); }\n"},
+        {"t08 typeof_unqual(t) keeps the pointee's const",
+         "const char *t;\n"
+         "int main(void) { return _Generic((typeof_unqual(t) *)0, const char **: 42, char **: 2, default: 1); }\n"},
+        {"t09 typeof_unqual of a char *const is char *",
+         "char *const t = 0;\n"
+         "int main(void) { return _Generic((typeof_unqual(t) *)0, char **: 42, default: 1); }\n"},
+        {"w02 typeof(t) keeps it too",
+         "const char *t;\n"
+         "int main(void) { return _Generic((typeof(t) *)0, const char **: 42, char **: 2, default: 1); }\n"},
+        {"t10 *(const char *)q reads a const char, lvalue-converted to char",
+         "int main(void) { const char c = 'x'; char *q = (char *)&c;\n"
+         "  return _Generic(*(const char *)q, char: 42, default: 1); }\n"},
+        // Each `typeof` shape of the test above beside its `typeof_unqual` twin
+        // (✔MEASURED, probe r4j q01-q06: 42 on gcc 13.3.0 and clang 18.1.3 at `-std=c2x`
+        // and MSVC 19.51 at `/std:clatest`).
+        {"q01 typeof_unqual(cx) — r4i's twin — is int",
+         "int main(void) { const int cx = 1; (void)cx; return _Generic(0, typeof_unqual(cx): 42, default: 1); }\n"},
+        {"q02 typeof_unqual(t) — r4v's twin — keeps the pointee's const",
+         "int main(void) { char *s = 0; const char *t = 0; (void)s; (void)t;\n"
+         "  return _Generic(s, typeof_unqual(t): 1, default: 42); }\n"},
+        {"q03 typeof_unqual(&f_const) — r4a's twin — keeps the parameter's",
+         "void f_plain(char *p) { (void)p; }\nvoid f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, typeof_unqual(&f_const): 1, default: 42); }\n"},
+        {"q04 typeof_unqual(&f_const) — r4m's twin",
+         "void f_const(const char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_const, typeof_unqual(&f_const): 42, default: 1); }\n"},
+        {"q06 typeof(cp) names `char *const`, typeof_unqual(cp) `char *`",
+         "int main(void) { char *const cp = 0; (void)cp;\n"
+         "  return _Generic(cp, typeof(cp): 1, typeof_unqual(cp): 42, default: 2); }\n"},
+        {"q05 the volatile control: a volatile pointee parameter",
+         "void f_plain(char *p) { (void)p; }\nvoid f_vol(volatile char *p) { (void)p; }\n"
+         "int main(void) { return _Generic(&f_plain, __typeof__(&f_vol): 1, default: 42); }\n"},
+    });
+}
+
+// ── a conditional over two pointers the TypeIds call one type, and C does not ────
+// `c ? &f_plain : &f_const` over `int (char *)` / `int (const char *)`, `c ? pp : qq`
+// over `char **` / `const char **`: the pointees are incompatible (C 6.7.6.1p2,
+// 6.7.6.3p15), so the conditional is `void *` — the fork P68 round 9 decided for every
+// incompatible pair — with the S_IncompatiblePointerConversion warning. ✔MEASURED
+// (probe r4e, every build RUN): gcc 13.3.0 and clang 18.1.3 (c2x) select `void *` with
+// "pointer type mismatch" on u01-u03 and u07; MSVC 19.51 selects an arm's type,
+// silently. The controls (u04-u06, w04) select the pointer type on all three.
+TEST(GenericQualifierAxis, AConditionalOverAQualifierApartPairIsAVoidPointer) {
+    constexpr char const* kFns =
+        "static int f_plain(char *s) { return s[0]; }\n"
+        "static int f_const(const char *s) { return s[0]; }\n"
+        "static int f_plain2(char *s) { return s[1]; }\n";
+    struct Cond { char const* name; std::string src; std::size_t warnings; };
+    auto const body = [&](char const* ctl) {
+        return std::string{kFns}
+             + "int main(int argc, char **argv) { char *a = \"x\"; const char *b = \"y\";\n"
+               "  char **pp = &a; const char **qq = &b; char *const *cq = &a;\n"
+               "  (void)argv; (void)pp; (void)qq; (void)cq;\n"
+               "  return " + ctl + "; }\n";
+    };
+    for (Cond const& c : {
+             Cond{"u02 two designators",
+                  body("_Generic(argc > 0 ? f_plain : f_const, void *: 42, default: 1)"), 1},
+             Cond{"u03 a designator beside &f",
+                  body("_Generic(argc > 0 ? f_plain : &f_const, void *: 42, default: 1)"), 1},
+             Cond{"r4o &f_plain beside &f_const",
+                  body("_Generic(argc > 0 ? &f_plain : &f_const, int (*)(char *): 1,"
+                       " int (*)(const char *): 2, default: 42)"), 1},
+             Cond{"u01 char ** beside const char **",
+                  body("_Generic(argc > 0 ? pp : qq, void *: 42, char **: 1, const char **: 2, default: 3)"), 1},
+             // THE CONTROLS: one signature, a pointee's OWN qualifier, a parameter's own
+             // top-level const, the same function twice.
+             Cond{"u04 a designator beside &f of one signature",
+                  body("_Generic(argc > 0 ? f_plain : &f_plain2, int (*)(char *): 42, default: 1)"), 0},
+             Cond{"u05 char *const * beside char ** is char *const *",
+                  body("_Generic(argc > 0 ? cq : pp, char *const *: 42, char **: 1, default: 2)"), 0},
+             Cond{"w04 the same function in both arms",
+                  body("_Generic(argc > 0 ? &f_const : &f_const, int (*)(const char *): 42,"
+                       " int (*)(char *): 2, default: 1)"), 0},
+         }) {
+        auto model = analyzeC(c.src);
+        EXPECT_FALSE(model.hasErrors()) << c.name << "\n" << c.src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion),
+                  c.warnings) << c.name << "\n" << c.src;
+        auto const arms = selectedArms(model);
+        ASSERT_EQ(arms.size(), 1u) << c.name;
+        EXPECT_EQ(arms[0], "42") << c.name << "\n" << c.src;
+    }
+    // A CALL through the `void *` conditional is refused, as gcc and clang refuse it.
+    auto call = analyzeC(std::string{kFns}
+        + "int main(int argc, char **argv) { (void)argv; char b[] = \"x\";\n"
+          "  return (argc > 0 ? &f_plain : &f_const)(b); }\n");
+    EXPECT_TRUE(call.hasErrors()) << "a `void *` is not a function";
+}

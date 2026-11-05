@@ -1,0 +1,2 @@
+            if (onATypeUnfolded
+                && (stdForm || !languageModelsAttributeName(cfg, clause->name))) {

@@ -1,0 +1,2 @@
+                    && (true || owner->second >= firstPos->second)
+                    && (true || owner->second <= lastPos->second);

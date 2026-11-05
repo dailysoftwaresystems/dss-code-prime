@@ -1,0 +1,28 @@
+{
+  "$comment": "★★ A COMMON BESIDE MinGW's WEAK DEFINITION OF ITS NAME: THE COMMON STANDS (P69 send-back 5, review-xa4 MINOR 4; D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT) -- on the SAME format where cl's select-any replaces a common (`examples/c/common_beside_a_selectany_definition_pe`), because here the fact is the OBJECT's. The two objects named to the link are mingw-w64 gcc's builds of `int dss_tentative; int dss_read_tentative(void) { return dss_tentative; }` under `-fcommon` (a COMMON, with an `-aligncomm:` directive for it) and of `__attribute__((weak)) int dss_tentative = 5;`, which mingw-w64 gcc writes as a WEAK EXTERNAL over a body of its own (`.weak.dss_tentative.`): a name any other definition satisfies, a common included. ✔MEASURED 2026-10-08 (the same main.c built by mingw-w64 gcc 13.2.0, GNU ld 2.42): in both object orders the common stands and the program reads 0, exit 37, as the common object alone does. The COFF reader states the definition's KIND on what it reads from a weak external's body (`ModuleSymbol::weakKind`, `overridable`), and the link's one answer (`linker::commonYieldsToDefinition`) asks the format document, whose `commonYieldsTo: nonOverridableDefinition` lets a common outrank exactly that kind. main.c is DSS's; the 37 it adds keeps either answer apart from the exit code of a program that did nothing -- a link that let the 5 through would exit 42. The `release` arm pins that optimizing the DSS half changes nothing about which of the two the program reads.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 37,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The COMMON, and the function that reads it. Source and rebuild command: `tests/link/data/tentative_common.source.c` (mingw-w64 gcc 13.2.0 `-O2 -fcommon -c`; md5 119be2569ac83657b3c21e358b69f3d3). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the reader's name.",
+          "path": "tests/link/data/tentative_common_x86_64_pe_mingw.o",
+          "containerWitness": "dss_read_tentative"
+        },
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (mingw-w64 gcc 13.2.0 `-O2 -c`; md5 4d2a95faa99961f854de10103995c462). The witness is the name of the body the weak external stands over: an object that defines `dss_tentative` any other way cannot pass.",
+          "path": "tests/link/data/tentative_weak_x86_64_pe_mingw.o",
+          "containerWitness": ".weak.dss_tentative."
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

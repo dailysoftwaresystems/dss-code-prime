@@ -493,9 +493,11 @@ TEST(ParserCastExpr, LocalValueShadowsFileScopeTypedef) {
     EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
 }
 
-// Param shadowing: a parameter binds into the FUNCTION's scope
-// (funcDefTail opens one scope over params + body), so a param named T
-// shadows the file-scope typedef INSIDE the body.
+// Param shadowing: a parameter binds into its parameter list's prototype
+// scope, and a DEFINITION's own parameters are carried into the scope its
+// declaration opens (c's topLevelDecl / externDecl) when its body opens
+// (P69 L2a2), so a param named T shadows the file-scope typedef INSIDE the
+// body.
 TEST(ParserCastExpr, ParamShadowsFileScopeTypedefInsideBody) {
     auto r = parseC(
         "typedef int T;\n"
@@ -533,18 +535,192 @@ TEST(ParserCastExpr, TypedefAfterUseSiteIsNotVisible) {
 
 // ── ParseResult sidecars ────────────────────────────────────────────────
 
-// The global-scope TYPE export surface: typedefs + struct/union/enum
-// tags at file scope, in binding order. (The CU oracle harvests this.)
+// The global-scope TYPE export surface: the file-scope TYPE NAMES (typedefs),
+// in binding order. (The CU oracle harvests this.) P69 L2 (lane `lm`): a
+// struct/union/enum TAG is not one — it lives in the tag name space (C 6.2.3) and
+// never makes its spelling a type name, in this tree or another; while it was
+// exported, a tag in one file could seed `(S)` as a cast in the next.
 TEST(ParserCastExpr, GlobalTypeNamesExported) {
     auto r = parseC(
         "typedef int MyT;\n"
         "struct S { int x; };\n"
+        "union U { int y; };\n"
+        "enum E { EA };\n"
         "int g;\n"
         "int main() { return 0; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
-    ASSERT_EQ(r.globalTypeNames.size(), 2u);
+    ASSERT_EQ(r.globalTypeNames.size(), 1u);
     EXPECT_EQ(r.globalTypeNames[0], "MyT");
-    EXPECT_EQ(r.globalTypeNames[1], "S");
+}
+
+// ── P69 L2 (lane `lm`): WHICH NAME THE TRIAGE SEES ──────────────────────────
+// The type-name triage asks the binder sketch whether `(name)` opens a type name.
+// Two readings it gave wrongly, both MEASURED at eb6f22a3 (pe64, images run
+// natively) against gcc 13.3.0 and clang 18.1.3 (gnu2x and c2x -pedantic-errors,
+// built and run): a struct/union/enum TAG answered as an ordinary type (C 6.2.3
+// gives tags their own name space), so a tag newer than a function or an object of
+// its spelling turned `(name)` into a cast — `int g(int); struct g {…}; (g)(2)` and
+// `int T = 44; enum T {A = 2}; (T) - A` were refused, `typedef int T; … int T = 44;
+// { struct T {…}; return (T) - 2; }` RAN -2 (references: 42, every one); and a
+// declarator's name was bound only at the end of its DECLARATION, while C 6.2.1p7
+// starts its scope at the end of its DECLARATOR — `int T = 44, y = (T) - 2;` RAN -2
+// and `typedef char T; … int T = sizeof(T);` RAN 1 (references: 42 and sizeof(int)).
+// A structure MEMBER was recorded as an ordinary value likewise: `typedef int P;
+// struct S { int P; char a[(P) 42]; };` was refused P_UnexpectedToken at `42`
+// (MEASURED on this lane's tree; both references build it).
+// The sketch now records ordinary identifiers only: neither a tag nor a member.
+// RED-ON-DISABLE: a tag row's name recorded → the tag rows; a member row's name
+// recorded → the member row; the slot declarator's record skipped → the declarator
+// rows of the next case. The controls hold either way: a use BEFORE the object's
+// declarator still reads the typedef. The two rows inside a tag's own body are
+// REGRESSION pins: HEAD built and ran both (✔MEASURED, exit 42) even while it bound
+// the tag there as an ordinary type.
+TEST(ParserCastExpr, ATagNeverAnswersTheTypeNameTriage) {
+    struct Row { char const* what; char const* src; std::size_t casts; };
+    Row const rows[] = {
+        {"a function, then a tag of its spelling: `(g)(2)` is a call",
+         "int g(int v) { return v + 40; }\nstruct g { int a; };\n"
+         "int main(void) { return (g)(2); }\n", 0},
+        {"an object hides the typedef; a newer inner TAG changes nothing",
+         "typedef int T;\nint main(void) { int T = 44; { struct T { int a; }; "
+         "return (T) - 2; } }\n", 0},
+        {"an object, then an ENUM TAG of its spelling",
+         "int main(void) { int T = 44; enum T { A = 2 }; return (T) - A; }\n", 0},
+        {"a tag defined inside the operand: only the operand's own cast",
+         "int g(void *p) { return p ? 1 : 42; }\n"
+         "int main(void) { return (g)((struct g { int a; } *)0); }\n", 1},
+        // Inside its own body the tag is declared (`struct g *next;` works), and still
+        // no ordinary identifier: `(g)` there is the function (both references: 42).
+        {"inside its own body a tag answers no ordinary lookup: `sizeof (g)(2)` is a call",
+         "int g(int v) { return v + 40; }\nstruct g { int a[sizeof (g)(2)]; };\n", 0},
+        {"... and where a cast could parse: `sizeof ((g)(2))` is a call",
+         "int g(int v) { return v + 40; }\nstruct g { int a[sizeof ((g)(2))]; };\n", 0},
+        // A structure MEMBER is its structure's own name space (C 6.2.3) as a tag is
+        // its own: `(P)` in the next member's bound casts through the typedef.
+        {"a member spelled like the typedef: `(P) 42` is a cast",
+         "typedef int P;\nstruct S { int P; char a[(P) 42]; };\n", 1},
+        // CONTROL: a typedef with a tag of its spelling, in both orders, is a type.
+        {"a tag, then a typedef of its spelling: `(T)(x)` is a cast",
+         "struct T { int a; };\ntypedef int T;\n"
+         "int main(void) { T x = 40; return (T)(x); }\n", 1},
+        {"a typedef, then a tag of its spelling: `(T)(x)` is a cast",
+         "typedef int T;\nstruct T { int a; };\n"
+         "int main(void) { T x = 40; return (T)(x); }\n", 1},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
+    }
+}
+
+TEST(ParserCastExpr, ADeclaratorsNameIsInScopeFromTheEndOfItsDeclarator) {
+    struct Row { char const* what; char const* src; std::size_t casts; std::size_t sizeofTypes; };
+    Row const rows[] = {
+        {"the next declarator of the same declaration sees the object",
+         "typedef int T;\nint main(void) { int T = 44, y = (T) - 2; return y; }\n", 0, 0},
+        {"its own initializer sees the object",
+         "typedef char T;\nint main(void) { int T = sizeof(T); return T; }\n", 0, 0},
+        {"a typedef's next declarator sees the typedef",
+         "typedef int T, U[sizeof(T) * 10 + 2];\nint main(void) { return 0; }\n", 0, 1},
+        {"a parameter is in scope in the body",
+         "typedef int T;\nint f(int T) { return (T) - 2; }\n", 0, 0},
+        {"a block-scope function declaration hides the typedef",
+         "typedef int T;\nint main(void) { int T(int); return (T)(2); }\n", 0, 0},
+        // CONTROLS: a use BEFORE the object's declarator reads the typedef.
+        {"a use before the object's declaration is the typedef's",
+         "typedef int T;\nint main(void) { int y = (T) - 2; int T = 44; return y + T; }\n",
+         1, 0},
+        {"a use inside the object's own declarator is the typedef's",
+         "typedef int T;\nint main(void) { int T[sizeof(T)]; return 0; }\n", 0, 1},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "sizeofType"), row.sizeofTypes) << row.what;
+    }
+}
+
+// P69 L2a2 (the L2a review's N9): a PARAMETER of a function declarator that is not a
+// definition's own has function prototype scope (C 6.2.1p4); past its declarator the typedef
+// it shadowed is a type again, so `(T)(x)` is a cast. The sketch bound such a parameter into
+// the enclosing block, and `(T)(x)` parsed as a call. A definition's own parameter reaches its
+// body (the control rows). ✔MEASURED 2026-10-28 (WSL gcc 13.3.0 / clang 18.1.3, gnu2x and c2x
+// -pedantic-errors): every cast row's program exits 42; the own-parameter call is refused.
+TEST(ParserCastExpr, APrototypeParametersScopeEndsWithItsDeclarator) {
+    struct Row { char const* what; char const* src; std::size_t casts; };
+    Row const rows[] = {
+        {"a function-pointer object's parameter",
+         "typedef int T;\nint main(void) { int (*fp)(int T) = 0; int x = 42; (void)fp; "
+         "return (T)(x); }\n", 2},
+        {"a block-scope prototype's parameter",
+         "typedef int T;\nint main(void) { int f(int T); int x = 42; return (T)(x); }\n", 1},
+        {"a block-scope typedef's parameter",
+         "typedef int T;\nint main(void) { typedef int (*F)(int T); F f = 0; int x = 42; "
+         "(void)f; return (T)(x); }\n", 2},
+        {"a cast's type name's parameter",
+         "typedef int T;\nint main(void) { (void)(int (*)(int T))0; int x = 42; "
+         "return (T)(x); }\n", 3},
+        {"a file-scope prototype's parameter, in the next declarator",
+         "typedef int T;\nint f(int T), y = sizeof((T)(1));\n", 1},
+        {"a definition's RETURNED function type's parameter, in its body",
+         "typedef int T;\nstatic int h(int t) { return t; }\n"
+         "static int (*g(int a))(int T) { return (a == (T)(a)) ? h : 0; }\n", 1},
+        // CONTROLS: a definition's OWN parameter reaches its body, in either spelling.
+        {"a definition's own parameter, in its body",
+         "typedef int T;\nint f(int T, int x) { return (T)(x); }\n", 0},
+        {"a parenthesised definition's own parameter, in its body",
+         "typedef int T;\nint (f)(int T, int x) { return (T)(x); }\n", 0},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
+    }
+}
+
+// ── P69 L2b1 (lane `lm`, the L2a2 review's A1): A DEFINITION'S OWN PARAMETERS SURVIVE THE
+// PARAMETER LISTS OF THE TYPE IT RETURNS. A function returning a function pointer writes its
+// own list INSIDE its declarator and the returned type's lists AFTER it; each `param` row of a
+// returned list ended its declarator and its row by dropping every list the sketch had noted, the
+// definition's own included, so its body saw none of its parameters and `(T)(x)` there was a cast
+// through the file-scope typedef. ✔MEASURED 2026-11-03 (probe-reference-cc run
+// 20261103-200559-43e50237, gcc 13.3.0 and clang 18.1.3, default and -std=c2x -pedantic-errors,
+// built and run): every shape below with `(T) - 1` in the body exits 42 — the parameter, never the
+// typedef. THE UNIVERSE: the returned list unnamed, named or `(void)` × one or two levels of
+// returned function pointers × a DEFINITION (its own `T` is the body's: `(T)(x)` is a call, no
+// cast) and a DECLARATION (its own list ends with its declarator: `(T)(1)` after it is a cast),
+// and the `signal` shape (a function-pointer PARAMETER beside a returned function pointer).
+TEST(ParserCastExpr, ADefinitionsOwnParametersSurviveTheListsOfTheTypeItReturns) {
+    struct Shape { char const* what; char const* head; char const* tail; };
+    // `head` + "g(int T, int x)" + `tail` is the declarator; the definition's own list is g's.
+    Shape const shapes[] = {
+        {"one level, the returned list unnamed", "int (*", ")(int)"},
+        {"one level, the returned list named", "int (*", ")(int u)"},
+        {"one level, the returned list (void)", "void (*", ")(void)"},
+        {"two levels, unnamed", "int (*(*", ")(int))(int)"},
+        {"two levels, named", "int (*(*", ")(int u))(int v)"},
+        {"two levels, (void)", "void (*(*", ")(void))(void)"},
+    };
+    for (Shape const& s : shapes) {
+        std::string const decl = std::string{s.head} + "g(int T, int x)" + s.tail;
+        std::string const def = "typedef int T;\nstatic " + decl
+                                + " { int y = (T)(x); (void)y; return 0; }\n";
+        auto rd = parseC(def);
+        EXPECT_FALSE(rd.tree.diagnostics().hasErrors()) << "definition, " << s.what;
+        // (void)y is the one cast; `(T)(x)` is a call of the parameter.
+        EXPECT_EQ(countNodesWithRule(rd.tree, "castExpr"), 1u) << "definition, " << s.what << "\n" << def;
+        std::string const dcl = "typedef int T;\nstatic " + decl + ";\nint y = sizeof((T)(1));\n";
+        auto rc = parseC(dcl);
+        EXPECT_FALSE(rc.tree.diagnostics().hasErrors()) << "declaration, " << s.what;
+        EXPECT_EQ(countNodesWithRule(rc.tree, "castExpr"), 1u) << "declaration, " << s.what << "\n" << dcl;
+    }
+    // The `signal` shape: a function-pointer parameter's own list closes inside g's list.
+    auto rs = parseC("typedef int T;\nstatic void (*s(int T, void (*fn)(int), int x))(int) "
+                     "{ int y = (T)(x); (void)y; return fn; }\n");
+    EXPECT_FALSE(rs.tree.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesWithRule(rs.tree, "castExpr"), 1u) << "the signal shape";
 }
 
 // Seeding (the oracle's reparse channel): the SAME ambiguous source that

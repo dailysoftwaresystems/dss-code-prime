@@ -1,0 +1,2 @@
+                    && owner->second >= firstPos->second
+                    && owner->second <= lastPos->second;

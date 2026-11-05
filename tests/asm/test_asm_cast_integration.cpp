@@ -101,6 +101,8 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
     // constrained static-initializer fold reads a const object's value through (P68 round 13
     // fold F7: the constraint was threaded here without it).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg,

@@ -1,0 +1,1 @@
+    if (false && (strict.on || strict.malformed)) return ControlReading::MeasureIt;

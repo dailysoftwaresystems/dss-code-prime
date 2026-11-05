@@ -4,6 +4,7 @@
 #include "core/types/semantic_config.hpp"        // InlineAsmConfig
 #include "core/types/string_literal_decode.hpp"  // decodeAdjacentStringBodies
 #include "core/types/tree.hpp"                   // Tree / NodeId / NodeKind
+#include "core/substrate/walk_steps.hpp"             // P69 L2: a walk's bound is what it walks
 
 #include <cstddef>
 #include <cstdint>
@@ -75,8 +76,11 @@ descendantsOfRule(Tree const& tree, NodeId root, RuleId want) {
     if (!want.valid()) return out;
     std::vector<NodeId> stk;
     pushChildrenReversed(tree, root, stk);
-    int guard = 0;
-    while (!stk.empty() && ++guard <= 65536) {
+    // P69 L2 (lane `lm`): bounded by the tree it walks (`WalkSteps`) — a fixed 65536 nodes
+    // dropped the operands past them in silence.
+    substrate::WalkSteps steps{tree.nodeCount(), "descendantsOfRule's walk"};
+    while (!stk.empty()) {
+        steps.step();
         NodeId const n = stk.back();
         stk.pop_back();
         if (tree.kind(n) != NodeKind::Internal) continue;
@@ -170,11 +174,6 @@ struct InlineAsmFacts {
     // them).
     bool isExtended        = false;
 
-    // ★ FAIL-SAFE: set when the structural scan hit its iteration guard, i.e.
-    // the subtree was not fully inspected. Treated as "payload present" by the
-    // gate — an unfinished scan must never be read as a clean bare barrier.
-    bool scanTruncated     = false;
-
     // ── the payload, CAPTURED ──
     // Outputs then inputs, each in source order. This concatenation IS the `%N`
     // index space (GNU 6.47.2.3) — `outputCount` splits it.
@@ -201,12 +200,14 @@ struct InlineAsmFacts {
     // Does this statement carry anything at all beyond a bare template?
     [[nodiscard]] bool hasPayload() const noexcept {
         return hasOutputs || hasInputs || hasClobbers || hasLabelsSection
-               || hasLabelList || hasGotoQualifier || scanTruncated;
+               || hasLabelList || hasGotoQualifier;
     }
     // Did the capture fail anywhere? The RESIDUAL predicate the extended-asm
-    // refusal now keys on.
+    // refusal now keys on. The structural scan always finishes: it is bounded by
+    // the tree it walks (P69 L2, lane `lm`; it stopped at a fixed 65536 nodes and
+    // set a flag both tiers refused on), so an operand that did not decompose is
+    // the one way left to fail.
     [[nodiscard]] bool captureFailed() const noexcept {
-        if (scanTruncated) return true;
         for (auto const& o : operands) {
             if (o.malformed) return true;
         }
@@ -313,9 +314,11 @@ captureOperand(Tree const& tree, NodeId operandNode, InlineAsmConfig const& ia,
         if (tree.kind(c) == NodeKind::Internal) { internals.push_back(c); continue; }
         // The symbolic name is the ONLY Identifier token an operand can carry:
         // the other three token roles are brackets and parens. Keyed on the
-        // token KIND the host bound to `symbolName`, never on position.
+        // token KIND the host bound to `symbolName`, never on position. Not
+        // Internal is not Token: a parser recovery (Error) child is neither
+        // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
         if (identifierToken.valid() && !f.symbolicNameTok.valid()
-            && tree.tokenKind(c).v == identifierToken.v) {
+            && tree.tokenKindIfToken(c) == identifierToken) {
             f.symbolicNameTok = c;
             f.symbolicName    = tree.text(c);
         }
@@ -1252,9 +1255,8 @@ gatherInlineAsmFacts(Tree const& tree, NodeId asmNode, InlineAsmConfig const& ia
         for (auto it = kids.rbegin(); it != kids.rend(); ++it)
             stack.push_back({*it, 0u});
     }
-    int guard = 0;
-    while (!stack.empty()) {
-        if (++guard > 65536) { f.scanTruncated = true; break; }
+    for (substrate::WalkSteps steps{tree.nodeCount(), "gatherInlineAsmFacts' structural scan"};
+         !stack.empty(); steps.step()) {
         Frame const cur = stack.back();
         stack.pop_back();
         if (tree.kind(cur.node) != NodeKind::Internal) continue;
@@ -1321,8 +1323,11 @@ gatherInlineAsmFacts(Tree const& tree, NodeId asmNode, InlineAsmConfig const& ia
             if (identifierToken.valid()) {
                 std::vector<NodeId> lstk;
                 pushChildrenReversed(tree, cur.node, lstk);
-                int lguard = 0;
-                while (!lstk.empty() && ++lguard <= 4096) {
+                // P69 L2 (lane `lm`): bounded by the tree (`WalkSteps`) — a fixed 4096 nodes
+                // dropped the labels past them in silence.
+                substrate::WalkSteps lsteps{tree.nodeCount(), "the asm goto label list walk"};
+                while (!lstk.empty()) {
+                    lsteps.step();
                     NodeId const ln = lstk.back();
                     lstk.pop_back();
                     if (tree.kind(ln) == NodeKind::Token) {
@@ -1376,8 +1381,11 @@ gatherInlineAsmFacts(Tree const& tree, NodeId asmNode, InlineAsmConfig const& ia
         std::vector<NodeId> stk;
         pushChildrenReversed(tree, asmNode, stk);
         std::vector<std::pair<std::uint32_t, NodeId>> seen;
-        int qguard = 0;
-        while (!stk.empty() && ++qguard <= 4096) {
+        // P69 L2 (lane `lm`): bounded by the tree (`WalkSteps`) — a fixed 4096 nodes left a
+        // qualifier past them unread.
+        substrate::WalkSteps qsteps{tree.nodeCount(), "the asm qualifier window walk"};
+        while (!stk.empty()) {
+            qsteps.step();
             NodeId const cur = stk.back();
             stk.pop_back();
             if (f.templateNode.valid() && cur.v == f.templateNode.v) break;
@@ -1400,7 +1408,12 @@ gatherInlineAsmFacts(Tree const& tree, NodeId asmNode, InlineAsmConfig const& ia
                 seen.emplace_back(kind, cur);
                 continue;
             }
-            if (ia.isTailRule(tree.rule(cur))) continue;   // never enter a section
+            // A parser recovery (Error) node has no rule and no children: its own
+            // ParseDiagnostic speaks for it
+            // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
+            std::optional<RuleId> const scanned = tree.ruleIfInternal(cur);
+            if (!scanned.has_value()) continue;
+            if (ia.isTailRule(*scanned)) continue;   // never enter a section
             pushChildrenReversed(tree, cur, stk);
         }
     }

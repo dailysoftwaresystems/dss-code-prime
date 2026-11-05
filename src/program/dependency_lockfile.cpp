@@ -114,9 +114,9 @@ DependencyLockfile::load(fs::path const& lockPath, DiagnosticReporter& rep) {
     // PERMISSION error on an existing file does not masquerade as "no lockfile"
     // — that would be exactly the tolerant fallback U-4 forbids, arriving
     // through the filesystem instead of through the parser.
-    if (!fs::exists(lockPath, ec) || ec) return DependencyLockfile{};
+    if (core::reachedKind(lockPath, ec) == core::EntryKind::Absent || ec) return DependencyLockfile{};
 
-    std::ifstream in{lockPath, std::ios::binary};
+    std::ifstream in{core::extendedLengthSpelling(lockPath), std::ios::binary};
     if (!in) {
         emitLockfileMalformed(rep, lockPath,
                               "the file exists but could not be opened for "
@@ -230,8 +230,8 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
     fs::path const dir = lockPath.parent_path();
     if (!dir.empty()) {
         std::error_code ec;
-        fs::create_directories(dir, ec);
-        // `create_directories` reports "already exists" as NO error, so a true
+        static_cast<void>(core::createDirectories(dir, ec));   // at any length
+        // `createDirectories` reports "already exists" as NO error, so a true
         // `ec` here means the directory genuinely could not be established.
         if (ec) {
             emitLockfileWriteFailed(rep, "the directory '" + core::genericSpelling(dir)
@@ -310,8 +310,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         // Asked at the ENTRY (`symlink_status`), which is the question the
         // exclusive create asked; anything else is a real failure, reported now.
         std::error_code eec;
-        auto const      entry = fs::symlink_status(candidate, eec);
-        if (!eec && fs::exists(entry)) continue;
+        if (core::entryKind(candidate, eec) != core::EntryKind::Absent && !eec) continue;
         emitLockfileWriteFailed(rep, "the scratch file '"
                                          + core::genericSpelling(candidate)
                                          + "' could not be created for writing");
@@ -330,7 +329,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
                                              + core::genericSpelling(tmp)
                                              + "' failed");
             std::error_code rmec;
-            fs::remove(tmp, rmec);
+            static_cast<void>(core::removeEntry(tmp, rmec));
             return false;
         }
     }
@@ -351,7 +350,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
                                          + core::genericSpelling(lockPath)
                                          + "': " + commit.refusal);
         std::error_code rmec;
-        fs::remove(tmp, rmec);
+        static_cast<void>(core::removeEntry(tmp, rmec));
         return false;
     }
     return true;

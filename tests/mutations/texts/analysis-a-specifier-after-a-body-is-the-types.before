@@ -1,0 +1,2 @@
+            if (pastBody) {
+                appendDeclarationSpecifiersAfterBody(cfg, tree, c, declarationsOwn);

@@ -2803,10 +2803,7 @@ def remove_tree(path):
         if not os.path.lexists(path):
             return True
         try:
-            if sys.version_info >= (3, 12):
-                shutil.rmtree(path, onexc=_rm_readonly)
-            else:
-                shutil.rmtree(path, onerror=_rm_readonly)
+            shutil.rmtree(path, onexc=_rm_readonly)
         except OSError:
             time.sleep(0.25 * (attempt + 1))
     return not os.path.lexists(path)

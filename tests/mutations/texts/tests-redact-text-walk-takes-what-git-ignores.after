@@ -1,0 +1,1 @@
+                for dirpath, dirs, files in os.walk(top):

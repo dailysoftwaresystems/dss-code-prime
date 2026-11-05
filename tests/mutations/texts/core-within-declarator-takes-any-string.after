@@ -1,0 +1,2 @@
+                                } else if (!wd.is_string()
+                                           || (false && wd.get<std::string>() != "type")) {

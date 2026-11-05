@@ -1,0 +1,2 @@
+                        if (isQualifiedAttributeName(cfg.attributeSpellings, key))
+                            continue;

@@ -256,6 +256,9 @@ struct DSS_EXPORT CstToHirResult {
     // when the source declares no externs (every existing
     // pre-FF6 test fixture).
     std::vector<HirExternRecord> externDecls;
+    // P69 (lane `cs`): the unit's symbol aliases (`HirSymbolAlias`), one per alias
+    // name, in declaration order. Empty for every unit that writes no `alias`.
+    std::vector<HirSymbolAlias> symbolAliases;
 
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp, HirInlineAsmPool ap)

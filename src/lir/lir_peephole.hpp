@@ -6,6 +6,8 @@
 #include "lir/lir.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 // LIR PEEPHOLE — plan 22 OPT8, the post-regalloc instruction-level cleanup.
 //
@@ -289,6 +291,15 @@ struct DSS_EXPORT LirPeepholeResult {
     // False iff the rebuild left the module unusable (a terminator the
     // shared dispatch refused). Same HARD channel as the sibling passes.
     bool        rebuilt = false;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every rebuild
+    // publishes its block entry image. R1 deletes instructions and R2 drops a
+    // branch operand, never a block, so what this pass publishes is the identity
+    // IT PERFORMED — written down where each source block is begun, from the map
+    // the rebuild goes through. Indexed by the SOURCE module's block arena
+    // (`LirBlockId.v`; slot 0 holds 0): the `.v` of the block of `lir` where that
+    // block's instructions begin. `lir/lir_descriptor_blocks.hpp` follows the
+    // blocks data names through it, and refuses a rebuild that publishes none.
+    std::vector<std::uint32_t> blockEntryImage;
 
     // Shape-consistency is the success channel, exactly as
     // `LirTwoAddrLegalizeResult::ok()`: the pass must have rebuilt as many

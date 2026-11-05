@@ -953,6 +953,41 @@ void checkIntrinsicCallResultValidity(Lir const& lir, Mir const& mir,
     }
 }
 
+// ★ THE CARRIER'S STAGE RULE (see `verifyLirStackedAggregatesLowered` in the
+// header): past `lowerWideCallArgs` no instruction carries a by-value
+// stacked-aggregate marker. Every instruction is judged, not only Calls: the
+// marker means something on a Call before that pass and on nothing after it.
+// One finding per instruction — the first marker names the defect.
+void checkNoStackedAggregateCarrier(Lir const& lir, TargetSchema const& sch,
+                                    LirVerdict& verdict) {
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const inst = lir.blockInstAt(b, i);
+                auto const ops = lir.instOperands(inst);
+                for (std::size_t k = 0; k < ops.size(); ++k) {
+                    if (ops[k].kind != LirOperandKind::ByValueStackAgg) continue;
+                    auto const* info = sch.opcodeInfo(lir.instOpcode(inst));
+                    report(verdict, std::format(
+                        "inst {} ({}) carries a by-value stacked-aggregate "
+                        "marker at operand {} ({} bytes) after lowerWideCallArgs — "
+                        "that pass copies every stacked aggregate into its "
+                        "outgoing bytes and takes the carrier off the Call, so "
+                        "no later stage reads one",
+                        inst.v, info != nullptr ? info->mnemonic : "?", k,
+                        ops[k].byValueAggBytes));
+                    break;
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 LirVerifyResult verifyLir(Lir const&                  lir,
@@ -1059,6 +1094,17 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
     // after the peephole fails the build instead of shipping a branch that
     // falls into the wrong one.
     checkTerminatorBlockRefsMatchSuccessors(lir, schema, verdict);
+    // ★ The carrier's stage rule, at every post-regalloc checkpoint: the
+    // module in hand is downstream of `lowerWideCallArgs`.
+    checkNoStackedAggregateCarrier(lir, schema, verdict);
+    return verdict.clean(baseline);
+}
+
+bool verifyLirStackedAggregatesLowered(Lir const& lir, TargetSchema const& schema,
+                                       DiagnosticReporter& reporter) {
+    auto const baseline = reporter.errorCount();
+    LirVerdict verdict{reporter};
+    checkNoStackedAggregateCarrier(lir, schema, verdict);
     return verdict.clean(baseline);
 }
 

@@ -248,15 +248,41 @@ def prelude_wrapper_target(path):
     return m.group(1)
 
 
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("gen-pe64-manifest: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["--self-test"], ["--selftest"]) and len(argv) == 1:
         return self_test()
     p = argparse.ArgumentParser(prog="gen-pe64-manifest.py")
-    p.add_argument("--tus", required=True, help="file: one absolute TU path per line")
-    p.add_argument("--includes", required=True, help="file: one include dir per line")
-    p.add_argument("--defines", required=True, help="file: one NAME[=VALUE] per line")
-    p.add_argument("--target", required=True, help="<targetName>:<formatName> spec")
+    p.add_argument("--tus", required=True, help="file: one absolute TU path per line",
+                   type=_path_types().read_path_arg("--tus"))
+    p.add_argument("--includes", required=True, help="file: one include dir per line",
+                   type=_path_types().read_path_arg("--includes"))
+    p.add_argument("--defines", required=True, help="file: one NAME[=VALUE] per line",
+                   type=_path_types().read_path_arg("--defines"))
+    p.add_argument("--target", required=True, help="<targetName>:<formatName> spec",
+                   type=_path_types().text_arg("--target"))
     p.add_argument("--resolve-library", action="append", default=[],
                    metavar="PATH[=IMPORT_NAME]",
                    help="a resolve-library binary (repeatable) — the tcl + zlib DLLs. "
@@ -265,10 +291,9 @@ def main(argv=None):
                         "the binary's own embedded soname — for cross-building against "
                         "a stand-in library (e.g. a MacPorts dylib whose LC_ID_DYLIB is "
                         "/opt/local/lib/...). Split on the LAST '=', matching the DSS "
-                        "CLI's --resolve-library <path>[=<import-name>].")
-    p.add_argument("--artifact-name", default="testfixture")
-    p.add_argument("--extra-define", action="append", default=[], metavar="NAME[=VALUE]",
-                   help="an extra define prepended to the recipe defines (opt-in shim only)")
+                        "CLI's --resolve-library <path>[=<import-name>].",
+                   type=_path_types().read_path_arg("--resolve-library"))
+    p.add_argument("--artifact-name", default="testfixture", type=_path_types().text_arg("--artifact-name"))
     p.add_argument("--recipe-transform", default="windows-selfconfig",
                    choices=RECIPE_TRANSFORMS,
                    help="how to adapt the POSIX-derived recipe defines for this "
@@ -276,7 +301,7 @@ def main(argv=None):
                         "DEFAULT 'windows-selfconfig' — the pe64 behaviour this "
                         "generator shipped with (kept for the old PowerShell "
                         "driver's call site, which passed none; the driver now "
-                        "always passes one).")
+                        "always passes one).", type=_path_types().text_arg("--recipe-transform"))
     p.add_argument("--stack-reserve", type=int, default=8 * 1024 * 1024,
                    metavar="BYTES",
                    help="per-program stack reserve to request in the emitted "
@@ -287,13 +312,16 @@ def main(argv=None):
                    help="file: the leg's declared build.tuPreludes as JSON -- each declared TU this "
                         "artifact builds is compiled through a generated wrapper holding the "
                         "declared lines, then #include of the real TU (both compilers read the "
-                        "same manifest). Absent: no TU is wrapped.")
-    p.add_argument("--output", required=True, help="path of the .dss-project.json to write")
+                        "same manifest). Absent: no TU is wrapped.",
+                   type=_path_types().read_path_arg("--tu-preludes", empty_means_absent=True))
+    p.add_argument("--output", required=True, type=_path_types().written_path_arg("--output"),
+                   help="path of the .dss-project.json to write")
     args = p.parse_args(argv)
 
     sources = read_lines(args.tus)
     includes = read_lines(args.includes)
-    defines = [strip_d(d) for d in args.extra_define] + [strip_d(d) for d in read_lines(args.defines)]
+    # (`--extra-define`, an opt-in shim no caller ever passed, retired on 2026-09-30.)
+    defines = [strip_d(d) for d in read_lines(args.defines)]
 
     # ── recipe transform ──────────────────────────────────────────────────────
     # `windows-selfconfig`: the recipe defines are captured from a POSIX

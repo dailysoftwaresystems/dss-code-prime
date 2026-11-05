@@ -1,0 +1,4 @@
+    std::size_t const        first = std::min(spelled.find(NativeChar{fs::path::preferred_separator}, root.volume), spelled.size());
+    fs::path const           base{spelled.substr(0, root.kind != core::RootSpelling::Kind::Verbatim ? first : root.volume)};
+    if (root.kind != core::RootSpelling::Kind::Verbatim)
+        return descend(base, fs::path{spelled.substr(std::min(first + 1, spelled.size()))}, matching, cache);

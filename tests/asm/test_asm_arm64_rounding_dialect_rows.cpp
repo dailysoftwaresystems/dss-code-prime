@@ -219,7 +219,7 @@ runOn(std::shared_ptr<GrammarSchema> dialect,
     }
 
     run->ok = lowerAsmTemplateToLirRun(*tree, *run->dialect, *run->target,
-                                       bindings, builder, run->reporter);
+                                       bindings, builder, run->reporter, nullptr);
 
     auto const retOp = run->target->opcodeByMnemonic("ret");
     if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};

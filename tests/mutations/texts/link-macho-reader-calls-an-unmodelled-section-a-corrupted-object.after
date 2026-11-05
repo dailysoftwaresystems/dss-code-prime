@@ -1,0 +1,2 @@
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: defined symbol '"

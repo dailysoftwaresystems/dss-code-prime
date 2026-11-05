@@ -40,17 +40,26 @@
 // outright is a duplicate-symbol failure in DSS (K_SymbolRedefinedAcrossUnits)
 // and in clang (`ld: duplicate symbol`) alike.
 //
-// ★ ROW 4 IS THE ONE THIS EXAMPLE EXISTS FOR, and it is a COMPILE gate on
+// ★ ROW 4 IS THE ONE THIS EXAMPLE EXISTS FOR, and it is a COMPILE-TIME gate on
 // purpose, because that is where `noreturn` is observable at all. `pick` is
 // non-void and its last path ends in `die(...)` with NO return. If the
 // after-keyword `__noreturn__` is honored, that path structurally terminates and
-// the program builds; if the attribute is parsed and its meaning dropped, HIR
-// verification refuses the function —
+// nothing is said about `pick`'s end; if the attribute is parsed and its meaning
+// dropped, `pick`'s end is REACHED. When the matrix above was measured that was
+// a refusal by HIR verification —
 //     error[H0003] non-void function #N may fall through without returning a value
-// MEASURED, both directions, on this exact program: with the attribute → exit 0
-// and a running binary; with `extern void die(int);` instead → H0003, no binary.
-// A runtime check could not witness this: the failure mode is a REFUSAL, not a
-// wrong number.
+// MEASURED then, both directions, on this exact program: with the attribute →
+// exit 0 and a running binary; with `extern void die(int);` instead → H0003, no
+// binary.
+//
+// ★ SINCE P69 THE SAME DEFECT PRESENTS DIFFERENTLY, and the gate moved with it.
+// C23 6.9.2p13 accepts a non-void function whose end is reached (only USING the
+// value is undefined) and DSS now honors that, so a dropped `__noreturn__` is a
+// compile that SUCCEEDS with the warning H_NonVoidFunctionEndReachable on `pick`
+// — and a program that still exits 42, because `pick(1)` never takes that path.
+// A runtime check could never witness this row; the refusal no longer does
+// either. The manifest's `forbidDiagnostics` does: it names that code, and the
+// arm is red on it, in both runners.
 //
 // Rows 2 and 3 are COMPILE-GATE witnesses and this file says so rather than
 // pretending otherwise: `__nothrow__`/`__leaf__` are ABI-neutral hints and
@@ -95,7 +104,8 @@ extern _Thread_local __attribute__((visibility("hidden"))) int t_first;
 extern __attribute__((visibility("hidden"))) _Thread_local int t_second;
 
 /* Non-void, and its fall-through path ends in a call to the noreturn `die`.
-   This function COMPILES ONLY IF the after-keyword `__noreturn__` was honored. */
+   This function's end is UNREACHED — nothing reported — only if the after-keyword
+   `__noreturn__` was honored (the manifest forbids the report). */
 int pick(int c) {
     if (c) return wfun();
     die(2);

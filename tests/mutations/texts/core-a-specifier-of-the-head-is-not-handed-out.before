@@ -1,0 +1,1 @@
+            if (tree.parent(cur).v == head.v) out.push_back(cur);

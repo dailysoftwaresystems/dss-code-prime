@@ -1,8 +1,15 @@
 {
-  "$comment": "Neutral shipped <stdarg.h> (C89 7.15). `va_list` + `va_start`/`va_arg`/`va_end` are ALREADY BUILT IN: the c grammar declares the vaArgRule, so the semantic phase injects the `va_list` builtin type (target-specific: __va_list_tag[1] on SysV, char* on Win64/Apple-arm64, __va_list on AAPCS64 — selected by VaListStrategy) and the parser lowers the va_* operations directly. So this descriptor exists ONLY to make `#include <stdarg.h>` RESOLVE (the angle-include resolver maps the header stem to <stem>.json; a missing descriptor fires F_ShippedHeaderNotFound). A descriptor must declare >=1 surface, so it carries a documentary `va_list` typedef — the builtin of the same name WINS (README: 'A builtin type of the same name wins'), so this alias is shadowed and never affects codegen; ptr<void> is a placeholder shape only.",
+  "$comment": "Neutral shipped <stdarg.h> (C89 7.15). `va_list` + `va_start`/`va_arg`/`va_end`/`va_copy` are ALREADY BUILT IN: the c grammar declares the variadic rules, so the semantic phase injects the `va_list` builtin type (target-specific: __va_list_tag[1] on SysV, char* on Win64/Apple-arm64, __va_list on AAPCS64 — selected by VaListStrategy) and the parser lowers the va_* operations directly. So this descriptor exists to make `#include <stdarg.h>` RESOLVE (the angle-include resolver maps the header stem to <stem>.json; a missing descriptor fires F_ShippedHeaderNotFound), and to make the five names MACROS once it is included, as C 7.16 says they are — code tests `#ifdef va_copy` (or `__va_copy`) before choosing how to copy a list. P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): ✔MEASURED 2026-09-30 (the lane's probe pp2): after `#include <stdarg.h>`, gcc 13.3.0 and clang 18.1.3 (both modes) define all five, MSVC 19.51 the four without `__va_copy`, and none of the three defines any without the include. Each macro expands to the keyword of its own name (`__va_copy` to `va_copy`); a macro is never re-expanded inside its own expansion (C 6.10.3.4p2), so the expansion reaches the grammar as the keyword. The `va_list` typedef is documentary — the builtin of the same name WINS (README: 'A builtin type of the same name wins'), so this alias is shadowed and never affects codegen; ptr<void> is a placeholder shape only.",
   "header": "stdarg.h",
   "standard": "c89",
   "typedefs": [
     { "name": "va_list", "type": "ptr<void>" }
+  ],
+  "macros": [
+    { "name": "va_start",  "params": [], "variadic": true, "replacement": "va_start(__VA_ARGS__)" },
+    { "name": "va_arg",    "params": ["ap", "T"],          "replacement": "va_arg(ap, T)" },
+    { "name": "va_end",    "params": ["ap"],               "replacement": "va_end(ap)" },
+    { "name": "va_copy",   "params": ["dest", "src"],      "replacement": "va_copy(dest, src)" },
+    { "name": "__va_copy", "params": ["dest", "src"],      "replacement": "va_copy(dest, src)" }
   ]
 }

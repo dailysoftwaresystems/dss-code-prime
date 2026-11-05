@@ -1,0 +1,1 @@
+            if (ia.isTailRule(tree.rule(cur))) continue;   // never enter a section

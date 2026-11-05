@@ -1,0 +1,2 @@
+                reportInst(reporter, DiagnosticCode::I_SehStructure, term,
+                           filter.problem);

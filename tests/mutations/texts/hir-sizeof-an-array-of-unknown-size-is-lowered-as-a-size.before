@@ -1,0 +1,1 @@
+        if (sem.sizeofIncompleteArraySize.has_value()

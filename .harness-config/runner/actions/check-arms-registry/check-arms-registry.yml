@@ -1,0 +1,41 @@
+# PURPOSE: check what the mutation arms registry promises that `dssharness check-mutations` does not: every row stands in the tree, each section is in order, one case count per (runner, leg), and a sweep's reds and diagnostics against its rows.
+name: check-arms-registry
+description: >-
+  Checks tests/mutations/arms.registry for what `dssharness check-mutations` does not check itself:
+  every A and M row's before-text stands exactly once in its site, each area's section is in order,
+  the arms of one runner on one leg state one case count, and -- given a sweep's JSON -- each driven
+  arm's reds against its C and G rows and its diagnostic in its run log. The program documents itself
+  in its own header; this file declares only how a runner starts it and what witnesses that it ran.
+  Gated by ctest as `arms_registry_guard` (the tree, then the self-test), and its self-test as
+  `harness/arms_registry_selftest`, one case per arm.
+steps:
+  - name: verify
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-arms-registry.py
+    successPattern: '^check-arms-registry: self-test OK \(\d+ arms\)$'
+    requireInputsUnmoved: true
+
+  # The self-test ALONE: each check against a synthesized negative, beside a control.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-arms-registry.py --self-test
+    successPattern: '^check-arms-registry: self-test OK \(\d+ arms\)$'
+    requireInputsUnmoved: true
+
+  # A sweep's report: the JSON a `check-mutations --json` run wrote, a path relative to the tree. An arm's run log
+  # is read from its records directory in this tree (`dssharness sync --legs <leg> --pull <records>/run.log`).
+
+  - name: sweep
+    manual: true
+    workingDirectoryRoot: tree
+    inputs:
+      json:
+        description: "the sweep's JSON document, a path relative to the tree"
+    run: |
+      python3 .harness-config/runner/actions/check-arms-registry/check-arms-registry.py --sweep "{json}"
+    successPattern: '^check-arms-registry: OK \(0 arm\(s\) not as their rows say\)$'
+    requireInputsUnmoved: true

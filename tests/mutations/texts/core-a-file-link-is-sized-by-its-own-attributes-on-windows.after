@@ -1,0 +1,1 @@
+    if (WIN32_FILE_ATTRIBUTE_DATA own{}; ::GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &own)) return (std::uintmax_t{own.nFileSizeHigh} << 32) | own.nFileSizeLow; return std::nullopt;

@@ -30,6 +30,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_text.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -90,8 +91,9 @@ TEST(MirTextGlobalAttrs, EveryNonDefaultFieldSurvivesTheRoundTrip) {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const i32 = ti.primitive(TypeKind::I32);
     MirBuilder   b;
-    b.addGlobal(i32, SymbolId{10}, UINT32_MAX, MirFuncId{}, kBinding,
-                kVisibility, kIsConst, kStorage, kAlign);
+    b.addGlobal(i32, SymbolId{10}, UINT32_MAX, MirFuncId{},
+                dss::test_support::linkageOf(kBinding, kVisibility), kIsConst,
+                kStorage, kAlign);
     Mir m = std::move(b).finish();
 
     auto const names = namesWithGlobalAt10();
@@ -137,8 +139,9 @@ TEST(MirTextGlobalAttrs, TheAttributeListItselfReachesTheText) {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const i32 = ti.primitive(TypeKind::I32);
     MirBuilder   b;
-    b.addGlobal(i32, SymbolId{10}, UINT32_MAX, MirFuncId{}, kBinding,
-                kVisibility, kIsConst, kStorage, kAlign);
+    b.addGlobal(i32, SymbolId{10}, UINT32_MAX, MirFuncId{},
+                dss::test_support::linkageOf(kBinding, kVisibility), kIsConst,
+                kStorage, kAlign);
     Mir m = std::move(b).finish();
 
     DiagnosticReporter emitRep;
@@ -198,8 +201,9 @@ TEST(MirTextGlobalAttrs, AForwardReferencedInitFuncGlobalKeepsItsAttributes) {
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
     b.addReturn();
-    b.addGlobal(i32, SymbolId{10}, UINT32_MAX, init, kBinding, kVisibility,
-                kIsConst, kStorage, kAlign);
+    b.addGlobal(i32, SymbolId{10}, UINT32_MAX, init,
+                dss::test_support::linkageOf(kBinding, kVisibility), kIsConst,
+                kStorage, kAlign);
     Mir m = std::move(b).finish();
 
     std::vector<std::string> names(12, std::string{});
@@ -224,7 +228,7 @@ TEST(MirTextGlobalAttrs, AForwardReferencedInitFuncGlobalKeepsItsAttributes) {
 namespace {
 
 [[nodiscard]] std::string globalDoc(std::string_view attrs) {
-    return std::string{"dssir 3\nmodule {\n  global %10 : i32"} +
+    return std::string{"dssir 7\nmodule {\n  global %10 : i32"} +
            std::string{attrs} + " = zero\n}\n";
 }
 
@@ -308,7 +312,7 @@ TEST(MirTextGlobalAttrs, AWellFormedAttributeListParsesGreen) {
     // a legal list. Without it, a parser that refused every attribute list
     // would satisfy all three negatives and be useless.
     DiagnosticReporter rep;
-    auto res = parseMir(globalDoc(" [weak, hidden, const, threadlocal, align=64]"),
+    auto res = parseMir(globalDoc(" [weak(overridable), hidden, const, threadlocal, align=64]"),
                         CompilationUnitId{1}, rep);
     ASSERT_TRUE(res->ok);
     ASSERT_EQ(res->mir.moduleGlobalCount(), 1u);

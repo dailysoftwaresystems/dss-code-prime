@@ -1,0 +1,2 @@
+    value = str(value)
+    if value.startswith("-"):

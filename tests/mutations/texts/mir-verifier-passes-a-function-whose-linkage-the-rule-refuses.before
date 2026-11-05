@@ -1,0 +1,2 @@
+                             /*hasInitializer=*/false, /*isThreadLocal=*/false);
+        if (defect.empty()) continue;

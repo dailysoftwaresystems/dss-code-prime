@@ -1,0 +1,2 @@
+        if (!width.has_value()) return t;
+        return bitFieldPromotedType(interner, t, *width, *arith);

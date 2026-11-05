@@ -79,6 +79,17 @@
 # clang 18.1.3 and ucrtbase.dll produced for the same inputs in P46).
 # [[D-CSUBSET-TGMATH-COMPLEX]]
 #
+# EXTENDED 2026-10-01 (cycle P69, lane `cs`) by TWO rows -- nan and nanf, the
+# library functions `__builtin_nan(s)` / `__builtin_nanf(s)` call for a
+# non-literal `s` (math.json's two new rows) -- on macOS (Darwin 25.6.0, arm64
+# host), Apple clang 21.0.0 (clang-2100.1.1.101), through `dssharness run
+# probe-reference-cc` on macos-arm64-release (object mode + `nm -u`, run
+# 20261001-151822-09de8866): each returned exactly one undefined symbol, the plain
+# decorated identifier on BOTH arches (an ABSENT `linkName`). Because DSS
+# eager-imports every function a descriptor lists, the import was also LINKED on
+# both arches against libSystem and RUN natively (exit 42), run
+# 20261001-151908-af8b6cc3.
+#
 # EXTENDED 2026-09-23 (P68 round 9, lane `lm`) by THREE rows — `getopt`,
 # `getopt_long`, `getopt_long_only`, which the new shipped <getopt.h> (and
 # <unistd.h>, for `getopt`) import on Mach-O — measured on the operator's Mac
@@ -102,7 +113,75 @@
 # has no row here; the batches' four wide-character probes — mbstowcs mbtowc
 # wcstombs wctomb, the same plain names — wait for S2 to import them.)
 # [[D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES]]
+#
+# EXTENDED 2026-10-01 (P69, lane `lm`) by TWENTY-EIGHT rows, and TEN rows LEFT.
+# Measured on the operator's Mac (Darwin 25.6.0, arm64 host), Apple clang 21.0.0
+# (clang-2100.1.1.101), by THIS file's method — `#include <HEADER>` and
+# `void *p(void){return (void*)&SYM;}`, `cc -arch A -fno-builtin
+# -fno-stack-protector -w -c`, `nm -u` — one probe per identifier per arch (56,
+# runs 20261001-030809-1cee13bb x86_64 and 20261001-030830-b1aa44e3 arm64), each
+# returning exactly one undefined symbol, and NONE diverges: every cell is the
+# plain decorated identifier on BOTH arches.
+#   * TWELVE public imports the round's rows added: fgetpos fsetpos setbuf
+#     tmpfile tmpnam (stdio.h), imaxabs imaxdiv (inttypes.h), mbstowcs mbtowc
+#     wcstombs wctomb strtold (stdlib.h) — absent `linkName`.
+#   * FIFTEEN PRIVATE rows — `__dss_platform_<x>`, the only way DSS's own runtime
+#     units (runtime/platform/src/stdio.c, stdio_libsystem.c, stdlib_strto.c,
+#     inttypes.c) reach libSystem (C 7.1.3 reserves the double underscore for
+#     the implementation, so no program can collide with one). A private row's
+#     identifier is DSS's and its LINK NAME is the platform's; the cell is what
+#     Apple cc emits for that platform identifier, which the row names in its
+#     `linkName`: vfprintf vfscanf vsnprintf vsprintf vsscanf (stdio.h),
+#     flockfile and funlockfile (`__dss_platform_lock_file` / `_unlock_file`,
+#     stdio.h), strtol strtoll strtoul strtoull (stdlib.h), strtoimax strtoumax
+#     wcstoimax wcstoumax (inttypes.h).
+#   * `call_once` — the one row whose identifier Apple's SDK does not declare at
+#     all (no <threads.h> on macOS: ✔MEASURED, `'threads.h' file not found` on
+#     both arches, run 20261001-022915-5ebff155). DSS binds C's call_once on
+#     Mach-O to libSystem's `pthread_once` (`linkName`), the function with C's
+#     contract there, so the cell is what Apple cc emits for `&pthread_once`
+#     through <pthread.h>: `_pthread_once` on both arches, implying linkName
+#     `pthread_once`.
+# LEFT: fprintf printf snprintf sprintf sscanf strtol strtoll strtoul strtoull
+# vfprintf — on Mach-O each is DSS's C23 entry point now (`__dss_isoc23_<name>`,
+# realized from DSS's runtime source), not an import, so the census no longer
+# names them (axis 3: no row outlives its symbol). Their 2026-08-25 readings
+# were the plain names; the platform functions they named are imported through
+# the private rows above, re-measured here.
+# [[D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM]]
+# [[D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES]]
+#
+# EXTENDED 2026-10-07 (P69, lane `cs`) by SEVEN rows -- the ISO C functions
+# string.json and ctype.json now import on Mach-O too: strcoll strxfrm strpbrk
+# strtok (C89), isblank (C99, through <ctype.h>), memccpy and strndup (C23) --
+# measured on the operator's Mac (Darwin 25.6.0, arm64 host), Apple clang
+# 21.0.0 (clang-2100.1.1.101), through `dssharness run probe-reference-cc` on
+# macos-arm64-release by THIS file's method (`#include <HEADER>` and
+# `void *p(void){return (void*)&SYM;}`, `cc -arch A -fno-builtin
+# -fno-stack-protector -w -c`, `nm -u`), one probe per identifier per arch (14,
+# run 20261007-191714-ceb4dcc2, host run 20261007-191707-f962555c), each
+# returning exactly one undefined symbol. NONE diverges: the plain decorated
+# identifier on BOTH arches, so all seven imply an ABSENT `linkName`. Because
+# DSS eager-imports every function a descriptor lists, the seven were also
+# LINKED on x86_64 (`nm -u` of the image names all seven) and RUN natively on
+# arm64 (exit 42), and libSystem's `dlsym` finds each, in the same run.
+# [[D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN]]
 _Exit	stdlib.h	__Exit	__Exit
+__dss_platform_lock_file	stdio.h	_flockfile	_flockfile
+__dss_platform_strtoimax	inttypes.h	_strtoimax	_strtoimax
+__dss_platform_strtol	stdlib.h	_strtol	_strtol
+__dss_platform_strtoll	stdlib.h	_strtoll	_strtoll
+__dss_platform_strtoul	stdlib.h	_strtoul	_strtoul
+__dss_platform_strtoull	stdlib.h	_strtoull	_strtoull
+__dss_platform_strtoumax	inttypes.h	_strtoumax	_strtoumax
+__dss_platform_unlock_file	stdio.h	_funlockfile	_funlockfile
+__dss_platform_vfprintf	stdio.h	_vfprintf	_vfprintf
+__dss_platform_vfscanf	stdio.h	_vfscanf	_vfscanf
+__dss_platform_vsnprintf	stdio.h	_vsnprintf	_vsnprintf
+__dss_platform_vsprintf	stdio.h	_vsprintf	_vsprintf
+__dss_platform_vsscanf	stdio.h	_vsscanf	_vsscanf
+__dss_platform_wcstoimax	inttypes.h	_wcstoimax	_wcstoimax
+__dss_platform_wcstoumax	inttypes.h	_wcstoumax	_wcstoumax
 __error	errno.h	___error	___error
 abort	stdlib.h	_abort	_abort
 abs	stdlib.h	_abs	_abs
@@ -128,6 +207,7 @@ atoll	stdlib.h	_atoll	_atoll
 bsearch	stdlib.h	_bsearch	_bsearch
 cabs	tgmath.h	_cabs	_cabs
 cacos	tgmath.h	_cacos	_cacos
+call_once	pthread.h	_pthread_once	_pthread_once
 calloc	stdlib.h	_calloc	_calloc
 casin	tgmath.h	_casin	_casin
 catan	tgmath.h	_catan	_catan
@@ -167,6 +247,7 @@ feof	stdio.h	_feof	_feof
 ferror	stdio.h	_ferror	_ferror
 fflush	stdio.h	_fflush	_fflush
 fgetc	stdio.h	_fgetc	_fgetc
+fgetpos	stdio.h	_fgetpos	_fgetpos
 fgets	stdio.h	_fgets	_fgets
 fgetws	wchar.h	_fgetws	_fgetws
 fileno	stdio.h	_fileno	_fileno
@@ -176,7 +257,6 @@ floorf	math.h	_floorf	_floorf
 fmod	math.h	_fmod	_fmod
 fmodf	math.h	_fmodf	_fmodf
 fopen	stdio.h	_fopen	_fopen
-fprintf	stdio.h	_fprintf	_fprintf
 fputc	stdio.h	_fputc	_fputc
 fputs	stdio.h	_fputs	_fputs
 fputws	wchar.h	_fputws	_fputws
@@ -185,6 +265,7 @@ free	stdlib.h	_free	_free
 freopen	stdio.h	_freopen	_freopen
 fsctl	unistd.h	_fsctl	_fsctl
 fseek	stdio.h	_fseek	_fseek
+fsetpos	stdio.h	_fsetpos	_fsetpos
 fstat	sys/stat.h	_fstat$INODE64	_fstat
 fstatfs	sys/mount.h	_fstatfs$INODE64	_fstatfs
 fsync	unistd.h	_fsync	_fsync
@@ -209,10 +290,13 @@ gettimeofday	sys/time.h	_gettimeofday	_gettimeofday
 getuid	unistd.h	_getuid	_getuid
 gmtime	time.h	_gmtime	_gmtime
 gmtime_r	time.h	_gmtime_r	_gmtime_r
+imaxabs	inttypes.h	_imaxabs	_imaxabs
+imaxdiv	inttypes.h	_imaxdiv	_imaxdiv
 ioctl	sys/ioctl.h	_ioctl	_ioctl
 isalnum	ctype.h	_isalnum	_isalnum
 isalpha	ctype.h	_isalpha	_isalpha
 isatty	unistd.h	_isatty	_isatty
+isblank	ctype.h	_isblank	_isblank
 iscntrl	ctype.h	_iscntrl	_iscntrl
 isdigit	ctype.h	_isdigit	_isdigit
 isgraph	ctype.h	_isgraph	_isgraph
@@ -247,6 +331,9 @@ malloc_zone_free	malloc/malloc.h	_malloc_zone_free	_malloc_zone_free
 malloc_zone_malloc	malloc/malloc.h	_malloc_zone_malloc	_malloc_zone_malloc
 malloc_zone_realloc	malloc/malloc.h	_malloc_zone_realloc	_malloc_zone_realloc
 mblen	stdlib.h	_mblen	_mblen
+mbstowcs	stdlib.h	_mbstowcs	_mbstowcs
+mbtowc	stdlib.h	_mbtowc	_mbtowc
+memccpy	string.h	_memccpy	_memccpy
 memchr	memory.h	_memchr	_memchr
 memcmp	memory.h	_memcmp	_memcmp
 memcpy	memory.h	_memcpy	_memcpy
@@ -256,6 +343,8 @@ mkdir	sys/stat.h	_mkdir	_mkdir
 mktime	time.h	_mktime	_mktime
 mmap	sys/mman.h	_mmap	_mmap
 munmap	sys/mman.h	_munmap	_munmap
+nan	math.h	_nan	_nan
+nanf	math.h	_nanf	_nanf
 nanosleep	time.h	_nanosleep	_nanosleep
 open	fcntl.h	_open	_open
 opendir	dirent.h	_opendir$INODE64	_opendir
@@ -265,7 +354,6 @@ popen	stdio.h	_popen	_popen
 pow	math.h	_pow	_pow
 powf	math.h	_powf	_powf
 pread	unistd.h	_pread	_pread
-printf	stdio.h	_printf	_printf
 pthread_cond_destroy	pthread.h	_pthread_cond_destroy	_pthread_cond_destroy
 pthread_cond_init	pthread.h	_pthread_cond_init	_pthread_cond_init
 pthread_cond_signal	pthread.h	_pthread_cond_signal	_pthread_cond_signal
@@ -302,6 +390,7 @@ rename	stdio.h	_rename	_rename
 rewind	stdio.h	_rewind	_rewind
 rmdir	unistd.h	_rmdir	_rmdir
 sched_yield	sched.h	_sched_yield	_sched_yield
+setbuf	stdio.h	_setbuf	_setbuf
 setenv	stdlib.h	_setenv	_setenv
 setjmp	setjmp.h	_setjmp	_setjmp
 setlocale	locale.h	_setlocale	_setlocale
@@ -311,18 +400,16 @@ sin	math.h	_sin	_sin
 sinf	math.h	_sinf	_sinf
 sinh	math.h	_sinh	_sinh
 sleep	unistd.h	_sleep	_sleep
-snprintf	stdio.h	_snprintf	_snprintf
-sprintf	stdio.h	_sprintf	_sprintf
 sqrt	math.h	_sqrt	_sqrt
 sqrtf	math.h	_sqrtf	_sqrtf
 srand	stdlib.h	_srand	_srand
 srandomdev	stdlib.h	_srandomdev	_srandomdev
-sscanf	stdio.h	_sscanf	_sscanf
 stat	sys/stat.h	_stat$INODE64	_stat
 statfs	sys/mount.h	_statfs$INODE64	_statfs
 strcat	string.h	_strcat	_strcat
 strchr	string.h	_strchr	_strchr
 strcmp	string.h	_strcmp	_strcmp
+strcoll	string.h	_strcoll	_strcoll
 strcpy	string.h	_strcpy	_strcpy
 strcspn	string.h	_strcspn	_strcspn
 strdup	string.h	_strdup	_strdup
@@ -334,15 +421,16 @@ strlen	string.h	_strlen	_strlen
 strncat	string.h	_strncat	_strncat
 strncmp	string.h	_strncmp	_strncmp
 strncpy	string.h	_strncpy	_strncpy
+strndup	string.h	_strndup	_strndup
+strpbrk	string.h	_strpbrk	_strpbrk
 strrchr	string.h	_strrchr	_strrchr
 strspn	string.h	_strspn	_strspn
 strstr	string.h	_strstr	_strstr
 strtod	stdlib.h	_strtod	_strtod
 strtof	stdlib.h	_strtof	_strtof
-strtol	stdlib.h	_strtol	_strtol
-strtoll	stdlib.h	_strtoll	_strtoll
-strtoul	stdlib.h	_strtoul	_strtoul
-strtoull	stdlib.h	_strtoull	_strtoull
+strtok	string.h	_strtok	_strtok
+strtold	stdlib.h	_strtold	_strtold
+strxfrm	string.h	_strxfrm	_strxfrm
 swab	unistd.h	_swab	_swab
 symlink	unistd.h	_symlink	_symlink
 sysconf	unistd.h	_sysconf	_sysconf
@@ -353,6 +441,8 @@ tan	math.h	_tan	_tan
 tanf	math.h	_tanf	_tanf
 tanh	math.h	_tanh	_tanh
 time	time.h	_time	_time
+tmpfile	stdio.h	_tmpfile	_tmpfile
+tmpnam	stdio.h	_tmpnam	_tmpnam
 tolower	ctype.h	_tolower	_tolower
 toupper	ctype.h	_toupper	_toupper
 trunc	math.h	_trunc	_trunc
@@ -362,5 +452,6 @@ unsetenv	stdlib.h	_unsetenv	_unsetenv
 usleep	unistd.h	_usleep	_usleep
 utime	utime.h	_utime	_utime
 utimes	sys/time.h	_utimes	_utimes
-vfprintf	stdio.h	_vfprintf	_vfprintf
+wcstombs	stdlib.h	_wcstombs	_wcstombs
+wctomb	stdlib.h	_wctomb	_wctomb
 write	unistd.h	_write	_write

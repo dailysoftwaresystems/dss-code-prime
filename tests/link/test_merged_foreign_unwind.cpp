@@ -424,10 +424,13 @@ withAugmentationChar(std::span<std::uint8_t const> obj, std::size_t unwindOff,
 
 } // namespace
 
-// A personality routine that this project's neutral representation cannot
-// carry must REFUSE, never zero the pointer: a dropped personality turns a
-// caught exception into a terminate, and the image would look complete.
-TEST(MergedForeignUnwind, PersonalityAugmentationIsRefusedByName) {
+// A personality field the CIE cannot hold is REFUSED by name, never read past
+// or zeroed: a dropped personality turns a caught exception into a terminate,
+// and the image would look complete. (Since P69 fold 3d the decoder READS a
+// 'P' -- the routine is carried. "zR" -> "zP" leaves the one byte of
+// augmentation data, gcc's 0x1b, as the routine's encoding with no room for
+// its 4-byte field.)
+TEST(MergedForeignUnwind, APersonalityFieldPastItsCieIsRefusedByName) {
     forEachPort([](Port const& p) {
         auto loaded = load(p);
         if (!loaded.has_value()) return;
@@ -443,9 +446,10 @@ TEST(MergedForeignUnwind, PersonalityAugmentationIsRefusedByName) {
         auto mod = elf::readRelocatableObject(mutated, *loaded->target,
                                               *loaded->format, rep);
         EXPECT_FALSE(mod.has_value())
-            << p.label << ": a CIE naming a personality routine was ACCEPTED";
-        EXPECT_NE(diagText(rep).find("personality"), std::string::npos)
-            << p.label << ": the refusal did not name the personality routine."
+            << p.label << ": a personality field past its CIE was ACCEPTED";
+        EXPECT_NE(diagText(rep).find("personality field runs past the augmentation data"),
+                  std::string::npos)
+            << p.label << ": the refusal did not name the personality field."
             << diagText(rep);
     });
 }
@@ -507,9 +511,12 @@ TEST(MergedForeignUnwind, AnFdeThatDoesNotCoverItsFunctionIsRefused) {
 
 // ★★ THE ROW'S OWN VOCABULARY CLAIM, EXERCISED: the reader finds the section
 //    by its universal `kind` and never by the string `.eh_frame`. Remove the
-//    row and the very same bytes carry nothing -- which is exactly the
-//    pre-fix behaviour, so this arm is the in-suite twin of the end-to-end
-//    config mutant.
+//    row and the very same bytes carry no unwind information -- the in-suite
+//    twin of the end-to-end config mutant. Since P69 fold 3d they are not
+//    read in SILENCE either: the section is then an allocated section the
+//    reader made no item of, and its relocations would be dropped, so the
+//    object is refused naming it (the reader's step 7). A reader that found the
+//    section by its name would carry the unwind information instead.
 TEST(MergedForeignUnwind, WithNoUnwindRowDeclaredTheSameBytesCarryNothing) {
     forEachPort([](Port const& p) {
         auto loaded = load(p);
@@ -541,16 +548,19 @@ TEST(MergedForeignUnwind, WithNoUnwindRowDeclaredTheSameBytesCarryNothing) {
         auto const bytes = p.object();
         auto mod = elf::readRelocatableObject(bytes, *loaded->target,
                                               **stripped, rep);
-        ASSERT_TRUE(mod.has_value())
-            << p.label << ": an undeclared unwind section must leave the object "
-                          "readable, exactly as before the row existed"
-            << diagText(rep);
-        for (std::size_t i = 0; i < mod->functions.size(); ++i) {
-            EXPECT_FALSE(mod->functions[i].cfi.has_value())
-                << p.label << ": function #" << i
-                << " carried unwind information with NO `unwind` row declared, "
-                   "so the reader is finding the section some other way than "
-                   "through the format vocabulary";
+        if (mod.has_value()) {
+            for (std::size_t i = 0; i < mod->functions.size(); ++i) {
+                EXPECT_FALSE(mod->functions[i].cfi.has_value())
+                    << p.label << ": function #" << i
+                    << " carried unwind information with NO `unwind` row declared, "
+                       "so the reader is finding the section some other way than "
+                       "through the format vocabulary";
+            }
         }
+        EXPECT_FALSE(mod.has_value())
+            << p.label << ": an undeclared unwind section's relocations were dropped in silence";
+        EXPECT_NE(diagText(rep).find("patches section '.eh_frame', which the program loads"),
+                  std::string::npos)
+            << p.label << diagText(rep);
     });
 }

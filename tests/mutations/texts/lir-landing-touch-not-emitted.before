@@ -1,0 +1,3 @@
+            if (footing.landingTouch) {
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);

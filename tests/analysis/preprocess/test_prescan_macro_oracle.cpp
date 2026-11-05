@@ -39,6 +39,7 @@
 #include "core/types/header_name_matching.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/preprocess_config.hpp"   // PredefinedMacroDef (ppWithErasingPredefine)
 #include "core/types/source_buffer.hpp"
 
 #include "test_support/repo_root.hpp"
@@ -123,16 +124,30 @@ struct CwdFixture {
                       DiagnosticBudget::libraryDefault());
 }
 
-// The same, with the PE object format active. Needed by exactly one pair of arms:
-// the C profile gates `__declspec`/`_declspec` to `pe` (`availableObjectFormats`),
-// so the function-like-PREDEFINE arms have no subject at all without a format.
-// Stated explicitly rather than defaulted, so the dependence is greppable.
-[[nodiscard]] PreprocessResult ppPe(std::string text) {
+// The same, with ONE FUNCTION-LIKE PREDEFINE THAT ERASES ITS ARGUMENT handed in as
+// a target predefine. Needed by exactly one pair of arms, and built here because
+// the shipped C profile no longer has such a macro to borrow: its `__declspec`
+// became a keyword (on pe it is predefined OBJECT-like, expanding to itself) and
+// its `_declspec(x)` expands to `__declspec(x)`, which no `#if` can evaluate. A
+// `PredefinedMacroDef` built in C++ never passes through the JSON loader, so
+// `Ordinary` is stated rather than defaulted.
+constexpr std::string_view kErasingPredefineName = "__ORACLE_ERASES__";
+
+[[nodiscard]] PreprocessResult ppWithErasingPredefine(std::string text) {
+    PredefinedMacroDef erasing;
+    erasing.name                = std::string{kErasingPredefineName};
+    erasing.kind                = PredefinedMacroKind::Constant;
+    erasing.value               = "";
+    erasing.params              = {"x"};
+    erasing.isFunctionLike      = true;
+    erasing.programRedefinition = PredefinedMacroRedefinition::Ordinary;
+    std::vector<PredefinedMacroDef> const targetMacros{erasing};
     auto buf = SourceBuffer::fromString(std::move(text), std::string{kMainName});
     std::vector<fs::path> const noDirs;
+    std::vector<std::string> const noDefines;
     return preprocess(buf, cSchema(), noDirs, kDefaultHeaderNameMatching,
                       DiagnosticBudget::libraryDefault(), noDirs,
-                      ObjectFormatKind::Pe);
+                      ObjectFormatKind::Elf, noDefines, targetMacros);
 }
 
 [[nodiscard]] bool hasCode(PreprocessResult const& r, DiagnosticCode code) {
@@ -312,14 +327,17 @@ TEST(PreScanMacroOracle, ComputedIncludeThatSpellsNoHeaderNameStillFailsLoud) {
 // function-like predefined macro, because the weaker evaluator could not expand
 // a call and value-seeding one would have made the pre-scan read more-live than
 // the real pass. The prefix is now the authoritative `<built-in>` prologue
-// verbatim, so `__declspec(x)` (which erases to nothing) is an ordinary macro in
-// both passes and `#if __declspec(dllimport) 1` reduces to `#if 1`.
+// verbatim, so a function-like predefine that erases to nothing is an ordinary
+// macro in both passes and `#if __ORACLE_ERASES__(dllimport) 1` reduces to
+// `#if 1`. (The subject was the shipped pe `__declspec(x)` while that macro
+// erased; it is a keyword now, so the arm brings its own — see
+// `ppWithErasingPredefine`.)
 TEST(PreScanMacroOracle, FunctionLikePredefineCalledInAGuardSplices) {
     CwdFixture fx;
     fx.writeHeader();
 
-    PreprocessResult const r = ppPe(
-        "#if __declspec(dllimport) 1\n"
+    PreprocessResult const r = ppWithErasingPredefine(
+        "#if __ORACLE_ERASES__(dllimport) 1\n"
         "#include \"oracle_h.h\"\n"
         "#endif\n"
         "int v = ORACLE_VALUE;\n");
@@ -328,20 +346,21 @@ TEST(PreScanMacroOracle, FunctionLikePredefineCalledInAGuardSplices) {
 }
 
 // The CONTROL FINDING-A's own note pinned: a BARE function-like predefine name
-// (no call) must still fold to 0, so `#if !__declspec` is TRUE and splices.
-// ✔MEASURED at the time as DSS 42 / mingw-w64 gcc 13.2.0 42. A "fix" that
-// value-seeded the call macros would break exactly this.
+// (no call) must still fold to 0, so `#if !__ORACLE_ERASES__` is TRUE and
+// splices. ✔MEASURED at the time, on the then-shipped `__declspec`, as DSS 42 /
+// mingw-w64 gcc 13.2.0 42. A "fix" that value-seeded the call macros would break
+// exactly this.
 TEST(PreScanMacroOracle, BareFunctionLikePredefineNameStillFoldsToZero) {
     CwdFixture fx;
     fx.writeHeader();
 
-    PreprocessResult const r = ppPe(
-        "#if !__declspec\n"
+    PreprocessResult const r = ppWithErasingPredefine(
+        "#if !__ORACLE_ERASES__\n"
         "#include \"oracle_h.h\"\n"
         "#endif\n"
         "int v = ORACLE_VALUE;\n");
 
-    expectSpliced(r, "`#if !__declspec` — a bare call-macro name folds to 0");
+    expectSpliced(r, "`#if !__ORACLE_ERASES__` — a bare call-macro name folds to 0");
 }
 
 // ── 6. `#undef` OF A PREDEFINED NAME COMPOSES ──────────────────────────────

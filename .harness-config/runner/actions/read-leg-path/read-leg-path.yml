@@ -6,7 +6,8 @@ description: >-
   and kept, redacted (the tree's absolute path, the home directory, the user and the host name never
   leave the host). It refuses a path outside the tree and any connection data or secret by name,
   because it prints what it reads. Built 2026-09-23 because DssHarness 0.5.8 keeps a remote leg's
-  logs on its host with no verb to read them. The program documents itself in its own header; this
+  logs on its host with no verb to read them. Everything it prints passes the ONE redactor
+  (`redact/redact.py`, loaded by path). The program documents itself in its own header; this
   file declares only how a runner starts it and what witnesses that it ran.
   Bring the kept file back with `dssharness sync --legs <leg> --pull <its path>`.
   The SELF-TEST is a manual step, so it runs on ANY leg's host with no build:
@@ -26,8 +27,10 @@ steps:
       match:
         description: 'a Python regular expression; a file prints only its lines that match it'
         default: '.'
+    # ★ EVERY OPTION IS SPELLED `--name=value`: a `match` expression may BEGIN with `-`, and argparse reads
+    # `--match -x` as a second option (exit 2) -- FOUND 2026-09-30 (cycle P69); the self-test holds this line to it.
     run: |
-      python3 ./read-leg-path.py --tree "{treeDir}" --path "{path}" --lines "{lines}" --match "{match}" --out "{stepBuild}/read-leg-path.txt"
+      python3 ./read-leg-path.py --tree="{treeDir}" --path="{path}" --lines="{lines}" --match="{match}" --out="{stepBuild}/read-leg-path.txt"
     outputs: [read-leg-path.txt]
     persist: true
     successPattern: 'read-leg-path: OK '
@@ -37,4 +40,4 @@ steps:
     workingDirectoryRoot: action
     run: |
       python3 ./read-leg-path.py --selftest
-    successPattern: '^read-leg-path selftest: OK\b'
+    successPattern: '^read-leg-path selftest: OK \(\d+ arm\(s\)\)$'

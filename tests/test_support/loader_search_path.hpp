@@ -55,7 +55,14 @@
 //
 // SELF-CONTAINED ON PURPOSE, for the reason every shared corpus-runner header
 // is: its two consumers have disjoint link sets (`dss_examples_runner` links
-// the compiler, `integrated_tests` links nlohmann_json alone).
+// the compiler, `integrated_tests` links nlohmann_json alone) -- and the one
+// unit of the compiler both DO build is the path substrate (`integrated_tests`
+// compiles path_identity.cpp beside its runner), which this header asks where a
+// library's directory is (P69 H6: the library's own `lexically_normal()` destroys
+// a `\\?\` or `\\server\share` root on the MinGW build, and its `absolute()`
+// re-roots a share onto the local drive).
+
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, normalizeKeepingRoot, parentWithinRoot
 
 #include <filesystem>
 #include <set>
@@ -115,9 +122,9 @@ loaderSearchPathValue(std::vector<std::filesystem::path> const& resolvedLibrarie
         // The non-throwing overload: the throwing one consults the process
         // working directory and ends a run whose cwd has been deleted.
         std::error_code ec;
-        auto file = std::filesystem::absolute(lib, ec);
+        auto file = dss::core::absoluteKeepingRoot(lib, ec);
         if (ec) file = lib;
-        auto dir = file.lexically_normal().parent_path();
+        auto dir = dss::core::parentWithinRoot(dss::core::normalizeKeepingRoot(file));
         std::string const spelled = dir.make_preferred().string();
         if (spelled.empty() || !seen.insert(spelled).second) continue;
         if (!value.empty()) value += kLoaderSearchPathListSeparator;

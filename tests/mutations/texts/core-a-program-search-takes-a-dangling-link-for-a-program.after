@@ -1,0 +1,1 @@
+    return fs::is_regular_file(candidate, ec) && !ec ? CandidateVerdict::Executable

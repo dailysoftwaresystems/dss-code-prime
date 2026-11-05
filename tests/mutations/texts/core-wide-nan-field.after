@@ -1,0 +1,2 @@
+            case Class::NaN:      return {(std::uint64_t{1} << 63)                // integer bit
+                                              | (std::uint64_t{1} << 62),             // the field

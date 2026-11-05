@@ -1,0 +1,2 @@
+        if (formatByName.at(TargetSpec::parse(spec)->formatName)
+                ->isImageFlavor()) {

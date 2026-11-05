@@ -1,0 +1,2 @@
+            NodeId const selected = model.selectedGenericExpr(n);
+            if (!selected.valid()) return std::nullopt;

@@ -1,0 +1,1 @@
+        print((f"ninja-deps: FAIL {build_dir} -- {len(flagged)} of {total} objects "

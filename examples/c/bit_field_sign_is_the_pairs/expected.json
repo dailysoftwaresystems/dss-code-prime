@@ -1,0 +1,46 @@
+{
+  "$comment": "P69 (lane lm; a review of checkpoint 21, findings F1 and N2): a bit-field's sign is the pair's - a plain `char` field by the target's plain-char answer (C 6.2.5p15), an enumeration field by the integer type its enumeration is compatible with (C 6.7.2.2p4: `int` under the Microsoft x64 ABI, `unsigned int` for one with no negative value under SysV, AAPCS and Darwin) - read through a constant object and a volatile one; the program asks the pair's own answers and checks every field against them. MEASURED 2026-10-15 (pe64, both pipelines): the run-time extraction read every plain `char` field UNSIGNED (a list of its own, no `Char`) while the constant tier read it by the target's sign, and `if (g.b == -1) return 42; return 7;` over a constant `g` died of an illegal instruction - the fold said TRUE and the code after the `if` was marked never reached. RED-ON-DISABLE: restore that list in `emitBitfieldExtract` -> exit 1 (or the illegal instruction) on every signed-char target. The release arm reads the same fields through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

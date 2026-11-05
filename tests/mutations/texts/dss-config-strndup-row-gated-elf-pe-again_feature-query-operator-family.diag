@@ -1,0 +1,1 @@
+and on macho the row imports libSystem's (its `dlsym` finds strndup and Apple clang

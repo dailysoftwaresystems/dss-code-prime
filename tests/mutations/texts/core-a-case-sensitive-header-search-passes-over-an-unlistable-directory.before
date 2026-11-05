@@ -1,0 +1,2 @@
+        bool const      spelled = listsExactly(cache, dir, name.native(), listingError);
+        if (listingError) return unlistedMatch(dir, name, matching, cache, listingError, reached);

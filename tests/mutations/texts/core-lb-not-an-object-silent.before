@@ -1,0 +1,3 @@
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, lbPath,
+                              "'semantics.libraryBuiltins' must be an object "
+                              "{ prefix, functions }");

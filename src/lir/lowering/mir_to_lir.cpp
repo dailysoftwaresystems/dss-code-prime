@@ -937,6 +937,24 @@ struct Lowerer {
     // reserved room for (a silent overrun of the neighbouring slot).
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
                                     allocaSlotAlignByFunc_;
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495) — A CALLER PLACES EVERY
+    // STACK-PASSED ARGUMENT WHERE THE CALLEE'S ABI EXPECTS IT, AT ITS DECLARED
+    // ALIGNMENT, WHATEVER SP'S OWN ALIGNMENT IS AT THE CALL. The outgoing cursor
+    // places a stacked by-value carrier at its alignment RELATIVE to SP
+    // (`StackArgCursor::placeNamedAggregate`), and SP is only `stackAlignment`-
+    // aligned, so a carrier aligned past it landed misaligned in absolute terms,
+    // where gcc's and clang's callees use the bytes in place (✔MEASURED, the native
+    // witness in run f26c-s22: their `&s` misplaced for 32, 64 and 256, every value
+    // right). `stackedArgAlign_` is THIS function's widest carrier alignment
+    // (`functionStackedArgAlignment`, 0 = none past the stack's); when it exceeds the
+    // stack alignment the function runs on the ONE dynamic frame model -- the VLA
+    // frame-pointer model, "SP moves at run time" -- realigned once after its
+    // parameters are received (`emitPendingStackRealign`), every VLA of it rounded to
+    // the same alignment, and the frame's outgoing area sized to it
+    // (`FuncLocalAlignment::stackedArgAlignBytes`). Reset per function.
+    std::uint32_t                   stackedArgAlign_ = 0;
+    bool                            stackRealignPending_ = false;
+    std::unordered_map<std::uint32_t, std::uint32_t> stackedArgAlignByFunc_;
     // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: for the SEH
     // filter funclet currently being lowered, the MIR function whose frame its
     // `RecoverParentFrameSlot` ops read. Set per function from the scope records
@@ -1214,16 +1232,33 @@ struct Lowerer {
     // address is taken) when the format declares `externAddrBinding ==
     // Got`. Distinct from `slotIndirectAddrSymbols_` (the Mach-O DSS-local
     // __got model, data-only): there the __got slot is DSS-bound + reached
-    // via lea+deref; HERE the FOREIGN linker owns the slot, reached via
-    // the arm64 GOT-page relocs of the `lea_extern_got` macro. The two
-    // are mutually exclusive by FORMAT (a format declares dataImportBinding
-    // OR externAddrBinding, never both), so their arms never contend.
-    // Likewise disjoint from the `externCallDispatch == IndirectSlot`
-    // contribution above: no shipped format declares BOTH `got` and
-    // `indirect-slot`, and the slot-deref arm is ordered first anyway.
+    // via lea+deref; HERE the slot is one the LINK makes (a foreign
+    // linker's GOT, or `lowerGotSlotReferences` in DSS's own image link),
+    // reached through the `lea_extern_got` row. ★ P69
+    // (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): a format MAY
+    // declare BOTH, and the ELF DSO and every Mach-O image do, deliberately:
+    // a DATUM is in both sets and takes the slot-indirect arm, which
+    // `lowerGlobalAddr` orders FIRST, so it keeps the slot the image binds
+    // for it; a FUNCTION is only in this set, so its ADDRESS takes the GOT
+    // arm while a call to it still folds to a direct call. (This used to
+    // say the two were mutually exclusive by format; nothing validated
+    // that, and the order below is what makes the combination sound.)
+    // The `externCallDispatch == IndirectSlot` contribution above combines
+    // with it the same way, and the PE relocatable documents declare both
+    // (P69 review M2): a WEAK import is in the slot-indirect set too, so it
+    // keeps its object-carried `.refptr` slot — its call site dereferences
+    // that slot, and the slot-deref arm is ordered first — while a STRONG
+    // function import's address takes the GOT arm (COFF has no GOT
+    // relocation, so the link gives it a carried pointer,
+    // `lowerGotSlotReferences`; P69 re-review MAJOR 2).
     // Empty for every non-`got` module ⇒ lowering byte-identical.
     std::optional<ExternAddrBinding> externAddrBinding_;
     std::unordered_set<std::uint32_t> externAddrGotSymbols_;
+    // ★★ P69 round 4 (D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO):
+    // every WEAK import. Its ADDRESS takes the GOT arm above on every format,
+    // and a call to it outside the slot shape is a call THROUGH that address
+    // (`weakImportCalledThroughItsAddress`) — see the constructor.
+    std::unordered_set<std::uint32_t> weakImportSymbols_;
 
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE format's thread-local
     // access block + the ctor-populated set of THREAD-LOCAL SymbolIds
@@ -1270,105 +1305,77 @@ struct Lowerer {
 
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
     // block-address materialization. A block whose address is taken gets ONE local
-    // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
-    // lazily to 1 + max(existing function/global SymbolId) on first use so a minted
-    // id can't collide with a user symbol (same discipline as hir_to_mir's
-    // string-literal synthetic minter). `blockToSym_` keys the dedup off the MIR
-    // block id (stable for the duration of THIS lowering — the LIR-pass block
-    // renumbering happens AFTER, and the BlockRef operand carried on the emitted
-    // `lea` is what survives those passes via remapBlockRef).
+    // symbol (deduped by MIR block id within the module), drawn from `symbolIds_`.
+    // `blockToSym_` keys the dedup off the MIR block id (stable for the duration
+    // of THIS lowering — the LIR-pass block renumbering happens AFTER, and the
+    // BlockRef operand carried on the emitted `lea` is what survives those passes
+    // via remapBlockRef).
     //
     // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5 survey): every symbol this
-    // minter produces (block-address `lea`s via lowerBlockAddress, jump-table
+    // lowering mints (block-address `lea`s via lowerBlockAddress, jump-table
     // symbols via mintJumpTableSymbol, fneg sign-mask symbols via
-    // mintSignMaskSymbol) is minted PAST the module's function/global/extern
-    // high-water mark, so it can NEVER collide with a `threadLocalSymbols_`
-    // entry — those riprel/symbol-relative emissions need no TLS exclusion
-    // (unreachable for a TLS symbol by construction).
-    std::optional<std::uint32_t>                  nextBlockSym_;
+    // mintSignMaskSymbol, the imports it serves itself) is minted PAST the
+    // module's whole id space, so it can NEVER collide with a
+    // `threadLocalSymbols_` entry — those riprel/symbol-relative emissions need
+    // no TLS exclusion (unreachable for a TLS symbol by construction).
     std::unordered_map<std::uint32_t, SymbolId>   blockToSym_;
-    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the highest block symbol
-    // PRE-MINTED at HIR→MIR (a label whose address a static initializer took). Such
-    // a symbol is neither a function, a global, nor an extern, so the high-water
-    // scan below would step right over it and this minter would hand the SAME id to
-    // a different block — two definitions of one symbol, which the linker reports
-    // as "declared more than once". Folded into the seed of BOTH minters.
-    std::uint32_t preMintedBlockSymCeiling_ = 0;
-    // The seed's high-water mark (for the refusal's sentence) and whether the
-    // refusal was already made — it is made ONCE per lowering, not per mint.
-    std::uint32_t symbolHighWater_               = 0;
+    // ★ THE LOWERING'S IDS CONTINUE THE MODULE'S
+    // (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE, the sixth minter).
+    // ONE continuation per lowering: its first id is `mir.symbolIdEnd()` — past
+    // the name table the module was made from, every symbol the module defines
+    // and every id minted for it since — and it is kept clear of the one kind of
+    // id that can sit BESIDE a module, outside its end: an import row handed in
+    // (the constructor). A block symbol an export publishes is no such id: the
+    // export DEFINES it, and the module's end is past it from the moment the
+    // instruction is built (`MirBuilder::addInst`, every door that writes one).
+    // The seed used to be a SCAN — the highest function, global and handed-in
+    // import id, plus one. ✔MEASURED 2026-10-08 on a module made from a table of
+    // nine names and holding one: block symbols 2 and 3, a jump table 2 and its
+    // blocks 3..9 — ids of the table, each some other name's, and no diagnostic.
+    // A scan sees what a module HOLDS; a table owns far more (a declaration
+    // defined elsewhere, an import nobody handed in, a local, a tag).
+    MirSymbolIdContinuation symbolIds_{mir};
+    // The refusal of an exhausted id space is made ONCE per lowering, not per mint.
     bool          symbolSpaceExhaustedReported_  = false;
 
     // ★ THE ONE MINTER OF LOWERING-SYNTHESIZED SYMBOLS (P68 round 8, lane `ht`,
-    // part 1c). Block, jump-table and sign-mask symbols draw from ONE monotone
-    // sequence seeded once, past the module's highest function / global / extern
-    // SymbolId and the pre-minted block-symbol ceiling, so none can collide with
-    // an id the module owns. The seed used to be written out TWICE — here and in
-    // `mintJumpTableSymbol` — as `maxV + 1u` then `(*nextBlockSym_)++`, and both
-    // WRAPPED: a module holding the top of the 32-bit space minted 0, the invalid
-    // sentinel, then walked up through ids the module already owns; and on the
-    // way it could hand out 0xFFFFFF01, the writer-reserved PE `_tls_index`
-    // singleton, aliasing a block address onto the TLS index. Now the reserved
-    // values are stepped over by the owner's own predicate
-    // (`isWriterReservedSymbolIdValue`), and exhaustion is refused ONCE, by name
+    // part 1c; its seed replaced in P69). Block, jump-table and sign-mask
+    // symbols, and the imports this lowering serves itself, draw from ONE
+    // sequence — `symbolIds_`, which continues the module's id space through the
+    // module's own door. So a value a format writer reserves is stepped over by
+    // its owner's predicate (it used to be handed out: 0xFFFFFF01, the PE
+    // `_tls_index` singleton, aliased a block address onto the TLS index), the
+    // last value of the space is never handed out, and nothing wraps (a module
+    // holding the top id used to mint 0, the invalid sentinel, then walk up
+    // through ids it owns). Exhaustion is refused ONCE, by name
     // (`L_SymbolIdSpaceExhausted`, unsuppressable): the lowering's error gate
     // then withholds the module, so the invalid `SymbolId{}` returned meanwhile
     // is never emitted — the discipline `hir_to_mir`'s synthetic minters keep.
-    // `nextBlockSym_ == 0` means "exhausted": 0 is never a minted id.
-    [[nodiscard]] SymbolId mintPastHighWater(std::string_view what) {
-        constexpr std::uint32_t kTop = std::numeric_limits<std::uint32_t>::max();
-        if (!nextBlockSym_.has_value()) {
-            std::uint32_t maxV = preMintedBlockSymCeiling_;
-            for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
-                if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
-                    maxV = v;
-                }
-            }
-            for (std::uint32_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
-                if (std::uint32_t const v = mir.globalSymbol(mir.globalAt(gi)).v; v > maxV) {
-                    maxV = v;
-                }
-            }
-            // EXTERN imports occupy SymbolIds too (the exec entry/_start/exit
-            // trampoline externs are minted past the function/global high-water at
-            // HIR→MIR time). A block symbol minted into their range would collide
-            // at link (K_SymbolUndefined "declared more than once"), so clear them.
-            for (std::uint32_t const ev : externSymbols) {
-                if (ev > maxV) maxV = ev;
-            }
-            symbolHighWater_ = maxV;
-            nextBlockSym_    = maxV == kTop ? 0u : maxV + 1u;
+    [[nodiscard]] SymbolId mintPastTheModulesIds(std::string_view what) {
+        SymbolId const minted = symbolIds_.mint();
+        if (minted.valid()) return minted;
+        if (!symbolSpaceExhaustedReported_) {
+            symbolSpaceExhaustedReported_ = true;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_SymbolIdSpaceExhausted;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "cannot mint a {}: the SymbolId space is exhausted — this module's "
+                "ids end at {} (its name table, every symbol it defines and every "
+                "id already minted for it), and the lowering's own symbols continue "
+                "from there; wrapping would land on the invalid sentinel and on ids "
+                "the module already owns",
+                what, symbolIds_.end());
+            reporter.report(std::move(d));
         }
-        std::uint32_t next = *nextBlockSym_;
-        while (next != 0 && isWriterReservedSymbolIdValue(next)) {
-            next = next == kTop ? 0u : next + 1u;
-        }
-        if (next == 0) {
-            nextBlockSym_ = 0u;
-            if (!symbolSpaceExhaustedReported_) {
-                symbolSpaceExhaustedReported_ = true;
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::L_SymbolIdSpaceExhausted;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "cannot mint a {}: the SymbolId space is exhausted — this module's "
-                    "highest function / global / extern id is {}, and the lowering "
-                    "mints its own symbols past that mark; wrapping would land on the "
-                    "invalid sentinel and on ids the module already owns",
-                    what, symbolHighWater_);
-                reporter.report(std::move(d));
-            }
-            return SymbolId{};
-        }
-        nextBlockSym_ = next == kTop ? 0u : next + 1u;
-        return SymbolId{next};
+        return SymbolId{};
     }
 
     [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
         if (auto it = blockToSym_.find(block.v); it != blockToSym_.end()) {
             return it->second;
         }
-        SymbolId const sym = mintPastHighWater("block symbol");
+        SymbolId const sym = mintPastTheModulesIds("block symbol");
         if (!sym.valid()) return sym;   // refused by name above; nothing is recorded
         blockToSym_.emplace(block.v, sym);
         return sym;
@@ -1419,26 +1426,83 @@ struct Lowerer {
     // translate them to LIR. `sehScopesIn_` is the input; as each function lowers,
     // its blocks' MIR→LIR ids + owning func index are recorded persistently (the
     // per-function `mirBlockToLirBlock` is cleared each function, so it can't be
-    // read after the fact). `run()` then builds one `SehScopeDescriptor` per scope.
+    // read after the fact). `run()` then builds each scope's `SehScopeDescriptor`s
+    // (`buildSehScopeDescriptors`).
     std::span<MirSehScope const>                     sehScopesIn_;
     std::unordered_map<std::uint32_t, LirBlockId>    sehMirBlockToLir_;
     std::unordered_map<std::uint32_t, std::uint32_t> sehMirBlockFuncIndex_;
     std::vector<SehScopeDescriptor>                  sehScopeDescriptors_;
 
+    // ── A GUARDED REGION IS A SET OF CONTIGUOUS RUNS, ONE RECORD PER RUN ────────
+    // (D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES)
+    //
+    // Every MIR block gets its LIR block BEFORE any body is lowered, so a block
+    // this lowering CREATES while lowering an instruction receives an id after
+    // all of them, and a LIR block id is a position: the created block is laid
+    // out at the END of the function, after the one contiguous run the region's
+    // own blocks make. A scope record used to name that run alone, so whatever
+    // sat in a created block was outside the `__try` it was written in.
+    // ✔MEASURED P69 on pe64, debug and release: an `asm goto` whose output is a
+    // structure left in a register, written in a guarded body over a no-access
+    // page, ended the process with 0xC0000005 — its two edge stores sat in the
+    // function's last two blocks, past the scope's end.
+    //
+    // ⇒ A CREATED BLOCK BELONGS TO THE MIR BLOCK BEING LOWERED WHEN IT IS
+    // CREATED, AND TO EVERY REGION THAT BLOCK IS IN. Every creator goes through
+    // ONE place (`createLateBlock`), which writes the pair down; for each scope
+    // `buildSehScopeDescriptors` then emits, after the record of the region's
+    // own blocks, one more record per MAXIMAL RUN of contiguous created blocks
+    // of that region — same handler, same funclet, same personality. No creator
+    // asks anything and none can forget to: the creators today are an
+    // `asm goto`'s edge blocks (`createAsmCaptureBlocks`), the LL/SC retry loop
+    // of an atomic compare-exchange (`lowerAtomicCas`, whose `done` block also
+    // receives THE REST of the guarded MIR block), a phi edge's split block
+    // (`lowerTerminator`), a dense switch's table-read block and a sparse one's
+    // compare chain. `run()` holds the lowering to it on the finished module:
+    // a function that has a scope and a block nobody wrote down is refused.
+    //
+    // What this tier knows of the table is only that a record is a RANGE. That
+    // is the whole capability: a format that hands scopes in declared a scope
+    // table of such records (`sehPersonality`), and a format with none never
+    // reaches here — its `__try` is refused where the region resolves
+    // (`synthesizeSehFunclets`). The ORDER of the records is the one sentence of
+    // mir/merge/synth_seh_funclets.hpp, which owns the order of REGIONS: the
+    // scopes arrive in table order, and each region's own records stay together
+    // — its body's record, then its runs in address order. Nothing here sorts
+    // across regions, and nothing after this tier sorts at all.
+    struct LateBlock {
+        LirBlockId    block;       // created while lowering…
+        MirBlockId    owner;       // …this MIR block,
+        std::uint32_t funcIndex;   // of this function
+    };
+    std::vector<LateBlock>                           lateBlocks_;   // creation order = layout order
+    std::unordered_map<std::uint32_t, std::uint32_t> sehMirBlockPosition_;   // MIR block .v → its place in its function
+    MirBlockId                                       loweringMirBlock_{};
+
+    // THE ONE PLACE A BLOCK IS CREATED AFTER THE 1:1 PRE-PASS. Only a module
+    // that carries scopes pays for the record.
+    [[nodiscard]] LirBlockId createLateBlock() {
+        LirBlockId const created = lir.createBlock();
+        if (!sehScopesIn_.empty()) {
+            lateBlocks_.push_back(LateBlock{created, loweringMirBlock_, currentFuncIndex_});
+        }
+        return created;
+    }
+
     // Mint a fresh synthetic SymbolId for a jump table's `.data` item. Draws
-    // from the SAME monotone `nextBlockSym_` sequence `mintBlockSymbol` uses, so
-    // a table symbol can never collide with a block symbol (or a user / extern
-    // symbol — the shared lazy seed sits past every function/global/extern id).
-    // Not deduped (each dense switch gets its own table).
+    // from the SAME sequence `mintBlockSymbol` uses (`symbolIds_`), so a table
+    // symbol can never collide with a block symbol, nor with any id of the
+    // module's own space or beside it. Not deduped (each dense switch gets its
+    // own table).
     [[nodiscard]] SymbolId mintJumpTableSymbol() {
-        // The SAME sequence and seed as `mintBlockSymbol` — through the one minter,
-        // so the two cannot disagree about the seed or about exhaustion.
-        return mintPastHighWater("jump-table or sign-mask symbol");
+        // The SAME sequence as `mintBlockSymbol` — through the one minter, so the
+        // two cannot disagree about where the ids start or about exhaustion.
+        return mintPastTheModulesIds("jump-table or sign-mask symbol");
     }
 
     // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): a fresh synthetic SymbolId for a float-
-    // negate sign-mask `.rodata` item. Draws from the SAME monotone
-    // `nextBlockSym_` sequence (via `mintJumpTableSymbol`), so a mask symbol
+    // negate sign-mask `.rodata` item. Draws from the SAME sequence (via
+    // `mintJumpTableSymbol`), so a mask symbol
     // can never collide with a block/table/user/extern symbol. Per-occurrence.
     [[nodiscard]] SymbolId mintSignMaskSymbol() { return mintJumpTableSymbol(); }
 
@@ -1463,7 +1527,8 @@ struct Lowerer {
             std::vector<SymbolBinding> indirectSlotBindings,
             std::vector<SymbolBinding> preemptibleDefinitionBindings,
             std::span<DefinedSymbolName const> definedSymbolNames,
-            std::optional<ObjectFormatKind> assemblyFormatKind)
+            std::optional<ObjectFormatKind> assemblyFormatKind,
+            std::span<std::string const> imageDefinedNames)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
@@ -1481,6 +1546,9 @@ struct Lowerer {
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
             externSymbols.insert(e.symbol.v);
+            // An import row sits BESIDE the module: a module built by hand has
+            // no table whose end covers the row's id (see `symbolIds_`).
+            symbolIds_.keepClearOf(e.symbol);
             // LD-2: index by mangled name so a minted F128 softcall reuses a
             // user import of the same helper (dedup at the link boundary).
             suppliedExternByName_.emplace(e.mangledName, e.symbol);
@@ -1493,9 +1561,41 @@ struct Lowerer {
         // explicitly declared GotIndirect binding — a nullopt binding (a
         // relocatable format, which binds no imports) leaves the set empty
         // rather than guessing an indirection level.
+        // ★★ P69 (D-LIR-THREAD-LOCAL-IMPORT-STAMPED-READ-THROUGH-A-SLOT): a
+        // THREAD-LOCAL import never joins this set, under this binding or the
+        // dispatch below. Its access is the format's TLS sequence
+        // (`lowerThreadLocalGlobalAddr`, which `lowerGlobalAddr` runs FIRST),
+        // and no model DSS lowers reads an address slot: local-exec adds a
+        // link-time tpoff to the thread pointer, `pe-indexed` reads the
+        // image's `_tls_index`, `macho-tlv` calls through the variable's own
+        // descriptor (the one that would, initial-exec, is unimplemented and
+        // refused by name, D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC). The set is
+        // what the import row's `readThroughSlot` is stamped from, so a
+        // thread-local in it left stamped as a slot read its code never
+        // makes, and the link then minted an address slot for the
+        // definition and retargeted the thread-pointer relocation into it —
+        // ✔MEASURED at HEAD 71648598 and this round's tree alike: a DSS
+        // `extern _Thread_local int shared;` read against gcc's or clang's
+        // object of `_Thread_local int shared = 7;` was refused on both ELF
+        // execs (`K_RelocationKindMismatch`, the writer's thread-local
+        // data-item backstop) where GNU ld and ld.lld link it and it exits 7.
+        // ★ P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a name
+        // the IMAGE defines (`imageDefinedNames`, the document's
+        // `imageDefinedSymbols`) never joins this set, under this binding or
+        // the dispatch below. It is in the image, never an import, so no slot
+        // holds its address: its reference is DIRECT, as cl's own
+        // `lea __ImageBase` is, and every unit of a link -- a DSS unit, a DSS
+        // `-c` object or library member, a cl object -- reaches it in ONE
+        // shape the link binds to the image.
+        auto const imageDefines = [&](ExternImport const& e) {
+            return std::find(imageDefinedNames.begin(), imageDefinedNames.end(),
+                             e.mangledName) != imageDefinedNames.end();
+        };
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
-                if (e.isData) slotIndirectAddrSymbols_.insert(e.symbol.v);
+                if (e.isData && !e.isThreadLocal && !imageDefines(e)) {
+                    slotIndirectAddrSymbols_.insert(e.symbol.v);
+                }
             }
         }
         // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
@@ -1523,16 +1623,21 @@ struct Lowerer {
         // slot deref — the half-narrowing the linker's own comment warns
         // about (retarget narrowed, call shape format-wide) is a miscompile,
         // and the two halves moving together is what makes this one safe.
+        // (A thread-local import stays out here too — the rule above, which is
+        // about the ACCESS, not the binding: a weak thread-local's access reads
+        // no `.refptr` slot either.)
         if (externCallDispatch_ == ExternCallDispatch::IndirectSlot) {
             for (auto const& e : externImports) {
-                if (importTakesSlot(e.binding)) {
+                if (importTakesSlot(e.binding) && !e.isThreadLocal && !imageDefines(e)) {
                     slotIndirectAddrSymbols_.insert(e.symbol.v);
                 }
             }
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
-        // extern-address format (arm64 ELF relocatable / static-archive
-        // member), an undefined extern's ADDRESS-as-a-VALUE must
+        // extern-address format (every relocatable and static-archive
+        // document since P69 — the arm64 ELF ones since TF-C52 — and the
+        // images that cannot make a stub canonical: ELF `-dyn`, Mach-O, PE),
+        // an undefined extern's ADDRESS-as-a-VALUE must
         // materialize through a foreign-linker GOT slot (the
         // `lea_extern_got` macro), NOT an absolute page-pair lea a foreign
         // default-PIE link would reject. Collect ALL extern imports —
@@ -1545,6 +1650,28 @@ struct Lowerer {
         // arm; only the value/argument use reaches the GOT macro.)
         if (externAddrBinding_ == ExternAddrBinding::Got) {
             for (auto const& e : externImports) {
+                externAddrGotSymbols_.insert(e.symbol.v);
+            }
+        }
+        // ★★ P69 round 4 (D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO):
+        // A WEAK import may resolve to NOTHING, and then neither a displacement
+        // nor a branch reaches it in an image the loader moves or whose writer
+        // gives the branch no stub (`weakResolvedToNothing` refuses both there),
+        // while a SLOT holding 0 is what every image link makes for it
+        // (`lowerGotSlotReferences`, `resolvedToNothing`). So its ADDRESS takes
+        // the GOT arm on every format, and a call to it is a call through that
+        // address (`weakImportCalledThroughItsAddress`): gcc's own shape for a
+        // weak symbol on aarch64 and under -fPIE / -fno-plt, clang's on PE (a
+        // slot for both the test and the call), ld64's GOT load (✔MEASURED, the
+        // row's probe runs). Keyed on the BINDING, never on a format: the
+        // address of a symbol that may be absent is read, not computed. A DATUM
+        // whose format binds data imports through a slot keeps that arm, which
+        // `lowerGlobalAddr` orders first; a format that already reaches weak
+        // imports through its own slot (`indirectSlotBindings: ["weak"]`) keeps
+        // that call shape, which `externRefUsesSlot` answers first.
+        for (auto const& e : externImports) {
+            if (e.binding == SymbolBinding::Weak) {
+                weakImportSymbols_.insert(e.symbol.v);
                 externAddrGotSymbols_.insert(e.symbol.v);
             }
         }
@@ -1794,6 +1921,18 @@ struct Lowerer {
     // the only way they can still agree.
     [[nodiscard]] bool externRefUsesSlot(SymbolId s) const noexcept {
         return slotIndirectAddrSymbols_.contains(s.v);
+    }
+
+    // ★★ P69 round 4 (D-LIR-WEAK-FUNCTION-NAMED-DIRECTLY-WHERE-NO-FIELD-REACHES-ZERO):
+    // is a call to `s` a call THROUGH its address? For a WEAK import outside
+    // the slot shape, yes: the address comes out of the GOT arm (a slot holding
+    // 0 when nothing defines the name) and the call branches to the register,
+    // so a guarded call never taken links on every image and an unguarded one
+    // jumps to 0 as the references' PLT entry does. Read by the direct-callee
+    // fold (which must then keep the address) and by `lowerCall` (which must
+    // then call the register), so the two cannot disagree.
+    [[nodiscard]] bool weakImportCalledThroughItsAddress(SymbolId s) const noexcept {
+        return weakImportSymbols_.contains(s.v) && !externRefUsesSlot(s);
     }
 
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: may this artifact's
@@ -5029,7 +5168,7 @@ struct Lowerer {
         // with the fall-off-the-end one.
         std::vector<LirBlockId> fellIntoLabel;
         if (!lowerAsmTemplateToLirRun(tree, dialect, target, bindings, body,
-                                      reporter, stubBindings, &fellIntoLabel,
+                                      reporter, nullptr, stubBindings, &fellIntoLabel,
                                       assemblyFormatKind_)) {
             return false;
         }
@@ -5731,6 +5870,11 @@ struct Lowerer {
             // run on each edge, and a spilled output's store is placed by the
             // rewriter at the head of each edge — which is sound only on a
             // block no other path enters.
+            // ★★ IN A GUARDED BODY THOSE BLOCKS ARE A RUN OF THE BODY'S REGION
+            // (`createLateBlock`): a by-address output is stored through its
+            // object's address on each of them, that address is the program's,
+            // and the store's fault reaches the handler of the `__try` the
+            // statement is written in — the run has a scope record of its own.
             captureBlocks = createAsmCaptureBlocks(succs, outs, ins);
             // The label half of the operand-spelling rule above: a spelling
             // bound twice is resolved by FIRST match, so a repeat would bind
@@ -5947,7 +6091,7 @@ struct Lowerer {
         std::vector<LirBlockId> blocks;
         blocks.reserve(succs.size());           // every edge; see above
         for (std::size_t j = 0; j < succs.size(); ++j) {
-            blocks.push_back(lir.createBlock());
+            blocks.push_back(createLateBlock());
         }
         return blocks;
     }
@@ -7024,11 +7168,38 @@ struct Lowerer {
         // now the SHARED `emitAlignUpToPowerOfTwo` primitive, which this sequence
         // used to spell inline. Its docblock carries the agnosticism argument for
         // the reg-reg `and` + materialized negative mask.
+        // ★ P69 (fold f26c, ledger 495): in a function realigned for a stacked argument
+        // (`emitPendingStackRealign`), the descent is a multiple of THAT alignment, so
+        // SP keeps the boundary every later call's outgoing area needs.
+        std::uint32_t const descentAlign = std::max(stackAlign, stackedArgAlign_);
         std::optional<LirReg> const size16Opt =
-            emitAlignUpToPowerOfTwo(sizeWithHeadroom, stackAlign,
+            emitAlignUpToPowerOfTwo(sizeWithHeadroom, descentAlign,
                                     "a variable-length array's runtime byte size");
         if (!size16Opt.has_value()) { poisonValue(id); return; }
-        LirReg const size16 = *size16Opt;
+        LirReg size16 = *size16Opt;
+        // ★ THE DESCENT'S SIZE OPERAND IS A REGISTER DEFINED FOR IT ALONE. Under a
+        //   calling convention that declares a guard page, the callconv pass COUNTS
+        //   THIS REGISTER DOWN while it walks the pages the descent crosses
+        //   (D-CSUBSET-VLA-WIN64-STACK-PROBE) — sound only because nothing reads it
+        //   after the descent. The headroom add and the align-up above each define a
+        //   fresh register, but an alignment of 1 hands back the align-up's INPUT, so
+        //   with no headroom either the descent would read the program's own size
+        //   value, which other instructions may still read. That one case gets a copy
+        //   of its own, so the contract holds by construction whatever a target
+        //   declares (no shipped cc aligns its stack to 1, so no shipped byte moves).
+        if (size16 == *sizeRaw) {
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "a variable-length array's stack-descent size");
+                poisonValue(id);
+                return;
+            }
+            LirReg const own = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(size16)};
+            emitInst(*movOp, own, ops, /*payload=*/0, /*flags=*/0);  // width 64
+            size16 = own;
+        }
         // `sub sp, size16`: descend the stack. operand0 = the physical SP (the r/m
         // destination+source1 on x86, the baked Rd=Rn=sp on arm64), operand1 = the
         // aligned byte count. result:none (SP mutates in place). A physical-reg
@@ -7062,6 +7233,84 @@ struct Lowerer {
             base = *alignedBase;
         }
         defineValue(id, base);
+    }
+
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495): the widest alignment a
+    // stacked by-value carrier of `mf`'s calls states -- the SAME answer each
+    // carrier's `ByValueStackAgg` marker states (`byValueCarrierAlignment`), so the
+    // frame realigns to exactly what the outgoing cursor places by. 0 when `mf`
+    // passes nothing on the stack by value.
+    [[nodiscard]] std::uint32_t functionStackedArgAlignment(MirFuncId mf) const {
+        std::uint32_t widest = 0;
+        std::uint32_t const bc = mir.funcBlockCount(mf);
+        for (std::uint32_t bi = 0; bi < bc; ++bi) {
+            MirBlockId const mb = mir.funcBlockAt(mf, bi);
+            std::uint32_t const n = mir.blockInstCount(mb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const id = mir.blockInstAt(mb, i);
+                if (mir.instOpcode(id) != MirOpcode::ByValueStackArg) continue;
+                widest = std::max(widest,
+                                  byValueCarrierAlignment(
+                                      mir.instType(id),
+                                      mir.instPayload(id) & kByValueStackArgSizeMask,
+                                      mir.instPayload2(id)));
+            }
+        }
+        return widest;
+    }
+
+    // ★ P69 (fold f26c, ledger 495): REALIGN SP to `stackedArgAlign_` -- once, in the
+    // entry block, after the parameters are received (their `arg` reads take ABI
+    // registers this sequence's own registers may not clobber first) and before any
+    // call, VLA or scope watermark:
+    //     w = sp_copy SP          (the dynamic frame's capture: SP + the outgoing area,
+    //                              which lir_callconv sizes to a multiple of the
+    //                              alignment, so w ≡ SP mod it)
+    //     d = w & (align - 1)     (the reg-reg `and` with a materialized mask, as
+    //                              `emitAlignUpToPowerOfTwo` spells it, both ISAs' form)
+    //     sub_sp_reg SP, d        (SP descends to the boundary)
+    // The `sub_sp_reg` is the dynamic frame model's own signal, so the function takes
+    // the frame-pointer frame lir_callconv builds for a VLA -- the fixed frame off FP,
+    // the frame pointer saved and kept out of allocation, the CFA rule moved to it,
+    // `SP<-FP` before the epilogue -- with no second model. Every later SP move keeps
+    // the boundary: a VLA rounds its size to the same alignment (`lowerVlaAlloca`) and
+    // a watermark is captured after this point.
+    void emitPendingStackRealign() {
+        stackRealignPending_ = false;
+        auto const subOp  = opcode(MnemonicSlot::SubSpReg);
+        auto const copyOp = opcode(MnemonicSlot::SpCopy);
+        auto const andOp  = opcode(MnemonicSlot::And);
+        auto const* cc = target.callingConvention(0);
+        if (!subOp.has_value() || !copyOp.has_value() || !andOp.has_value() || cc == nullptr
+            || !cc->stackPointer.has_value() || !cc->framePointer.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_VlaDynamicAllocaUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "a call of this function passes an argument on the stack aligned to {} "
+                "bytes, past the stack's {}, and target '{}' declares no dynamic stack "
+                "frame (`sub_sp_reg`, `sp_copy`, `and`, a frame pointer) to realign the "
+                "stack pointer by: the argument cannot be placed where the callee reads "
+                "it", stackedArgAlign_, ccStackAlignment(), target.name());
+            reporter.report(std::move(d));
+            return;
+        }
+        LirReg const sp = makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        LirReg const w = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
+            emitInst(*copyOp, w, ops, /*payload=*/0, /*flags=*/0);
+        }
+        std::optional<LirReg> const mask =
+            emitBareConstToFresh(static_cast<std::int64_t>(stackedArgAlign_) - 1);
+        if (!mask.has_value()) return;
+        LirReg const d = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{LirOperand::makeReg(w), LirOperand::makeReg(*mask)};
+            emitInst(*andOp, d, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        std::array<LirOperand, 2> ops{LirOperand::makeReg(sp), LirOperand::makeReg(d)};
+        emitInst(*subOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
     }
 
     // VLA C5 (D-CSUBSET-VLA): capture SP into a fresh vreg — the scope-entry
@@ -7445,8 +7694,8 @@ struct Lowerer {
     // here, so nothing a later store does can reach it, and a `volatile` read
     // happens where the program performs it (C 6.7.3) instead of wherever the
     // value is next consumed. `emitWideFloatHomeCopy` is the one bytes-mover —
-    // exactly the 10 significant bytes of an x87 datum (so a packed member is
-    // never over-read), all 16 of a binary128 — and the home is recorded in
+    // the 10 value bytes of an x87 datum (its six padding bytes are not
+    // copied), all 16 of a binary128 — and the home is recorded in
     // `allocaSlotIndex_`, so every consumer rematerializes its address instead
     // of holding a long-lived register.
     void lowerF80Load(MirInstId id) {
@@ -7483,15 +7732,22 @@ struct Lowerer {
     // format axis and the target's own opcode table decides the rest, so there
     // is no arch/format identity branch here.
     //
-    // ⚠⚠ F80 MOVES THROUGH THE x87 STACK, AND THAT IS NOT AN ACCIDENT OF
-    // HISTORY. An F80 source address can be ANY `long double` lvalue's address —
-    // `lowerF80Load` copies FROM the object itself, and reads a value in place
-    // where nothing can write it first — so the address may point at a 10-byte
-    // object inside a packed struct rather than at one of this lowerer's own
-    // 16-byte scratch slots. `fld_m80`/`fstp_m80` touch exactly the 10
-    // significant bytes; a two-word 16-byte GPR copy (the shape F128 uses, and
-    // the cheaper one) would OVER-READ such a source by six bytes. F128 is a
-    // true 16-byte binary128, so its 16-byte copy is exact.
+    // ⚠⚠ F80 MOVES THROUGH THE x87 STACK: `fld_m80`/`fstp_m80` read and write
+    // exactly the 10 VALUE bytes of the datum and never its six padding bytes,
+    // so the copy carries the value and nothing else, whatever the source
+    // address is (`lowerF80Load` copies FROM the object itself, and reads a
+    // value in place where nothing can write it first). F128 is a true 16-byte
+    // binary128, so its two-word copy is exact.
+    // ⚠ WHAT THIS IS NOT: a guard against over-reading a "10-byte object". This
+    // note used to say a 16-byte copy would over-read a `long double` member of
+    // a packed structure by six bytes; no such object exists. ✔MEASURED (P69,
+    // lane `lm`; gcc 13.3.0, clang 18.1.3 and DSS on x86_64 ELF): `sizeof(long
+    // double)` is 16 and `struct __attribute__((packed)) { char c; long double
+    // v; }` is 17 bytes with `v` at offset 1 — a packed member keeps the type's
+    // 16 bytes — and gcc -O2 itself copies such an object as two 8-byte words.
+    // A two-word copy would therefore read nothing outside the object either;
+    // the x87 pair is the move the target declares for the datum, and it leaves
+    // the destination's padding bytes unwritten.
     //
     // Fail-loud (false, diagnostic already reported) if the target declares no
     // such op, or if `kind` is not a memory-resident wide float — the caller
@@ -8915,9 +9171,9 @@ struct Lowerer {
                                 "MIR F128 softcall (extern-call dispatch)");
             return std::nullopt;
         }
-        // 4. Mint. Draw the SymbolId from the shared monotone `nextBlockSym_`
-        //    sequence (collision-free: seeded past every func/global/extern id)
-        //    and record it in `externSymbols` so any downstream extern-aware
+        // 4. Mint. Draw the SymbolId from the lowering's one sequence
+        //    (`symbolIds_`: past the module's whole id space and every id beside
+        //    it) and record it in `externSymbols` so any downstream extern-aware
         //    site treats it correctly.
         SymbolId const sym = mintJumpTableSymbol();
         ExternImport imp;
@@ -9902,6 +10158,9 @@ struct Lowerer {
         }
         MirInstId const user = it->second.user;
         if (mir.instOpcode(user) != MirOpcode::Call) return false;
+        // P69 round 4: a weak import's callee address is READ, not folded —
+        // `lowerCall` calls through it (`weakImportCalledThroughItsAddress`).
+        if (weakImportCalledThroughItsAddress(mir.globalAddrSymbol(gaId))) return false;
         auto const userOps = mir.instOperands(user);
         // operand[0] is the callee slot; a GlobalAddr at operand ≥ 1 is a call
         // ARGUMENT (`f(&g)`), not the callee — keep its lea.
@@ -10408,8 +10667,10 @@ struct Lowerer {
             return;
         }
         // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got`
-        // extern-address format (arm64 ELF relocatable / static-archive
-        // member), an undefined extern's ADDRESS as a live code-form VALUE
+        // extern-address format (every relocatable and static-archive
+        // document since P69 — the arm64 ELF ones since TF-C52 — and the
+        // images that cannot make a stub canonical: ELF `-dyn`, Mach-O, PE),
+        // an undefined extern's ADDRESS as a live code-form VALUE
         // materializes through a foreign-linker GOT slot — the arm64
         // `lea_extern_got` macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:
         // sym]` (R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC). A
@@ -10555,9 +10816,11 @@ struct Lowerer {
     // build the `ByValueStackAgg` size marker — it never needs a register. The carrier
     // is only ever consumed by a Call (it sits in the Call's operand list at the
     // aggregate's argument position); aliasing the address keeps the value-map total
-    // without an extra mov. (A stray ByValueStackArg whose result is consumed by
-    // anything OTHER than a Call's by-value-stack arm would simply read the address,
-    // which is harmless — but no such source path exists.)
+    // without an extra mov. A ByValueStackArg whose result is consumed by anything
+    // OTHER than a Call's by-value-stack arm reads the address, which is what it is:
+    // since P69 fold f26c the inliner maps a spliced callee's `RecvByValueStackParam`
+    // to its caller's carrier, so the spliced body byte-copies from the caller's
+    // private copy through exactly this alias.
     // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the OWN byte alignment of the datum
     // a `ByValueStackArg` carrier carries, for the `ByValueStackAgg` marker. 0 means
     // NOT STATED, and the overflow cursor floors an unstated alignment at the slot —
@@ -10567,29 +10830,28 @@ struct Lowerer {
     // producer (`appendByValueStackArg` and the F80 scalar arm of
     // `finishScalarCallArg`), so the datum's kind is one operand away.
     //
-    // ★ WHY A SCALAR CAN BE ANSWERED HERE AND AN AGGREGATE CANNOT. A scalar's
-    // alignment is the config's bounded-natural rule — `min(size, maxAlignment)`,
-    // both read from `aggregateLayout`, no arch branch — and the size is the payload
-    // this marker already carries. An aggregate's alignment is a LAYOUT result
-    // (max over its members, raised by an `alignas`), and this tier deliberately has
-    // no layout engine: the carrier exists precisely because the LIR tier cannot
-    // compute layouts. So an aggregate states NOTHING and gets the slot.
-    //
-    // ⚠ THAT SILENCE IS SAFE ONLY WHILE AN OVER-ALIGNED AGGREGATE CANNOT REACH HERE,
-    // and it cannot: an aggregate's alignment exceeds the 8-byte slot only if it has
-    // a `long double` / `_BitInt(128)` / `alignas(16)` member, and a long-double-leaf
-    // aggregate is walled loud upstream (D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI). The
-    // day that wall lifts, the alignment must be stated at the MIR tier rather than
-    // re-derived here — the marker already has the byte for it.
-    [[nodiscard]] std::uint8_t byValueCarrierAlignment(TypeId carrierPtrTy,
-                                                       std::uint32_t bytes) const {
+    // ★ WHO ANSWERS IT. An AGGREGATE's alignment is a LAYOUT result (max over its
+    // members, raised by an `alignas`), and this tier deliberately has no layout
+    // engine — so the MIR tier STATES it, in the carrier's secondary payload
+    // (`payload2`, set by `appendByValueStackArg`; mir_node.hpp's one statement of
+    // `payload2`), and a stated alignment is returned as it stands. ★ P69 (lane
+    // `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // before it no producer stated one, which was safe only while no over-aligned
+    // aggregate could reach a carrier; a SysV MEMORY-class argument (a `long double`
+    // member, an `_Alignas(32)` one) now does. A SCALAR carrier (the F80 arm of
+    // `finishScalarCallArg`) states none, and is answered here: its alignment is the
+    // config's bounded-natural rule — `min(size, maxAlignment)`, both read from
+    // `aggregateLayout`, no arch branch — and the size is the payload this marker
+    // already carries. Anything else states nothing and gets the slot.
+    [[nodiscard]] std::uint32_t byValueCarrierAlignment(TypeId carrierPtrTy,
+                                                        std::uint32_t bytes,
+                                                        std::uint32_t statedAlign) const {
+        if (statedAlign != 0) return statedAlign;
         if (!carrierPtrTy.valid()) return 0;
         auto const ptrOps = interner.operands(carrierPtrTy);
         if (ptrOps.empty()) return 0;
         if (!isPrimitiveTypeKind(interner.kind(ptrOps[0]))) return 0;
-        std::uint32_t const a =
-            naturalScalarAlignment(bytes, target.aggregateLayout());
-        return a > 0xFFu ? std::uint8_t{0} : static_cast<std::uint8_t>(a);
+        return naturalScalarAlignment(bytes, target.aggregateLayout());
     }
 
     void lowerByValueStackArg(MirInstId id) {
@@ -10665,8 +10927,12 @@ struct Lowerer {
         // disjoint from function symbols by construction. No exclusion
         // needed here.
         MirInstId const calleeMir = operands[0];
+        // P69 round 4: a WEAK import outside the slot shape is called through
+        // the address its GlobalAddr materialized (the GOT arm) — the
+        // indirect-call form below, exactly as a function pointer is.
         bool const calleeIsGlobalAddr =
-            mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr;
+            mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr
+            && !weakImportCalledThroughItsAddress(mir.globalAddrSymbol(calleeMir));
 
         // Determine extern-vs-internal based on the GlobalAddr's
         // SymbolId. An indirect callee (no GlobalAddr) is never an
@@ -10973,10 +11239,11 @@ struct Lowerer {
                         (bvPayload >> kByValueStackArgExhaustShift) & 0x3u),
                     // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: state the carried
                     // datum's OWN alignment so the overflow cursor can honour the
-                    // boundary the CC declares. Derived from the carrier's own MIR
-                    // type, which is `pointer(datum)` — this is the last tier that
-                    // still has it.
-                    byValueCarrierAlignment(mir.instType(operandMir), bvBytes)));
+                    // boundary the CC declares: the alignment the MIR carrier states
+                    // (an aggregate's), else derived from the carrier's own MIR type,
+                    // which is `pointer(datum)` (a scalar's).
+                    byValueCarrierAlignment(mir.instType(operandMir), bvBytes,
+                                            mir.instPayload2(operandMir))));
                 // ★ THE CARRIER CLAMPS the class it exhausts, exactly as
                 // `lir_callconv`'s walk does with the same marker — a later
                 // F128 must not be handed a register that walk will not.
@@ -13183,9 +13450,13 @@ struct Lowerer {
                                     "MIR AtomicCas (LL/SC loop)");
                 return;
             }
-            LirBlockId const retry = lir.createBlock();
-            LirBlockId const store = lir.createBlock();
-            LirBlockId const done  = lir.createBlock();
+            // The loop's blocks are created HERE. Its exclusive load and store
+            // address the program's object, and `done` receives the REST of the
+            // MIR block: in a guarded body the three are a run of the body's
+            // region, under a scope record of their own (`createLateBlock`).
+            LirBlockId const retry = createLateBlock();
+            LirBlockId const store = createLateBlock();
+            LirBlockId const done  = createLateBlock();
             // The loop-carried result + the exclusive-store status vregs are
             // created ONCE; the retry back-edge re-executes the same
             // instructions into the same vregs (loop-spanning live ranges).
@@ -14740,7 +15011,7 @@ struct Lowerer {
                 // arms must land on the same split, or the second arm would skip
                 // them.
                 if (edgeWasSplit(s)) continue;
-                LirBlockId const split = lir.createBlock();
+                LirBlockId const split = createLateBlock();
                 edgeSplitTarget_.emplace(s.v, split);
                 edgeSplits_.emplace_back(s, split);
             }
@@ -14865,17 +15136,29 @@ struct Lowerer {
     // (the real filter logic was extracted into a funclet by synthesizeSehFunclets;
     // the parent's filter block is a `[Const; SehFilterReturn]` stub reached only by
     // the CFG-fiction edge and never executed at runtime — the guarded body branches
-    // over it). It emits NO runtime dispatch; we seal the block with a branch to its
-    // (fiction) handler successor so the LIR CFG mirrors the MIR CFG (handlerBB keeps
-    // a predecessor). Dead at runtime; the OS resumes at handlerBB via the scope
-    // table's JumpTarget. Returns true (sealed).
+    // over it). It emits NO runtime dispatch; the OS resumes at handlerBB via the
+    // scope table's JumpTarget.
+    //
+    // ★★★ THE STUB LEADS NOWHERE IN THE LIR. Control never goes from this block
+    // to the handler: the handler's way in is the unwinder's, from any instruction
+    // of the guarded run, and liveness reads THAT off the guarded runs it is
+    // handed (`LirGuardedRegion`). This block used to be sealed with `jmp handler`
+    // "so the handler keeps a predecessor" — and nothing branches to the stub, so
+    // the block order appends it LAST, and whatever is live into the handler was
+    // live out of a block at the function's end: every value a handler reads held
+    // its register across everything laid out after the handler. ✔MEASURED
+    // 2026-10-12 on pe64, both pipelines: a function whose handler reads a
+    // parameter and which then adds two call results saved FOUR non-volatile
+    // registers in a 120-byte frame, where the same function with a handler that
+    // reads nothing saved three in 104. So the stub is sealed as what it is — a
+    // block control does not leave.
     bool lowerSehFilterReturn(MirInstId id, std::span<MirBlockId const> succs) {
         if (succs.size() != 1) {
             reportMalformed(MirOpcode::SehFilterReturn, id, std::format("{} successor(s)", succs.size()), "exactly 1 successor(s)");
             return false;
         }
-        if (!opcode(MnemonicSlot::Jmp).has_value()) {
-            reportMissingOpcode(MnemonicSlot::Jmp, "MIR SehFilterReturn");
+        if (!opcode(MnemonicSlot::Unreachable).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Unreachable, "MIR SehFilterReturn");
             return false;
         }
         if (!mirBlockToLirBlock.has(succs[0])) {
@@ -14884,9 +15167,7 @@ struct Lowerer {
                 "never created — the CFG it names is not this function's");
             return false;
         }
-        // `lirSucc` for uniformity; an identity here (one successor — nothing to
-        // split, see `lowerTerminator`).
-        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(succs[0]));
+        emitUnreachable(*opcode(MnemonicSlot::Unreachable));
         return true;
     }
 
@@ -15432,7 +15713,7 @@ struct Lowerer {
                 LirOperand::makeReg(idxReg), *spanOperand};
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);  // 64-bit
         }
-        LirBlockId const body        = lir.createBlock();
+        LirBlockId const body        = createLateBlock();
         LirBlockId const defaultLir  = lirSucc(defaultMir);
         {
             std::uint32_t const ugtCond =
@@ -15736,7 +16017,7 @@ struct Lowerer {
             if (isLastCase) {
                 // Final compare: jcc-eq to case target, else jcc fallthrough
                 // to a tiny "jmp default" block.
-                LirBlockId const defaultJump = lir.createBlock();
+                LirBlockId const defaultJump = createLateBlock();
                 std::array<LirOperand, 2> jccOps{
                     LirOperand::makeBlockRef(caseTarget.v),
                     LirOperand::makeBlockRef(defaultJump.v)};
@@ -15746,7 +16027,7 @@ struct Lowerer {
                 emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(defaultMir));
                 return true;
             }
-            nextBlock = lir.createBlock();
+            nextBlock = createLateBlock();
             std::array<LirOperand, 2> jccOps{
                 LirOperand::makeBlockRef(caseTarget.v),
                 LirOperand::makeBlockRef(nextBlock.v)};
@@ -15857,6 +16138,7 @@ struct Lowerer {
         reserveWideFloatPhiHomes();
         std::uint32_t const n = mir.blockInstCount(mb);
         if (n == 0) {
+            if (stackRealignPending_) emitPendingStackRealign();
             // Empty MIR block — defensive seal so the LIR module finishes.
             if (opcode(MnemonicSlot::Ret).has_value()) {
                 emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
@@ -15872,8 +16154,19 @@ struct Lowerer {
         //     no-ops Phi by design so we must catch mis-positioned Phis
         //     loud here)
         MirInstId const term = mir.blockInstAt(mb, n - 1);
+        // ★ P69 (fold f26c, ledger 495): the stack realignment's place -- the entry
+        // block (lowered first, and the only block lowered while it is pending), just
+        // after its last parameter reception.
+        std::uint32_t realignBefore = 0;
+        if (stackRealignPending_)
+            for (std::uint32_t i = 0; i + 1 < n; ++i) {
+                MirOpcode const op = mir.instOpcode(mir.blockInstAt(mb, i));
+                if (op == MirOpcode::Arg || op == MirOpcode::RecvByValueStackParam)
+                    realignBefore = i + 1;
+            }
         bool sawNonPhi = false;
         for (std::uint32_t i = 0; i + 1 < n; ++i) {
+            if (stackRealignPending_ && i == realignBefore) emitPendingStackRealign();
             MirInstId const inst = mir.blockInstAt(mb, i);
             MirOpcode const op = mir.instOpcode(inst);
             if (isMirTerminator(op)) {
@@ -15899,6 +16192,8 @@ struct Lowerer {
             if (op != MirOpcode::Phi) sawNonPhi = true;
             lowerInst(inst);
         }
+        // An entry block that only receives its parameters realigns before its jump.
+        if (stackRealignPending_) emitPendingStackRealign();
         // Then the terminator (which is also responsible for PLACING the
         // phi-edge moves for all its MIR successors — inline ahead of itself
         // when it has one successor, in per-edge split blocks when it has
@@ -16165,6 +16460,11 @@ struct Lowerer {
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: same per-function lifetime as
         // the counter it is indexed by.
         allocaSlotAlign_.clear();
+        // ★ P69 (fold f26c, ledger 495): this function's widest stacked-carrier
+        // alignment, known BEFORE its body is lowered, because a VLA anywhere in it
+        // rounds to it and the realignment precedes every call.
+        stackedArgAlign_     = functionStackedArgAlignment(mf);
+        stackRealignPending_ = stackedArgAlign_ > ccStackAlignment();
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: if this
         // function is a filter funclet, the parent whose frame its recovered locals
         // live in. Empty for every other function, which is why an ordinary function
@@ -16212,23 +16512,34 @@ struct Lowerer {
             if (!sehScopesIn_.empty()) {
                 sehMirBlockToLir_[mb.v]     = lb;
                 sehMirBlockFuncIndex_[mb.v] = currentFuncIndex_;
+                // Its place in the function's own order: a region is every
+                // block from its first to its last in that order (the funclet
+                // pass lays a guarded body out contiguously), which is how a
+                // created block's owner is found in or out of a region
+                // (`buildSehScopeDescriptors`).
+                sehMirBlockPosition_[mb.v]  = i;
             }
         }
         // Pre-pass 2: allocate vregs for all Phi results so back-edge
         // predecessor moves resolve cleanly.
         prepassAllocatePhis(mf);
 
-        // Pass 3: lower bodies block-by-block in MIR's declared order.
+        // Pass 3: lower bodies block-by-block in MIR's declared order. Whatever
+        // block is created meanwhile is the block being lowered's
+        // (`createLateBlock`).
         for (std::uint32_t i = 0; i < blockCount; ++i) {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
+            loweringMirBlock_ = mb;
             lowerBlock(mb);
         }
+        loweringMirBlock_ = MirBlockId{};
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: hand this function's
         // reservation-order alignment record to the post-lowering harvest, which
         // cross-checks it against its own frozen-LIR walk and fails loud on any
         // skew. Keyed by MIR function id so the harvest can find it without
         // depending on either walk's ordering.
         allocaSlotAlignByFunc_[mf.v] = allocaSlotAlign_;
+        stackedArgAlignByFunc_[mf.v] = stackedArgAlign_;
     }
 
     // Record the LIR inst → source MIR inst mapping. Resizes the
@@ -16354,8 +16665,6 @@ struct Lowerer {
                     SymbolId const sym = mir.blockAddressExportSymbol(inst);
                     MirBlockId const target = mir.blockAddressTarget(ops[0]);
                     blockToSym_[target.v] = sym;
-                    if (sym.v > preMintedBlockSymCeiling_)
-                        preMintedBlockSymCeiling_ = sym.v;
                     // The census `lowerFunction` builds is per-function and is not
                     // available yet; the export-only decision is made there.
                 }
@@ -16394,7 +16703,8 @@ struct Lowerer {
             lowerFunction(mir.funcAt(i));
         }
         // c116 (D-WIN64-SEH-FUNCLETS): translate each SEH scope (parent MIR block
-        // ids) to LIR block ids + emit one SehScopeDescriptor. All three blocks of
+        // ids) to LIR block ids + emit its SehScopeDescriptors — the record of
+        // its own blocks, then one per run of created blocks. All three blocks of
         // a scope live in ONE parent function, so their funcIndex agrees; we key on
         // the begin block's owning function.
         buildSehScopeDescriptors();
@@ -16402,6 +16712,7 @@ struct Lowerer {
         // BELOW from the FROZEN LIR (not MIR), see the harvest comment there.
         std::vector<FuncLocalAlignment> funcLocalAlignments;
         Lir frozen = std::move(lir).finish();
+        verifyEveryLateBlockIsWrittenDown(frozen);
         // Ensure lirToMir spans every LIR inst slot (any trailing
         // slots without recorded sources default to InvalidMirInst).
         if (lirToMir.size() < frozen.nodeCount()) {
@@ -16418,8 +16729,9 @@ struct Lowerer {
         // source (via lirToMir → the Alloca's instPayload2 effective-alignment
         // channel); a SYNTHETIC scratch alloca (whose source is not a MIR Alloca)
         // has natural alignment ≤ word → 0 (its alignUp is a no-op). SPARSE: only
-        // a function with an over-aligned local (maxLocalAlign > the GPR word)
-        // gets an entry. For a 1:1 MIR↔LIR alloca function (every case before
+        // a function with an over-aligned local (maxLocalAlign > the GPR word) --
+        // or (P69 fold f26c) one realigned for a stacked argument, below -- gets an
+        // entry. For a 1:1 MIR↔LIR alloca function (every case before
         // this cycle) this is byte-identical to the prior MIR scan.
         std::uint32_t gprWidth = 0;
         for (auto const& reg : target.registers())
@@ -16485,10 +16797,25 @@ struct Lowerer {
                         perAllocaAlign.size(), rec->second.size(), fi);
                     reporter.report(std::move(d));
                 }
-                if (maxLocalAlign > gprWidth)
-                    funcLocalAlignments.push_back(
-                        FuncLocalAlignment{frozen.funcSymbol(fn), maxLocalAlign,
-                                           std::move(perAllocaAlign)});
+                // ★ P69 (fold f26c, ledger 495/497): a row also for a function whose
+                // only reason is a stacked argument aligned past the stack -- its frame
+                // sizes the outgoing area to that alignment -- with no local
+                // alignment stated, so its local layout is the row-less one.
+                std::uint32_t const stackedAlign =
+                    (fi < mir.moduleFuncCount())
+                        ? [&] {
+                              auto const s = stackedArgAlignByFunc_.find(mir.funcAt(fi).v);
+                              return s != stackedArgAlignByFunc_.end() ? s->second : 0u;
+                          }()
+                        : 0u;
+                bool const overAlignedLocal = maxLocalAlign > gprWidth;
+                bool const realignsForArgs  = stackedAlign > ccStackAlignment();
+                if (overAlignedLocal || realignsForArgs)
+                    funcLocalAlignments.push_back(FuncLocalAlignment{
+                        frozen.funcSymbol(fn), overAlignedLocal ? maxLocalAlign : 0u,
+                        overAlignedLocal ? std::move(perAllocaAlign)
+                                         : std::vector<std::uint32_t>{},
+                        realignsForArgs ? stackedAlign : 0u});
             }
         }
         // Designated initializers prevent a future field reorder
@@ -16522,18 +16849,30 @@ struct Lowerer {
         };
     }
 
-    // c116 (D-WIN64-SEH-FUNCLETS): build one SehScopeDescriptor per MirSehScope by
-    // translating its (rebuilt-module) parent MIR block ids to LIR block ids via the
-    // persistent map. Fails loud (never a silent drop) if a scope block was not
-    // lowered — that would mean a region referenced a nonexistent block.
+    // c116 (D-WIN64-SEH-FUNCLETS): build the SehScopeDescriptors of every
+    // MirSehScope, IN TABLE ORDER — for each scope in the order it is handed in,
+    // the record of the region's own blocks (its parent MIR block ids translated
+    // to LIR block ids via the persistent map), then one record per maximal run
+    // of contiguous created blocks whose owner is a block of the region
+    // (`createLateBlock`), in address order. A created block of an inner body is
+    // a block of every region around it, so it is in a run of each — the inner
+    // region's record first, because the inner scope arrives first. Fails loud
+    // (never a silent drop) if a scope block was not lowered — that would mean a
+    // region referenced a nonexistent block.
     void buildSehScopeDescriptors() {
         for (auto const& s : sehScopesIn_) {
             auto beginIt = sehMirBlockToLir_.find(s.beginBlock.v);
             auto endIt   = sehMirBlockToLir_.find(s.endBlock.v);
             auto handIt  = sehMirBlockToLir_.find(s.handlerBlock.v);
             auto fiIt    = sehMirBlockFuncIndex_.find(s.beginBlock.v);
+            // Where the region's first and last block stand in their function's
+            // own order — filled beside the two maps above, for the same blocks.
+            auto const firstPos = sehMirBlockPosition_.find(s.beginBlock.v);
+            auto const lastPos  = sehMirBlockPosition_.find(s.endBlock.v);
             if (beginIt == sehMirBlockToLir_.end() || endIt == sehMirBlockToLir_.end()
-                || handIt == sehMirBlockToLir_.end() || fiIt == sehMirBlockFuncIndex_.end()) {
+                || handIt == sehMirBlockToLir_.end() || fiIt == sehMirBlockFuncIndex_.end()
+                || firstPos == sehMirBlockPosition_.end()
+                || lastPos == sehMirBlockPosition_.end()) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
                 d.severity = DiagnosticSeverity::Error;
@@ -16550,11 +16889,89 @@ struct Lowerer {
             desc.filterFuncletSymbol = s.filterFuncletSymbol;
             desc.personalitySymbol   = s.personalitySymbol;
             sehScopeDescriptors_.push_back(desc);
+
+            // The region's RUNS. A region is every block of its function from
+            // its first to its last, in the function's own order; a created
+            // block is in it when its owner is. `lateBlocks_` is in creation
+            // order, which is layout order, so a run is a stretch of it whose
+            // ids follow one another and whose owners are all of the region.
+            auto const inRegion = [&](LateBlock const& late) {
+                // A block's place is counted per function, so the function is
+                // asked first: another function's blocks stand at the same places.
+                if (late.funcIndex != fiIt->second) return false;
+                auto const owner = sehMirBlockPosition_.find(late.owner.v);
+                return owner != sehMirBlockPosition_.end()
+                    && owner->second >= firstPos->second
+                    && owner->second <= lastPos->second;
+            };
+            bool open = false;
+            SehScopeDescriptor run = desc;   // same function, handler, funclet, personality
+            for (LateBlock const& late : lateBlocks_) {
+                bool const member = inRegion(late);
+                if (open && member && late.block.v == run.endLirBlockV + 1u) {
+                    run.endLirBlockV = late.block.v;
+                    continue;
+                }
+                if (open) sehScopeDescriptors_.push_back(run);
+                open = member;
+                if (member) {
+                    run.beginLirBlockV = late.block.v;
+                    run.endLirBlockV   = late.block.v;
+                }
+            }
+            if (open) sehScopeDescriptors_.push_back(run);
+        }
+    }
+
+    // THE OTHER HALF OF `createLateBlock`, held on the FINISHED module: every
+    // block of a function is one of its MIR blocks' (the 1:1 pre-pass) or is
+    // written down with its owner. A creator that went around the one place
+    // would leave a block no region's record can cover — an unguarded piece of
+    // a `__try`, in silence — so it is refused by name instead. Asked only of a
+    // module that carries scopes.
+    void verifyEveryLateBlockIsWrittenDown(Lir const& frozen) {
+        if (sehScopesIn_.empty()) return;
+        std::vector<std::uint32_t> lateCount(frozen.moduleFuncCount(), 0u);
+        for (LateBlock const& late : lateBlocks_) {
+            // Written down = its owner is a MIR block of the function it was
+            // created in (a block created outside the lowering of any block has
+            // none, and counts as missing).
+            auto const ownerFunc = sehMirBlockFuncIndex_.find(late.owner.v);
+            if (ownerFunc == sehMirBlockFuncIndex_.end()
+                || ownerFunc->second != late.funcIndex) {
+                continue;
+            }
+            if (late.funcIndex < lateCount.size()) ++lateCount[late.funcIndex];
+        }
+        std::uint32_t const fnCount =
+            static_cast<std::uint32_t>(frozen.moduleFuncCount());
+        for (std::uint32_t fi = 0; fi < fnCount && fi < mir.moduleFuncCount(); ++fi) {
+            std::uint32_t const have  = frozen.funcBlockCount(frozen.funcAt(fi));
+            std::uint32_t const owned = mir.funcBlockCount(mir.funcAt(fi)) + lateCount[fi];
+            if (have == owned) continue;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_SideStructureIndexDangling;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "mir_to_lir: function #{} was lowered to {} block(s), of which {} "
+                "are its MIR blocks' and {} were created with their owner written "
+                "down — a block was created around the one place that records "
+                "which guarded region it belongs to, so no scope record could "
+                "cover it",
+                fi, have, mir.funcBlockCount(mir.funcAt(fi)), lateCount[fi]);
+            reporter.report(std::move(d));
         }
     }
 };
 
 } // namespace
+
+// The two rows of the slot table `lowerSehTryBegin` and `lowerSehFilterReturn`
+// ask the target for, in that order — see the header.
+std::array<std::string_view, 2> guardedRegionSealMnemonics() noexcept {
+    return {kMnemonicRows[static_cast<std::size_t>(MnemonicSlot::Jmp)].mnemonic,
+            kMnemonicRows[static_cast<std::size_t>(MnemonicSlot::Unreachable)].mnemonic};
+}
 
 MirToLirResult lowerToLir(Mir const&          mir,
                           TargetSchema const& target,
@@ -16573,7 +16990,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::vector<SymbolBinding>
                               preemptibleDefinitionBindings,
                           std::vector<DefinedSymbolName> definedSymbolNames,
-                          std::optional<ObjectFormatKind> assemblyFormatKind) {
+                          std::optional<ObjectFormatKind> assemblyFormatKind,
+                          std::vector<std::string> imageDefinedNames) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -16616,7 +17034,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
               std::move(atomicsRuntime), std::move(indirectSlotBindings),
               std::move(preemptibleDefinitionBindings), definedSymbolNames,
-              assemblyFormatKind};
+              assemblyFormatKind, imageDefinedNames};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

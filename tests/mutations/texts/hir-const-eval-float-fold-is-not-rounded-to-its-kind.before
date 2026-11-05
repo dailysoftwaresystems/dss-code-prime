@@ -1,0 +1,1 @@
+        case HirOpKind::Add: folded.value = narrowToFloatWidth(av + bv, bits); return folded;

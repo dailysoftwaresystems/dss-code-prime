@@ -491,6 +491,52 @@ TEST(ConstFold, WrapsU32OnAddOverflowToZero) {
            "unsigned wraparound)";
 }
 
+// [[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]]: THIS FOLDER WAS RIGHT, AND
+// THIS IS WHAT KEEPS IT RIGHT. The shared unary fold computes `-` and `~` on the
+// 64-bit pattern unless its caller states a type; this pass states none, because
+// it converts EVERY folded value to the instruction's own type itself
+// (`normalizeToType`) — the one owner of that reduction here. ✔MEASURED
+// 2026-10-10: the same expressions the two constant walkers got wrong were right
+// in function bodies wherever this pass or the code generator computed them.
+// A change that dropped the conversion from the unary arm (trusting the shared
+// fold to have reduced) would make `~0u` the 64-bit -1 under a 32-bit type.
+TEST(ConstFold, UnaryFoldIsReducedToTheInstructionsOwnType) {
+    struct Row { MirOpcode op; TypeKind type; std::int64_t operand; std::int64_t expected; };
+    for (Row const row : {Row{MirOpcode::Not, TypeKind::U32, 0, 0xFFFFFFFFLL},
+                          Row{MirOpcode::Neg, TypeKind::U32, 1, 0xFFFFFFFFLL},
+                          Row{MirOpcode::Neg, TypeKind::U32, 5, 0xFFFFFFFBLL},
+                          Row{MirOpcode::Not, TypeKind::U8, 0, 0xFF},
+                          // The signed controls, and 64 bits where the pattern is the value.
+                          Row{MirOpcode::Not, TypeKind::I32, 0, -1},
+                          Row{MirOpcode::Neg, TypeKind::I32, 1, -1},
+                          Row{MirOpcode::Not, TypeKind::U64, 0, -1},
+                          Row{MirOpcode::Neg, TypeKind::U64, 1, -1}}) {
+        TypeInterner interner{CompilationUnitId{1}};
+        BuildResult br;
+        auto const ty = interner.primitive(row.type);
+        br.fnSig = interner.fnSig({}, ty, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(br.fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirLiteralValue v; v.value = row.operand; v.core = row.type;
+        MirInstId const ops[] = {mb.addConst(v, ty)};
+        mb.addReturn(mb.addInst(row.op, ops, ty));
+        br.mir = std::move(mb).finish();
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runConstFold(br.mir, interner, rep);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.instructionsFolded, 1u)
+            << "opcode " << static_cast<int>(row.op) << " type " << static_cast<int>(row.type);
+        auto const ret = inspectReturnOperand(br.mir);
+        ASSERT_TRUE(ret.isConst);
+        EXPECT_EQ(ret.constValue, row.expected)
+            << "opcode " << static_cast<int>(row.op) << " type " << static_cast<int>(row.type)
+            << ": the folded value is the instruction's type's, not the 64-bit pattern";
+    }
+}
+
 // G3: nested folding. `Add(Mul(2, 3), 7)` must fold to `Const 13` in
 // a SINGLE pass — the Mul folds to a Const that the constCache
 // resolves so the Add also folds. Regression target: a constCache

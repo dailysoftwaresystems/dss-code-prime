@@ -1,0 +1,2 @@
+    } else if (auto promoted = findPromotedMember(memberScope, name, access);
+               false && promoted.has_value()) {

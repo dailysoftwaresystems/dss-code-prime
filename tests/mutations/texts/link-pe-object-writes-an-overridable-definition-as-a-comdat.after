@@ -1,0 +1,3 @@
+            if (false && ms.binding == SymbolBinding::Weak
+                && fmt.weakDefinitionDialectFor(ms.weakKind)
+                       == WeakDefinitionDialect::WeakExternal) {

@@ -53,6 +53,7 @@
 #include "opt/optimizer.hpp"
 #include "opt/passes/inlining.hpp"
 #include "diagnostic_count.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -60,6 +61,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -151,7 +153,7 @@ Mir buildCallerCalleeModule(TypeInterner& interner, SymbolBinding calleeBinding,
     MirBuilder mb;
 
     // callee f (SymbolId 50): single-block leaf returning a constant.
-    mb.addFunction(fnSig, SymbolId{50}, calleeBinding, SymbolVisibility::Default);
+    mb.addFunction(fnSig, SymbolId{50}, dss::test_support::linkageOf(calleeBinding));
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(fEntry);
     mb.addReturn(mb.addConst(i32Lit(retVal), i32));
@@ -551,9 +553,9 @@ TEST(Inlining, AlwaysInlineDoesNotOverrideTheWeakCalleeRefusal) {
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
-    mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Weak,
-                   SymbolVisibility::Default, /*noInline=*/false,
-                   /*alwaysInline=*/true);
+    mb.addFunction(fnSig, SymbolId{50},
+                   dss::test_support::linkageOf(SymbolBinding::Weak),
+                   /*noInline=*/false, /*alwaysInline=*/true);
     MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(fEntry);
     mb.addReturn(mb.addConst(i32Lit(7), i32));
@@ -1017,6 +1019,117 @@ TEST(Inlining, ArgumentIsSubstitutedIntoSplicedBody) {
            "present), not merely have the Call deleted";
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// a callee that receives a by-value aggregate from the incoming stack
+// (`RecvByValueStackParam`, every SysV MEMORY-class parameter since the fold) is
+// INLINED when the reception states its call-operand position (`payload2` =
+// position + 1) and the caller's operand there is the `ByValueStackArg` carrier of its
+// type: the reception maps to the carrier, whose value is the address of the caller's
+// private copy. Refused, as before: a reception stating no position (the x87 scalar
+// parameter), and one whose operand is no carrier (a call/signature mismatch).
+// RED-ON-DISABLE: restore the gate's blanket refusal → the first cell inlines nothing.
+namespace {
+struct StackReceptionModule {
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir          mir;
+};
+// g(struct Big b) { return b.c; } received from the stack with `position2`, called by
+// main with operand `useCarrier ? ByValueStackArg(temp) : temp`.
+[[nodiscard]] StackReceptionModule buildStackReception(std::uint32_t position2,
+                                                       bool useCarrier) {
+    StackReceptionModule out;
+    TypeInterner& in = out.interner;
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    TypeId const fields[] = {i64, i64, i64};
+    TypeId const big = in.structType("Big", fields);
+    TypeId const bigPtr = in.pointer(big);
+    TypeId const params[] = {big};
+    TypeId const gSig = in.fnSig(params, i64, CallConv::CcSysV);
+    TypeId const mainSig = in.fnSig({}, i64, CallConv::CcSysV);
+    MirLiteralValue sixteen;
+    sixteen.value = 16;
+    sixteen.core  = TypeKind::I64;
+    MirBuilder mb;
+    mb.addFunction(gSig, SymbolId{60});
+    MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(gEntry);
+    MirInstId const recv = mb.addInst(MirOpcode::RecvByValueStackParam, {}, bigPtr,
+                                      /*payload=*/0, MirInstFlags::None, position2);
+    MirInstId const off = mb.addConst(sixteen, i64);
+    MirInstId const gepOps[] = {recv, off};
+    MirInstId const fieldC = mb.addInst(MirOpcode::Gep, gepOps, in.pointer(i64));
+    MirInstId const loadOps[] = {fieldC};
+    MirInstId const c = mb.addInst(MirOpcode::Load, loadOps, i64);
+    mb.addReturn(c);
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const temp = mb.addInst(MirOpcode::Alloca, {}, bigPtr, 24);
+    MirInstId operand = temp;
+    if (useCarrier) {
+        MirInstId const carrierOps[] = {temp};
+        operand = mb.addInst(MirOpcode::ByValueStackArg, carrierOps, bigPtr, 24,
+                             MirInstFlags::None, /*payload2=*/8);
+    }
+    MirInstId const gAddr = mb.addGlobalAddr(SymbolId{60}, gSig);
+    MirInstId const callOps[] = {gAddr, operand};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i64);
+    mb.addReturn(call);
+    out.mir = std::move(mb).finish();
+    return out;
+}
+} // namespace
+
+TEST(Inlining, StackReceivedAggregateCalleeIsInlinedThroughItsCarrier) {
+    auto mod = buildStackReception(/*position2=*/1, /*useCarrier=*/true);
+    ASSERT_EQ(countOpInModule(mod.mir, MirOpcode::Call), 1u);
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mod.mir, mod.interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u)
+        << "a reception stating its position maps to the caller's carrier — inlined";
+    EXPECT_EQ(countOpInModule(mod.mir, MirOpcode::Call), 0u);
+    // The spliced Gep in main reads THROUGH the carrier (the caller's copy), not a
+    // copied reception: main holds no RecvByValueStackParam.
+    bool gepOffCarrier = false;
+    std::size_t recvInMain = 0;
+    for (std::uint32_t fi = 0; fi < mod.mir.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mod.mir.funcAt(fi);
+        if (mod.mir.funcSymbol(f).v != 100) continue;
+        for (std::uint32_t bi = 0; bi < mod.mir.funcBlockCount(f); ++bi) {
+            MirBlockId const b = mod.mir.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < mod.mir.blockInstCount(b); ++i) {
+                MirInstId const id = mod.mir.blockInstAt(b, i);
+                if (mod.mir.instOpcode(id) == MirOpcode::RecvByValueStackParam) ++recvInMain;
+                if (mod.mir.instOpcode(id) != MirOpcode::Gep) continue;
+                auto const ops = mod.mir.instOperands(id);
+                if (!ops.empty() && mod.mir.instOpcode(ops[0]) == MirOpcode::ByValueStackArg)
+                    gepOffCarrier = true;
+            }
+        }
+    }
+    EXPECT_TRUE(gepOffCarrier) << "the spliced field read must go through the carrier";
+    EXPECT_EQ(recvInMain, 0u) << "a reception spliced into main would read main's frame";
+    MirVerifier verifier{mod.mir, &mod.interner};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+TEST(Inlining, StackReceptionStatingNoPositionOrFacingNoCarrierIsNotInlined) {
+    for (auto const& [position2, useCarrier, why] :
+         {std::tuple{0u, true, "a reception stating no position (the x87 scalar form)"},
+          std::tuple{1u, false, "a reception whose operand is no carrier"},
+          std::tuple{2u, true, "a reception stating a position past the call's operands"}}) {
+        auto mod = buildStackReception(position2, useCarrier);
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mod.mir, mod.interner, rep,
+                                                opt::kMaxInlineThreshold);
+        EXPECT_TRUE(r.ok) << why;
+        EXPECT_EQ(r.callsInlined, 0u) << why;
+        EXPECT_EQ(countOpInModule(mod.mir, MirOpcode::Call), 1u) << why;
+    }
 }
 
 // ── Recursion is REFUSED (this cycle only refuses self-recursion) ──
@@ -1641,7 +1754,7 @@ TEST(Inlining, MutualRecursiveCallIsNotInlined) {
 // intrinsic id (a per-CU HIR-registry index MIR does not carry), so the
 // gate cannot tell the two kinds apart and REFUSES what it cannot prove
 // safe — the rule every sibling arm follows (Va*Addr, returns-twice Call,
-// Seh*, StackSave/StackRestore, RecvByValueStackParam).
+// Seh*, StackSave/StackRestore, a RecvByValueStackParam stating no position).
 // The POSITIVE CONTROL in the same module is load-bearing: an
 // intrinsic-FREE callee still inlines, so this pins an INTRINSIC-SPECIFIC
 // refusal and goes red if the gate ever degrades into refuse-everything.
@@ -1955,6 +2068,69 @@ TEST(Inlining, RecoverParentFrameSlotCalleeIsNotInlined) {
 
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── P69 (lane `cs`, review M2): a RUNTIME-SIZED Alloca keeps its callee out of line ──
+// f(n) { return alloca(n); }   main(n) { return f(n); }
+// A runtime-sized block (`__builtin_alloca(n)`) lives until the function holding it
+// RETURNS; spliced into main it would live until MAIN returns, so a call in a loop would
+// keep every iteration's block (examples/c/alloca_helper_called_in_a_loop is the runtime
+// witness). CONTROL: the same callee with a FIXED Alloca — a local's slot, no size
+// operand — inlines.
+// RED-on-disable: delete the runtime-sized `Alloca` arm in inlineLegalityGate → f inlines.
+TEST(Inlining, RuntimeSizedAllocaCalleeIsNotInlined) {
+    for (bool const runtimeSized : {true, false}) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i64   = interner.primitive(TypeKind::I64);
+        TypeId const u8    = interner.primitive(TypeKind::U8);
+        TypeId const block = runtimeSized ? interner.pointer(interner.vlaArray(u8))
+                                          : interner.pointer(u8);
+        TypeId const params[] = {i64};
+        TypeId const fSig    = interner.fnSig(params, block, CallConv::CcSysV);
+        MirBuilder mb;
+
+        // f (SymbolId 55): the block, runtime-sized (operand n) or fixed (payload 16).
+        mb.addFunction(fSig, SymbolId{55});
+        MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(fEntry);
+        MirInstId const n = mb.addArg(0, i64);
+        MirInstId a;
+        if (runtimeSized) {
+            std::array<MirInstId, 1> const ops{n};
+            a = mb.addInst(MirOpcode::Alloca, ops, block, /*payload=*/0, MirInstFlags::None,
+                           /*align=*/16);
+        } else {
+            a = mb.addInst(MirOpcode::Alloca, {}, block, /*payload=*/16, MirInstFlags::None,
+                           /*align=*/16);
+        }
+        mb.addReturn(a);
+
+        // main (SymbolId 100): return f(n).
+        mb.addFunction(fSig, SymbolId{100});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const mArg  = mb.addArg(0, i64);
+        MirInstId const fAddr = mb.addGlobalAddr(SymbolId{55}, fSig);
+        MirInstId const callOps[] = {fAddr, mArg};
+        mb.addReturn(mb.addInst(MirOpcode::Call, callOps, block));
+        Mir mir = std::move(mb).finish();
+        ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep,
+                                                opt::kMaxInlineThreshold);
+        EXPECT_TRUE(r.ok);
+        if (runtimeSized) {
+            EXPECT_EQ(r.callsInlined, 0u)
+                << "a callee holding a runtime-sized Alloca must be REFUSED: spliced, its "
+                   "block would outlive the call by the caller's whole lifetime";
+            EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u) << "main's Call survives";
+        } else {
+            EXPECT_EQ(r.callsInlined, 1u) << "CONTROL: a fixed Alloca is a local's slot";
+        }
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep));
+    }
 }
 
 // ── VOID single-block leaf callee IS inlined (invalid-result-id path) ─

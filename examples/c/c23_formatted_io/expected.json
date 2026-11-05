@@ -1,0 +1,57 @@
+{
+  "$comment": "P69 (lane lm, E1 — D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM, and the ELF arms of D-C-GLIBC-C23-ENTRY-POINTS-NOT-BOUND): C23's formatted I/O and integer conversions end to end on every pair. printf's b/B with every flag, width and precision form (a negative `*` width left-justifies; `%.0b` and `%#.0b` of 0 print nothing; `#` prefixes 0b/0B only to a nonzero value), every length on b, the wN/wfN lengths on d/i/u/x/X/b, `%n` of every length (the UCRT refuses %n by default: DSS's engine performs it), snprintf's truncation and would-be length across a %b, sprintf/vsprintf/vsnprintf/vfprintf through variadic helpers, a mixed format whose %s %5.2f %c %% %Lf %ls %jd %zd %p %a are the PLATFORM's own bytes (compared in-program against the platform's rendering of the same specifications, never printed), a tmpfile stream, positional arguments beside C23 conversions where the platform has them (glibc, libSystem; the UCRT's printf has none, so Windows prints the same line from a sequential format), scanf's %b and the 0b/0x/0/decimal/-0b forms of %i with widths and %n (sscanf, vsscanf, fscanf), the 0b subject of strtol/strtoul/strtoll/strtoull/strtoimax/strtoumax/wcstoimax/wcstoumax (prefix, base 2, base 0, `0b` alone, overflow with ERANGE, whitespace and sign, and base 16 reading `0b100` as hex), and PRIb32/PRIB8/PRIbMAX/SCNb32 round trips. ELF: glibc's own printf and C23 entry points; pe and Mach-O: DSS's runtime (runtime/platform/src/stdio.c, stdlib_strto.c, inttypes.c) over the platform's own functions. ✔MEASURED: the stdout below is what gcc 13.3.0, clang 18.1.3 (glibc 2.39, x86_64) and aarch64-linux-gnu-gcc print for this source (probe-reference-cc runs 20260930-233301-c0aae8b7, 20260930-234325-6227be93); MSVC and Apple clang are no reference for these lines — their libraries print a literal `b` — which is the defect. The `scan3` line differs by platform BY DESIGN: `0b` with no binary digit after it follows what the same platform's scanf does for `0x` with no hex digit after it (✔MEASURED per platform, P69 lane lm findings): glibc takes both characters as the item (1 0 2), the UCRT fails the directive — at the end of the input an input failure, nothing stored (-1 -1 -1) — and libSystem takes the `0` and leaves the letter (1 0 1). §12 (P69 round 4, the review's MAJOR 1 / MINOR 5 / MINOR 6 / NIT 13): the `long:` line — a hundred repeated flags, a hundred-flag UNKNOWN specification compared with the platform's own reading of it, a `*` width of INT_MIN failing the call with EOVERFLOW, a 208-character scanset, and %n through the platform's 64-bit length storing all eight bytes in printf and scanf — ✔MEASURED identical from gcc 13.3.0, clang 18.1.3 and aarch64-linux-gnu-gcc 13.3.0 (probe-reference-cc run 20261007-192839-2074c933) and from native aarch64 gcc 13.3.0 (run 20261007-192900-b2509bb6), exit 42; on pe and Mach-O DSS's engine prints the same line. The pe-only `ucrt I:` line is the UCRT's own reading of `I` alone, which sizes only an integer conversion: printf's `%In` is `%n` (an int store, the guard beside it untouched) and scanf's `%In` is the conversion `I` (= `i`) and then a literal `n` (✔MEASURED, MSVC 19.51 over the UCRT, run 20261007-180358-0281be33). §13 (P69 round 4, the review's MINOR 10 — the `%n` arm, whose first red-on-disable read NOT RED): the `lone n:` line — a `%n` that is the ONLY specification its platform lacks. Every other `%n` of this file stands beside a `%b`, and one `%b` hands the whole call to DSS's engine whatever the platform says of `%n`; this call is the one that reaches the UCRT, which refuses `%n` (0xC0000409), unless the engine takes it for that alone. ✔MEASURED `lone n: 5 3 [abcde]`: the whole file from gcc 13.3.0, clang 18.1.3 and aarch64-linux-gnu-gcc 13.3.0 (run 20261008-091521-1ea66b63) and native aarch64 gcc 13.3.0 (run 20261008-091538-1c0fcc33), one stdout byte for byte, exit 42; the cell alone from Apple clang 21 over libSystem, arm64 and x86_64, -O0 and -O2 (run 20261008-091558-50da714c), and from MSVC 19.51 and mingw-w64 gcc 13.2.0 over the UCRT once `_set_printf_count_output(1)` has enabled what it refuses by default (run 20261008-091616-5974dd22).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "[101] [101] [0b101] [0B101] [00000101] [101     |] [000000000101] [       101] [101] [101   |] [101   |] [] [] [0b00000101] [101] [101]\r\n[101100] [1000101110000] [110] [1001] [1010] [1011] [1100]\r\n[-5] [-300] [4000000000] [deadbeefcafe] [110] [FF] [-7] [1001] [-70000] [123456789012] [abc]\r\nn: 1 3 6 7 9 10 12 13 16 17 | 17 abbcccdeefggh11ij\r\ntrunc: 10 [1111] 5 [<110>] 7 [<0b110>] 16 [1111111] 10\r\nmixed: same\r\nstream: 11 [k=0b101;42]\r\nscan: 6 5 7 31 15 -3 42 27\r\nscan2: 4 10 3 -123 77\r\nscan3: -1 -1 -1\r\nfscan: 3 13 3 0\r\nstrto: 5 -3 0@1 1 1 1 45312 9 3 -5 1\r\npri: [10100101|11|0b10] 1 165\r\npos: [101 7 0B110] [110  |]\r\nlong: 19 [101|7    |+9|0b10 |] same | -1 1 | 2 3 [hello] 10 | 4 1 5\r\nucrt I: 4 -1 | 2 1 7 -1\r\nlone n: 5 3 [abcde]\r\nc23 formatted io: ok\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "expectedStdout": "[101] [101] [0b101] [0B101] [00000101] [101     |] [000000000101] [       101] [101] [101   |] [101   |] [] [] [0b00000101] [101] [101]\n[101100] [1000101110000] [110] [1001] [1010] [1011] [1100]\n[-5] [-300] [4000000000] [deadbeefcafe] [110] [FF] [-7] [1001] [-70000] [123456789012] [abc]\nn: 1 3 6 7 9 10 12 13 16 17 | 17 abbcccdeefggh11ij\ntrunc: 10 [1111] 5 [<110>] 7 [<0b110>] 16 [1111111] 10\nmixed: same\nstream: 11 [k=0b101;42]\nscan: 6 5 7 31 15 -3 42 27\nscan2: 4 10 3 -123 77\nscan3: 1 0 2\nfscan: 3 13 3 0\nstrto: 5 -3 0@1 1 1 1 45312 9 3 -5 1\npri: [10100101|11|0b10] 1 165\npos: [101 7 0B110] [110  |]\nlong: 19 [101|7    |+9|0b10 |] same | -1 1 | 2 3 [hello] 10 | 4 1 5\nlone n: 5 3 [abcde]\nc23 formatted io: ok\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "[101] [101] [0b101] [0B101] [00000101] [101     |] [000000000101] [       101] [101] [101   |] [101   |] [] [] [0b00000101] [101] [101]\n[101100] [1000101110000] [110] [1001] [1010] [1011] [1100]\n[-5] [-300] [4000000000] [deadbeefcafe] [110] [FF] [-7] [1001] [-70000] [123456789012] [abc]\nn: 1 3 6 7 9 10 12 13 16 17 | 17 abbcccdeefggh11ij\ntrunc: 10 [1111] 5 [<110>] 7 [<0b110>] 16 [1111111] 10\nmixed: same\nstream: 11 [k=0b101;42]\nscan: 6 5 7 31 15 -3 42 27\nscan2: 4 10 3 -123 77\nscan3: 1 0 2\nfscan: 3 13 3 0\nstrto: 5 -3 0@1 1 1 1 45312 9 3 -5 1\npri: [10100101|11|0b10] 1 165\npos: [101 7 0B110] [110  |]\nlong: 19 [101|7    |+9|0b10 |] same | -1 1 | 2 3 [hello] 10 | 4 1 5\nlone n: 5 3 [abcde]\nc23 formatted io: ok\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": "",
+      "expectedStdout": "[101] [101] [0b101] [0B101] [00000101] [101     |] [000000000101] [       101] [101] [101   |] [101   |] [] [] [0b00000101] [101] [101]\n[101100] [1000101110000] [110] [1001] [1010] [1011] [1100]\n[-5] [-300] [4000000000] [deadbeefcafe] [110] [FF] [-7] [1001] [-70000] [123456789012] [abc]\nn: 1 3 6 7 9 10 12 13 16 17 | 17 abbcccdeefggh11ij\ntrunc: 10 [1111] 5 [<110>] 7 [<0b110>] 16 [1111111] 10\nmixed: same\nstream: 11 [k=0b101;42]\nscan: 6 5 7 31 15 -3 42 27\nscan2: 4 10 3 -123 77\nscan3: 1 0 1\nfscan: 3 13 3 0\nstrto: 5 -3 0@1 1 1 1 45312 9 3 -5 1\npri: [10100101|11|0b10] 1 165\npos: [101 7 0B110] [110  |]\nlong: 19 [101|7    |+9|0b10 |] same | -1 1 | 2 3 [hello] 10 | 4 1 5\nlone n: 5 3 [abcde]\nc23 formatted io: ok\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": "",
+      "expectedStdout": "[101] [101] [0b101] [0B101] [00000101] [101     |] [000000000101] [       101] [101] [101   |] [101   |] [] [] [0b00000101] [101] [101]\n[101100] [1000101110000] [110] [1001] [1010] [1011] [1100]\n[-5] [-300] [4000000000] [deadbeefcafe] [110] [FF] [-7] [1001] [-70000] [123456789012] [abc]\nn: 1 3 6 7 9 10 12 13 16 17 | 17 abbcccdeefggh11ij\ntrunc: 10 [1111] 5 [<110>] 7 [<0b110>] 16 [1111111] 10\nmixed: same\nstream: 11 [k=0b101;42]\nscan: 6 5 7 31 15 -3 42 27\nscan2: 4 10 3 -123 77\nscan3: 1 0 1\nfscan: 3 13 3 0\nstrto: 5 -3 0@1 1 1 1 45312 9 3 -5 1\npri: [10100101|11|0b10] 1 165\npos: [101 7 0B110] [110  |]\nlong: 19 [101|7    |+9|0b10 |] same | -1 1 | 2 3 [hello] 10 | 4 1 5\nlone n: 5 3 [abcde]\nc23 formatted io: ok\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release", "mustDifferFromBaseline": true
+    }
+  ]
+}

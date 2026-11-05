@@ -44,8 +44,9 @@ not punished like shipping a new deferral.
 ### Move on close, and never hand-write a row
 
 - **Closing a row MOVES it** out of its working registry into the archive; reopening moves it back.
-  `check-anchor-balance` fails the tree for a closed row left behind, for an open row filed in the
-  archive, and for a `Status` column that contradicts its own `Trigger` prose.
+  `dssharness check-anchor-balance` fails the tree for a closed row left behind and for an open row filed
+  in the archive; a `Status` column that contradicts its own `Trigger` prose is refused by the door
+  (`anchors.triggerCarriesVerdict`) and reported by `dssharness read-anchors --lint`.
 - **`dssharness`** is the door — `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`. The
   writer takes the FIELDS, so a wrapped anchor id (invisible to every grep, and it mints a false
   id), an unescaped `|` and a wrong cell count are inexpressible. ⚠ The registry selector is
@@ -76,13 +77,14 @@ harness we fix as we need when we face the problem (NEVER LATER)."*
 - ★ **The measure of a cycle is its production movement.** One whose closures are all harness-shaped
   rows has hardened the workshop and shipped nothing.
 
-Every RESOLVER globs `_deferred-anchor-registry*.md`, so `check-anchor-balance` and the registry
+Every RESOLVER globs `_deferred-anchor-registry*.md`, so `dssharness check-anchor-balance` and the registry
 guard read both with no flag — but **a human reading the archive is not reading what is left**.
 ⚠ `burndown-queue` deliberately does NOT band a row from the archive: it exits loudly instead,
 because a live row filed there is invisible to every queue in the project and quietly coping is how
 an invariant stops being one. ⚠ **Never quote a count from prose; re-derive it**
-(`check-anchor-balance.py --breakdown --denominator registry` ⏳ SCRIPT-ERA (superseded 2026-09-17: the live instruments are `dssharness check-anchor-balance` for the balance and `dssharness read-anchors --pending --open --band <P>` for a band, whose listing ends with its count; see dss-cycle/references/registry-and-priority.md)) — the P34 handoff's own production
-figure was wrong by 20, and the breakdown is what caught it.
+(`dssharness check-anchor-balance` for the balance, `dssharness read-anchors --pending --open --band <P>`
+for a band, whose listing ends with its count) — the P34 handoff's own production figure was wrong by
+20, and a per-bucket breakdown checked against the total is what caught it.
 
 ## ★★★★ NO FOLLOW-UPS — A ROW YOU OPEN, YOU CLOSE (operator ruling 2026-08-26)
 

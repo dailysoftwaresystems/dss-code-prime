@@ -1,0 +1,1 @@
+    if (declared.intSigned && ((reduced >> (width - 1)) & 1u) != 0) reduced |= ~mask;

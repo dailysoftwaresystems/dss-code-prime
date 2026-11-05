@@ -59,12 +59,16 @@
 // absent, because the unwinder trusts it. Every construct below is
 // therefore refused BY NAME rather than approximated:
 //
-//   * a `P` (personality) or `L` (LSDA) augmentation, and any non-empty
-//     FDE augmentation data. `CfiFunction` carries neither pointer, so
-//     accepting them would silently zero a language-specific handler and
-//     turn a catch into a terminate. The row that anchors this file states
-//     the constraint outright: personality / LSDA must FAIL LOUD until
-//     they are carried, never be zeroed.
+//   * FDE augmentation data its CIE does not account for. A `P`
+//     (personality) and an `L` (language-specific data area) augmentation
+//     are READ since P69 fold 3d -- each is a POINTER FIELD this file
+//     reports exactly as it reports `initial_location` (where the field is,
+//     how it is encoded, what it holds) and the caller binds, because only
+//     the caller knows whether a relocation carries the reference. What
+//     stays refused is what nothing here can account for: an encoding whose
+//     width or meaning this file does not read, and augmentation bytes past
+//     the data-area field (or any, under a CIE with no `L`) -- a field that
+//     is skipped is a handler that is dropped.
 //   * an `S` (signal-frame) augmentation. `CfiFunction::signalFrame`
 //     exists but `buildEhFrame` does not emit it (it is a CIE-level
 //     property and DSS emits ONE shared CIE per module — the same
@@ -147,6 +151,39 @@ inline constexpr std::uint8_t kDwEhPeAbsPtr = 0x00;
 inline constexpr std::uint8_t kDwEhPePcRel8 = 0x10;  // pcrel | absptr (8-byte)
 inline constexpr std::uint8_t kDwEhPeOmit   = 0xff;
 
+// The three parts of a pointer encoding byte (LSB, "DWARF Exception Header
+// Encoding"): the FORMAT half says how many bytes the field is and whether
+// they are signed, the APPLICATION half what the value is measured from,
+// and the top bit that the field holds the address of a SLOT holding the
+// pointer rather than the pointer itself.
+inline constexpr std::uint8_t kDwEhPeFormatMask      = 0x0f;
+inline constexpr std::uint8_t kDwEhPeApplicationMask = 0x70;
+inline constexpr std::uint8_t kDwEhPeIndirect        = 0x80;
+inline constexpr std::uint8_t kDwEhPeSignedBit       = 0x08;
+
+// The width in bytes of a PERSONALITY or DATA-AREA field, or 0 for an
+// encoding this decoder does not read. It reads the absolute and the
+// pc-relative application of the 4- and 8-byte formats, indirect or not --
+// every form a measured producer writes (✔MEASURED P69 fold 3d, the
+// `elf_cleanup_handler_*.o` fixtures: gcc and clang write the personality
+// as 0x9b and the area as 0x1b under -fPIC, both as 0x03 under x86_64
+// -fno-pic). `datarel`, `textrel`, `funcrel`, `aligned`, the LEB128 and the
+// 2-byte formats are refused rather than read at a guessed width.
+[[nodiscard]] constexpr std::uint32_t dwEhPeHandlerFieldWidth(std::uint8_t enc) noexcept {
+    std::uint8_t const application = enc & kDwEhPeApplicationMask;
+    if (application != 0x00u && application != 0x10u) return 0;
+    switch (enc & kDwEhPeFormatMask) {
+    case 0x00: case 0x04: case 0x0c: return 8;   // absptr (64-bit), udata8, sdata8
+    case 0x03: case 0x0b: return 4;              // udata4, sdata4
+    default: return 0;
+    }
+}
+
+// Does the field hold the address of a SLOT that holds the pointer?
+[[nodiscard]] constexpr bool dwEhPeIsIndirect(std::uint8_t enc) noexcept {
+    return (enc & kDwEhPeIndirect) != 0;
+}
+
 // Is `enc` a pointer encoding whose field is EIGHT bytes wide? The one place
 // the format half is interpreted — the gate and the reader must agree about
 // the width or the gate admits an encoding the reader mis-reads.
@@ -160,8 +197,25 @@ inline constexpr std::uint8_t kDwEhPeOmit   = 0xff;
 // here beside the encodings themselves so a caller cannot reach for a bit
 // test of its own and get the mask subtly wrong.
 [[nodiscard]] constexpr bool dwEhPeIsPcRelative(std::uint8_t enc) noexcept {
-    return enc == kDwEhPePcRel4 || enc == kDwEhPePcRel8;
+    return (enc & kDwEhPeApplicationMask) == 0x10u;
 }
+
+// A POINTER FIELD a CIE or an FDE carries beside the function reference: the
+// personality routine's (`P`) and the language-specific data area's (`L`).
+// Reported and never resolved here, for the reason the header gives for
+// `initial_location`: in a relocatable object the field holds nothing and a
+// relocation carries the reference, and only the caller knows which form
+// its object took.
+struct DecodedPointerField {
+    // Byte offset WITHIN the decoded section of the field's first byte.
+    std::uint32_t fieldOffset = 0;
+    // The field's pointer encoding (its width, its application, whether it
+    // is indirect).
+    std::uint8_t  encoding = kDwEhPeOmit;
+    // The value the field holds: sign-extended for a signed 4-byte format,
+    // zero-extended for an unsigned one, the raw 8 bytes otherwise.
+    std::int64_t  stored = 0;
+};
 
 // One decoded FDE: the function's unwind description plus everything the
 // caller needs to bind it to a reconstructed function.
@@ -180,6 +234,13 @@ struct DecodedFde {
     // The function's unwind description. `codeLength` is the FDE's
     // `address_range`.
     CfiFunction   cfi;
+    // The personality routine's field, which lives in the FDE's CIE: every
+    // FDE of one CIE reports the same field. Absent when the CIE carries no
+    // `P` (or states it omitted).
+    std::optional<DecodedPointerField> personality;
+    // The language-specific data area's field, in this FDE's augmentation
+    // data. Absent when the CIE carries no `L` (or states it omitted).
+    std::optional<DecodedPointerField> dataArea;
 };
 
 struct DecodedEhFrame {
@@ -258,7 +319,40 @@ struct DecodedCie {
     std::uint8_t  fdePointerEncoding  = kDwEhPeOmit;
     bool          hasZAugmentation    = false;
     CfiInitialState initial{};
+    // `P`: the personality routine's field, in this CIE's augmentation data.
+    std::optional<DecodedPointerField> personality;
+    // `L`: the encoding of the data-area field each of its FDEs carries
+    // (`kDwEhPeOmit` when the CIE has no `L`, or states the field omitted).
+    std::uint8_t  dataAreaEncoding    = kDwEhPeOmit;
 };
+
+// Read one personality or data-area field of `enc` at `pos`, advancing it.
+// Returns false when the field runs past `end` (the caller names the field).
+[[nodiscard]] inline bool readHandlerField(std::span<std::uint8_t const> b, std::size_t& pos,
+                                           std::size_t end, std::uint8_t enc,
+                                           DecodedPointerField& out) {
+    std::uint32_t const width = dwEhPeHandlerFieldWidth(enc);
+    if (width == 0 || pos + width > end) return false;
+    out.fieldOffset = static_cast<std::uint32_t>(pos);
+    out.encoding    = enc;
+    if (width == 8u) {
+        std::uint64_t raw = 0;
+        if (!readU64LE(b, pos, raw)) return false;
+        out.stored = static_cast<std::int64_t>(raw);
+        return true;
+    }
+    std::uint32_t raw = 0;
+    if (!readU32LE(b, pos, raw)) return false;
+    out.stored = (enc & kDwEhPeSignedBit) != 0
+                     ? static_cast<std::int64_t>(static_cast<std::int32_t>(raw))
+                     : static_cast<std::int64_t>(raw);
+    return true;
+}
+
+// Name an encoding byte in a refusal.
+[[nodiscard]] inline std::string encodingHex(std::uint8_t enc) {
+    return std::string("0x") + "0123456789abcdef"[(enc >> 4) & 0xFu] + "0123456789abcdef"[enc & 0xFu];
+}
 
 } // namespace detail
 
@@ -731,8 +825,7 @@ decodeEhFrame(std::span<std::uint8_t const> section,
               DiagnosticReporter& reporter) {
     auto fail = [&](std::string const& msg) -> std::optional<DecodedEhFrame> {
         emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
-             std::string(contextLabel) + ": " + msg
-                 + " (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE)");
+             std::string(contextLabel) + ": " + msg);
         return std::nullopt;
     };
 
@@ -850,24 +943,52 @@ decodeEhFrame(std::span<std::uint8_t const> section,
                         }
                         cie.fdePointerEncoding = section[pos++];
                         break;
-                    case 'P':
-                        return fail(
-                            "CIE at byte offset " + std::to_string(recStart)
-                            + " carries a 'P' (personality routine) augmentation. "
-                              "The neutral call-frame representation this project "
-                              "encodes every format's unwind table from carries no "
-                              "personality pointer, so accepting it would drop the "
-                              "language-specific handler and silently turn a caught "
-                              "exception into a terminate. Refusing until the "
-                              "pointer is carried");
-                    case 'L':
-                        return fail(
-                            "CIE at byte offset " + std::to_string(recStart)
-                            + " carries an 'L' (LSDA) augmentation. Each FDE then "
-                              "points at a language-specific data area this project's "
-                              "neutral call-frame representation cannot carry, and "
-                              "zeroing it would leave every catch clause in the "
-                              "merged function unreachable at run time");
+                    case 'P': {
+                        // The personality routine: an encoding byte, then the
+                        // field. Reported, never resolved (see the struct).
+                        if (pos >= augEnd) {
+                            return fail("CIE augmentation 'P' has no encoding byte");
+                        }
+                        std::uint8_t const enc = section[pos++];
+                        if (enc == kDwEhPeOmit) break;   // stated omitted: no field follows
+                        DecodedPointerField field;
+                        if (dwEhPeHandlerFieldWidth(enc) == 0) {
+                            return fail(
+                                "CIE at byte offset " + std::to_string(recStart)
+                                + " names its personality routine in pointer encoding "
+                                + detail::encodingHex(enc)
+                                + ". This decoder reads the absolute and pc-relative "
+                                  "4- and 8-byte encodings, indirect or not, and refuses "
+                                  "the rest rather than read the field at a guessed width "
+                                  "and name the wrong routine");
+                        }
+                        if (!detail::readHandlerField(section, pos, augEnd, enc, field)) {
+                            return fail("CIE at byte offset " + std::to_string(recStart)
+                                        + ": its personality field runs past the "
+                                          "augmentation data");
+                        }
+                        cie.personality = field;
+                        break;
+                    }
+                    case 'L': {
+                        // Only the ENCODING lives here; each FDE carries its own
+                        // data-area field in its augmentation data.
+                        if (pos >= augEnd) {
+                            return fail("CIE augmentation 'L' has no encoding byte");
+                        }
+                        std::uint8_t const enc = section[pos++];
+                        if (enc != kDwEhPeOmit && dwEhPeHandlerFieldWidth(enc) == 0) {
+                            return fail(
+                                "CIE at byte offset " + std::to_string(recStart)
+                                + " states its FDEs' language-specific data areas in "
+                                  "pointer encoding " + detail::encodingHex(enc)
+                                + ". This decoder reads the absolute and pc-relative "
+                                  "4- and 8-byte encodings and refuses the rest rather "
+                                  "than point a function at the wrong data");
+                        }
+                        cie.dataAreaEncoding = enc;
+                        break;
+                    }
                     case 'S':
                         return fail(
                             "CIE at byte offset " + std::to_string(recStart)
@@ -1020,20 +1141,40 @@ decodeEhFrame(std::span<std::uint8_t const> section,
             fde.cfi.codeLength = static_cast<std::uint32_t>(addressRange);
             fde.cfi.initial    = cie->initial;
 
+            fde.personality = cie->personality;
             if (cie->hasZAugmentation) {
                 std::uint64_t augLen = 0;
                 if (!detail::readULeb(section, pos, augLen)) {
                     return fail("truncated FDE augmentation data length");
                 }
-                if (augLen != 0u) {
+                // The CIE's `L` is the only thing that gives an FDE's
+                // augmentation data a meaning: exactly one data-area field of
+                // its encoding's width. Anything else is bytes nothing here can
+                // account for, and skipping them could skip a handler's data.
+                std::uint32_t const expected =
+                    cie->dataAreaEncoding == kDwEhPeOmit
+                        ? 0u
+                        : dwEhPeHandlerFieldWidth(cie->dataAreaEncoding);
+                if (augLen != expected) {
                     return fail(
                         "FDE at byte offset " + std::to_string(recStart)
                         + " carries " + std::to_string(augLen)
-                        + " bytes of augmentation data (a language-specific data "
-                          "area pointer). The neutral call-frame representation "
-                          "carries no LSDA pointer, and dropping it would leave "
-                          "the function's catch clauses unreachable at run time "
-                          "while the table still looked complete");
+                        + " bytes of augmentation data where its CIE accounts for "
+                        + std::to_string(expected)
+                        + (expected == 0u
+                               ? " (it states no language-specific data area)"
+                               : " (one language-specific data-area field)")
+                        + "; bytes nothing here can read could be a handler's "
+                          "data, and the table would still look complete");
+                }
+                if (expected != 0u) {
+                    DecodedPointerField field;
+                    if (!detail::readHandlerField(section, pos, recEnd,
+                                                  cie->dataAreaEncoding, field)) {
+                        return fail("FDE at byte offset " + std::to_string(recStart)
+                                    + ": its data-area field runs past its record");
+                    }
+                    fde.dataArea = field;
                 }
             }
 

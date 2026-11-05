@@ -1,0 +1,2 @@
+            std::uint32_t const r = tree.rule(cur).v;
+            auto const ops = internals(cur);

@@ -1,0 +1,2 @@
+            || !schema->notFollowedBy(rule).empty()
+            || !schema->followedBy(rule).empty();

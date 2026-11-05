@@ -78,10 +78,24 @@ constexpr std::string_view kCallsUnderscorePutchar =
     "\taddq\t$40, %rsp\n"
     "\tret\n";
 
-// pe realizes `printf` as a COMPILER-SYNTHESIZED shim over
-// `__stdio_common_vfprintf` (ucrtbase exports no bare `printf`), and the
-// `encode` tier runs no MIR synthesis. Binding it would link clean and die at
-// LOAD with 0xC0000139.
+// pe realizes `mtx_lock` as a COMPILER-SYNTHESIZED shim over kernel32 (no pe
+// image exports `mtx_lock`), and the `encode` tier runs no MIR synthesis.
+// Binding it would link clean and die at LOAD with 0xC0000139. (★ P69: this
+// was `printf` until the pe printf family became DSS's runtime SOURCE — see
+// `ShippedSourceRowWrittenByItsCNameStaysUnboundAndFailsTheLink`.)
+constexpr std::string_view kCallsMtxLock =
+    "\t.text\n"
+    "\t.globl\tmain\n"
+    "\t.type\tmain, @function\n"
+    "main:\n"
+    "\tsubq\t$40, %rsp\n"
+    "\tcall\tmtx_lock\n"
+    "\tmovl\t$0, %eax\n"
+    "\taddq\t$40, %rsp\n"
+    "\tret\n";
+
+// pe's `printf` is DSS's runtime source (runtime/platform/src/stdio.c) under the
+// link name `__dss_isoc23_printf`; nothing defines a plain `printf` on pe.
 constexpr std::string_view kCallsPrintf =
     "\t.text\n"
     "\t.globl\tmain\n"
@@ -210,19 +224,20 @@ TEST(AsmExternBinding, ResolveLibraryIsHonouredNotSilentlyDroppedOnEncodeTier) {
 // A `synthesize` ROW IS REFUSED LOUD, AND ONLY WHERE IT IS A RECIPE.
 // ════════════════════════════════════════════════════════════════════════════
 //
-// `printf` is a shim on pe and an ordinary import on elf. ONE source, TWO
+// `mtx_lock` is a shim on pe and an ordinary import on elf. ONE source, TWO
 // verdicts, from ONE config-driven policy — which is also what proves the
 // refusal is not a format branch: the same code path answers both ways because
-// the descriptor says different things.
+// the descriptor says different things. (★ P69: re-pointed from `printf`, which
+// is no longer a recipe on pe.)
 //
 // RED-ON-DISABLE: drop the `recipeId.empty()` guard in `bindAsmExternImports`
-// and the pe leg binds `printf` to ucrtbase.dll, links green, and produces a
+// and the pe leg binds `mtx_lock` to kernel32, links green, and produces a
 // binary that fails at LOAD — rc becomes 0 and the assertion below reds.
 TEST(AsmExternBinding, SynthesizeRecipeRowIsRefusedOnPeAndBoundOnElf) {
     {
         ScratchDir scratch{Location::InsideRepo, "asm-extern"};
         scratch.useAsCwd();
-        auto const src = writeFile(scratch.path(), "shim.s", kCallsPrintf);
+        auto const src = writeFile(scratch.path(), "shim.s", kCallsMtxLock);
         DiagnosticReporter rep;
         Program            prog;
         int const rc = prog.compileFiles(
@@ -230,7 +245,7 @@ TEST(AsmExternBinding, SynthesizeRecipeRowIsRefusedOnPeAndBoundOnElf) {
             {std::string{"x86_64:pe64-x86_64-windows-exec"}}, rep);
         std::string const text = allDiagnosticText(rep);
         EXPECT_NE(rc, 0)
-            << "pe realizes printf as a COMPILER-SYNTHESIZED body; the encode "
+            << "pe realizes mtx_lock as a COMPILER-SYNTHESIZED body; the encode "
                "tier emits none, and importing the name directly would link "
                "clean and fail at LOAD\n" << text;
         EXPECT_TRUE(sawCode(rep, DiagnosticCode::A_AsmTextUnsupported)) << text;
@@ -241,7 +256,7 @@ TEST(AsmExternBinding, SynthesizeRecipeRowIsRefusedOnPeAndBoundOnElf) {
     {
         ScratchDir scratch{Location::InsideRepo, "asm-extern"};
         scratch.useAsCwd();
-        auto const src = writeFile(scratch.path(), "shim.s", kCallsPrintf);
+        auto const src = writeFile(scratch.path(), "shim.s", kCallsMtxLock);
         DiagnosticReporter rep;
         Program            prog;
         int const rc = prog.compileFiles(
@@ -250,9 +265,40 @@ TEST(AsmExternBinding, SynthesizeRecipeRowIsRefusedOnPeAndBoundOnElf) {
         EXPECT_EQ(rc, 0)
             << "on elf the SAME name is an ordinary libc export and must bind — "
                "the refusal above is the platform's answer, not a rule about "
-               "the spelling `printf`\n"
+               "the spelling `mtx_lock`\n"
             << allDiagnosticText(rep);
     }
+}
+
+// ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): a `.s` that writes
+// `call printf` on pe names a symbol NOTHING defines — the platform's printf is DSS's
+// runtime source under `__dss_isoc23_printf`, and ucrtbase exports no `printf` — so the
+// binder must NOT bind it to an image (that is the 0xC0000139 load failure) and the
+// build must fail LOUD rather than produce a binary. The same source still binds glibc's
+// `printf` on elf (the arm above's shape).
+TEST(AsmExternBinding, ShippedSourceRowWrittenByItsCNameStaysUnboundAndFailsTheLink) {
+    ScratchDir scratch{Location::InsideRepo, "asm-extern"};
+    scratch.useAsCwd();
+    auto const src = writeFile(scratch.path(), "printf.s", kCallsPrintf);
+    DiagnosticReporter rep;
+    Program            prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, std::string{kAttLanguage},
+        {std::string{"x86_64:pe64-x86_64-windows-exec"}}, rep);
+    std::string const text = allDiagnosticText(rep);
+    EXPECT_NE(rc, 0) << "a pe image importing `printf` links clean and fails at LOAD\n" << text;
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_SymbolUndefined)) << text;
+    EXPECT_NE(text.find("printf"), std::string::npos) << text;
+
+    ScratchDir elfScratch{Location::InsideRepo, "asm-extern"};
+    elfScratch.useAsCwd();
+    auto const elfSrc = writeFile(elfScratch.path(), "printf.s", kCallsPrintf);
+    DiagnosticReporter elfRep;
+    Program            elfProg;
+    EXPECT_EQ(elfProg.compileFiles({elfSrc.generic_string()}, std::string{kAttLanguage},
+                                   {std::string{"x86_64:elf64-x86_64-linux-exec"}}, elfRep),
+              0)
+        << allDiagnosticText(elfRep);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

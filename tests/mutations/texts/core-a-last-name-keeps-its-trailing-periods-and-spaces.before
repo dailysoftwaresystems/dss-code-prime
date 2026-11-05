@@ -1,0 +1,1 @@
+    while (!component.empty() && (component.back() == C('.') || component.back() == C(' ')))

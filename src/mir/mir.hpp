@@ -73,7 +73,9 @@ public:
     // REQUIRED — no defaults — so a direct call site can't silently
     // produce a sound-but-wrong-shape module by omitting them.
     // `MirBuilder::finish` is the only intended producer and threads
-    // both through explicitly.
+    // both through explicitly. (The module's symbol-id end is not an
+    // argument: the constructor counts it past every symbol the arenas
+    // define, and `MirBuilder::finish` raises it to the builder's.)
     Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
         GlobalArena globalArena,
         std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
@@ -280,11 +282,22 @@ public:
     // linkage attributes consumed by the optimizer's DCE pass and the
     // downstream link-tier emitter. `isExternallyVisible(binding,
     // visibility)` is the DCE-protect predicate.
+    //
+    // ★ P69: `funcLinkage` IS THE ACCESSOR A COPY USES. It returns the WHOLE
+    // record (`MirLinkage`: binding, visibility, the weak kind, the tentative
+    // mark) and a site that re-adds a function hands it to
+    // `MirBuilder::addFunction` as it came — never the fields one by one, which
+    // is how a fact added later is dropped at one of nine sites in silence.
+    // `funcBinding` / `funcVisibility` stay for a reader that ASKS one question
+    // (DCE's keep predicate, the inliner's weak refusal); they read the record.
+    [[nodiscard]] MirLinkage funcLinkage(MirFuncId id) const {
+        return funcArena_.at(id).linkage;
+    }
     [[nodiscard]] SymbolBinding funcBinding(MirFuncId id) const {
-        return funcArena_.at(id).binding;
+        return funcArena_.at(id).linkage.binding;
     }
     [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
-        return funcArena_.at(id).visibility;
+        return funcArena_.at(id).linkage.visibility;
     }
     // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): TRUE iff the source declared this function
     // `__attribute__((noinline))`. The inliner's §2.9 legality gate REFUSES to
@@ -350,11 +363,56 @@ public:
     // discipline as `funcBinding` / `funcVisibility`. A global
     // with `isExternallyVisible(binding, visibility) == true` MUST
     // survive DCE / unused-symbol elimination.
+    // ★ P69: `globalLinkage` is the accessor a COPY uses — the whole record, on
+    // the terms `funcLinkage` states above. It is also the only reader of a
+    // global's weak kind and of its tentative mark.
+    [[nodiscard]] MirLinkage globalLinkage(MirGlobalId id) const {
+        return globalArena_.at(id).linkage;
+    }
+    // ── IS THIS GLOBAL A COMMON? — the ONE statement (P69 fold 3, lane `xa`) ──
+    //    D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED
+    //
+    // A COMMON is a tentative definition the link FOLDS with the other units'
+    // (C 6.9.2p2; the common extension, C11 J.5.11): `int x;` in two units is
+    // one object, and beside an initialized definition elsewhere it is that
+    // object. Two readers ask — the cross-unit merge, which folds two of them
+    // (`mergeCuMirs`), and the pipeline, which states a unit's as the COMMON
+    // row every object reader already produces (`ExternImport::commonSize`) —
+    // and they ask HERE so that they cannot disagree about which definitions
+    // those are. It is the tentative mark, READ ALONE: the mark means "may be
+    // written as a common", the tier above states it once and clears it on every
+    // definition that is its unit's outright (P69, lane `cs`: `nocommon`, a
+    // variable an `alias` names, and the two below), and the builders refuse it
+    // where it could not mean that (`mirLinkageDefect`) — so no reader restates
+    // the list. The two a reader once asked beside the mark, now defects:
+    //   * A WEAK BINDING. A weak tentative definition
+    //     (`__attribute__((weak)) int t;`) is a WEAK definition: its kind
+    //     decides what it is beside every other, and no reference writes it as
+    //     a common.
+    //   * THREAD STORAGE. ✔MEASURED 2026-10-12: no reference writes a
+    //     thread-local tentative definition as a common — cl 19.44 and clang
+    //     19.1.5 put `_Thread_local int t;` in `.tls$`, gcc 13.3 and clang 18.1
+    //     on ELF in `.tbss` even under `-fcommon`, MinGW gcc 13.2 in its
+    //     emulated-TLS control object — and two units holding one are REFUSED
+    //     by link.exe, lld-link, GNU ld and ld.lld alike (7 of 7 cells), as two
+    //     strong definitions are. So it stays a definition, and the pair stays
+    //     refused. Mach-O agrees (✔MEASURED 2026-10-12, Apple clang 21: the
+    //     object is in `__DATA,__thread_vars`, and the pair is refused as a
+    //     duplicate symbol by ld-1267 on arm64 and x86_64 and by `-ld_classic`,
+    //     6 of 6).
+    // The builders refuse the mark there, on a local global and beside an
+    // initializer alike (`mirLinkageDefect`), so none is asked again.
+    // (The reading itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that a
+    // reader holding the record WITHOUT a module — the decoder of a stored
+    // summary — is judged by the same words.)
+    [[nodiscard]] bool globalIsCommon(MirGlobalId id) const {
+        return mirLinkageIsCommon(globalArena_.at(id).linkage);
+    }
     [[nodiscard]] SymbolBinding globalBinding(MirGlobalId id) const {
-        return globalArena_.at(id).binding;
+        return globalArena_.at(id).linkage.binding;
     }
     [[nodiscard]] SymbolVisibility globalVisibility(MirGlobalId id) const {
-        return globalArena_.at(id).visibility;
+        return globalArena_.at(id).linkage.visibility;
     }
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: true iff the source declared this
     // global `const`. The assembler's section selection routes an INITIALIZED
@@ -421,7 +479,55 @@ public:
     // Rust / strict-typed DSLs declare `false`.
     [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
 
+    // ── the module's SYMBOL-ID SPACE (P69 round 5,
+    //    D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE) ──
+    // ONE PAST the highest SymbolId.v of the id space this module's symbols are
+    // numbered in: the name table the module was made from (its semantic model's
+    // records, or a merge's allocation), every symbol the module defines, and
+    // every id minted for it since. Most of that space the module never holds — a
+    // local, a parameter, a typedef, a tag, an enum constant, an extern another
+    // unit defines — and whoever lowers or merges the module names each of its ids
+    // through that table, so a symbol synthesized for the module is numbered from
+    // HERE and nowhere else: `MirBuilder::mintSymbol`, the one door. Carried by
+    // every rebuild (`MirBuilder::continueSymbolIdsOf`). 1 for the empty module —
+    // 0 is the invalid id.
+    [[nodiscard]] std::uint32_t symbolIdEnd() const noexcept { return symbolIdEnd_; }
+
+    // Whether that end was STATED, or only COUNTED.
+    //   STATED — whoever made the module said where its id space ends: the name
+    //   table it was made from (`MirBuilder::stateSymbolIdEnd`), its maker's word
+    //   that nothing stands beside it (`MirBuilder::stateSelfContainedSymbolIds`),
+    //   or the module it replaces, when THAT module's end was stated
+    //   (`MirBuilder::continueSymbolIdsOf` copies the fact and never invents it).
+    //   COUNTED — nobody said. `symbolIdEnd()` is then one past the symbols the
+    //   arenas define and no more, and it reads exactly like a real end.
+    // That likeness is how an entrance got through in silence: the door aborted on
+    // a BUILDER never told its end, the frozen module dropped the fact, and the
+    // first rebuild's `continueSymbolIdsOf` turned a counted end into a stated one
+    // (✔MEASURED 2026-10-08: the `.dssir` reader stated nothing, a text declaring
+    // `%1 "f"` and `%2 "g"` and defining `f` alone read back ending at 2, and
+    // MIR→LIR named a block `%2` — `g`'s id — with no diagnostic). The fact now
+    // travels WITH the module, and both leaves of the door refuse to mint past a
+    // counted end (`MirBuilder::mintSymbol`, `MirSymbolIdContinuation::mint`), so
+    // an entrance that forgets its statement is loud at the first id it needs.
+    [[nodiscard]] bool symbolIdEndIsStated() const noexcept { return symbolIdEndStated_; }
+
+    // ── SECOND NAMES OF THE MODULE's DEFINITIONS (P69, lane `cs`) ──
+    // Every `alias("target")` the module defines (`MirAlias`, mir/mir_node.hpp),
+    // in the order the builder was handed them. A name here is a definition of
+    // the module: the object producer writes it as one more symbol row on its
+    // target's definition, and a symbol-keyed reader that asks "does this module
+    // define the name" asks here too.
+    [[nodiscard]] std::span<MirAlias const> aliases() const noexcept { return aliases_; }
+    [[nodiscard]] std::size_t moduleAliasCount() const noexcept { return aliases_.size(); }
+
 private:
+    // `MirBuilder::finish` hands the built module the builder's symbol-id end —
+    // the one fact of a module its arenas cannot state (the constructor's own
+    // count covers the symbols they define, never the name table's) — and the
+    // module's aliases, which no arena holds.
+    friend class MirBuilder;
+
     InstArena                   instArena_;
     BlockArena                  blockArena_;
     FuncArena                   funcArena_;
@@ -439,6 +545,9 @@ private:
     MirAsmDescriptorPool        asmDescriptorPool_;  // inline-asm templates + constraints
     MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
     bool                        charTypesAliasAll_ = true;
+    std::uint32_t               symbolIdEnd_ = 1;   // see `symbolIdEnd()`
+    bool                        symbolIdEndStated_ = false;   // see `symbolIdEndIsStated()`
+    std::vector<MirAlias>       aliases_;           // see `aliases()`
 };
 
 // `MirAttribute<T>` — the HIR-style side-table over the instruction tier (the
@@ -498,6 +607,94 @@ public:
     void setCharTypesAliasAll(bool v) noexcept { charTypesAliasAll_ = v; }
     [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
 
+    // ── THE SYMBOL-ID SPACE: the ONE DOOR a fresh SymbolId comes through ──
+    // (P69 round 5, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE)
+    //
+    // A symbol synthesized for a module — a literal's global, an optimizer's
+    // constant, a startup function, a funclet, a helper import — needs an id no
+    // other symbol of the module's id space has, and most of that space is in
+    // the NAME TABLE the module was made from, not in the module (see
+    // `Mir::symbolIdEnd`). Five sites each scanned the module and added one;
+    // four were in time handed the table's end by their caller, and the fifth
+    // never was (✔MEASURED 2026-10-08: the optimizer's rodata zero took id 154
+    // in a unit whose table ends at 159, and where that id was an extern
+    // import's the release build of a 12-line program was refused, or linked
+    // and crashed). So the MODULE carries the end and hands out the ids:
+    //   * `stateSymbolIdEnd(end)` — a module MADE FROM A NAME TABLE states the
+    //     table's end where it is made (HIR→MIR: the semantic table's size; the
+    //     merge: its allocator's end; the `.dssir` reader: the text's own
+    //     table);
+    //   * `stateSelfContainedSymbolIds()` — a module MADE FROM NOTHING BUT
+    //     ITSELF says so: no name table stands beside it, and the only ids of
+    //     its space it does not define are the ones handed to the door beside
+    //     it and kept clear of there (`keepSymbolIdsClearOf`,
+    //     `MirSymbolIdContinuation::keepClearOf`: an import row, a recipe's
+    //     reserved id). Its end is the counted one, STATED. That is the
+    //     hand-built module of a unit test; no product file makes one
+    //     (tests/mir/test_synth_symbol_floor.cpp holds every file under src/ to
+    //     that);
+    //   * `continueSymbolIdsOf(rebuilt)` — a module that REPLACES another
+    //     continues that module's ids AND carries whether they were ever
+    //     stated: it COPIES that fact, it does not make it (it once set it, and
+    //     so turned a counted end into a stated one at the first rebuild — see
+    //     `Mir::symbolIdEndIsStated`). Every rebuild does (the clone-globals
+    //     helpers), and a pass that mints does so before it mints;
+    //   * `mintSymbol()` — the next id; the space grows by one. It ABORTS on a
+    //     builder whose end nobody stated — no statement made here, and none by
+    //     a module it continues: an id counted from the symbols a
+    //     builder happens to hold is exactly the defect, so no caller is left a
+    //     way to mint without the module's end. It never returns a value a format
+    //     WRITER defines for itself (`isWriterReservedSymbolIdValue`): the end
+    //     steps over it. Returns the invalid `SymbolId{}` when the space is
+    //     exhausted (the next id would be the last value, and the end could not
+    //     move past it); the caller refuses.
+    //   * `mintSymbolOrAbort(who)` — the same id for a caller that has no
+    //     diagnostic to give (a pass over a frozen module cannot position an
+    //     error on source text): at exhaustion it aborts, naming `who`.
+    // The statements only RAISE the end, a symbol the builder is handed
+    // (`addFunction`, `addGlobal`) raises it past itself, and
+    // `keepSymbolIdsClearOf` raises it past an id something BESIDE the module
+    // already uses for it (an import row, a recipe's reserved id) — in a module
+    // made from a table those are all below the end already; it matters to a
+    // hand-built one, whose end is otherwise one past the symbols it defines.
+    // Raising the end states nothing: `keepSymbolIdsClearOf` alone leaves a
+    // builder's end COUNTED.
+    void stateSymbolIdEnd(std::uint32_t end) noexcept;
+    void stateSelfContainedSymbolIds() noexcept;
+    void continueSymbolIdsOf(Mir const& rebuilt) noexcept;
+    void keepSymbolIdsClearOf(SymbolId taken) noexcept;
+    [[nodiscard]] SymbolId mintSymbol();
+    [[nodiscard]] SymbolId mintSymbolOrAbort(char const* who);
+    [[nodiscard]] std::uint32_t symbolIdEnd() const noexcept { return symbolIdEnd_; }
+    [[nodiscard]] bool symbolIdEndIsStated() const noexcept { return symbolIdEndStated_; }
+
+    // ── THE ONE PLACE a module that REPLACES another copies what the MODULE
+    //    carries ──
+    // Not what a function or a global carries — that is cloned where the function
+    // or the global is — but the facts that belong to the module as a whole: the
+    // alias-analysis polarity, the character-type aliasing rule, and the
+    // symbol-id space (`continueSymbolIdsOf`). Every rebuild calls it: the three
+    // clone-globals helpers (opt/passes/mir_rebuild_helper.cpp), through which
+    // every optimizer pass and synthesis pass rebuilds, and DCE's own rebuild. A
+    // module-level fact added later is added HERE and reaches them all. Each
+    // rebuild once copied its own list, which is how strict-TBAA was silently
+    // downgraded after the first pass
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE) and how a fourth list could
+    // have forgotten the id space. P69 (lane `cs`): the module's ALIASES too
+    // (`Mir::aliases`) — keyed by symbol ids, which no rebuild renumbers, so they
+    // are carried whole; DCE roots each target, so no rebuild drops one.
+    void carryModuleFactsOf(Mir const& rebuilt);
+
+    // ── A SECOND NAME OF A DEFINITION (P69, lane `cs`) ──
+    // States that this module defines `alias` as the definition `target` is
+    // (`MirAlias`). Aborts, by name, on a producer's bug: an invalid id, a name
+    // that is its own target, a name already stated as an alias here, a tentative
+    // mark (an alias has no storage), or a linkage record the one rule refuses
+    // (`mirLinkageDefect`). Whether the module DEFINES `target`, and defines
+    // `alias` in no other way, is a fact of the whole module: `MirVerifier` holds
+    // it (`checkAliases`), and the `.dssir` reader asks it before calling here.
+    void addAlias(SymbolId alias, SymbolId target, MirLinkage linkage);
+
     // ── function / block lifecycle ──
     // Open a function. Closes any open function first (which requires its current
     // block be terminated and the function have ≥1 block). `signature` is the
@@ -539,6 +736,29 @@ public:
     // one single-flag record somewhere, not that every record is single-flag. For
     // THIS flag that discipline is the only detector available at all, since no
     // codegen difference exists to observe.
+    //
+    // ★★ P69 (lane `xa`) — THE LINKAGE IS ONE RECORD, AND THERE ARE TWO FORMS.
+    //   * THE RECORD FORM (`MirLinkage linkage`, the first declaration below) is
+    //     the one a site that COPIES a function uses — it passes
+    //     `src.funcLinkage(f)` whole — and the one a producer that knows the
+    //     symbol's weak kind uses (HIR→MIR, the text reader, a synthesis pass
+    //     whose function is weak). It REFUSES, each by name: a weak binding that
+    //     states no kind (the object writers spell the two kinds differently on
+    //     PE, so "weak, kind unknown" has no honest spelling); a kind beside a
+    //     binding that is not weak (a kind nobody may read); and a `tentative`
+    //     mark, which is a global's fact.
+    //   * THE (binding, visibility) FORM stays as the form for a symbol that is
+    //     NEITHER weak NOR tentative — a synthesized entry, a funclet, a test's
+    //     plain function. It REFUSES a weak binding by name instead of guessing a
+    //     kind for it, so no caller can make a kindless weak definition through
+    //     the shorter spelling.
+    MirFuncId addFunction(TypeId signature, SymbolId symbol,
+                          MirLinkage       linkage,
+                          bool             noInline     = false,
+                          bool             alwaysInline = false,
+                          bool             noOptimize   = false,
+                          bool             noSanitizeThread = false,
+                          StaticInitSchedule staticInit = {});
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
                           SymbolBinding    binding      = SymbolBinding::Global,
                           SymbolVisibility visibility   = SymbolVisibility::Default,
@@ -591,6 +811,25 @@ public:
     // alignmentBytes)` — `MirThreadStorage` admits neither conversion, so
     // both mistakes are compile errors (see the enum's doc in mir_node.hpp;
     // propagation sites bridge via `mirThreadStorageOf(bool)`).
+    //
+    // ★★ P69 (lane `xa`) — THE LINKAGE IS ONE RECORD, in two forms, on the terms
+    // `addFunction` states above: the RECORD form is what a site that copies a
+    // global passes (`src.globalLinkage(g)`, whole) and what a producer that
+    // knows the weak kind or the tentative mark passes; the (binding,
+    // visibility) form is for a global that is neither weak nor tentative and
+    // refuses a weak binding. The record form refuses, each by name: a weak
+    // binding with no kind; a kind beside a binding that is not weak; a
+    // `tentative` mark on a module-private (`Local`) global, which the link
+    // never folds; and a `tentative` mark beside an initializer of either shape
+    // — a tentative definition is by its definition the one with none (C
+    // 6.9.2p2).
+    MirGlobalId addGlobal(TypeId type, SymbolId symbol,
+                          std::uint32_t initLiteralIndex,
+                          MirFuncId     initFunc,
+                          MirLinkage       linkage,
+                          bool             isConst,
+                          MirThreadStorage threadStorage,
+                          std::uint32_t    alignmentBytes = 0);
     MirGlobalId addGlobal(TypeId type, SymbolId symbol,
                           std::uint32_t initLiteralIndex,
                           MirFuncId     initFunc,
@@ -599,6 +838,20 @@ public:
                           bool             isConst,
                           MirThreadStorage threadStorage,
                           std::uint32_t    alignmentBytes = 0);
+
+    // ── THE ONE DOOR THAT DOES NOT ASK THE LINKAGE RULE (P69 fold 3) ───────────
+    //
+    // Replaces the linkage record of a function or a global this builder
+    // already holds, UNJUDGED: `mirLinkageDefect` is not asked. It exists for
+    // the reason `addInst` takes a raw payload — so that the VERIFIER's half of
+    // a rule the builders also hold can be reached and shown to fire. Both
+    // `addFunction` and `addGlobal` abort on an ill-formed record, which left
+    // `MirVerifier`'s refusal of one (`checkLinkageRecords`) with no module that
+    // could reach it, and a refusal nothing can reach is one nobody can pin.
+    // NO PRODUCER CALLS IT: a module that comes out of one of these is the
+    // verifier's to refuse, by name.
+    void restateLinkageUnjudged(MirFuncId function, MirLinkage linkage);
+    void restateLinkageUnjudged(MirGlobalId global, MirLinkage linkage);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).
@@ -913,7 +1166,8 @@ public:
     // pieces (SysV ≤16B → 2). Each `values[i]` is a piece value (I64/F64); the
     // callconv pass moves piece i into its per-class return register.
     MirInstId addReturnMulti(std::span<MirInstId const> values);
-    MirInstId addUnreachable();
+    // P69: `kind` is the `MirUnreachableKind` the terminator asserts (its payload).
+    MirInstId addUnreachable(MirUnreachableKind kind = MirUnreachableKind::Assumed);
 
     // ── introspection (read-only on the in-progress build) ──
     // True iff the currently-open block has been sealed (i.e. one of the
@@ -1012,6 +1266,16 @@ private:
     MirAsmDescriptorPool        asmDescriptorPool_;
     MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
     bool                        charTypesAliasAll_ = true;
+    // The symbol-id space's end (see `mintSymbol`), and whether it was ever
+    // STATED — here (`stateSymbolIdEnd`, `stateSelfContainedSymbolIds`) or by a
+    // module this builder continues (`continueSymbolIdsOf`). `finish` hands both
+    // to the module.
+    std::uint32_t               symbolIdEnd_ = 1;
+    bool                        symbolIdEndStated_ = false;
+    std::vector<MirAlias>       aliases_;   // `addAlias`; handed over by `finish`
+    void raiseSymbolIdEndTo_(std::uint32_t end) noexcept {
+        if (end > symbolIdEnd_) symbolIdEnd_ = end;
+    }
 
     // Per-phi pending incomings, keyed by the phi instruction's slot (.v),
     // flushed into `phiPool_` (contiguously per phi) at `finish`.
@@ -1022,6 +1286,52 @@ private:
 
     MirFuncId  openFunc_;   // invalid ⇒ no open function
     MirBlockId openBlock_;  // invalid ⇒ no open block
+};
+
+// ── The door's second leaf: ids PAST a FROZEN module's symbol-id space ──
+//
+// A tier that lowers a module into its own representation needs symbols there
+// that the module never holds (MIR→LIR names its blocks, its jump tables and its
+// sign masks). It cannot ask a `MirBuilder` — the module is frozen and the symbols
+// are not the module's — but its ids must still clear everything
+// `Mir::symbolIdEnd` covers: the name table the module was made from, every
+// import beside it, and every symbol minted for the module that is neither a
+// function nor an object of it (a block symbol HIR→MIR pre-mints for a label
+// whose address a static initializer takes) — none of which a scan of the module,
+// or of a set a caller hands in, is guaranteed to see. This CONTINUES the
+// module's ids: the first `mint()` is `mir.symbolIdEnd()`. It mints through the
+// same one place as `MirBuilder::mintSymbol`, so it never returns a
+// writer-reserved value either — and, like it, ABORTS rather than mint past an
+// end nobody stated (`Mir::symbolIdEndIsStated`): a module whose end was only
+// counted may have a table beside it that this leaf cannot see, and the first id
+// it handed out would be one of that table's. Constructing a continuation over
+// such a module is no error; minting from it is.
+//
+// ⚠ ONE continuation per lowering of a module. It does not write back — the
+// module is const — so two continuations of one module hand out the same ids.
+class DSS_EXPORT MirSymbolIdContinuation {
+public:
+    explicit MirSymbolIdContinuation(Mir const& mir) noexcept;
+
+    // Raise the end past an id something BESIDE the module already uses for it —
+    // an import row handed to the lowering next to a hand-built module (in a
+    // module made from a table every import's id is below the end already).
+    // It states nothing: a counted end stays counted.
+    void keepClearOf(SymbolId taken) noexcept;
+    // The next id, or the invalid `SymbolId{}` when the space is exhausted.
+    // Aborts, by name, over a module whose end was only counted.
+    [[nodiscard]] SymbolId mint() noexcept;
+    // `mint` for a caller with no diagnostic to give: at exhaustion it aborts,
+    // naming `who`.
+    [[nodiscard]] SymbolId mintOrAbort(char const* who);
+    // One past the highest id handed out so far.
+    [[nodiscard]] std::uint32_t end() const noexcept { return end_; }
+    // Whether the module's end was stated (see `Mir::symbolIdEndIsStated`).
+    [[nodiscard]] bool endIsStated() const noexcept { return stated_; }
+
+private:
+    std::uint32_t end_;
+    bool          stated_;
 };
 
 } // namespace dss

@@ -1,0 +1,2 @@
+            groupMemberDataIndices.push_back(i);
+            leaderOfGroupMember.emplace(i, *leader);

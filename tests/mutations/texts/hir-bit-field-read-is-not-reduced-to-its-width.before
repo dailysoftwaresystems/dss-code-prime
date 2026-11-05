@@ -1,0 +1,1 @@
+    std::uint64_t reduced = static_cast<std::uint64_t>(*bits) & mask;

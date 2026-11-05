@@ -1,0 +1,1 @@
+            return ownAlign < slot ? slot : (ownAlign < 16u ? ownAlign : 16u);

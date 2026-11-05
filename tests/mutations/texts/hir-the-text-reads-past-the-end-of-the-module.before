@@ -1,0 +1,1 @@
+        if (!peekIs(Tk::Eof)) {

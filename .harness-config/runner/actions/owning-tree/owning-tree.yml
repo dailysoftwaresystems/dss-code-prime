@@ -1,10 +1,11 @@
-# PURPOSE: name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment.
+# PURPOSE: name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment -- and what a walk of that tree leaves out: its own .gitignore, as git reads it.
 name: owning-tree
 description: >-
-  The action proves the tree-identity walk, git's agreement and the root arms can fail.
+  The action proves the tree-identity walk, git's agreement, the root arms and the
+  reading of what a walk of a tree leaves out can fail.
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
-  Gated by ctest as `owning_tree_selftest_guard`.
+  Gated by ctest as `owning_tree_selftest_guard`, one case per arm.
 steps:
   - name: self-test
     workingDirectoryRoot: action

@@ -1,0 +1,2 @@
+                        {static_cast<std::uint16_t>(slotFromSp & 0xFFFF),
+                         static_cast<std::uint16_t>((slotFromSp >> 16) & 0xFFFF)},

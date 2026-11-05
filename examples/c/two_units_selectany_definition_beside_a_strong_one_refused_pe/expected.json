@@ -1,0 +1,18 @@
+{
+  "$comment": "P69 fold 3 (lane `xa`), D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER: a `__declspec(selectany)` definition beside a STRONG definition of its name in another unit is a DUPLICATE on PE -- link.exe 14.44 (LNK2005), lld-link 19.1.5 and GNU ld 2.42 each refuse the pair in either order (MEASURED 2026-10-10 and 2026-10-12, cl 19.44, clang 19.1.5 and MinGW gcc 13.2 objects). Before the fold DSS linked it and the program ran with the strong definition's value (22 from `v * 10 + getv()`, MEASURED 2026-10-12, compiled units and reference objects alike): every weak definition yielded to a strong one, whatever its kind. What a strong definition makes of a weak one is now each format's document's answer per kind (`weakDefinitionBesideStrong`; PE: overridable yields, select-any collides), and the pair is refused as the redefinition it is, naming the key. PE only: ELF and Mach-O spell one kind of weak definition, which yields.",
+  "language": "c",
+  "sources": ["a.c", "b.c"],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_SymbolRedefinedAcrossUnits",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

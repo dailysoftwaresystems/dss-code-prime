@@ -1,0 +1,1 @@
+        out = String{sep, sep, s[2] == C('?') ? C('?') : C('.'), sep};

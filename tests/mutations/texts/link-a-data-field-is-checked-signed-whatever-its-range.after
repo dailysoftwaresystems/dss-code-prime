@@ -1,0 +1,1 @@
+            if (std::string why; tri->widthBytes < 8 && (signedValue < -(std::int64_t{1} << (8 * tri->widthBytes - 1)) || signedValue >= (std::int64_t{1} << (8 * tri->widthBytes - 1)))) {

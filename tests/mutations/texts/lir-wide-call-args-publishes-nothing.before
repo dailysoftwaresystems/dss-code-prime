@@ -1,0 +1,1 @@
+        entryImage[srcBlock.v] = srcToDst.at(srcBlock.v).v;

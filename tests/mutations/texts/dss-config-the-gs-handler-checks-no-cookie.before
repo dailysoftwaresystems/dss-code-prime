@@ -1,0 +1,2 @@
+    checkFrameCookie((ULONG const *)dispatch->HandlerData, (ULONG_PTR)establisherFrame, dispatch);
+    return ExceptionContinueSearch;

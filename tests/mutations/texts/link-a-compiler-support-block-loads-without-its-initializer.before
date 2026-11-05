@@ -1,0 +1,2 @@
+            if (!cs.contains(kInitKey) || !cs.at(kInitKey).is_string()
+             || cs.at(kInitKey).get<std::string>().empty()) {

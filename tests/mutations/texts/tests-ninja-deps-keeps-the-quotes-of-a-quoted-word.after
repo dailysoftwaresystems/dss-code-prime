@@ -1,0 +1,1 @@
+        words += list(_COMMAND_WORD.findall(edge["vars"].get(name, "")))

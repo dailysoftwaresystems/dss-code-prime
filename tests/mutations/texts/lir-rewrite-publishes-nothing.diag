@@ -1,0 +1,1 @@
+(*s.image)[s.in->funcBlockAt(inFn, k).v]

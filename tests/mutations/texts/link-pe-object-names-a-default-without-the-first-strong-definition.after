@@ -1,0 +1,1 @@
+        if (false && !firstStrongDefinition.empty()) name += "." + firstStrongDefinition;

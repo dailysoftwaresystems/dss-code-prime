@@ -314,6 +314,17 @@ public:
     // monotonic per-function (resets when `addFunction` is called).
     [[nodiscard]] LirReg newVReg(LirRegClass cls);
 
+    // Every virtual register id up to and including `id` is TAKEN in the open
+    // function, so `newVReg` mints above it (a no-op when the counter is already
+    // past it). (P69 round 4.) A pass that REBUILDS a function copies its virtual
+    // registers verbatim — `addInst` takes the ids it is given and never moves the
+    // counter — so a pass that also mints one must first reserve every id the
+    // copied function holds, or `newVReg` hands out id 1 again and two live values
+    // share one register name, which liveness and the allocator cannot tell apart.
+    // `lowerWideCallArgs` is the first rebuilding pass that mints. Past the id
+    // space it refuses as `newVReg` does.
+    void reserveVRegIdsThrough(std::uint32_t id);
+
     // Append a non-terminator instruction to the current block.
     // `result` is the value-defining virtual register (`InvalidLirReg`
     // for value-less ops). `operands` are passed verbatim into the

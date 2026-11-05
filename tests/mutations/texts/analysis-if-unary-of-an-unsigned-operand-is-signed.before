@@ -1,0 +1,1 @@
+                detail::IntKindInfo{64, operand->core != TypeKind::U64});

@@ -1,0 +1,3 @@
+        if (a->unionMember.has_value() && lv.core != TypeKind::Union
+            && /*S2d*/ a->fields.size() > a->fields.size()) {
+            std::string_view const core = literalCoreName(lv.core);

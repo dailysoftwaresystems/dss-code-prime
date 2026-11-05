@@ -1,0 +1,3 @@
+                ConstEvalResult atType = done.kind == CstFoldFrame::Kind::Ref
+                                             ? inner
+                                             : convertToCastTarget(inner, *done.target, options, node);

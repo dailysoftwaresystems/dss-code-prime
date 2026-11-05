@@ -1,0 +1,1 @@
+    unread = next((w for w in words if w.startswith("@")), None)

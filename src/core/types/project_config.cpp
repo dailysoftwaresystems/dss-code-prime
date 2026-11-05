@@ -1,5 +1,6 @@
 #include "core/types/project_config.hpp"
 
+#include "core/substrate/path_identity.hpp"     // extendedLengthSpelling: the document opens at any length
 #include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey + DSS_CHECK_KEY_VOCABULARY
 #include "core/types/parse_diagnostic.hpp"
@@ -1004,7 +1005,7 @@ parseProjectConfig(std::string_view jsonText,
 std::optional<ProjectConfig>
 loadProjectConfig(std::filesystem::path const& path,
                   DiagnosticReporter& rep) {
-    std::ifstream in{path, std::ios::binary};
+    std::ifstream in{core::extendedLengthSpelling(path), std::ios::binary};
     if (!in) {
         emitProjectError(rep, DiagnosticCode::D_FileNotFound, path.string(),
                          "project config file could not be opened");

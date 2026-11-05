@@ -89,14 +89,19 @@ struct Leg {
     // OPPOSITE outcomes rather than the same one.
     bool                             carriesDwarfUnwind;
     // How many `unwind` rows this arch's SHIPPED DOCUMENT declares. A DOCUMENT
-    // fact rather than a producer one, and it must track `carriesDwarfUnwind`:
-    // the document declares a row for each encoding the objects carry.
+    // fact rather than a producer one: the document declares a row for each
+    // encoding an object of the arch CAN carry, which on arm64 is more than
+    // this stock fixture does -- the default invocation writes compact only
+    // (`carriesDwarfUnwind` false), while `-fasynchronous-unwind-tables` adds
+    // `__TEXT,__eh_frame` (✔MEASURED 2026-10-08, Apple clang 21.0.0; P69,
+    // D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ, pinned on such an
+    // object by `MachoUnwindRelocations` in `test_macho_object_reader.cpp`).
     std::size_t                      unwindRows;
 };
 
 [[nodiscard]] Leg arm64Leg() {
     return Leg{"arm64", "macho64-arm64-darwin",
-               dss::test::appleClangMachoCompactUnwindArm64Object(), 1, false, 1};
+               dss::test::appleClangMachoCompactUnwindArm64Object(), 1, false, 2};
 }
 [[nodiscard]] Leg x86Leg() {
     return Leg{"x86_64", "macho64-x86_64-darwin",
@@ -410,7 +415,10 @@ TEST(MachoCompactUnwind, EntrySizeThatDoesNotDivideTheBodyRefuses) {
     nlohmann::json doc = nlohmann::json::parse(text);
     bool retyped = false;
     for (auto& row : doc.at("sections")) {
-        if (row.at("kind").get<std::string>() == "unwind") {
+        // The COMPACT row: the record width is that encoding's (the DWARF row
+        // beside it has no record width to state).
+        if (row.at("kind").get<std::string>() == "unwind"
+            && row.value("encoding", "") == "compact-unwind") {
             ASSERT_EQ(row.at("entrySize").get<std::uint64_t>(), 32u)
                 << "the shipped width is MEASURED off Apple clang; if it moved, "
                    "this mutant is no longer the one it claims to be";
@@ -452,7 +460,10 @@ TEST(MachoCompactUnwind, ARowUnderTheWrongSegmentDoesNotClassifyTheSection) {
     nlohmann::json doc = nlohmann::json::parse(text);
     bool moved = false;
     for (auto& row : doc.at("sections")) {
-        if (row.at("kind").get<std::string>() == "unwind") {
+        // The COMPACT row -- the one that classifies the section this stock
+        // object carries.
+        if (row.at("kind").get<std::string>() == "unwind"
+            && row.value("encoding", "") == "compact-unwind") {
             ASSERT_EQ(row.at("segment").get<std::string>(), "__LD");
             row["segment"] = "__NOTLD";
             moved = true;
@@ -602,8 +613,7 @@ TEST(MachoCompactUnwind, X86_64DocumentMinusItsDwarfRowStopsCarrying) {
     auto stripped = ObjectFormatSchema::loadFromText(
         doc.dump(), std::string{leg.formatName} + "-no-dwarf-unwind-row");
     ASSERT_TRUE(stripped.has_value())
-        << "one unwind row is a legal document -- that is what the arm64 "
-           "sibling ships";
+        << "one unwind row is a legal document";
 
     DiagnosticReporter rep;
     auto mod = macho::readRelocatableObject(leg.object, *loaded.target,
@@ -629,9 +639,11 @@ TEST(MachoCompactUnwind, X86_64DocumentMinusItsDwarfRowStopsCarrying) {
 //   DWARF resynchronizes onto record bytes and produces a confident table of
 //   noise, which is strictly WORSE than the silence this row exists to end --
 //   the unwinder trusts a table that is present. So an unwind row with no
-//   `encoding` is refused BY NAME, and the arm64 document (whose single row
-//   makes the key optional as far as `validate()` is concerned) is the one
-//   that proves the READER, not the loader, holds that line.
+//   `encoding` is refused BY NAME, and a document with a SINGLE unwind row
+//   (which makes the key optional as far as `validate()` is concerned) is the
+//   one that proves the READER, not the loader, holds that line: the arm64
+//   document MINUS its `dwarf-cfi` row, which is the document arm64 shipped
+//   until that row was declared (P69).
 TEST(MachoCompactUnwind, AnUnwindRowWithNoDeclaredEncodingIsRefused) {
     Leg const leg = arm64Leg();
     std::string const text = shippedFormatText(leg.formatName);
@@ -641,15 +653,29 @@ TEST(MachoCompactUnwind, AnUnwindRowWithNoDeclaredEncodingIsRefused) {
 
     nlohmann::json doc = nlohmann::json::parse(text);
     bool erased = false;
-    for (auto& row : doc.at("sections")) {
-        if (row.at("kind").get<std::string>() != "unwind") continue;
-        ASSERT_EQ(row.at("encoding").get<std::string>(), "compact-unwind")
-            << "if the shipped encoding moved, this mutant no longer removes "
-               "what it claims to";
-        row.erase("encoding");
-        erased = true;
+    bool dwarfRowDropped = false;
+    nlohmann::json kept = nlohmann::json::array();
+    for (auto const& shipped : doc.at("sections")) {
+        nlohmann::json row = shipped;
+        if (row.at("kind").get<std::string>() == "unwind") {
+            std::string const encoding = row.at("encoding").get<std::string>();
+            if (encoding == "dwarf-cfi") {   // leave ONE unwind row
+                dwarfRowDropped = true;
+                continue;
+            }
+            ASSERT_EQ(encoding, "compact-unwind")
+                << "if the shipped encoding moved, this mutant no longer removes "
+                   "what it claims to";
+            row.erase("encoding");
+            erased = true;
+        }
+        kept.push_back(std::move(row));
     }
     ASSERT_TRUE(erased);
+    ASSERT_TRUE(dwarfRowDropped)
+        << "THE PREMISE: the shipped arm64 document declares a `dwarf-cfi` row "
+           "beside the compact one";
+    doc.at("sections") = kept;
 
     auto mutated = ObjectFormatSchema::loadFromText(
         doc.dump(), "macho64-arm64-unwind-row-without-encoding");

@@ -1,0 +1,1 @@
+    if (is(hirCfg.unaryExprRule) || is(hirCfg.binaryExprRule)

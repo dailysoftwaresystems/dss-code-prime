@@ -1,0 +1,2 @@
+        if not name or not is_source(p):
+            phantoms.append(p)

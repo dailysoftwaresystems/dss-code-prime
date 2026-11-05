@@ -1,0 +1,2 @@
+            auto const kv = constIntExpr(s, tree, indexKids.front(), scope, &sem,
+                                         std::nullopt);

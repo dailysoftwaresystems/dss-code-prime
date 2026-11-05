@@ -184,6 +184,13 @@ struct DSS_EXPORT LirAsmRegionExpansionResult {
     Lir         lir{};
     bool        ok = false;
     std::size_t regionsExpanded = 0;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: a template's labels become blocks HERE,
+    // and every block after one has a new id, so the pass publishes its block entry image: indexed by the
+    // SOURCE module's block arena (`LirBlockId.v`; slot 0 holds 0), the `.v` of the block of `lir` where
+    // that block's instructions begin — its pieces run from there to the next source block's entry, the
+    // order the plan creates them in. `lir/lir_descriptor_blocks.hpp` follows the blocks data names
+    // through it.
+    std::vector<std::uint32_t> blockEntryImage;
 };
 
 [[nodiscard]] DSS_EXPORT LirAsmRegionExpansionResult

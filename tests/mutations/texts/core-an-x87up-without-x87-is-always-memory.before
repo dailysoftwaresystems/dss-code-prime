@@ -1,0 +1,1 @@
+                if (rules.x87UpWithoutX87 == X87UpWithoutX87::Memory) memory = true;

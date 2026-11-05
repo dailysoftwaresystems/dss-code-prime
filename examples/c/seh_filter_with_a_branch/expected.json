@@ -1,0 +1,12 @@
+{
+  "$comment": "D-MIR-TRY-FILTER-WITH-A-BRANCH-REFUSED: a __try FILTER whose expression has a branch. `&&`, `||` and `?:` evaluate an operand on one path only, so a filter written with any of them is more than one basic block — `__except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION && g == 1)`, and the shape the vendor's documentation writes a filter in, `cond ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH`. A filter is compiled as a function of its own, and the whole of its expression — every path — belongs to that function. Before the fix every such filter was REFUSED, at baseline and in release (the region's skeleton took a filter to be one block). Twelve cases, each a function of its own: `&&` over a global, the conditional choosing the disposition, a logical OR whose left is false, `&&` over a local of the function, an inner filter that declines through its conditional while the outer region takes the fault, the right operand of `&&` not evaluated when the left is false and evaluated once when it holds, branches inside branches with a call that takes the exception record, a handler naming a global only its filter named, a region inside a loop, a filter that sees a store the guarded body made before it faulted; and two the review of the fold asked for — a conditional answering EXCEPTION_CONTINUE_EXECUTION after its left operand committed the reserved page the guarded body read (the read runs again, the handler does not), and filters whose value is COMPUTED on the arm taken (an inner one answering 0 declines, the outer one answering 1 takes the fault). The exit code names the first case to fail (11..22); 42 = all right; a crash = a filter declined a fault it should have accepted. The reference compiler (cl 19.51 x64, /Od and /O2) runs this file to 42. The release arm is the same file through the optimizer. ON A HOST THAT IS NOT WINDOWS this file is built and not run; `program/test_guarded_region_examples_on_every_host` builds both arms for pe64 on every host and reads the scope tables, and `mir/test_seh_filter_with_a_branch` pins the funclet's shape.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

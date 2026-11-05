@@ -1,0 +1,12 @@
+{
+  "$comment": "D-MIR-TRY-HANDLER-SHARED-FILTER-VALUE-ABORTS-IN-RELEASE: a __try HANDLER that names what its FILTER named — `__except (g == 5) { rc = g + 37; }`. The source shares nothing between the two; an optimized build shares one computation of the global's address, and the filter is a function of its own, so nothing it computed is in the function that holds the `__try`. Before the fix the baseline compiled this file and the RELEASE build ABORTED THE COMPILER; the function now computes such a value again when its handler starts. Five cases: a global, an array element (a value computed from another), both directions in one region (the filter reads what the function computed before the region AND the handler reads what the filter computed), the same through array elements, and a region inside the handler whose filter and handler name the global the outer filter named. The exit code names the first case to fail (11..15); 42 = all right; a crash = a filter declined a fault it should have accepted. THE RELEASE ARM IS THE SUBJECT: it is the arm that aborted. The reference compiler (cl 19.51 x64, /Od and /O2) runs this file to 42. ON A HOST THAT IS NOT WINDOWS this file is built and not run: `mir/test_seh_handler_takes_a_filter_value` pins on every host what the function computes again and what is refused, and `program/test_guarded_region_examples_on_every_host` builds both arms of this source for pe64 on every host and reads the scope tables.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

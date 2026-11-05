@@ -29,9 +29,11 @@
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "test_wait_budget.hpp"   // kWaitBudget: how long a pipe's writer waits for its reader
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <fstream>
 #include <istream>
@@ -41,7 +43,18 @@
 #include <streambuf>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <fcntl.h>      // a named pipe's writer: the bounded stream pins
+#include <sys/stat.h>   // mkfifo
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <thread>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -175,6 +188,9 @@ TEST(CheckedFileRead, AMissingFileIsAnOpenFailure) {
     EXPECT_EQ(r.error().kind, FileReadFailure::OpenFailed);
     EXPECT_TRUE(contains(r.error().message, "failed to open")) << r.error().message;
     EXPECT_TRUE(contains(r.error().message, "no-such-file.json")) << r.error().message;
+    // ... and the OS's reason, as gcc and clang name it.
+    EXPECT_TRUE(contains(r.error().message, std::generic_category().message(ENOENT)))
+        << "the open failure gave no reason: " << r.error().message;
 }
 
 TEST(CheckedFileRead, ADirectoryIsRefusedAndNeverReadsAsEmpty) {
@@ -377,4 +393,136 @@ TEST(CheckedFileReadGuard, NoHandWrittenStreamBufDrainRemainsInSrc) {
            "`in.bad()` cannot fire on it, `out.bad()` misses a throwing "
            "streambuf, and a short read reporting EOF sets no bit at all. "
            "D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT";
+}
+
+// ── A STREAM IS READ ONLY UNDER A BOUND, AND A BOUND IS KEPT ───────────────────────────────────────────────────
+// A device or a named pipe has no size to measure, so the bounded form reads it to its end and refuses it the moment
+// it passes the bound; a regular file past the bound is refused before it is read; the one-argument form reads no
+// stream at all. ✔MEASURED 2026-10-28 (probe-reference-cc): gcc 13.3.0, clang 18.1.3 and Apple clang 21.0.0 read
+// `#include "/dev/null"` and a header that is a named pipe fed by a writer -- the header reader passes its bound.
+TEST(CheckedFileRead, AFilePastTheBoundIsRefusedBeforeItIsRead) {
+    dss::test_support::ScratchDir dir{dss::test_support::Location::Temp, "checked-file-read"};
+    auto const                    p      = writeBytes(dir, "ten.bin", "0123456789");
+    auto const                    within = readFileChecked(p, 10);
+    ASSERT_TRUE(within.has_value()) << within.error().message;
+    EXPECT_EQ(*within, "0123456789");
+    auto const past = readFileChecked(p, 9);
+    ASSERT_FALSE(past.has_value()) << "a 10-byte file was read under a 9-byte bound";
+    EXPECT_EQ(past.error().kind, FileReadFailure::TooLarge) << past.error().message;
+    // A directory stays refused under a bound: it is no stream.
+    auto const directory = readFileChecked(dir.path(), 4096);
+    ASSERT_FALSE(directory.has_value()) << "a directory was read under a bound";
+    EXPECT_TRUE(directory.error().kind == FileReadFailure::OpenFailed
+                || directory.error().kind == FileReadFailure::NotARegularFile)
+        << directory.error().message;
+}
+
+TEST(CheckedFileRead, ADeviceIsReadToItsEndUnderABoundAndRefusedWithoutOne) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "the POSIX legs read a character device by path";
+#else
+    auto const bounded = readFileChecked("/dev/null", 4096);
+    ASSERT_TRUE(bounded.has_value()) << bounded.error().message;
+    EXPECT_EQ(*bounded, "") << "/dev/null read as something";
+    auto const unbounded = readFileChecked("/dev/null");
+    ASSERT_FALSE(unbounded.has_value()) << "a device was read with no bound";
+    EXPECT_EQ(unbounded.error().kind, FileReadFailure::NotARegularFile) << unbounded.error().message;
+    auto const endless = readFileChecked("/dev/zero", 4096);
+    ASSERT_FALSE(endless.has_value()) << "a stream with no end was read past its bound";
+    EXPECT_EQ(endless.error().kind, FileReadFailure::TooLarge) << endless.error().message;
+#endif
+}
+
+#if !defined(_WIN32)
+namespace {
+
+// What `read()` gave while a named pipe at `pipe` was fed `text` ONCE, by a writer that opens it only while a reader
+// holds it (for at most the shared wait budget, `kWaitBudget`). A reader that closes before the write would raise SIGPIPE: the case ignores it
+// while it runs.
+template <class Read>
+[[nodiscard]] auto whileAPipeIsFed(std::filesystem::path const& pipe, std::string_view text, Read read) {
+    auto const        priorPipeHandler = std::signal(SIGPIPE, SIG_IGN);
+    std::atomic<bool> done{false};
+    std::thread       writer{[&pipe, &done, text] {
+        auto const deadline = std::chrono::steady_clock::now() + dss::test_support::kWaitBudget;
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            int const fd = ::open(pipe.c_str(), O_WRONLY | O_NONBLOCK);   // succeeds only while a reader holds it
+            if (fd >= 0) {
+                ssize_t const wrote = ::write(fd, text.data(), text.size());
+                static_cast<void>(wrote);
+                ::close(fd);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+    }};
+    auto got = read();
+    done.store(true);
+    writer.join();
+    std::signal(SIGPIPE, priorPipeHandler);
+    return got;
+}
+
+// A named pipe at `pipe` fed `text` ONCE, then what the bounded read of it gave.
+[[nodiscard]] std::expected<std::string, dss::core::FileReadError>
+readAFedPipe(std::filesystem::path const& pipe, std::string_view text, std::uintmax_t bound) {
+    return whileAPipeIsFed(pipe, text, [&pipe, bound] { return readFileChecked(pipe, bound); });
+}
+
+} // namespace
+#endif
+
+TEST(CheckedFileRead, ANamedPipeIsReadToItsEndUnderABound) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows makes no named pipe in a directory; the POSIX legs read one";
+#else
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "checked_read_fifo"};
+    std::filesystem::path const   pipe = scratch.path() / "pipe";
+    ASSERT_EQ(::mkfifo(pipe.c_str(), 0600), 0) << "this host made no named pipe";
+    auto const read = readAFedPipe(pipe, "from the pipe\n", 4096);
+    ASSERT_TRUE(read.has_value()) << read.error().message;
+    EXPECT_EQ(*read, "from the pipe\n");
+#endif
+}
+
+TEST(CheckedFileRead, ANamedPipePastTheBoundIsRefusedByTheBound) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows makes no named pipe in a directory; the POSIX legs read one";
+#else
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "checked_read_fifo_bound"};
+    std::filesystem::path const   pipe = scratch.path() / "pipe";
+    ASSERT_EQ(::mkfifo(pipe.c_str(), 0600), 0) << "this host made no named pipe";
+    auto const read = readAFedPipe(pipe, "0123456789", 4);
+    ASSERT_FALSE(read.has_value()) << "a pipe that gave 10 bytes was read under a 4-byte bound: " << *read;
+    EXPECT_EQ(read.error().kind, FileReadFailure::TooLarge) << read.error().message;
+#endif
+}
+
+// THE SOURCE BUFFER READS A STREAM UNDER ITS BOUND. `SourceBuffer::fromFile` is the read of a PRIMARY source
+// (`UnitBuilder::addFile`) and of an include the import resolver follows with the preprocessor off; it passes the
+// bound a buffer can address, so a device or a named pipe is read to its end as the header read reads one (gcc 13.3.0,
+// clang 18.1.3 and Apple clang 21.0.0 read `#include "/dev/null"` and a fed pipe -- the measurement above). The
+// preprocessor's own header read is another call (`preScanIncludeFile`), so no header case reaches this one: this case
+// is the read's own pin. A failure here prints what `fromFile` threw.
+TEST(CheckedFileReadRouting, SourceBufferFromFileReadsADeviceAndANamedPipe) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows makes no device or named pipe a source path names; the POSIX legs read one";
+#else
+    auto const viaFromFile = [](std::filesystem::path const& p) -> std::pair<bool, std::string> {
+        try {
+            return {true, std::string{dss::SourceBuffer::fromFile(p)->text()}};
+        } catch (std::exception const& e) {
+            return {false, e.what()};
+        }
+    };
+    auto const device = viaFromFile("/dev/null");
+    EXPECT_TRUE(device.first) << "a character device as a source was refused: " << device.second;
+    EXPECT_EQ(device.first ? device.second : std::string{}, "") << "/dev/null read as something";
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "checked_read_source_fifo"};
+    std::filesystem::path const   pipe = scratch.path() / "source.c";
+    ASSERT_EQ(::mkfifo(pipe.c_str(), 0600), 0) << "this host made no named pipe";
+    auto const fed = whileAPipeIsFed(pipe, "int from_fifo;\n", [&] { return viaFromFile(pipe); });
+    ASSERT_TRUE(fed.first) << "a named pipe as a source was refused: " << fed.second;
+    EXPECT_EQ(fed.second, "int from_fifo;\n");
+#endif
 }

@@ -1,0 +1,2 @@
+        std::string const name  = top.names[top.next++];
+        if (work.size() == 1 && out.failures != 0 && isLastEntry(name)) return out;   // it stays, and the target

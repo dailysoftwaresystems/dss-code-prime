@@ -1,0 +1,2 @@
+                return fail(DiagnosticCode::K_ObjectSectionNotModelled,
+                    "pe::readRelocatableObject: defined symbol '" + defs[k].name

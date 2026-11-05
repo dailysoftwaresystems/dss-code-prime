@@ -1,0 +1,1 @@
+            if (std::uint32_t const a = op.byValueAggAlign(); a != 0)

@@ -130,6 +130,10 @@ Mir buildMtxInitCaller(TypeInterner& in, CallConv cc) {
     TypeId const initSig = in.fnSig(params, i32, cc);
 
     MirBuilder mb;
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED (the symbol-id door
+    // refuses to mint past an end nobody stated).
+    mb.stateSelfContainedSymbolIds();
     mb.addFunction(in.fnSig({}, i32, cc), SymbolId{kMainSym});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);

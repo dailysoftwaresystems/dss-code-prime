@@ -1,0 +1,3 @@
+    // The prior imports and this declaration does not.
+    if (true) return;
+    ParseDiagnostic d;

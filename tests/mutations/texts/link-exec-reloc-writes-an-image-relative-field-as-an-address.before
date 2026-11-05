@@ -1,0 +1,1 @@
+                    auto const linear = linearFieldValue(*tri, S, A, P, imageRelativeBase);

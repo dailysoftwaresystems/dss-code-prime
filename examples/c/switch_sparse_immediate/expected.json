@@ -1,6 +1,8 @@
 {
   "$comment": "D-OPT-SWITCH-JUMP-TABLE (c70): the SPARSE compare-chain path. Case values are widely spaced (0, 7, 100, 5000, -3, 123456) so the density test (span <= 3*caseCount) fails -> the switch stays on the compare chain, which c70 changed to emit each SMALL non-negative case constant as an IMMEDIATE compare (cmp discrim, imm12/imm32) instead of a live per-case register — the register-pressure cure for the chain. Wide or negative case values (5000, 123456, -3) FALL BACK to register materialization (arch-blind: arm64 cmp-imm is a 12-bit unsigned imm12), which is correct on every target. Probes each case + no-case(default) + negative-no-case + far-no-case; gcc/clang exit 42 (cross-checked x86_64 -O0/-O1, aarch64 -O1 qemu).",
   "language": "c",
+  "$commentForbidDiagnostics": "P69: this example holds a value-returning function whose last statement is not a plain `return` (found by a mechanical scan of the corpus for exactly that shape), so the function is complete only because DSS SEES that control never arrives at its closing brace. Until P69 losing that sight REFUSED the compile. Under C it no longer does: C23 6.9.2p13 accepts a non-void function whose end is reached, so the compile succeeds with the warning H_NonVoidFunctionEndReachable and the program may run unchanged. This key keeps the red: the arm fails when that code is reported, in both runners, where the exit code could not see the regression.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
   "source": "main.c",
   "exitCode": 42,
   "targets": [

@@ -1,0 +1,5 @@
+        if (objectFormatInAvailabilitySet(row.documentGate, fmt)
+            && objectFormatInAvailabilitySet(row.symbolGate, fmt)
+            && std::find(row.shippedSourceFormats.begin(), row.shippedSourceFormats.end(),
+                         std::string{objectFormatKindName(fmt)}) == row.shippedSourceFormats.end())
+            return !row.isObject;

@@ -1,0 +1,33 @@
+{
+  "$comment": "P69 L2 (lane lm): a `typeof` of a variable-length array TYPE keeps its run-time evaluation — the bound is evaluated when the declaration is reached, ONCE however many names share it, through nested typeof layers, and a typedef spelled with it freezes the size there — also a typedef with dimensions of its own over the head's first name or over a variable-length typedef (`typedef R S[m];`), and a typeof that names such a typedef (`typeof(R)`). MEASURED at eb6f22a3 (pe64, image run natively; probes/nest t_typeof_vla1 / t_typeof_vla): DSS REFUSED `typeof(int[n + k++]) a;` with H_UnsupportedLoweringForKind (\"variable-length array declarator carries no array suffix to lower its runtime size from\") — the lowering looked for the bound in the declarator only, never in the head's type name. gcc 13.3.0 and clang 18.1.3 build THIS file at -std=gnu2x, -std=c2x -pedantic-errors and -std=gnu17, -O0 and -O2, and exit 42 (gcc -Wall warns -Wsequence-point on each `n + k++`, a false alarm both compilers' results contradict). Exit 42, or the number of the first check that fails. Check 12 (P69 L2a, lane lm): a typeof of a variable-length array OBJECT read whole (`typeof(v)`) - an object, two names, its own dimension, a pointer, a typedef and a typedef with a dimension of its own - takes the size the object froze; DSS REFUSED each at 937a3b15 (the orchestrator's compile-and-keep, pe64: H_UnsupportedLoweringForKind, \"carries no array suffix\"). The release arm folds the same sizes through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false}
+  ]
+}

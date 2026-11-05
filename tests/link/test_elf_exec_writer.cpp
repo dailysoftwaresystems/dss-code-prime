@@ -15,7 +15,9 @@
 //   * Cycle-2 fail-loud guard: modules with non-empty relocations[]
 //     emit `K_RelocationKindMismatch` and return empty bytes.
 //   * Cycle-2 fail-loud guard: zero-function module emits
-//     `K_SymbolUndefined`.
+//     `K_ProgramEntryUndefined` (P69 fold 3d: a program with no
+//     instruction has no entry; it was `K_SymbolUndefined` /
+//     `K_RelocationKindMismatch` before).
 
 #include "asm/asm.hpp"
 #include "ffi/binary_reader.hpp"
@@ -227,6 +229,7 @@ TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -260,6 +263,7 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -349,6 +353,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -574,7 +579,9 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 2, "jumpSlot": 5, "relative": 3},
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
         "pageAlign": 4096, "interpreter": "/lib/ld-linux-riscv64-lp64d.so.1", "bindNow": true
       },
@@ -1138,7 +1145,8 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "entryPoint": "sym_42",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1183,7 +1191,8 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "entryPoint": "sym_99",
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1259,7 +1268,8 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
@@ -1290,7 +1300,8 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -1320,8 +1331,10 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "entryPoint": "",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
         "pageAlign":4096,
         "interpreter":"/lib64/ld-linux-x86-64.so.2",
@@ -1422,23 +1435,56 @@ TEST(ElfExecWriter, PtLoadHeaderHasReadExecutePermsAndPageAlign) {
     EXPECT_EQ(pType, 1u);  // PT_LOAD
     std::uint32_t const pFlags = readU32LE(bytes, 64 + 4);
     EXPECT_EQ(pFlags, 5u);  // PF_X | PF_R
-    // p_offset @ +8 = file offset of .text (depends on layout, > 64+56)
+    // p_offset @ +8 = 0: since P69 fold 3d the segment opens at the image's
+    // first byte, its own ELF header, which it maps as GNU ld maps it in every
+    // static image (`__ehdr_start` names it). `.text` follows at 0x1000.
     std::uint64_t const pOffset = readU64LE(bytes, 64 + 8);
-    EXPECT_GE(pOffset, 64u + 56u);
-    // p_vaddr / p_paddr @ +16, +24 = 0x401000
-    EXPECT_EQ(readU64LE(bytes, 64 + 16), 0x401000u);
-    EXPECT_EQ(readU64LE(bytes, 64 + 24), 0x401000u);
-    // p_filesz / p_memsz @ +32, +40 — the segment closes on
-    // `.note.gnu.build-id`, which this format now declares
+    EXPECT_EQ(pOffset, 0u);
+    // p_vaddr / p_paddr @ +16, +24 = 0x400000: `.text`'s VA (0x401000) less
+    // its file offset (0x1000), the address of the header.
+    EXPECT_EQ(readU64LE(bytes, 64 + 16), 0x400000u);
+    EXPECT_EQ(readU64LE(bytes, 64 + 24), 0x400000u);
+    // p_filesz / p_memsz @ +32, +40 — the header page, then the segment closes
+    // on `.note.gnu.build-id`, which this format now declares
     // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE): 3 bytes of `.text`, padded to the
     // note's 4-byte addralign, then the 48-byte note (12-byte Nhdr + "GNU\0"
-    // + a 32-byte SHA-256 descriptor) = 52. The note is SHF_ALLOC in both
-    // references, so it MUST be inside a PT_LOAD — an unmapped identity is
-    // invisible to the crash reporter that reads it.
-    EXPECT_EQ(readU64LE(bytes, 64 + 32), 52u);
-    EXPECT_EQ(readU64LE(bytes, 64 + 40), 52u);
+    // + a 32-byte SHA-256 descriptor) = 0x1000 + 52. The note is SHF_ALLOC in
+    // both references, so it MUST be inside a PT_LOAD — an unmapped identity
+    // is invisible to the crash reporter that reads it.
+    EXPECT_EQ(readU64LE(bytes, 64 + 32), 0x1000u + 52u);
+    EXPECT_EQ(readU64LE(bytes, 64 + 40), 0x1000u + 52u);
     // p_align @ +48 = 0x1000 (4KB page, kernel-required)
     EXPECT_EQ(readU64LE(bytes, 64 + 48), 0x1000u);
+}
+
+// P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the ELF neighbour):
+// the static arm gives an image-defined name the address of the image's own
+// header -- the bytes at it are "\x7fELF", mapped by PT_LOAD #1 -- through
+// the same relocation kernel as every other address. A `rel32` from `.text`
+// (an `lea`'s disp32 at offset 3 of `48 8D 05 <disp32> C3`) lands at the
+// header: target = P + 4 + disp32 == 0x400000. RED-ON-DISABLE: give the name
+// no address -> the relocation is refused undefined; open PT_LOAD #1 at
+// `.text` again -> the address is unmapped (p_offset != 0).
+TEST(ElfExecWriter, AnImageDefinedNameIsTheImagesOwnMappedHeader) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3}, 1);
+    Relocation rel;
+    rel.offset = 3;
+    rel.target = SymbolId{77};
+    rel.kind   = RelocationKind{1};   // x86_64.target.json: rel32 (pc-relative, bias -4)
+    mod.functions[0].relocations.push_back(rel);
+    mod.imageDefinedSymbols.push_back({SymbolId{77}, ImageDefinedAddress::ImageHeader});
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    std::uint64_t const textVa = 0x401000u;
+    std::int32_t const disp = static_cast<std::int32_t>(readU32LE(bytes, 0x1000 + 3));
+    std::uint64_t const target = textVa + 7u + static_cast<std::uint64_t>(static_cast<std::int64_t>(disp));
+    EXPECT_EQ(target, 0x400000u) << "the name is the image's first address";
+    EXPECT_EQ(readU64LE(bytes, 64 + 8), 0u) << "PT_LOAD #1 maps the header";
+    EXPECT_EQ(readU64LE(bytes, 64 + 16), target) << "...at the name's address";
+    EXPECT_EQ(bytes[0], 0x7Fu);
+    EXPECT_EQ(bytes[1], 'E');
 }
 
 TEST(ElfExecWriter, TextSectionHeaderShAddrEqualsVirtualAddress) {
@@ -1764,7 +1810,7 @@ TEST(ElfExecFormatJsonValidate, AbsoluteWithAddendBiasRejected) {
       "dssTargetVersion": 1,
       "target": {"name":"bad-bias"},
       "relocations":[
-        { "name": "weird", "kind": 1, "pcRelative": false, "addendBias": -4, "widthBytes": 4 }
+        { "name": "weird", "kind": 1, "pcRelative": false, "addendBias": -4, "widthBytes": 4, "fieldRange": "signed" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");
@@ -1779,7 +1825,7 @@ TEST(ElfExecFormatJsonValidate, AddendBiasOverflowWidthRejected) {
       "dssTargetVersion": 1,
       "target": {"name":"bias-overflows-width"},
       "relocations":[
-        { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 70000, "widthBytes": 4 }
+        { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 70000, "widthBytes": 4, "fieldRange": "signed" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");
@@ -1790,7 +1836,7 @@ TEST(ElfExecFormatJsonValidate, AddendBiasOverflowWidthRejected) {
           "dssTargetVersion": 1,
           "target": {"name":"bias-overflows-width-2"},
           "relocations":[
-            { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 2147483647, "widthBytes": 4 }
+            { "name": "weird", "kind": 1, "pcRelative": true, "addendBias": 2147483647, "widthBytes": 4, "fieldRange": "signed" }
           ],
           "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
         })");
@@ -1867,13 +1913,19 @@ TEST(ElfExecWriter, ZeroFunctionModuleFailLoud) {
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
-    // The LK6 cycle-1 empty-.text guard fires before the entry-point
-    // lookup would reach K_SymbolUndefined — a zero-function module
-    // produces zero `.text` bytes, and an executable with no entry
-    // instructions would SIGSEGV at exec time. EITHER diagnostic
-    // code counts as fail-loud; pin the contract loosely so future
-    // re-orderings of the two guards don't churn this test.
-    EXPECT_GT(rep.errorCount(), 0u);
+    // A zero-function module produces zero `.text` bytes, and a program
+    // with no instruction has no entry: the document declares entry
+    // verbs, so it is refused as a program with no entry — ONE code,
+    // pinned exactly (P69 fold 3d: before it, the shared relocation
+    // kernel refused it under K_RelocationKindMismatch and the e_entry
+    // lookup under K_SymbolUndefined, and this cell accepted either).
+    std::size_t entryUndefined = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ProgramEntryUndefined) ++entryUndefined;
+        EXPECT_NE(d.code, DiagnosticCode::K_RelocationKindMismatch) << d.actual;
+        EXPECT_NE(d.code, DiagnosticCode::K_SymbolUndefined) << d.actual;
+    }
+    EXPECT_EQ(entryUndefined, 1u);
 }
 
 // ── Schema validate rules pinned ───────────────────────────────
@@ -1891,6 +1943,7 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
@@ -1931,6 +1984,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -1959,6 +2013,7 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -2056,6 +2111,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
       "sections":[
@@ -2107,6 +2163,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
       "sections":[
@@ -2222,6 +2279,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
@@ -2293,7 +2351,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -2353,7 +2412,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
-      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "entryTransition": "jumped",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8} },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
       "relocationAddends": "explicit",
       "inputSectionPlacement": "unit",
@@ -2894,35 +2954,37 @@ TEST(ElfExecWriter, BssSectionEmittedNobitsWritable) {
            "memory, not file bytes)";
 }
 
-TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
-    // Fail-loud: a rodata item carrying its OWN relocations (data->data
-    // reference) is deferred this cycle — the ELF writer patches
-    // FUNCTION relocations only. Cited anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
+TEST(ElfExecWriter, RodataDataItemWithRelocationIsPatchedInPlace) {
+    // D-LK1-ELF-RODATA-DATAITEM-RELOC (closed in P69 fold 3c): a READ-ONLY item
+    // carrying its OWN relocation — what the ELF object reader makes of gcc's jump
+    // table in `.rodata` — is laid out WITH it, and the static image patches it in
+    // place as it patches `.data`'s items. `.rodata` stays read-only. Until fold
+    // 3c this arm refused the item.
     auto loaded = loadShipped();
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // `ret` at .text+0
     AssembledData d;
     d.symbol    = SymbolId{42};
     d.section   = DataSectionKind::Rodata;
-    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};    // 8-byte pointer slot
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};    // 8-byte slot, patched below
     d.alignment = Alignment::of<8>();
     Relocation r;
-    r.offset = 0; r.target = SymbolId{1}; r.kind = RelocationKind{2};
+    r.offset = 0; r.target = SymbolId{1}; r.kind = RelocationKind{2};   // abs64 to the function
     d.relocations.push_back(r);
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
-    for (auto const& diag : rep.all()) {
-        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
-         && diag.actual.find("D-LK1-ELF-RODATA-DATAITEM-RELOC")
-                != std::string::npos) {
-            sawCode = true;
-        }
-    }
-    EXPECT_TRUE(sawCode)
-        << "rodata dataItem with relocations must fail loud citing "
-           "D-LK1-ELF-RODATA-DATAITEM-RELOC";
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "a read-only item with a relocation is laid out, not refused";
+    ASSERT_FALSE(bytes.empty());
+    int const rodataIdx = findSectionByName(bytes, ".rodata");
+    ASSERT_GE(rodataIdx, 0) << "the item rides `.rodata`";
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const rodataOff = readU64LE(bytes, shoff + rodataIdx * 64 + 24);
+    EXPECT_EQ(readU64LE(bytes, shoff + rodataIdx * 64 + 8) & 1u, 0u) << "`.rodata` has no SHF_WRITE";
+    auto const* secText = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(secText, nullptr);
+    EXPECT_EQ(readU64LE(bytes, rodataOff), secText->virtualAddress)
+        << "the read-only slot is patched in place with the function's VA";
 }
 
 TEST(ElfExecWriter, RelRoConstItemFoldsIntoDataAndPatchesInPlace) {
@@ -2975,9 +3037,10 @@ TEST(ElfExecWriter, ElfRelAcceptsRodataDataItem) {
     // exec-only" reject is LIFTED. The item lands in `.rodata`
     // (sh_addr=0) with a section-relative `.symtab` symbol the final linker
     // binds. (The section-relative data-symbol shape is pinned by
-    // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a data item
-    // WITH its own relocation still fails loud — the D-LK1-ELF-RODATA-DATAITEM-RELOC
-    // test above.) RED if the ELF writer reverts to rejecting ET_REL data.
+    // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a rodata item
+    // WITH its own relocation writes `.rela.rodata` since P69 fold 3c —
+    // ElfWriter.RodataItemWithRelocationsWritesItsOwnRelaRodata.) RED if the ELF
+    // writer reverts to rejecting ET_REL data.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");

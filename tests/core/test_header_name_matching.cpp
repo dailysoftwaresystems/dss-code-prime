@@ -21,26 +21,40 @@
 // `<Windows.h>` rc=1 error[F001A]; the SAME tree via /mnt/c DrvFs -> BOTH rc=0.
 
 #include "core/substrate/path_identity.hpp"
+#include "core/substrate/process_spawn.hpp"   // the LIVE case asks git itself
 #include "core/types/ascii_case.hpp"
 #include "core/types/header_name_matching.hpp"
 #include "core/types/header_case_diagnostic.hpp"
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/unsuppressable_codes.hpp"
+#include "program/git_acquire.hpp"           // gitRepositoryLocalVariables: the LIVE case's git sees no caller repository
+#include "os_link.hpp"                       // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "tree_ignores.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>                 // the one case table (tests/test_support/tree_ignores_cases.json)
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>   // geteuid: a permission case means nothing to root
+#else
+#include <aclapi.h>   // an ACL entry denying this user a directory's listing (ListingDenied)
+#endif
 
 namespace fs = std::filesystem;
 using namespace dss;
@@ -171,24 +185,24 @@ constexpr std::u8string_view kNihon = u8"\u65E5\u672C.json";    // ...from this 
 // ── the repo-hygiene checker, factored out so the guard test and its
 //    red-on-disable control run the IDENTICAL code over different trees ──
 
-// Directory names that are BUILD OUTPUT or VCS internals rather than
-// checked-out content. Skipped so the repo-wide sweep answers the question that
-// actually matters — "can this repo be CLONED onto a case-insensitive host" —
-// and does not spend minutes walking `build-dbg/`. Recursion is pruned AT the
-// directory, so their contents are never even enumerated.
-//
-// ⚠ THIS LIST MATCHES A BARE NAME AT EVERY DEPTH, so only names nobody would
-// give to CONTENT may join it. `.git`, `node_modules`, `test-scratch` qualify;
-// an ordinary word like `dist` does not. This repo has already paid for that
-// distinction once — an UNANCHORED rsync exclude `build*` also matched
-// `src/program/build_scripts.cpp`, and a gate leg was configured against a tree
-// missing a changed `.cpp`. Generated trees whose name is ordinary are pruned by
-// ABSOLUTE PATH instead; see `prunedSubtrees` on `caseCollisionsUnder` below.
-[[nodiscard]] bool isGeneratedDirName(std::string const& name) {
-    return name == ".git" || name == "test-scratch" || name == "node_modules"
-        || name == ".claude" || name == "target"
-        || name.rfind("build", 0) == 0;   // build, build-dbg, build-wsl, …
-}
+// WHAT THE SWEEP LEAVES OUT: WHAT GIT IGNORES IN THE TREE, and `.git`. The question
+// the repo-wide sweep answers is "can this repo be CLONED onto a case-insensitive
+// host", and a clone materializes nothing git ignores: build output, a session's
+// scratch, and the copies and workers DssHarness keeps in a tree (`.worktrees/`,
+// `.orchestrators/`, `.legs/`, `.mutations/` — each a whole tree of its own, whose
+// files a sweep or a lane may delete while this walk reads them, and a walk error is
+// a red here). It is asked of the ONE statement of that, the tree's own `.gitignore`,
+// through `tests/test_support/tree_ignores.hpp` — the C++ reader of the grammar
+// `owning-tree.py`'s `TreeIgnores` reads for the repository's programs. Recursion is
+// pruned AT a directory left out, so its contents are never even enumerated.
+// ⓘ Until 2026-10-15 this file kept its own list of bare names (`.git`,
+// `test-scratch`, `node_modules`, `.claude`, `target`, every name starting `build`)
+// plus one generated subtree by path: a second statement that walked the copies the
+// tool keeps — ✔MEASURED from run records: 11 to 56 s for this test on the main
+// checkout's Windows legs, against 1 to 7 s in lane trees that hold none — and that
+// pruned the TRACKED `.claude/` skills as well. An anchored rule still prunes only
+// its one path (`/src/dss-config/runtime/platform/dist/`), as git reads it.
+using dss::test_support::TreeIgnores;
 
 // Returns every group of >= 2 paths under `root` whose relative paths are equal
 // after ASCII lowercasing. Such a group cannot be checked out at all on NTFS or
@@ -227,63 +241,94 @@ struct CaseCollisionScan {
     // guards against. Counting it makes the limit legible — the sweep can then say "clean over
     // N files, and M I could not spell" instead of implying it looked at everything.
     std::size_t     unrenderable = 0;
+    // ★ AND WHAT IT LEFT OUT IS SAID, NEVER SILENT: a `.gitignore` the one reader cannot
+    // read as git does refuses the whole sweep, and so does a swept root the tree's rules
+    // leave out — a sweep of nothing.
+    std::string              refusal;
+    std::string              leftOutRoot;
+    std::vector<std::string> paths;   // every file swept, relative to the swept root, in walk order
 };
 
-// `prunedSubtrees` names ABSOLUTE subtrees to skip — the path-anchored half of
-// the prune, for generated trees whose bare NAME is too ordinary to hand to
-// `isGeneratedDirName`. Today that is
-// `src/dss-config/runtime/platform/dist/`: compiled object artifacts living
-// INSIDE the config tree (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Nothing
-// generated is ever CLONED, so enumerating it would make this guard answer a
-// different question than the one it states. Default empty, so a caller that
-// has no generated subtree writes nothing.
-CaseCollisionScan caseCollisionsUnder(fs::path const&              root,
-                                      std::vector<fs::path> const& prunedSubtrees = {}) {
+// `tree` is the checkout `ignores` was read from (`.gitignore` at its root), `root` the
+// directory swept — the tree itself or one under it. What `ignores` leaves out is never
+// enumerated: a path is judged RELATIVE TO THE TREE, the frame its rules are written in,
+// and reported relative to `root`.
+CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root, TreeIgnores const& ignores) {
     CaseCollisionScan scan;
     std::map<std::string, std::vector<std::string>> byFolded;
+    if (!ignores.refusal.empty()) {
+        scan.refusal = ignores.refusal;
+        return scan;
+    }
 
-    // ⚠ NORMALIZE BOTH SIDES, AND `.` IS EXACTLY WHY. The repo-wide guard walks
-    // `*root / "."` as one of its four roots, and `.` is a REAL element of
-    // `fs::path` iteration — not a spelling the library folds away — so every
-    // entry that walk yields reads `<root>/./src/...`. An as-written compare
-    // against `<root>/src/...` therefore NEVER matches, and the prune would be
-    // live for the `src/dss-config` root while silently absent for the
-    // whole-repo one, which is the only root that reaches the generated tree at
-    // all. `lexically_normal()` also settles `/` vs `\` on Windows, so the
-    // compare is about the SUBTREE and never about how it was spelled.
-    std::vector<fs::path> pruned;
-    pruned.reserve(prunedSubtrees.size());
-    for (auto const& p : prunedSubtrees) pruned.push_back(p.lexically_normal());
+    // ⚠ NORMALIZE, AND `.` IS EXACTLY WHY. The repo-wide guard walks `*root / "."` as
+    // one of its four roots, and `.` is a REAL element of `fs::path` iteration — not a
+    // spelling the library folds away — so every entry that walk yields reads
+    // `<root>/./src/...`. Judged as written, nothing under it would ever match an
+    // anchored rule, and the whole-repo root — the only one that reaches every
+    // directory the tree's rules leave out — would silently walk them all.
+    // `lexically_normal()` settles `.` and `/` vs `\`; a trailing separator it leaves
+    // is taken off, so the frame is the TREE and never how it was spelled.
+    auto const frame = [](fs::path p) {
+        p = p.lexically_normal();
+        return p.has_filename() ? p : p.parent_path();
+    };
+    fs::path const treeFrame = frame(tree);
+    auto const     treeRel = [&](fs::path const& p) { return narrowUtf8OrEmpty(frame(p).lexically_relative(treeFrame)); };
+    // ★ A PATH THE ONE READER CANNOT ANSWER AS GIT DOES REFUSES THE WHOLE SWEEP, naming it (a name
+    // holding a backslash, a rule whose match core.ignorecase would change): the sweep's verdict
+    // would otherwise be one host's answer.
+    try {
+        if (std::string const rootRel = treeRel(root); !rootRel.empty() && rootRel != ".") {
+            scan.leftOutRoot = ignores.leavesOut(rootRel, true);
+            if (!scan.leftOutRoot.empty()) return scan;
+        }
 
-    std::error_code ec;
-    fs::recursive_directory_iterator it{root, ec};
-    if (ec) { scan.walkError = ec; return scan; }
-    for (fs::recursive_directory_iterator const end; it != end; it.increment(ec)) {
-        if (ec) { scan.walkError = ec; return scan; }   // truncated — NOT a pass
-        std::error_code dirEc;
-        if (it->is_directory(dirEc)) {
-            // An unrenderable directory name yields "" — which is not a generated name, so the
-            // walk DESCENDS rather than pruning. Erring toward scanning more is the safe
-            // direction for a collision guard.
-            bool const prunedHere =
-                isGeneratedDirName(narrowUtf8OrEmpty(it->path().filename()))
-                || std::find(pruned.begin(), pruned.end(),
-                             it->path().lexically_normal()) != pruned.end();
-            if (prunedHere) it.disable_recursion_pending();
-            continue;
+        using dss::core::EntryKind;
+        using dss::core::WalkStep;
+        // The substrate's walk (`dss::core::walkTree`): an explicit work stack, and it never descends
+        // a link, on every build.
+        auto const walk = dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
+            std::string const inTree = treeRel(entry.path);
+            auto const        names = dss::test_support::tree_ignores_detail::splitNames(inTree);
+            // ★ A SYMBOLIC LINK IS NO DIRECTORY AND IS NEVER DESCENDED: git records a link as a file,
+            // so a `build/` rule does not take one (✔MEASURED, git 2.55), and a clone holds the link
+            // itself — a path that can collide like any file. The ENTRY's own kind decides, never what
+            // it points at — asked of the substrate, which asks the OS on Windows: libstdc++ there
+            // reads a link as what it reaches (✔MEASURED, the substrate's header), so a scan that asked
+            // `symlink_status` DESCENDED a directory link when built with MinGW.
+            if (entry.kind == EntryKind::Directory) {
+                // An unrenderable directory name yields "" — which no rule can judge, so the walk
+                // DESCENDS rather than pruning. Erring toward scanning more is the safe direction
+                // for a collision guard.
+                if (!inTree.empty() && !ignores.decide(names, true).empty()) return WalkStep::Prune;
+                return WalkStep::Continue;
+            }
+            if (entry.kind == EntryKind::Absent) return WalkStep::Continue;   // gone since it was listed
+            if (!inTree.empty() && !ignores.decide(names, false).empty()) return WalkStep::Continue;   // never cloned
+            // LEXICALLY relative to the swept root, never through `fs::relative`, which resolves a
+            // symbolic link to what it points at and would report the target, not the link.
+            fs::path const    relPath = frame(entry.path).lexically_relative(frame(root));
+            std::string const rel     = narrowUtf8OrEmpty(relPath);
+            if (rel.empty()) {
+                // Distinguish the two reasons rather than folding them: no relative path is a
+                // walk problem, an unrenderable spelling is a text problem, and only the second is
+                // this scan's own blind spot.
+                if (!relPath.empty()) ++scan.unrenderable;
+                return WalkStep::Continue;
+            }
+            ++scan.filesScanned;
+            scan.paths.push_back(rel);
+            byFolded[asciiToLower(rel)].push_back(rel);
+            return WalkStep::Continue;
+        });
+        if (walk.error) {   // truncated — NOT a pass
+            scan.walkError = walk.error;
+            return scan;
         }
-        std::error_code relEc;
-        fs::path const  relPath = fs::relative(it->path(), root, relEc);
-        std::string const rel   = narrowUtf8OrEmpty(relPath);
-        if (rel.empty()) {
-            // Distinguish the two reasons rather than folding them: `relative` failing is a
-            // walk problem, an unrenderable spelling is a text problem, and only the second is
-            // this scan's own blind spot.
-            if (!relPath.empty()) ++scan.unrenderable;
-            continue;
-        }
-        ++scan.filesScanned;
-        byFolded[asciiToLower(rel)].push_back(rel);
+    } catch (dss::test_support::TreeIgnoreRefusal const& refused) {
+        scan.refusal = refused.what();
+        return scan;
     }
     for (auto& [folded, group] : byFolded) {
         if (group.size() < 2) continue;
@@ -473,6 +518,318 @@ TEST(HeaderNameMatching, QuoteAndDirListSearchesHonourPolicy) {
               HeaderSearchStatus::NotFound);
 }
 
+// ── [[D-PP-HEADER-CASE-DANGLING-SYMLINK-ASYMMETRY]] ─────────────────────────
+//
+// A DANGLING LINK IS NO HEADER, UNDER EITHER POLICY. ✔MEASURED 2026-10-20 on this very
+// fixture, built by each reference: a dangling link `x.h` in the first search directory and
+// a real `x.h` in a later one — gcc 13.3.0, clang 18.1.3, Apple clang 21.0.0, MinGW-w64 gcc
+// 13.2.0 and cl 19.51, `#include "x.h"` and `#include <x.h>` alike, each went ON to the later
+// directory. The two policy arms used to disagree on it (the case-sensitive arm's probe said
+// "absent", the case-insensitive arm took whatever its listing held), and the MinGW build took
+// the link under both. One case per policy arm; the link is made by the OS, which MinGW's
+// library cannot do.
+namespace {
+
+// Which `x.h` a search took, spelled `<its directory's name>/x.h`, or what it took instead.
+[[nodiscard]] std::string tookWhat(HeaderSearchResult const& r) {
+    switch (r.status) {
+    case HeaderSearchStatus::Found:
+        return u8Bytes(r.path.parent_path().filename().u8string()) + "/" +
+               u8Bytes(r.path.filename().u8string());
+    case HeaderSearchStatus::NotFound: return "nothing";
+    case HeaderSearchStatus::AmbiguousCase: return "an ambiguity";
+    case HeaderSearchStatus::Unexaminable:
+        return "unexaminable " + u8Bytes(r.path.parent_path().filename().u8string()) + "/" +
+               u8Bytes(r.path.filename().u8string()) + (r.error ? "" : " (with no reason)");
+    }
+    return "an unknown status";
+}
+
+void expectADanglingLinkIsNoHeader(HeaderNameMatching matching, char const* scratchName) {
+    ScratchDir scratch{Location::Temp, scratchName};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first);
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(first / "no-such.h", first / "x.h",
+                                                             dss::test_support::LinkTo::File));
+
+    HeaderSearchCache cache;   // one compile's view of the tree
+    std::vector<fs::path> const dirs{first, later};
+    std::string const took = tookWhat(findInDirs("x.h", dirs, matching, cache));
+    EXPECT_EQ(took, "later/x.h")
+        << "the search took " << took << " -- a dangling link was taken for a header, where "
+           "every reference goes on to the later directory";
+    std::string const atFirst = tookWhat(resolveInDir(first, "x.h", matching, cache));
+    EXPECT_EQ(atFirst, "nothing") << "the first directory alone answered " << atFirst;
+}
+
+} // namespace
+
+TEST(HeaderNameMatching, ADanglingLinkIsNoHeaderUnderTheCaseSensitivePolicy) {
+    expectADanglingLinkIsNoHeader(HeaderNameMatching::CaseSensitive, "header_dangling_cs");
+}
+
+TEST(HeaderNameMatching, ADanglingLinkIsNoHeaderUnderTheCaseInsensitivePolicy) {
+    expectADanglingLinkIsNoHeader(HeaderNameMatching::CaseInsensitive, "header_dangling_ci");
+}
+
+// A CANDIDATE WHOSE REACH CANNOT BE EXAMINED ENDS THE SEARCH, NAMED: a link in an earlier directory that loops is
+// no absence, so the search never goes on to a later directory. ✔MEASURED 2026-10-28 (probe-reference-cc,
+// linux-x86_64-debug): `-Ia -Ib` with `a/x.h` a looping link -- gcc 13.3 "fatal error: a/x.h: Too many levels of
+// symbolic links", clang "fatal error: cannot open file 'a/x.h': Too many levels of symbolic links", each exit 1;
+// a DANGLING `a/x.h` (absence, the case above) goes on to `b/x.h` in both. One case per policy arm; the link is made
+// by the OS and names itself, which loops on every host.
+namespace {
+
+void expectALoopingLinkEndsTheSearch(HeaderNameMatching matching, char const* scratchName) {
+    ScratchDir scratch{Location::Temp, scratchName};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first);
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(first / "x.h", first / "x.h",
+                                                             dss::test_support::LinkTo::File));
+
+    HeaderSearchCache cache;
+    std::vector<fs::path> const dirs{first, later};
+    std::string const took = tookWhat(findInDirs("x.h", dirs, matching, cache));
+    EXPECT_EQ(took, "unexaminable first/x.h")
+        << "the search took " << took << " -- a looping link was read as no header and the search went on, where "
+           "gcc and clang both stop at it, naming it";
+}
+
+} // namespace
+
+TEST(HeaderNameMatching, ALoopingLinkEndsTheSearchUnderTheCaseSensitivePolicy) {
+    expectALoopingLinkEndsTheSearch(HeaderNameMatching::CaseSensitive, "header_loop_cs");
+}
+
+TEST(HeaderNameMatching, ALoopingLinkEndsTheSearchUnderTheCaseInsensitivePolicy) {
+    expectALoopingLinkEndsTheSearch(HeaderNameMatching::CaseInsensitive, "header_loop_ci");
+}
+
+// A SEARCH DIRECTORY THAT REFUSES ITS LISTING IS SEARCHED BY NAME, AND THE CASE IS VERIFIED BY NAME, under both
+// policies. ✔MEASURED 2026-10-28 (probe-reference-cc, linux-x86_64-debug, run 20261029-000115-ff8a36d9, gcc 13.3.0 and
+// clang 18.1.3): `first` holding x.h with its search bit and not its read bit, searched before `later` -- both take
+// first/x.h by name. The case question the listing would answer is asked of the entries (`decideUnlisted`; what each
+// host tells is path_identity.hpp's table): the exact spelling is taken under both policies; the other case is no
+// header under the case-sensitive policy -- on a folding host because the entry's STORED name is x.h, on one that keeps
+// case because nothing answers to it; under the case-insensitive policy a folding directory gives its one fold-match,
+// spelled as stored, and a name it does not hold goes on to `later`, while a directory that keeps case cannot rule out
+// a fold-match only its listing could show, and ends the search there, named (Linux tells no directory's case rule)
+// -- except where the other-case spelling is itself a second entry: an ambiguity. The checkpoint-34 bytes read the
+// refused listing as holding nothing and took later/x.h, the header of the wrong directory, in silence. POSIX as a user
+// the permission binds; Windows with this user's FILE_LIST_DIRECTORY denied by an ACL entry of its own.
+namespace {
+
+#if defined(_WIN32)
+// This user's FILE_LIST_DIRECTORY on `dir` denied for the scope by an ACL entry of its own, the directory's ACL put back
+// after. ✔MEASURED (h5's probe, windows-x86_64-release, run 20261029-003341-e5d4743a): FindFirstFileW is then refused
+// (error 5) and an entry in the directory is still opened by name.
+class ListingDenied {
+public:
+    explicit ListingDenied(fs::path dir) : dir_(std::move(dir)) {
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return;
+        DWORD size = 0;
+        ::GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        user_.resize(size);
+        BOOL const got = ::GetTokenInformation(token, TokenUser, user_.data(), size, &size);
+        ::CloseHandle(token);
+        if (!got) return;
+        if (::GetNamedSecurityInfoW(dir_.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &old_,
+                                    nullptr, &descriptor_) != ERROR_SUCCESS)
+            return;
+        EXPLICIT_ACCESSW deny{};
+        deny.grfAccessPermissions = FILE_LIST_DIRECTORY;
+        deny.grfAccessMode        = DENY_ACCESS;
+        deny.grfInheritance       = NO_INHERITANCE;
+        deny.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+        deny.Trustee.TrusteeType  = TRUSTEE_IS_USER;
+        deny.Trustee.ptstrName    = static_cast<LPWSTR>(reinterpret_cast<TOKEN_USER*>(user_.data())->User.Sid);
+        PACL denied = nullptr;
+        if (::SetEntriesInAclW(1, &deny, old_, &denied) != ERROR_SUCCESS) return;
+        held_ = ::SetNamedSecurityInfoW(const_cast<wchar_t*>(dir_.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                        nullptr, nullptr, denied, nullptr)
+             == ERROR_SUCCESS;
+        ::LocalFree(denied);
+    }
+    ~ListingDenied() {
+        if (held_)
+            ::SetNamedSecurityInfoW(const_cast<wchar_t*>(dir_.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                    nullptr, nullptr, old_, nullptr);
+        if (descriptor_ != nullptr) ::LocalFree(descriptor_);
+    }
+    ListingDenied(ListingDenied const&)            = delete;
+    ListingDenied& operator=(ListingDenied const&) = delete;
+    [[nodiscard]] bool held() const { return held_; }
+
+private:
+    fs::path             dir_;
+    std::vector<BYTE>    user_;
+    PACL                 old_        = nullptr;   // points into `descriptor_`
+    PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+    bool                 held_       = false;
+};
+#else
+// `dir`'s read bit taken for the scope -- its search bit kept, mode 0300 -- and its mode put back after.
+class ListingDenied {
+public:
+    explicit ListingDenied(fs::path dir) : dir_(std::move(dir)) {
+        std::error_code ec;
+        fs::permissions(dir_, fs::perms::owner_write | fs::perms::owner_exec, fs::perm_options::replace, ec);
+        held_ = !ec;
+    }
+    ~ListingDenied() {
+        std::error_code ec;
+        if (held_) fs::permissions(dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
+    }
+    ListingDenied(ListingDenied const&)            = delete;
+    ListingDenied& operator=(ListingDenied const&) = delete;
+    [[nodiscard]] bool held() const { return held_; }
+
+private:
+    fs::path dir_;
+    bool     held_ = false;
+};
+#endif
+
+void expectAnUnlistableDirectoryIsSearchedByName(HeaderNameMatching matching, char const* scratchName) {
+#if !defined(_WIN32)
+    if (::geteuid() == 0) GTEST_SKIP() << "root lists a directory whatever its mode: nothing is refused to it";
+#endif
+    ScratchDir     scratch{Location::Temp, scratchName};
+    fs::path const first = scratch.path() / "first";
+    fs::path const pair  = scratch.path() / "pair";
+    fs::path const later = scratch.path() / "later";
+    writeFile(first / "x.h", "#define FROM_FIRST 1\n");
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    writeFile(later / "y.h", "#define FROM_LATER 1\n");
+    writeFile(pair / "x.h", "#define LOWER 1\n");
+    // Whether this host's scratch directory folds case: the host's own lookup of the other spelling, asked once.
+    bool const folds = fs::exists(first / "X.H");
+    if (!folds) writeFile(pair / "X.H", "#define UPPER 1\n");   // a second entry only a case-keeping host can hold
+    bool const caseSensitive = matching == HeaderNameMatching::CaseSensitive;
+    std::vector<fs::path> const dirs{first, later};
+    std::vector<fs::path> const pairOnly{pair};
+    std::map<std::string, std::string> took;
+    {
+        ListingDenied const deniedFirst{first};
+        ListingDenied const deniedPair{pair};
+        ASSERT_TRUE(deniedFirst.held() && deniedPair.held()) << "this host would not refuse the listings";
+        std::error_code listing;
+        fs::directory_iterator const tried{first, listing};
+        ASSERT_TRUE(listing) << "the listing of `first` was not refused: this case would ask nothing";
+        HeaderSearchCache cache;
+        auto const answer = [&](HeaderSearchResult const& r) -> std::string {
+            if (r.status == HeaderSearchStatus::Unexaminable && (r.path == first || r.path == pair))
+                return std::string{"refused at "} + (r.path == first ? "first" : "pair") + (r.error ? "" : " (no reason)");
+            return tookWhat(r);
+        };
+        for (char const* name : {"x.h", "X.h", "y.h"}) took[name] = answer(findInDirs(name, dirs, matching, cache));
+        took["pair"] = answer(findInDirs("x.h", pairOnly, matching, cache));
+    }
+    SCOPED_TRACE(folds ? "this host folds case" : "this host keeps case");
+    EXPECT_EQ(took["x.h"], caseSensitive || folds ? "first/x.h" : "refused at first")
+        << "the exact spelling in a directory whose listing is refused";
+    EXPECT_EQ(took["X.h"], caseSensitive ? "nothing" : folds ? "first/x.h" : "refused at first")
+        << "the other case: no header under the case-sensitive policy, the stored spelling under the other";
+    EXPECT_EQ(took["y.h"], !caseSensitive && !folds ? "refused at first" : "later/y.h")
+        << "a name the first directory does not hold";
+    EXPECT_EQ(took["pair"], caseSensitive ? "pair/x.h" : folds ? "pair/x.h" : "an ambiguity")
+        << "x.h beside X.H, where only a case-keeping host holds both";
+}
+
+} // namespace
+
+TEST(HeaderNameMatching, AnUnlistableSearchDirectoryIsSearchedByNameUnderTheCaseSensitivePolicy) {
+    expectAnUnlistableDirectoryIsSearchedByName(HeaderNameMatching::CaseSensitive, "header_unlistable_cs");
+}
+
+TEST(HeaderNameMatching, AnUnlistableSearchDirectoryIsSearchedByNameUnderTheCaseInsensitivePolicy) {
+    expectAnUnlistableDirectoryIsSearchedByName(HeaderNameMatching::CaseInsensitive, "header_unlistable_ci");
+}
+
+// A NAME ENDING IN `..` IS EXAMINED ONCE, BY THE SEARCH ITSELF. No candidate probe names such a tail (`..` is
+// navigation, appended as written), so the search examines the path it ends at, through the compile's cache: a reach
+// it cannot examine ends the search, named, and what it can examine decides what the search may take (a directory:
+// nothing, and the search goes on). `first/d/sub`
+// keeps no search bit, so `first/d/sub/..` cannot be reached, though `first/d/sub` itself can (its parent is
+// searchable). The checkpoint-34 bytes handed that path back as Found, unexamined. POSIX, as a user the permission
+// binds.
+TEST(HeaderNameMatching, ANameEndingInADotDotIsExaminedOnceAndARefusalThereEndsTheSearch) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows grants traversal by ACL, which this case does not set; the POSIX legs ask it";
+#else
+    if (::geteuid() == 0) GTEST_SKIP() << "root traverses a directory whatever its mode: nothing is refused to it";
+    ScratchDir scratch{Location::Temp, "header_dot_dot_tail"};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first / "d" / "sub");
+    fs::create_directories(later / "d" / "sub");
+    std::vector<fs::path> const dirs{first, later};
+    fs::permissions(first / "d" / "sub", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+    for (HeaderNameMatching const matching : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(matching));
+        HeaderSearchCache        cache;
+        HeaderSearchResult const r = findInDirs("d/sub/..", dirs, matching, cache);
+        EXPECT_EQ(r.status, HeaderSearchStatus::Unexaminable)
+            << "the search took " << tookWhat(r) << " -- a path it never examined was handed back";
+        EXPECT_EQ(r.path, first / "d" / "sub" / "..") << "the refusal named " << r.path.generic_string();
+    }
+    fs::permissions(first / "d" / "sub", fs::perms::owner_all, fs::perm_options::replace);
+    // The control: the same tail through a searchable `sub` is examined, and reaches a directory -- no header -- in
+    // both directories, so the search answers nothing: the refusal above is the unexaminable reach, not the tail.
+    HeaderSearchCache cache;
+    EXPECT_EQ(tookWhat(findInDirs("d/sub/..", dirs, HeaderNameMatching::CaseSensitive, cache)), "nothing");
+    // A `..` through a FILE reaches nothing (the host answers "not a directory"): no header, in either directory.
+    // A FRESH cache per policy: the compile's cache keeps each listing as first read, and the one above was read
+    // before `f.h` existed -- through it the search stops at `f.h` itself and never meets the tail (✔MEASURED: the
+    // arm that drops this refusal SURVIVED on such a cache, sweep run 20261029-040147-5f53414c, macos-arm64-debug).
+    // So the same cache must first FIND `first/f.h`: the walk reaches the file, and the tail is what is judged.
+    writeFile(first / "f.h", "int f;\n");
+    writeFile(later / "f.h", "int f;\n");
+    for (HeaderNameMatching const matching : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(matching));
+        HeaderSearchCache fileCache;
+        ASSERT_EQ(tookWhat(findInDirs("f.h", dirs, matching, fileCache)), "first/f.h")
+            << "the search does not reach the file, so the tail through it would be judged on nothing";
+        EXPECT_EQ(tookWhat(findInDirs("f.h/..", dirs, matching, fileCache)), "nothing")
+            << "a dot-dot tail through a file was handed back";
+    }
+#endif
+}
+
+// A DIRECTORY NAMED LIKE THE HEADER IS NO HEADER, AND THE SEARCH GOES ON -- under both policies and for every search
+// the tiers share: the -I search (`findInDirs`), the quote form's (`resolveIncludePath`, its includer's directory
+// first) and the descriptor's (`resolveSystemDescriptor`). ✔MEASURED 2026-10-28 (probe-reference-cc,
+// linux-x86_64-debug, run 20261029-000351-99219a41, gcc 13.3.0 and clang): with a directory `u/x.h` searched first and
+// a header `b/x.h` later, both take b/x.h -- `#include <x.h>`, `#include "x.h"` on -I and in the includer's own
+// directory alike; with the directory alone both say not found.
+TEST(HeaderNameMatching, ADirectoryNamedLikeTheHeaderIsNoHeaderAndTheSearchGoesOn) {
+    ScratchDir     scratch{Location::Temp, "header_directory_hit"};
+    fs::path const first = scratch.path() / "first";
+    fs::path const later = scratch.path() / "later";
+    fs::create_directories(first / "x.h");
+    fs::create_directories(first / "x.json");
+    writeFile(later / "x.h", "#define FROM_LATER 1\n");
+    writeFile(later / "x.json", "{}\n");
+    std::vector<fs::path> const dirs{first, later};
+    std::vector<fs::path> const laterOnly{later};
+    std::vector<fs::path> const firstOnly{first};
+    for (HeaderNameMatching const matching : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(matching));
+        HeaderSearchCache cache;
+        EXPECT_EQ(tookWhat(findInDirs("x.h", dirs, matching, cache)), "later/x.h") << "the -I search";
+        EXPECT_EQ(tookWhat(resolveIncludePath("x.h", first, laterOnly, matching, cache)), "later/x.h")
+            << "the quote search, its includer's directory first";
+        EXPECT_EQ(tookWhat(resolveSystemDescriptor("x.h", dirs, matching, cache)), "later/x.json")
+            << "the descriptor search";
+        EXPECT_EQ(tookWhat(findInDirs("x.h", firstOnly, matching, cache)), "nothing") << "the directory alone";
+    }
+}
+
 // ── [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]] ────────
 //
 // A COMPILE reads each directory ONCE, and only for itself. Every search above used to
@@ -629,19 +986,17 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
     // the wrong half of the system.
     auto const root = dss::test::findRepoRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    // The ONE generated tree that `isGeneratedDirName` cannot claim, because
-    // `dist` is an ordinary word and a bare-name entry would prune EVERY
-    // directory so named anywhere in the repo (see the note there). Named by
-    // ABSOLUTE path, once, for every root below: it is simply unreachable from
-    // the two narrow roots, so listing it there costs one path compare that
-    // never fires and keeps a single source of truth for what is generated.
-    std::vector<fs::path> const generatedSubtrees{
-        *root / "src/dss-config/runtime/platform/dist"};
+    // What a clone never materializes is what git ignores in the tree — build
+    // output, a session's scratch, the generated runtime objects under
+    // `src/dss-config/runtime/platform/dist/`, the copies DssHarness keeps in a tree —
+    // read ONCE from the tree's own `.gitignore` for every root below.
+    TreeIgnores const ignores = dss::test_support::readTreeIgnores(*root);
+    ASSERT_TRUE(ignores.refusal.empty()) << ignores.refusal;
 
     // `src/dss-config/**` first (the descriptors this axis resolves), then the
     // WHOLE checked-out tree — the invariant is about CLONING the repo, not
     // just about headers, so the sweep must cover everything a clone
-    // materializes. Build output and `.git` are pruned by `isGeneratedDirName`.
+    // materializes, and nothing git ignores (`.git` included).
     for (char const* sub : {"src/dss-config/shippedLibs",
                             "src/dss-config/object-formats",
                             "src/dss-config",
@@ -650,7 +1005,11 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
         ASSERT_TRUE(fs::is_directory(dir))
             << sub << " must exist — a guard that silently skips its own "
                       "subject is the vacuous-pass class";
-        auto const scan = caseCollisionsUnder(dir, generatedSubtrees);
+        auto const scan = caseCollisionsUnder(*root, dir, ignores);
+        EXPECT_TRUE(scan.refusal.empty())
+            << sub << ": the sweep was refused, so it says nothing of the tree: " << scan.refusal;
+        EXPECT_TRUE(scan.leftOutRoot.empty())
+            << sub << ": the tree's .gitignore leaves the swept root out (" << scan.leftOutRoot << ")";
         // Prove the instrument did work before believing its verdict.
         EXPECT_FALSE(scan.walkError)
             << sub << ": the walk was TRUNCATED (" << scan.walkError.message()
@@ -690,13 +1049,14 @@ TEST(HeaderNameMatching, CaseCollisionGuardActuallyDetectsACollision) {
                         "case-sensitive leg";
     }
     writeFile(dir / "nested" / "windows.json");
-    auto const clean = caseCollisionsUnder(dir);
+    TreeIgnores const none;   // the scratch tree has no `.gitignore`: nothing but `.git` is left out
+    auto const clean = caseCollisionsUnder(dir, dir, none);
     EXPECT_TRUE(clean.groups.empty())
         << "no collision yet — the guard must not fire on a clean tree";
     EXPECT_EQ(clean.filesScanned, 1u) << "and it must have actually LOOKED";
     EXPECT_FALSE(clean.walkError);
     writeFile(dir / "nested" / "Windows.json");
-    auto const scan = caseCollisionsUnder(dir);
+    auto const scan = caseCollisionsUnder(dir, dir, none);
     EXPECT_FALSE(scan.walkError);
     EXPECT_EQ(scan.filesScanned, 2u);
     ASSERT_EQ(scan.groups.size(), 1u)
@@ -706,74 +1066,460 @@ TEST(HeaderNameMatching, CaseCollisionGuardActuallyDetectsACollision) {
     EXPECT_EQ(scan.groups[0][1], "nested/windows.json");
 }
 
-// CONTROL for the PATH-ANCHORED prune the repo-wide guard passes.
+// CONTROL for an ANCHORED rule of the tree's `.gitignore`, the shape the repo-wide
+// guard needs for `src/dss-config/runtime/platform/dist/`.
 //
-// ★ WHY THIS CANNOT BE LEFT TO THE REAL TREE. `src/dss-config/runtime/platform/
-// dist/` is GENERATED, so it is ABSENT from a fresh clone and absent on any host
-// that has not built the runtime — which means a prune that silently matched
-// nothing would look EXACTLY like a prune that worked, in every log this project
-// keeps. That is the vacuous-fix class, one step removed from the vacuous-pass
-// class `CaseCollisionScan` already carries a denominator for. So the mechanism
-// is exercised over a tree this test builds, in BOTH directions, on EXACT
-// counts — emptiness cannot tell "pruned" apart from "scanned nothing".
+// ★ WHY THIS CANNOT BE LEFT TO THE REAL TREE. That directory is GENERATED, so it is
+// ABSENT from a fresh clone and absent on any host that has not built the runtime —
+// which means a rule that silently matched nothing would look EXACTLY like a rule
+// that worked, in every log this project keeps. That is the vacuous-fix class, one
+// step removed from the vacuous-pass class `CaseCollisionScan` already carries a
+// denominator for. So the mechanism is exercised over a tree this test builds, in
+// BOTH directions, on EXACT counts — emptiness cannot tell "left out" apart from
+// "scanned nothing".
 //
 // It needs no case-colliding pair and therefore no host capability: the claim is
 // about WHAT WAS ENUMERATED, which every filesystem can answer.
-TEST(HeaderNameMatching, CaseCollisionScanPrunesOnlyTheSubtreesItIsGiven) {
+TEST(HeaderNameMatching, CaseCollisionScanLeavesOutOnlyTheAnchoredPathItsRuleNames) {
     ScratchDir scratch{Location::Temp, "header_case_prune"};
     fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore", "/generated/\n");
     writeFile(dir / "kept.json");
     writeFile(dir / "kept-nested" / "also-kept.json");
     writeFile(dir / "generated" / "one.o");
     writeFile(dir / "generated" / "deeper" / "two.o");
-    // ★ A SECOND DIRECTORY OF THE SAME BARE NAME, at a different path — the
-    // whole reason this prune is anchored. A bare-name `dist`/`generated` entry
-    // in `isGeneratedDirName` would take this one out too, deleting coverage of
-    // a tree that IS cloned, and the guard would still report a clean pass.
+    // ★ A SECOND DIRECTORY OF THE SAME BARE NAME, at a different path — the whole
+    // reason the rule is anchored. Read as a bare name it would take this one out
+    // too, deleting coverage of a tree that IS cloned, and the guard would still
+    // report a clean pass.
     writeFile(dir / "kept-nested" / "generated" / "three.o");
 
-    auto const all = caseCollisionsUnder(dir);
+    auto const all = caseCollisionsUnder(dir, dir, TreeIgnores{});
     EXPECT_FALSE(all.walkError);
-    EXPECT_EQ(all.filesScanned, 5u)
-        << "UNPRUNED direction: the walk must see all five files, including the "
+    EXPECT_EQ(all.filesScanned, 6u)
+        << "UNPRUNED direction: the walk must see all six files, including the "
            "two under `<dir>/generated/`. Without this the count below could be "
            "explained by the files never existing";
     EXPECT_TRUE(all.groups.empty());
 
-    auto const pruned = caseCollisionsUnder(dir, {dir / "generated"});
+    TreeIgnores const ignores = dss::test_support::readTreeIgnores(dir);
+    ASSERT_TRUE(ignores.refusal.empty()) << ignores.refusal;
+    auto const pruned = caseCollisionsUnder(dir, dir, ignores);
     EXPECT_FALSE(pruned.walkError);
-    EXPECT_EQ(pruned.filesScanned, 3u)
-        << "PRUNED direction: exactly `<dir>/generated/one.o` and "
-           "`<dir>/generated/deeper/two.o` drop out. `kept.json`, "
+    EXPECT_EQ(pruned.filesScanned, 4u)
+        << "LEFT-OUT direction: exactly `<dir>/generated/one.o` and "
+           "`<dir>/generated/deeper/two.o` drop out. `.gitignore`, `kept.json`, "
            "`kept-nested/also-kept.json` and `kept-nested/generated/three.o` "
            "remain — the last one is the anchoring proof";
     EXPECT_TRUE(pruned.groups.empty());
 }
 
-// ...and the prune must survive the root spelling the repo-wide guard actually
-// uses. `*root / "."` is one of that guard's four roots, and `.` is a REAL
-// element of `fs::path` iteration, so every entry it yields carries a `./` the
-// pruned path does not. An as-written compare fails HERE AND NOWHERE ELSE: the
-// three narrow roots would keep pruning correctly while the whole-repo root —
-// the only one that reaches the generated tree — silently walked it. The
-// unpruned scan is the control that attributes the count to the prune rather
-// than to the dot-spelled root breaking the walk.
-TEST(HeaderNameMatching, CaseCollisionScanPrunesThroughADotSpelledRoot) {
+// ...and the rule must hold through the root spelling the repo-wide guard actually
+// uses. `*root / "."` is one of that guard's four roots, and `.` is a REAL element
+// of `fs::path` iteration, so every entry it yields carries a `./`. Judged as
+// written, it fails HERE AND NOWHERE ELSE: the three narrow roots would keep their
+// rules while the whole-repo root — the only one that reaches every directory the
+// rules leave out — silently walked them. The scan with no rules is the control that
+// attributes the count to the rule rather than to the dot-spelled root breaking the walk.
+TEST(HeaderNameMatching, CaseCollisionScanLeavesOutThroughADotSpelledRoot) {
     ScratchDir scratch{Location::Temp, "header_case_prune_dot"};
     fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore", "/generated/\n");
     writeFile(dir / "kept.json");
     writeFile(dir / "generated" / "one.o");
 
-    auto const all = caseCollisionsUnder(dir / ".");
+    auto const all = caseCollisionsUnder(dir, dir / ".", TreeIgnores{});
     EXPECT_FALSE(all.walkError);
-    EXPECT_EQ(all.filesScanned, 2u)
+    EXPECT_EQ(all.filesScanned, 3u)
         << "a `.` component must not disturb the walk itself";
 
-    auto const pruned = caseCollisionsUnder(dir / ".", {dir / "generated"});
+    auto const pruned = caseCollisionsUnder(dir, dir / ".", dss::test_support::readTreeIgnores(dir));
     EXPECT_FALSE(pruned.walkError);
-    EXPECT_EQ(pruned.filesScanned, 1u)
-        << "with an as-written compare this reads 2, and the repo-wide guard "
-           "walks the generated tree it was told to skip";
+    EXPECT_EQ(pruned.filesScanned, 2u)
+        << "with an as-written compare this reads 3, and the repo-wide guard "
+           "walks the generated tree its rule names";
+}
+
+// THE COPIES DSSHARNESS KEEPS IN A TREE, A SESSION'S SCRATCH, AND A BUILD, beside the
+// real files: the sweep enumerates exactly what a clone holds. The tree's `.gitignore`
+// is written in the shapes the repository's carries — the tool's managed block (each
+// directory's CONTENTS left out, its placeholder kept), a bare scratch name, a build
+// directory — and the files in each would be swept twice, or vanish under the walk,
+// were they read.
+TEST(HeaderNameMatching, CaseCollisionScanLeavesOutTheCopiesTheToolKeepsAScratchAndABuild) {
+    ScratchDir scratch{Location::Temp, "header_case_harness_dirs"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore",
+              ".temp/\nbuild/\n/.worktrees/*\n!/.worktrees/.gitkeep\n/.orchestrators/*\n!/.orchestrators/.gitkeep\n"
+              "/.mutations/*\n!/.mutations/.gitkeep\n/.legs/*\n!/.legs/.gitkeep\n");
+    for (char const* real : {"examples/c/x/expected.json", "src/a.json", ".legs/.gitkeep", ".mutations/.gitkeep"})
+        writeFile(dir / real);
+    for (char const* copy : {".legs/x/examples/c/x/expected.json", ".mutations/aw-1/src/a.json",
+                             ".temp/x/examples/c/x/expected.json", ".worktrees/lane/src/a.json",
+                             ".orchestrators/o/work/a/src/a.json", "build/v1/bin/dss/runner.json",
+                             "tests/.temp/y.json"})
+        writeFile(dir / copy);
+
+    auto const all = caseCollisionsUnder(dir, dir, TreeIgnores{});
+    EXPECT_EQ(all.filesScanned, 12u) << "the control: with no rule every file is swept";
+
+    auto const scan = caseCollisionsUnder(dir, dir, dss::test_support::readTreeIgnores(dir));
+    EXPECT_TRUE(scan.refusal.empty()) << scan.refusal;
+    EXPECT_FALSE(scan.walkError);
+    std::vector<std::string> swept = scan.paths;
+    std::sort(swept.begin(), swept.end());
+    EXPECT_EQ(swept, (std::vector<std::string>{".gitignore", ".legs/.gitkeep", ".mutations/.gitkeep",
+                                               "examples/c/x/expected.json", "src/a.json"}))
+        << "a leg copy, a mutation worker, a lane's checkout, a work copy, a session's scratch "
+           "(at the root and below) and a build are what git ignores here: none is swept";
+}
+
+// THE SWEEP NEVER DESCENDS A SYMBOLIC LINK AND COUNTS IT AS THE FILE A CLONE HOLDS. git records a
+// link as a file, so a `build/` rule does not take a link named `build` (✔MEASURED, git 2.55), and
+// a clone materializes the link itself — a path that collides like any other. A walk through it
+// would read another tree, or this one twice.
+TEST(HeaderNameMatching, CaseCollisionScanNeverDescendsASymbolicLinkAndCountsIt) {
+    ScratchDir scratch{Location::Temp, "header_case_links"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / ".gitignore", "build/\n");
+    writeFile(dir / "real" / "x.json");
+    // Made by the OS (`os_link.hpp`): MinGW's library cannot make a link, and that build is the one
+    // whose library cannot see one either.
+    using dss::test_support::LinkTo;
+    std::error_code ec = dss::test_support::makeSymbolicLink(dir / "real", dir / "build", LinkTo::Directory);
+    if (!ec) ec = dss::test_support::makeSymbolicLink(dir / "real", dir / "elsewhere", LinkTo::Directory);
+    ASSERT_FALSE(ec) << "a symbolic link cannot be made on this host (" << ec.message()
+                     << "): the case did not run";
+    auto const scan = caseCollisionsUnder(dir, dir, dss::test_support::readTreeIgnores(dir));
+    EXPECT_TRUE(scan.refusal.empty()) << scan.refusal;
+    EXPECT_FALSE(scan.walkError);
+    std::vector<std::string> swept = scan.paths;
+    std::sort(swept.begin(), swept.end());
+    EXPECT_EQ(swept, (std::vector<std::string>{".gitignore", "build", "elsewhere", "real/x.json"}))
+        << "the scan swept " << swept.size()
+        << " of the 4 files: each link is swept as the file it is, and nothing behind it is read";
+}
+
+// ── the C++ reader of the one statement (`tests/test_support/tree_ignores.hpp`) ──
+// THE ONE CASE TABLE, `tests/test_support/tree_ignores_cases.json`, states every scenario: its
+// rules and each path's kind and answer, or the line a reader refuses. A case below asks one
+// scenario of THIS reader, on paths alone, so every host answers alike; owning-tree.py's self-test
+// asks the same scenario of the Python reader, and each suite's LIVE case asks git itself.
+
+namespace {
+
+using dss::test_support::TreeIgnoreRefusal;
+
+// Every scenario a case below asks: the table's names, compared with the table by
+// `EveryScenarioOfTheCaseTableIsAskedByOneCase` (a scenario added there and asked here by no case is red).
+constexpr char const* kScenarios[] = {
+    "the copies the tool keeps in a tree, a session's scratch and a build",
+    "a later rule decides, and a negation re-includes",
+    "a rule with no slash matches that name at any depth",
+    "a rule with a slash is anchored to the tree's root",
+    "a rule ending in a slash matches a directory only",
+    "a rule ending in a slash never matches a symbolic link",
+    "a double-star name is any number of directories",
+    "a star, a question mark and a class match the name's bytes",
+    "the twelve POSIX classes read as git reads them",
+    "a dash, a bracket first, a range and a lone [: inside a class read as git reads them",
+    "nothing under a left-out directory is re-included",
+    "git's own directory is always left out, as a directory or a worktree's file",
+    "a path a rule matches under one setting of core.ignorecase and not the other is refused",
+    "a name that is git's own only when case is folded is refused",
+    "a name holding a backslash is refused",
+    "a byte order mark, a CR LF ending and trailing spaces are no part of a rule, a trailing tab is",
+    "a rule holding a backslash is refused, naming its line",
+    "a class opened and never closed is refused, naming its line",
+    "a POSIX class git does not name is refused, naming its line",
+    "a rule naming nothing between two separators, or nothing at all, is refused",
+};
+
+[[nodiscard]] nlohmann::json const& caseTable() {
+    static nlohmann::json const table = [] {
+        auto const root = dss::test::findRepoRoot();
+        if (!root) throw std::runtime_error("no repository root, so no case table: " + dss::test::repoRootDiagnostic());
+        std::ifstream in(*root / "tests" / "test_support" / "tree_ignores_cases.json", std::ios::binary);
+        if (!in) throw std::runtime_error("tests/test_support/tree_ignores_cases.json cannot be read");
+        return nlohmann::json::parse(in);
+    }();
+    return table;
+}
+
+[[nodiscard]] nlohmann::json const& scenario(std::string const& name) {
+    for (auto const& s : caseTable().at("scenarios"))
+        if (s.at("name").get<std::string>() == name) return s;
+    throw std::runtime_error("the case table holds no scenario named '" + name + "'");
+}
+
+[[nodiscard]] std::string rulesText(nlohmann::json const& sc) {
+    std::string const nl = sc.contains("newline") ? sc.at("newline").get<std::string>() : std::string("\n");
+    std::string       text;
+    for (auto const& r : sc.at("rules")) text += r.get<std::string>() + nl;
+    return text;
+}
+
+// This reader's answer for one path, in the table's words.
+struct Answer {
+    bool        refused = false;
+    std::string text;   // the rule that leaves it out ("" kept), or the refusal
+};
+
+[[nodiscard]] Answer ask(TreeIgnores const& t, std::string const& path, bool isDir) {
+    try {
+        return {false, t.leavesOut(path, isDir)};
+    } catch (TreeIgnoreRefusal const& refused) {
+        return {true, refused.what()};
+    }
+}
+
+[[nodiscard]] std::string render(Answer const& a) {
+    if (a.refused) return "refused (" + a.text.substr(0, 140) + ")";
+    return a.text.empty() ? std::string("kept") : "left out by " + a.text;
+}
+
+[[nodiscard]] std::string render(nlohmann::json const& answer) {
+    if (answer.is_null()) return "kept";
+    if (answer.is_object()) return "refused (" + answer.at("refused").get<std::string>() + ")";
+    return "left out by " + answer.get<std::string>();
+}
+
+[[nodiscard]] bool agrees(nlohmann::json const& answer, Answer const& got) {
+    if (answer.is_object()) return got.refused && got.text.find(answer.at("refused").get<std::string>()) != std::string::npos;
+    return !got.refused && got.text == (answer.is_null() ? std::string{} : answer.get<std::string>());
+}
+
+// Every path of one scenario asked of this reader.
+void expectAnswers(std::string const& name) {
+    auto const&       sc = scenario(name);
+    TreeIgnores const t = dss::test_support::readTreeIgnoreRules(rulesText(sc), "fixture-ignore");
+    ASSERT_TRUE(t.refusal.empty()) << t.refusal;
+    for (auto const& p : sc.at("paths")) {
+        std::string const path = p.at(0).get<std::string>();
+        std::string const kind = p.at(1).get<std::string>();
+        Answer const      got = ask(t, path, kind == "dir");
+        EXPECT_TRUE(agrees(p.at(2), got))
+            << path << " (" << kind << "): answered " << render(got) << ", the table says " << render(p.at(2));
+    }
+}
+
+// Every rule set of one scenario read by this reader: refused at the line the table names, saying
+// what it says, or read whole where the table names no line.
+void expectRefusals(std::string const& name) {
+    for (auto const& r : scenario(name).at("refusals")) {
+        std::string text, shown;
+        for (auto const& line : r.at("rules")) {
+            text += line.get<std::string>() + "\n";
+            shown += (shown.empty() ? "" : " ; ") + line.get<std::string>();
+        }
+        std::string const refusal = dss::test_support::readTreeIgnoreRules(text, "fixture-ignore").refusal;
+        if (r.at("line").is_null()) {
+            EXPECT_TRUE(refusal.empty()) << "[" << shown << "] was refused: " << refusal;
+        } else {
+            int const         line = r.at("line").get<int>();
+            std::string const says = r.at("says").get<std::string>();
+            EXPECT_TRUE(refusal.find("fixture-ignore line " + std::to_string(line) + ":") != std::string::npos
+                        && refusal.find(says) != std::string::npos)
+                << "[" << shown << "] was " << (refusal.empty() ? std::string("read whole") : "refused: " + refusal)
+                << ", the table says refused at line " << line << " for " << says;
+        }
+    }
+}
+
+} // namespace
+
+TEST(TreeIgnoresGrammar, TheCopiesTheToolKeepsAScratchAndABuildAreLeftOut) { expectAnswers(kScenarios[0]); }
+TEST(TreeIgnoresGrammar, ALaterRuleDecidesAndANegationReincludes) { expectAnswers(kScenarios[1]); }
+TEST(TreeIgnoresGrammar, ARuleWithNoSlashMatchesThatNameAtAnyDepth) { expectAnswers(kScenarios[2]); }
+TEST(TreeIgnoresGrammar, ARuleWithASlashIsAnchoredToTheTreesRoot) { expectAnswers(kScenarios[3]); }
+TEST(TreeIgnoresGrammar, ATrailingSlashMatchesADirectoryOnly) { expectAnswers(kScenarios[4]); }
+TEST(TreeIgnoresGrammar, ATrailingSlashNeverMatchesASymbolicLink) { expectAnswers(kScenarios[5]); }
+TEST(TreeIgnoresGrammar, ADoubleStarNameIsAnyNumberOfDirectories) { expectAnswers(kScenarios[6]); }
+TEST(TreeIgnoresGrammar, AStarAQuestionMarkAndAClassMatchTheNamesBytes) { expectAnswers(kScenarios[7]); }
+TEST(TreeIgnoresGrammar, TheTwelvePosixClassesReadAsGitReadsThem) { expectAnswers(kScenarios[8]); }
+TEST(TreeIgnoresGrammar, ADashABracketFirstARangeAndALoneColonOpenerReadAsGitReadsThem) {
+    expectAnswers(kScenarios[9]);
+}
+TEST(TreeIgnoresGrammar, NothingUnderALeftOutDirectoryIsReincluded) { expectAnswers(kScenarios[10]); }
+TEST(TreeIgnoresGrammar, GitsOwnIsAlwaysLeftOutAsADirectoryOrAWorktreesFile) { expectAnswers(kScenarios[11]); }
+TEST(TreeIgnoresGrammar, APathARuleMatchesUnderOneSettingOfIgnoreCaseAndNotTheOtherIsRefused) {
+    expectAnswers(kScenarios[12]);
+}
+TEST(TreeIgnoresGrammar, ANameThatIsGitsOwnOnlyWhenCaseIsFoldedIsRefused) { expectAnswers(kScenarios[13]); }
+TEST(TreeIgnoresGrammar, ANameHoldingABackslashIsRefused) { expectAnswers(kScenarios[14]); }
+TEST(TreeIgnoresGrammar, AByteOrderMarkACrLfEndingAndTrailingSpacesAreNoPartOfARule) { expectAnswers(kScenarios[15]); }
+TEST(TreeIgnoresGrammar, ARuleHoldingABackslashIsRefusedNamingItsLine) { expectRefusals(kScenarios[16]); }
+TEST(TreeIgnoresGrammar, AClassNeverClosedIsRefusedNamingItsLine) { expectRefusals(kScenarios[17]); }
+TEST(TreeIgnoresGrammar, APosixClassGitDoesNotNameIsRefusedNamingItsLine) { expectRefusals(kScenarios[18]); }
+TEST(TreeIgnoresGrammar, ARuleNamingNothingIsRefusedNamingItsLine) { expectRefusals(kScenarios[19]); }
+
+TEST(TreeIgnoresGrammar, EveryScenarioOfTheCaseTableIsAskedByOneCase) {
+    std::vector<std::string> named, asked(std::begin(kScenarios), std::end(kScenarios));
+    for (auto const& s : caseTable().at("scenarios")) named.push_back(s.at("name").get<std::string>());
+    std::sort(named.begin(), named.end());
+    std::sort(asked.begin(), asked.end());
+    EXPECT_EQ(asked, named) << "a scenario of the table that no case asks, or a case asking none";
+}
+
+// A `.gitignore` that is a DIRECTORY is refused, as the Python reader refuses it: a reader that
+// opened it and read nothing would leave out nothing, in silence.
+TEST(TreeIgnoresGrammar, AGitignoreThatIsADirectoryIsRefused) {
+    ScratchDir scratch{Location::Temp, "tree_ignores_dir_gitignore"};
+    fs::create_directories(scratch.path() / ".gitignore");
+    TreeIgnores const t = dss::test_support::readTreeIgnores(scratch.path());
+    EXPECT_NE(t.refusal.find("it is a directory"), std::string::npos) << "read as: '" << t.refusal << "'";
+}
+
+// LIVE: git itself, over every scenario's paths. One repository, each scenario in its own directory
+// whose `.gitignore` holds the scenario's rules (anchored to that directory exactly as a root rule
+// is to the root); a `dir` leaf made a directory and a `link` leaf a link (git decides a path it
+// cannot stat as no directory, so a `file` leaf needs no file). Asked under both settings of
+// core.ignorecase, with no excludes file of the host's and none of the caller's git environment. A
+// path the table refuses for case must be one git answers differently under the two; every other
+// answered path must be this reader's answer under both. No git on the host is a failure, never a pass.
+// git's C-style quoting of a path undone: a name holding a control byte, a double quote, a backslash
+// or (under core.quotePath) a byte at or above 0x80 is written between double quotes, with \a \b \t
+// \n \v \f \r \" \\ and three octal digits for every other byte it quotes; any other name is as is.
+namespace {
+[[nodiscard]] std::string gitUnquoted(std::string const& s) {
+    if (s.size() < 2 || s.front() != '"' || s.back() != '"') return s;
+    std::string out;
+    for (std::size_t i = 1; i + 1 < s.size(); ++i) {
+        if (s[i] != '\\' || i + 2 >= s.size()) {
+            out += s[i];
+            continue;
+        }
+        char const e = s[++i];
+        switch (e) {
+            case 'a': out += '\a'; break;
+            case 'b': out += '\b'; break;
+            case 't': out += '\t'; break;
+            case 'n': out += '\n'; break;
+            case 'v': out += '\v'; break;
+            case 'f': out += '\f'; break;
+            case 'r': out += '\r'; break;
+            default:
+                if (e >= '0' && e <= '3' && i + 3 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '7' && s[i + 2] >= '0'
+                    && s[i + 2] <= '7') {
+                    out += static_cast<char>(((e - '0') << 6) | ((s[i + 1] - '0') << 3) | (s[i + 2] - '0'));
+                    i += 2;
+                } else {
+                    out += e;   // `\"` and `\\`
+                }
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST(TreeIgnoresGrammar, LiveEveryScenarioIsAnsweredAsGitCheckIgnoreAnswersIt) {
+    auto const gitExe = dss::substrate::resolveExecutableOnPath("git");
+    ASSERT_TRUE(gitExe.has_value()) << "no git on this host: the live comparison did not run, which is no pass";
+    ScratchDir     scratch{Location::Temp, "tree_ignores_live_git"};
+    fs::path const repo = scratch.path() / "repo";
+    fs::path const target = scratch.path() / "link-target";
+    fs::create_directories(repo);
+    fs::create_directories(target);
+    auto const& withheld = dss::gitRepositoryLocalVariables();
+    {
+        auto const init = dss::substrate::spawnAndWaitRedirectStdout({narrowUtf8OrEmpty(*gitExe), "init", "-q"}, repo,
+                                                                     scratch.path() / "init.out", withheld);
+        ASSERT_TRUE(init.spawned && init.exitCode == 0) << init.diagnostic;
+    }
+    struct Asked {
+        std::string           scenario, path, kind, asAsked;
+        nlohmann::json        answer;
+        TreeIgnores const*    reader;
+    };
+    std::vector<Asked>       asked;
+    std::vector<TreeIgnores> readers;
+    auto const&              scenarios = caseTable().at("scenarios");
+    readers.reserve(scenarios.size());
+    for (std::size_t k = 0; k < scenarios.size(); ++k) {
+        auto const& sc = scenarios[k];
+        if (!sc.contains("paths") || (sc.contains("asked_of_git") && !sc.at("asked_of_git").get<bool>())) continue;
+        std::string const top = "s" + std::to_string(k);
+        fs::create_directories(repo / top);
+        writeFile(repo / top / ".gitignore", rulesText(sc));
+        readers.push_back(dss::test_support::readTreeIgnoreRules(rulesText(sc), "fixture-ignore"));
+        for (auto const& p : sc.at("paths")) {
+            std::string const path = p.at(0).get<std::string>();
+            std::string const kind = p.at(1).get<std::string>();
+            if (p.at(2).is_object() && p.at(2).at("refused").get<std::string>() != "core.ignorecase") continue;
+            std::u8string const u8path(path.begin(), path.end());
+            fs::path const      full = repo / top / fs::path(u8path);
+            std::error_code     ec;
+            if (kind == "dir") {
+                fs::create_directories(full, ec);
+            } else if (kind == "link") {
+                fs::create_directories(full.parent_path(), ec);
+                if (!ec) ec = dss::test_support::makeSymbolicLink(target, full, dss::test_support::LinkTo::Directory);
+            }
+            ASSERT_FALSE(ec) << "cannot make " << path << " (" << kind << ") on this host (" << ec.message()
+                             << "): the live comparison did not run";
+            asked.push_back({sc.at("name").get<std::string>(), path, kind, top + "/" + path, p.at(2), &readers.back()});
+        }
+    }
+    ASSERT_FALSE(asked.empty());
+    // The paths go on the command line: git takes `-z` only with `--stdin` (it refuses `-z` beside
+    // named paths), and the spawner hands a child this process's own standard input. So each answer
+    // is git's line form: `<source>:<line>:<pattern>` (`::` when no rule matched), a tab, and the
+    // path -- written C-quoted whenever it holds a byte git quotes, which a quoted path's tab never
+    // is; the pattern is written as it stands and may hold a tab, so the LAST tab ends it.
+    std::map<std::string, std::map<std::string, std::string>> said;   // setting -> path -> pattern ("" none)
+    for (std::string const fold : {"false", "true"}) {
+        std::vector<std::string> argv{narrowUtf8OrEmpty(*gitExe), "-c", "core.ignorecase=" + fold, "-c",
+                                      "core.excludesFile=" + narrowUtf8OrEmpty(scratch.path() / "no-excludes-file"),
+                                      "-c", "core.quotePath=true", "check-ignore", "--no-index", "-v", "-n", "--"};
+        for (auto const& a : asked) argv.push_back(a.asAsked);
+        fs::path const out = scratch.path() / ("check-ignore-" + fold + ".out");
+        auto const     r = dss::substrate::spawnAndWaitRedirectStdout(argv, repo, out, withheld);
+        ASSERT_TRUE(r.spawned && (r.exitCode == 0 || r.exitCode == 1)) << r.diagnostic << " exit " << r.exitCode;
+        std::ifstream     in(out, std::ios::binary);
+        std::string const bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        std::size_t       at = 0;
+        while (at < bytes.size()) {
+            std::size_t const  eol = bytes.find('\n', at);
+            std::string const  line = bytes.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+            at = eol == std::string::npos ? bytes.size() : eol + 1;
+            std::size_t const  tab = line.rfind('\t');
+            ASSERT_NE(tab, std::string::npos) << "a line of git check-ignore with no tab: " << line;
+            std::string const  head = line.substr(0, tab);
+            std::size_t const  c1 = head.find(':');
+            std::size_t const  c2 = c1 == std::string::npos ? c1 : head.find(':', c1 + 1);
+            ASSERT_NE(c2, std::string::npos) << "a line of git check-ignore with no source and line: " << line;
+            std::string const  pattern = head.substr(c2 + 1);
+            said[fold][gitUnquoted(line.substr(tab + 1))] =
+                (pattern.empty() || pattern.front() == '!') ? std::string{} : pattern;
+        }
+    }
+    for (auto const& a : asked) {
+        auto const   gf = said["false"].count(a.asAsked) ? said["false"][a.asAsked] : std::string("<unanswered>");
+        auto const   gt = said["true"].count(a.asAsked) ? said["true"][a.asAsked] : std::string("<unanswered>");
+        Answer const mine = ask(*a.reader, a.path, a.kind == "dir");
+        if (a.answer.is_object()) {
+            EXPECT_TRUE(mine.refused && gf != gt)
+                << a.path << " (" << a.kind << "): this reader " << render(mine) << ", git '" << gf
+                << "' under false and '" << gt << "' under true";
+        } else {
+            EXPECT_TRUE(!mine.refused && mine.text == gf && gf == gt)
+                << a.path << " (" << a.kind << "): this reader " << render(mine) << ", git '" << gf
+                << "' under false and '" << gt << "' under true";
+        }
+    }
+}
+
+// LIVE: the repository's own `.gitignore` leaves out every directory DssHarness keeps
+// in a tree and keeps each one's placeholder — the statement the sweep above relies on.
+TEST(TreeIgnoresGrammar, ThisRepositorysGitignoreLeavesOutEveryDirectoryTheToolKeepsInATree) {
+    auto const root = dss::test::findRepoRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    TreeIgnores const t = dss::test_support::readTreeIgnores(*root);
+    ASSERT_TRUE(t.refusal.empty()) << t.refusal;
+    for (char const* kept : {".worktrees", ".orchestrators", ".mutations", ".legs"}) {
+        EXPECT_FALSE(t.leavesOut(std::string(kept) + "/x", true).empty()) << kept << " is walked";
+        EXPECT_EQ(t.leavesOut(std::string(kept) + "/.gitkeep", false), "") << kept << "'s placeholder is left out";
+    }
 }
 
 // `.` and `..` are NAVIGATION components, not filenames — no directory listing

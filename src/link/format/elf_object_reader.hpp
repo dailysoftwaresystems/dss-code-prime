@@ -38,20 +38,27 @@
 //     `.text.<fn>` / `.rodata.str1.1` / `.data.rel.ro.local` / TLS
 //     `.tdata`/`.tbss` body is recovered, never silently dropped.
 //   * SHN_UNDEF symbols become `externImports` (the mangled name is the
-//     symbol name). `isData` is seeded from the symtab type (STT_FUNC ->
-//     false, STT_OBJECT -> true, STT_NOTYPE -> data by default) and forced
-//     to false (function) when a reloc carrying one of the format's DECLARED
-//     call signals targets it -- the x86_64 PLT-variant native id
-//     (`pltNativeId`) AND any row declared `"isCall": true` (aarch64 CALL26)
-//     (agnostic; no hardcoded reloc number, and no inference from the
-//     target's arithmetic formula -- D-LK-MACHO-ISDATA-NO-CALL-SIGNAL). This
-//     correctly types an address-taken extern FUNCTION (called AND
-//     `&fn`-referenced) and every aarch64 extern call (aarch64 declares no
-//     PLT-variant id).
+//     symbol name). The code-vs-data kind is what the object STATES: the
+//     symtab type for a typed symbol (STT_FUNC -> function, any other type
+//     -> datum), and a reloc carrying one of the format's DECLARED call
+//     signals -- every row declared `"isCall": true` (x86_64 PLT32 since
+//     P69, aarch64 CALL26) -- makes the row a stated function (agnostic; no
+//     hardcoded reloc number, and no inference from the target's arithmetic
+//     formula -- D-LK-MACHO-ISDATA-NO-CALL-SIGNAL). An STT_NOTYPE symbol no
+//     call names states nothing, so its row is `ExternKindOrigin::Pending`
+//     and its DEFINITION decides, as ld takes it (since P69,
+//     D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA; it was seeded DATA before).
+//     This types an address-taken extern FUNCTION (called AND
+//     `&fn`-referenced), every aarch64 extern call, and a member that reaches
+//     a library function only through the GOT.
+//   * SHN_COMMON symbols (a tentative definition under -fcommon) become
+//     COMMON rows (`ExternImport::commonSize`, its alignment from
+//     `st_value`), which the link allocates once per name (P69,
+//     D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
 //   * each RELA entry becomes a `Relocation{offset, target, kind,
 //     addend}`: the ELF `r_type` (the low 32 bits of r_info) is mapped
 //     back to the universal `RelocationKind` through the format schema's
-//     `nativeId`/`pltNativeId` rows, and the psABI `r_addend` has the
+//     `nativeId` rows, and the psABI `r_addend` has the
 //     target schema's `addendBias` UN-BAKED (subtracted) so the
 //     reconstructed `Relocation::addend` is DSS-native again -- the
 //     inverse of the writer's `rel.addend + addendBias`. Re-emitting the
@@ -97,7 +104,7 @@ namespace dss::elf {
 // structural / bounds / unknown-reloc failure.
 //
 // `objectFormatSchema` supplies the section-name -> SectionKind mapping
-// and the reloc `nativeId`/`pltNativeId` -> RelocationKind reverse map
+// and the reloc `nativeId` -> RelocationKind reverse map
 // (both config-driven -- no hardcoded ELF numbers in the reader beyond
 // the structural record layout the writer also hardcodes). `targetSchema`
 // supplies each reloc kind's `addendBias` for the addend un-bake.

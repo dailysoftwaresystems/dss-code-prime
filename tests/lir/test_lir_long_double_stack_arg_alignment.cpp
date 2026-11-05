@@ -192,6 +192,49 @@ TEST(LongDoubleStackArgAlignment, TheAggregateCapDiffersBetweenSysvAndAapcs64) {
         << "AAPCS64 honours a FUNDAMENTAL type's 16-byte alignment";
 }
 
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET,
+// main's ledger 452): SYSV BEGINS A STACKED AGGREGATE ON ITS OWN ALIGNMENT, UNCAPPED. ✔MEASURED (probe sv cell 0,
+// gcc 13.3.0 and clang 18.1.3, RUN; probe sa after one and two stacked eightbytes): alignment 8, 16, 32, 64 and
+// 256 begin at +8/+16/+32/+64/+256 after one stacked eightbyte and +16/+16/+32/+64/+256 after two. The
+// convention states it as `own` (StackArgPackingRules::AlignmentCap); it stated 16, and a DSS caller put a
+// 32-aligned aggregate 16 bytes before where a gcc or clang callee reads it. CONTROLS: AAPCS64 clamps a
+// composite at the slot (measured), Win64 declares no cap.
+TEST(LongDoubleStackArgAlignment, SysVBeginsAStackedAggregateOnItsOwnAlignmentUncapped) {
+    auto const x86 = loadCc("x86_64", "sysv_amd64");
+    auto const arm = loadCc("arm64", "aapcs64");
+    auto const win = loadCc("x86_64", "ms_x64");
+    ASSERT_NE(x86.cc, nullptr);
+    ASSERT_NE(arm.cc, nullptr);
+    ASSERT_NE(win.cc, nullptr);
+    EXPECT_EQ(x86.cc->stackArgPacking.maxAggregateAlignment.kind,
+              StackArgPackingRules::AlignmentCap::Kind::Own);
+    struct Cell {
+        std::uint32_t align;
+        std::uint32_t afterOne;
+        std::uint32_t afterTwo;
+    };
+    for (Cell const c : {Cell{8, 8, 16}, Cell{16, 16, 16}, Cell{32, 32, 32}, Cell{64, 64, 64},
+                         Cell{256, 256, 256}}) {
+        StackArgCursor one{*x86.cc, kSlot};
+        (void)one.placeNamedScalar(kSlot);
+        EXPECT_EQ(one.placeNamedAggregate(/*aggBytes=*/c.align < 32 ? 32 : c.align, c.align), c.afterOne)
+            << "SysV, alignment " << c.align << " after one stacked eightbyte";
+        StackArgCursor two{*x86.cc, kSlot};
+        (void)two.placeNamedScalar(kSlot);
+        (void)two.placeNamedScalar(kSlot);
+        EXPECT_EQ(two.placeNamedAggregate(/*aggBytes=*/c.align < 32 ? 32 : c.align, c.align), c.afterTwo)
+            << "SysV, alignment " << c.align << " after two stacked eightbytes";
+        StackArgCursor onArm{*arm.cc, kSlot};
+        (void)onArm.placeNamedScalar(kSlot);
+        EXPECT_EQ(onArm.placeNamedAggregate(/*aggBytes=*/16, c.align), 8u)
+            << "AAPCS64 clamps a composite at the slot, alignment " << c.align;
+        StackArgCursor onWin{*win.cc, kSlot};
+        (void)onWin.placeNamedScalar(kSlot);
+        EXPECT_EQ(onWin.placeNamedAggregate(/*aggBytes=*/8, c.align), kSlot)
+            << "Win64 declares no cap, alignment " << c.align;
+    }
+}
+
 // ── (D) AN UNDECLARED CONVENTION IS UNCHANGED ───────────────────────────────
 
 TEST(LongDoubleStackArgAlignment, AnUndeclaredConventionKeepsTheFlatStride) {
@@ -201,8 +244,11 @@ TEST(LongDoubleStackArgAlignment, AnUndeclaredConventionKeepsTheFlatStride) {
     // "every other target is byte-identical" claim structural.
     auto const t = loadCc("x86_64", "ms_x64");
     ASSERT_NE(t.cc, nullptr);
-    EXPECT_EQ(t.cc->stackArgPacking.maxScalarAlignment, 0u);
-    EXPECT_EQ(t.cc->stackArgPacking.maxAggregateAlignment, 0u);
+    using Cap = StackArgPackingRules::AlignmentCap;
+    EXPECT_EQ(t.cc->stackArgPacking.maxScalarAlignment.kind, Cap::Kind::Bytes);
+    EXPECT_EQ(t.cc->stackArgPacking.maxScalarAlignment.bytes, 0u);
+    EXPECT_EQ(t.cc->stackArgPacking.maxAggregateAlignment.kind, Cap::Kind::Bytes);
+    EXPECT_EQ(t.cc->stackArgPacking.maxAggregateAlignment.bytes, 0u);
 
     for (std::uint32_t align : {0u, 1u, 2u, 4u, 8u, 16u, 32u}) {
         StackArgCursor c{*t.cc, kSlot};

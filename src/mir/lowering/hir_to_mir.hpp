@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -65,6 +66,41 @@ struct DSS_EXPORT HirToMirResult {
 // reads the schema(s) and passes the resolved policy in; multi-language
 // CUs conservatively AND each schema's knob (any `false` ⇒ module-wide
 // `false`) until per-Global routing lands in plan 20.
+
+// WHAT `lowerToMir` IS TOLD ABOUT THE ID SPACE THE UNIT'S SYMBOLS WERE NUMBERED IN —
+// the statement the lowered module's symbol-id end is made from
+// (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE). It is one of two things, and
+// each caller says which; there is no value that means "nobody said".
+// Made ONLY by its two factories (P69, lane `cs`, fold f26b): the constructor is
+// private, so `{}`, `{n}` and `optional::emplace()` cannot state an end without saying
+// which of the two statements it is.
+class MirSymbolIdSpace {
+public:
+    // The unit was analysed against a NAME TABLE that ends at `tableEnd` — the driver's
+    // case (`model.symbols().size()`). Every id the module mints is past it, so none is
+    // a record of the table: the table holds typedefs, tags, fields, locals and injected
+    // constants beside the functions and objects MIR sees, and the whole-program merge
+    // maps a MIR symbol to a NAME through it (c86, D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS:
+    // a synthetic literal global whose id was a typedef's record entered the merge as a
+    // NAMED strong definition).
+    [[nodiscard]] static constexpr MirSymbolIdSpace endingAt(std::uint32_t tableEnd) noexcept {
+        return MirSymbolIdSpace{tableEnd};
+    }
+    // The unit IS its own table: nothing stands beside it (HIR built by hand or read
+    // from text, lowered with no semantic model). The module's end is then one past the
+    // highest symbol the unit holds — its functions, objects and imports.
+    [[nodiscard]] static constexpr MirSymbolIdSpace unitIsItsOwnTable() noexcept {
+        return MirSymbolIdSpace{0};
+    }
+    // The end to state: the table's, or 0 where the unit's own symbols are all there is
+    // (the builder's end is never below a symbol the module holds or was kept clear of).
+    [[nodiscard]] constexpr std::uint32_t statedEnd() const noexcept { return statedEnd_; }
+
+private:
+    explicit constexpr MirSymbolIdSpace(std::uint32_t end) noexcept : statedEnd_{end} {}
+    std::uint32_t statedEnd_;
+};
+
 struct DSS_EXPORT MirLoweringConfig {
     bool globalsAllowFloat = true;
     // P68 round 13 (lane `cs`, the static-initializer item): the constant forms beyond
@@ -133,17 +169,19 @@ struct DSS_EXPORT MirLoweringConfig {
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the active CC's by-value aggregate
     // classification strategy + max-register-bytes, threaded from the resolved
     // `TargetCallingConvention` (the §B-locked HIR→MIR boundary, mirroring how
-    // `dataModel` is threaded). `aggregateClassification == None` (default) ⇒ the
+    // `dataModel` is threaded). `aggregate.classification == None` (default) ⇒ the
     // by-value guard stays FAIL-LOUD (no CC / unsupported strategy). When the
     // strategy is implemented (`aggregateAbiImplemented`), HIR→MIR classifies a
     // struct arg/return via the `aggregate_abi` engine and synthesizes pieces /
     // a hidden sret pointer. `aggregateSretViaHiddenArg` = the CC has NO
     // indirect-result register (SysV/Win64 ⇒ sret ptr is a hidden first INTEGER
     // arg; AAPCS64's x8 path is false, C3).
-    AggregateClassKind aggregateClassification   = AggregateClassKind::None;
-    std::uint16_t      aggregateMaxRegBytes       = 0;
+    // The convention's by-value aggregate rules, taken WHOLE from the resolved `TargetCallingConvention`
+    // (`AggregateConventionRules`, aggregate_layout.hpp: the strategy, the register-size bound, the stack-
+    // exhaust policy, the MEMORY-class argument carrier and the X87UP rule; P69 lane `cs`, fold f26c,
+    // main's ledger 455 -- they were copied one field at a time).
+    AggregateConventionRules aggregate{};
     bool               aggregateSretViaHiddenArg  = true;
-
     // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the active CC's `slotAligned` flag.
     // When false (SysV/AAPCS64 — INDEPENDENT counters) the param `Arg` payload is
     // the PER-CLASS physical register ordinal (GPR/FPR counted separately); when
@@ -161,14 +199,13 @@ struct DSS_EXPORT MirLoweringConfig {
     // `argGprCount`/`argFprCount` are the agnostic source for the all-or-nothing
     // register-exhaustion check on EVERY call (the variadic-only `vaListLayout`
     // save-counts coincide for the shipped CCs but are the wrong semantic source
-    // for a non-variadic call). `aggregateStackExhaustsRegisters` decides what
+    // for a non-variadic call). `aggregate.stackExhaustsRegisters` decides what
     // happens to the overflowed class once a by-value aggregate is placed wholly
     // on the stack: false ⇒ BACKFILL (SysV — cursor not advanced); true ⇒ EXHAUST
     // (AAPCS64 — cursor clamped to the pool). 0/false defaults preserve the
     // pre-FC12 behavior (no by-value aggregate ⇒ the check never fires).
     std::uint32_t      argGprCount                = 0;
     std::uint32_t      argFprCount                = 0;
-    bool               aggregateStackExhaustsRegisters = false;
 
     // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the active CC's
     // stacked-argument packing rules, threaded from the resolved
@@ -194,25 +231,37 @@ struct DSS_EXPORT MirLoweringConfig {
     // has_value() guard mirrors `variadicVectorCountReg.has_value()`.
     std::optional<VaListLayout> vaListLayout;
 
-    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the FIRST SymbolId value the
-    // synthetic-global minter (`mintSyntheticGlobalSymbol` — string/float
-    // literal promotion, jump tables, FP sign masks) may use. The pipeline
-    // passes the SEMANTIC SYMBOL TABLE's END (`model.symbols().size()`), so a
-    // synthetic id can NEVER alias a semantic record: the minter's own scan
-    // covers only MIR-VISIBLE symbols (functions/globals/externs), but the
-    // semantic table also holds typedefs, tags, fields, locals, and injected
-    // constants — and the LK11 whole-program merge maps every MIR symbol to a
-    // NAME through that table (`nameOf` → `recordFor`). Pre-fix, a per-CU
-    // synthetic literal global whose id landed on (say) the `sqlite3_stmt`
-    // TYPEDEF record entered the merge as a NAMED STRONG GLOBAL DEFINITION —
-    // two CUs doing the same produced bogus K_SymbolRedefinedAcrossUnits
-    // (witnessed: the c86 sqlite3.c+shell.c probe's five opaque-tag
-    // collisions), and an alias onto a record whose name a sibling CU
-    // genuinely defines would MIS-MERGE references onto an anonymous string
-    // literal (a silent miscompile class). Default 0 = the pre-fix seeding
-    // (test fixtures / golden-MIR stability — their single-CU output never
-    // consults names).
-    std::uint32_t syntheticSymbolFloor = 0;
+    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): where the id space the unit was
+    // analysed in ENDS — the first SymbolId value a symbol synthesized for the
+    // module may take. The pipeline says `MirSymbolIdSpace::endingAt(the semantic
+    // symbol table's end)`, so a synthetic id can NEVER alias a semantic record
+    // (pre-fix, a per-CU synthetic literal global whose id landed on the
+    // `sqlite3_stmt` TYPEDEF record entered the LK11 merge as a NAMED STRONG GLOBAL
+    // DEFINITION — two CUs doing the same produced bogus
+    // K_SymbolRedefinedAcrossUnits, witnessed on the c86 sqlite3.c+shell.c probe's
+    // five opaque-tag collisions — and an alias onto a record whose name a sibling
+    // CU genuinely defines would MIS-MERGE references onto an anonymous string
+    // literal, a silent miscompile class).
+    //
+    // ★ READ BY ONE STATEMENT (P69 round 5): `lowerToMir` states it to the
+    // module's builder (`MirBuilder::stateSymbolIdEnd`) when the module is made,
+    // and the MODULE carries it from there (`Mir::symbolIdEnd`) through every
+    // rebuild. This tier's own minter, mem2reg's zero constant and the three
+    // synthesis passes all ask the module (`MirBuilder::mintSymbol`); none is
+    // handed this number, so none can be handed a wrong one. Until then four
+    // callers each carried it separately and the optimizer's minter had none.
+    //
+    // ★ ABSENT = NOBODY SAID, AND THE MODULE THEN STATES NOTHING. This was a plain
+    // number defaulting to 0, and `lowerToMir` stated it whatever it was — so the
+    // one entrance where forgetting the statement is a DEFAULT ARGUMENT was also
+    // the one the door could not hear: a caller that passed no table got a module
+    // whose counted end read as stated, and its first mint was handed out in
+    // silence where the door refuses every other unstated module by name. Now a
+    // caller that says nothing gets a module whose end is only counted, and the
+    // first id anything mints for it is refused — INSIDE this lowering too, which
+    // mints a symbol for a string literal. A fixture that lowers hand-built HIR
+    // says `MirSymbolIdSpace::unitIsItsOwnTable()`; it does not get it by silence.
+    std::optional<MirSymbolIdSpace> symbolIdSpace;
 };
 
 class GrammarSchema;
@@ -428,6 +477,20 @@ lowerToMir(Hir const&               hir,
            // this row, because a per-function label ordinal cannot be resolved
            // without knowing its function. Every OTHER initializer is unaffected, so
            // a map-free test fixture keeps working exactly as before.
-           HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr);
+           HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr,
+           // P69 (lane `cs`): the unit's symbol aliases (`HirSymbolAlias`, the GNU
+           // `alias("target")` attribute) — each handed to `MirBuilder::addAlias`
+           // once the module's definitions are lowered. Supplied by the one
+           // production caller, the driver (`compile_pipeline.cpp`), as
+           // `CstToHirResult::symbolAliases`. Empty (the default) for a test fixture
+           // that lowers a unit with none.
+           // ⚠ THE DEFAULT IS NO SAFE ANSWER FOR A UNIT THAT HAS ONE. An alias left
+           // out is a name the module does not define: an external alias's uses stay
+           // a reference row of its name, which the link refuses as undefined when
+           // the alias is strong — and binds to NOTHING (address 0, the image faulting
+           // where it is read) when it is weak, a weak reference no definition
+           // answers. So every caller lowering a unit the front end produced passes
+           // the table; the default exists for the fixture calls that predate it.
+           std::span<HirSymbolAlias const> symbolAliases = {});
 
 } // namespace dss

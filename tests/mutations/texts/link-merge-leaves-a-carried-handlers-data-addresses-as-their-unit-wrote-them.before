@@ -1,0 +1,1 @@
+                retargetRelocs(i, out.languageHandler->relocations);

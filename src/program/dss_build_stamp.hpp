@@ -34,10 +34,20 @@
 // docblock is where the reasoning lives and this one does not restate it.
 // Shapes, for orientation only:
 //
-//     0.0.2                                   clean tree, git present
-//     0.0.2+g4095c13b2f1a                      …and the commit it came from
-//     0.0.2+g4095c13b2f1a.dirty9f2c1b0d7e4a3d56 …plus a digest of the DIRT
-//     0.0.2+nogit20260817T091455Z.7            no git, or no work tree
+//     0.0.2+g4095c13b2f1a                      a work tree whose inputs match HEAD
+//     0.0.2+g4095c13b2f1a.dirty9f2c1b0d7e4a3d56 …plus a digest of the inputs' DIRT
+//     0.0.2+src5d1e07c3a9b24f68                no git, or no work tree: the inputs' CONTENT
+//     <any of the three>.deps3c0a9e6b1f2d4a57  …plus a digest of the dependency SOURCES
+//                                              the build was HANDED instead of fetching
+//
+// "The inputs" are what the top-level CMakeLists declares the compiler is built
+// from (`DSS_BUILD_STAMP_INPUTS`, `DSS_BUILD_STAMP_SCRIPT_DIRS`), less the
+// harness records `DSS_BUILD_STAMP_RECORDS` names. A dependency the build FETCHES
+// is named by its pin in that same file; one it is handed
+// (`FETCHCONTENT_SOURCE_DIR_<NAME>`) is whatever bytes stood in the directory, and
+// the `.deps` component is their digest. So the longest stamp is the second shape
+// with that component: 62 characters, which the runtime object cache's Windows
+// path budget is measured against (`RuntimeObjectCachePathBudget`).
 //
 // ── WHO ASKS, AND WHY IT MATTERS THAT NOBODY ELSE DOES ──────────────────────
 // The runtime object cache (`runtime_object_cache.hpp`) keys a compiled
@@ -46,8 +56,8 @@
 // entry. That cache is the intended sole consumer.
 //
 // ⚠⚠ DO NOT INCLUDE THIS FROM A WIDELY-INCLUDED HEADER. The generated header
-// changes on every dirty edit, so EVERY translation unit that reaches this one
-// recompiles on every dirty edit. Reaching it is opt-in at the build level —
+// changes on every edit of the compiler's inputs, so EVERY translation unit that
+// reaches this one recompiles on every such edit. Reaching it is opt-in at the build level —
 // a target sees it only after `dss_use_build_stamp(<target>)` in CMake — and
 // that gate exists precisely so this cannot spread by an ordinary `#include`
 // added in passing. Adding a second includer is a review-stop, not a

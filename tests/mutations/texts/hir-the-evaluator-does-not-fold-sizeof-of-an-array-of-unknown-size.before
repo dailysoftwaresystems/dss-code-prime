@@ -1,0 +1,1 @@
+        if (!alignment && sem.sizeofIncompleteArraySize.has_value()

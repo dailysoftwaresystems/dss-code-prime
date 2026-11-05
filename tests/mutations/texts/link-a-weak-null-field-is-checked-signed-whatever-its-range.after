@@ -1,0 +1,1 @@
+        if (std::string range; width < 8 && !fitsSigned(value, 8u * width)) {

@@ -1,0 +1,1 @@
+the POINTER is aligned: gcc gives 8 / 16 with a 4-aligned pointee

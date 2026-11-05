@@ -1,0 +1,1 @@
+            if (e->target == "Assign") { return std::nullopt; }   // `=` and `OP=`

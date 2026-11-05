@@ -1,0 +1,2 @@
+if(_dss_handed)
+    list(SORT _dss_handed)

@@ -1,0 +1,1 @@
+    if ((gs[0] & phase) != 0) checkFrameCookie(gs, (ULONG_PTR)establisherFrame, dispatch);

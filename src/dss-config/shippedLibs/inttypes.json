@@ -1,27 +1,1364 @@
 {
-  "$comment": "TF-C66 (D-FFI-SHIPPED-LIBS-OS-ONLY testfixture recipe): C99 <inttypes.h> — an OS/libc surface, so it legitimately ships a descriptor. NEED-DRIVEN (the tcl.json growth discipline): it models four format macros — PRIi64, PRIu32, PRIi32 and PRIu64 — and none of the imax*/strto*max functions or intmax_t; examples/c/inttypes_format_macros runs them. ⓘ This comment used to say the sqlite full-source testfixture TU set uses exactly those four (PRIi64 x6 / PRIu32 x2 / PRIi32 x2 / PRIu64 x1), citing wal.c's \"%.3x:%\" PRIi64 adjacent-string concat. ✔MEASURED 2026-09-24 over sqlite f544d3599a10: no file under src/ spells PRIi64, nor has one in the clone's whole history; the four macros' only uses in src/ and ext/ are ext/wasm/libcmpp.c's (x5/x2/x1/x1 — a wasm build tool, not a testfixture TU); and nothing there spells an SCN* macro, an imax*/strto*max function or intmax_t. The header itself is live: sqliteInt.h includes it under `#ifdef HAVE_INTTYPES_H`, which the configure-produced sqlite_cfg.h defines to 1. Each replacement is a STRING-LITERAL FRAGMENT (quotes INCLUDED — the TCL_VERSION \"8.6\" precedent) that adjacent-string-concats into the caller's format string. ★ The 64-bit prefixes are #47-class PER-FORMAT divergent: glibc LP64 defines int64_t as `long` -> PRI[iu]64 = \"l\"-prefix; Apple arm64 and Windows LLP64 define int64_t as `long long` -> \"ll\"-prefix. A wrong prefix is a SILENT printf ABI mismatch at runtime (varargs reads the wrong width), so the per-format `variants` arms are load-bearing, not cosmetic. The 32-bit pair is `int` everywhere -> flat. C99 7.8p1: <inttypes.h> includes <stdint.h> — the `includes` closure mirrors that so int64_t/uint32_t resolve wherever only <inttypes.h> is spelled.",
+  "$comment": "C 7.8 <inttypes.h> — an OS/libc surface. ★ P69 (lane lm, D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS): the WHOLE header — every PRI/SCN macro for the 8/16/32/64-bit, LEAST, FAST, MAX and PTR widths, C23's binary ones, imaxdiv_t, and imaxabs, imaxdiv, strtoimax, strtoumax, wcstoimax and wcstoumax. It shipped four macros (PRIi64, PRIu64, PRIi32, PRIu32) with their modifiers RESTATED per format (TF-C66, need-driven for the sqlite testfixture); each is now an alias of the type-format predefine, so no modifier is stated here at all. ✔MEASURED: ucrtbase.dll exports all six functions (its export table: imaxabs 2231, imaxdiv 2232, strtoimax 2405, strtoumax 2413, wcstoimax 2465, wcstoumax 2475), Apple clang 21 binds the plain names on both arches, and glibc 2.39 under C23 binds the four conversions to their C23 entry points `__isoc23_<name>` @GLIBC_2.38 (the load floor and the other ten names: stdlib.json's `$isoc23EntryPointsComment`). imaxabs/imaxdiv are each C library's own. The four conversions are C23's on every pair: glibc's own entry points on elf; on pe and macho, whose libraries answer strtoimax(\"0b101\", 0, 0) with 0, DSS's `__dss_isoc23_<name>` (runtime/platform/src/inttypes.c, E1 of P69: the `0b` subject converted there, every other input handed WHOLE to the platform's own export through the private `__dss_platform_<name>` rows). imaxdiv_t is {quot, rem} of intmax_t — `long` on glibc and Apple (16 bytes, align 8, ✔ Apple run), `long long` on the UCRT; its tag `_imaxdiv_t` is DSS's (glibc and Apple leave it anonymous, the UCRT spells `_Lldiv_t` — a reserved name, so naming it is acceptance, never a program's meaning; the stdlib.json div_t precedent). wcstoimax/wcstoumax take the pair's own wchar_t — the target's ABI typedef, as stddef.json realizes it (int on x86_64 ELF and Darwin, unsigned int on aarch64 ELF, unsigned short on Windows). C99 7.8p1: <inttypes.h> includes <stdint.h> — the `includes` closure mirrors it.",
   "header": "inttypes.h",
   "standard": "C99",
-  "availableObjectFormats": ["elf", "macho", "pe"],
-  "includes": ["stdint.h"],
+  "availableObjectFormats": [
+    "elf",
+    "macho",
+    "pe"
+  ],
+  "includes": [
+    "stdint.h"
+  ],
+  "library": {
+    "pe": {
+      "role": "cLibrary"
+    },
+    "elf": {
+      "role": "cLibrary"
+    },
+    "macho": {
+      "role": "cLibrary"
+    }
+  },
+  "typedefs": [
+    {
+      "name": "imaxdiv_t",
+      "variants": [
+        {
+          "when": {
+            "dataModel": "LP64",
+            "format": "elf"
+          },
+          "type": "struct \"_imaxdiv_t\" { i64 \"long\", i64 \"long\" }"
+        },
+        {
+          "when": {
+            "dataModel": "LP64",
+            "format": "macho"
+          },
+          "type": "struct \"_imaxdiv_t\" { i64 \"long\", i64 \"long\" }"
+        },
+        {
+          "when": {
+            "dataModel": "LLP64",
+            "format": "pe"
+          },
+          "type": "struct \"_imaxdiv_t\" { i64 \"long long\", i64 \"long long\" }"
+        }
+      ]
+    }
+  ],
+  "structs": [
+    {
+      "name": "_imaxdiv_t",
+      "variants": [
+        {
+          "when": {
+            "format": "elf"
+          },
+          "fields": [
+            {
+              "name": "quot",
+              "type": "i64 \"long\""
+            },
+            {
+              "name": "rem",
+              "type": "i64 \"long\""
+            }
+          ]
+        },
+        {
+          "when": {
+            "format": "macho"
+          },
+          "fields": [
+            {
+              "name": "quot",
+              "type": "i64 \"long\""
+            },
+            {
+              "name": "rem",
+              "type": "i64 \"long\""
+            }
+          ]
+        },
+        {
+          "when": {
+            "format": "pe"
+          },
+          "fields": [
+            {
+              "name": "quot",
+              "type": "i64 \"long long\""
+            },
+            {
+              "name": "rem",
+              "type": "i64 \"long long\""
+            }
+          ]
+        }
+      ]
+    }
+  ],
   "macros": [
     {
+      "$comment": "★ P69 (lane lm, D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS): every PRI/SCN macro is an ALIAS of the `type-format` predefine of its type — `PRId64` expands to `__INT64_FMTd__`, whose value is the length modifier the SHIPPED int64_t has on the pair (\"ld\" where it is `long`, \"lld\" where it is `long long`) — so the macro, the predefine and the typedef a program declares are one fact, stated once (c.lang.json's `typeFormatModifiers`). One spelling serves printf AND scanf: the exact modifier (`\"hhd\"` for int8_t), the one MSVC and Apple spell and every C library's scanf needs.",
+      "name": "PRId8",
+      "replacement": "__INT8_FMTd__"
+    },
+    {
+      "name": "PRIi8",
+      "replacement": "__INT8_FMTi__"
+    },
+    {
+      "name": "PRIo8",
+      "replacement": "__UINT8_FMTo__"
+    },
+    {
+      "name": "PRIu8",
+      "replacement": "__UINT8_FMTu__"
+    },
+    {
+      "name": "PRIx8",
+      "replacement": "__UINT8_FMTx__"
+    },
+    {
+      "name": "PRIX8",
+      "replacement": "__UINT8_FMTX__"
+    },
+    {
+      "name": "PRId16",
+      "replacement": "__INT16_FMTd__"
+    },
+    {
+      "name": "PRIi16",
+      "replacement": "__INT16_FMTi__"
+    },
+    {
+      "name": "PRIo16",
+      "replacement": "__UINT16_FMTo__"
+    },
+    {
+      "name": "PRIu16",
+      "replacement": "__UINT16_FMTu__"
+    },
+    {
+      "name": "PRIx16",
+      "replacement": "__UINT16_FMTx__"
+    },
+    {
+      "name": "PRIX16",
+      "replacement": "__UINT16_FMTX__"
+    },
+    {
+      "name": "PRId32",
+      "replacement": "__INT32_FMTd__"
+    },
+    {
+      "name": "PRIi32",
+      "replacement": "__INT32_FMTi__"
+    },
+    {
+      "name": "PRIo32",
+      "replacement": "__UINT32_FMTo__"
+    },
+    {
+      "name": "PRIu32",
+      "replacement": "__UINT32_FMTu__"
+    },
+    {
+      "name": "PRIx32",
+      "replacement": "__UINT32_FMTx__"
+    },
+    {
+      "name": "PRIX32",
+      "replacement": "__UINT32_FMTX__"
+    },
+    {
+      "name": "PRId64",
+      "replacement": "__INT64_FMTd__"
+    },
+    {
       "name": "PRIi64",
-      "variants": [
-        { "when": { "format": "elf" },   "replacement": "\"li\"" },
-        { "when": { "format": "macho" }, "replacement": "\"lli\"" },
-        { "when": { "format": "pe" },    "replacement": "\"lli\"" }
-      ]
+      "replacement": "__INT64_FMTi__"
+    },
+    {
+      "name": "PRIo64",
+      "replacement": "__UINT64_FMTo__"
     },
     {
       "name": "PRIu64",
-      "variants": [
-        { "when": { "format": "elf" },   "replacement": "\"lu\"" },
-        { "when": { "format": "macho" }, "replacement": "\"llu\"" },
-        { "when": { "format": "pe" },    "replacement": "\"llu\"" }
-      ]
+      "replacement": "__UINT64_FMTu__"
     },
-    { "name": "PRIi32", "replacement": "\"i\"" },
-    { "name": "PRIu32", "replacement": "\"u\"" }
+    {
+      "name": "PRIx64",
+      "replacement": "__UINT64_FMTx__"
+    },
+    {
+      "name": "PRIX64",
+      "replacement": "__UINT64_FMTX__"
+    },
+    {
+      "name": "PRIdLEAST8",
+      "replacement": "__INT_LEAST8_FMTd__"
+    },
+    {
+      "name": "PRIiLEAST8",
+      "replacement": "__INT_LEAST8_FMTi__"
+    },
+    {
+      "name": "PRIoLEAST8",
+      "replacement": "__UINT_LEAST8_FMTo__"
+    },
+    {
+      "name": "PRIuLEAST8",
+      "replacement": "__UINT_LEAST8_FMTu__"
+    },
+    {
+      "name": "PRIxLEAST8",
+      "replacement": "__UINT_LEAST8_FMTx__"
+    },
+    {
+      "name": "PRIXLEAST8",
+      "replacement": "__UINT_LEAST8_FMTX__"
+    },
+    {
+      "name": "PRIdLEAST16",
+      "replacement": "__INT_LEAST16_FMTd__"
+    },
+    {
+      "name": "PRIiLEAST16",
+      "replacement": "__INT_LEAST16_FMTi__"
+    },
+    {
+      "name": "PRIoLEAST16",
+      "replacement": "__UINT_LEAST16_FMTo__"
+    },
+    {
+      "name": "PRIuLEAST16",
+      "replacement": "__UINT_LEAST16_FMTu__"
+    },
+    {
+      "name": "PRIxLEAST16",
+      "replacement": "__UINT_LEAST16_FMTx__"
+    },
+    {
+      "name": "PRIXLEAST16",
+      "replacement": "__UINT_LEAST16_FMTX__"
+    },
+    {
+      "name": "PRIdLEAST32",
+      "replacement": "__INT_LEAST32_FMTd__"
+    },
+    {
+      "name": "PRIiLEAST32",
+      "replacement": "__INT_LEAST32_FMTi__"
+    },
+    {
+      "name": "PRIoLEAST32",
+      "replacement": "__UINT_LEAST32_FMTo__"
+    },
+    {
+      "name": "PRIuLEAST32",
+      "replacement": "__UINT_LEAST32_FMTu__"
+    },
+    {
+      "name": "PRIxLEAST32",
+      "replacement": "__UINT_LEAST32_FMTx__"
+    },
+    {
+      "name": "PRIXLEAST32",
+      "replacement": "__UINT_LEAST32_FMTX__"
+    },
+    {
+      "name": "PRIdLEAST64",
+      "replacement": "__INT_LEAST64_FMTd__"
+    },
+    {
+      "name": "PRIiLEAST64",
+      "replacement": "__INT_LEAST64_FMTi__"
+    },
+    {
+      "name": "PRIoLEAST64",
+      "replacement": "__UINT_LEAST64_FMTo__"
+    },
+    {
+      "name": "PRIuLEAST64",
+      "replacement": "__UINT_LEAST64_FMTu__"
+    },
+    {
+      "name": "PRIxLEAST64",
+      "replacement": "__UINT_LEAST64_FMTx__"
+    },
+    {
+      "name": "PRIXLEAST64",
+      "replacement": "__UINT_LEAST64_FMTX__"
+    },
+    {
+      "name": "PRIdFAST8",
+      "replacement": "__INT_FAST8_FMTd__"
+    },
+    {
+      "name": "PRIiFAST8",
+      "replacement": "__INT_FAST8_FMTi__"
+    },
+    {
+      "name": "PRIoFAST8",
+      "replacement": "__UINT_FAST8_FMTo__"
+    },
+    {
+      "name": "PRIuFAST8",
+      "replacement": "__UINT_FAST8_FMTu__"
+    },
+    {
+      "name": "PRIxFAST8",
+      "replacement": "__UINT_FAST8_FMTx__"
+    },
+    {
+      "name": "PRIXFAST8",
+      "replacement": "__UINT_FAST8_FMTX__"
+    },
+    {
+      "name": "PRIdFAST16",
+      "replacement": "__INT_FAST16_FMTd__"
+    },
+    {
+      "name": "PRIiFAST16",
+      "replacement": "__INT_FAST16_FMTi__"
+    },
+    {
+      "name": "PRIoFAST16",
+      "replacement": "__UINT_FAST16_FMTo__"
+    },
+    {
+      "name": "PRIuFAST16",
+      "replacement": "__UINT_FAST16_FMTu__"
+    },
+    {
+      "name": "PRIxFAST16",
+      "replacement": "__UINT_FAST16_FMTx__"
+    },
+    {
+      "name": "PRIXFAST16",
+      "replacement": "__UINT_FAST16_FMTX__"
+    },
+    {
+      "name": "PRIdFAST32",
+      "replacement": "__INT_FAST32_FMTd__"
+    },
+    {
+      "name": "PRIiFAST32",
+      "replacement": "__INT_FAST32_FMTi__"
+    },
+    {
+      "name": "PRIoFAST32",
+      "replacement": "__UINT_FAST32_FMTo__"
+    },
+    {
+      "name": "PRIuFAST32",
+      "replacement": "__UINT_FAST32_FMTu__"
+    },
+    {
+      "name": "PRIxFAST32",
+      "replacement": "__UINT_FAST32_FMTx__"
+    },
+    {
+      "name": "PRIXFAST32",
+      "replacement": "__UINT_FAST32_FMTX__"
+    },
+    {
+      "name": "PRIdFAST64",
+      "replacement": "__INT_FAST64_FMTd__"
+    },
+    {
+      "name": "PRIiFAST64",
+      "replacement": "__INT_FAST64_FMTi__"
+    },
+    {
+      "name": "PRIoFAST64",
+      "replacement": "__UINT_FAST64_FMTo__"
+    },
+    {
+      "name": "PRIuFAST64",
+      "replacement": "__UINT_FAST64_FMTu__"
+    },
+    {
+      "name": "PRIxFAST64",
+      "replacement": "__UINT_FAST64_FMTx__"
+    },
+    {
+      "name": "PRIXFAST64",
+      "replacement": "__UINT_FAST64_FMTX__"
+    },
+    {
+      "name": "PRIdMAX",
+      "replacement": "__INTMAX_FMTd__"
+    },
+    {
+      "name": "PRIiMAX",
+      "replacement": "__INTMAX_FMTi__"
+    },
+    {
+      "name": "PRIoMAX",
+      "replacement": "__UINTMAX_FMTo__"
+    },
+    {
+      "name": "PRIuMAX",
+      "replacement": "__UINTMAX_FMTu__"
+    },
+    {
+      "name": "PRIxMAX",
+      "replacement": "__UINTMAX_FMTx__"
+    },
+    {
+      "name": "PRIXMAX",
+      "replacement": "__UINTMAX_FMTX__"
+    },
+    {
+      "name": "PRIdPTR",
+      "replacement": "__INTPTR_FMTd__"
+    },
+    {
+      "name": "PRIiPTR",
+      "replacement": "__INTPTR_FMTi__"
+    },
+    {
+      "name": "PRIoPTR",
+      "replacement": "__UINTPTR_FMTo__"
+    },
+    {
+      "name": "PRIuPTR",
+      "replacement": "__UINTPTR_FMTu__"
+    },
+    {
+      "name": "PRIxPTR",
+      "replacement": "__UINTPTR_FMTx__"
+    },
+    {
+      "name": "PRIXPTR",
+      "replacement": "__UINTPTR_FMTX__"
+    },
+    {
+      "name": "SCNd8",
+      "replacement": "__INT8_FMTd__"
+    },
+    {
+      "name": "SCNi8",
+      "replacement": "__INT8_FMTi__"
+    },
+    {
+      "name": "SCNo8",
+      "replacement": "__UINT8_FMTo__"
+    },
+    {
+      "name": "SCNu8",
+      "replacement": "__UINT8_FMTu__"
+    },
+    {
+      "name": "SCNx8",
+      "replacement": "__UINT8_FMTx__"
+    },
+    {
+      "name": "SCNd16",
+      "replacement": "__INT16_FMTd__"
+    },
+    {
+      "name": "SCNi16",
+      "replacement": "__INT16_FMTi__"
+    },
+    {
+      "name": "SCNo16",
+      "replacement": "__UINT16_FMTo__"
+    },
+    {
+      "name": "SCNu16",
+      "replacement": "__UINT16_FMTu__"
+    },
+    {
+      "name": "SCNx16",
+      "replacement": "__UINT16_FMTx__"
+    },
+    {
+      "name": "SCNd32",
+      "replacement": "__INT32_FMTd__"
+    },
+    {
+      "name": "SCNi32",
+      "replacement": "__INT32_FMTi__"
+    },
+    {
+      "name": "SCNo32",
+      "replacement": "__UINT32_FMTo__"
+    },
+    {
+      "name": "SCNu32",
+      "replacement": "__UINT32_FMTu__"
+    },
+    {
+      "name": "SCNx32",
+      "replacement": "__UINT32_FMTx__"
+    },
+    {
+      "name": "SCNd64",
+      "replacement": "__INT64_FMTd__"
+    },
+    {
+      "name": "SCNi64",
+      "replacement": "__INT64_FMTi__"
+    },
+    {
+      "name": "SCNo64",
+      "replacement": "__UINT64_FMTo__"
+    },
+    {
+      "name": "SCNu64",
+      "replacement": "__UINT64_FMTu__"
+    },
+    {
+      "name": "SCNx64",
+      "replacement": "__UINT64_FMTx__"
+    },
+    {
+      "name": "SCNdLEAST8",
+      "replacement": "__INT_LEAST8_FMTd__"
+    },
+    {
+      "name": "SCNiLEAST8",
+      "replacement": "__INT_LEAST8_FMTi__"
+    },
+    {
+      "name": "SCNoLEAST8",
+      "replacement": "__UINT_LEAST8_FMTo__"
+    },
+    {
+      "name": "SCNuLEAST8",
+      "replacement": "__UINT_LEAST8_FMTu__"
+    },
+    {
+      "name": "SCNxLEAST8",
+      "replacement": "__UINT_LEAST8_FMTx__"
+    },
+    {
+      "name": "SCNdLEAST16",
+      "replacement": "__INT_LEAST16_FMTd__"
+    },
+    {
+      "name": "SCNiLEAST16",
+      "replacement": "__INT_LEAST16_FMTi__"
+    },
+    {
+      "name": "SCNoLEAST16",
+      "replacement": "__UINT_LEAST16_FMTo__"
+    },
+    {
+      "name": "SCNuLEAST16",
+      "replacement": "__UINT_LEAST16_FMTu__"
+    },
+    {
+      "name": "SCNxLEAST16",
+      "replacement": "__UINT_LEAST16_FMTx__"
+    },
+    {
+      "name": "SCNdLEAST32",
+      "replacement": "__INT_LEAST32_FMTd__"
+    },
+    {
+      "name": "SCNiLEAST32",
+      "replacement": "__INT_LEAST32_FMTi__"
+    },
+    {
+      "name": "SCNoLEAST32",
+      "replacement": "__UINT_LEAST32_FMTo__"
+    },
+    {
+      "name": "SCNuLEAST32",
+      "replacement": "__UINT_LEAST32_FMTu__"
+    },
+    {
+      "name": "SCNxLEAST32",
+      "replacement": "__UINT_LEAST32_FMTx__"
+    },
+    {
+      "name": "SCNdLEAST64",
+      "replacement": "__INT_LEAST64_FMTd__"
+    },
+    {
+      "name": "SCNiLEAST64",
+      "replacement": "__INT_LEAST64_FMTi__"
+    },
+    {
+      "name": "SCNoLEAST64",
+      "replacement": "__UINT_LEAST64_FMTo__"
+    },
+    {
+      "name": "SCNuLEAST64",
+      "replacement": "__UINT_LEAST64_FMTu__"
+    },
+    {
+      "name": "SCNxLEAST64",
+      "replacement": "__UINT_LEAST64_FMTx__"
+    },
+    {
+      "name": "SCNdFAST8",
+      "replacement": "__INT_FAST8_FMTd__"
+    },
+    {
+      "name": "SCNiFAST8",
+      "replacement": "__INT_FAST8_FMTi__"
+    },
+    {
+      "name": "SCNoFAST8",
+      "replacement": "__UINT_FAST8_FMTo__"
+    },
+    {
+      "name": "SCNuFAST8",
+      "replacement": "__UINT_FAST8_FMTu__"
+    },
+    {
+      "name": "SCNxFAST8",
+      "replacement": "__UINT_FAST8_FMTx__"
+    },
+    {
+      "name": "SCNdFAST16",
+      "replacement": "__INT_FAST16_FMTd__"
+    },
+    {
+      "name": "SCNiFAST16",
+      "replacement": "__INT_FAST16_FMTi__"
+    },
+    {
+      "name": "SCNoFAST16",
+      "replacement": "__UINT_FAST16_FMTo__"
+    },
+    {
+      "name": "SCNuFAST16",
+      "replacement": "__UINT_FAST16_FMTu__"
+    },
+    {
+      "name": "SCNxFAST16",
+      "replacement": "__UINT_FAST16_FMTx__"
+    },
+    {
+      "name": "SCNdFAST32",
+      "replacement": "__INT_FAST32_FMTd__"
+    },
+    {
+      "name": "SCNiFAST32",
+      "replacement": "__INT_FAST32_FMTi__"
+    },
+    {
+      "name": "SCNoFAST32",
+      "replacement": "__UINT_FAST32_FMTo__"
+    },
+    {
+      "name": "SCNuFAST32",
+      "replacement": "__UINT_FAST32_FMTu__"
+    },
+    {
+      "name": "SCNxFAST32",
+      "replacement": "__UINT_FAST32_FMTx__"
+    },
+    {
+      "name": "SCNdFAST64",
+      "replacement": "__INT_FAST64_FMTd__"
+    },
+    {
+      "name": "SCNiFAST64",
+      "replacement": "__INT_FAST64_FMTi__"
+    },
+    {
+      "name": "SCNoFAST64",
+      "replacement": "__UINT_FAST64_FMTo__"
+    },
+    {
+      "name": "SCNuFAST64",
+      "replacement": "__UINT_FAST64_FMTu__"
+    },
+    {
+      "name": "SCNxFAST64",
+      "replacement": "__UINT_FAST64_FMTx__"
+    },
+    {
+      "name": "SCNdMAX",
+      "replacement": "__INTMAX_FMTd__"
+    },
+    {
+      "name": "SCNiMAX",
+      "replacement": "__INTMAX_FMTi__"
+    },
+    {
+      "name": "SCNoMAX",
+      "replacement": "__UINTMAX_FMTo__"
+    },
+    {
+      "name": "SCNuMAX",
+      "replacement": "__UINTMAX_FMTu__"
+    },
+    {
+      "name": "SCNxMAX",
+      "replacement": "__UINTMAX_FMTx__"
+    },
+    {
+      "name": "SCNdPTR",
+      "replacement": "__INTPTR_FMTd__"
+    },
+    {
+      "name": "SCNiPTR",
+      "replacement": "__INTPTR_FMTi__"
+    },
+    {
+      "name": "SCNoPTR",
+      "replacement": "__UINTPTR_FMTo__"
+    },
+    {
+      "name": "SCNuPTR",
+      "replacement": "__UINTPTR_FMTu__"
+    },
+    {
+      "name": "SCNxPTR",
+      "replacement": "__UINTPTR_FMTx__"
+    },
+    {
+      "$comment": "★ P69: C23's binary conversions (7.8.1: PRIbN … PRIBPTR, SCNbN … SCNbPTR) on EVERY pair: glibc 2.39's printf renders %b/%B and its C23 scanf entry points (__isoc23_*) read %b (✔MEASURED); on the UCRT and libSystem, which print a literal \"b\" (MSVC 19.51, mingw-w64 13.2.0, Apple clang 21), DSS's own C23 conversion layer (runtime/platform/src/stdio.c, D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM) renders and reads them — examples/c/c23_formatted_io round-trips PRIb32 / PRIB8 / PRIbMAX / SCNb32 on all five pairs.",
+      "name": "PRIb8",
+      "replacement": "__UINT8_FMTb__"
+    },
+    {
+      "name": "PRIB8",
+      "replacement": "__UINT8_FMTB__"
+    },
+    {
+      "name": "PRIb16",
+      "replacement": "__UINT16_FMTb__"
+    },
+    {
+      "name": "PRIB16",
+      "replacement": "__UINT16_FMTB__"
+    },
+    {
+      "name": "PRIb32",
+      "replacement": "__UINT32_FMTb__"
+    },
+    {
+      "name": "PRIB32",
+      "replacement": "__UINT32_FMTB__"
+    },
+    {
+      "name": "PRIb64",
+      "replacement": "__UINT64_FMTb__"
+    },
+    {
+      "name": "PRIB64",
+      "replacement": "__UINT64_FMTB__"
+    },
+    {
+      "name": "PRIbLEAST8",
+      "replacement": "__UINT_LEAST8_FMTb__"
+    },
+    {
+      "name": "PRIBLEAST8",
+      "replacement": "__UINT_LEAST8_FMTB__"
+    },
+    {
+      "name": "PRIbLEAST16",
+      "replacement": "__UINT_LEAST16_FMTb__"
+    },
+    {
+      "name": "PRIBLEAST16",
+      "replacement": "__UINT_LEAST16_FMTB__"
+    },
+    {
+      "name": "PRIbLEAST32",
+      "replacement": "__UINT_LEAST32_FMTb__"
+    },
+    {
+      "name": "PRIBLEAST32",
+      "replacement": "__UINT_LEAST32_FMTB__"
+    },
+    {
+      "name": "PRIbLEAST64",
+      "replacement": "__UINT_LEAST64_FMTb__"
+    },
+    {
+      "name": "PRIBLEAST64",
+      "replacement": "__UINT_LEAST64_FMTB__"
+    },
+    {
+      "name": "PRIbFAST8",
+      "replacement": "__UINT_FAST8_FMTb__"
+    },
+    {
+      "name": "PRIBFAST8",
+      "replacement": "__UINT_FAST8_FMTB__"
+    },
+    {
+      "name": "PRIbFAST16",
+      "replacement": "__UINT_FAST16_FMTb__"
+    },
+    {
+      "name": "PRIBFAST16",
+      "replacement": "__UINT_FAST16_FMTB__"
+    },
+    {
+      "name": "PRIbFAST32",
+      "replacement": "__UINT_FAST32_FMTb__"
+    },
+    {
+      "name": "PRIBFAST32",
+      "replacement": "__UINT_FAST32_FMTB__"
+    },
+    {
+      "name": "PRIbFAST64",
+      "replacement": "__UINT_FAST64_FMTb__"
+    },
+    {
+      "name": "PRIBFAST64",
+      "replacement": "__UINT_FAST64_FMTB__"
+    },
+    {
+      "name": "PRIbMAX",
+      "replacement": "__UINTMAX_FMTb__"
+    },
+    {
+      "name": "PRIBMAX",
+      "replacement": "__UINTMAX_FMTB__"
+    },
+    {
+      "name": "PRIbPTR",
+      "replacement": "__UINTPTR_FMTb__"
+    },
+    {
+      "name": "PRIBPTR",
+      "replacement": "__UINTPTR_FMTB__"
+    },
+    {
+      "name": "SCNb8",
+      "replacement": "__UINT8_FMTb__"
+    },
+    {
+      "name": "SCNb16",
+      "replacement": "__UINT16_FMTb__"
+    },
+    {
+      "name": "SCNb32",
+      "replacement": "__UINT32_FMTb__"
+    },
+    {
+      "name": "SCNb64",
+      "replacement": "__UINT64_FMTb__"
+    },
+    {
+      "name": "SCNbLEAST8",
+      "replacement": "__UINT_LEAST8_FMTb__"
+    },
+    {
+      "name": "SCNbLEAST16",
+      "replacement": "__UINT_LEAST16_FMTb__"
+    },
+    {
+      "name": "SCNbLEAST32",
+      "replacement": "__UINT_LEAST32_FMTb__"
+    },
+    {
+      "name": "SCNbLEAST64",
+      "replacement": "__UINT_LEAST64_FMTb__"
+    },
+    {
+      "name": "SCNbFAST8",
+      "replacement": "__UINT_FAST8_FMTb__"
+    },
+    {
+      "name": "SCNbFAST16",
+      "replacement": "__UINT_FAST16_FMTb__"
+    },
+    {
+      "name": "SCNbFAST32",
+      "replacement": "__UINT_FAST32_FMTb__"
+    },
+    {
+      "name": "SCNbFAST64",
+      "replacement": "__UINT_FAST64_FMTb__"
+    },
+    {
+      "name": "SCNbMAX",
+      "replacement": "__UINTMAX_FMTb__"
+    },
+    {
+      "name": "SCNbPTR",
+      "replacement": "__UINTPTR_FMTb__"
+    }
+  ],
+  "symbols": [
+    {
+      "name": "imaxabs",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf"
+            },
+            "value": "fn(i64 \"long\") -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "macho"
+            },
+            "value": "fn(i64 \"long\") -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LLP64",
+              "format": "pe"
+            },
+            "value": "fn(i64 \"long long\") -> i64 \"long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external"
+    },
+    {
+      "name": "imaxdiv",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf"
+            },
+            "value": "fn(i64 \"long\", i64 \"long\") -> struct \"_imaxdiv_t\" { i64 \"long\", i64 \"long\" }"
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "macho"
+            },
+            "value": "fn(i64 \"long\", i64 \"long\") -> struct \"_imaxdiv_t\" { i64 \"long\", i64 \"long\" }"
+          },
+          {
+            "when": {
+              "dataModel": "LLP64",
+              "format": "pe"
+            },
+            "value": "fn(i64 \"long long\", i64 \"long long\") -> struct \"_imaxdiv_t\" { i64 \"long long\", i64 \"long long\" }"
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external"
+    },
+    {
+      "name": "strtoimax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "macho"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LLP64",
+              "format": "pe"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "linkName": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "__isoc23_strtoimax"
+          },
+          {
+            "when": {
+              "format": "pe"
+            },
+            "value": "__dss_isoc23_strtoimax"
+          },
+          {
+            "when": {
+              "format": "macho"
+            },
+            "value": "__dss_isoc23_strtoimax"
+          }
+        ]
+      },
+      "version": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "GLIBC_2.38"
+          }
+        ]
+      },
+      "realization": {
+        "pe": {
+          "source": "runtime/platform/src/inttypes.c"
+        },
+        "macho": {
+          "source": "runtime/platform/src/inttypes.c"
+        }
+      }
+    },
+    {
+      "name": "strtoumax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "macho"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "dataModel": "LLP64",
+              "format": "pe"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "linkName": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "__isoc23_strtoumax"
+          },
+          {
+            "when": {
+              "format": "pe"
+            },
+            "value": "__dss_isoc23_strtoumax"
+          },
+          {
+            "when": {
+              "format": "macho"
+            },
+            "value": "__dss_isoc23_strtoumax"
+          }
+        ]
+      },
+      "version": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "GLIBC_2.38"
+          }
+        ]
+      },
+      "realization": {
+        "pe": {
+          "source": "runtime/platform/src/inttypes.c"
+        },
+        "macho": {
+          "source": "runtime/platform/src/inttypes.c"
+        }
+      }
+    },
+    {
+      "name": "wcstoimax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf",
+              "arch": "x86_64",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "format": "elf",
+              "arch": "arm64",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<u32>>, ptr<ptr<u32>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "format": "macho",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "format": "pe",
+              "dataModel": "LLP64"
+            },
+            "value": "fn(ptr<const<u16>>, ptr<ptr<u16>>, i32) -> i64 \"long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "linkName": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "__isoc23_wcstoimax"
+          },
+          {
+            "when": {
+              "format": "pe"
+            },
+            "value": "__dss_isoc23_wcstoimax"
+          },
+          {
+            "when": {
+              "format": "macho"
+            },
+            "value": "__dss_isoc23_wcstoimax"
+          }
+        ]
+      },
+      "version": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "GLIBC_2.38"
+          }
+        ]
+      },
+      "realization": {
+        "pe": {
+          "source": "runtime/platform/src/inttypes.c"
+        },
+        "macho": {
+          "source": "runtime/platform/src/inttypes.c"
+        }
+      }
+    },
+    {
+      "name": "wcstoumax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf",
+              "arch": "x86_64",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "format": "elf",
+              "arch": "arm64",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<u32>>, ptr<ptr<u32>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "format": "macho",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "format": "pe",
+              "dataModel": "LLP64"
+            },
+            "value": "fn(ptr<const<u16>>, ptr<ptr<u16>>, i32) -> u64 \"unsigned long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "linkName": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "__isoc23_wcstoumax"
+          },
+          {
+            "when": {
+              "format": "pe"
+            },
+            "value": "__dss_isoc23_wcstoumax"
+          },
+          {
+            "when": {
+              "format": "macho"
+            },
+            "value": "__dss_isoc23_wcstoumax"
+          }
+        ]
+      },
+      "version": {
+        "variants": [
+          {
+            "when": {
+              "format": "elf"
+            },
+            "value": "GLIBC_2.38"
+          }
+        ]
+      },
+      "realization": {
+        "pe": {
+          "source": "runtime/platform/src/inttypes.c"
+        },
+        "macho": {
+          "source": "runtime/platform/src/inttypes.c"
+        }
+      }
+    },
+    {
+      "name": "__dss_platform_strtoimax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "macho"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LLP64",
+              "format": "pe"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "availableObjectFormats": [
+        "pe",
+        "macho"
+      ],
+      "linkName": "strtoimax"
+    },
+    {
+      "name": "__dss_platform_strtoumax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "macho"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "dataModel": "LLP64",
+              "format": "pe"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "availableObjectFormats": [
+        "pe",
+        "macho"
+      ],
+      "linkName": "strtoumax"
+    },
+    {
+      "name": "__dss_platform_wcstoimax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "format": "macho",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "format": "pe",
+              "dataModel": "LLP64"
+            },
+            "value": "fn(ptr<const<u16>>, ptr<ptr<u16>>, i32) -> i64 \"long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "availableObjectFormats": [
+        "pe",
+        "macho"
+      ],
+      "linkName": "wcstoimax"
+    },
+    {
+      "name": "__dss_platform_wcstoumax",
+      "signature": {
+        "variants": [
+          {
+            "when": {
+              "format": "macho",
+              "dataModel": "LP64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "format": "pe",
+              "dataModel": "LLP64"
+            },
+            "value": "fn(ptr<const<u16>>, ptr<ptr<u16>>, i32) -> u64 \"unsigned long long\""
+          }
+        ]
+      },
+      "kind": "function",
+      "linkage": "external",
+      "availableObjectFormats": [
+        "pe",
+        "macho"
+      ],
+      "linkName": "wcstoumax"
+    }
   ]
 }

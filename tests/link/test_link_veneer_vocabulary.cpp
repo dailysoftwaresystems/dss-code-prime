@@ -173,10 +173,15 @@ TEST(LinkVeneerVocabulary, Arm64DeclaresTheAbisGrantAndTheReferenceBody) {
     EXPECT_EQ(lv->scratchRegisters[0], *arm64().registerByName("x16"));
     EXPECT_EQ(lv->scratchRegisters[1], *arm64().registerByName("x17"));
 
-    ASSERT_EQ(lv->routableRelocationNames, std::vector<std::string>{"call26"})
-        << "AAELF64 routes CALL26/JUMP26 only; DSS spells both with `call26`";
+    // P69 fold 3c: JUMP26 has its own kind (`jump26`, call26's formula: a format document gives one wire id per
+    // kind), so the routable set names both rows AAELF64 lets a linker veneer.
+    ASSERT_EQ(lv->routableRelocationNames, (std::vector<std::string>{"call26", "jump26"}))
+        << "AAELF64 routes CALL26/JUMP26 only; DSS spells them `call26` and `jump26`";
+    ASSERT_EQ(lv->routableRelocations.size(), 2u);
     EXPECT_EQ(lv->routableRelocations[0],
               arm64().relocationByName("call26")->kind);
+    EXPECT_EQ(lv->routableRelocations[1],
+              arm64().relocationByName("jump26")->kind);
 
     ASSERT_EQ(lv->bodies.size(), 2u);
     auto const& body = lv->bodies[0];
@@ -361,7 +366,7 @@ TEST(LinkVeneerVocabulary, EveryNameResolvesOrTheLoadFailsAtItsPath) {
         "a vector register cannot hold a branch destination");
     expectRefusedAt(
         mutateShippedTargetSchemaDoc("arm64", [](nlohmann::json& doc) {
-            doc.at("linkVeneers").at("routableRelocations") = {"jump26"};
+            doc.at("linkVeneers").at("routableRelocations") = {"plt32"};
         }),
         "/linkVeneers/routableRelocations/0", "an undeclared relocation row");
     expectRefusedAt(

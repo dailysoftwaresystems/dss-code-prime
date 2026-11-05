@@ -1,0 +1,29 @@
+{
+  "$comment": "P69 fold 3 (lane `xa`), D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE, the review of fold 2, F1 -- A REGRESSION OF THIS PULL REQUEST, CLOSED IN IT. Two ELF objects each carry COMDAT group `f` of two sections: `.text.f` and its jump table `.rodata.f`, whose entries are relocations against `.text.f` (the section's own symbol) -- a relocation that stands INSIDE the group and names the bytes of another member of it. GNU ld 2.42 and ld.lld 18.1.3 link the pair in either order and keep the first unit's group (MEASURED 2026-10-12: 44 with unit A first, 88 with unit B first). Fold 2 of P69 refused a relocation naming the bytes of a discarded group's member by (unit, target) alone, so the losing unit's own table was refused and the pair did not link in either order (MEASURED 2026-10-12 on a build of fold 2's bytes; a build without fold 2 linked it, 44 and 88). Since P69 fold 3c DSS discards the later unit's group whole, as the references do -- its body, its table and the table's relocations together -- so the image holds unit A's `f` alone. Unit A first: both callers answer 22, exit 44. The other order is `elf_group_jump_table_pair_other_order`.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 44,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "UNIT A: f(1) answers 22. Source and rebuild command: `tests/link/data/elf_group_jump_table_a.source.s` (GNU as 2.42 through gcc 13.3.0, `gcc -c`; md5 36086c6ca57f6e900b02d10abedff4fa). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the unit's own caller.",
+          "path": "tests/link/data/elf_group_jump_table_a_x86_64_elf_gas.o",
+          "containerWitness": "jump_table_a"
+        },
+        {
+          "$comment": "UNIT B: f(1) answers 44, in a body padded so that its table does not fit unit A's function. Source and rebuild command: `tests/link/data/elf_group_jump_table_b.source.s` (GNU as 2.42 through gcc 13.3.0, `gcc -c`; md5 f0324ac6a30ed6c511e2c8db43716020).",
+          "path": "tests/link/data/elf_group_jump_table_b_x86_64_elf_gas.o",
+          "containerWitness": "jump_table_b"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

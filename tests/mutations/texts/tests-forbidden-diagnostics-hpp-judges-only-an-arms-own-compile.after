@@ -1,0 +1,2 @@
+    for (auto const& compile : compiles) {
+        if (&compile != &compiles.back()) continue;

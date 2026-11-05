@@ -1,0 +1,1 @@
+                for (std::string const& name : kept) (void)name;

@@ -1,0 +1,1 @@
+        string(APPEND _dss_manifest "${_dss_dep_name}\n")

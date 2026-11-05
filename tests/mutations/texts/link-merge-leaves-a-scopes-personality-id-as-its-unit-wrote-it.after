@@ -1,0 +1,4 @@
+                if (false && scope.personalitySymbol.valid()) {
+                    scope.personalitySymbol =
+                        SymbolId{mergedIdFor(i, scope.personalitySymbol)};
+                }

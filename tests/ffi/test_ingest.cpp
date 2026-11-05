@@ -28,6 +28,7 @@
 #include "hir/hir_node.hpp"
 #include "link/object_format_schema.hpp"
 #include "byte_emit.hpp"
+#include "os_link.hpp"     // links made by the OS: MinGW's library makes none
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -386,6 +387,74 @@ TEST(FfiIngest, ReadCHeaderDirectoryEnumeratesAlphabetical) {
     // Alphabetical: stdio.h before stdlib.h.
     EXPECT_EQ((*rows)[0].mangledName, "puts");
     EXPECT_EQ((*rows)[1].mangledName, "exit");
+}
+
+// A LINK IS A HEADER BY WHAT IT REACHES, on every build: a link to a regular `.h` is that header, and a
+// DANGLING link is none -- what the MSVC and POSIX builds always answered. libstdc++ on Windows reads a dangling
+// link's own attributes and calls it a regular file, so the MinGW build took it for a header and failed to read
+// it: a directory holding only that link read as a failed read where the others read an empty one
+// ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The links are made by the OS.
+TEST(FfiIngest, ReadCHeaderDirectoryTakesALinkByWhatItReaches) {
+    using dss::test_support::LinkTo;
+    ScratchDir scratch{Location::Temp, "ff5-links"};
+    fs::path const elsewhere = scratch.path() / "elsewhere";
+    fs::path const linked    = scratch.path() / "linked";
+    fs::path const dangling  = scratch.path() / "dangling";
+    fs::create_directories(elsewhere);
+    fs::create_directories(linked);
+    fs::create_directories(dangling);
+    { std::ofstream{elsewhere / "named.h"} << "extern void exit(int status);\n"; }
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere / "named.h", linked / "via-link.h", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dangling / "no-such.h", dangling / "gone.h", LinkTo::File));
+
+    {
+        DiagnosticReporter rep;
+        auto rows = readCHeaderDirectory(linked, "libc.so.6", elfPair(), rep);
+        ASSERT_TRUE(rows.has_value()) << "the directory holding a link to a header failed: "
+                                      << headerReadErrorKindName(rows.error().kind);
+        ASSERT_EQ(rows->size(), 1u);
+        EXPECT_EQ((*rows)[0].mangledName, "exit");
+    }
+    {
+        DiagnosticReporter rep;
+        auto rows = readCHeaderDirectory(dangling, "libc.so.6", elfPair(), rep);
+        ASSERT_TRUE(rows.has_value()) << "the directory holding only a dangling link failed: "
+                                      << headerReadErrorKindName(rows.error().kind);
+        EXPECT_TRUE(rows->empty()) << "the dangling link read as " << rows->size() << " rows";
+        EXPECT_EQ(rep.errorCount(), 0u);
+    }
+}
+
+// AN ENTRY NAMED AS A HEADER THAT CANNOT BE READ FAILS THE READ, naming it: a link that names itself (a loop) is
+// no header anyone can read, and a directory read without it would hand a partial surface on as the whole one.
+// An unreadable entry named otherwise is no header whatever it reaches, and changes nothing.
+TEST(FfiIngest, ReadCHeaderDirectoryRefusesAHeaderItCannotReadNamingIt) {
+    using dss::test_support::LinkTo;
+    ScratchDir scratch{Location::Temp, "ff5-loop"};
+    fs::path const headers = scratch.path() / "headers";
+    fs::path const others  = scratch.path() / "others";
+    fs::create_directories(headers);
+    fs::create_directories(others);
+    { std::ofstream{headers / "a.h"} << "extern void exit(int status);\n"; }
+    { std::ofstream{others / "a.h"} << "extern void exit(int status);\n"; }
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(headers / "loop.h", headers / "loop.h", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(others / "loop", others / "loop", LinkTo::File));
+    {
+        DiagnosticReporter rep;
+        auto rows = readCHeaderDirectory(headers, "libc.so.6", elfPair(), rep);
+        ASSERT_FALSE(rows.has_value()) << "a directory holding a header-named link that loops read as " << rows->size()
+                                       << " row(s): the unreadable header vanished";
+        EXPECT_EQ(rows.error().kind, HeaderReadErrorKind::FileOpenFailed);
+        EXPECT_NE(rows.error().detail.find("loop.h"), std::string::npos)
+            << "the refusal does not name the entry: " << rows.error().detail;
+    }
+    {
+        DiagnosticReporter rep;
+        auto rows = readCHeaderDirectory(others, "libc.so.6", elfPair(), rep);
+        ASSERT_TRUE(rows.has_value()) << "a looping link named as no header failed the read: "
+                                      << rows.error().detail;
+        EXPECT_EQ(rows->size(), 1u);
+    }
 }
 
 TEST(FfiIngest, ReadCHeaderDirectoryRejectsNonDirectory) {

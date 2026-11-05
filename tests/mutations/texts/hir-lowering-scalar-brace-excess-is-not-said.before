@@ -1,0 +1,2 @@
+            if (elems.size() > 1) {
+                if (admits.excessElements == DiagnosticCode::None) {

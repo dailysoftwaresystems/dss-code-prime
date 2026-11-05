@@ -1,0 +1,1 @@
+                                typedefOriginAcc.emplace_back(sym.v, vlaOriginOf(origin).v);

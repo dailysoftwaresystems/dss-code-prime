@@ -7,6 +7,7 @@
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_compatibility.hpp"   // sameOrEnumCompatible
+#include "core/substrate/walk_steps.hpp"                         // P69 L2: a walk's bound is what it walks
 
 #include <cstdint>
 #include <optional>
@@ -143,7 +144,8 @@ namespace detail::type_rules {
 // on the two references that WORK).
 //
 // The predicate walks the array spine pairwise and admits a level whose lengths
-// differ ONLY when at least one side is the VLA sentinel; two DIFFERENT constants
+// differ ONLY when at least one side is the VLA sentinel or the size-not-present one
+// (`kIncompleteArrayLength`: `int (*)[]` beside `int (*)[3]`); two DIFFERENT constants
 // stay a loud mismatch (`int (*)[2]` vs `int (*)[3]` is still `S_TypeMismatch`), and
 // so does any element-type difference below the spine. Non-array levels must be
 // interner-IDENTICAL, so this can never launder a `Ptr<int>`/`Ptr<float>` pair.
@@ -153,12 +155,13 @@ namespace detail::type_rules {
 // bound, so in every other language no type reaches this predicate with a sentinel
 // level and it answers exactly what `sameType` already answered.
 //
-// Terminates: each step takes `operands[0]` of an Array and the interned operand DAG
-// is acyclic; the guard is belt-and-braces, matching `declaredTypeDerivesFromAliasHead`.
+// Terminates: each step takes `operands[0]` of an Array and the interned operand DAG is
+// acyclic, so the walk is bounded by the interner it walks (`WalkSteps`; P69 L2, lane `lm`):
+// a fixed 4096 levels answered "incompatible" past them in silence.
 [[nodiscard]] inline bool vlaCompatibleArrayTypes(TypeInterner const& interner,
                                                   TypeId a, TypeId b) {
     if (!a.valid() || !b.valid()) return false;
-    for (int guard = 0; guard < 4096; ++guard) {
+    for (substrate::WalkSteps steps{interner.size(), "vlaCompatibleArrayTypes' spine"};; steps.step()) {
         if (a == b) return true;
         if (interner.kind(a) != TypeKind::Array
             || interner.kind(b) != TypeKind::Array) {
@@ -168,9 +171,16 @@ namespace detail::type_rules {
         auto const bLen = interner.scalars(b);
         if (aLen.empty() || bLen.empty()) return false;
         // Both bounds are integer constant expressions and they DIFFER → C says
-        // incompatible. Only a VLA level (a non-ICE bound) may straddle.
+        // incompatible. A VLA level (a non-ICE bound) may straddle, and so may a
+        // level whose size is NOT PRESENT (C 6.7.6.2p6: the two sizes must agree
+        // only "if both size specifiers are present and integer constant
+        // expressions"). P69 (lane `cs`): ✔MEASURED, `int (*p)[] = &buf` with an
+        // `int buf[3]` is silent on gcc 13.3.0 and clang 18.1.3 (probe sz); DSS
+        // warned it as an incompatible pointer conversion before this arm.
         if (aLen[0] != bLen[0]
-            && aLen[0] != kVlaLength && bLen[0] != kVlaLength) {
+            && aLen[0] != kVlaLength && bLen[0] != kVlaLength
+            && aLen[0] != kIncompleteArrayLength
+            && bLen[0] != kIncompleteArrayLength) {
             return false;
         }
         auto const aElem = interner.operands(a);
@@ -205,6 +215,34 @@ namespace detail::type_rules {
     return pointee.valid() && element.valid()
         && sameOrEnumCompatible(interner, interner.stripVolatile(pointee),
                                 interner.stripVolatile(element));
+}
+
+// ── THE FUNCTION-TO-POINTER DECAY'S SIGNATURE TEST, ONE ANSWER FOR BOTH TIERS ──────
+// (P69 fold f26b, lane `cs`)
+//
+// Does a function designator of type `fn` decay into a pointer whose pointee is
+// `pointee` as C's own conversion? When the two function types are COMPATIBLE: the
+// designator decays to a pointer to its own type (C 6.3.2.1p4), and a pointer to a
+// compatible type is assignment-compatible (C 6.5.16.1p1). Two function types are
+// compatible when their results are and their parameter lists agree in number, in the
+// ellipsis and in each parameter taken unqualified (C 6.7.6.3p15), at every level below
+// — where an array of unknown or variable size is compatible with one of any size of a
+// compatible element (C 6.7.6.2p6). That relation is `sameOrEnumCompatible`'s, the one
+// the pointer arms, the redeclaration oracles and `_Generic` ask. The ADMIT side
+// (`isAssignable`'s Ptr←FnSig arm) and the REALIZE side (the HIR `coerce` FnSig→Ptr
+// arm) both ask HERE, so admit ⟺ realize holds by construction.
+// ✔MEASURED (lane `cs` probe ft, 2026-10-22): a designator returning `int (*)[]` into a
+// pointer to a function returning `int (*)[3]`, the reverse, the same with a run-time
+// bound, a parameter both ways, a pointer to a function returning a pointer to such a
+// function, a call argument, a return statement and a result and a parameter each
+// knowing a size the other does not — gcc 13.3.0 and clang 18.1.3 at -pedantic-errors
+// and mingw-w64 gcc 13.2.0 build and run every one in silence; cl 19.51 runs the
+// constant-size ones with C4048 / C4113 and has no run-time bound. DSS warned each as
+// an incompatible pointer conversion: the arm asked for the IDENTICAL signature.
+[[nodiscard]] inline bool decayedFunctionReachesPointee(TypeInterner const& interner,
+                                                        TypeId pointee, TypeId fn) {
+    return pointee.valid() && fn.valid() && interner.kind(fn) == TypeKind::FnSig
+        && sameOrEnumCompatible(interner, pointee, fn);
 }
 
 // rhs assignable into lhs?
@@ -783,17 +821,19 @@ namespace detail::type_rules {
     // NO synthetic HIR decay node is needed: a bare function Ref inherently
     // lowers to the function's ADDRESS at MIR time (which is why `fp = add`
     // compiled AND ran correctly before the assign-stmt assignability check
-    // existed — only the new SEMANTIC check rejected it). Pinned to the SAME
-    // signature (the lhs pointee FnSig == the rhs FnSig, by interner
-    // identity): an incompatible-signature assignment (`int (*g)(int) = add`
-    // where add is `int(int,int)`) interns a DISTINCT FnSig and stays a loud
+    // existed — only the new SEMANTIC check rejected it). Pinned to a
+    // COMPATIBLE signature (P69 fold f26b, lane `cs`: C 6.7.6.3p15, asked of
+    // `decayedFunctionReachesPointee`, which the HIR `coerce` asks too — it was
+    // interner IDENTITY, which refused a result or parameter that differs only in
+    // an array's size where one side has none): an incompatible-signature
+    // assignment (`int (*g)(int) = add` where add is `int(int,int)`) stays a loud
     // mismatch. The arm is the shared `isAssignable` chokepoint, so it fixes
     // assignment, initialization, call-argument, and return positions at
     // once. Closes the `fp = add` regression of
     // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS.
     if (lk == TypeKind::Ptr && rk == TypeKind::FnSig) {
         auto const lhsElem = interner.operands(lhs);
-        if (!lhsElem.empty() && lhsElem[0] == rhs) {
+        if (!lhsElem.empty() && decayedFunctionReachesPointee(interner, lhsElem[0], rhs)) {
             return true;
         }
     }
@@ -1159,6 +1199,18 @@ pointerOperandRefusedByUnary(TypeInterner const& interner, std::string_view targ
         && contributedPointee(interner, operand).valid();
 }
 
+// The `nullptr_t` half (C23 6.5.3.3p1): the same three operators take an arithmetic
+// (`~`: an integer) operand, and `nullptr_t` is neither. ONE predicate, two askers:
+// pass2Post's nullptr gate refuses the operation, and the expression typer gives the
+// refused operation no type — so the operator above it is not told it holds a
+// `nullptr_t` and says nothing more. ✔MEASURED 2026-10-20, gcc 13.3.0 and clang 18.1.3
+// (`-std=gnu2x`, `-std=c2x -pedantic-errors`): `+nullptr` is refused, and `- -nullptr` /
+// `~ ~nullptr` draw ONE error, at the inner operator.
+[[nodiscard]] inline bool
+unaryRefusesNullptrOperand(std::string_view target) noexcept {
+    return target == "Neg" || target == "Pos" || target == "BitNot";
+}
+
 // Which class a pair the ordinary rules DECLINED belongs to. `target` is the type
 // converted TO (an lvalue's, a parameter's, a function result's), `source` the
 // operand's own, un-decayed. The pairing sites (`==`, `?:`) pass a pointer target
@@ -1217,8 +1269,8 @@ diagnosedConversionCode(DiagnosedConversion c) noexcept {
 }
 
 // The sentence each class reports — one wording for both tiers, so a brace element
-// (reported by the HIR tier, the one that knows which slot it fills) reads exactly
-// like the initialization the semantic tier reports.
+// (reported by the HIR tier, where its conversion is realized in the slot it fills)
+// reads exactly like the initialization the semantic tier reports.
 [[nodiscard]] inline std::string
 diagnosedConversionSentence(DiagnosedConversion c, DiagnosedConversionSite site,
                             std::string_view operandText) {
@@ -1703,6 +1755,47 @@ arrayToPointerDecay(TypeInterner& interner, TypeId t) noexcept {
     return elems.empty() ? t : interner.pointer(elems[0]);
 }
 
+// ── C 6.3.2.1p2-p4: THE TYPE OF AN EXPRESSION'S VALUE ──────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// An expression that is no longer an lvalue — the value a comma operator or a GNU
+// statement expression yields, the controlling expression of a generic selection —
+// has the type its operand had, CONVERTED, and the conversion is three steps and no
+// more:
+//   * an ARRAY is the pointer to its first element (p3: `arrayToPointerDecay`);
+//   * a FUNCTION designator is the pointer to the function (p4);
+//   * anything else is the unqualified, non-atomic version of its type (p2) — the
+//     qualifiers the TypeId interns, `volatile` and `_Atomic`; `const` and `restrict`
+//     are not interned, and the spine beside the TypeId says the same of them
+//     (`expressionQualifierSpine`: a value has no qualifier at level 0).
+// NOT a promotion: a `char` stays a `char` (`sizeof(({ c; }))` is 1). A type-level
+// alignment is no qualifier and stays.
+//
+// ✔MEASURED 2026-10-12 (31 questions, each through `({ e; })`, through `(0, e)` and
+// bare where the bare form is a control; `sizeof`, `_Generic` and `__typeof__` as the
+// readers): gcc 13, mingw-w64 gcc 13.2, clang 18 and AppleClang 21 apply exactly these
+// three steps to both constructs — `_Atomic` through a statement expression alone is
+// kept by clang 18 and dropped by the other three, whom this follows. A BIT-FIELD is
+// not this law's: each reference gives its value one type bare, through the braces
+// and through the comma (gcc a type of its own, clang the declared one, as DSS does).
+//
+// ★ ONE STATEMENT, BECAUSE THERE WERE THREE AND THEY DISAGREED. The generic selection
+// spelled the three steps inline and was right; the comma converted an array and
+// nothing else (`sizeof((0, f))` was 1 and `typeof((0, v))` kept `volatile`, where the
+// four say 8 and drop it); a statement expression converted nothing (`sizeof(({ "abc";
+// }))` was 4, the array's size, where the four say 8) — and a static pointer
+// initialized through one was refused, the conversion laid over the sequence instead
+// of inside it. Both tiers and all three constructs read this function.
+[[nodiscard]] inline TypeId
+valueConversion(TypeInterner& interner, TypeId t) {
+    if (!t.valid()) return t;
+    TypeKind const k = interner.kind(t);   // through any qualifier skin
+    if (k == TypeKind::Array) return arrayToPointerDecay(interner, t);
+    TypeId const material = interner.stripVolatile(t);
+    if (k == TypeKind::FnSig) return interner.pointer(material);
+    return interner.typeAligned(material, interner.typeAlignOverride(t));
+}
+
 // ── FC3 c1: config-driven usual arithmetic conversions (C 6.3.1.8) ──────
 //
 // The `arithmeticConversions` SemanticConfig block, RESOLVED for the
@@ -2137,6 +2230,50 @@ integerPromotedType(TypeInterner& interner, TypeId t,
     TypeKind const p = promoteIntegerKind(k, rules);
     if (p == k) return t;
     return interner.primitive(p);
+}
+
+// ── THE TYPE A BIT-FIELD'S VALUE HAS (C 6.3.1.1p2) ────────────────────────────────────
+// (cycle P69 round 1, lane `lm`.)
+//
+// A bit-field is promoted BY ITS WIDTH, not by its declared type: "If an int can represent
+// all values of the original type (as restricted by the width, for a bit-field), the value
+// is converted to an int; otherwise, it is converted to an unsigned int." `declared` is the
+// field's declared type and `width` its width; the answer, with the promotion floor `int`
+// the language names (`rules.minRank`):
+//   * an integer field narrower than `int` → `int` (every value fits);
+//   * a field of exactly `int`'s width → `int` when its type is signed, else `unsigned int`;
+//   * a WIDER field → its declared type, unchanged;
+//   * a bit-precise (`_BitInt`) field, or no integer at all → the declared type (C23
+//     6.3.1.1p2 converts a bit-precise field to its own bit-precise type).
+// ✔MEASURED 2026-10-15 (17 fields × 51 programs on AppleClang 21, clang 18, gcc 13 and
+// mingw-w64 gcc 13.2): the four promote by width whatever the declared type — `unsigned :3`,
+// `unsigned char :3`, `_Bool :1`, `unsigned long long :3` and `long long :3` are `int`;
+// `unsigned :32` and `unsigned long long :32` are `unsigned int`. A field wider than `int`
+// is the standard's to leave to the implementation, and the references split: clang 18,
+// AppleClang 21 and cl 19.51 keep the declared type, gcc gives the field a type of its own
+// width — a reading clang's sources decline, and so does this (the row says why). cl 19.51
+// promotes no bit-field by its width; ISO C, gcc and clang do, and DSS follows them.
+// The returned type for a field of `int`'s width or less is the BARE promoted type: the
+// value is `int` (or `unsigned int`), not the declared type's name — `long b : 3` on an
+// LLP64 target is an `int`, as on every other.
+[[nodiscard]] inline TypeId
+bitFieldPromotedType(TypeInterner& interner, TypeId declared, std::uint32_t width,
+                     ResolvedArithmeticRules const& rules) {
+    if (!declared.valid() || width == 0) return declared;
+    using namespace detail::type_rules;
+    TypeKind const k = interner.kind(enumUnderlyingOrSelf(interner, declared));
+    bool isInteger = intWidthRank(k) != 0;
+    for (TypeKind p : rules.alsoPromote) {
+        if (p == k) isInteger = true;   // `_Bool`, plain `char` — the promoted kinds
+    }
+    int const floorBits = intKindBits(rules.minRank);
+    if (!isInteger || floorBits == 0) return declared;
+    if (width < static_cast<std::uint32_t>(floorBits)) return interner.primitive(rules.minRank);
+    if (width == static_cast<std::uint32_t>(floorBits)) {
+        if (signedIntRank(k) != 0) return interner.primitive(rules.minRank);
+        return interner.primitive(kindAtRank(intWidthRank(rules.minRank), /*isSigned=*/false));
+    }
+    return declared;
 }
 
 // C 6.5.7 shift RESULT TYPE under the config verb `shiftResult` — the SINGLE

@@ -1,0 +1,7 @@
+    {
+      "$comment": "P69 fold 3c (D-LK-RELOCATION-TYPES-REFERENCE-COMPILERS-EMIT-FOR-C-UNDECLARED): the B imm26 of a TAIL CALL. ELF type R_AARCH64_JUMP26 = 282. `kind` = 17 matches arm64.target.json's `jump26` row (call26's formula under its own kind: one wire id per kind). ★ `isCall`: a B can only target code, as a BL can. MEASURED 2026-10-20: gcc 13.3 -O2 and clang 18.1.3 write it for an ordinary tail call; before this row every such object was refused at read.",
+      "name": "R_AARCH64_JUMP26",
+      "kind": 17,
+      "nativeId": 282,
+      "isCall": true
+    },

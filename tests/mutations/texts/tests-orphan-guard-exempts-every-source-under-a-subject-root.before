@@ -1,0 +1,1 @@
+        if path.startswith(root + "/") and posixpath.splitext(path)[1] in extensions:

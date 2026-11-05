@@ -106,7 +106,7 @@ struct Outcome {
         bindings.push_back(std::move(ob));
     }
     out.lowered = lowerAsmTemplateToLirRun(*tree, **grammar, **target, bindings,
-                                           builder, rep);
+                                           builder, rep, nullptr);
     for (auto const& diag : rep.all()) out.diagnostics += diag.actual + "\n";
     return out;
 }

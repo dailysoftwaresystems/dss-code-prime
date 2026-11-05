@@ -1,0 +1,1 @@
+    if (false && !defect.empty()) refuse(std::string{defect}.c_str());

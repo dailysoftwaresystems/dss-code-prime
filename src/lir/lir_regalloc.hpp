@@ -34,6 +34,13 @@
 // cross-call range takes a callee-saved register or spills. Call
 // detection is target-agnostic via `TargetOpcodeInfo::isCall`.
 //
+// **The same constraint at a landing block**: a range live INTO the
+// landing block of a guarded run (`LirGuardedRegion`, `lir_liveness.hpp`)
+// is held across a transfer made by a party that keeps only what a call
+// keeps, so it is given exactly what a cross-call range is given. The two
+// are ONE predicate in the .cpp, and `findLandingViolation` below audits
+// the finished table independently of it.
+//
 // **Partition preference** (plan 22 OPT8): a range that does NOT cross a
 // call is offered the CALLER-SAVED partition first and falls back to
 // callee-saved. Both were always legal for such a range; the order is what
@@ -354,6 +361,47 @@ struct DSS_EXPORT LirAllocationConflict {
 [[nodiscard]] DSS_EXPORT std::optional<LirAllocationConflict>
 findAllocationConflict(LirFuncLiveness const&   flow,
                        LirFuncAllocation const& alloc) noexcept;
+
+// ── THE INDEPENDENT LANDING AUDITOR ─────────────────────────────────────────
+//
+// ★★★ D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER. NOTHING RUNS BETWEEN A
+// FAULT AND THE FIRST INSTRUCTION OF THE LANDING BLOCK IT IS DELIVERED TO. So a
+// value that block reads (`LirGuardedRegion`, `lir_liveness.hpp`) must be in
+// ONE place for the whole guarded run and at the landing's entry — there is no
+// edge to put a move or a reload on — and that place must be one the party
+// making the transfer keeps: a spill slot, or a register outside the calling
+// convention's volatile set. A handler that breaks either reads whatever a
+// dispatcher left behind, and nothing downstream can tell: the LIR is
+// well-formed and the program is wrong.
+//
+// `findLandingViolation` re-derives both halves on the FINISHED table, for
+// every register class at once, from the liveness SETS (what each landing block
+// reads) and the ranges — never from the allocator's own predicate:
+//   * `VolatileRegister`  — the value is assigned a register the convention's
+//     `callerSaved` names;
+//   * `NotHeldThroughRun` — its range does not span a block of the run
+//     (`blockV`), or the landing's entry (`blockV == landingBlockV`). The
+//     assignment table holds ONE location per virtual register, so a range
+//     that spans the run IS one location through it. ⚠ The day ranges are split
+//     into sub-intervals (D-PLAN12-SPLIT-AWARE-SUB-INTERVAL-LIRLIVERANGE-LIST-CURRENTLY-FLAT)
+//     that sentence stops being true and this arm must compare the location at
+//     each position instead;
+//   * `Unassigned`        — it has no range or no assignment at all.
+//
+// ⓘ It reports the FIRST violation and stops; the caller aborts the compile.
+// `std::nullopt` for a function with no guarded run, and for a table the
+// allocator left empty after a reported error.
+struct DSS_EXPORT LirLandingViolation {
+    enum class Kind : std::uint8_t { VolatileRegister, NotHeldThroughRun, Unassigned };
+    LirReg        vreg{};             // the value
+    std::uint32_t landingBlockV = 0;  // `LirBlockId.v` of the landing block that reads it
+    std::uint32_t blockV        = 0;  // the block it is not held through (see Kind)
+    Kind          kind = Kind::VolatileRegister;
+};
+
+[[nodiscard]] DSS_EXPORT std::optional<LirLandingViolation>
+findLandingViolation(Lir const& lir, TargetSchema const& schema,
+                     LirFuncLiveness const& flow, LirFuncAllocation const& alloc);
 
 // Module-level wrapper. Per-function entries in the same order as
 // `lir.funcAt(i)`. `ok()` is a derived property — true iff every

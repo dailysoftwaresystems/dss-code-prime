@@ -1,0 +1,2 @@
+            //     (`sizeof.incompleteArraySize`), else refused by name.
+            return s.lattice.interner().incompleteArray(inner);

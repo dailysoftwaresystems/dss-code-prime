@@ -1,0 +1,1 @@
+    for (char const* top : {"src", "integrated_tests", "tests/test_support"}) {

@@ -1,0 +1,1 @@
+        words += [w.replace('"', "") for w in _COMMAND_WORD.findall(edge["vars"].get(name, ""))]

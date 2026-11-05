@@ -1,0 +1,2 @@
+                    std::string const got = lex_.peek().text;
+                    malformed(got.empty()

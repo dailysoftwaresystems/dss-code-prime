@@ -1,0 +1,3 @@
+        if (!handlerVa.has_value()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: SEH personality symbol #"}

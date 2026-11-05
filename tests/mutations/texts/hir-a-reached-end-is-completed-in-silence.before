@@ -1,0 +1,1 @@
+        emitHAt(DiagnosticCode::H_NonVoidFunctionEndReachable,

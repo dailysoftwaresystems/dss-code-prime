@@ -1,0 +1,44 @@
+{
+  "$comment": "P69 (lane lm, D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES — M7.0, then row 1): <stdlib.h>'s C23 surface beyond what the platform's C library gives, from <stdlib.h> alone, on every pair. (1) The names NO platform exports — memalignment, free_sized, free_aligned_sized — realized from DSS's own runtime unit runtime/platform/src/stdlib.c on EVERY object format; memalignment was the first shipped-source unit on ELF and Mach-O, the proof that the runtime-archive path (compile the unit for the target's staticlib sibling, pull the member by symbol reference) works there as on pe, resting on the R3 precedence: stdlib.json imports from the C library on every format and a row's own `realization` supersedes that inherited import. (2) strfromd/strfromf/strfroml — glibc's own on ELF, runtime/platform/src/stdlib_strfrom.c on pe and Mach-O (the UCRT and libSystem export none; C23 7.24.1.3 makes each the snprintf of its value). (3) aligned_alloc — the platform's on ELF and Mach-O, runtime/platform/src/stdlib_aligned_alloc.c on pe (the UCRT exports none). (4) mbtowc, wctomb, mbstowcs, wcstombs and strtold — imports on every pair, read in the \"C\" locale. (5) C23 7.24p2's once trio — once_flag, ONCE_FLAG_INIT, call_once — with no <threads.h>: the call_once rows are byte-identical to threads.json's (DSS's runtime source on pe, libSystem's pthread_once on Mach-O, glibc's on ELF), and this is the arm that pins call_once on Mach-O x86_64, where <threads.h>'s thread creation has no vehicle. The expected values: memalignment is C23's definition (the largest power of two dividing the address; 0 for null) applied to a 16-aligned block; the rest is the references' own output — gcc and clang -std=c2x (glibc 2.39, x86_64) and aarch64-linux-gnu-gcc -std=c2x -static under qemu print these six lines and exit 42 (✔MEASURED, run 20261001-030054-842688dc, through probes/stdlibsurf_ref.c: this program verbatim plus local memalignment/free_sized/free_aligned_sized bodies and <threads.h>, because no reference's <stdlib.h> declares those names — the UCRT, mingw-w64 and Apple's SDK declare none of them, glibc 2.39 none of the once trio). RED-ON-DISABLE: a row's realization dropped makes its name an import the pair's C library does not export — memalignment, free_sized and free_aligned_sized on every pair, strfrom* on pe and Mach-O, aligned_alloc on pe — so that pair's program cannot load; the once trio dropped from stdlib.json fails the compile on every pair.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "memalignment: null=0 base_at_least_16=1 plus1=1 plus8=8\r\nstrfrom: 2.500/5 0.5/3 1.5/3\r\naligned_alloc: 16-aligned=1\r\nmultibyte: mbtowc=1/1 wctomb=1/B mbstowcs=2/1 wcstombs=2/ok\r\nstrtold: 1\r\ncall_once: initializer ran 1 time(s)\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "memalignment: null=0 base_at_least_16=1 plus1=1 plus8=8\nstrfrom: 2.500/5 0.5/3 1.5/3\naligned_alloc: 16-aligned=1\nmultibyte: mbtowc=1/1 wctomb=1/B mbstowcs=2/1 wcstombs=2/ok\nstrtold: 1\ncall_once: initializer ran 1 time(s)\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "memalignment: null=0 base_at_least_16=1 plus1=1 plus8=8\nstrfrom: 2.500/5 0.5/3 1.5/3\naligned_alloc: 16-aligned=1\nmultibyte: mbtowc=1/1 wctomb=1/B mbstowcs=2/1 wcstombs=2/ok\nstrtold: 1\ncall_once: initializer ran 1 time(s)\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "memalignment: null=0 base_at_least_16=1 plus1=1 plus8=8\nstrfrom: 2.500/5 0.5/3 1.5/3\naligned_alloc: 16-aligned=1\nmultibyte: mbtowc=1/1 wctomb=1/B mbstowcs=2/1 wcstombs=2/ok\nstrtold: 1\ncall_once: initializer ran 1 time(s)\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "memalignment: null=0 base_at_least_16=1 plus1=1 plus8=8\nstrfrom: 2.500/5 0.5/3 1.5/3\naligned_alloc: 16-aligned=1\nmultibyte: mbtowc=1/1 wctomb=1/B mbstowcs=2/1 wcstombs=2/ok\nstrtold: 1\ncall_once: initializer ran 1 time(s)\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

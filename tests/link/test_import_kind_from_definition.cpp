@@ -9,8 +9,9 @@
 //   * a SIBLING unit's definition binds the reference directly, whatever it is;
 //   * a library that states FUNCTION: the reference gets the stub the format's
 //     call dispatch provides, the address every DSS reference to that function
-//     gets (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB is why that is not
-//     yet the process's address);
+//     gets — and since P69 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) an
+//     ELF executable makes that stub the import's CANONICAL address, the one
+//     the rest of the process sees;
 //   * a library that states DATUM: refused by name, because the reference would
 //     need a copy relocation, which DSS does not make;
 //   * a library that states NOTHING (a NOTYPE export): refused by name.
@@ -46,6 +47,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -193,6 +195,279 @@ TEST(ImportKindFromDefinition, AnUnboundPendingRowIsAnUndefinedSymbol) {
     auto const image = linker::link(m, *s.target, *s.format, rep);
     EXPECT_TRUE(withCode(rep, DiagnosticCode::K_ImportReferenceUnbindable).empty());
     EXPECT_EQ(withCode(rep, DiagnosticCode::K_SymbolUndefined).size(), 1u);
+    EXPECT_FALSE(image.ok());
+}
+
+// ── a datum is judged by HOW the unit reaches it, whoever stated the kind ──
+//
+// P69 (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA): an object reader mints an
+// untyped undefined symbol `Pending`, and the archive-member binder takes its
+// kind from the library, so a member that reads `stdout` THROUGH THE GOT reaches
+// the link as a `FromLibrary` datum. Only a DIRECT code reference to a library
+// datum needs a copy relocation (the refusal above): a GOT load reads the
+// loader-filled slot, and a data item's pointer is a row against the symbol,
+// which the loader fills. Until P69 every `FromLibrary` datum was refused,
+// whatever named it, so both of these were refused.
+
+namespace {
+
+// One unit whose `main` reaches `ext` through the target row `kindName` with
+// `addend` — in code, or (`fromData`) from a data item's pointer.
+AssembledModule unitReaching(Schemas const& s, ExternImport ext, std::string_view kindName,
+                             std::int64_t addend, bool fromData) {
+    AssembledModule m;
+    m.cuId              = CompilationUnitId{1};
+    m.expectedFuncCount = 1;
+    auto const* row = s.target->relocationByName(std::string{kindName});
+    EXPECT_NE(row, nullptr) << kindName;
+    RelocationKind const kind = row != nullptr ? row->kind : RelocationKind{};
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // `movq <ext>(%rip)`-shaped (a load through the field), then `ret`.
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    if (!fromData) fn.relocations.push_back(Relocation{3u, ext.symbol, kind, addend});
+    m.functions.push_back(std::move(fn));
+    if (fromData) {
+        AssembledData d;
+        d.symbol    = SymbolId{2};
+        d.section   = DataSectionKind::Data;
+        d.bytes.assign(8, 0);
+        d.alignment = Alignment::ofRuntimePow2(8);
+        d.relocations.push_back(Relocation{0u, ext.symbol, kind, addend});
+        m.dataItems.push_back(std::move(d));
+        m.symbols.push_back(ModuleSymbol{SymbolId{2}, "slot_of_the_datum", SymbolBinding::Global,
+                                         SymbolVisibility::Default});
+    }
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, "main", SymbolBinding::Global,
+                                     SymbolVisibility::Default});
+    m.userEntrySymbol = SymbolId{1};
+    m.externImports.push_back(std::move(ext));
+    return m;
+}
+
+std::string allErrors(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) out += "\n  " + d.actual;
+    return out;
+}
+
+// ── reading the linked ELF image back (P69 round 4, review-xa3 NIT 10) ────
+// What the image ITSELF says: the address `.symtab` gives a function (an
+// image's `.symtab` lists its functions), the bytes a loaded address holds, and
+// the rows the loader applies.
+
+[[nodiscard]] std::uint64_t le(std::vector<std::uint8_t> const& b, std::uint64_t off, int width) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < width; ++i) v |= static_cast<std::uint64_t>(b.at(off + i)) << (i * 8);
+    return v;
+}
+
+struct ElfImageSection {
+    std::string   name;
+    std::uint32_t type = 0;
+    std::uint64_t addr = 0, offset = 0, size = 0;
+    std::uint32_t link = 0;
+};
+
+[[nodiscard]] std::string cstr(std::vector<std::uint8_t> const& b, std::uint64_t off) {
+    std::string s;
+    for (std::uint64_t p = off; p < b.size() && b[p] != 0; ++p) s.push_back(static_cast<char>(b[p]));
+    return s;
+}
+
+[[nodiscard]] std::vector<ElfImageSection> sectionsOf(std::vector<std::uint8_t> const& b) {
+    std::uint64_t const shoff    = le(b, 40, 8);
+    auto const          shnum    = static_cast<std::uint16_t>(le(b, 60, 2));
+    auto const          shstrndx = static_cast<std::uint16_t>(le(b, 62, 2));
+    std::uint64_t const strOff   = le(b, shoff + shstrndx * 64ull + 24, 8);
+    std::vector<ElfImageSection> out;
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::uint64_t const o = shoff + i * 64ull;
+        ElfImageSection s;
+        s.name   = cstr(b, strOff + le(b, o, 4));
+        s.type   = static_cast<std::uint32_t>(le(b, o + 4, 4));
+        s.addr   = le(b, o + 16, 8);
+        s.offset = le(b, o + 24, 8);
+        s.size   = le(b, o + 32, 8);
+        s.link   = static_cast<std::uint32_t>(le(b, o + 40, 4));
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+constexpr std::uint32_t kShtRela   = 4;
+constexpr std::uint32_t kShtNobits = 8;
+
+[[nodiscard]] std::optional<std::uint64_t> functionAddress(std::vector<std::uint8_t> const& b, std::string_view name) {
+    auto const secs = sectionsOf(b);
+    for (auto const& s : secs) {
+        if (s.name != ".symtab" || s.link >= secs.size()) continue;
+        auto const& strtab = secs[s.link];
+        for (std::uint64_t p = 24; p + 24 <= s.size; p += 24) {
+            if (cstr(b, strtab.offset + le(b, s.offset + p, 4)) == name) return le(b, s.offset + p + 8, 8);
+        }
+    }
+    return std::nullopt;
+}
+
+// The loaded section holding `va`, if any.
+[[nodiscard]] std::optional<ElfImageSection> sectionHolding(std::vector<std::uint8_t> const& b, std::uint64_t va) {
+    for (auto const& s : sectionsOf(b)) {
+        if (s.addr != 0 && va >= s.addr && va < s.addr + s.size) return s;
+    }
+    return std::nullopt;
+}
+
+// The `width` bytes the image loads at `va` (a NOBITS section's are zero).
+[[nodiscard]] std::optional<std::uint64_t> loadedValue(std::vector<std::uint8_t> const& b, std::uint64_t va,
+                                                       int width) {
+    auto const s = sectionHolding(b, va);
+    if (!s.has_value()) return std::nullopt;
+    if (s->type == kShtNobits) return 0u;
+    return le(b, s->offset + (va - s->addr), width);
+}
+
+struct DynamicRow {
+    std::uint64_t offset = 0;
+    std::uint32_t type   = 0;
+    std::string   symbol;
+    std::int64_t  addend = 0;
+};
+
+// Every RELA row the loader applies (each SHT_RELA section whose symbols are `.dynsym`'s), its symbol named.
+[[nodiscard]] std::vector<DynamicRow> dynamicRows(std::vector<std::uint8_t> const& b) {
+    auto const secs = sectionsOf(b);
+    std::vector<DynamicRow> out;
+    for (auto const& s : secs) {
+        if (s.type != kShtRela || s.link >= secs.size() || secs[s.link].name != ".dynsym") continue;
+        auto const& dynsym = secs[s.link];
+        if (dynsym.link >= secs.size()) continue;
+        auto const& dynstr = secs[dynsym.link];
+        for (std::uint64_t p = 0; p + 24 <= s.size; p += 24) {
+            std::uint64_t const info = le(b, s.offset + p + 8, 8);
+            DynamicRow r;
+            r.offset = le(b, s.offset + p, 8);
+            r.type   = static_cast<std::uint32_t>(info & 0xFFFFFFFFu);
+            r.addend = static_cast<std::int64_t>(le(b, s.offset + p + 16, 8));
+            if (auto const sym = info >> 32; sym != 0) {
+                r.symbol = cstr(b, dynstr.offset + le(b, dynsym.offset + sym * 24, 4));
+            }
+            out.push_back(std::move(r));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(ImportKindFromDefinition, ALibraryDatumReadThroughTheGotIsNotRefused) {
+    auto const s = shipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(s.target && s.format);
+    // `movq stdout@GOTPCREL(%rip), %rax`: R_X86_64_REX_GOTPCRELX, wire addend -4.
+    auto const m = unitReaching(
+        s, importRow("stdout", "libc.so.6", ExternKindOrigin::FromLibrary, true),
+        "rex_gotpcrelx32", -4, /*fromData=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(m, *s.target, *s.format, rep);
+    EXPECT_TRUE(withCode(rep, DiagnosticCode::K_ImportReferenceUnbindable).empty()) << allErrors(rep);
+    EXPECT_TRUE(image.ok()) << allErrors(rep);
+}
+
+TEST(ImportKindFromDefinition, ALibraryDatumNamedOnlyByADataSlotIsNotRefused) {
+    auto const s = shipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(s.target && s.format);
+    // `.quad stdout` in a data item: a row against the symbol, which the loader fills.
+    auto const m = unitReaching(
+        s, importRow("stdout", "libc.so.6", ExternKindOrigin::FromLibrary, true),
+        "abs64", 0, /*fromData=*/true);
+    DiagnosticReporter rep;
+    auto const image = linker::link(m, *s.target, *s.format, rep);
+    EXPECT_TRUE(withCode(rep, DiagnosticCode::K_ImportReferenceUnbindable).empty()) << allErrors(rep);
+    ASSERT_TRUE(image.ok()) << allErrors(rep);
+    // ...and the slot IS that row (review-xa3 NIT 10): ONE loader row fills the data item's slot in `.data`, against
+    // `stdout` itself — R_X86_64_64, addend 0 — over a slot the file holds as 0, so what the program reads there is
+    // what the loader writes: the datum's address, never the image's own slot for it (an R_X86_64_RELATIVE there
+    // would bake in that slot's address). The import's own GOT slot is another row and another section.
+    std::vector<DynamicRow> atData;
+    for (auto const& r : dynamicRows(image.bytes)) {
+        auto const holder = sectionHolding(image.bytes, r.offset);
+        if (holder.has_value() && holder->name == ".data") atData.push_back(r);
+    }
+    ASSERT_EQ(atData.size(), 1u) << "one loader row fills the data item's slot";
+    EXPECT_EQ(atData[0].symbol, "stdout") << "against the datum itself";
+    EXPECT_EQ(atData[0].type, 1u) << "R_X86_64_64: the loader writes the datum's address";
+    EXPECT_EQ(atData[0].addend, 0);
+    EXPECT_EQ(loadedValue(image.bytes, atData[0].offset, 8), std::optional<std::uint64_t>{0u})
+        << "the slot holds nothing until the loader fills it";
+}
+
+// ── a WEAK reference that states no kind, resolved to nothing ─────────────
+//
+// An image resolves a weak symbol nothing defines to NOTHING, whose value is 0.
+// A unit that reads the name through a GOT slot (`cmpq $0, w@GOTPCREL(%rip)`,
+// the glibc idiom) reads a slot holding 0 whatever the kind; a DIRECT reference
+// computes its field from 0 where the image lets that field reach it — an
+// ET_EXEC image sits at its link address, so `leaq w(%rip)` reaches 0 there —
+// and is refused by name where it does not (a PIE, which the loader moves).
+// Until P69 an object's untyped weak symbol was taken as DATA and resolved to
+// the null slot whatever reached it, and then (round 3) refused when named
+// directly; the per-field rule is pinned in test_weak_resolved_to_nothing.cpp
+// (D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO).
+
+TEST(ImportKindFromDefinition, AWeakReferenceThatStatesNoKindReachedThroughTheGotResolvesToNothing) {
+    auto const s = shipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(s.target && s.format);
+    auto row = importRow("weak_nobody", "", ExternKindOrigin::Pending, false);
+    row.binding = SymbolBinding::Weak;
+    auto const m = unitReaching(s, std::move(row), "gotpcrel32", -5, /*fromData=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(m, *s.target, *s.format, rep);
+    EXPECT_FALSE(rep.hasErrors()) << allErrors(rep);
+    ASSERT_TRUE(image.ok()) << allErrors(rep);
+    // ...and the slot it reads holds 0, which no loader row fills (review-xa3 NIT 10). `gotpcrel32` is SLOT + A - P,
+    // bias 0, with A = -5 here, so `main`'s patched displacement names the slot at P + disp + 5.
+    auto const mainAt = functionAddress(image.bytes, "main");
+    ASSERT_TRUE(mainAt.has_value());
+    std::uint64_t const field = *mainAt + 3;
+    auto const disp = loadedValue(image.bytes, field, 4);
+    ASSERT_TRUE(disp.has_value());
+    std::uint64_t const slot =
+        field + static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(*disp)) + 5);
+    auto const holder = sectionHolding(image.bytes, slot);
+    ASSERT_TRUE(holder.has_value()) << "the displacement names a slot the image loads";
+    EXPECT_NE(holder->name, ".text") << "a slot, not code";
+    EXPECT_EQ(loadedValue(image.bytes, slot, 8), std::optional<std::uint64_t>{0u}) << "the slot holds 0";
+    for (auto const& r : dynamicRows(image.bytes)) {
+        EXPECT_NE(r.offset, slot) << "no loader row fills the weak slot (row type " << r.type << ", '" << r.symbol
+                                  << "')";
+    }
+}
+
+TEST(ImportKindFromDefinition, AWeakReferenceThatStatesNoKindNamedDirectlyReachesZeroInAnExec) {
+    auto const s = shipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(s.target && s.format);
+    auto row = importRow("weak_nobody", "", ExternKindOrigin::Pending, false);
+    row.binding = SymbolBinding::Weak;
+    auto const m = unitReaching(s, std::move(row), "riprel32", 0, /*fromData=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(m, *s.target, *s.format, rep);
+    EXPECT_FALSE(rep.hasErrors()) << allErrors(rep);
+    EXPECT_TRUE(image.ok()) << allErrors(rep);
+}
+
+TEST(ImportKindFromDefinition, AWeakReferenceThatStatesNoKindNamedDirectlyIsRefusedInAPie) {
+    auto const s = shipped("elf64-x86_64-linux-pie");
+    ASSERT_TRUE(s.target && s.format);
+    auto row = importRow("weak_nobody", "", ExternKindOrigin::Pending, false);
+    row.binding = SymbolBinding::Weak;
+    auto const m = unitReaching(s, std::move(row), "riprel32", 0, /*fromData=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(m, *s.target, *s.format, rep);
+    auto const refused = withCode(rep, DiagnosticCode::K_SymbolUndefined);
+    ASSERT_EQ(refused.size(), 1u) << allErrors(rep);
+    EXPECT_TRUE(mentions(refused[0], "'weak_nobody'")) << refused[0].actual;
+    EXPECT_TRUE(mentions(refused[0], "names it DIRECTLY")) << refused[0].actual;
+    EXPECT_TRUE(mentions(refused[0], "a PC-relative field")) << refused[0].actual;
     EXPECT_FALSE(image.ok());
 }
 

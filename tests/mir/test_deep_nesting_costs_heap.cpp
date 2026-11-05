@@ -203,6 +203,8 @@ constexpr std::size_t kProbeBudgetFactor = std::size_t{1} << 20;
 
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     mirCfg.aggregateLayout       = target->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target->aggregateLayoutLoaded();
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
@@ -801,7 +803,7 @@ TEST(HirToMirSehDeepNesting, NestedTryExceptRegionsCostHeapNotCallFrames) {
 TEST(MirTextDeepNesting, DeeplyNestedTypeParsesBackOnAnOrdinaryThread) {
     constexpr int kDepth = 4000;   // 4x the MEASURED pre-fix crash floor (1000)
 
-    std::string text = "dssir 3\nmodule {\n  global %1 : ";
+    std::string text = "dssir 7\nmodule {\n  global %1 : ";
     for (int i = 0; i < kDepth; ++i) text += "ptr<";
     text += "i32";
     for (int i = 0; i < kDepth; ++i) text += ">";
@@ -850,7 +852,7 @@ TEST(MirTextDeepNesting, DeeplyNestedTypeParsesBackOnAnOrdinaryThread) {
 TEST(MirTextDeepNesting, DeeplyNestedLiteralParsesBackOnAnOrdinaryThread) {
     constexpr int kDepth = 4000;   // 2.6x the recursive reader's crash floor
                                    // (1500) AND 2x the pre-fix destructor wall
-    std::string text = "dssir 3\nmodule {\n  global %1 : i64 = ";
+    std::string text = "dssir 7\nmodule {\n  global %1 : i64 = ";
     for (int i = 0; i < kDepth; ++i) text += "lit agg { ";
     text += "lit int 7 : i64";
     for (int i = 0; i < kDepth; ++i) text += " } : i64";

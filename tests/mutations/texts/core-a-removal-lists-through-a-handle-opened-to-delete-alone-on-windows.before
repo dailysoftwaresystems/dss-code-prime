@@ -1,0 +1,1 @@
+constexpr ACCESS_MASK kDirectoryRemovalAccess = kRemovalAccess | FILE_LIST_DIRECTORY;

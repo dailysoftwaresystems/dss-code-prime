@@ -1,0 +1,4 @@
+        std::optional<RuleId> const scanned = tree.ruleIfInternal(c);
+        if (!scanned.has_value()) continue;
+        RuleId const cr = *scanned;
+        // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the bare-`[*]` suffix is a THIRD

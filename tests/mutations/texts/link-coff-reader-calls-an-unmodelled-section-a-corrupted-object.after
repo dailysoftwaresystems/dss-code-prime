@@ -1,0 +1,2 @@
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: defined symbol '" + defs[k].name

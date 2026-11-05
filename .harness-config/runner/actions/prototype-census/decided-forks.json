@@ -1,0 +1,25 @@
+{
+  "purpose": "VALUES on which two references' headers of ONE pair disagree, DECIDED: which header is the pair's authority, with both values recorded. The census's values step reads an entry as `decided` only while BOTH recorded values still hold; a value that moved, on either side, fails the step and names the entry, so the decision is read again. This is data, never a skip: a name this table does not hold whose two values differ is a MISMATCH and fails the step. One entry per (format, dialect, header, name) -- the object format of the leg's pair, the dialect of the reference that disagrees (clang, gcc or msvc, as prototype-census.py reads it from the compiler), the header and the name.",
+  "decided": [
+    {
+      "format": "pe",
+      "dialect": "gcc",
+      "header": "stdio.h",
+      "name": "L_tmpnam",
+      "reference": 14,
+      "dss": 260,
+      "authority": "the UCRT's own <stdio.h>, the Windows SDK's, which cl reads: `#define L_tmpnam 260 // _MAX_PATH`",
+      "reason": "DSS's pe target binds the UCRT and a buffer size describes the linked library, so the value follows that library's own header, while mingw-w64's <stdio.h> gives `sizeof(_P_tmpdir) + 12` whatever runtime its gcc targets -- and the MinGW leg's gcc targets the UCRT too (MEASURED 2026-10-08: `_UCRT` defined, `__MSVCRT_VERSION__` 0xE00, the UCRT's API sets imported)."
+    },
+    {
+      "format": "pe",
+      "dialect": "gcc",
+      "header": "stdio.h",
+      "name": "TMP_MAX",
+      "reference": 32767,
+      "dss": 2147483647,
+      "authority": "the UCRT's own <stdio.h>, the Windows SDK's, which cl reads: `#define TMP_MAX _CRT_INT_MAX`, 2147483647 -- the header Microsoft's document \"_tempnam, _wtempnam, tmpnam, _wtmpnam\" defers to for this value (\"see STDIO.H\")",
+      "reason": "DSS's pe target binds the UCRT and a limit describes the linked library, so the value follows that library's own header, while mingw-w64's <stdio.h> defines 32767 under no conditional on the runtime -- and the MinGW leg's gcc targets the UCRT too (MEASURED 2026-10-08, as for L_tmpnam)."
+    }
+  ]
+}

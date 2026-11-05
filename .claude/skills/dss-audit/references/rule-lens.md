@@ -35,7 +35,9 @@ This is where the auditor earns its keep. Each entry: the **class**, its **tell*
 4. **Asserted-not-proven guard (the missing red-on-disable).** A correctness mechanism exists in
    `src/` but no test forces it to matter. *Tell:* the mechanism is present and the schema/constraint
    is tested, but no *behavior* test exercises the failure it prevents. *Disproof:* a pin that goes
-   **red when the guard is disabled** — watched, not asserted. (The regalloc implicit-clobber exclusion
+   **red when the guard is disabled** — watched, not asserted: an ARM of `tests/mutations/arms.registry`
+   that `dssharness check-mutations` reads `passed` on the bytes under audit. A pin with no arm, or one
+   whose arm was read on other bytes, is still asserted-not-proven. (The regalloc implicit-clobber exclusion
    had the mechanism + a schema test but no behavior pin until a vreg-live-across-the-op test with a
    demonstrated red-on-disable.)
 
@@ -53,11 +55,23 @@ This is where the auditor earns its keep. Each entry: the **class**, its **tell*
 7. **Cross-platform / CI blind spot.** Local-green that is CI-red. *Tell:* MSVC builds clean but a
    header (`<format>`, `<span>`, `<algorithm>`, `<cstdint>`) is used without explicit include (MSVC's
    transitive includes mask it; GCC/Clang don't); gtest `ASSERT_*` in a non-void helper. *Disproof:*
-   only CI confirms it — the auditor **flags it unverified** (§K), never claims green it cannot run.
+   the eight-run gate (`dssharness test --legs gate`) builds with gcc, clang and MSVC on its four legs,
+   and CI's verdicts are read with `dssharness check-ci-legs`; what neither shows the auditor **flags
+   unverified** (§K), never claims green it did not observe.
 
 8. **Over-claimed close.** An anchor marked fully closed when only part of its stated scope landed.
    *Tell:* the registry/anchor text describes more than the commit delivered. *Disproof:* read the
    anchor's *stated scope* and confirm the work satisfies all of it; otherwise it is a **partial**
    close with the remainder re-anchored — not a strike.
+
+9. **Instance closure — the class left open.** A fix correct for the reported case, made where it was seen,
+   while the same decision is taken at other sites. *Tell:* the diff touches one site and the closing names a
+   case (one format, one target, one form) rather than a universe; the same theme appears in earlier commit
+   subjects of the round; a path edited five or more times in the round; the pin lists the reported case by
+   hand. *Disproof:* search the DATA (the kind, the schema key, the diagnostic) across every tier, format and
+   target and compare with the lane's site list; pick two cells of the universe the pin does not name, plus the
+   optimized form of the same source, and measure them on DSS and on each reference. A site left deciding the
+   same thing, or a neighbour that fails, is green-but-rule-breaking. The lane's class-closure record must exist
+   and be searched by data (`dss-cycle` `references/class-closure.md`).
 
 ---

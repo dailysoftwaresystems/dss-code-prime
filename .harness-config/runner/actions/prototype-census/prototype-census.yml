@@ -1,36 +1,48 @@
-# PURPOSE: judge every prototype DSS ships against the TYPE the leg's own platform header gives it — twice, by DSS's own `_Generic` and by the leg's reference compiler — and keep a per-symbol report, so a shipped prototype's identity is MEASURED, never assumed.
+# PURPOSE: judge every prototype and every integer value DSS ships against the leg's own platform header — each prototype twice, by DSS's own `_Generic` and by the leg's reference compiler, each value by what both sides' preprocessors define — and keep a per-name report, so a shipped prototype's identity and a shipped constant's value are MEASURED, never assumed.
 name: prototype-census
 description: >-
-  Over every `symbols` row of the tree's shipped descriptors that the leg's pair sees, two verdicts per symbol: (a)
-  DSS judges its own prototype against the type the reference compiler spells for the platform header, with its
-  own `_Generic`, in a program the leg's dsscp builds for the leg's own pair and runs there; (b) the reference
-  compiler judges the descriptor's text, rendered to C with typedef names kept, against its real header. Each judge
-  is blind where the other sees (the program's header says where), so the report keeps both, and a symbol they
-  disagree on is a finding of its own. Built 2026-09-25 (P68 round 12, lane `lm`) to prove S2a's descriptor type
-  identity and to measure S2c's prototype-shape class. It needs the leg's BUILT dsscp (`{product}`) — run it after
-  `dssharness build` on the leg. The program documents itself in its own header; this file declares only how a runner
-  starts it and what witnesses that it ran. Bring the kept report back with
-  `dssharness sync --legs <leg> --pull <its path>`.
+  Over every row of the tree's shipped descriptors that the leg's own pair sees. PROTOTYPES (the census step): two
+  verdicts per `symbols` row — (a) DSS judges its own prototype against the type the reference compiler spells for the
+  platform header, with its own `_Generic`, in a program the leg's dsscp builds for the leg's own pair and runs there;
+  (b) the reference compiler judges the descriptor's text, rendered to C with typedef names kept, against its real
+  header. VALUES (the values step): every integer constant and integer-literal macro the descriptors define, printed
+  by a program the reference compiler and the leg's dsscp each build and run; a name both define with different values
+  fails the step, unless the fork is a DECIDED one — an entry of `decided-forks.json`, beside the program, whose two
+  recorded values both still hold. The leg's pair is DERIVED (the host's executable format, the harness's {processor}, the tree's
+  object-format documents) and the reference's dialect is read from the compiler itself (clang's or gcc's --version
+  banner, the banner MSVC's cl prints when run with no arguments), never from its name; each dialect carries its own
+  standard mode and options. Built 2026-09-25 (P68 round 12, lane `lm`); the values step and the derived pair
+  2026-09-30 (P69); cl's dialect 2026-10-07 (P69, lane `hm`). It needs the leg's BUILT dsscp: every step names
+  `{product}`, so DssHarness builds each leg before it runs, whichever runner starts it (`help runners`). The program
+  documents itself in its own header; this file declares only how a runner starts it and what witnesses that it ran.
+  Bring a kept report back with `dssharness sync --legs <leg> --pull <its path>`.
 inputs:
   cc:
-    description: "the reference C compiler, a bare program name on the host's PATH — clang, whose refusal spells the header's type in the (aka …) form verdict (a) reads"
-    default: 'clang'
+    description: "the reference C compiler, a program name on the host's PATH or a path — `cc`, the host's own, by default. It is the leg's own compiler on Linux and macOS, where `cc` is the toolchain's; neither Windows leg has a `cc`, and a run step cannot be handed the leg's toolchain compiler (DssHarness 0.6.10 hands a run step neither the toolchain's env nor a compiler name), so a run there names it: `--input cc=gcc` on windows-x86_64-debug, `--input cc=cl` on windows-x86_64-release. Its dialect (clang, gcc or MSVC's cl) is read from the compiler itself; any other compiler is refused by name"
+    default: 'cc'
   flags:
-    description: 'comma-separated reference flags (each percent-decoded; a comma inside one flag is %2C)'
-    default: '-std=gnu2x,-D_GNU_SOURCE'
+    description: "comma-separated flags ADDED to the dialect's own (gcc and clang `-std=gnu2x -D_GNU_SOURCE`, cl `/std:clatest`), in the reference's own spelling; the program percent-decodes each one, so a comma inside one flag is written %2C"
+    default: ''
   only:
-    description: 'one header to census, e.g. string.h (empty = every header the pair sees)'
+    description: 'the census step only: one header to census, e.g. string.h (empty = every header the pair sees)'
     default: ''
 steps:
   - name: self-test
     workingDirectoryRoot: action
     run: |
-      python3 ./prototype-census.py --selftest --tree="{treeDir}" --os="{os}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}"
+      python3 ./prototype-census.py --selftest --tree="{treeDir}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}"
     successPattern: 'prototype-census: SELFTEST OK '
   - name: census
     workingDirectoryRoot: action
     run: |
-      python3 ./prototype-census.py --tree="{treeDir}" --os="{os}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}" --only="{only}" --out="{stepBuild}/prototype-census.tsv"
+      python3 ./prototype-census.py --tree="{treeDir}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}" --only="{only}" --out="{stepBuild}/prototype-census.tsv"
     outputs: [prototype-census.tsv]
     persist: true
     successPattern: 'prototype-census: OK '
+  - name: values
+    workingDirectoryRoot: action
+    run: |
+      python3 ./prototype-census.py --values --tree="{treeDir}" --processor="{processor}" --dsscp="{product}" --cc="{cc}" --flags="{flags}" --out="{stepBuild}/prototype-census-values.tsv"
+    outputs: [prototype-census-values.tsv]
+    persist: true
+    successPattern: 'prototype-census: VALUES OK '

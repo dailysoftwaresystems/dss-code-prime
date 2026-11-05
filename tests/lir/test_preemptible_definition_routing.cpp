@@ -42,6 +42,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -98,8 +99,12 @@ lowerFixture(TargetSchema const& sch, DiagnosticReporter& rep,
                                      CallConv::CcSysV);
 
     MirBuilder mb;
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED (the symbol-id door
+    // refuses to mint past an end nobody stated).
+    mb.stateSelfContainedSymbolIds();
     auto addLeaf = [&](std::uint32_t sym, SymbolBinding b, SymbolVisibility v) {
-        mb.addFunction(sig, SymbolId{sym}, b, v);
+        mb.addFunction(sig, SymbolId{sym}, dss::test_support::linkageOf(b, v));
         auto const bb = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(bb);
         MirLiteralValue lv;

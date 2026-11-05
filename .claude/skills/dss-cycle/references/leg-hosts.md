@@ -38,9 +38,14 @@ and report the result as the cycle's.
 - **A push is a SYNC, never an accumulation.** `dssharness sync` deletes what the source no
   longer has and verifies the copy afterwards — one transport, every host. A transport that only
   adds is a transport that silently diverges.
-- **Worktrees are excluded at the transport, on BOTH carriages.** An agent worktree never
-  belongs on a gate host. ⓘ rsync does NOT delete excluded paths, so adding the exclude does
-  not clean a host that already holds one — that needs an explicit removal, once.
+- **Worktrees are withheld at the transport.** An agent worktree never belongs on a gate host's repo
+  copy: `dssharness sync` never carries `.worktrees/` or `.orchestrators/`, and never deletes on a host a
+  path it does not manage — so withholding one does not clean a host that already holds one (that needs an
+  explicit removal, once), and a directory deleted here whose host copy still holds ignored files stays
+  there, named in sync's WARN (✔MEASURED 2026-09-29: the retired `lane-fold/` stayed on the WSL copy,
+  holding only an empty `build/` directory, and was removed once, by `rmdir`). A lane's OWN host copy
+  (`<repo path>.worktree-<o>--<a>`, its name in the tool's source; made when its legs run) sits beside the repo, is recorded by
+  DssHarness, and goes with `delete-agent`; `list-worktree --hosts` shows every such copy.
 - **The cleanup is the CYCLE's job, not a thing to notice later.** Before a leg is trusted,
   the host holds the repo and nothing else.
 
@@ -110,8 +115,8 @@ makes every git-reading guard a coin flip, and the flip is invisible from the dr
 ✔MEASURED 2026-08-26: both remote hosts carried a registered, `prunable` `dss-probe-6f4aab73`
 worktree from a cycle that never cleaned up — and it **survived the operator's own manual pass**,
 because a stale worktree registration lives in `.git/worktrees/` and **never appears in
-`git status`**. A parallel lane may take a worktree on a leg host; the lane that takes it owns
-removing it.
+`git status`**. A lane's copies on the leg hosts are removed by `delete-agent` with its worktree, and a
+probe's by `delete-worktree`; whoever created one owns removing it.
 
 ⚠ **AND THE TILDE DOES NOT EXPAND.** ✔MEASURED against the live VPS on the first run: every leg
 names its repo `~/src/…`, and `cd "$var"` does **not** expand a tilde held in a variable — `~` is

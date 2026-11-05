@@ -1,0 +1,2 @@
+            && aLen[0] != kIncompleteArrayLength
+            && bLen[0] != kIncompleteArrayLength) {

@@ -1,0 +1,2 @@
+        // root included — the twin of `subtreeContainsToken`'s stop.
+        if (false && isAttributeSpecifierNode(tree, cur)) {

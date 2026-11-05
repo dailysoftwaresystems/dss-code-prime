@@ -30,9 +30,13 @@
 // SUBPROCESS), so a shared home that needed either of those would not be shared.
 //
 // ⚠ INCLUDED BY RELATIVE PATH by both consumers, for the reason
-// `arm_verdict_ledger.hpp` states in its own header: `integrated_tests` carries
-// ONLY `tests/test_support` on its include path — no `src/` — because it links
-// no DSS library at all.
+// `arm_verdict_ledger.hpp` states in its own header. `integrated_tests` links no
+// DSS library at all; it compiles ONE host-substrate unit,
+// `src/core/substrate/path_identity.cpp`, whose walk this staging asks (below),
+// and reaches its header through `src/` -- nothing else of the compiler.
+
+#include "core/substrate/path_identity.hpp"   // walkTree: never follows a link, on any build
+#include "os_link.hpp"                         // the self-test's link, made by the OS
 
 #include <filesystem>
 #include <fstream>
@@ -94,22 +98,16 @@ namespace fs = std::filesystem;
 // examples/README.md documents that contract on the corpus side.
 [[nodiscard]] inline std::string stageExampleTree(fs::path const& srcDir,
                                                   fs::path const& dstDir) {
-    std::error_code ec;
-    fs::recursive_directory_iterator it{srcDir, fs::directory_options::none,
-                                        ec};
-    fs::recursive_directory_iterator const walkEnd{};
-    // The `ec` test comes BEFORE the end test deliberately: a failed
-    // `increment` is permitted to leave the iterator EQUAL to end(), so a loop
-    // that asked "am I finished?" first would read a walk error as a completed
-    // walk and report success over a tree it never got to the bottom of.
-    while (true) {
-        if (ec) {
-            return "cannot walk the example directory '"
-                 + srcDir.generic_string() + "': " + ec.message();
-        }
-        if (it == walkEnd) break;
-
-        fs::path const from = it->path();
+    // THE SUBSTRATE'S WALK (`dss::core::walkTree`), never
+    // `recursive_directory_iterator`: it never descends a link, and it tells a
+    // link from what it reaches on EVERY build. ✔MEASURED 2026-10-20 (the
+    // substrate's header): libstdc++ on Windows cannot -- its `is_symlink` is never
+    // true -- so the refusal of a SYMLINKED directory below never fired on the
+    // MinGW build, which descended the link and staged what it reached instead.
+    // A walk error ENDS the staging, named, before anything is reported done.
+    std::string failure;
+    auto const  walk = dss::core::walkTree(srcDir, [&](dss::core::TreeEntry const& entry) {
+        fs::path const& from = entry.path;
         // LEXICALLY relative, not `fs::relative`: the latter runs both paths
         // through `weakly_canonical`, which touches the filesystem and RESOLVES
         // SYMLINKS — so a repo reached through a symlinked path would have its
@@ -118,71 +116,66 @@ namespace fs = std::filesystem;
         // the exact one, needs no syscall, and cannot fail for an I/O reason.
         fs::path const rel = from.lexically_relative(srcDir);
         if (rel.empty()) {
-            return "cannot express '" + from.generic_string()
-                 + "' relative to '" + srcDir.generic_string()
-                 + "': the walk yielded an entry outside the tree it is walking";
+            failure = "cannot express '" + from.generic_string()
+                    + "' relative to '" + srcDir.generic_string()
+                    + "': the walk yielded an entry outside the tree it is walking";
+            return dss::core::WalkStep::Stop;
         }
-        fs::path const to = dstDir / rel;
+        fs::path const  to = dstDir / rel;
+        std::error_code ec;
 
-        bool const isDir = it->is_directory(ec);
-        if (ec) {
-            return "cannot stat '" + from.generic_string() + "': "
-                 + ec.message();
-        }
-        if (isDir) {
-            bool const isLink = it->is_symlink(ec);
-            if (ec) {
-                return "cannot stat '" + from.generic_string() + "': "
-                     + ec.message();
-            }
-            if (isLink) {
-                return "refusing to stage the SYMLINKED directory '"
-                     + from.generic_string()
-                     + "': the walk deliberately does not descend through a"
-                       " symlink (a cycle would never terminate), so staging"
-                       " it would create an EMPTY directory here and drop"
-                       " everything under it without a word";
-            }
+        if (entry.kind == dss::core::EntryKind::Directory) {
             // Created EAGERLY rather than on demand from the first file found
             // inside it, so that an example may ship an intentionally EMPTY
             // directory (an output dir its program writes into) and still find
             // it waiting in the scratch tree.
             fs::create_directories(to, ec);
             if (ec) {
-                return "cannot create the staged directory '"
-                     + to.generic_string() + "': " + ec.message();
+                failure = "cannot create the staged directory '"
+                        + to.generic_string() + "': " + ec.message();
+                return dss::core::WalkStep::Stop;
             }
-            it.increment(ec);
-            continue;
+            return dss::core::WalkStep::Continue;
         }
-
-        bool const isFile = it->is_regular_file(ec);
-        if (ec) {
-            return "cannot stat '" + from.generic_string() + "': "
-                 + ec.message();
+        if (entry.kind == dss::core::EntryKind::Link
+            && entry.reaches == dss::core::EntryKind::Directory) {
+            failure = "refusing to stage the SYMLINKED directory '"
+                    + from.generic_string()
+                    + "': the walk deliberately does not descend through a"
+                      " symlink (a cycle would never terminate), so staging"
+                      " it would create an EMPTY directory here and drop"
+                      " everything under it without a word";
+            return dss::core::WalkStep::Stop;
         }
-        if (!isFile) {
-            return "refusing to silently skip '" + from.generic_string()
-                 + "': it is neither a directory nor a regular file, and a"
-                   " dropped input is the confusing missing-file error this"
-                   " staging exists to prevent";
+        if (entry.reaches != dss::core::EntryKind::File) {
+            failure = "refusing to silently skip '" + from.generic_string()
+                    + "': it is neither a directory nor a regular file, and a"
+                      " dropped input is the confusing missing-file error this"
+                      " staging exists to prevent";
+            return dss::core::WalkStep::Stop;
         }
-        if (rel.generic_string() == "expected.json") {
-            it.increment(ec);
-            continue;
-        }
+        if (rel.generic_string() == "expected.json") return dss::core::WalkStep::Continue;
 
         fs::create_directories(to.parent_path(), ec);
         if (ec) {
-            return "cannot create the staged directory '"
-                 + to.parent_path().generic_string() + "': " + ec.message();
+            failure = "cannot create the staged directory '"
+                    + to.parent_path().generic_string() + "': " + ec.message();
+            return dss::core::WalkStep::Stop;
         }
         fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
         if (ec) {
-            return "cannot stage '" + rel.generic_string() + "' into '"
-                 + dstDir.generic_string() + "': " + ec.message();
+            failure = "cannot stage '" + rel.generic_string() + "' into '"
+                    + dstDir.generic_string() + "': " + ec.message();
+            return dss::core::WalkStep::Stop;
         }
-        it.increment(ec);
+        return dss::core::WalkStep::Continue;
+    });
+    if (!failure.empty()) return failure;
+    if (walk.error) {
+        return "cannot walk the example directory '" + srcDir.generic_string()
+             + "': " + walk.error.message()
+             + (walk.where == srcDir ? std::string{}
+                                     : " (at '" + walk.where.generic_string() + "')");
     }
     return {};
 }
@@ -231,10 +224,12 @@ namespace fs = std::filesystem;
     fs::path const dst = sandbox / "staged";
     // A rerun must not inherit a stale tree, or a file left behind by the
     // PREVIOUS run would satisfy an assertion this run's staging never met.
-    fs::remove_all(sandbox, ec);
-    if (ec) {
+    // The substrate's removal: the sandbox holds the link planted below, which
+    // libstdc++'s `remove_all` on Windows would follow.
+    if (auto const cleared = dss::core::removeTree(sandbox); cleared.failures != 0) {
         return "self-test sandbox '" + sandbox.generic_string()
-             + "' could not be cleared: " + ec.message();
+             + "' could not be cleared: '" + cleared.firstPath.generic_string()
+             + "': " + cleared.firstError.message();
     }
 
     auto const plant = [&](char const* rel, char const* body) -> bool {
@@ -322,6 +317,30 @@ namespace fs = std::filesystem;
         fail("staging a MISSING source directory failed without NAMING it,"
              " which is the half of the diagnostic the reader needs: "
              + absentErr);
+    }
+
+    // The refusal of a SYMLINKED directory, on every build: a directory link in
+    // an example must be REFUSED by name, never descended and staged as the
+    // directory it reaches. The link is made by the OS (`os_link.hpp`): the MinGW
+    // build's library can neither make one nor see one, and that build is the
+    // one whose staging went through the link.
+    fs::path const linked = sandbox / "linked-example";
+    fs::create_directories(linked, ec);
+    if (std::error_code const linkEc = dss::test_support::makeSymbolicLink(
+            src / "dep_module", linked / "dep_link", dss::test_support::LinkTo::Directory)) {
+        fail("the OS refused to make the directory link the symlink arm stages ("
+             + linkEc.message() + "), so that arm did not run, which is no pass");
+    } else {
+        std::string const linkErr = stageExampleTree(linked, sandbox / "linked-staged");
+        if (linkErr.find("SYMLINKED directory") == std::string::npos) {
+            fail("staging an example holding a directory LINK did not refuse it by"
+                 " name (it reported: '" + linkErr + "'); a staging that descends"
+                 " a link stages another tree, and one that skips it drops it");
+        }
+        std::error_code probe;
+        if (fs::exists(sandbox / "linked-staged" / "dep_link" / "src" / "lib.c", probe)) {
+            fail("staging went THROUGH the directory link and copied what it reaches");
+        }
     }
 
     if (findingCount == 0) return {};

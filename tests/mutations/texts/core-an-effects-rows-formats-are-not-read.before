@@ -1,0 +1,2 @@
+                            if (row.contains("availableObjectFormats")) {
+                                (void)readAvailableObjectFormats(

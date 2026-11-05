@@ -1,0 +1,1 @@
+            if (dc.fnSuffixRule.valid() && r == dc.fnSuffixRule.v) continue;

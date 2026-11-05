@@ -52,7 +52,7 @@
 //
 // ★ RED ON DISABLE, per mechanism — the fix has two, and one mutant cannot cover
 // both (✔ the transcript is in the lane's findings):
-//   * drop `kRenameFlagPosixSemantics` from the replace in `writer.cpp`
+//   * drop `FILE_RENAME_FLAG_POSIX_SEMANTICS` from the replace in `writer.cpp`
 //     (`renameByHandle`)       -> (A) goes red; (B)–(G) stay green.
 //   * make the commit loop stop consulting its patience after a holder's
 //     refusal                  -> (B), (D), (E) go red; (A), (C), (F), (G) stay green.

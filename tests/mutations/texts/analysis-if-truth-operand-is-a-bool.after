@@ -1,0 +1,1 @@
+    return detail::makeBoolLiteral(truth ? 1 : 0);

@@ -1,0 +1,1 @@
+the shipped <unistd.h> does not give _SC_NPROCESSORS_ONLN the number

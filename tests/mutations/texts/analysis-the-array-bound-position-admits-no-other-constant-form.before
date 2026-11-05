@@ -1,0 +1,2 @@
+    auto len = constIntExpr(s, tree, lenNode, fromScope, cfg,
+                            IntegerConstantPosition::ArrayBound);

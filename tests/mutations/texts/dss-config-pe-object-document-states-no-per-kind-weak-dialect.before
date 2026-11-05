@@ -1,0 +1,1 @@
+  "weakDefinition": { "dialect": "comdat", "byKind": { "overridable": "weak-external" } },

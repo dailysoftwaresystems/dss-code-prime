@@ -222,6 +222,24 @@ struct DSS_EXPORT CfiOp {
     // representation carrying pre-factored values would be unusable by
     // Win64, whose scaling factor is different (8).
     std::int64_t  offset   = 0;
+    // `RegAtCfaOffset` only — HOW MUCH of `reg` its producer stored at that
+    // slot, in bytes. A convention may preserve less of a register than the
+    // register holds (the low 64 bits of a 128-bit vector register, say), and
+    // the frame producer's store is then that narrow; the rule says where the
+    // register is, and this says how much of it is there.
+    //
+    // 0 = THE PRODUCER STATES NO WIDTH. A rule read back from a foreign
+    // object's unwind data, or written in assembly text, has none to state:
+    // neither notation has a field for it. A writer then reads the rule as its
+    // own format defines a save — which is all such a rule ever said.
+    //
+    // ★ WHO READS IT: a writer whose format's save code CLAIMS a width. Win64's
+    // vector save says the WHOLE 16-byte register is at the slot, so a rule
+    // that states fewer bytes is one that format cannot say, and its writer
+    // refuses it by name. The DWARF writers do not read it: a DWARF rule names
+    // a register number and a slot, and how much of the register the ABI
+    // preserves is the ABI's statement, not the rule's.
+    std::uint32_t savedBytes = 0;
 };
 
 // ── The state at function entry ─────────────────────────────────────────

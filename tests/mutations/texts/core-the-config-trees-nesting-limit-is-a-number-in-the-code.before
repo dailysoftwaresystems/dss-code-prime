@@ -1,0 +1,1 @@
+    return ConfigNestingLimit{static_cast<std::size_t>(DSS_CONFIG_MAX_NESTING),

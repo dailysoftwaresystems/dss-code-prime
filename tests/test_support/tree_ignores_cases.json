@@ -1,0 +1,278 @@
+{
+  "about": [
+    "THE ONE CASE TABLE of what a walk of a tree leaves out: what git ignores there, read from the tree's own",
+    ".gitignore. Its two readers are owning-tree.py's TreeIgnores (.harness-config/runner/actions/owning-tree) and",
+    "tests/test_support/tree_ignores.hpp; each suite asks every scenario here of its reader, one case per scenario",
+    "(owning-tree.py's self-test and tests/core/test_header_name_matching.cpp), and each suite's LIVE case asks git",
+    "check-ignore the same paths under both settings of core.ignorecase, so the table itself is git's answer.",
+    "A scenario: name, rules (the .gitignore's lines, written joined by newline, or by the scenario's newline), and",
+    "either paths -- [path, kind, answer] with kind file | dir | link (a symbolic link to a directory) and answer",
+    "null (kept), the rule text that leaves it out (or .git, git's own), or {refused: a word its refusal says} -- or",
+    "refusals: {rules, line, says} where line is the line the reader refuses (null: the rules read whole).",
+    "asked_of_git false: the scenario's answers are the readers' own (git's own directory), never check-ignore's."
+  ],
+  "scenarios": [
+    {
+      "name": "the copies the tool keeps in a tree, a session's scratch and a build",
+      "rules": [".temp/", "build/", "/.harness-config/*", "!/.harness-config/config.json", "!/.harness-config/runner/",
+                "/.harness-config/runner/*", "!/.harness-config/runner/actions/", "# >>> dss-harness managed block >>>",
+                "/.harness-config/lock.json", "/.harness-config/runs", "/.worktrees/*", "!/.worktrees/.gitkeep",
+                "/.orchestrators/*", "!/.orchestrators/.gitkeep", "/.mutations/*", "!/.mutations/.gitkeep", "/.legs/*",
+                "!/.legs/.gitkeep", "/.harness-config/runner/actions/**/build/", "# <<< dss-harness managed block <<<"],
+      "paths": [
+        ["examples/README.md", "file", null],
+        ["examples/c/x/expected.json", "file", null],
+        ["src/a.cpp", "file", null],
+        [".legs/.gitkeep", "file", null],
+        [".mutations/.gitkeep", "file", null],
+        [".worktrees/.gitkeep", "file", null],
+        [".orchestrators/.gitkeep", "file", null],
+        [".harness-config/config.json", "file", null],
+        [".harness-config/runner/actions/a/a.py", "file", null],
+        [".legs/x/examples/README.md", "file", "/.legs/*"],
+        [".mutations/aw-1/src/a.cpp", "file", "/.mutations/*"],
+        [".worktrees/lane/src/a.cpp", "file", "/.worktrees/*"],
+        [".orchestrators/o/work/w.md", "file", "/.orchestrators/*"],
+        [".harness-config/runs/r/test.log", "file", "/.harness-config/runs"],
+        [".harness-config/lock.json", "file", "/.harness-config/lock.json"],
+        [".harness-config/runner/actions/a/build/o.txt", "file", "/.harness-config/runner/actions/**/build/"],
+        [".temp/x/notes.md", "file", ".temp/"],
+        ["tests/.temp/notes.md", "file", ".temp/"],
+        ["build/v1/bin/dss/runner.json", "file", "build/"]
+      ]
+    },
+    {
+      "name": "a later rule decides, and a negation re-includes",
+      "rules": ["/.legs/*", "!/.legs/.gitkeep", "*.o", "!keep.o"],
+      "paths": [
+        [".legs/x", "dir", "/.legs/*"],
+        [".legs/.gitkeep", "file", null],
+        ["a.o", "file", "*.o"],
+        ["src/b.o", "file", "*.o"],
+        ["keep.o", "file", null],
+        ["src/keep.o", "file", null]
+      ]
+    },
+    {
+      "name": "a rule with no slash matches that name at any depth",
+      "rules": [".temp/"],
+      "paths": [
+        [".temp", "dir", ".temp/"],
+        [".temp/x/notes.md", "file", ".temp/"],
+        ["tests/.temp/y.md", "file", ".temp/"],
+        ["examples/c/x/main.c", "file", null]
+      ]
+    },
+    {
+      "name": "a rule with a slash is anchored to the tree's root",
+      "rules": ["/src/dss-config/runtime/platform/dist/", ".claude/worktrees/"],
+      "paths": [
+        ["src/dss-config/runtime/platform/dist/o.json", "file", "/src/dss-config/runtime/platform/dist/"],
+        ["src/dist/x.json", "file", null],
+        [".claude/worktrees/w/x.md", "file", ".claude/worktrees/"],
+        ["docs/.claude/worktrees/z.md", "file", null]
+      ]
+    },
+    {
+      "name": "a rule ending in a slash matches a directory only",
+      "rules": ["build/"],
+      "paths": [
+        ["tests/build", "file", null],
+        ["out/build", "dir", "build/"],
+        ["build/v/bin/dss/r", "file", "build/"]
+      ]
+    },
+    {
+      "name": "a rule ending in a slash never matches a symbolic link",
+      "rules": ["build/", "lnk"],
+      "paths": [
+        ["build", "link", null],
+        ["deep/build", "link", null],
+        ["real/build", "dir", "build/"],
+        ["lnk", "link", "lnk"]
+      ]
+    },
+    {
+      "name": "a double-star name is any number of directories",
+      "rules": ["/.harness-config/runner/actions/**/build/", "/x/**", "**/deep"],
+      "paths": [
+        [".harness-config/runner/actions/build/o.txt", "file", "/.harness-config/runner/actions/**/build/"],
+        [".harness-config/runner/actions/a/build/o.txt", "file", "/.harness-config/runner/actions/**/build/"],
+        [".harness-config/runner/actions/a/b/build/o.txt", "file", "/.harness-config/runner/actions/**/build/"],
+        [".harness-config/runner/actions/a/a.py", "file", null],
+        ["x", "dir", null],
+        ["x/y", "file", "/x/**"],
+        ["deep", "file", "**/deep"],
+        ["p/q/deep", "file", "**/deep"]
+      ]
+    },
+    {
+      "name": "a star, a question mark and a class match the name's bytes",
+      "rules": ["[._]*.sw[a-p]", "build-*/", "lo?", "[!a]z", "x??", "a**b"],
+      "paths": [
+        [".x.swp", "file", "[._]*.sw[a-p]"],
+        ["x.swz", "file", null],
+        ["build-dbg/o", "file", "build-*/"],
+        ["log", "file", "lo?"],
+        ["logs", "file", null],
+        ["loé", "file", null],
+        ["bz", "file", "[!a]z"],
+        ["az", "file", null],
+        ["éz", "file", null],
+        ["xab", "file", "x??"],
+        ["xé", "file", "x??"],
+        ["xa", "file", null],
+        ["axyb", "file", "a**b"],
+        ["a/b", "file", null]
+      ]
+    },
+    {
+      "name": "the twelve POSIX classes read as git reads them",
+      "rules": ["[[:digit:]]*.log", "[[:upper:]][[:lower:]]1", "[[:alpha:]][[:alnum:]]2", "[[:blank:]]3",
+                "[[:space:]]4", "[[:punct:]]5", "[[:xdigit:]]6", "[[:cntrl:]]7", "[[:graph:]]8", "[[:print:]]9",
+                "[![:digit:]]0"],
+      "paths": [
+        ["1.log", "file", "[[:digit:]]*.log"],
+        ["a.log", "file", null],
+        ["Ab1", "file", "[[:upper:]][[:lower:]]1"],
+        ["aB1", "file", {"refused": "core.ignorecase"}],
+        ["9b1", "file", null],
+        ["q72", "file", "[[:alpha:]][[:alnum:]]2"],
+        ["_72", "file", null],
+        [" 3", "file", "[[:blank:]]3"],
+        ["\u000b3", "file", null],
+        ["\r4", "file", "[[:space:]]4"],
+        ["\u000c4", "file", null],
+        ["_5", "file", "[[:punct:]]5"],
+        ["a5", "file", null],
+        ["F6", "file", "[[:xdigit:]]6"],
+        ["g6", "file", null],
+        ["\u007f7", "file", "[[:cntrl:]]7"],
+        [" 7", "file", null],
+        ["~8", "file", "[[:graph:]]8"],
+        [" 8", "file", null],
+        [" 9", "file", "[[:print:]]9"],
+        ["\u001f9", "file", null],
+        ["x0", "file", "[![:digit:]]0"],
+        ["50", "file", null],
+        ["é.log", "file", null]
+      ]
+    },
+    {
+      "name": "a dash, a bracket first, a range and a lone [: inside a class read as git reads them",
+      "rules": ["[a-]4", "[]a]5", "[[:digit:]-z]6", "[[:ab]c", "[[:]e", "[Z-a]3"],
+      "paths": [
+        ["-4", "file", "[a-]4"],
+        ["b4", "file", null],
+        ["]5", "file", "[]a]5"],
+        ["a5", "file", "[]a]5"],
+        ["-6", "file", "[[:digit:]-z]6"],
+        ["m6", "file", null],
+        ["ac", "file", "[[:ab]c"],
+        ["[c", "file", "[[:ab]c"],
+        ["dc", "file", null],
+        ["[e", "file", "[[:]e"],
+        [":e", "file", "[[:]e"],
+        ["xe", "file", null],
+        ["_3", "file", "[Z-a]3"],
+        ["b3", "file", null]
+      ]
+    },
+    {
+      "name": "nothing under a left-out directory is re-included",
+      "rules": ["/gone/", "!/gone/back.md"],
+      "paths": [
+        ["gone", "dir", "/gone/"],
+        ["gone/back.md", "file", "/gone/"],
+        ["here/back.md", "file", null]
+      ]
+    },
+    {
+      "name": "git's own directory is always left out, as a directory or a worktree's file",
+      "asked_of_git": false,
+      "rules": [],
+      "paths": [
+        [".git/HEAD", "file", ".git"],
+        ["sub/.git", "file", ".git"],
+        ["sub/x.md", "file", null]
+      ]
+    },
+    {
+      "name": "a path a rule matches under one setting of core.ignorecase and not the other is refused",
+      "rules": [".temp/", "*.LOG", "[A]1", "ok"],
+      "paths": [
+        [".temp/x.md", "file", ".temp/"],
+        [".TEMP/x.md", "file", {"refused": "core.ignorecase"}],
+        ["b.LOG", "file", "*.LOG"],
+        ["a.log", "file", {"refused": "core.ignorecase"}],
+        ["A1", "file", {"refused": "core.ignorecase"}],
+        ["a1", "file", null],
+        ["ok", "file", "ok"],
+        ["OK", "file", {"refused": "core.ignorecase"}],
+        ["kept.md", "file", null]
+      ]
+    },
+    {
+      "name": "a name that is git's own only when case is folded is refused",
+      "asked_of_git": false,
+      "rules": [],
+      "paths": [
+        ["sub/.GIT/x", "file", {"refused": "core.ignorecase"}],
+        ["sub/.gitx", "file", null]
+      ]
+    },
+    {
+      "name": "a name holding a backslash is refused",
+      "rules": ["x"],
+      "paths": [
+        ["a\\b", "file", {"refused": "backslash"}],
+        ["c/d\\e/f", "file", {"refused": "backslash"}],
+        ["ab", "file", null]
+      ]
+    },
+    {
+      "name": "a byte order mark, a CR LF ending and trailing spaces are no part of a rule, a trailing tab is",
+      "newline": "\r\n",
+      "rules": ["﻿/first", "spaced   ", "tabbed\t", "crlf"],
+      "paths": [
+        ["first", "file", "/first"],
+        ["spaced", "file", "spaced"],
+        ["tabbed", "file", null],
+        ["tabbed\t", "file", "tabbed\t"],
+        ["crlf", "file", "crlf"]
+      ]
+    },
+    {
+      "name": "a rule holding a backslash is refused, naming its line",
+      "refusals": [
+        {"rules": ["a/", "b\\#c"], "line": 2, "says": "backslash"},
+        {"rules": ["\\!x"], "line": 1, "says": "backslash"}
+      ]
+    },
+    {
+      "name": "a class opened and never closed is refused, naming its line",
+      "refusals": [
+        {"rules": ["x", "y", "z[ab"], "line": 3, "says": "never closes"},
+        {"rules": ["[[:alpha"], "line": 1, "says": "never closes"},
+        {"rules": ["ok[]"], "line": 1, "says": "never closes"}
+      ]
+    },
+    {
+      "name": "a POSIX class git does not name is refused, naming its line",
+      "refusals": [
+        {"rules": ["[[:foo:]]z"], "line": 1, "says": "class"},
+        {"rules": ["ok", "[[::]]q"], "line": 2, "says": "class"},
+        {"rules": ["[[:Digit:]]"], "line": 1, "says": "class"}
+      ]
+    },
+    {
+      "name": "a rule naming nothing between two separators, or nothing at all, is refused",
+      "refusals": [
+        {"rules": ["a//b"], "line": 1, "says": "nothing"},
+        {"rules": ["ok", "/"], "line": 2, "says": "nothing"},
+        {"rules": ["!"], "line": 1, "says": "nothing"},
+        {"rules": ["# a comment", "", "ok/   ", "[[:digit:]]x"], "line": null, "says": ""}
+      ]
+    }
+  ]
+}

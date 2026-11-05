@@ -1,0 +1,1 @@
+            if (inAttrName && model.attributeNameIgnoredForKind(n)) continue;

@@ -130,16 +130,20 @@ GlobalClonePrelude
 cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
                        DiagnosticReporter& reporter,
                        std::string_view passName) {
-    // Propagate the module-level alias-analysis polarity through every
-    // optimizer pass's rebuild. WITHOUT this line, MirBuilder defaults
-    // to Permissive and a release pipeline `[ConstFold, ..., Cse, Licm,
-    // ...]` silently downgrades strict-TBAA to Permissive after the
-    // first rebuild — CSE/LICM later in the pipeline read the wrong
-    // polarity. Closes D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE.
-    // Same propagation discipline for `charTypesAliasAll` (per-language
-    // C99 §6.5 ¶7 opt-in).
-    builder.setAliasingMode(mir.aliasingMode());
-    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+    // Carry what the MODULE carries through every optimizer pass's rebuild
+    // (`MirBuilder::carryModuleFactsOf`, the one list — all three clone paths
+    // call it). The alias-analysis polarity: WITHOUT it MirBuilder defaults to
+    // Permissive and a release pipeline `[ConstFold, ..., Cse, Licm, ...]`
+    // silently downgrades strict-TBAA to Permissive after the first rebuild —
+    // CSE/LICM later in the pipeline read the wrong polarity (closes
+    // D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE); `charTypesAliasAll`
+    // (per-language C99 §6.5 ¶7 opt-in) the same way. And the module's
+    // SYMBOL-ID SPACE (P69 round 5): the rebuilt module continues the ids of
+    // the one it replaces, so a later pass that mints a symbol
+    // (`MirBuilder::mintSymbol`) is still clear of the name table the module
+    // was made from; without it that pass would be back to counting from the
+    // symbols the module holds.
+    builder.carryModuleFactsOf(mir);
 
     std::size_t const ng = mir.moduleGlobalCount();
     for (std::uint32_t i = 0; i < ng; ++i) {
@@ -165,7 +169,9 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across the pass rebuild —
@@ -181,10 +187,10 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
 void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
                                    std::span<std::uint32_t const> oldOrdinalToNew,
                                    std::string_view passName) {
-    // Same alias-analysis polarity propagation every clone path performs
-    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
-    builder.setAliasingMode(mir.aliasingMode());
-    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+    // The same module facts every clone path carries (the alias-analysis
+    // polarity, D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE; the module's
+    // symbol ids) — one list, `MirBuilder::carryModuleFactsOf`.
+    builder.carryModuleFactsOf(mir);
 
     if (oldOrdinalToNew.size() != mir.moduleFuncCount()) {
         rebuildFatal("cloneGlobalsRemappingInitFunc", passName,
@@ -221,7 +227,9 @@ void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
         }
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, newInitFunc,
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across the clone.
@@ -233,12 +241,12 @@ void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
 }
 
 void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
-    // Same alias-analysis polarity propagation as cloneGlobalsOrCarveOut
-    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE) — without it the
-    // rebuilt module silently downgrades strict-TBAA / char-aliases-all
-    // to the MirBuilder defaults.
-    builder.setAliasingMode(mir.aliasingMode());
-    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+    // The same module facts cloneGlobalsOrCarveOut carries
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE — without them the
+    // rebuilt module silently downgrades strict-TBAA / char-aliases-all to
+    // the MirBuilder defaults — and the module's symbol ids): one list,
+    // `MirBuilder::carryModuleFactsOf`.
+    builder.carryModuleFactsOf(mir);
 
     // CONTRACT: call this AFTER every function has been re-added to
     // `builder` (the prune adds functions in source order, so the new
@@ -268,7 +276,9 @@ void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
             : MirFuncId{};
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, newInitFunc,
-                          mir.globalBinding(g), mir.globalVisibility(g),
+                          // P69: the linkage is copied as its ONE record
+                          // (binding, visibility, weak kind, tentative mark).
+                          mir.globalLinkage(g),
                           mir.globalIsConst(g),
                           // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
                           // thread storage duration across the verbatim clone.
@@ -369,7 +379,9 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // RebuildFunctionPreservesNoSanitizeThread` is the ONLY thing standing between
     // this argument and silent deletion.
     dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
-                     src_.funcBinding(oldFn), src_.funcVisibility(oldFn),
+                     // P69: the linkage is copied as its ONE record (binding,
+                     // visibility, weak kind) — under all 8 rebuild passes.
+                     src_.funcLinkage(oldFn),
                      src_.funcNoInline(oldFn), src_.funcAlwaysInline(oldFn),
                      src_.funcNoOptimize(oldFn),
                      src_.funcNoSanitizeThread(oldFn),
@@ -813,7 +825,9 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             return;
         }
         case MirOpcode::Unreachable: {
-            MirInstId const newId = dst_.addUnreachable();
+            // P69: what the terminator asserts survives the rebuild.
+            MirInstId const newId = dst_.addUnreachable(
+                static_cast<MirUnreachableKind>(src_.instPayload(oldId)));
             remember(newId);
             return;
         }

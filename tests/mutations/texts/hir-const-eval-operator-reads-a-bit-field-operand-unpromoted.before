@@ -1,0 +1,1 @@
+    if (!operandMayBePromoted(v, env) || !operandN.valid()) return v;

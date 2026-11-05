@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/unit_linker_requests.hpp"   // DirectiveImageSettings
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -91,11 +92,28 @@ struct DSS_EXPORT ImageRequest {
     // (`runpathEntryRefusal`: empty, or holding a NUL byte).
     std::vector<std::string> runpaths;
 
+    // ── D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4) ──
+    //
+    // What the PROGRAM'S OWN UNITS ask of the image — a foreign COFF object's
+    // `/STACK:`, `/HEAP:`, `/SUBSYSTEM:`, `/VERSION:`, `/BASE:`, `/ALIGN:`,
+    // `/RELEASE`, `/SECTION:` and `/EXPORT:` — as `linker::link` decided them
+    // across the link's units (`decideUnitLinkerRequests`) and hands them to the
+    // image writer, which realizes each against its format's defaults. The
+    // driver never fills it: the linker writes it into the request it passes the
+    // writer. The program's own `stackReserveBytes` above WINS over a unit's
+    // stack request, reserve and commit alike (link.exe's precedence).
+    //
+    // ★ NOT CONSULTED BY `empty()` OR BY `enforceImageRequest`: those ask what
+    // the user requested of a format, and these requests are already decided
+    // against the format's writer (`realizesDirectiveImageSettings`).
+    DirectiveImageSettings directives;
+
     // True iff this request asks for anything at all. Lets a caller skip the
     // whole gate cheaply, and keeps the "did the user request something?"
     // question in ONE place as fields are added.
     // ⚠ `artifactFileName` is NOT consulted — see its docblock: it is a fact
     // the driver supplies unconditionally, not a request a format could refuse.
+    // Nor is `directives` (its own docblock says why).
     [[nodiscard]] bool empty() const noexcept {
         return !stackReserveBytes.has_value() && runpaths.empty();
     }

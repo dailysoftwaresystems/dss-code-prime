@@ -12,3 +12,46 @@ steps:
       python3 ./check-stale-refusal-citations.py
     successPattern: 'stale-refusal-citations selftest: OK'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-stale-refusal-citations --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-stale-refusal-citations.py --selftest
+    successPattern: 'selftest: OK \(\d+ arm\(s\), 0 failure\(s\)\)'
+    requireInputsUnmoved: true
+
+  # Every site the census finds, the inventory's ceilings ignored -- a READING verb.
+
+  - name: list
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-stale-refusal-citations.py --list
+    successPattern: '^stale-refusal-citations: \d+ site\(s\) across \d+ file\(s\) of \d+ governed'
+    requireInputsUnmoved: true
+
+  # The BURN-DOWN verb: it may only LOWER a ceiling -- a TREE WRITER, run only where a run names it: `dssharness run check-stale-refusal-citations-write`, the runner that runs it on
+  # ONE leg, this machine's own tree (config.json). It moves a tracked file by design, so it cannot carry
+  # requireInputsUnmoved; a plain run afterwards verifies.
+
+  - name: write
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-stale-refusal-citations.py --write
+    successPattern: '^stale-refusal-citations: re-baselined \d+ file\(s\), \d+ site\(s\)'
+
+  # The verb that establishes NEW ground: it CAN RAISE a ceiling, and says so -- a TREE WRITER, run only where a run names it: `dssharness run check-stale-refusal-citations-baseline`, the runner that runs it on
+  # ONE leg, this machine's own tree (config.json). It moves a tracked file by design, so it cannot carry
+  # requireInputsUnmoved; a plain run afterwards verifies.
+
+  - name: baseline
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-stale-refusal-citations.py --baseline
+    successPattern: '^stale-refusal-citations: BASELINED \d+ file\(s\)'

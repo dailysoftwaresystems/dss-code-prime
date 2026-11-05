@@ -1,0 +1,1 @@
+        if (false && linkage.binding == SymbolBinding::Local) {

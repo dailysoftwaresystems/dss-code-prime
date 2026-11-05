@@ -51,6 +51,24 @@ using HirFfiMap = HirAttribute<FfiMetadata>;
 // optimizer's DCE-protect predicate `isExternallyVisible()` consults.
 using HirLinkageMap = HirAttribute<LinkageAttr>;
 
+// P69 (lane `cs`): one SECOND NAME of a definition of the unit — the GNU
+// `alias("target")` attribute, resolved by the semantic tier (`SymbolRecord::
+// aliasTarget`). `alias` is the declared name's symbol: its declaration stays a
+// reference to the name (an `ExternFunction` / `ExternGlobal` when the name has
+// external linkage, nothing when it is internal — its uses were bound to the target),
+// and this entry is the DEFINITION it makes. `linkage` is the alias's own binding,
+// visibility and weak kind, folded from its declaration's specifiers as any other
+// declaration's are; never tentative (an alias has no storage of its own). Produced by
+// CST→HIR (`CstToHirResult::symbolAliases`); HIR→MIR hands each entry to
+// `MirBuilder::addAlias`, and the object producer writes it as one more symbol row on
+// the target's definition. Not a node attribute: an alias is a fact of the MODULE,
+// keyed by two symbols, and no HIR node is its own.
+struct HirSymbolAlias {
+    SymbolId    alias{};
+    SymbolId    target{};
+    LinkageAttr linkage{};
+};
+
 // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): native FUNCTION declarations the source marked
 // `__attribute__((noinline))`. Populated by CST→HIR lowering from the bound
 // symbol's `SymbolRecord.isNoInline`; read by HIR→MIR lowering to stamp

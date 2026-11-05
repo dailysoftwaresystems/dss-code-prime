@@ -1,0 +1,4 @@
+        s.braceElementValueTypes.set(
+            peelGroupingWrappers(tree.schema().semantics(), tree, value,
+                                 "a brace element's value"),
+            vt);

@@ -67,9 +67,9 @@ namespace {
 // when the member changes.
 //
 // Each verdict is the answer for that flavour, and each `why` is the argument for
-// it. An excluded flavour is NEVER silently skipped: it is asserted to still be
-// excludable, so the day it gains what it was excluded from this test goes red and
-// the exclusion has to be re-argued instead of quietly widening.
+// it. Since P69 fold 3c no flavour is excluded from the unwind spine (the two
+// OBJECT flavours were, until their writer arm was re-measured), and a verdict of
+// `false` is RED by name: an exclusion is a writer defect to fix, never a verdict.
 //
 // ⚠⚠ P54 SPLIT ONE BOOLEAN INTO TWO, AND THE SPLIT IS THE POINT RATHER THAN A
 // TIDY-UP. Until D-CSUBSET-PACKED-ATOMIC-MEMBER's pe64 arm landed there was only
@@ -122,43 +122,38 @@ constexpr PeFlavour kPeFlavours[] = {
      "a DLL can contain an under-aligned `_Atomic` access for exactly the reason "
      "it can contain a __try — much of Windows is written as DLLs — and a "
      "format-level omission would silently keep the non-atomic native pair there"},
-    {"pe64-x86_64-windows-staticlib", false, true,
-     "the .lib archive goes through pe::encode's Obj arm, which attaches no "
-     "FrameUnwindInfo and emits NO .pdata/.xdata. MEASURED by declaring the keys "
-     "anyway: rc=0 and the emitted seh.lib carried `.text` ONLY, so the filter "
-     "funclets and the scope table are SILENTLY DROPPED and __except can never "
-     "run. Declaring here would trade a loud, correct refusal for a silent "
-     "miscompile; the rationale lives in the file's "
-     "$sehPersonalityOmittedComment",
-     "⚠ THE ATOMICS ANSWER IS THE OPPOSITE OF THE UNWIND ONE ON THIS SAME FILE, "
-     "which is why they cannot share a boolean. There is no silent-drop hazard "
+    // ★ P69 fold 3c (the review of the fix fold, A2): the two OBJECT flavours MOVED to `mustDeclareUnwind = true`.
+    // Their exclusion rested on the 2026-08-10 measurement below it ("`.text` ONLY"), which the Obj arm outgrew on
+    // 2026-08-27 (it writes `.pdata`/`.xdata`, and a `__try`'s scope table as relocations: `PeObjWriter.
+    // ATryRegionCarriesItsScopeTableIntoTheObject`), so the exclusion had become the refusal of a `__try` cl compiles
+    // into an object. This test's own instruction for that day was followed: the flavours moved, the emitted
+    // sections re-measured — by `PeObjSeh` in tests/link/test_pe_object_unwind_reference_link.cpp, a `__try`
+    // through the CLI's object door whose object DSS, link.exe and MinGW's gcc link and whose `__except` runs.
+    {"pe64-x86_64-windows-staticlib", true, true,
+     "the .lib archive's members are written by pe::encode's Obj arm, which "
+     "emits .pdata + .xdata and a `__try`'s scope table as relocations the final "
+     "linker resolves; a member is the loose object's twin, so the archive "
+     "declares the same personality (MEASURED by `PeObjSeh` through the object "
+     "door; the 2026-08-10 `.text`-only reading predates the arm's unwind data)",
+     "the atomics answer is its own boolean because it is its own question (until "
+     "P69 fold 3c it was the OPPOSITE of the unwind one on this same file). There "
+     "is no silent-drop hazard "
      "for a CALL: `externCallDispatch: direct-plt` is already declared and an "
      "extern call is what this arm emits every day, so the member objects carry "
      "an undefined external the final link resolves. Omitting it would split the "
      "flavours on MEANING — the same source taking the runtime as an .exe and "
      "silently keeping the non-atomic pair as a .lib. elf64-x86_64-linux-staticlib "
      "declares libatomic.so.1 on identical reasoning"},
-    {"pe64-x86_64-windows", false, true,
-     "the relocatable .obj, same Obj arm and the same MEASURED silent drop "
-     "(`.text` only). Worse here than for the archive, because the object exists "
-     "to be linked LATER and the final linker cannot notice that unwind data was "
-     "never emitted for these functions",
-     "same split verdict as the archive, and the contrast is what makes it safe: "
-     "the unwind omission exists because a dropped scope table is INVISIBLE to the "
-     "later linker, whereas an atomics entry that never resolves is an UNRESOLVED "
-     "SYMBOL at that same later link — loud, at the tier that can see it, and "
-     "strictly better than shipping a silent loss of atomicity"},
+    {"pe64-x86_64-windows", true, true,
+     "the relocatable .obj, the direct analogue of `cl /c`: its Obj arm emits "
+     ".pdata + .xdata and a `__try`'s scope table as relocations, so a `__try` "
+     "compiles into the object and its `__except` runs once DSS or link.exe "
+     "links it (MEASURED by `PeObjSeh`, both Windows legs)",
+     "the same verdict as the archive, and safe for the same reason: an atomics "
+     "entry that never resolves is an UNRESOLVED SYMBOL at the later link — loud, "
+     "at the tier that can see it, and strictly better than shipping a silent "
+     "loss of atomicity"},
 };
-
-// The root key an excluded flavour must carry so the absence reads as a decision
-// rather than an oversight, at the site a future editor is already looking.
-// ⚠ NOT `$absentKeyRationale`: that key belongs to the CROSS-ARCH mechanism in
-// tests/link/test_object_format_family_symmetry.cpp, whose families are keyed on
-// `<container><bits>-<os>[-<tier>]` with the ARCH token stripped. x86_64 is the
-// only pe arch shipped, so every pe flavour is a ONE-MEMBER family with an empty
-// absent-vs-siblings set, and `NoRationaleOutlivesTheAbsenceItExplains` would
-// reject any entry placed there as explaining an asymmetry that does not exist.
-constexpr std::string_view kOmissionRationaleKey = "$sehPersonalityOmittedComment";
 
 // A flavour carries a `runtimeLibraries` TABLE iff at least one of its two
 // verdicts is positive — the table is the union of the roles its blocks name, so
@@ -215,15 +210,6 @@ constexpr std::string_view kOmissionRationaleKey = "$sehPersonalityOmittedCommen
     }
     if (ec) ADD_FAILURE() << "cannot enumerate " << dir.string() << ": " << ec.message();
     return out;
-}
-
-// The RAW document, for the `$`-prefixed rationale key — `ObjectFormatSchema`
-// drops documentation keys on load, so the parsed schema cannot answer whether the
-// justification is present.
-[[nodiscard]] nlohmann::json formatDoc(std::string_view name) {
-    auto const text = readShippedFormatText(name);
-    if (text.empty()) return {};
-    return nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
 }
 
 // Replace the FIRST occurrence of `from` with `to`; returns false if absent, so a
@@ -287,10 +273,8 @@ emitImage(ObjectFormatSchema const& format, std::string& why) {
 //   (2) every flavour the verdict says MUST declare a table is present BY NAME with
 //       a non-empty table that actually declares `unwindPersonality` — so "three of
 //       four quietly stopped declaring" is a failure, not a pass;
-//   (3) every EXCLUDED flavour is asserted to still be excluded AND to still carry
-//       its written justification — so an exclusion can neither be silently
-//       widened (a table appearing there reds this) nor silently stripped of the
-//       argument that earned it.
+//   (3) no flavour is EXCLUDED — a `false` unwind verdict is itself red (since
+//       P69 fold 3c, when the last two exclusions were re-measured away).
 // Only then is the msvcrt sweep run, over ALL FOUR.
 TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
     // (1) ENUMERATION — the verdict table and the shipped tree must agree, both
@@ -350,13 +334,13 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
                 // dependency AND leave the archive member unpulled.
                 EXPECT_EQ(ar->libraryPath, "") << flavour.name;
                 auto const src =
-                    table.sourceForRole(RuntimeLibraryRole::AtomicsRuntime);
-                ASSERT_TRUE(src.has_value())
+                    table.sourcesForRole(RuntimeLibraryRole::AtomicsRuntime);
+                ASSERT_EQ(src.size(), 1u)
                     << flavour.name
-                    << ": the atomicsRuntime role must be REALIZED from a shipped "
+                    << ": the atomicsRuntime role must be REALIZED from ONE shipped "
                        "source on every pe flavour — an `image` here is the "
                        "external-DLL dependency P54 removed.";
-                EXPECT_EQ(*src, "runtime/platform/src/atomic.c") << flavour.name;
+                EXPECT_EQ(src[0], "runtime/platform/src/atomic.c") << flavour.name;
                 // Undecorated: this format's `cSymbolDecoration` is `none`.
                 EXPECT_EQ(ar->loadMangledName, "__atomic_load") << flavour.name;
                 EXPECT_EQ(ar->storeMangledName, "__atomic_store") << flavour.name;
@@ -383,56 +367,25 @@ TEST(RuntimeLibraryRoles, NoPeFormatNamesTheLegacyCrtInItsRoleTable) {
                 << " must declare `sehPersonality`; the table row alone names an "
                    "image with nothing pointing at it.";
         } else {
-            // (3) EXCLUDED — asserted, justified, and RATCHETED. This is the arm
-            // that must never be a silent skip: it fails the moment the flavour
-            // gains what it was excluded from having.
-            // ⚠⚠ P54 NARROWED THIS FROM `table.empty()` TO THE UNWIND ROLE, AND
-            // THE NARROWING IS NOT A WEAKENING — it is the same correction the
-            // struct's two booleans are. `table.empty()` asserted the ABSENCE OF
-            // ANY TABLE as a stand-in for the absence of the UNWIND SPINE, which
-            // held only while unwind was the sole role a pe flavour could name.
-            // The .lib and .obj now name `atomicsRuntime` for a reason that has
-            // nothing to do with .pdata/.xdata, so the old form would have
-            // reddened a correct config and the only ways out would have been to
-            // widen an exclusion that must stay narrow or to delete the ratchet.
-            // Asserting the ROLE keeps every bit of the original guard: the day
-            // this flavour gains an unwindPersonality row, this still reds.
-            EXPECT_FALSE(table.imageForRole(RuntimeLibraryRole::UnwindPersonality)
-                             .has_value())
+            // (3) NO FLAVOUR IS EXCLUDED, AND AN EXCLUSION IS RED. Until P69 fold 3c the
+            // two OBJECT flavours were, on the 2026-08-10 reading that their writer arm
+            // emitted `.text` only; the arm outgrew it (it writes `.pdata`/`.xdata` and a
+            // `__try`'s scope table as relocations), and the exclusion had become the
+            // refusal of a `__try` cl compiles into an object. With its last member gone
+            // the exclusion protocol (a rationale key at the site, the absence asserted)
+            // went too: a writer arm that cannot carry unwind data is a defect of that
+            // arm to fix, never a verdict to record here.
+            ADD_FAILURE()
                 << flavour.name
-                << " is on the EXPLICIT exclusion list but now names an "
-                   "`unwindPersonality` role. This test is deliberately red so the "
-                   "exclusion gets re-argued rather than widened by accident. The "
-                   "recorded reason it was excluded: " << flavour.why
-                << ". If the underlying limitation is genuinely fixed (the pe Obj "
-                   "arm now emits .pdata/.xdata), move this flavour to "
-                   "mustDeclareUnwind = true and re-measure the emitted sections — "
-                   "do not delete this assertion.";
-            EXPECT_FALSE((*r)->sehPersonality().has_value())
-                << flavour.name
-                << " is excluded but declares `sehPersonality`. MEASURED: the Obj "
-                   "arm accepts the declaration, returns rc=0, and emits `.text` "
-                   "only — the SEH funclets and scope table are dropped without a "
-                   "diagnostic, so __except can never run. " << flavour.why;
-            auto const doc = formatDoc(flavour.name);
-            ASSERT_TRUE(doc.is_object())
-                << flavour.name << ".format.json must parse as a JSON object";
-            auto const key = std::string{kOmissionRationaleKey};
-            ASSERT_TRUE(doc.contains(key))
-                << flavour.name << " is excluded from the runtimeLibraries "
-                << "coverage requirement but carries no `" << kOmissionRationaleKey
-                << "`. An exclusion with no written reason at the site is "
-                   "indistinguishable from an oversight, and the next editor "
-                   "reading the `synthesizeSehFunclets` diagnostic will follow its "
-                   "'Add the block' advice straight into the silent drop.";
-            EXPECT_TRUE(doc.at(key).is_string() && !doc.at(key).get<std::string>().empty())
-                << flavour.name << "'s `" << kOmissionRationaleKey
-                << "` must be a non-empty string.";
+                << " is classified as NOT declaring unwind. Every PE writer arm emits "
+                   ".pdata/.xdata and a `__try`'s scope table, so an exclusion refuses a "
+                   "`__try` a reference compiles for the same artifact (cl /c for an "
+                   "object). The recorded reason: " << flavour.why;
         }
 
-        // The criterion itself, over ALL FOUR flavours — the excluded ones have
-        // empty tables, so this loop is trivially satisfied for them, and that is
-        // exactly why it could not be the only assertion in this test.
+        // The criterion itself, over ALL FOUR flavours — a flavour with an empty
+        // table satisfies it trivially, which is exactly why it could not be the
+        // only assertion in this test.
         for (auto const& b : table.bindings) {
             EXPECT_NE(b.image, "msvcrt.dll")
                 << flavour.name << " points role '"
@@ -527,12 +480,18 @@ TEST(RuntimeLibraryRoles, EveryShippedFormatsRolesResolveConsistently) {
     // counting keys in the format files.
     // ★★ PINNING IT AT THE LIVE VALUE IS SAFE *AND* STRICTER, because this
     // population only ever GROWS: a format gaining a role-naming block raises
-    // the count, so an addition can never false-red this. The realization arc
-    // will raise it (macho64-x86_64-darwin-exec gains librarySynthesis ⇒ 17).
+    // the count, so an addition can never false-red this.
     // ⇒ RAISE this when a vehicle lands; NEVER lower it to green a break. A
     // removed role claim is precisely the regression this exists to catch.
-    EXPECT_GE(rolesChecked, 12u)
-        << "only " << rolesChecked << " role claims were checked, against 12 "
+    // ✔RAISED P69 (lane lm) 12 -> 13: macho64-x86_64-darwin-exec gained its
+    // `librarySynthesis` (pthread, role cLibrary — the coordinator's grant,
+    // C11 threads on every pair). Counted over the shipped documents by the
+    // same rule as this sweep — a role-naming processExit / processArgs /
+    // sehPersonality / librarySynthesis block — 13 on 2026-10-01. (The old
+    // forecast here said that change would make it 17; it was counting from
+    // the 16 present blocks the note above refutes.)
+    EXPECT_GE(rolesChecked, 13u)
+        << "only " << rolesChecked << " role claims were checked, against 13 "
            "measured live — a block stopped naming a role, so the two-copies-"
            "of-one-fact agreement it used to force is no longer being checked "
            "anywhere. Find the block that lost its role; do not lower this.";
@@ -1019,10 +978,10 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
         EXPECT_EQ(ar->libraryPath, "")
             << name << ": the atomicsRuntime role is REALIZED here, so its "
                        "resolved image must be EMPTY.";
-        auto const src = (*loaded)->runtimeLibraries().sourceForRole(
+        auto const src = (*loaded)->runtimeLibraries().sourcesForRole(
             RuntimeLibraryRole::AtomicsRuntime);
-        ASSERT_TRUE(src.has_value()) << name;
-        EXPECT_EQ(*src, "runtime/platform/src/atomic.c") << name;
+        ASSERT_EQ(src.size(), 1u) << name;
+        EXPECT_EQ(src[0], "runtime/platform/src/atomic.c") << name;
     }
 }
 
@@ -1030,7 +989,7 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
 //
 // ★★ THE LOADER AND THE RAW KEY MUST AGREE, ACROSS EVERY SHIPPED FORMAT. The
 // shipped-source SWEEP in `tests/ffi/test_shipped_source_realization.cpp` reads
-// `runtimeLibraries[].source` as raw JSON, because `ffi` cannot depend on the
+// `runtimeLibraries[].source` / `.sources` as raw JSON, because `ffi` cannot depend on the
 // object-format schema without inverting the layering. That makes it a SECOND
 // READER of a config key, which is how a sweep and a loader come to disagree
 // about what a document says — so the two are pinned against each other here,
@@ -1062,9 +1021,13 @@ TEST(RuntimeLibraryRoles, EveryRealizedRoleSourceMatchesTheRawKey) {
         if (doc.contains("runtimeLibraries")
             && doc.at("runtimeLibraries").is_array()) {
             for (auto const& row : doc.at("runtimeLibraries")) {
-                if (!row.is_object() || !row.contains("source")) continue;
-                if (!row.at("source").is_string()) continue;
-                raw.push_back(row.at("source").get<std::string>());
+                if (!row.is_object()) continue;
+                if (row.contains("source") && row.at("source").is_string())
+                    raw.push_back(row.at("source").get<std::string>());
+                // P69 H5: a body of several units, `sources`, read the same way.
+                if (row.contains("sources") && row.at("sources").is_array())
+                    for (auto const& s : row.at("sources"))
+                        if (s.is_string()) raw.push_back(s.get<std::string>());
             }
         }
 
@@ -1074,7 +1037,7 @@ TEST(RuntimeLibraryRoles, EveryRealizedRoleSourceMatchesTheRawKey) {
         EXPECT_EQ(seen, raw)
             << name
             << ": the loader's realized-source list and the raw "
-               "`runtimeLibraries[].source` key disagree. The shipped-source "
+               "`runtimeLibraries[].source` / `.sources` keys disagree. The shipped-source "
                "sweep in tests/ffi reads the RAW key, so a disagreement here "
                "means that sweep is guarding a document the compiler does not "
                "see.";
@@ -1157,9 +1120,8 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
             // The provider spelling carries its KIND as well as its value, so a
             // format naming an IMAGE called exactly what a sibling names as a
             // SOURCE cannot collapse into agreement.
-            std::string const provider =
-                b.source.empty() ? ("image " + b.image)
-                                 : ("shipped source " + b.source);
+            std::string provider = b.sources.empty() ? ("image " + b.image) : "shipped sources";
+            for (auto const& s : b.sources) provider += " " + s;
             byFamily[{kind, std::string{runtimeLibraryRoleName(b.role)}}]
                     [provider].push_back(name);
         }
@@ -1271,5 +1233,126 @@ TEST(RuntimeLibraryRoles, ARuntimeLibraryRowDeclaringBothAProviderKindIsRefused)
                "`operator/` with a rooted right operand REPLACES rather than "
                "appends, so the document would name a file outside the config "
                "root";
+    }
+}
+
+// ══ P69 H5: THE `compilerSupport` ROLE — a body of several shipped units ═══════════════════════════════════════
+//
+// D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED, D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED,
+// D-LK-PE-FOREIGN-OBJECT-GCC-MAIN-HOOK-UNDEFINED: the routines a reference toolchain's own static runtime defines for
+// its objects are DSS's to define on pe, from three units. Every pe flavour declares the role (who plays a role is
+// the format FAMILY's fact), realized -- an empty library path -- from exactly the three units, and the block names
+// the cookie seeder DSS's PE startup calls.
+TEST(RuntimeLibraryRoles, EveryPeFlavourRealizesCompilerSupportFromItsThreeUnits) {
+    std::vector<std::string> const units{"runtime/platform/src/pe_compiler_support.c",
+                                         "runtime/platform/src/pe_compiler_support_x86_64.s",
+                                         "runtime/platform/src/pe_gcc_unwind.c"};
+    std::size_t seen = 0;
+    for (auto const& flavour : kPeFlavours) {
+        SCOPED_TRACE(flavour.name);
+        auto r = ObjectFormatSchema::loadShipped(flavour.name);
+        ASSERT_TRUE(r.has_value()) << "must load";
+        auto const src = (*r)->runtimeLibraries().sourcesForRole(RuntimeLibraryRole::CompilerSupport);
+        EXPECT_EQ(std::vector<std::string>(src.begin(), src.end()), units)
+            << "the compilerSupport row must be realized from exactly the three units, in that order";
+        auto const& cs = (*r)->compilerSupport();
+        ASSERT_TRUE(cs.has_value()) << "every pe flavour declares the compilerSupport block";
+        EXPECT_EQ(cs->role, RuntimeLibraryRole::CompilerSupport);
+        EXPECT_EQ(cs->libraryPath, "") << "a REALIZED role resolves to no image";
+        EXPECT_EQ(cs->securityCookieInitializerMangledName, "__security_init_cookie");
+        auto const realized = (*r)->runtimeLibraries().realizedSources();
+        for (auto const& u : units) {
+            EXPECT_NE(std::find(realized.begin(), realized.end(), u), realized.end())
+                << u << " must reach the shipped-runtime unit list";
+        }
+        ++seen;
+    }
+    EXPECT_EQ(seen, std::size(kPeFlavours));
+}
+
+// Each shape of a row's provider has exactly ONE spelling, and the loader refuses the other: a body of one unit is
+// `source` (so `sources` holding one is refused), and a row names one provider (so `source` beside `sources`, or an
+// image beside them, is refused); a unit is a non-empty path inside the config root, named once.
+TEST(RuntimeLibraryRoles, ARowOfSeveralUnitsHasOneSpellingAndTheOthersAreRefused) {
+    std::string const text = readShippedFormatText("pe64-x86_64-windows-exec");
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value())
+        << "the UNMUTATED shipped text must load clean, or the mutants prove nothing";
+    constexpr std::string_view kRow =
+        R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s", "runtime/platform/src/pe_gcc_unwind.c"] })";
+    ASSERT_NE(text.find(kRow), std::string::npos) << "the mutation anchor must still exist";
+    struct Mutant { char const* what; char const* row; char const* at; };
+    Mutant const mutants[] = {
+        {"`sources` holding ONE unit (a body of one unit is written `source`)",
+         R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c"] })", "/sources"},
+        {"`source` beside `sources`",
+         R"({ "role": "compilerSupport", "source": "runtime/platform/src/pe_gcc_unwind.c", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s"] })",
+         "/runtimeLibraries/"},
+        {"an `image` beside `sources`",
+         R"({ "role": "compilerSupport", "image": "ucrtbase.dll", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s"] })",
+         "/runtimeLibraries/"},
+        {"an EMPTY unit", R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", ""] })",
+         "/sources"},
+        {"`sources` that is not an array", R"({ "role": "compilerSupport", "sources": "runtime/platform/src/pe_compiler_support.c" })",
+         "/sources"},
+        {"a unit named TWICE",
+         R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support.c"] })",
+         "/sources/1"},
+        {"an ESCAPING unit",
+         R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "//host/share/evil.s"] })",
+         "/sources/1"},
+    };
+    for (auto const& m : mutants) {
+        SCOPED_TRACE(m.what);
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(mutant, kRow, m.row));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<sources>");
+        ASSERT_FALSE(bad.has_value()) << "must be refused at load";
+        std::string said;
+        bool        atTheRow = false;
+        for (auto const& d : bad.error()) {
+            said += "\n  " + d.path + ": " + d.message;
+            if (d.path.find("/runtimeLibraries/") != std::string::npos && d.path.find(m.at) != std::string::npos)
+                atTheRow = true;
+        }
+        EXPECT_TRUE(atTheRow) << "the refusal must name the row's own path (" << m.at << "):" << said;
+    }
+}
+
+// The block's two halves are both required: a compilerSupport block with no cookie initializer would define the
+// cookie and leave it at the value the runtime's object ships. And the other direction of the role table's rule:
+// with the block gone, the row is named by nothing and the format is refused.
+TEST(RuntimeLibraryRoles, ACompilerSupportBlockNeedsItsInitializerAndItsRowNeedsTheBlock) {
+    std::string const text = readShippedFormatText("pe64-x86_64-windows-exec");
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value());
+    constexpr std::string_view kInit = "    \"securityCookieInitializer\": \"__security_init_cookie\"\n";
+    {
+        std::string mutant = text;
+        ASSERT_TRUE(substituteOnce(mutant, "    \"role\": \"compilerSupport\",\n",
+                                   "    \"role\": \"compilerSupport\"\n"));
+        ASSERT_TRUE(substituteOnce(mutant, kInit, ""));
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<no-initializer>");
+        ASSERT_FALSE(bad.has_value()) << "a compilerSupport block with no initializer must be refused";
+        bool named = false;
+        for (auto const& d : bad.error())
+            if (d.path == "/compilerSupport/securityCookieInitializer") named = true;
+        EXPECT_TRUE(named) << "the refusal must name the missing key";
+    }
+    {
+        std::size_t const blockAt = text.find(R"("compilerSupport": {)");
+        ASSERT_NE(blockAt, std::string::npos);
+        std::size_t const closeAt = text.find("\n  },\n", blockAt);
+        ASSERT_NE(closeAt, std::string::npos);
+        std::string mutant = text;
+        mutant.erase(blockAt, (closeAt + 6) - blockAt);
+        ASSERT_EQ(mutant.find(R"("compilerSupport": {)"), std::string::npos);
+        auto bad = ObjectFormatSchema::loadFromText(mutant, "<no-block>");
+        ASSERT_FALSE(bad.has_value()) << "the compilerSupport row named by NO block is inert config";
+        bool namedTheTable = false;
+        for (auto const& d : bad.error())
+            if (d.path == "/runtimeLibraries" && d.message.find("compilerSupport") != std::string::npos)
+                namedTheTable = true;
+        EXPECT_TRUE(namedTheTable) << "the refusal must name the table and the role";
     }
 }

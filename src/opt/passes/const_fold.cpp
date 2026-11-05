@@ -38,6 +38,7 @@ HirLiteralValue toHirLiteral(MirLiteralValue const& src) {
             HirAggregateValue agg;
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toHirLiteral(f));
+            agg.unionMember = arm.unionMember;   // a union value's member (P69)
             dst.value = std::move(agg);
         } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
             // F5: a symbol-address literal is a MIR-tier link-time constant with
@@ -73,6 +74,7 @@ MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
             MirAggregateValue agg;
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toMirLiteral(f));
+            agg.unionMember = arm.unionMember;   // a union value's member (P69)
             dst.value = std::move(agg);
         } else if constexpr (std::is_same_v<T, HirAddressValue>) {
             // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): mirror the main hir_to_mir
@@ -223,7 +225,14 @@ private:
         if (oldOps.size() == 1 && unaryOpKind(op).has_value()) {
             auto const operand = readConstOperand(oldOps[0]);
             if (!operand.has_value()) return std::nullopt;
-            auto folded = detail::applyUnaryInt(*unaryOpKind(op), *operand);
+            // NO DOMAIN IS STATED, and that is this tier's statement: the
+            // reduction to the instruction's own type is `normalizeToType`'s — the
+            // one owner every fold of this pass goes through (unary, unsigned,
+            // binary). The shared fold computes on the 64-bit pattern and the
+            // conversion to `instType` is modular, so the wide intermediate cannot
+            // differ from a narrower one in any bit the type keeps.
+            auto folded = detail::applyUnaryInt(*unaryOpKind(op), *operand,
+                                                std::nullopt);
             if (!folded.has_value()) return std::nullopt;
             return normalizeToType(std::move(*folded), src_.instType(oldId));
         }

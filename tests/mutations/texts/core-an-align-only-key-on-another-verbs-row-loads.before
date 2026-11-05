@@ -1,0 +1,1 @@
+                                if (out.effect == AttributeEffect::Align) return true;

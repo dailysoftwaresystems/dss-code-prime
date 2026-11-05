@@ -1,0 +1,1 @@
+        if (TypeId const c = compose(composite, s.symbols.at(r).type); c.valid())

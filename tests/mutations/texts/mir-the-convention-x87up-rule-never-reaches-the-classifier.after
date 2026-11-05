@@ -1,0 +1,2 @@
+        mirCfg.aggregate = cc->aggregate;
+        mirCfg.aggregate.x87UpWithoutX87 = X87UpWithoutX87::Memory;

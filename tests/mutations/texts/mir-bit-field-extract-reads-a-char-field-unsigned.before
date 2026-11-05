@@ -1,0 +1,1 @@
+        if (isSignedIntKind(interner.kind(fieldTy))) {

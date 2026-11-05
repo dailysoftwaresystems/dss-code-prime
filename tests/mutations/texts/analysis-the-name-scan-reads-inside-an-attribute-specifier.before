@@ -1,0 +1,1 @@
+        if (isAttributeSpecifierNode(tree, cur)) continue;

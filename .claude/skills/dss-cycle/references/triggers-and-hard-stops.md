@@ -1,7 +1,7 @@
 # Triggers, §B gates and hard stops
 
 When a trigger, a §B gate or a hard stop genuinely stops the cycle, and when it does not. The
-decision gate itself — what the agent decides, how it reports, and the cases that still pause the
+decision gate itself — what the session decides, how it reports, and the cases that still pause the
 loop — is in `SKILL.md`; the pause-and-ask gate it amended on 2026-09-21 is kept below, whole.
 
 ## Contents
@@ -18,7 +18,7 @@ loop — is in `SKILL.md`; the pause-and-ask gate it amended on 2026-09-21 is ke
 
 The operator's ruling of 2026-09-21 — *"you do everything. I'm not your babysitter."* — amends it: forks,
 meaning forks included, documented-behaviour changes and a new engine mechanism at step 4 are decided by
-the agent, written into the row and reported veto-able. The gates' three escape hatches — a deferral,
+the session, written into the row and reported veto-able. The gates' three escape hatches — a deferral,
 carrying a net-open rise, growing a ratchet baseline — stay the operator's, because standing orders
 govern them (close, do not file; no follow-ups; a ratchet only comes down). The loop pauses, with one
 crisp question, for five cases: what no measurement can answer and no standing order covers; the OPT7 /

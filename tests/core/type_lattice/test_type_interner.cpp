@@ -986,6 +986,55 @@ TEST(TypeInterner, VlaArrayIsDistinctSentinelAndDedups) {
     EXPECT_NE(ti.vlaArray(ti.primitive(TypeKind::I64)), vla);
 }
 
+// P69 L2b1 (lane `lm`, the L2a2 review's B2): "IS THIS TYPE VARIABLY MODIFIED" HAS ONE HOME
+// (`TypeInterner::isVariablyModified`, C 6.7.6p3): a VLA reached through any pointer, array element
+// or function RESULT makes the type variably modified; a function's PARAMETER never does (its bound
+// has function prototype scope, C 6.7.6.2p5). One row per derivation shape the review names — a
+// pointer to a POINTER to a VLA, a function returning a pointer to one — beside the array spine
+// `typeContainsVla` answers, the controls with no VLA, and the parameter.
+// RED-ON-DISABLE: the walk stopping at a pointer (`typeContainsVla`'s spine) reddens every pointer
+// and function row; stopping at a function type (the lowering's own gate until the L2a review's N5)
+// reddens the two function-result rows; following a function's parameters reddens the two
+// parameter rows.
+TEST(TypeInterner, IsVariablyModifiedFollowsPointersArraysAndResultsNeverParameters) {
+    auto ti = makeInterner(1);
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const vla   = ti.vlaArray(i32);                       // int[n]
+    TypeId const fixed = ti.array(i32, 4);                       // int[4]
+    std::array<TypeId, 1> const vlaParam{ti.pointer(vla)};
+    TypeId const takesVla = ti.fnSig(vlaParam, i32, CallConv::CcSysV);   // int (int (*)[n])
+    TypeId const returnsVla =
+        ti.fnSig(std::span<TypeId const>{}, ti.pointer(vla), CallConv::CcSysV);   // int (*(void))[n]
+    struct Row {
+        char const* what;
+        TypeId      type;
+        bool        variablyModified;
+    };
+    Row const rows[] = {
+        {"int[n]", vla, true},
+        {"int[5][n] (a fixed array of VLAs)", ti.array(vla, 5), true},
+        {"int[n][4] (a VLA of fixed arrays)", ti.vlaArray(fixed), true},
+        {"int (*)[n]", ti.pointer(vla), true},
+        {"int (**)[n]", ti.pointer(ti.pointer(vla)), true},
+        {"int (*(void))[n] (a function returning a pointer to a VLA)", returnsVla, true},
+        {"int (*(*)(void))[n]", ti.pointer(returnsVla), true},
+        {"volatile int[n]", ti.volatileQualified(vla), true},
+        {"int (*)[n] with a volatile element", ti.pointer(ti.vlaArray(ti.volatileQualified(i32))), true},
+        {"int (int (*)[n]) (a PARAMETER's VLA)", takesVla, false},
+        {"int (*)(int (*)[n])", ti.pointer(takesVla), false},
+        {"int", i32, false},
+        {"int[4]", fixed, false},
+        {"int (*)[4]", ti.pointer(fixed), false},
+        {"int[]", ti.incompleteArray(i32), false},
+        {"an invalid type", InvalidType, false},
+    };
+    for (Row const& r : rows) {
+        EXPECT_EQ(ti.isVariablyModified(r.type), r.variablyModified) << r.what;
+    }
+    // The array spine alone stops at a pointer: the question this home exists apart from.
+    EXPECT_FALSE(ti.typeContainsVla(ti.pointer(vla)));
+}
+
 // D-LANG-TYPE-IDENTITY-VOCABULARY + C 6.3.2.1p2: `TypeInterner::commonType` —
 // the block-less-language sibling of `usualArithmeticCommonType` — short-circuits
 // on `a == b`. That short-circuit used to `return a` VERBATIM for every float and

@@ -1,0 +1,2 @@
+                if (rng == nullptr || a == nullptr) continue;
+                if (rng == nullptr) {

@@ -1,0 +1,1 @@
+    bool const same = a.lexically_normal() == b.lexically_normal();

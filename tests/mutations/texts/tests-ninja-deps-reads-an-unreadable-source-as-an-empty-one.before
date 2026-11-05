@@ -1,0 +1,2 @@
+    except OSError:
+        return (False, f"its source {src} cannot be read")

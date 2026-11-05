@@ -1,0 +1,1 @@
+                defs[c.def].bodySize = static_cast<std::size_t>(lay->size);

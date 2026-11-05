@@ -18,3 +18,38 @@ steps:
       python3 ./check-line-endings.py --selftest-watchdog
     successPattern: 'line-endings: watchdog OK'
     requireInputsUnmoved: true
+
+  # The self-test ALONE, without verifying the tree -- `dssharness run check-line-endings --manual-step self-test`:
+  # the instrument's arms read while the tree itself is red, or while a mutant is being read.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-line-endings.py --selftest
+    successPattern: '^line-endings: self-test OK \(\d+ arms\)$'
+    requireInputsUnmoved: true
+
+  # Check F alone: no CR instrument that cannot see a CR.
+
+  - name: audit-instruments
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-line-endings.py --audit-instruments
+    successPattern: '^line-endings: Check F OK \('
+    requireInputsUnmoved: true
+
+  # Are THESE files clean? The paths are read from a list file, both relative to the tree, which is
+  # why this step runs at the tree's root.
+
+  - name: files
+    manual: true
+    workingDirectoryRoot: tree
+    inputs:
+      list:
+        description: "a file naming the paths to measure, one per line, each relative to the tree"
+    run: |
+      python3 .harness-config/runner/actions/check-line-endings/check-line-endings.py --files-from "{list}"
+    successPattern: '^line-endings: OK \(\d+ file\(s\), none carries a CR'
+    requireInputsUnmoved: true

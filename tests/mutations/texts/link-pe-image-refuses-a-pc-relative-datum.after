@@ -1,0 +1,1 @@
+            if (tri->formulaKind != RelocFormulaKind::Linear || tri->pcRelative || tri->widthBytes == 0) {

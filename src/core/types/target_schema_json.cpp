@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstdint>
@@ -1418,7 +1419,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // that depends on the ISA (x86's `%~`) reads.
     // 22 -> 23 (P68 round 9): `pcRelativeMemoryBase`, the program counter as a
     // memory base (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
-    static constexpr std::array<std::string_view, 23> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 24> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -1470,6 +1471,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // the load refuses rather than the runtime.
         "atomics",
         "callingConventions",
+        // The convention ids this target's reference compilers give a meaning
+        // and this compiler does not implement — what makes a source-level
+        // convention name REFUSED rather than warned-and-ignored. See
+        // `TargetSchemaData::unimplementedCallingConventions`.
+        "unimplementedCallingConventions",
         // What a LINKER may build, and clobber, to carry a branch past its
         // field's reach — the ABI's grant, per relocation kind
         // (D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH).
@@ -1680,10 +1686,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 10> kRelocationKeys{
+            static constexpr std::array<std::string_view, 11> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
                 "addendBias", "tls", "imageRelative", "scaleLog2",
-                "gotSlotTwin"};
+                "gotSlotTwin", "fieldRange"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1791,6 +1797,28 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     return false;
                 }
                 info.imageRelative = r.at("imageRelative").get<bool>();
+            }
+            // P69 fold 3c: `fieldRange` — the values a narrow Linear field
+            // holds (`RelocFieldRange`). Read here; WHICH rows must state it
+            // and which may not is `TargetSchema::validate()`'s, which a
+            // programmatically-built schema also reaches.
+            if (r.contains("fieldRange")) {
+                auto const path = std::format("/relocations/{}/fieldRange", i);
+                if (!r.at("fieldRange").is_string()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'fieldRange' must be a string: 'signed', 'unsigned' "
+                           "or 'either'");
+                    return false;
+                }
+                auto const spelled = r.at("fieldRange").get<std::string>();
+                auto const range = kRelocFieldRangeTable.fromName(spelled);
+                if (!range.has_value()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'fieldRange' '{}' is none of 'signed', "
+                                       "'unsigned', 'either'", spelled));
+                    return false;
+                }
+                info.fieldRange = *range;
             }
             // P68 round 9: `scaleLog2` — the access size a SCALED page-offset
             // field is measured in (`TargetRelocationInfo::scaleLog2`). The
@@ -4545,6 +4573,64 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         } else {
             auto const& ccs = doc.at("callingConventions");
             data.callingConventions.reserve(ccs.size());
+            // ★ P69 (lane `cs`, fold f26c, main's ledger 454): A ROW MAY DERIVE FROM ANOTHER. `derivesFrom` names
+            // a row of this array whose keys the row takes; the row's own keys override them, a key's whole value
+            // at a time (never a merge inside one); `name` and the `$` prose keys are never taken. A convention
+            // that differs from another in a few keys states only those (`apple_arm64` from `aapcs64`,
+            // `sysv_amd64_darwin` from `sysv_amd64`), so a rule the two share has one home. A `derivesFrom` that
+            // is not a string, names no row, or leads back to a row it left is refused by name, and the row is
+            // not read. A chain is followed by a loop bounded by the row count -- never by recursion.
+            std::vector<std::optional<json>> derived(ccs.size());
+            std::vector<std::vector<std::string>> basesOf(ccs.size());   // each row's chain, nearest first
+            {
+                std::vector<std::pair<std::string, std::size_t>> rowByName;
+                for (std::size_t r = 0; r < ccs.size(); ++r)
+                    if (ccs[r].is_object() && ccs[r].contains("name") && ccs[r].at("name").is_string())
+                        rowByName.emplace_back(ccs[r].at("name").get<std::string>(), r);
+                auto const rowNamed = [&](std::string const& n) -> std::optional<std::size_t> {
+                    for (auto const& [rn, r] : rowByName)
+                        if (rn == n) return r;   // the first; a duplicate name is refused below
+                    return std::nullopt;
+                };
+                for (std::size_t r = 0; r < ccs.size(); ++r) {
+                    if (!ccs[r].is_object()) continue;   // refused by the loop below
+                    std::vector<std::size_t> chain{r};
+                    std::string refusal;
+                    while (refusal.empty() && ccs[chain.back()].contains("derivesFrom")) {
+                        json const& b = ccs[chain.back()].at("derivesFrom");
+                        if (!b.is_string()) {
+                            refusal = "'derivesFrom' must be a string naming another row of 'callingConventions'";
+                            break;
+                        }
+                        std::string const base = b.get<std::string>();
+                        std::optional<std::size_t> const at = rowNamed(base);
+                        if (!at.has_value())
+                            refusal = std::format("'derivesFrom' names '{}', which is no row of "
+                                                  "'callingConventions'", base);
+                        else if (std::find(chain.begin(), chain.end(), *at) != chain.end())
+                            refusal = std::format("'derivesFrom' leads back to '{}': a row cannot derive "
+                                                  "from itself through its bases", base);
+                        else
+                            chain.push_back(*at);
+                    }
+                    if (!refusal.empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/callingConventions/{}/derivesFrom", r), refusal);
+                        continue;
+                    }
+                    json row = json::object();
+                    for (std::size_t k = chain.size(); k-- > 0;) {
+                        for (auto const& [key, value] : ccs[chain[k]].items()) {
+                            if (key == "derivesFrom") continue;
+                            if (k != 0 && (key == "name" || key.starts_with("$"))) continue;
+                            row[key] = value;
+                        }
+                    }
+                    derived[r] = std::move(row);
+                    for (std::size_t k = 1; k < chain.size(); ++k)
+                        basesOf[r].push_back(ccs[chain[k]].at("name").get<std::string>());
+                }
+            }
             auto readStringArray = [&](json const& root,
                                        std::size_t  ci,
                                        char const*  field,
@@ -4567,8 +4653,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
             };
             for (std::size_t i = 0; i < ccs.size(); ++i) {
-                auto const& c = ccs[i];
-                if (!c.is_object()) {
+                auto const& written = ccs[i];
+                if (!written.is_object()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/callingConventions/{}", i),
                               "calling-convention entry must be an object");
@@ -4578,8 +4664,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 28> kCallConvKeys{
+                static constexpr std::array<std::string_view, 30> kCallConvKeys{
                     "name",
+                    // P69 (lane `cs`, fold f26c, main's ledger 454): the row this one derives
+                    // from (above), and what an X87UP eightbyte not preceded by X87 becomes.
+                    "derivesFrom", "x87UpWithoutX87",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "callerSaved", "calleeSaved",
                     // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
@@ -4587,11 +4676,20 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     // per register class. Absent ⇒ the whole register.
                     "calleeSavedPreservedBits",
                     "stackAlignment", "shadowSpaceBytes", "redZoneBytes",
-                    "entryStackPointerBias", "callPushBytes",
+                    // ★ `entryStackPointerBias` IS DELIBERATELY ABSENT, so a
+                    // document still declaring it is REFUSED AT LOAD: the
+                    // process-entry bias is derived from the exec format's
+                    // `entryTransition` and `callPushBytes`, and a convention
+                    // carrying its own would be a second owner
+                    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+                    "callPushBytes",
                     "stackProbePageBytes", "aggregateMaxRegBytes",
                     "aggregateClassification", "slotAligned",
                     "variadicArgsAlwaysStack",
                     "aggregateStackExhaustsRegisters",
+                    // P69 (lane `cs`, fold f26c): how a MEMORY-class by-value
+                    // aggregate argument travels (`stack` / `callerCopy`).
+                    "aggregateMemoryArgument",
                     "stackArgPacking",
                     "linkRegister", "stackPointer", "framePointer",
                     // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
@@ -4607,10 +4705,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     "variadicVectorCountReg", "indirectResultRegister",
                     "vaListLayout"};
                 DSS_CHECK_KEY_VOCABULARY(kCallConvKeys);
-                rejectUnknownKeys(c, kCallConvKeys,
+                rejectUnknownKeys(written, kCallConvKeys,
                                   std::format("/callingConventions/{}", i),
                                   "a calling-convention row", coll);
+                // The row as its base and its own keys make it; a refused derivation was said above.
+                if (!derived[i].has_value()) continue;
+                json const& c = *derived[i];
                 TargetCallingConvention cc;
+                cc.bases = std::move(basesOf[i]);
                 if (!c.contains("name") || !c.at("name").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
                               std::format("/callingConventions/{}/name", i),
@@ -4776,19 +4878,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readBoundedInt(c, coll, ccPath, "stackAlignment",   cc.stackAlignment);
                 readBoundedInt(c, coll, ccPath, "shadowSpaceBytes", cc.shadowSpaceBytes);
                 readBoundedInt(c, coll, ccPath, "redZoneBytes",     cc.redZoneBytes);
-                // D-LK10-ENTRY-TRAMP-PROLOGUE: process-entry RSP bias
-                // when this cc is the entry cc. See target_schema.hpp
-                // for the per-cc concrete values. Validated below
-                // (must be < stackAlignment when set).
-                readBoundedInt(c, coll, ccPath, "entryStackPointerBias",
-                               cc.entryStackPointerBias);
                 // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: ISA-level
                 // call-instruction RSP-push width. x86_64 = 8 (CALL
                 // pushes 8-byte return address); ARM64 = 0 (BL writes
                 // LR, no push). Validated below: must be strictly <
                 // `stackAlignment` (the bias is an OFFSET into the
-                // alignment quantum, parallel to `entryStackPointerBias`'s
-                // contract).
+                // alignment quantum). Also the entry trampoline's
+                // process-entry bias wherever the exec format's
+                // `entryTransition` says the loader CALLS the entry
+                // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
                 // D-WIN64-LARGE-FRAME-STACK-PROBE: OS stack guard-page
@@ -4801,7 +4899,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // the max aggregate size passed/returned in registers (SysV 16,
                 // Win64 8, AAPCS64 16); larger ⇒ by-reference / sret.
                 readBoundedInt(c, coll, ccPath, "aggregateMaxRegBytes",
-                               cc.aggregateMaxRegBytes);
+                               cc.aggregate.maxRegBytes);
                 // FC7: the by-value aggregate CLASSIFICATION strategy (a closed
                 // verb set — the realization tier switches on this enum, never
                 // identity). Unknown strategy ⇒ FAIL-LOUD (no silent fallback).
@@ -4824,7 +4922,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         auto const s = c.at("aggregateClassification").get<std::string>();
                         if (auto const k = aggregateClassKindFromName(s); k.has_value()) {
-                            cc.aggregateClassification = *k;
+                            cc.aggregate.classification = *k;
                         } else {
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       std::format("{}/aggregateClassification", ccPath),
@@ -4869,6 +4967,57 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // arg-register class (AAPCS64). Default false = BACKFILL (SysV:
                 // the leftover registers stay available for later args). Win64 is
                 // slot-aligned so it never straddles (the flag is inert).
+                // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+                // OPTIONAL — how a
+                // MEMORY-class by-value aggregate ARGUMENT travels: `stack` (its bytes
+                // in the outgoing argument area, SysV AMD64) or `callerCopy` (a
+                // pointer to a caller copy, Win64 and AAPCS64). Absent ⇒ callerCopy.
+                // A wrong type or an unknown spelling is refused naming the set.
+                if (c.contains("aggregateMemoryArgument")) {
+                    json const& v = c.at("aggregateMemoryArgument");
+                    std::optional<AggregateMemoryArgument> const k =
+                        v.is_string() ? aggregateMemoryArgumentFromName(v.get<std::string>())
+                                      : std::nullopt;
+                    if (!k.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/aggregateMemoryArgument", ccPath),
+                                  std::format("'aggregateMemoryArgument' must name how a "
+                                              "MEMORY-class aggregate argument travels — "
+                                              "accepted: {}",
+                                              detail::renderAllowedList(
+                                                  allNames(kAggregateMemoryArgumentTable),
+                                                  " / ")));
+                    } else {
+                        cc.aggregate.memoryArgument = *k;
+                    }
+                }
+                // ★ P69 (lane `cs`, fold f26c, main's ledger 454): OPTIONAL -- what an X87UP eightbyte not preceded
+                // by X87 becomes (`X87UpWithoutX87`, aggregate_layout.hpp): `memory` (psABI) or `sse` (Apple's
+                // x86_64). Absent ⇒ memory. Only the `sysv_eightbyte` classification reads it, so a row of another
+                // strategy declaring it is refused (a key no reader asks is a promise nobody keeps), as is a wrong
+                // type or an unknown spelling, naming the set.
+                if (c.contains("x87UpWithoutX87")) {
+                    json const& v = c.at("x87UpWithoutX87");
+                    std::optional<X87UpWithoutX87> const k =
+                        v.is_string() ? x87UpWithoutX87FromName(v.get<std::string>()) : std::nullopt;
+                    if (!k.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/x87UpWithoutX87", ccPath),
+                                  std::format("'x87UpWithoutX87' must name what an X87UP eightbyte not "
+                                              "preceded by X87 becomes -- accepted: {}",
+                                              detail::renderAllowedList(allNames(kX87UpWithoutX87Table),
+                                                                        " / ")));
+                    } else if (cc.aggregate.classification != AggregateClassKind::SysVEightbyte) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/x87UpWithoutX87", ccPath),
+                                  std::format("'x87UpWithoutX87' is read only by the '{}' aggregate "
+                                              "classification, and this row's is '{}'",
+                                              aggregateClassKindName(AggregateClassKind::SysVEightbyte),
+                                              aggregateClassKindName(cc.aggregate.classification)));
+                    } else {
+                        cc.aggregate.x87UpWithoutX87 = *k;
+                    }
+                }
                 if (c.contains("aggregateStackExhaustsRegisters")) {
                     if (!c.at("aggregateStackExhaustsRegisters").is_boolean()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -4877,7 +5026,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "'aggregateStackExhaustsRegisters' must be a "
                                   "boolean");
                     } else {
-                        cc.aggregateStackExhaustsRegisters =
+                        cc.aggregate.stackExhaustsRegisters =
                             c.at("aggregateStackExhaustsRegisters").get<bool>();
                     }
                 }
@@ -4949,38 +5098,58 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the two
                         // alignment caps. Omitted ⇒ 0 ⇒ no over-alignment
                         // honoured, which is the pre-existing flat-slot stride.
-                        readBoundedInt(sap, coll, sapPath, "maxScalarAlignment",
-                                       cc.stackArgPacking.maxScalarAlignment);
-                        readBoundedInt(sap, coll, sapPath,
-                                       "maxAggregateAlignment",
-                                       cc.stackArgPacking.maxAggregateAlignment);
-                        // A cap is an ALIGNMENT, so it is 0 or a power of two —
+                        // A NUMBER is an ALIGNMENT, so it is 0 or a power of two —
                         // the same shape rule `stackAlignment` carries. A typo'd
                         // 24 would silently mis-place every over-aligned stacked
                         // argument rather than failing, which is the ABI
                         // divergence that compiles clean and breaks at the
-                        // boundary.
-                        for (auto const& [key, value] :
-                             {std::pair<char const*, std::uint16_t>{
-                                  "maxScalarAlignment",
-                                  cc.stackArgPacking.maxScalarAlignment},
-                              std::pair<char const*, std::uint16_t>{
-                                  "maxAggregateAlignment",
-                                  cc.stackArgPacking.maxAggregateAlignment}}) {
-                            if (value != 0
-                                && (value & static_cast<std::uint16_t>(
-                                                value - 1)) != 0) {
-                                coll.emit(
-                                    DiagnosticCode::C_MalformedJson,
-                                    std::format("{}/{}", sapPath, key),
-                                    std::format(
-                                        "'{}' ({}) must be 0 (no over-alignment "
-                                        "honoured) or a power of two — it is the "
-                                        "largest own-alignment this calling "
-                                        "convention honours for a stacked "
-                                        "argument", key, value));
+                        // boundary. ★ P69 (lane `cs`, fold f26c — the SysV row,
+                        // main's ledger 452): or the keyword `own`, the argument's
+                        // own alignment uncapped (`StackArgPackingRules::
+                        // AlignmentCap`); any other string, or a non-number, is
+                        // refused naming both forms.
+                        auto readCap = [&](char const* key,
+                                           StackArgPackingRules::AlignmentCap& out) {
+                            using Cap = StackArgPackingRules::AlignmentCap;
+                            if (!sap.contains(key)) return;
+                            auto const& v = sap.at(key);
+                            std::string const path = std::format("{}/{}", sapPath, key);
+                            std::string const forms = std::format(
+                                "a number of bytes — 0 (no over-alignment honoured) or "
+                                "a power of two, the largest own-alignment this calling "
+                                "convention honours for a stacked argument — or '{}' (the "
+                                "argument's own alignment, uncapped)",
+                                Cap::kOwnKeyword);
+                            if (v.is_string()) {
+                                std::string const s = v.get<std::string>();
+                                if (s == Cap::kOwnKeyword) {
+                                    out = Cap::own();
+                                    return;
+                                }
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          std::format("'{}' is '{}': it must be {}", key,
+                                                      s, forms));
+                                return;
                             }
-                        }
+                            if (!v.is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          std::format("'{}' must be {}", key, forms));
+                                return;
+                            }
+                            std::int64_t const n = v.get<std::int64_t>();
+                            if (n < 0 || n > std::numeric_limits<std::uint16_t>::max()
+                                || (n != 0 && (n & (n - 1)) != 0)) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          std::format("'{}' ({}) must be {}", key, n,
+                                                      forms));
+                                return;
+                            }
+                            out = Cap::ofBytes(static_cast<std::uint16_t>(n));
+                        };
+                        readCap("maxScalarAlignment",
+                                cc.stackArgPacking.maxScalarAlignment);
+                        readCap("maxAggregateAlignment",
+                                cc.stackArgPacking.maxAggregateAlignment);
                         // ⚠ ONE BUILDABLE VALUE ON THE AGGREGATE AXIS, AND THE
                         // OTHER IS REFUSED RATHER THAN APPROXIMATED. ✔MEASURED:
                         // both shipped ABIs slot-round the SIZE of a stacked
@@ -5495,6 +5664,55 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.callingConventions.push_back(std::move(cc));
+            }
+        }
+    }
+
+    // ── unimplementedCallingConventions (P69 round 4, lane `cs`) ──
+    // The convention ids a reference compiler of this target emits and this
+    // compiler does not. Read AFTER `callingConventions`, because the one
+    // cross-check it owes needs the rows: an id is a convention this compiler
+    // EMITS or one it does NOT, and a document saying both would make a
+    // source-level name both the active-or-refused kind and the
+    // always-refused kind — the analyzer asks the rows first, so the second
+    // listing would be dead text that reads as a fact. Duplicates are refused
+    // for the same reason every id list here refuses them: a repeat is a typo
+    // or a bad merge, never information.
+    if (doc.contains("unimplementedCallingConventions")) {
+        auto const& uc = doc.at("unimplementedCallingConventions");
+        if (!uc.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/unimplementedCallingConventions",
+                      "'unimplementedCallingConventions' must be an array of "
+                      "calling-convention ids (strings)");
+        } else {
+            for (std::size_t i = 0; i < uc.size(); ++i) {
+                auto const path =
+                    std::format("/unimplementedCallingConventions/{}", i);
+                if (!uc[i].is_string() || uc[i].get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "each entry must be a non-empty calling-convention "
+                              "id");
+                    continue;
+                }
+                auto id = uc[i].get<std::string>();
+                if (data.callingConventionIndex.find(id)
+                    != data.callingConventionIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is a row of 'callingConventions' — a "
+                                  "convention this target EMITS cannot also be "
+                                  "listed as one it does not implement", id));
+                    continue;
+                }
+                if (std::ranges::find(data.unimplementedCallingConventions, id)
+                    != data.unimplementedCallingConventions.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("duplicate unimplemented "
+                                          "calling-convention id '{}'", id));
+                    continue;
+                }
+                data.unimplementedCallingConventions.push_back(std::move(id));
             }
         }
     }

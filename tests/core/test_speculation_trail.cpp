@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -279,6 +280,58 @@ TEST(SpeculationTrail, WriteLogRecordsNothingBeforeItsFirstMark) {
     log.discardJournal();
     EXPECT_EQ(log.journalSize(), 0u);
     EXPECT_FALSE(log.armed());
+}
+
+// ── the read count (P69 L2b1, lane `lm`, the L2a2 review's A4) ────────────
+// Every read path counts the entries it hands out, and nothing else counts: the owners' work
+// counters (the binder sketch's, the builder's scope work) add `reads()`, so a walk or a copy of a
+// stack is seen however it is written. One row per read path and per mutation, over an empty, a
+// one-entry and a five-entry stack: a read path that stops counting, or a mutation that starts,
+// reddens its row by name.
+TEST(SpeculationTrail, EveryReadPathCountsTheEntriesItHandsOut) {
+    struct Path {
+        char const* what;
+        bool        needsAnEntry;   // an element read of an empty stack is no read at all
+        // the read, and the count it must add for a stack of `n` entries
+        void (*run)(TrailedStack<int>&);
+        std::uint64_t (*expected)(std::size_t n);
+    };
+    auto const none  = [](std::size_t) -> std::uint64_t { return 0; };
+    auto const one   = [](std::size_t) -> std::uint64_t { return 1; };
+    auto const whole = [](std::size_t n) -> std::uint64_t { return n; };
+    Path const paths[] = {
+        {"operator[]", true, [](TrailedStack<int>& s) { (void)s[0]; }, one},
+        {"back()", true, [](TrailedStack<int>& s) { (void)s.back(); }, one},
+        {"span()", false, [](TrailedStack<int>& s) { (void)s.span(); }, whole},
+        {"begin()", false, [](TrailedStack<int>& s) { (void)s.begin(); }, whole},
+        {"end()", false, [](TrailedStack<int>& s) { (void)s.end(); }, none},
+        {"rbegin()", false, [](TrailedStack<int>& s) { (void)s.rbegin(); }, whole},
+        {"rend()", false, [](TrailedStack<int>& s) { (void)s.rend(); }, none},
+        {"a range-for", false,
+         [](TrailedStack<int>& s) { for (int const v : s) (void)v; }, whole},
+        {"a vector copy", false,
+         [](TrailedStack<int>& s) { (void)std::vector<int>(s.begin(), s.end()); }, whole},
+        {"take()", false, [](TrailedStack<int>& s) { (void)std::move(s).take(); }, whole},
+        {"empty() and size()", false,
+         [](TrailedStack<int>& s) { (void)s.empty(); (void)s.size(); }, none},
+        {"mark() and rewindTo()", false,
+         [](TrailedStack<int>& s) { auto const m = s.mark(); s.push(7); s.rewindTo(m); }, none},
+        {"push() and pop()", false, [](TrailedStack<int>& s) { s.push(7); s.pop(); }, none},
+        {"assign() and truncate()", true,
+         [](TrailedStack<int>& s) { s.assign(0, 9); s.truncate(0); }, none},
+        {"discardJournal()", false, [](TrailedStack<int>& s) { s.discardJournal(); }, none},
+    };
+    for (Path const& p : paths) {
+        for (std::size_t const n : {std::size_t{0}, std::size_t{1}, std::size_t{5}}) {
+            if (p.needsAnEntry && n == 0) continue;
+            TrailedStack<int> s;
+            for (std::size_t i = 0; i < n; ++i) s.push(static_cast<int>(i));
+            std::uint64_t const before = s.reads();
+            p.run(s);
+            EXPECT_EQ(s.reads() - before, p.expected(n))
+                << p.what << " on a stack of " << n << " entries";
+        }
+    }
 }
 
 // ── fail-loud contracts ──────────────────────────────────────────────────

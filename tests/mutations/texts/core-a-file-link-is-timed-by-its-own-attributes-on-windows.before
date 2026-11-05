@@ -1,0 +1,3 @@
+    Handle const reached = reachedHandle(p, FILE_READ_ATTRIBUTES, ec);
+    if (!reached) return std::nullopt;
+    FILETIME written{};

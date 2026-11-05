@@ -1,0 +1,1 @@
+    if (!library && !rec.isImplicitDeclaration && in.fnResult(rec.type).v != resultIt->second.v && false) {

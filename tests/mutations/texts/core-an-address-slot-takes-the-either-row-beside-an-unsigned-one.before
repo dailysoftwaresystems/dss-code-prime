@@ -1,0 +1,1 @@
+        anyExact = anyExact || (isSlot(r) && r.fieldRange == RelocFieldRange::Unsigned);

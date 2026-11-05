@@ -1,0 +1,1 @@
+    auto text = core::readFileChecked(path, std::numeric_limits<std::uint32_t>::max());
