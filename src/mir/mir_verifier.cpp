@@ -274,8 +274,10 @@ constexpr int kDescribeMaxDepth = 3;
 // operand `Return` (checkTypeInvariants); the Call RESULT half reuses it rather
 // than minting a second list, because both are asking the identical question —
 // "is this a register piece of a lowered aggregate?" — and two lists drift.
-// F128 is an AAPCS64 binary128 HFA piece (a Q-register); F80 is the x87
-// counterpart, defensive (x87 struct returns classify ByReference).
+// F128 is an AAPCS64 binary128 HFA piece (a Q-register); F80 is the x87 one: a
+// SysV X87-class result (`struct { long double x; }`) is returned as its one
+// `long double` in st0, so its Call is typed F80 (P69 fold f26c; it was an sret
+// call before, and this kind was listed defensively).
 [[nodiscard]] bool isAbiPieceKind(TypeKind k) {
     return k == TypeKind::I64 || k == TypeKind::F64 || k == TypeKind::F32
         || k == TypeKind::Ptr || k == TypeKind::F80 || k == TypeKind::F128;
@@ -451,6 +453,20 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                     "blockaddress_export carries the invalid SymbolId 0 — a data "
                     "relocation against it resolves to whichever symbol occupies "
                     "slot 0");
+            }
+        }
+        if (op == MirOpcode::ByValueStackArg) {
+            // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // the carrier's secondary payload is the carried aggregate's own
+            // alignment (mir_node.hpp), which the outgoing cursor rounds to — 0
+            // (not stated) or an alignment the `Alignment` type can hold, asked of
+            // that type as the Alloca arm below asks it. A garbled value would place
+            // the aggregate where the callee does not read it, in silence.
+            std::uint32_t const a = mir_.instPayload2(id);
+            if (a != 0 && !Alignment::fromBytes(a).has_value()) {
+                reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
+                    std::format("byvaluestackarg alignment payload {} is not a power "
+                                "of two in [1, {}]", a, Alignment::kMaxBytes));
             }
         }
         if (op == MirOpcode::Alloca) {
@@ -1395,8 +1411,8 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                                 // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a
                                 // binary128 HFA piece (F128) is a legitimate
                                 // register return piece (AAPCS64, a Q-register), as
-                                // is an F80 x87 piece (symmetric; x87 struct
-                                // returns are ByReference so this is defensive).
+                                // is an F80 x87 piece (a SysV X87-class result
+                                // returns its one `long double`, P69 fold f26c).
                                 if (vk != TypeKind::I64 && vk != TypeKind::F64
                                     && vk != TypeKind::F32 && vk != TypeKind::Ptr
                                     && vk != TypeKind::F80 && vk != TypeKind::F128) {
@@ -1524,10 +1540,10 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
                 // Three distinct shipped shapes land here and none is a defect:
                 //   * a call whose value is DISCARDED (an expression statement);
                 //   * a call to a genuinely void callee;
-                //   * a ByReference/sret struct-returning call, which hir_to_mir
+                //   * a MEMORY-class (sret) struct-returning call, which hir_to_mir
                 //     emits with `InvalidType` because the callee writes THROUGH
                 //     the hidden pointer and the MIR Call is valueless
-                //     (emitStructReturningCall's ByReference arm).
+                //     (emitStructReturningCall's Memory arm).
                 // The tier cannot distinguish the first from a lowering that
                 // LOST a needed result, so it must not guess. Stated rather
                 // than left implicit, because "no result is always fine" is a
@@ -1620,7 +1636,7 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
         //   * a by-value-class PARAM (struct/union/_Complex/wide int) becomes
         //     EITHER N register-piece operands, OR one by-reference pointer, OR
         //     one `ByValueStackArg` carrier (hir_to_mir emitByValueStructCallArg);
-        //   * a by-value-class RETURN classified ByReference PREPENDS an sret
+        //   * a by-value-class RETURN classified Memory PREPENDS an sret
         //     pointer at operand[1] — and on the SysV/Win64 hidden-arg path that
         //     prepend carries NO marker at all (only the x8 path sets
         //     `call_payload::kIndirectResultBit`), so it cannot be detected.

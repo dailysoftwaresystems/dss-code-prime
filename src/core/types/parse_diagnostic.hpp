@@ -2780,6 +2780,20 @@ enum class DiagnosticCode : std::uint16_t {
     // `double f(double)` declared it runs on clang 18.1.3 (warned) and cl, and gcc refuses
     // it. A WARNING, suppressible.
     S_OutOfScopeDeclarationUsed           = 0xE09D,
+    // P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION):
+    // a CALL whose callee names no declaration in scope at the call declares it implicitly,
+    // as the language document's call rule states (`implicitDeclaration`; for C, C90 6.3.2.2's
+    // `extern int name()`). ✔MEASURED (lane `cs` probes ip, ip3; each program RUN): gcc 13.3.0
+    // (default standard and -std=c2x), mingw-w64 gcc 13.2.0 and cl 19.51 make the declaration
+    // and warn ("implicit declaration of function 'f'", C4013); clang 18.1.3 refuses. A
+    // WARNING, suppressible.
+    S_ImplicitFunctionDeclaration         = 0xE09E,
+    // The implicit declaration of a callee disagrees with a LATER declaration of the name:
+    // that declaration does not return the implicit declaration's result type. ✔MEASURED
+    // (probe ip3 cell 2, `double f(double v)` after the call): gcc, mingw-w64 gcc ("conflicting
+    // types for 'f'") and cl (C2371) refuse it; cl takes a later `int f(char)` and
+    // `int f(int, ...)`, which gcc refuses, so only the result is held to it. An ERROR.
+    S_ImplicitDeclarationConflicts        = 0xE09F,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -4465,16 +4479,16 @@ enum class DiagnosticCode : std::uint16_t {
     //   fixed-slot path and silently lose the runtime size (a `lea` of a 1-slot
     //   scalar for the whole array — a stack miscompile).
     L_VlaDynamicAllocaUnsupported  = 0xB00D,
-    // VLA C1b LEAF-scope gate (D-CSUBSET-VLA-NONLEAF-CALL-FRAME): a function with a
-    //   variable-length array ALSO makes a call OR calls `va_start`. C1b builds the
-    //   dynamic-stack frame model for a LEAF function only: after `sub sp,<vlaSize>`
-    //   the outgoing-args area (call args) and the va-area leas are SP-relative, and
-    //   under the moved SP NO base (neither SP nor the frame pointer) addresses them
-    //   correctly while the `call`/va-walk runs at the moved SP. The non-leaf VLA
-    //   frame model (outgoing-args placement under a runtime-moved SP) is a separate
-    //   designed cycle. Fails loud (never a silent outgoing-arg/va miscompile).
-    //   UNSUPPRESSABLE — suppressed, a non-leaf VLA would emit call args INSIDE the
-    //   VLA region (an ABI break). Red-on-disable via the non-leaf fail-loud pins.
+    // A FRAME WHOSE STACK POINTER MOVES AT RUN TIME (a VLA, or a realignment for an
+    //   over-aligned stacked argument) reached a shape its frame model does not cover.
+    //   It was born as the C1b LEAF gate (D-CSUBSET-VLA-NONLEAF-CALL-FRAME: such a
+    //   function that made a call or called `va_start`); both arms are built now — the
+    //   outgoing-args area travels with SP, and the va-area leas and the variadic spill
+    //   are the frame pointer's. Two reasons remain: the frame-base VERIFIER (a
+    //   fixed-frame reference left SP-relative under the moved SP, a silent stack
+    //   miscompile) and a SEH `__try` parent (D-CSUBSET-VLA-WIN64-UNWIND: its funclets'
+    //   establisher frame is unwitnessed for a frame-register parent). UNSUPPRESSABLE —
+    //   suppressed, the function would address its frame off a stack pointer that moved.
     L_VlaNonLeafFrameUnsupported   = 0xB00E,
 
     // D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED: a terminator's CFG edges are

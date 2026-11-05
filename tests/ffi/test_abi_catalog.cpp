@@ -336,7 +336,8 @@ TEST(FfiAbiResolve, X86_64PeResolvesToMS64) {
 
 TEST(FfiAbiResolve, X86_64MachOResolvesToSysV) {
     // Apple's x86_64 ABI is SysV-with-quirks: the same cc row as Linux ELF.
-    expectResolves("x86_64", "macho64-x86_64-darwin", "sysv_amd64");
+    // Apple's realization of SysV (P69 lane `cs`, fold f26c, main's ledger 454: an X87UP eightbyte is SSE).
+    expectResolves("x86_64", "macho64-x86_64-darwin", "sysv_amd64_darwin");
 }
 
 TEST(FfiAbiResolve, Arm64ElfResolvesToAAPCS64) {

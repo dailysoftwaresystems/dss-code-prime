@@ -1,0 +1,15 @@
+{
+  "$comment": "P69 round 1, fold f26c (lane cs): a parameter declared by its type alone and followed by an attribute run -- `int add(int __attribute__((unused)), int);`. The C document's `param` row reads its declarator BY POSITION (`declarator: 1`), and with the declarator absent position 1 was the trailing attribute run, so the prototype lost the parameter's type: H_TypeUnresolved on the prototype alone, S_IncompatibleRedeclaration beside its definition (MEASURED with a pre-fix dsscp, lane cs probe np), where gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and Apple clang 21.0.0 run each shape. The role children of a declaration now END at a slot standing where a role should be (decl_prefix_strip.hpp). Runnable so the CALLS are proven, not only the signature: a `mode(QI)` run on a nameless parameter converts 298 to 42 at the call. Exit 42 = every check held; another code names the first check that did not.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

@@ -600,9 +600,10 @@ TEST(DisasmDefensive, LeakedPassInternalOperandMarkerFailsLoudNotSilentZero) {
 
     // REX.W 0x48 + 0xC7 + ModRM(mod=3 /0 rm=rcx) 0xC1 + imm32 LE 0 — a
     // perfectly well-formed `mov rcx, 0`. The BYTES are honest; what is wrong
-    // is that the LIR inst's wire-0 operand is a pass-internal marker that
-    // `materializeCallingConvention` should have consumed long before the
-    // encoder, so there is nothing for the oracle to compare against.
+    // is that the LIR inst's wire-0 operand is a pass-internal marker that a
+    // pass should have consumed long before the encoder (`lowerWideCallArgs`
+    // the first, `materializeCallingConvention` the second), so there is
+    // nothing for the oracle to compare against.
     std::array<std::uint8_t, 7> const immZeroBytes{
         0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00
     };

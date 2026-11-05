@@ -801,6 +801,33 @@ round's close; each checkpoint's commit message says what was and was not run on
   Folded with one file settled by hand (program.cpp: the lane reads the objects once before every route and packages
   them inside H5's one packaging step; every other H5 line kept, MEASURED). The merged tree's five-leg suite, repo-guard
   and the sweep of 3d's arms follow the commit. Fold order now: f26c → H6 → 3e → L2b2 → f26d → H7.
+  ✔MEASURED on checkpoint 39's MERGED tree (dispatcher 20261105-012031-*): macos-arm64-debug (AppleClang 21.0.0),
+  linux-x86_64-debug and linux-arm64-debug (GNU 13.3.0) 2905 of 2905 each, windows-x86_64-release (MSVC 19.51) passed,
+  windows-x86_64-debug (GNU 13.2.0) 2903 of 2905 — the two reds read by name:
+  `PeCompilerSupportRuntime.AGccObjectsMainHookProbeAndUnwinderEntriesAreDefined` (checkpoint 38's known red; green on
+  the harness lane's H6 tree) and `PeSecurityCookieInitNative.EachObjectRunsSeededUnderDssLinkExeAndLldLink`
+  (`K_ImageWriteOpenFailed` on a test-scratch path past MAX_PATH, the long-path class H6 closes); repo-guard 29 of 29
+  (run 20261105-034357-f694c11a). THE REVIEW OF 3d SENT BACK (0 BLOCKER, 2 MAJOR: the asm dialect's second entry
+  vocabulary, an entry in an archive member): the fold stands, its fixed rows close only after their class's findings
+  are answered — the link lane's 3e opens with that answer (one entry election over every route and grammar).
+- **Checkpoint 40 (2026-11-05) = the front-end and convention lane's fold f26c, its CODE**: a caller places every
+  stack-passed argument at its declared alignment (the dynamic frame realigns once before any call; the CFA stays on
+  the frame pointer across it, read from DSS's own linked images on ELF and Mach-O); how a by-value aggregate travels
+  is a fact of the convention row, answered by one classifier (`AggregateConventionRules`, `classifyAggregate`; SysV's
+  MEMORY class by pointer, an X87 result in st0, Darwin x86_64 a derived row); a use sees only a binding whose scope has
+  begun; a call with no declaration makes the implicit declaration the references make, warned once (0xE09E) and held to
+  every later declaration (0xE09F); `mode` built; the conditional of compatible pointers takes their composite type.
+  THE REVIEW OF f26c SENT BACK (0 BLOCKER, 2 MAJOR: a `long double _Complex` result is returned through a hidden pointer
+  where the psABI's COMPLEX_X87 class returns it in st0/st1; arms whose declared red sets are not exact), so NO ROW
+  CLOSES at this fold: 11 rows applied, every one OPEN or DISCLOSED as it was, each closing "FIX FOLDED in fold f26c
+  (checkpoint 40) … closes on main's `--pending` sweep and the answer to review-csf26c". The row the lane had born
+  for the over-aligned stacked argument was dropped (the fold's own SysV change created that case; its record is the
+  SysV row's). ✔MEASURED by the lane (run 20261105-011403-94fdad7d, every binary it changed run whole, four legs):
+  windows 317, linux-x86_64 316, linux-arm64 316, macos-arm64 316, all passed; 56 new arms, unswept. Balance unchanged:
+  687 open against 620 at `71648598` (counted −25, REAL net +67). The merged tree's suite, repo-guard and the sweep
+  of the fold's arms follow the commit. Fold order now: H6 → f26c2 (the review's answer) → 3e → L2b2 → f26d → H7;
+  f26d opens with D-FFI-SHIPPED-CONSTANTS-TYPED-OTHERWISE-THAN-THE-REAL-HEADERS and the shipped `windows.json`'s
+  missing declarations (`GetModuleHandle*`, `GetModuleFileName*`, `VirtualQuery`), one class.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

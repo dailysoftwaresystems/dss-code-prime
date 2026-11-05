@@ -1,0 +1,16 @@
+{
+  "$comment": "AN OVER-ALIGNED OBJECT KEEPS ITS TYPE'S ALIGNMENT WHEREVER IT LIVES (P69 round 1, lane cs, fold f26c). C 6.2.8 / 6.7.5: an object has the alignment its type states. DSS stated a frame slot's alignment for a named local and a VLA but not for an anonymous temp, and a slot that states nothing is promised only the stack's 16 bytes, so a temp of a type aligned past 16 was misaligned: the caller copy Win64 and AAPCS64 hand a callee as its by-value parameter, a compound literal, and the temporaries of a call's and a conditional's aggregate result (probes w2, w3 and w4, the last reading each address through a volatile object, since gcc answers a plain test from the type: every reference aligns the compound literal and the result temporaries at -O0; of the by-value parameter's copy, gcc and clang on x86_64, Apple clang on both, and cl 19.51 at 32 and 64 align it, while gcc 13.3.0 on aarch64 and mingw-w64 gcc 13.2.0 leave it where the stack pointer is, 16-aligned; cl refuses a call's 256-aligned result and a 128- or 256-aligned parameter). One home now decides every typed slot (hir_to_mir's frameSlotAlignment). Each form is checked at 32, 64 and 256 on every target; the release arm inlines the direct calls, whose spliced parameter is the caller's copy. Each return before 42 names the first form that failed: 10 * form + the alignment's index.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

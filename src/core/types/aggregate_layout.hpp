@@ -139,6 +139,134 @@ aggregateClassKindFromName(std::string_view s) noexcept {
     return kAggregateClassKindTable.fromName(s);
 }
 
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// HOW A BY-VALUE AGGREGATE ARGUMENT OF CLASS MEMORY TRAVELS — a fact of the CALLING CONVENTION
+// (`CallingConvention::aggregateMemoryArgument`, declared in each `.target.json`), read by the
+// HIR→MIR argument and parameter paths, never derived from the classification strategy or a
+// target name. Lives beside `AggregateClassKind` for the same reason it does: the lowering
+// config and the classifier speak it without the target substrate.
+//   * `Stack`      — the aggregate's BYTES in the outgoing stack argument area, at its own
+//                    alignment as the convention's `stackArgPacking` honours it (SysV AMD64
+//                    psABI 3.2.3: "If the class is MEMORY, pass the argument on the stack").
+//   * `CallerCopy` — a POINTER to a copy the caller made, in the next integer argument
+//                    (Win64; AAPCS64 B.4 / C.11 for a composite over 16 bytes).
+// A MEMORY-class RESULT is not this fact: every convention returns it through the hidden
+// result pointer.
+enum class AggregateMemoryArgument : std::uint8_t {
+    CallerCopy = 0,
+    Stack      = 1,
+};
+
+inline constexpr EnumNameTable<AggregateMemoryArgument, 2> kAggregateMemoryArgumentTable{{{
+    { AggregateMemoryArgument::CallerCopy, "callerCopy" },
+    { AggregateMemoryArgument::Stack,      "stack"      },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kAggregateMemoryArgumentTable);
+
+[[nodiscard]] constexpr std::string_view
+aggregateMemoryArgumentName(AggregateMemoryArgument k) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling. See `dataModelName`.
+    switch (k) {
+        case AggregateMemoryArgument::CallerCopy:
+        case AggregateMemoryArgument::Stack:
+            break;
+    }
+    return kAggregateMemoryArgumentTable.nameOrEmpty(k);
+}
+[[nodiscard]] constexpr std::optional<AggregateMemoryArgument>
+aggregateMemoryArgumentFromName(std::string_view s) noexcept {
+    return kAggregateMemoryArgumentTable.fromName(s);
+}
+
+// ★ P69 (lane `cs`, fold f26c, main's ledger 454): WHAT AN X87UP EIGHTBYTE NOT PRECEDED BY X87 BECOMES -- the one
+// point where Apple's x86_64 ABI departs from the SysV AMD64 psABI. A union of a `long double` and a member of
+// eight bytes or less (`union { long double a; int i; }`) has a first eightbyte that merges X87 with INTEGER
+// (INTEGER) and a second that is X87UP alone. psABI 3.2.3's post-merger cleanup (revision 0.98): "If one of the
+// classes is X87UP and not preceded by X87, the whole argument is passed in memory". gcc 13.3.0 and clang 18.1.3
+// on Linux return such a union through the hidden pointer; Apple clang 21.0.0 for x86_64 returns it in %rax and
+// %xmm0 -- that eightbyte as SSE (probe sv cell 6 and probe su, -O1 asm, 2026-11-03).
+//   * `Memory` -- the whole aggregate is MEMORY (psABI 0.98; `sysv_amd64`, the default).
+//   * `Sse`    -- that eightbyte is SSE (Apple's x86_64; `sysv_amd64_darwin`).
+// Read only by the `SysVEightbyte` classification; a row of another strategy declaring it is refused at load.
+enum class X87UpWithoutX87 : std::uint8_t {
+    Memory = 0,
+    Sse    = 1,
+};
+
+inline constexpr EnumNameTable<X87UpWithoutX87, 2> kX87UpWithoutX87Table{{{
+    { X87UpWithoutX87::Memory, "memory" },
+    { X87UpWithoutX87::Sse,    "sse"    },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kX87UpWithoutX87Table);
+
+[[nodiscard]] constexpr std::string_view
+x87UpWithoutX87Name(X87UpWithoutX87 k) noexcept {
+    // The `-Werror=switch` backstop -- it owns no spelling. See `dataModelName`.
+    switch (k) {
+        case X87UpWithoutX87::Memory:
+        case X87UpWithoutX87::Sse:
+            break;
+    }
+    return kX87UpWithoutX87Table.nameOrEmpty(k);
+}
+[[nodiscard]] constexpr std::optional<X87UpWithoutX87>
+x87UpWithoutX87FromName(std::string_view s) noexcept {
+    return kX87UpWithoutX87Table.fromName(s);
+}
+
+// ★ P69 (lane `cs`, fold f26c, main's ledger 455): A CALLING CONVENTION'S BY-VALUE AGGREGATE RULES, AS ONE VALUE.
+// The target document's convention row declares them (`TargetCallingConvention::aggregate`), the HIR→MIR lowering
+// takes them WHOLE where the convention is resolved (`MirLoweringConfig::aggregate`, one assignment), and the
+// classifier reads them (`classifyAggregate`). They were four fields copied into the lowering's config one at a
+// time, by hand, at every resolution site (the pipeline, the LIR fixture, four MIR fixtures) -- so a key added to
+// the row and to no copy would have been read as its default, in silence: the miss this struct removes. Lives
+// here, beside the vocabulary it is made of, for the reason `AggregateMemoryArgument` does: the lowering config and
+// the classifier speak it without the target substrate.
+struct AggregateConventionRules {
+    // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN), JSON `aggregateClassification`: the
+    // classification STRATEGY for a struct/union passed/returned by value. A closed enum (the `aggregate_abi`
+    // classifier switches on it, never on identity). `None` (default) ⇒ this CC fails loud on a by-value
+    // aggregate (un-built). x86_64 SysV = SysVEightbyte (C1); Win64 / AAPCS64 flip on in C2 / C3.
+    AggregateClassKind classification = AggregateClassKind::None;
+
+    // JSON `aggregateMaxRegBytes`: the max aggregate SIZE (bytes) this CC passes/returns in registers; larger ⇒
+    // MEMORY (an argument by `memoryArgument` / an sret return). SysV = 16 (two eightbytes); Win64 = 8;
+    // AAPCS64 = 16. 0 ⇒ unused (strategy = None). Consumed only by the `aggregate_abi` classifier.
+    std::uint16_t maxRegBytes = 0;
+
+    // ★ P69 (lane `cs`, fold f26c -- D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET),
+    // JSON `aggregateMemoryArgument`: how a MEMORY-class by-value aggregate ARGUMENT travels
+    // (`AggregateMemoryArgument` above): `stack` (SysV AMD64) or `callerCopy` (Win64, AAPCS64); omitted ⇒
+    // `callerCopy`, every shipped convention states it. Consumed by the HIR→MIR by-value argument and parameter
+    // paths (caller and callee alike).
+    AggregateMemoryArgument memoryArgument = AggregateMemoryArgument::CallerCopy;
+
+    // JSON `aggregateStackExhaustsRegisters`.
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: what happens to the
+    // ARG REGISTERS of a class once a by-value aggregate is placed WHOLLY on the
+    // stack because its pieces did not all fit (the all-or-nothing/straddle case).
+    // The two shipped ABIs DIVERGE — a documented, config-distinguishable fact,
+    // verified against gcc's own arg-advance logic (NOT an identity branch):
+    //   * false (SysV `sysv_amd64`): BACKFILL. The leftover registers stay
+    //     available for a LATER (smaller) arg — gcc `function_arg_advance_64`
+    //     leaves `cum->nregs`/`regno` untouched on the stack branch; the SysV ABI
+    //     "if registers were assigned for some eightbytes … the assignments get
+    //     reverted". The per-class cursor is NOT advanced on route-to-stack.
+    //   * true  (AAPCS64 `aapcs64`):  EXHAUST. The OVERFLOWED class is marked
+    //     full (NGRN/NSRN ← 8) so every subsequent arg of that class also goes to
+    //     memory — gcc `aarch64_layout_arg` sets `aapcs_nextncrn = NUM_ARG_REGS`
+    //     (or `nextnvrn` for an HFA). The cursor is CLAMPED to the pool size.
+    // Win64 (`ms_x64`, slotAligned) never straddles (1 struct = 1 positional
+    // slot) so the flag is inert (default false). Consumed by HIR→MIR's caller
+    // (Phase A) + callee (Phase B) cursor handling — kept in lockstep so the two
+    // sides agree AND va_start's `__gr_offs`/`__vr_offs` clamp reflects it.
+    bool stackExhaustsRegisters = false;
+
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 454), JSON `x87UpWithoutX87`: what an X87UP eightbyte not
+    // preceded by X87 becomes (`X87UpWithoutX87` above). Omitted ⇒ `Memory` (psABI).
+    X87UpWithoutX87 x87UpWithoutX87 = X87UpWithoutX87::Memory;
+};
+
 // FC8 bitfields (D-CSUBSET-BITFIELD / D-CSUBSET-BITFIELD-ABI-EXACT): the per-ABI
 // bit-field PACKING strategy. A CLOSED, config-declared enum — the layout engine
 // switches on THIS, never on a target/format name (the `ScalarAlignmentRule` /

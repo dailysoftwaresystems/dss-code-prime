@@ -662,12 +662,12 @@ private:
 // `MemOffset` this comment used to describe as "the aggregate's offset stated on
 // its carrier, which the call arm READS" is a form no pass produces now). So on
 // every Call the pipeline lowers the call arm places NOTHING and copies nothing.
-// The call arm's own instance and its copy remain for a module that never went
-// through that pass — a hand-built one (tests/lir, tests/asm): it copies a
-// carrier at a stated offset, places an unplaced one itself on an UNSTAMPED Call,
-// and REFUSES to place anything on a stamped one. Removing that residual arm,
-// together with the carrier form's other consumers, is owned by
-// D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
+// No carrier reaches the call arm at all — the LIR verifier's stage rule
+// (`verifyLirStackedAggregatesLowered`) states it after that pass, so the call
+// arm holds no copy and no aggregate placement. Its own instance remains for a
+// stacked SCALAR on a Call that never went through that pass (a hand-built
+// module): it places one itself on an UNSTAMPED Call and REFUSES to place
+// anything on a stamped one.
 // The pre-scan and the callee's `arg` arm walk different argument lists (the
 // caller's reservation, the callee's own incoming region) and are unaffected.
 //
@@ -1137,6 +1137,14 @@ struct DSS_EXPORT LirFuncLocalAlignment {
     // alloca count (checked loud at consume). 0 in a slot = no over-alignment
     // (alignUp is a no-op). Mirrors `FuncLocalAlignment::perAllocaAlignBytes`.
     std::vector<std::uint32_t> perAllocaAlignBytes;
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495): the widest alignment a STACK-PASSED
+    // argument of this function's calls states (a by-value carrier's datum alignment; 0 =
+    // none). When it exceeds the convention's `stackAlignment` the function runs on the
+    // frame-pointer model with its stack pointer REALIGNED to it after the prologue, so
+    // the outgoing area -- which the cursor places relative to SP -- sits where the
+    // callee's ABI expects it in absolute terms. Mirrors
+    // `FuncLocalAlignment::stackedArgAlignBytes`.
+    std::uint32_t stackedArgAlignBytes = 0;
 };
 
 [[nodiscard]] DSS_EXPORT LirCallconvResult

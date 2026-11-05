@@ -1,0 +1,1 @@
+                    for (std::size_t k = chain.size(); k-- > 0;) {

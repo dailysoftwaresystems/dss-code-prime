@@ -4213,17 +4213,21 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     EXPECT_EQ(model.symbols().size() - 1, 157u);
 }
 
-// Use-before-decl inside the same scope resolves through Pass 1's
-// pre-minting (G-209 forward refs). Also asserts the use of `x` binds to
-// the EXACT declared symbol AND inherits its I32 type — not just "no
-// undeclared diagnostic".
-TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE): A USE
+// BEFORE ITS DECLARATION IN THE SAME BLOCK IS AN UNDECLARED IDENTIFIER. This test pinned the opposite
+// ("use-before-decl inside the same scope resolves through Pass 1's pre-minting", G-209), and it was
+// the row's defect pinned as a feature: C 6.2.1p7 begins `x`'s scope after its declarator, so `x;`
+// names nothing (C 6.5.1p2) — gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and cl 19.51 refuse
+// every use before its declaration the row's probe ip3 measured (cells 8-13; cell 12 a block's own
+// object named before its declaration: "'x' undeclared", C2065). Pass 1 still MINTS
+// `x` (the symbol count below is unchanged); the use binds none of it and has no type.
+TEST(SemanticAnalyzerC, AUseBeforeItsDeclarationInTheSameBlockIsUndeclared) {
     auto cu = buildShippedUnit("c", {
         "int main() { x; int x; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
 
     // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
     // (__va_list_tag + va_list + the __builtin_va_list alias,
@@ -4265,23 +4269,38 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     EXPECT_EQ(model.symbols()[xSym.v].name, "x");
 
     // Find the `x` USE leaf (the `x;` statement, which precedes the decl).
-    // The decl's own name leaf also carries xSym; we want a leaf whose
-    // node differs from the decl name node. Both should bind to xSym.
+    // The decl's own name leaf carries xSym; the use carries no symbol and no type.
     Tree const& tree = cu->trees()[0];
     NodeId declName = model.symbols()[xSym.v].declNode;
-    int boundUses = 0;
+    int uses = 0;
     walkPreOrder(tree, [&](TreeCursor const& cursor) {
         NodeId const n = cursor.current();
         if (tree.kind(n) != NodeKind::Token || tree.text(n) != "x") return;
         if (n.v == declName.v) return;  // skip the decl's own name leaf
-        EXPECT_EQ(model.symbolAt(n).v, xSym.v) << "use of x binds to x's decl";
-        EXPECT_EQ(model.lattice().interner().kind(model.typeAt(n)), TypeKind::I32)
-            << "use inherits the declared I32 type";
-        ++boundUses;
+        EXPECT_FALSE(model.symbolAt(n).valid()) << "the use before the declaration binds nothing";
+        EXPECT_FALSE(model.typeAt(n).valid()) << "…and has no type";
+        ++uses;
     });
     // Source has EXACTLY one `x;` use site preceding the decl — strict
     // equality so a future regression that adds (or drops) a use is loud.
-    EXPECT_EQ(boundUses, 1) << "the `x;` use site must be present and bound";
+    EXPECT_EQ(uses, 1) << "the `x;` use site must be present";
+    // CONTROL: the same use AFTER the declaration binds it, typed `int`.
+    auto cu2 = buildShippedUnit("c", {"int main() { int x; x; }\n"});
+    assertNoBuilderErrors(*cu2);
+    auto model2 = analyze(cu2, DiagnosticBudget::libraryDefault());
+    EXPECT_EQ(countCode(model2.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+    Tree const& tree2 = cu2->trees()[0];
+    int bound = 0;
+    walkPreOrder(tree2, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (tree2.kind(n) != NodeKind::Token || tree2.text(n) != "x") return;
+        SymbolId const sym = model2.symbolAt(n);
+        if (!sym.valid() || model2.symbols()[sym.v].declNode.v == n.v) return;
+        EXPECT_EQ(model2.symbols()[sym.v].name, "x");
+        EXPECT_EQ(model2.lattice().interner().kind(model2.typeAt(n)), TypeKind::I32);
+        ++bound;
+    });
+    EXPECT_EQ(bound, 1) << "the use after the declaration binds it";
 }
 
 // IntLiteral and FloatLiteral leaves get the configured TypeId.
@@ -4719,17 +4738,22 @@ TEST(SemanticAnalyzerC, CallingVariableEmitsNotCallable) {
 // tsql peer test (`UnknownFunctionCallEmitsUndeclared`) still passes
 // because tsql's callee is a bare `Identifier` token NOT covered by
 // any `references` rule, so checkCall remains the sole emitter there.
+// P69 (lane `cs`, fold f26c): a callee no declaration names is now DECLARED by the call
+// (C90 6.3.2.2, `ACallBeforeAnyDeclarationDeclaresItsCalleeImplicitly`), so the pin of
+// the one-emit decision moved to a callee no call declares — a name of a builtin family
+// (`__builtin_ggg`, the call rule's `implicitDeclarationBuiltinPrefixes`); and `ggg(1)`
+// and the reserved-but-not-builtin `__ggg(1)` are pinned to their ONE warning each.
 TEST(SemanticAnalyzerC, UnknownCalleeEmitsExactlyOneUndeclared) {
     auto cu = buildShippedUnit("c", {
-        "int main() { ggg(1); }\n",
+        "int main() { __builtin_ggg(1); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault().withoutDedup());
     std::size_t gggCount = 0;
     ParseDiagnostic const* gggDiag = nullptr;
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_UndeclaredIdentifier
-            && d.actual == "ggg") {
+            && d.actual == "__builtin_ggg") {
             ++gggCount;
             gggDiag = &d;
         }
@@ -4737,13 +4761,36 @@ TEST(SemanticAnalyzerC, UnknownCalleeEmitsExactlyOneUndeclared) {
     EXPECT_EQ(gggCount, 1u)
         << "the undeclared callee must produce EXACTLY ONE "
            "S_UndeclaredIdentifier — not two";
-    // The diagnostic must land on the `ggg` token's span. Layout:
-    //   "int main() { ggg(1); }"
-    //    0123456789012345678901
-    // `ggg` is at columns 13..16 (3 chars; half-open span [13, 16)).
+    // The diagnostic must land on the `__builtin_ggg` token's span. Layout:
+    //   "int main() { __builtin_ggg(1); }"
+    //    0123456789012345678901234567
+    // `__builtin_ggg` is at columns 13..26 (13 chars; half-open span [13, 26)).
     ASSERT_NE(gggDiag, nullptr);
     EXPECT_EQ(gggDiag->span.start(), 13u);
-    EXPECT_EQ(gggDiag->span.end(),   16u);
+    EXPECT_EQ(gggDiag->span.end(),   26u);
+
+    // A name no builtin family spells — `ggg`, and `__ggg`, which C 7.1.3 reserves but no
+    // reference implements (gcc 13 and cl declare it and run it where another unit defines
+    // it): declared by the call, warned EXACTLY ONCE (the reference arm and the call arm
+    // both resolve the callee), at the callee's span, and nothing is undeclared.
+    for (auto const& [src, end] : {std::pair<char const*, std::uint32_t>{"int main() { ggg(1); }\n", 16u},
+                                   std::pair<char const*, std::uint32_t>{"int main() { __ggg(1); }\n", 18u}}) {
+        auto cu2 = buildShippedUnit("c", {src});
+        assertNoBuilderErrors(*cu2);
+        auto model2 = analyze(cu2, DiagnosticBudget::libraryDefault().withoutDedup());
+        std::size_t warned = 0, undeclared = 0;
+        ParseDiagnostic const* w = nullptr;
+        for (auto const& d : model2.diagnostics().all()) {
+            if (d.code == DiagnosticCode::S_ImplicitFunctionDeclaration) { ++warned; w = &d; }
+            if (d.code == DiagnosticCode::S_UndeclaredIdentifier) ++undeclared;
+        }
+        EXPECT_EQ(warned, 1u) << src;
+        EXPECT_EQ(undeclared, 0u) << src;
+        EXPECT_FALSE(model2.hasErrors()) << src;
+        ASSERT_NE(w, nullptr) << src;
+        EXPECT_EQ(w->span.start(), 13u) << src;
+        EXPECT_EQ(w->span.end(),   end) << src;
+    }
 }
 
 // SE6 (c): `i++` is a postfix expression but NOT a call — the
@@ -9271,16 +9318,353 @@ TEST(SemanticAnalyzerC, ACallTakesAnOutOfScopeBlockDeclarationWarned) {
     }
     // (The declared type reaching the call is pinned by a RUN: the example
     // two_units_call_through_an_out_of_scope_block_declaration passes 40 as 40.0.)
-    // CONTROLS: no block declaration at all; a use that is no call; a declaration written
-    // AFTER the call — each the implicit declaration's case, refused today.
+    // CONTROLS: no block declaration at all, and a declaration written AFTER the call — each the
+    // implicit declaration's case (fold f26c: declared, warned, no out-of-scope warning); a use that
+    // is no call stays undeclared.
     for (char const* src : {"int b(void) { return g(40) + 2; }\n",
-                            "void a(void) { int g(int); }\nint (*b(void))(int) { return &g; }\n",
                             "int b(void) { return g(40) + 2; }\nvoid a(void) { int g(int); }\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_FALSE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitFunctionDeclaration), 1u)
+            << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 0u)
+            << src;
+    }
+    {
+        char const* src = "void a(void) { int g(int); }\nint (*b(void))(int) { return &g; }\n";
         auto model = analyzeShipped("c", {src});
         EXPECT_TRUE(model.hasErrors()) << src;
         EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u) << src;
         EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 0u)
             << src;
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c — the review of fold f26b, F1): BLOCK-SCOPE DECLARATIONS OF ONE
+// EXTERNAL NAME, WITH NO FILE-SCOPE DECLARATION OF IT, ARE ONE ENTITY (C 6.2.2p2, p4), so their types
+// must agree (C 6.2.7p2). ✔MEASURED (lane `cs` probe bb, object mode; gcc 13.3.0 and clang 18.1.3
+// -Wall, mingw-w64 gcc 13.2.0, cl 19.51 /W4): all four refuse two incompatible function declarations
+// in two functions, in sibling blocks, in nested blocks and with the explicit `extern`, and two that
+// differ in the return type only ("conflicting types for 'g'", C2371); all four refuse a function and
+// an object of one name (C2373); gcc, clang and mingw-w64 gcc refuse two incompatible `extern`
+// objects, cl accepts them — decided for the refusal (any access through either is undefined, C
+// 6.2.7p2); all four accept the compatible pairs. Before f26c each block declaration stood alone:
+// every incompatible pair was ACCEPTED in silence, and the function-and-object pair crashed its image.
+//
+// RED-ON-DISABLE: drop the block-with-block absorption from the block-extern sweep and every refusal
+// below is gone (accepted in silence) and each compatible pair keeps two surviving records.
+TEST(SemanticAnalyzerC, BlockDeclarationsOfOneExternalNameAreJudgedAsOneEntity) {
+    for (char const* src : {
+             "void a(void) { int g(int); g(1); }\nvoid b(void) { double g(double); g(2.0); }\n",
+             "void a(void) { { int g(int); g(1); } { double g(double); g(2.0); } }\n",
+             "void a(void) { int g(int); g(1); { double g(double); g(2.0); } }\n",
+             "void a(void) { extern int g(int); g(1); }\nvoid b(void) { extern double g(double); g(2.0); }\n",
+             "void a(void) { int g(void); g(); }\nvoid b(void) { long long g(void); g(); }\n",
+             "void a(void) { extern int x; x = 1; }\nvoid b(void) { extern double x; x = 2.0; }\n",
+         }) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+            << src << ": the two declarations name one entity and disagree, said once";
+    }
+    {
+        char const* src = "void a(void) { int g(int); g(1); }\nvoid b(void) { extern int g; g = 2; }\n";
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src << ": a function and an object of one name";
+    }
+    for (char const* src : {
+             "void a(void) { int g(int); g(1); }\nvoid b(void) { int g(int); g(2); }\n",
+             "void a(void) { extern int x; x = 1; }\nvoid b(void) { extern int x; x += 2; }\n",
+         }) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_FALSE(model.hasErrors()) << src;
+        std::size_t surviving = 0, absorbed = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+            auto const& r = model.symbols()[i];
+            if (r.name != "g" && r.name != "x") continue;
+            ++(r.isAbsorbedProto ? absorbed : surviving);
+        }
+        EXPECT_EQ(surviving, 1u) << src << ": one entity, one record standing for it";
+        EXPECT_EQ(absorbed, 1u) << src << ": the later block's declaration absorbed into the first";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c — the review of fold f26b's note on f26c's lookup): A CALL THAT TAKES AN
+// OUT-OF-SCOPE BLOCK DECLARATION TAKES THE ENTITY IT DECLARES — the record a block-extern sweep absorbed
+// it into, where every other use of the name lands. Here two blocks declare `g`; the call after both is
+// resolved to the later declaration, which is absorbed into the first: its use is the first record's.
+//
+// RED-ON-DISABLE: return the block record itself from the out-of-scope lookup and the call's use lands
+// on the absorbed record (the second assertion).
+TEST(SemanticAnalyzerC, AnOutOfScopeCallTakesTheEntityItsDeclarationWasAbsorbedInto) {
+    auto model = analyzeShipped("c", {
+        "void a(void) { int g(int); }\nvoid b(void) { int g(int); }\nint c(void) { return g(40) + 2; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_OutOfScopeDeclarationUsed), 1u);
+    std::size_t usesOnSurvivor = 0, usesOnAbsorbed = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name != "g") continue;
+        std::size_t const uses = model.usesOf(SymbolId{static_cast<std::uint32_t>(i)}).size();
+        (r.isAbsorbedProto ? usesOnAbsorbed : usesOnSurvivor) += uses;
+    }
+    EXPECT_EQ(usesOnSurvivor, 1u) << "the call is a use of the entity";
+    EXPECT_EQ(usesOnAbsorbed, 0u) << "no use lands on an absorbed declaration";
+}
+
+// ★★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE): A USE OF AN
+// ORDINARY IDENTIFIER SEES ONLY A DECLARATION WHOSE SCOPE HAS BEGUN AT THE USE (C 6.2.1p7: just after its
+// declarator completes). ✔MEASURED (lane `cs` probe ip3; gcc 13.3.0 and clang 18.1.3 -Wall, mingw-w64 gcc
+// 13.2.0, cl 19.51 /W3; each built and RUN where it built): all four REFUSE an object read before its
+// file-scope definition, its address in a static initializer before it, a function designator before the
+// function, a block's own object in `sizeof` before it, an enumeration constant before its enumerator
+// ("'x' undeclared", C2065, "use of undeclared identifier"); all four RUN 42 where an ENCLOSING
+// declaration is in scope at the use (the inner, later one not yet), which this compiler ran at 2 before
+// fold f26c — a silent wrong value on a valid program. CONTROLS: an earlier non-defining declaration
+// begins the binding's scope though the definition the binding names comes later; a prototype before the
+// call; an initializer that names the object it initializes (the new object, C's rule).
+//
+// RED-ON-DISABLE: drop the position test (`ordinaryBindingBegunAt` answering true) and the refused cells
+// are accepted again, the enclosing declaration's uses land on the inner one.
+TEST(SemanticAnalyzerC, AUseSeesOnlyADeclarationWhoseScopeHasBegun) {
+    for (char const* src : {
+             "int b(void) { return x; }\nint x = 42;\n",
+             "int *p = &q;\nint q = 42;\n",
+             "int (*g(void))(int) { return f; }\nint f(int v) { return v; }\n",
+             "int b(void) { int r = (int)sizeof y; int y = 2; return r + y; }\n",
+             "int b(void) { return E42; }\nenum { E42 = 42 };\n",
+         }) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+            << src << ": no declaration of the name is in scope at the use";
+    }
+    struct Hidden {
+        char const* src;
+        char const* name;
+    };
+    for (Hidden const c : {
+             Hidden{"int y = 40;\nint b(void) { int r = y; int y = 2; return r + y; }\n", "y"},
+             Hidden{"int b(void) { int r = 40; { int s = r; int r = 2; return s + r; } }\n", "r"},
+         }) {
+        auto model = analyzeShipped("c", {c.src});
+        EXPECT_FALSE(model.hasErrors()) << c.src;
+        std::size_t records = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+            if (model.symbols()[i].name != c.name) continue;
+            ++records;
+            EXPECT_EQ(model.usesOf(SymbolId{static_cast<std::uint32_t>(i)}).size(), 1u)
+                << c.src << ": the outer declaration is read once before the inner begins, the inner "
+                            "once after";
+        }
+        EXPECT_EQ(records, 2u) << c.src;
+    }
+    for (char const* src : {
+             "extern int x;\nint b(void) { return x; }\nint x = 42;\n",
+             "int f(int);\nint b(void) { return f(40) + 2; }\nint f(int v) { return v; }\n",
+             "int b(void) { int r = 40; { int r = r + 0 * 1; (void)r; } return r + 2; }\n",
+             // THE TYPEDEF FORM (the review of L2a, N2; probe nt cells 1 and 2): the file's `T` until the
+             // block's own typedef — each assertion fails if the use takes the other.
+             "typedef int T;\nint b(void) { _Static_assert(sizeof(T) == sizeof(int), \"the file's T\");\n"
+             "  typedef char T; _Static_assert(sizeof(T) == 1, \"the block's T\"); return 0; }\n",
+             // An enumeration constant's scope begins after its enumerator: the initializer names the
+             // outer one (probe nt cell 5).
+             "enum { A = 40 };\nint b(void) { enum { A = A + 2 }; _Static_assert(A == 42, \"the outer A\"); return A; }\n",
+             // THE ORDER IS THE ORDER THE UNIT IS READ: a macro defined before what it names is read where
+             // it is expanded (probe nt cells 4 and 6; f26c-s2's shipped stdio.c).
+             "#define ADD (a + b)\nint f(int a, int b) { return ADD; }\n",
+             "#define SZ ((int)sizeof(L))\ntypedef long long L;\nint b(void) { return SZ; }\n",
+         }) {
+        // The target's layout, so a `sizeof` folds in a static assertion: without it no `sizeof` is a
+        // constant (the direct-API default, StaticAssertSizeofConditionFoldsTrue's note), and every
+        // typedef cell was refused for THAT (f26c-s8: "static assertion condition is not an integer
+        // constant expression").
+        auto cu = buildShippedUnit("c", {src});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+        std::string said;   // every diagnostic, so a red names its cause (f26c-s5 read none)
+        for (auto const& d : model.diagnostics().all())
+            said += std::string(d.actual) + "\n";
+        EXPECT_FALSE(model.hasErrors()) << src << said;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitFunctionDeclaration), 0u)
+            << src;
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c — the TAG form of D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE):
+// A TAG IS SEEN ONLY WHERE ITS SCOPE HAS BEGUN (C 6.2.1p7: just after the tag appears in the specifier that
+// declares it; C 6.7.2.3p9: a reference names the tag visible there). ✔MEASURED (probe tg; the analyzer
+// before this fold, pe64 and ELF x86_64, RUN): a declaration, a `sizeof (struct S)`, a member read and a
+// cast written before the block's own `struct S` took the block's LATER tag — two silent wrong sizes, three
+// refusals. Each assertion here fails if a use takes the other tag. CONTROLS: `struct S;` declares the
+// block's own tag over a visible one (C 6.7.2.3p7) and its later definition completes it; a use before its
+// own scope's definition with nothing outside is that definition's tag (one scope, one tag); an outer tag
+// written only by a reference before the block's own definition is the one seen.
+//
+// RED-ON-DISABLE: answer every scope's tag as begun (`lookupTagUse`'s position test) and the first three
+// cells take the later tag again; drop the `struct S;` record and the fourth takes the enclosing one.
+TEST(SemanticAnalyzerC, ATagUseSeesOnlyATagWhoseScopeHasBegun) {
+    struct Cell {
+        char const* what;
+        char const* src;
+    };
+    for (Cell const& c : {
+             Cell{"a declaration before the block's own tag",
+                  "struct S { int a; };\n"
+                  "int f(void) {\n"
+                  "    struct S *p = 0;\n"
+                  "    struct S { long long b, c, d; };\n"
+                  "    _Static_assert(sizeof *p == sizeof(int), \"the file's S\");\n"
+                  "    struct S q = { 1, 2, 3 };\n"
+                  "    _Static_assert(sizeof q == 3 * sizeof(long long), \"the block's S\");\n"
+                  "    return p != 0 && q.c == 2;\n"
+                  "}\n"},
+             Cell{"sizeof (struct S) before the block's own tag",
+                  "struct S { int a; };\n"
+                  "int f(void) {\n"
+                  "    _Static_assert(sizeof(struct S) == sizeof(int), \"the file's S\");\n"
+                  "    struct S { long long b, c, d; };\n"
+                  "    _Static_assert(sizeof(struct S) == 3 * sizeof(long long), \"the block's S\");\n"
+                  "    return 0;\n"
+                  "}\n"},
+             Cell{"a member read through a pointer and through a cast before the block's own tag",
+                  "struct S { int a; };\n"
+                  "int f(struct S *q, void *v) {\n"
+                  "    struct S *p = q;\n"
+                  "    int r = ((struct S *)v)->a;\n"
+                  "    struct S { long long b; };\n"
+                  "    return p->a + r;\n"
+                  "}\n"},
+             Cell{"`struct S;` declares the block's own tag; its definition completes it",
+                  "struct S { int a; };\n"
+                  "int f(void) {\n"
+                  "    struct S;\n"
+                  "    struct S *p;\n"
+                  "    struct S { long long b; } x = { 42 };\n"
+                  "    p = &x;\n"
+                  "    _Static_assert(sizeof *p == sizeof(long long), \"the block's S\");\n"
+                  "    return (int)p->b;\n"
+                  "}\n"},
+             Cell{"the file's tag before `struct S;`, the block's after it",
+                  "struct S { int a; };\n"
+                  "int f(void) {\n"
+                  "    struct S s = { 41 }, *p = &s;\n"
+                  "    struct S;\n"
+                  "    struct S { char c; } t = { 1 };\n"
+                  "    _Static_assert(sizeof t == 1, \"the block's S\");\n"
+                  "    return p->a + t.c;\n"
+                  "}\n"},
+             Cell{"a use before its own scope's definition, nothing outside: one scope, one tag",
+                  "int f(void) {\n"
+                  "    struct S *p;\n"
+                  "    struct S { int a; } x = { 42 };\n"
+                  "    p = &x;\n"
+                  "    return p->a;\n"
+                  "}\n"},
+             Cell{"a file tag written only by a reference before the block's own definition",
+                  "struct S *g;\n"
+                  "int f(void) {\n"
+                  "    struct S *p = g;\n"
+                  "    struct S { char c; };\n"
+                  "    return p == g;\n"
+                  "}\n"
+                  "struct S { int a; };\n"},
+         }) {
+        auto cu = buildShippedUnit("c", {c.src});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                             AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+        std::string said;   // every diagnostic, so a red names its cause
+        for (auto const& d : model.diagnostics().all())
+            said += std::string(d.actual) + "\n";
+        EXPECT_FALSE(model.hasErrors()) << c.what << "\n" << said;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion), 0u)
+            << c.what << ": a pointer to one tag's type is never assigned or compared to another's\n"
+            << said;
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION): A CALL
+// WHOSE CALLEE NAMES NO DECLARATION IN SCOPE DECLARES IT IMPLICITLY, warned, and a later declaration of the
+// name is the function called. ✔MEASURED (lane `cs` probe ip3 cells 1-7; mingw-w64 gcc 13.2.0 and cl 19.51,
+// each RUN; gcc 13.3.0 and clang 18.1.3 on Linux): a later `int f(int v)`, `int f(long long v)`, a `float`
+// argument against `int f(double v)`, a later prototype then the definition — both Windows references run
+// 42, warned; `int f(char v)` and `int f(int v, ...)` — cl runs 42, gcc refuses; `double f(double v)` —
+// every reference that makes the declaration refuses it. clang refuses every cell.
+//
+// RED-ON-DISABLE: drop the call rule's `implicitDeclarationResult` (or the arm that reads it) and every
+// accepted cell is S_UndeclaredIdentifier; drop the result's test and the conflicting cell is accepted.
+TEST(SemanticAnalyzerC, ACallBeforeAnyDeclarationDeclaresItsCalleeImplicitly) {
+    for (char const* src : {
+             "int b(void) { return f(40) + 2; }\nint f(int v) { return v; }\n",
+             "int b(void) { return f(40) + 2; }\nint f(long long v) { return (int)v; }\n",
+             "int b(void) { return f(40.0f) + 2; }\nint f(double v) { return (int)v; }\n",
+             "int b(void) { return f(40) + 2; }\nint f(int);\nint f(int v) { return v; }\n",
+             "int b(void) { return f(40) + 2; }\nint f(char v) { return v; }\n",
+             "int b(void) { return f(40) + 2; }\nint f(int v, ...) { return v; }\n",
+         }) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_FALSE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitFunctionDeclaration), 1u)
+            << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u) << src;
+    }
+    auto conflict = analyzeShipped("c", {"int b(void) { return (int)f(40) + 2; }\ndouble f(double v) { return v; }\n"});
+    EXPECT_TRUE(conflict.hasErrors());
+    EXPECT_EQ(countCode(conflict.diagnostics(), DiagnosticCode::S_ImplicitDeclarationConflicts), 1u);
+
+    // WHERE THE UNIT DECLARES THE NAME NOWHERE (probe ip2's c5: the definition is another unit's —
+    // gcc 13.3.0, mingw-w64 gcc 13.2.0 and cl 19.51 make the declaration, warned, and run 42): the
+    // declaration is MINTED — one function of the name, `int (int)` from the first call's promoted
+    // argument (a `short` promotes to `int`, a `float` to `double`) — and said ONCE per name, as gcc and
+    // cl say it, however many calls make it.
+    struct Minted {
+        char const* src;
+        std::size_t params;
+        TypeKind    first;
+    };
+    for (Minted const c : {
+             Minted{"int b(void) { return g(40) + 2; }\n", 1, TypeKind::I32},
+             Minted{"int b(void) { short s = 40; return g(s) + 2; }\n", 1, TypeKind::I32},
+             Minted{"int b(void) { return g(40.0f) + 2; }\n", 1, TypeKind::F64},
+             Minted{"int b(void) { return g(40) + g(2); }\nint c(void) { return g(1); }\n", 1, TypeKind::I32},
+             Minted{"int b(void) { { g(40); } return g(2); }\n", 1, TypeKind::I32},
+         }) {
+        auto model = analyzeShipped("c", {c.src});
+        EXPECT_FALSE(model.hasErrors()) << c.src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitFunctionDeclaration), 1u)
+            << c.src << ": said once per name";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u) << c.src;
+        auto const implicit = model.implicitDeclarations();
+        ASSERT_EQ(implicit.size(), 1u) << c.src << ": one function, however many calls";
+        auto const& rec = model.symbols()[implicit[0].v];
+        EXPECT_EQ(rec.name, "g");
+        auto const& in = model.lattice().interner();
+        ASSERT_TRUE(rec.type.valid());
+        ASSERT_EQ(in.kind(rec.type), TypeKind::FnSig);
+        EXPECT_EQ(in.kind(in.fnResult(rec.type)), TypeKind::I32) << c.src;
+        EXPECT_FALSE(in.fnIsVariadic(rec.type)) << c.src << ": a non-variadic call";
+        ASSERT_EQ(in.fnParams(rec.type).size(), c.params) << c.src;
+        EXPECT_EQ(in.kind(in.fnParams(rec.type)[0]), c.first) << c.src;
+    }
+    // A later call whose promoted arguments differ from the first's: at most one can match the
+    // definition, so the second is refused by name.
+    for (char const* src : {"int b(void) { return g(40) + g(1.0); }\n",
+                            "int b(void) { return g(40) + g(1, 2); }\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitDeclarationConflicts), 1u)
+            << src;
+    }
+    // CONTROLS: a use that is no call declares nothing; a later OBJECT of the name is no function.
+    for (char const* src : {"int (*b(void))(int) { return &g; }\n",
+                            "int b(void) { return g(40); }\nint g = 2;\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src;
+        EXPECT_TRUE(model.implicitDeclarations().empty()) << src;
     }
 }
 
@@ -14177,6 +14561,46 @@ TEST(SemanticAnalyzerC, VlaTypedefObjectAcceptsAndRecordsOrigin) {
         << "the recorded origin is the typedef R";
     EXPECT_EQ(model.symbols()[aRec->vlaTypedefOrigin.v].kind, DeclarationKind::Type)
         << "the recorded origin is a typedef (DeclarationKind::Type)";
+}
+
+// ★ P69 (lane `cs`, fold f26c — a neighbour of D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE): the
+// ORIGIN is the typedef the type resolver CHOSE, in order. `R a;` written before the inner block's own
+// `typedef int R[m];` has the OUTER R (its scope encloses `a`'s), and `R b;` after it the inner one (declared in
+// `b`'s own block). The origin used to be recovered by re-looking the NAME up from `a`'s scope, order-blind, which
+// found the inner R — so `a` copied its size from a bound captured after `a` is allocated (the runnable twin:
+// examples/c/a_vla_typedef_used_before_a_later_one_keeps_its_own_bound).
+TEST(SemanticAnalyzerC, AVlaTypedefOriginIsTheTypedefTheUseSawNotALaterOne) {
+    auto model = analyzeShipped("c", {
+        "int sizes(int n, int m) {\n"
+        "  typedef int R[n];\n"
+        "  {\n"
+        "    R a;\n"
+        "    typedef int R[m];\n"
+        "    R b;\n"
+        "    return (int)(sizeof a + sizeof b);\n"
+        "  }\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* aRec = findSym(model, "a");
+    SymbolRecord const* bRec = findSym(model, "b");
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_NE(bRec, nullptr);
+    ASSERT_TRUE(aRec->vlaTypedefOrigin.valid());
+    ASSERT_TRUE(bRec->vlaTypedefOrigin.valid());
+    ASSERT_LT(aRec->vlaTypedefOrigin.v, model.symbols().size());
+    ASSERT_LT(bRec->vlaTypedefOrigin.v, model.symbols().size());
+    SymbolRecord const& aOrigin = model.symbols()[aRec->vlaTypedefOrigin.v];
+    SymbolRecord const& bOrigin = model.symbols()[bRec->vlaTypedefOrigin.v];
+    EXPECT_EQ(aOrigin.name, "R");
+    EXPECT_EQ(bOrigin.name, "R");
+    EXPECT_NE(aRec->vlaTypedefOrigin.v, bRec->vlaTypedefOrigin.v)
+        << "`a` and `b` name two different typedefs R";
+    EXPECT_NE(aOrigin.scope.v, aRec->scope.v)
+        << "`a`'s origin is the OUTER R, declared in a scope enclosing `a`'s — not the R its own block "
+           "declares after it";
+    EXPECT_EQ(bOrigin.scope.v, bRec->scope.v)
+        << "`b`'s origin is the R its own block declared before it";
 }
 
 // D-CSUBSET-VLA-TYPEDEF-CHAINED ✅ CLOSED: a CHAINED VLA typedef (`typedef int R[n];

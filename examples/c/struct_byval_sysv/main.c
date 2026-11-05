@@ -3,8 +3,12 @@
  *   - two()   — 8-byte struct  → ONE eightbyte, passed in a single register (rdi).
  *   - three() — 12-byte struct → TWO eightbytes (C1b multi-register), passed in
  *               rdi:rsi; the far field t.z@8 lives in the SECOND register.
- *   - big()   — 24-byte struct → >16B MEMORY class, passed BY REFERENCE (the
- *               caller copies to a temp and passes a pointer); far field b.c@16.
+ *   - big()   — 24-byte struct → >16B MEMORY class, passed ON THE STACK (its bytes
+ *               in the outgoing argument area, no register — psABI 3.2.3, the
+ *               convention's `aggregateMemoryArgument: stack`); far field b.c@16.
+ *               (Until P69 fold f26c it went as a pointer to a caller copy, which
+ *               gcc and clang do not read —
+ *               D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.)
  * Each callee reconstructs into its frame slot. Values flow through the
  * non-inlined mk() so nothing folds; every far field must survive the transfer.
  * (3+4) + (5+6+7) + (8+9+0) = 7 + 18 + 17 = 42. SysV runtime closes on

@@ -169,17 +169,19 @@ struct DSS_EXPORT MirLoweringConfig {
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the active CC's by-value aggregate
     // classification strategy + max-register-bytes, threaded from the resolved
     // `TargetCallingConvention` (the §B-locked HIR→MIR boundary, mirroring how
-    // `dataModel` is threaded). `aggregateClassification == None` (default) ⇒ the
+    // `dataModel` is threaded). `aggregate.classification == None` (default) ⇒ the
     // by-value guard stays FAIL-LOUD (no CC / unsupported strategy). When the
     // strategy is implemented (`aggregateAbiImplemented`), HIR→MIR classifies a
     // struct arg/return via the `aggregate_abi` engine and synthesizes pieces /
     // a hidden sret pointer. `aggregateSretViaHiddenArg` = the CC has NO
     // indirect-result register (SysV/Win64 ⇒ sret ptr is a hidden first INTEGER
     // arg; AAPCS64's x8 path is false, C3).
-    AggregateClassKind aggregateClassification   = AggregateClassKind::None;
-    std::uint16_t      aggregateMaxRegBytes       = 0;
+    // The convention's by-value aggregate rules, taken WHOLE from the resolved `TargetCallingConvention`
+    // (`AggregateConventionRules`, aggregate_layout.hpp: the strategy, the register-size bound, the stack-
+    // exhaust policy, the MEMORY-class argument carrier and the X87UP rule; P69 lane `cs`, fold f26c,
+    // main's ledger 455 -- they were copied one field at a time).
+    AggregateConventionRules aggregate{};
     bool               aggregateSretViaHiddenArg  = true;
-
     // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the active CC's `slotAligned` flag.
     // When false (SysV/AAPCS64 — INDEPENDENT counters) the param `Arg` payload is
     // the PER-CLASS physical register ordinal (GPR/FPR counted separately); when
@@ -197,14 +199,13 @@ struct DSS_EXPORT MirLoweringConfig {
     // `argGprCount`/`argFprCount` are the agnostic source for the all-or-nothing
     // register-exhaustion check on EVERY call (the variadic-only `vaListLayout`
     // save-counts coincide for the shipped CCs but are the wrong semantic source
-    // for a non-variadic call). `aggregateStackExhaustsRegisters` decides what
+    // for a non-variadic call). `aggregate.stackExhaustsRegisters` decides what
     // happens to the overflowed class once a by-value aggregate is placed wholly
     // on the stack: false ⇒ BACKFILL (SysV — cursor not advanced); true ⇒ EXHAUST
     // (AAPCS64 — cursor clamped to the pool). 0/false defaults preserve the
     // pre-FC12 behavior (no by-value aggregate ⇒ the check never fires).
     std::uint32_t      argGprCount                = 0;
     std::uint32_t      argFprCount                = 0;
-    bool               aggregateStackExhaustsRegisters = false;
 
     // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the active CC's
     // stacked-argument packing rules, threaded from the resolved

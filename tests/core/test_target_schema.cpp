@@ -945,7 +945,13 @@ TEST(TargetSchema, ShippedX86_64HasBothSysVAndMsX64) {
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
     auto const& sch = **r;
-    EXPECT_EQ(sch.callingConventionCount(), 2u);
+    // Three rows: the two conventions, and Apple's x86_64 one, which DERIVES
+    // from `sysv_amd64` and states only the X87UP rule it does not keep
+    // (pinned whole by `ACallingConventionRowDerivesFromAnotherAndStatesOnlyWhatDiffers`).
+    EXPECT_EQ(sch.callingConventionCount(), 3u);
+    auto const* darwin = sch.callingConventionByName("sysv_amd64_darwin");
+    ASSERT_NE(darwin, nullptr);
+    EXPECT_EQ(darwin->bases, std::vector<std::string>{"sysv_amd64"});
 
     auto const* sysv = sch.callingConventionByName("sysv_amd64");
     ASSERT_NE(sysv, nullptr);
@@ -1635,6 +1641,263 @@ TEST(TargetSchema, CallingConventionAggregateStrategyNeedsNonZeroMaxRegBytes) {
     ASSERT_FALSE(r.has_value())
         << "a real aggregateClassification with aggregateMaxRegBytes=0 must fail-loud";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// `aggregateMemoryArgument` — how a MEMORY-class by-value aggregate ARGUMENT travels —
+// is read by name (`stack` / `callerCopy`, absent ⇒ `callerCopy`), refused naming the
+// set when it is no name of it, refused when a convention that classifies no aggregate
+// states a carrier, and stated by every shipped convention: SysV AMD64 `stack` (psABI
+// 3.2.3), Win64 and both AAPCS64 conventions `callerCopy`.
+TEST(TargetSchema, CallingConventionAggregateMemoryArgumentIsReadAndRefusedByName) {
+    auto const doc = [](std::string const& extra) {
+        return std::string(
+            R"({"dssTargetVersion":1,"target":{"name":"X"},
+                "opcodes":[{"mnemonic":"invalid","result":"none"}],
+                "registers":[{"name":"rax","class":"gpr","widthBytes":8},
+                             {"name":"rsp","class":"gpr","widthBytes":8}],
+                "callingConventions":[
+                  {"name":"c","argGprs":["rax"],"stackPointer":"rsp","stackAlignment":16)")
+            + extra + "}]}";
+    };
+    std::string const sysv =
+        R"(,"aggregateClassification":"sysv_eightbyte","aggregateMaxRegBytes":16)";
+    struct Read { char const* what; std::string extra; ::dss::AggregateMemoryArgument want; };
+    for (Read const& c : {Read{"stated stack", sysv + R"(,"aggregateMemoryArgument":"stack")",
+                               ::dss::AggregateMemoryArgument::Stack},
+                          Read{"stated callerCopy",
+                               sysv + R"(,"aggregateMemoryArgument":"callerCopy")",
+                               ::dss::AggregateMemoryArgument::CallerCopy},
+                          Read{"absent", sysv, ::dss::AggregateMemoryArgument::CallerCopy}}) {
+        auto r = TargetSchema::loadFromText(doc(c.extra));
+        std::string refused;
+        if (!r.has_value())
+            for (auto const& d : r.error()) refused += " | " + d.path + ": " + d.message;
+        ASSERT_TRUE(r.has_value()) << c.what << refused;
+        ASSERT_EQ((*r)->callingConventions().size(), 1u) << c.what;
+        EXPECT_EQ((*r)->callingConventions()[0].aggregate.memoryArgument, c.want) << c.what;
+    }
+    for (std::string const& bad : {sysv + R"(,"aggregateMemoryArgument":"heap")",
+                                   sysv + R"(,"aggregateMemoryArgument":1)",
+                                   sysv + R"(,"aggregateMemoryArgument":"Stack")"}) {
+        auto r = TargetSchema::loadFromText(doc(bad));
+        ASSERT_FALSE(r.has_value()) << bad;
+        bool named = false;
+        for (auto const& d : r.error()) {
+            if (d.code == DiagnosticCode::C_MalformedJson
+                && d.message.find("aggregateMemoryArgument") != std::string::npos
+                && d.message.find("callerCopy") != std::string::npos
+                && d.message.find("stack") != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named) << bad << ": refused naming the key and the accepted set";
+    }
+    {
+        auto r = TargetSchema::loadFromText(doc(R"(,"aggregateMemoryArgument":"stack")"));
+        ASSERT_FALSE(r.has_value())
+            << "a carrier stated on a convention that classifies no aggregate is refused";
+        bool named = false;
+        for (auto const& d : r.error()) {
+            if (d.code == DiagnosticCode::C_MalformedJson
+                && d.message.find("classifies no by-value aggregate") != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named);
+    }
+    struct Shipped { char const* target; char const* cc; ::dss::AggregateMemoryArgument want; };
+    for (Shipped const& s : {Shipped{"x86_64", "sysv_amd64", ::dss::AggregateMemoryArgument::Stack},
+                             Shipped{"x86_64", "ms_x64", ::dss::AggregateMemoryArgument::CallerCopy},
+                             Shipped{"arm64", "aapcs64", ::dss::AggregateMemoryArgument::CallerCopy},
+                             Shipped{"arm64", "apple_arm64",
+                                     ::dss::AggregateMemoryArgument::CallerCopy}}) {
+        auto r = TargetSchema::loadShipped(s.target);
+        ASSERT_TRUE(r.has_value()) << s.target;
+        auto const* cc = (*r)->callingConventionByName(s.cc);
+        ASSERT_NE(cc, nullptr) << s.target << " " << s.cc;
+        EXPECT_EQ(cc->aggregate.memoryArgument, s.want) << s.target << " " << s.cc;
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c, main's ledger 454): A CALLING-CONVENTION ROW MAY DERIVE FROM ANOTHER. `derivesFrom`
+// names the row whose keys it takes, its own keys override them a key at a time, through a chain; a base that names
+// no row, a chain that leads back to a row it left (itself included) and a base that is no string are refused by
+// name. `x87UpWithoutX87` is read by name (absent ⇒ memory), refused naming the set, and refused on a row whose
+// classification is not `sysv_eightbyte`. The shipped derivations state only what differs: `apple_arm64` takes
+// aapcs64's registers, aggregate rules and frame roles and differs in its caller-saved set, its stacked-argument
+// packing, its va_list, its frame-pointer reservation and its variadic rule; `sysv_amd64_darwin` is `sysv_amd64`
+// with `x87UpWithoutX87: sse`.
+TEST(TargetSchema, ACallingConventionRowDerivesFromAnotherAndStatesOnlyWhatDiffers) {
+    auto const doc = [](std::string const& rows) {
+        return std::string(
+            R"({"dssTargetVersion":1,"target":{"name":"X"},
+                "opcodes":[{"mnemonic":"invalid","result":"none"}],
+                "registers":[{"name":"rax","class":"gpr","widthBytes":8},
+                             {"name":"rbx","class":"gpr","widthBytes":8},
+                             {"name":"rsp","class":"gpr","widthBytes":8}],
+                "callingConventions":[)") + rows + "]}";
+    };
+    std::string const base =
+        R"({"name":"b","argGprs":["rax"],"stackPointer":"rsp","stackAlignment":16,
+            "aggregateClassification":"sysv_eightbyte","aggregateMaxRegBytes":16,
+            "aggregateMemoryArgument":"stack","$comment":"the base's prose, never taken"})";
+    {
+        auto r = TargetSchema::loadFromText(doc(base + R"(,{"name":"d","derivesFrom":"b","argGprs":["rbx"],
+            "x87UpWithoutX87":"sse"},{"name":"e","derivesFrom":"d","stackAlignment":8})"));
+        std::string refused;
+        if (!r.has_value())
+            for (auto const& d : r.error()) refused += " | " + d.path + ": " + d.message;
+        ASSERT_TRUE(r.has_value()) << refused;
+        auto const* b = (*r)->callingConventionByName("b");
+        auto const* d = (*r)->callingConventionByName("d");
+        auto const* e = (*r)->callingConventionByName("e");
+        ASSERT_TRUE(b != nullptr && d != nullptr && e != nullptr);
+        EXPECT_EQ(b->aggregate.x87UpWithoutX87, ::dss::X87UpWithoutX87::Memory) << "absent ⇒ memory";
+        EXPECT_EQ(d->argGprs, std::vector<std::string>{"rbx"}) << "an own key overrides the base's";
+        EXPECT_EQ(d->stackAlignment, 16u) << "a key the row does not state is the base's";
+        EXPECT_EQ(d->aggregate.memoryArgument, ::dss::AggregateMemoryArgument::Stack);
+        EXPECT_EQ(d->aggregate.x87UpWithoutX87, ::dss::X87UpWithoutX87::Sse);
+        EXPECT_EQ(e->argGprs, std::vector<std::string>{"rbx"}) << "through the chain e → d → b";
+        EXPECT_EQ(e->stackAlignment, 8u);
+        EXPECT_EQ(e->aggregate.x87UpWithoutX87, ::dss::X87UpWithoutX87::Sse);
+        EXPECT_EQ(e->aggregate.classification, ::dss::AggregateClassKind::SysVEightbyte);
+    }
+    struct Bad { char const* what; std::string rows; char const* says; };
+    for (Bad const& c : {Bad{"a base that names no row", base + R"(,{"name":"d","derivesFrom":"nope"})",
+                             "names 'nope', which is no row"},
+                         Bad{"a row deriving from itself", base + R"(,{"name":"d","derivesFrom":"d"})",
+                             "leads back to 'd'"},
+                         Bad{"a loop of two", base + R"(,{"name":"d","derivesFrom":"e"},{"name":"e","derivesFrom":"d"})",
+                             "leads back to"},
+                         Bad{"a base that is no string", base + R"(,{"name":"d","derivesFrom":7})",
+                             "must be a string"},
+                         Bad{"another spelling of the X87UP rule", base.substr(0, base.size() - 1)
+                                                                       + R"(,"x87UpWithoutX87":"SSE"})",
+                             "accepted: 'memory' / 'sse'"},
+                         Bad{"the X87UP rule as a number", base.substr(0, base.size() - 1)
+                                                               + R"(,"x87UpWithoutX87":1})",
+                             "accepted: 'memory' / 'sse'"},
+                         Bad{"the X87UP rule on a row of another strategy",
+                             R"({"name":"w","argGprs":["rax"],"stackPointer":"rsp","stackAlignment":16,
+                                 "aggregateClassification":"win64_by_size","aggregateMaxRegBytes":8,
+                                 "x87UpWithoutX87":"sse"})",
+                             "read only by the 'sysv_eightbyte' aggregate classification"}}) {
+        auto r = TargetSchema::loadFromText(doc(c.rows));
+        ASSERT_FALSE(r.has_value()) << c.what << " must be refused";
+        bool named = false;
+        std::string all;
+        for (auto const& d : r.error()) {
+            all += " | " + d.path + ": " + d.message;
+            if (d.code == DiagnosticCode::C_MalformedJson && d.message.find(c.says) != std::string::npos)
+                named = true;
+        }
+        EXPECT_TRUE(named) << c.what << ": refused saying '" << c.says << "'; said:" << all;
+    }
+    // The shipped derivations.
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto const* aapcs = (*arm)->callingConventionByName("aapcs64");
+    auto const* apple = (*arm)->callingConventionByName("apple_arm64");
+    ASSERT_TRUE(aapcs != nullptr && apple != nullptr);
+    EXPECT_EQ(apple->argGprs, aapcs->argGprs);
+    EXPECT_EQ(apple->argFprs, aapcs->argFprs);
+    EXPECT_EQ(apple->returnGprs, aapcs->returnGprs);
+    EXPECT_EQ(apple->returnFprs, aapcs->returnFprs);
+    EXPECT_EQ(apple->calleeSaved, aapcs->calleeSaved);
+    EXPECT_EQ(apple->stackAlignment, aapcs->stackAlignment);
+    EXPECT_EQ(apple->aggregate.classification, aapcs->aggregate.classification);
+    EXPECT_EQ(apple->aggregate.maxRegBytes, aapcs->aggregate.maxRegBytes);
+    EXPECT_EQ(apple->aggregate.memoryArgument, aapcs->aggregate.memoryArgument);
+    EXPECT_EQ(apple->aggregate.stackExhaustsRegisters, aapcs->aggregate.stackExhaustsRegisters);
+    ASSERT_TRUE(apple->indirectResultRegister.has_value() && aapcs->indirectResultRegister.has_value());
+    EXPECT_EQ(apple->indirectResultRegister->name, aapcs->indirectResultRegister->name);
+    EXPECT_NE(apple->callerSaved, aapcs->callerSaved) << "x18 is Apple's platform register";
+    EXPECT_TRUE(apple->variadicArgsAlwaysStack);
+    EXPECT_FALSE(aapcs->variadicArgsAlwaysStack);
+    ASSERT_TRUE(apple->vaListLayout.has_value() && aapcs->vaListLayout.has_value());
+    EXPECT_NE(apple->vaListLayout->strategy, aapcs->vaListLayout->strategy);
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    auto const* sysv = (*x86)->callingConventionByName("sysv_amd64");
+    auto const* darwin = (*x86)->callingConventionByName("sysv_amd64_darwin");
+    ASSERT_TRUE(sysv != nullptr && darwin != nullptr);
+    EXPECT_EQ(darwin->argGprs, sysv->argGprs);
+    EXPECT_EQ(darwin->argFprs, sysv->argFprs);
+    EXPECT_EQ(darwin->callerSaved, sysv->callerSaved);
+    EXPECT_EQ(darwin->calleeSaved, sysv->calleeSaved);
+    EXPECT_EQ(darwin->redZoneBytes, sysv->redZoneBytes);
+    EXPECT_EQ(darwin->aggregate.classification, sysv->aggregate.classification);
+    EXPECT_EQ(darwin->aggregate.memoryArgument, sysv->aggregate.memoryArgument);
+    EXPECT_EQ(darwin->stackArgPacking.maxAggregateAlignment.kind, sysv->stackArgPacking.maxAggregateAlignment.kind);
+    EXPECT_EQ(sysv->aggregate.x87UpWithoutX87, ::dss::X87UpWithoutX87::Memory);
+    EXPECT_EQ(darwin->aggregate.x87UpWithoutX87, ::dss::X87UpWithoutX87::Sse);
+}
+
+// ★ P69 (lane `cs`, fold f26c — the SysV row, main's ledger 452): A STACKED-ARGUMENT ALIGNMENT CAP is a number of
+// bytes (0 or a power of two) OR the keyword `own` — the argument's own alignment, uncapped — and nothing else: a
+// misspelt keyword, another string, a negative or a non-power-of-two number is refused naming BOTH forms. SysV
+// AMD64 states `own` for an aggregate (gcc and clang begin a stacked aggregate of alignment 32/64/256 at it) and
+// 16 for a scalar; Win64 and AAPCS64 state no aggregate cap.
+TEST(TargetSchema, AStackedAlignmentCapIsANumberOrOwnAndNothingElse) {
+    using Cap = ::dss::StackArgPackingRules::AlignmentCap;
+    auto const doc = [](std::string const& sap) {
+        return std::string(
+                   R"({"dssTargetVersion":1,"target":{"name":"X"},
+                "opcodes":[{"mnemonic":"invalid","result":"none"}],
+                "registers":[{"name":"rax","class":"gpr","widthBytes":8},
+                             {"name":"rsp","class":"gpr","widthBytes":8}],
+                "callingConventions":[
+                  {"name":"c","argGprs":["rax"],"stackPointer":"rsp","stackAlignment":16,
+                   "stackArgPacking":)")
+               + sap + "}]}";
+    };
+    struct Read {
+        char const* sap;
+        Cap         scalar;
+        Cap         aggregate;
+    };
+    for (Read const& c : {Read{R"({"maxAggregateAlignment":"own"})", Cap::ofBytes(0), Cap::own()},
+                          Read{R"({"maxScalarAlignment":"own","maxAggregateAlignment":32})", Cap::own(),
+                               Cap::ofBytes(32)},
+                          Read{R"({"maxScalarAlignment":0})", Cap::ofBytes(0), Cap::ofBytes(0)},
+                          Read{R"({})", Cap::ofBytes(0), Cap::ofBytes(0)}}) {
+        auto r = TargetSchema::loadFromText(doc(c.sap));
+        std::string refused;
+        if (!r.has_value())
+            for (auto const& d : r.error()) refused += " | " + d.path + ": " + d.message;
+        ASSERT_TRUE(r.has_value()) << c.sap << refused;
+        auto const& got = (*r)->callingConventions()[0].stackArgPacking;
+        EXPECT_EQ(got.maxScalarAlignment.kind, c.scalar.kind) << c.sap;
+        EXPECT_EQ(got.maxScalarAlignment.bytes, c.scalar.bytes) << c.sap;
+        EXPECT_EQ(got.maxAggregateAlignment.kind, c.aggregate.kind) << c.sap;
+        EXPECT_EQ(got.maxAggregateAlignment.bytes, c.aggregate.bytes) << c.sap;
+    }
+    for (char const* bad : {R"({"maxAggregateAlignment":"Own"})", R"({"maxAggregateAlignment":"natural"})",
+                            R"({"maxAggregateAlignment":24})", R"({"maxScalarAlignment":-16})",
+                            R"({"maxAggregateAlignment":true})", R"({"maxScalarAlignment":70000})"}) {
+        auto r = TargetSchema::loadFromText(doc(bad));
+        ASSERT_FALSE(r.has_value()) << bad;
+        bool named = false;
+        for (auto const& d : r.error())
+            named = named
+                 || (d.code == DiagnosticCode::C_MalformedJson
+                     && d.message.find("power of two") != std::string::npos
+                     && d.message.find("'own'") != std::string::npos);
+        EXPECT_TRUE(named) << bad << ": refused naming both forms";
+    }
+    // The shipped conventions.
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    auto const* sysv = (*x86)->callingConventionByName("sysv_amd64");
+    ASSERT_NE(sysv, nullptr);
+    EXPECT_EQ(sysv->stackArgPacking.maxAggregateAlignment.kind, Cap::Kind::Own);
+    EXPECT_EQ(sysv->stackArgPacking.maxScalarAlignment.kind, Cap::Kind::Bytes);
+    EXPECT_EQ(sysv->stackArgPacking.maxScalarAlignment.bytes, 16u);
+    auto const* ms = (*x86)->callingConventionByName("ms_x64");
+    ASSERT_NE(ms, nullptr);
+    EXPECT_EQ(ms->stackArgPacking.maxAggregateAlignment.kind, Cap::Kind::Bytes);
+    EXPECT_EQ(ms->stackArgPacking.maxAggregateAlignment.bytes, 0u);
 }
 
 // ─── cycle 2b — JSON loader edge cases ────────────────────────────────────

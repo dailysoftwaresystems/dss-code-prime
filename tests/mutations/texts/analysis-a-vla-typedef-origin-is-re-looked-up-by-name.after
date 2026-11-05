@@ -1,0 +1,2 @@
+                                    SymbolId const relooked = s.scopes.lookup(here, tree.text(aliasTok));
+                                    SymbolId const* const recorded = &relooked;

@@ -882,6 +882,8 @@ TEST(AsmArm64MemoryRows, ACallingConventionNamingTheAliasIsRejectedAtLoad) {
     auto const mutant = mutateShippedTargetSchemaDoc(
         kTarget, [&sawViolation](nlohmann::json& doc) {
             for (auto& cc : doc.at("callingConventions")) {
+                // A row that derives its pool (`derivesFrom`) takes the mutated base's.
+                if (!cc.contains("argFprs")) continue;
                 auto& pool = cc.at("argFprs");
                 if (pool.empty()) continue;
                 // Replace the FIRST arg register with its alias spelling: one

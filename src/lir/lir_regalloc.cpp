@@ -11,10 +11,6 @@
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
-// `kByValueStackArgExhaust{Gpr,Fpr}` — the by-value stack-aggregate class-
-// exhaust codes the outgoing-argument cursor walk must honour, read from the
-// same declaration `lir_rewrite` and `lir_callconv` read them from.
-#include "mir/mir_opcode.hpp"
 #include "lir/lir_reg_constraints.hpp"
 
 #include <algorithm>
@@ -1503,20 +1499,11 @@ void collectOutgoingArgHints(std::span<LirOperand const> ops,
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
-        // The marker and its MemOffset are consumed WITH the carrier, never
-        // argument positions of their own — the same reading
-        // `classifyCallRegArgs` and the callconv placement site perform.
-        if (lirIsByValueStackAggDescriptor(ops, k)) continue;
-        if (lirIsByValueStackAggCarrier(ops, k)) {
-            std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
-            if (ex == kByValueStackArgExhaustGpr) {
-                argCursors.exhaust(LirRegClass::GPR);
-            } else if (ex == kByValueStackArgExhaustFpr) {
-                argCursors.exhaust(LirRegClass::FPR);
-            }
-            ++argRegionIdx;
-            continue;
-        }
+        // ⓘ Every operand here is one argument: no by-value stacked-aggregate
+        // carrier reaches the allocator — `lowerWideCallArgs` took each one off
+        // its Call, and the LIR verifier's stage rule
+        // (`verifyLirStackedAggregatesLowered`) refuses a module where one
+        // survived.
         if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
         LirRegClass const cls = argOp.reg.regClass();
         // ⚠ THE CURSOR ADVANCES FOR EVERY REGISTER OPERAND, HINTED OR NOT.

@@ -165,6 +165,13 @@ dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
 dss_add_test(NAME lir/test_lir_long_double_stack_arg_alignment
              SOURCES test_lir_long_double_stack_arg_alignment.cpp)
 
+# P69 fold f26c (main's ledger 495): a caller places every stack-passed argument
+# where the callee's ABI expects it, at its declared alignment, whatever SP's own
+# alignment is at the call -- the realignment onto the VLA frame model, its row,
+# the frame it runs on, a VLA in it, and the caller-copy conventions untouched.
+dss_add_test(NAME lir/test_lir_stacked_argument_realignment
+             SOURCES test_lir_stacked_argument_realignment.cpp)
+
 # D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: ONE pass owns
 # every outgoing-argument byte offset. `lowerWideCallArgs` states each stacked
 # aggregate's offset on its carrier and stamps the Call; callconv reads those

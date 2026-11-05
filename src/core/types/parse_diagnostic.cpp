@@ -201,6 +201,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_CaseLabelNotConstant";
         case DiagnosticCode::S_OutOfScopeDeclarationUsed:
             return "S_OutOfScopeDeclarationUsed";
+        case DiagnosticCode::S_ImplicitFunctionDeclaration:
+            return "S_ImplicitFunctionDeclaration";
+        case DiagnosticCode::S_ImplicitDeclarationConflicts:
+            return "S_ImplicitDeclarationConflicts";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:

@@ -7381,6 +7381,26 @@ struct Lowerer {
                 if (isVoidPtr(thenD) && isObjectPtr(elseD))      common = thenD;
                 else if (isVoidPtr(elseD) && isObjectPtr(thenD)) common = elseD;
             }
+            // ★★ P69 (lane `cs`, fold f26c — D-C-A-POINTER-TO-AN-ARRAY-OF-UNKNOWN-SIZE-IS-WARNED-INCOMPATIBLE,
+            // item (3)): two arms that are pointers to COMPATIBLE types (after an array
+            // or a function designator decays) are converted to a pointer to their COMPOSITE (C 6.2.7p3,
+            // 6.5.15p6) — the EXACT mirror of the semantic `combineTernary` arm, where the meaning split
+            // (gcc, clang and mingw-w64 gcc the composite; cl the first arm) is measured and decided.
+            // Without it the conditional carried the stamped composite over arms of their own types.
+            if (!common.valid()) {
+                auto const decayToPointer = [&](TypeId t) -> TypeId {
+                    if (t.valid() && interner.kind(t) == TypeKind::FnSig) return interner.pointer(t);
+                    return decayArray(t);
+                };
+                TypeId const thenP = decayToPointer(thenE.type);
+                TypeId const elseP = decayToPointer(elseE.type);
+                if (thenP.valid() && elseP.valid() && thenP != elseP
+                    && interner.kind(thenP) == TypeKind::Ptr && interner.kind(elseP) == TypeKind::Ptr) {
+                    TypeId const composite =
+                        compositeType(interner, thenP, elseP, ArraysCompared::BelowAPointer);
+                    if (composite.valid()) common = composite;
+                }
+            }
             // ★★ P68 round 9 (lane `cs`): two arms contributing pointers to
             // INCOMPATIBLE types have type `void *` — the EXACT mirror of the semantic
             // `combineTernary` arm, where the meaning fork (gcc/clang `void *`, MSVC the
@@ -17509,6 +17529,28 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             // rule, exactly as it decorates `canonicalName` when it is empty.
             /*asmName=*/std::string{},
             ext.linkName});       // D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME
+    }
+
+    // ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION):
+    // the functions a CALL declared implicitly (`SemanticModel::implicitDeclarations`) — the unit
+    // declares none of them, so no CST declaration lowers them. Each is the reference an unabsorbed
+    // bare prototype is (c86's channel, above): an ExternFunction bound to NO library, not eager,
+    // which the link binds to the unit that defines it or refuses by name, as ld does. Its type
+    // (the implicit result; the first call's promoted arguments, not variadic) is the analyzer's.
+    for (SymbolId const sym : model.implicitDeclarations()) {
+        SymbolRecord const* rec = model.recordFor(sym);
+        if (rec == nullptr || !rec->type.valid()) continue;   // only a typed record is listed
+        // A declared type from `model`, so projected to its representation (`reprOf`'s rule).
+        HirNodeId const node = builder.makeExternFunction(
+            model.lattice().interner().representationType(rec->type), sym.v, {});
+        decls.push_back(node);
+        externDecls.push_back(HirExternRecord{
+            node, rec->name, std::unordered_map<std::string, std::string>{},
+            /*noLibraryBinding=*/true,
+            /*version=*/std::string{},
+            /*isEagerImport=*/false,
+            /*asmName=*/std::string{},
+            /*linkName=*/std::string{}});
     }
 
     HirNodeId const root = builder.makeModule(decls);

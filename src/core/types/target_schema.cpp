@@ -3425,18 +3425,30 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
         // FC7 C2: a CC declaring a real aggregate-classification STRATEGY must
         // also declare a non-zero `aggregateMaxRegBytes` — otherwise every
-        // by-value aggregate classifies BY REFERENCE (`size <= 0` is always
+        // by-value aggregate classifies as MEMORY (`size <= 0` is always
         // false), a silent wrong-but-self-consistent ABI. Fail loud at load so a
         // future target.json that wires the strategy but forgets the budget is
         // caught instead of quietly mis-passing every struct.
-        if (cc.aggregateClassification != AggregateClassKind::None
-            && cc.aggregateMaxRegBytes == 0) {
+        if (cc.aggregate.classification != AggregateClassKind::None
+            && cc.aggregate.maxRegBytes == 0) {
             fail(std::format("/callingConventions/{}/aggregateMaxRegBytes", i),
                  std::format("callingConvention '{}' declares aggregateClassification "
                              "'{}' but aggregateMaxRegBytes is 0 — a real strategy "
                              "needs a non-zero register budget",
                              cc.name,
-                             aggregateClassKindName(cc.aggregateClassification)));
+                             aggregateClassKindName(cc.aggregate.classification)));
+        }
+        // P69 (lane `cs`, fold f26c): `aggregateMemoryArgument: stack` states how a
+        // MEMORY-class aggregate argument travels; a convention that classifies no
+        // aggregate (`none`) has none, and a carrier stated for none is the document's
+        // mistake, said where it is written.
+        if (cc.aggregate.classification == AggregateClassKind::None
+            && cc.aggregate.memoryArgument != AggregateMemoryArgument::CallerCopy) {
+            fail(std::format("/callingConventions/{}/aggregateMemoryArgument", i),
+                 std::format("callingConvention '{}' states aggregateMemoryArgument '{}' but "
+                             "classifies no by-value aggregate (aggregateClassification "
+                             "'none'): no argument of class MEMORY can arise",
+                             cc.name, aggregateMemoryArgumentName(cc.aggregate.memoryArgument)));
         }
 
         // Stack alignment must be a power of two when ANY ABI field is
@@ -3836,5 +3848,15 @@ std::vector<ConfigDiagnostic> linkVeneerProblems(TargetSchemaData const& data) {
 }
 
 } // namespace detail
+
+bool TargetSchema::callingConventionIsOrDerivesFrom(std::string_view active,
+                                                    std::string_view id) const noexcept {
+    if (active == id) return true;
+    TargetCallingConvention const* const cc = callingConventionByName(active);
+    if (cc == nullptr) return false;
+    for (std::string const& base : cc->bases)
+        if (base == id) return true;
+    return false;
+}
 
 } // namespace dss

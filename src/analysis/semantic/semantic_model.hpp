@@ -320,6 +320,14 @@ struct DSS_EXPORT SymbolRecord {
     // emits NO HIR node — the survivor carries the symbol (the definition emits
     // the body; an unabsorbed proto emits nothing either). Default false.
     bool            isAbsorbedProto = false;
+    // ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION):
+    // TRUE iff the analyzer MINTED this function for a call whose callee the unit declares nowhere
+    // (C90 6.3.2.2's `extern int name();`, where the call rule states `implicitDeclarationResult`). It
+    // has no declaration in the tree: `declNode` is the first such call's callee name, and its type —
+    // the implicit result, the parameters the first call's arguments after their default argument
+    // promotions, not variadic — is completed at that call. The CST→HIR lowering emits it as an
+    // external function bound to no library (`SemanticModel::implicitDeclarations`). Default false.
+    bool            isImplicitDeclaration = false;
     // D-CSUBSET-EXTERN-DEFINITION-MERGE: TRUE iff this symbol was minted from a
     // NON-DEFINING declaration — a declaration that announces a symbol whose
     // storage/body lives elsewhere (an `extern` declaration in C). Set by Pass 1
@@ -1364,6 +1372,18 @@ public:
     // HirExternRecords. Empty unless the CU resolved a shipped-lib descriptor.
     [[nodiscard]] std::span<ShippedExternSymbol const> shippedExterns() const noexcept {
         return shippedExterns_;
+    }
+
+    // ★★ P69 (lane `cs`, fold f26c): the functions the analyzer declared IMPLICITLY — each
+    // record with `isImplicitDeclaration` and a completed type, in id order. The CST→HIR
+    // lowerer emits each as an external function bound to no library, as it does an
+    // unabsorbed bare prototype (c86), so the link binds it to the unit that defines it.
+    [[nodiscard]] std::vector<SymbolId> implicitDeclarations() const {
+        std::vector<SymbolId> out;
+        for (std::size_t i = 1; i < symbols_.size(); ++i)
+            if (symbols_[i].isImplicitDeclaration && symbols_[i].type.valid())
+                out.push_back(SymbolId{static_cast<std::uint32_t>(i)});
+        return out;
     }
 
     // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) + c156 (D-LK-ELF-SYMBOL-VERSIONING):

@@ -115,7 +115,7 @@ INVENTORY = {
     "src/link/linker.cpp": 16,
     "src/link/object_format_schema.cpp": 25,
     "src/link/object_format_schema_json.cpp": 9,
-    "src/lir/lir_callconv.cpp": 29,
+    "src/lir/lir_callconv.cpp": 26,
     "src/lir/lir_verifier.cpp": 3,
     "src/lir/lowering/mir_to_lir.cpp": 48,
     "src/mir/lowering/hir_to_mir.cpp": 77,

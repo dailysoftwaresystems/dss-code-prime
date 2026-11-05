@@ -25,9 +25,10 @@
 // on the Call, and callconv REFUSES to place anything of its own. Since P69
 // round 4 (D-AS-REGALLOC-WIDE-CALL-AGGREGATE-ADDRESS-OPERANDS) the pass also
 // WRITES each stacked aggregate's bytes at its offset, before the Call, so the
-// Call the pipeline hands callconv carries no aggregate at all; a carrier that
-// states its offset (the `Reg, ByValueStackAgg, MemOffset` triple) now reaches
-// callconv only from a hand-built module, which (C) builds.
+// Call the pipeline hands callconv carries no aggregate at all — and since the
+// carrier's stage rule (P69, lane `cs`, fold f26c) the LIR verifier refuses a
+// post-pass module that still carries one, in any form, so callconv holds no
+// arm for it. (C) builds both sides of that by hand.
 //
 //   (A) THE NEGATIVE MISCOMPILE PIN — the real MIR->LIR -> lowerWideCallArgs ->
 //       regalloc -> rewrite -> 2addr -> callconv pipeline over the colliding
@@ -39,11 +40,14 @@
 //       carriers at the offsets the cursor gave it, each loaded from its temp,
 //       and the Call carries the placed bit and no aggregate — all read back off
 //       the module `lowerWideCallArgs` produced.
-//   (C) THE REFUSALS, EXERCISED RATHER THAN READ — a placed Call whose carrier
-//       states nothing, and a placed Call with an overflow scalar still on it,
-//       are both refused; the SAME modules with the bit clear materialize
-//       cleanly, which is what shows the refusal keys on the placement authority
-//       and not on the shape.
+//   (C) THE REFUSALS, EXERCISED RATHER THAN READ — a post-pass module carrying
+//       the aggregate carrier in any form (unplaced or placed, the Call stamped
+//       or not) is refused by the verifier's stage rule, while the post-pass
+//       form of the same aggregate (its copy before the Call) verifies and
+//       materializes at its placed bytes; and a placed Call with an overflow
+//       scalar still on it is refused while the same module with the bit clear
+//       materializes cleanly, which is what shows that refusal keys on the
+//       placement authority and not on the shape.
 //   (D) THE VARARG BOUNDARY IS A POSITION, AND THIS PASS RENUMBERS POSITIONS —
 //       `fixedOperandCount` counts arg positions, so removing operands moves the
 //       boundary. Leaving it unrestated made the SysV variadic vector count (AL)
@@ -69,6 +73,7 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
+#include "lir/lir_verifier.hpp"
 #include "lir/lir_wide_call_args.hpp"
 #include "mir/mir_opcode.hpp"
 
@@ -495,10 +500,10 @@ TEST(OutgoingArgCursor, LowerWideCallArgsCopiesTheAggregateIntoItsPlacedBytes) {
 
 // ── (C) THE REFUSALS, EXERCISED ─────────────────────────────────────────────
 //
-// A post-regalloc module built by hand, so the two states a pipeline cannot
-// produce can be reached at all: a Call that CLAIMS its outgoing arguments were
-// placed while a carrier states nothing, and one that claims it while an
-// argument still overflows. Each is run with the claim and WITHOUT it, and the
+// Post-regalloc modules built by hand, so states a pipeline cannot produce can be
+// reached at all: a module past the wide-call pass that still carries the
+// aggregate carrier, and a Call that CLAIMS its outgoing arguments were placed
+// while an argument still overflows. Each is run against its control, and the
 // difference is the whole assertion.
 
 struct HandBuilt {
@@ -506,42 +511,73 @@ struct HandBuilt {
     LirAllocation alloc;
 };
 
-// `argCount` GPR arguments followed by an optional by-value aggregate carrier.
+// How a hand-built call passes its 16-byte stacked aggregate, if at all.
+enum class Aggregate : std::uint8_t {
+    None,
+    // The POST-pass form `lowerWideCallArgs` produces: two `load r11, [r15 + k]` /
+    // `store_outgoing_arg r11 @k` pairs before the Call, nothing on the Call.
+    CopiedBeforeTheCall,
+    // The carrier form, which the stage rule says no post-pass module holds:
+    CarrierUnplaced,  // (r15, ByValueStackAgg)
+    CarrierPlaced,    // (r15, ByValueStackAgg, MemOffset 0)
+};
+
+// `gprArgs` GPR arguments, then the aggregate in the form named.
 [[nodiscard]] HandBuilt
-buildCall(TargetSchema const& sch, std::uint32_t gprArgs, bool withAggregate,
-          bool statePlacement, bool stampPlacedFlag) {
+buildCall(TargetSchema const& sch, std::uint32_t gprArgs, Aggregate aggregate,
+          bool stampPlacedFlag) {
     HandBuilt out;
     auto const callOp = sch.opcodeByMnemonic("call");
     auto const retOp  = sch.opcodeByMnemonic("ret");
+    auto const storeOutOp = sch.opcodeByMnemonic("store_outgoing_arg");
+    auto const gprLoadOp =
+        sch.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load);
     EXPECT_TRUE(callOp.has_value());
     EXPECT_TRUE(retOp.has_value());
+    EXPECT_TRUE(storeOutOp.has_value());
+    EXPECT_TRUE(gprLoadOp.has_value());
 
     auto const* cc = sch.callingConvention(0);
     EXPECT_NE(cc, nullptr);
 
     // Sources drawn from the callee-saved pool so no arg-move cycle arises.
     std::array<char const*, 5> const homes{"rbx", "rbp", "r12", "r13", "r14"};
+    auto const physGpr = [&](char const* name) {
+        auto const ord = sch.registerByName(name);
+        EXPECT_TRUE(ord.has_value());
+        return makePhysicalReg(ord.value_or(0), LirRegClass::GPR);
+    };
     std::vector<LirOperand> ops;
     ops.push_back(LirOperand::makeSymbolRef(13));
-    for (std::uint32_t i = 0; i < gprArgs; ++i) {
-        auto const ord = sch.registerByName(homes[i % homes.size()]);
-        EXPECT_TRUE(ord.has_value());
-        ops.push_back(LirOperand::makeReg(
-            makePhysicalReg(*ord, LirRegClass::GPR)));
-    }
-    if (withAggregate) {
-        auto const ord = sch.registerByName("r15");
-        EXPECT_TRUE(ord.has_value());
-        ops.push_back(LirOperand::makeReg(
-            makePhysicalReg(*ord, LirRegClass::GPR)));
+    for (std::uint32_t i = 0; i < gprArgs; ++i)
+        ops.push_back(LirOperand::makeReg(physGpr(homes[i % homes.size()])));
+    if (aggregate == Aggregate::CarrierUnplaced
+        || aggregate == Aggregate::CarrierPlaced) {
+        ops.push_back(LirOperand::makeReg(physGpr("r15")));
         ops.push_back(LirOperand::makeByValueStackAgg(16));
-        if (statePlacement) ops.push_back(LirOperand::makeMemOffset(0));
+        if (aggregate == Aggregate::CarrierPlaced)
+            ops.push_back(LirOperand::makeMemOffset(0));
     }
 
     LirBuilder b{sch};
     b.addFunction(SymbolId{91});
     LirBlockId const block = b.createBlock();
     b.beginBlock(block);
+    if (aggregate == Aggregate::CopiedBeforeTheCall) {
+        auto const chunkWidth = lirInstWidthFlagForBits(64);
+        EXPECT_TRUE(chunkWidth.has_value());
+        LirReg const r11 = physGpr("r11");
+        for (std::int32_t off = 0; off < 16; off += 8) {
+            std::array<LirOperand, 3> const ld{LirOperand::makeReg(physGpr("r15")),
+                                               LirOperand::makeMemBase(1),
+                                               LirOperand::makeMemOffset(off)};
+            b.addInst(gprLoadOp.value_or(0), r11, ld, /*payload=*/0,
+                      chunkWidth.value_or(0));
+            std::array<LirOperand, 1> const so{LirOperand::makeReg(r11)};
+            b.addInst(storeOutOp.value_or(0), InvalidLirReg, so,
+                      static_cast<std::uint32_t>(off), chunkWidth.value_or(0));
+        }
+    }
     b.addInst(*callOp, InvalidLirReg, ops, /*payload=*/0u,
               stampPlacedFlag ? kLirInstFlagOutgoingArgsPlaced
                               : std::uint8_t{0});
@@ -556,35 +592,84 @@ buildCall(TargetSchema const& sch, std::uint32_t gprArgs, bool withAggregate,
     return out;
 }
 
-TEST(OutgoingArgCursor, CallconvRefusesAnUnplacedCarrierOnAPlacedCall) {
+// THE STAGE RULE'S NEGATIVE, in all four forms the carrier ever had: past the
+// wide-call pass no Call carries it, so the post-regalloc verifier refuses each —
+// stamped or not, placed or not — and names the pass that should have removed it.
+TEST(OutgoingArgCursor, APostPassCarrierIsRefusedByTheVerifierInEveryForm) {
     auto schema = loadTarget("x86_64");
     ASSERT_NE(schema, nullptr);
+    for (Aggregate const form : {Aggregate::CarrierUnplaced, Aggregate::CarrierPlaced}) {
+        for (bool const stamped : {false, true}) {
+            auto bad = buildCall(*schema, /*gprArgs=*/2, form, stamped);
+            DiagnosticReporter rep;
+            EXPECT_FALSE(verifyLirPostRegalloc(bad.lir, *schema, rep))
+                << "form " << static_cast<int>(form) << ", stamped " << stamped;
+            ASSERT_FALSE(rep.all().empty());
+            EXPECT_EQ(rep.all()[0].code, DiagnosticCode::L_UnsupportedLoweringForOpcode);
+            EXPECT_NE(rep.all()[0].actual.find("after lowerWideCallArgs"),
+                      std::string::npos)
+                << "the refusal must name the stage: " << rep.all()[0].actual;
+            DiagnosticReporter direct;
+            EXPECT_FALSE(verifyLirStackedAggregatesLowered(bad.lir, *schema, direct))
+                << "form " << static_cast<int>(form) << ", stamped " << stamped;
+        }
+    }
+}
 
-    // THE FAILURE ARM: the Call says its outgoing arguments were placed, and the
-    // carrier states nothing. Placing it here would use a cursor that never saw
-    // the scalars `lowerWideCallArgs` removed.
-    auto bad = buildCall(*schema, /*gprArgs=*/2, /*withAggregate=*/true,
-                         /*statePlacement=*/false, /*stampPlacedFlag=*/true);
-    DiagnosticReporter badRep;
-    auto const badResult =
-        materializeCallingConvention(bad.lir, *schema, bad.alloc, badRep);
-    EXPECT_FALSE(badResult.ok());
-    EXPECT_GT(badRep.errorCount(), 0u)
-        << "an unplaced carrier on a placed call must be REFUSED, not re-placed";
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// A STACKED AGGREGATE BEGINS ON ITS OWN ALIGNMENT, through the REAL sequence. HIR->MIR states the
+// aggregate's alignment on its carrier, MIR->LIR carries it onto the marker, and the wide-call pass places
+// from it: after the seventh `long` (stacked at +0) the 32-byte, 16-aligned `struct A16` begins at +16 —
+// where gcc and clang put it (the `stackArgPacking` comment of x86_64.target.json) — and its four eightbytes
+// are written at +16/+24/+32/+40. ⚠ TYPED OUT: an alignment dropped anywhere on the chain begins it at +8.
+TEST(OutgoingArgCursor, ASixteenAlignedAggregateAfterOneStackedEightbyteIsPlacedOnItsAlignment) {
+    auto schema = loadTarget("x86_64");
+    ASSERT_NE(schema, nullptr);
+    auto const ccIdx = ccIndexByName(*schema, "sysv_amd64");
+    ASSERT_TRUE(ccIdx.has_value());
+    auto p = runPipeline(
+        "struct A16 { long double x; long y; };\n"
+        "long f(long a, long b, long c, long d, long e, long g, long s, struct A16 v) {\n"
+        "    return s + v.y;\n"
+        "}\n"
+        "long g_r;\n"
+        "void caller(void) { struct A16 v; v.x = 0; v.y = 2; g_r = f(1, 2, 3, 4, 5, 6, 7, v); }\n",
+        schema, *ccIdx, LongDoubleFormat::X87_80);
+    ASSERT_TRUE(p.cc.ok())
+        << (p.reporter.all().empty() ? std::string{} : p.reporter.all()[0].actual);
+    EXPECT_EQ(storeOutgoingPayloads(p.wide.lir, *schema),
+              (std::vector<std::uint32_t>{0u, 16u, 24u, 32u, 40u}))
+        << "the seventh long at +0, then the 16-aligned aggregate at +16 — not +8";
+}
 
-    // THE CONTROL: byte-identical module with the claim removed. A module that
-    // never went through `lowerWideCallArgs` has exactly one cursor — callconv's
-    // — and must still materialize.
-    auto good = buildCall(*schema, /*gprArgs=*/2, /*withAggregate=*/true,
-                          /*statePlacement=*/false, /*stampPlacedFlag=*/false);
+// THE CONTROL: the post-pass form of the same aggregate — its copy before the Call,
+// on a stamped Call — verifies, and callconv materializes it at the bytes the copy
+// states, from the copy's own register, adding nothing.
+TEST(OutgoingArgCursor, ThePostPassCopyOfAnAggregateVerifiesAndMaterializesAtItsPlacedBytes) {
+    auto schema = loadTarget("x86_64");
+    ASSERT_NE(schema, nullptr);
+    auto const* cc = schema->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    auto good = buildCall(*schema, /*gprArgs=*/2, Aggregate::CopiedBeforeTheCall,
+                          /*stampPlacedFlag=*/true);
+    DiagnosticReporter verifyRep;
+    EXPECT_TRUE(verifyLirPostRegalloc(good.lir, *schema, verifyRep))
+        << (verifyRep.all().empty() ? std::string{} : verifyRep.all()[0].actual);
     DiagnosticReporter goodRep;
     auto const goodResult =
         materializeCallingConvention(good.lir, *schema, good.alloc, goodRep);
-    EXPECT_TRUE(goodResult.ok())
-        << "with no placement claim callconv owns the only cursor and must "
-           "still place the aggregate: "
+    ASSERT_TRUE(goodResult.ok())
         << (goodRep.all().empty() ? std::string{} : goodRep.all()[0].actual);
     EXPECT_EQ(goodRep.errorCount(), 0u);
+    auto const* layout = goodResult.forFuncByIndex(0);
+    ASSERT_NE(layout, nullptr);
+    EXPECT_EQ(layout->outgoingArgAreaSize, 16u);
+    auto const counts = outgoingStoreCounts(goodResult.lir, 0,
+                                            cc->stackPointer->ordinal,
+                                            layout->outgoingArgAreaSize);
+    EXPECT_EQ(counts, (std::map<std::int32_t, int>{{0, 1}, {8, 1}}))
+        << "the aggregate's two eightbytes are written once each, at +0 and +8";
 }
 
 TEST(OutgoingArgCursor, CallconvRefusesAnOverflowScalarOnAPlacedCall) {
@@ -599,8 +684,8 @@ TEST(OutgoingArgCursor, CallconvRefusesAnOverflowScalarOnAPlacedCall) {
     // THE FAILURE ARM: one argument past the GPR pool, on a Call that claims its
     // outgoing arguments were already placed. `lowerWideCallArgs` would have
     // removed it; that it is still here means the two arg walks disagree.
-    auto bad = buildCall(*schema, overflowing, /*withAggregate=*/false,
-                         /*statePlacement=*/false, /*stampPlacedFlag=*/true);
+    auto bad = buildCall(*schema, overflowing, Aggregate::None,
+                         /*stampPlacedFlag=*/true);
     DiagnosticReporter badRep;
     auto const badResult =
         materializeCallingConvention(bad.lir, *schema, bad.alloc, badRep);
@@ -610,8 +695,8 @@ TEST(OutgoingArgCursor, CallconvRefusesAnOverflowScalarOnAPlacedCall) {
            "a restarted cursor is how the two passes overlap";
 
     // THE CONTROL: the same overflow with no placement claim still materializes.
-    auto good = buildCall(*schema, overflowing, /*withAggregate=*/false,
-                          /*statePlacement=*/false, /*stampPlacedFlag=*/false);
+    auto good = buildCall(*schema, overflowing, Aggregate::None,
+                          /*stampPlacedFlag=*/false);
     DiagnosticReporter goodRep;
     auto const goodResult =
         materializeCallingConvention(good.lir, *schema, good.alloc, goodRep);

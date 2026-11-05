@@ -38,9 +38,6 @@ namespace {
         // A by-value struct returned via x8-sret: spliced, it would read the
         // CALLER's indirect-result register.
         case MirOpcode::ReadIndirectResult:
-        // A fixed by-value aggregate received WHOLLY from the incoming stack:
-        // spliced, it binds to the CALLER's incoming frame.
-        case MirOpcode::RecvByValueStackParam:
         // The three va_start area leaves lower to `lea reg, [sp + offset]`
         // against the CALLEE's OWN variadic prologue.
         case MirOpcode::VaRegSaveAreaAddr:
@@ -51,6 +48,15 @@ namespace {
         case MirOpcode::StackSave:
         case MirOpcode::StackRestore:
             return true;
+        // A by-value parameter received WHOLLY from the incoming stack that states
+        // NO call-operand position (the x87 `long double` scalar parameter):
+        // spliced, it binds to the CALLER's incoming frame. ★ P69 (lane `cs`, fold
+        // f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+        // an aggregate reception states its position (`payload2` = position + 1) and
+        // the gate maps it to the caller's carrier, so it is NOT frame-bound — the
+        // refusal the gate removed is removed here too, by this set's own rule.
+        case MirOpcode::RecvByValueStackParam:
+            return mir.instPayload2(id) == 0;
         case MirOpcode::Return:
             // A MULTI-PIECE return (a struct returned in registers) — the
             // splice paths take operand 0 only, truncating it to its first

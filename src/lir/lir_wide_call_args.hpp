@@ -38,19 +38,19 @@
 // and it stamps `kLirInstFlagOutgoingArgsPlaced` on the shrunken Call, which is
 // how `lir_callconv` KNOWS the placements are made and that it must compute none.
 //
-// ★ P69 round 4 — WHAT IS TRUE OF THE CARRIER TODAY. Every Call goes through this
-// pass (no shipped call opcode is a terminator), so after it NO Call the pipeline
-// lowers carries the `(Reg, ByValueStackAgg[, MemOffset])` form: the aggregate's
-// address is read by single-operand loads the allocator places like any other,
-// not kept live into the Call. This file used to leave the aggregate ON the Call
-// with its byte offset stated as a trailing `MemOffset` for `lir_callconv` to copy
-// after allocation; that is no longer done, and an input that already states such
-// an offset is REFUSED here (it has been through this pass before). The form is
-// still ACCEPTED by five consumers — `lir_callconv`'s copy, register allocation,
-// the rewrite, the text form and the verifier — because hand-built modules reach
-// them without this pass (tests/lir, tests/asm). Dropping those arms together,
-// with the verifier stating "after this pass no Call carries the form", is owned
-// by D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
+// ★ THE CARRIER'S STAGE RULE. Every Call goes through this pass, so after it NO
+// instruction carries the `(Reg, ByValueStackAgg[, MemOffset])` form: the
+// aggregate's address is read by single-operand loads the allocator places
+// like any other, not kept live into the Call. The LIR verifier states it —
+// `verifyLirStackedAggregatesLowered`, which this pass runs on the module it
+// produced (so a terminator Call, whose operands are carried verbatim, that
+// held one is refused here rather than passed on) and which
+// `verifyLirPostRegalloc` runs at every later checkpoint — so liveness, the
+// allocator, the rewrite and `lir_callconv` keep no arm for the form. An input
+// that already states a placement (the trailing `MemOffset` this pass used to
+// leave on the Call for `lir_callconv` to copy after allocation) is REFUSED: it
+// has been through here before. The form's only readers are this pass and the
+// text codec (a pre-pass module written out and read back).
 //
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the byte placement rule
 // itself lives in `StackArgCursor` (lir_callconv.hpp) — the same object the

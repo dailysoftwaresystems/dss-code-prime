@@ -1070,18 +1070,52 @@ struct StackArgPackingRules {
     StackArgPacking namedAggregates = StackArgPacking::Slot;
     StackArgPacking variadic        = StackArgPacking::Slot;
     // The largest own-alignment this CC honours for a stacked SCALAR / stacked
-    // by-value AGGREGATE. 0 ⇒ none above the slot (the pre-existing behaviour).
-    // Validated as 0-or-a-power-of-two at load, like every other alignment field.
-    std::uint16_t   maxScalarAlignment    = 0;
-    std::uint16_t   maxAggregateAlignment = 0;
+    // by-value AGGREGATE, stated one of TWO ways (`AlignmentCap::Kind`):
+    //   * a number of bytes — 0 ⇒ none above the slot (the pre-existing
+    //     behaviour), else a power of two, validated at load like every other
+    //     alignment field;
+    //   * `own` — the argument's OWN alignment, uncapped.
+    // ★ P69 (lane `cs`, fold f26c — the SysV row, main's ledger 452): SysV needs
+    // the second. ✔MEASURED (probe sv cell 0, linux-x86_64, gcc 13.3.0 and clang
+    // 18.1.3, RUN): after one stacked `long`, a stacked aggregate of alignment 32,
+    // 64 and 256 begins at +32, +64 and +256 — its own alignment, which no number
+    // short of the largest alignment a type can hold states, so the vocabulary
+    // carries the case instead of a sentinel number. This was 16 for SysV, and a
+    // DSS caller put a 32-aligned aggregate where a gcc or clang callee does not
+    // read it (the native witness of tests/mir/test_sysv_memory_class_reference_link).
+    struct AlignmentCap {
+        enum class Kind : std::uint8_t { Bytes, Own };
+        static constexpr char const* kOwnKeyword = "own";
+        Kind          kind  = Kind::Bytes;
+        std::uint16_t bytes = 0;   // read only when `kind == Kind::Bytes`
+
+        [[nodiscard]] static constexpr AlignmentCap ofBytes(std::uint16_t b) noexcept {
+            return AlignmentCap{Kind::Bytes, b};
+        }
+        [[nodiscard]] static constexpr AlignmentCap own() noexcept {
+            return AlignmentCap{Kind::Own, 0};
+        }
+        // THE ONE ANSWER: where a stacked argument of own-alignment `ownAlign`
+        // begins, floored at the slot. Every tier that places a stacked argument
+        // — the caller's outgoing cursor, the wide-call pass, the callee's
+        // incoming one — asks it through `scalarAlignment`/`aggregateAlignment`.
+        [[nodiscard]] constexpr std::uint32_t
+        honoured(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
+            if (kind == Kind::Bytes) return stackedArgAlignment(ownAlign, bytes, slotBytes);
+            std::uint32_t const slot = slotBytes == 0 ? 1u : slotBytes;
+            return ownAlign < slot ? slot : ownAlign;
+        }
+    };
+    AlignmentCap maxScalarAlignment{};
+    AlignmentCap maxAggregateAlignment{};
 
     [[nodiscard]] constexpr std::uint32_t
     scalarAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
-        return stackedArgAlignment(ownAlign, maxScalarAlignment, slotBytes);
+        return maxScalarAlignment.honoured(ownAlign, slotBytes);
     }
     [[nodiscard]] constexpr std::uint32_t
     aggregateAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
-        return stackedArgAlignment(ownAlign, maxAggregateAlignment, slotBytes);
+        return maxAggregateAlignment.honoured(ownAlign, slotBytes);
     }
 };
 
@@ -1164,6 +1198,11 @@ framePointerReservationFromName(std::string_view s) noexcept {
 // without the link/target substrate.)
 struct DSS_EXPORT TargetCallingConvention {
     std::string name;                     // "sysv_amd64" / "ms_x64" / ...
+    // ★ P69 (lane `cs`, fold f26c, main's ledgers 454/456): the rows this one DERIVES from (`derivesFrom`),
+    // nearest first -- empty for a row that states every key itself. The reader has already laid the row
+    // over them; what remains of the derivation is the FAMILY question a source-level convention name
+    // asks (`TargetSchema::callingConventionIsOrDerivesFrom`): a derived convention answers for its base.
+    std::vector<std::string> bases;
     std::vector<std::string> argGprs;     // arg-passing integer registers, in order
     std::vector<std::string> argFprs;     // arg-passing floating-point registers, in order
     std::vector<std::string> returnGprs;  // integer-return registers (rax/rdx on SysV; rax on MS)
@@ -1348,26 +1387,6 @@ struct DSS_EXPORT TargetCallingConvention {
     // D-FF3-APPLE-ARM64-ABI-DIVERGENCE.
     bool variadicArgsAlwaysStack = false;
 
-    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: what happens to the
-    // ARG REGISTERS of a class once a by-value aggregate is placed WHOLLY on the
-    // stack because its pieces did not all fit (the all-or-nothing/straddle case).
-    // The two shipped ABIs DIVERGE — a documented, config-distinguishable fact,
-    // verified against gcc's own arg-advance logic (NOT an identity branch):
-    //   * false (SysV `sysv_amd64`): BACKFILL. The leftover registers stay
-    //     available for a LATER (smaller) arg — gcc `function_arg_advance_64`
-    //     leaves `cum->nregs`/`regno` untouched on the stack branch; the SysV ABI
-    //     "if registers were assigned for some eightbytes … the assignments get
-    //     reverted". The per-class cursor is NOT advanced on route-to-stack.
-    //   * true  (AAPCS64 `aapcs64`):  EXHAUST. The OVERFLOWED class is marked
-    //     full (NGRN/NSRN ← 8) so every subsequent arg of that class also goes to
-    //     memory — gcc `aarch64_layout_arg` sets `aapcs_nextncrn = NUM_ARG_REGS`
-    //     (or `nextnvrn` for an HFA). The cursor is CLAMPED to the pool size.
-    // Win64 (`ms_x64`, slotAligned) never straddles (1 struct = 1 positional
-    // slot) so the flag is inert (default false). Consumed by HIR→MIR's caller
-    // (Phase A) + callee (Phase B) cursor handling — kept in lockstep so the two
-    // sides agree AND va_start's `__gr_offs`/`__vr_offs` clamp reflects it.
-    bool aggregateStackExhaustsRegisters = false;
-
     // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the three measured
     // stacked-argument packing axes (see `StackArgPackingRules` above). Omitted
     // in JSON ⇒ all three `Slot` ⇒ every pre-existing CC keeps its exact
@@ -1382,19 +1401,15 @@ struct DSS_EXPORT TargetCallingConvention {
     // aggregate is measurably NOT over-aligned there.
     StackArgPackingRules stackArgPacking{};
 
-    // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
-    // classification STRATEGY for a struct/union passed/returned by value.
-    // A closed enum (the `aggregate_abi` classifier switches on it, never on
-    // identity). `None` (default) ⇒ this CC fails loud on a by-value
-    // aggregate (un-built). x86_64 SysV = SysVEightbyte (C1); Win64 / AAPCS64
-    // flip on in C2 / C3.
-    AggregateClassKind aggregateClassification = AggregateClassKind::None;
+    // The convention's BY-VALUE AGGREGATE RULES as ONE value (`AggregateConventionRules`, aggregate_layout.hpp,
+    // where each field's meaning is stated): the FC7 classification strategy and register-size bound
+    // (D-FC7-STRUCT-BY-VALUE-ARG-RETURN), the stack-exhaust policy (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS),
+    // the MEMORY-class argument carrier (D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET)
+    // and the X87UP rule. Read from the row's JSON keys `aggregateClassification`, `aggregateMaxRegBytes`,
+    // `aggregateStackExhaustsRegisters`, `aggregateMemoryArgument` and `x87UpWithoutX87`; the lowering takes it
+    // whole (P69 lane `cs`, fold f26c, main's ledger 455).
+    AggregateConventionRules aggregate{};
 
-    // The max aggregate SIZE (bytes) this CC passes/returns in registers;
-    // larger ⇒ MEMORY (by-reference args / sret returns). SysV = 16 (two
-    // eightbytes); Win64 = 8; AAPCS64 = 16. 0 ⇒ unused (strategy = None).
-    // Consumed only by the `aggregate_abi` classifier.
-    std::uint16_t aggregateMaxRegBytes = 0;
 
     // Named register reference. Used for distinguished-role registers
     // (link register, stack pointer, frame pointer in future cycles).
@@ -6222,6 +6237,13 @@ public:
         if (it == d_.callingConventionIndex.end()) return nullptr;
         return &d_.callingConventions[it->second];
     }
+
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 456): WHETHER THE CONVENTION `active` IS `id` OR DERIVES FROM
+    // IT -- the one family question. A row that derives from another (`TargetCallingConvention::bases`) answers
+    // for it, so a source-level name that selects `sysv_amd64` selects Mach-O x86_64's `sysv_amd64_darwin` too,
+    // and one that selects `aapcs64` selects `apple_arm64`. Defined in target_schema.cpp.
+    [[nodiscard]] bool callingConventionIsOrDerivesFrom(std::string_view active,
+                                                        std::string_view id) const noexcept;
 
     // P69 round 4 (lane `cs`): the convention ids this target's reference
     // compilers give a meaning and this compiler does not implement — see

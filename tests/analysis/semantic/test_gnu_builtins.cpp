@@ -231,8 +231,9 @@ TEST(GnuBuiltins, OverflowOperandsAreIntegersAndTheResultAModifiableIntegerObjec
 
 // ── Library builtins ───────────────────────────────────────────────────────────────────────
 // `__builtin_strlen` IS `strlen`: with no header, with a header plus the program's own
-// prototype, and with a LOCAL `int strlen` in scope (s25-s27) — and the library name itself
-// stays undeclared where no header declares it. On pe, `__builtin_printf` binds stdio.json's
+// prototype, and with a LOCAL `int strlen` in scope (s25-s27) — and the library name itself,
+// called where no header declares it, is declared by the call and takes that same library
+// function. On pe, `__builtin_printf` binds stdio.json's
 // pe row (s29), whatever owns its body there. A function no descriptor provides on the
 // target is refused AT EVERY USE, once per use however many of Pass 2's arms resolve it
 // (P69 review n12).
@@ -273,10 +274,22 @@ TEST(GnuBuiltins, ALibraryBuiltinCallsTheLibraryFunction) {
         auto const m = analyzeOn(c.src, c.format, c.dm);
         EXPECT_EQ(errorCount(m), 0u) << c.src << describe(m);
     }
-    // The library NAME stays undeclared where nothing declares it.
+    // P69 (lane `cs`, fold f26c): the library NAME, called where nothing declares it, is
+    // declared by the call (C90 6.3.2.2) — warned once — and the function it takes is the
+    // library's, with the library's type (gcc's answer: "incompatible implicit declaration of
+    // built-in function"), not a minted `int strlen()`: nothing is minted. From the call on
+    // the declaration is in scope of its block (a later non-call use is declared); a use
+    // BEFORE the call is not.
     {
         auto const m = analyzeOn("int main(void) { return (int)__builtin_strlen(\"a\")\n"
-                                 "  + (int)strlen(\"a\"); }\n",
+                                 "  + (int)strlen(\"a\") - 2 + (strlen == 0); }\n",
+                                 ObjectFormatKind::Elf, DataModel::Lp64);
+        EXPECT_EQ(errorCount(m), 0u) << describe(m);
+        EXPECT_EQ(codeCount(m, DiagnosticCode::S_ImplicitFunctionDeclaration), 1u) << describe(m);
+        EXPECT_TRUE(m.implicitDeclarations().empty()) << "the library's strlen is the one called";
+    }
+    {
+        auto const m = analyzeOn("int main(void) { (void)strlen; return (int)strlen(\"a\") - 1; }\n",
                                  ObjectFormatKind::Elf, DataModel::Lp64);
         EXPECT_EQ(codeCount(m, DiagnosticCode::S_UndeclaredIdentifier), 1u) << describe(m);
         EXPECT_EQ(errorCount(m), 1u) << describe(m);

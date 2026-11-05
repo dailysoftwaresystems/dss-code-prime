@@ -23,6 +23,7 @@
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lir_verifier.hpp"
+#include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
@@ -36,9 +37,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ios>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -56,6 +59,9 @@ struct RewrittenBundle {
     DiagnosticReporter       regallocRep;
     LirRewriteResult         rewritten;
     DiagnosticReporter       rewriteRep;
+    // Set only by `lowerThroughWideCallArgsAndRewrite`: the module the
+    // allocator and the rewrite were run over.
+    LirWideCallResult        wide;
 
     RewrittenBundle(test_support::LoweredLir l) : lowered(std::move(l)) {}
 };
@@ -85,6 +91,33 @@ lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
     out.rewritten = rewriteWithAllocation(out.lowered.lir.lir,
                                           *out.lowered.target, out.alloc,
                                           out.rewriteRep);
+    return out;
+}
+
+// THE PIPELINE'S ORDER, for a source whose call passes a wholly-stacked by-value
+// aggregate. MIR->LIR hands such an aggregate to its Call as the
+// `(Reg, ByValueStackAgg)` carrier, which lives only until `lowerWideCallArgs`:
+// that pass copies the aggregate into its outgoing bytes before allocation and
+// takes the carrier off the Call, and the LIR verifier's stage rule
+// (`verifyLirStackedAggregatesLowered`) is why the allocator, the rewrite and
+// callconv hold no arm for one. `lowerThroughRewrite` above skips that pass, so a
+// test of what callconv makes of such a call runs it here, as
+// `compile_pipeline` does.
+[[nodiscard]] RewrittenBundle
+lowerThroughWideCallArgsAndRewrite(std::string src, std::uint16_t ccIndex = 0,
+                                   std::string targetName = "x86_64") {
+    RewrittenBundle out{lowerCToLir(std::move(src), std::move(targetName),
+                                    ccIndex)};
+    if (!out.lowered.lir.ok) return out;
+    out.wide = lowerWideCallArgs(out.lowered.lir.lir, *out.lowered.target,
+                                 ccIndex, out.regallocRep);
+    if (!out.wide.ok) return out;
+    out.liveness = analyzeLiveness(out.wide.lir);
+    out.alloc = allocateRegisters(out.wide.lir, *out.lowered.target,
+                                  out.liveness, ccIndex, out.regallocRep);
+    if (!out.alloc.ok()) return out;
+    out.rewritten = rewriteWithAllocation(out.wide.lir, *out.lowered.target,
+                                          out.alloc, out.rewriteRep);
     return out;
 }
 
@@ -1381,8 +1414,8 @@ TEST(LirCallconv, VlaLeafFunctionMaterializesFramePointerModel) {
 // and asserted `EXPECT_FALSE(result.ok())` — the C1b LEAF gate. That gate is gone:
 // a VLA function may now make calls, with the outgoing-args area TRAVELLING WITH SP
 // at [SP+0..outgoingArgAreaSize) and every dynamic object lifted above it, so a
-// captured stack watermark means `SP + outgoingArgAreaSize`. The two sibling gates
-// (`usesVaStart`, `isSehParent`) below are UNCHANGED and still fail loud.
+// captured stack watermark means `SP + outgoingArgAreaSize`. Of the two sibling gates
+// below, `isSehParent` still fails loud; `usesVaStart` was built in P69 fold f26c.
 //
 // The property under test is the BIAS, not merely that the pass succeeds: a pass
 // that succeeded and captured a bare SP would place the VLA object exactly on top of
@@ -1529,35 +1562,84 @@ TEST(LirCallconv, VlaLeafFunctionWatermarkCarriesNoBias) {
            "would move every leaf VLA object off its own allocation";
 }
 
-// D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate, va-arm): a VLA function that ALSO
-// calls va_start FAILS LOUD — its va-area address leas are SP-relative body refs the
-// runtime `sub sp` invalidates (and the va-overflow area lives ABOVE the entry SP,
-// outside the frame-pointer switch). RED-ON-DISABLE for the `usesVaStart` gate (a
-// refactor could silently drop the va-arm, which is separate from the call-arm).
-TEST(LirCallconv, VlaVariadicFunctionWithVaStartFailsLoud) {
-    auto bundle = lowerThroughRewrite(
-        "int f(int n, ...) {\n"
-        "  int a[n];\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  va_end(ap);\n"
-        "  return a[0];\n"
-        "}\n");
-    ASSERT_TRUE(bundle.lowered.lir.ok);
-    ASSERT_TRUE(bundle.rewritten.ok);
-    DiagnosticReporter ccRep;
-    auto result = materializeCallingConvention(bundle.rewritten.lir,
-                                               *bundle.lowered.target,
-                                               bundle.alloc, ccRep);
-    EXPECT_FALSE(result.ok())
-        << "a VLA function that calls va_start must fail the callconv pass";
-    bool sawNonLeaf = false;
-    for (auto const& d : ccRep.all()) {
-        if (d.code == DiagnosticCode::L_VlaNonLeafFrameUnsupported)
-            sawNonLeaf = true;
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME, the va-arm -- ⚠ THIS PIN WAS DELIBERATELY INVERTED
+// (P69 fold f26c, main's ledger 495). It read `VlaVariadicFunctionWithVaStartFailsLoud`:
+// a VLA function that called va_start was refused, its va-area address leas being
+// SP-relative body references the runtime `sub sp` invalidates. A frame whose SP moves at
+// run time now also realigns for an over-aligned stacked argument, and a variadic such
+// function must work, so the arm is BUILT, not re-worded: the prologue's variadic spill
+// runs after the frame-pointer capture and off the frame base, and every va-area lea is
+// the frame base's. The property under test is WHERE the leas address -- off the frame
+// pointer, and the incoming one (the overflow area / Win64 home space) at or past the
+// fixed frame's top -- on all three conventions that declare a va_list: sysv_amd64's
+// register-save area, ms_x64's home space, aapcs64's dual cursor. A lea left SP-relative
+// would read the save area through a stack pointer the VLA moved.
+[[nodiscard]] std::vector<std::pair<std::uint16_t, std::int64_t>>
+leaBasesAndOffsets(Lir const& lir, TargetSchema const& schema, std::uint32_t funcIndex) {
+    std::vector<std::pair<std::uint16_t, std::int64_t>> out;
+    auto const lea = schema.opcodeByMnemonic("lea");
+    if (!lea.has_value()) return out;
+    LirFuncId const fn = lir.funcAt(funcIndex);
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < lir.blockInstCount(blk); ++i) {
+            LirInstId const inst = lir.blockInstAt(blk, i);
+            if (lir.instOpcode(inst) != *lea) continue;
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() < 3 || ops[0].kind != LirOperandKind::Reg || ops[0].reg.isPhysical == 0
+                || ops[2].kind != LirOperandKind::MemOffset) continue;
+            out.emplace_back(static_cast<std::uint16_t>(ops[0].reg.id), ops[2].offset);
+        }
     }
-    EXPECT_TRUE(sawNonLeaf)
-        << "a VLA + va_start function must surface L_VlaNonLeafFrameUnsupported";
+    return out;
+}
+
+TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
+    struct Arm { char const* target; std::uint16_t cc; };
+    for (Arm const arm : {Arm{"x86_64", 0}, Arm{"x86_64", 1}, Arm{"arm64", 0}}) {
+        SCOPED_TRACE(std::string{arm.target} + " cc " + std::to_string(arm.cc));
+        auto bundle = lowerThroughRewrite(
+            "int f(int n, ...) {\n"
+            "  int a[n];\n"
+            "  va_list ap;\n"
+            "  va_start(ap, n);\n"
+            "  a[0] = va_arg(ap, int);\n"
+            "  va_end(ap);\n"
+            "  return a[0];\n"
+            "}\n",
+            arm.cc, arm.target);
+        ASSERT_TRUE(bundle.lowered.lir.ok);
+        ASSERT_TRUE(bundle.rewritten.ok);
+        DiagnosticReporter ccRep;
+        auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                                   *bundle.lowered.target,
+                                                   bundle.alloc, ccRep);
+        ASSERT_TRUE(result.ok())
+            << "a VLA function that calls va_start must materialize: "
+            << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+        for (auto const& d : ccRep.all())
+            EXPECT_NE(d.code, DiagnosticCode::L_VlaNonLeafFrameUnsupported)
+                << "the va-arm of the non-leaf VLA gate must be gone, not re-worded";
+        ASSERT_EQ(result.perFunc.size(), 1u);
+        auto const* cc = bundle.lowered.target->callingConvention(arm.cc);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->framePointer.has_value());
+        ASSERT_TRUE(cc->stackPointer.has_value());
+        FrameLayout const& layout = result.perFunc[0];
+        auto const leas = leaBasesAndOffsets(result.lir, *bundle.lowered.target, 0);
+        bool incomingOffFp = false;
+        for (auto const& [base, offset] : leas) {
+            EXPECT_NE(base, cc->stackPointer->ordinal)
+                << "a lea at [SP+" << offset << "] in a frame whose SP moved: the va areas (and every "
+                   "fixed-frame address) are the frame pointer's";
+            if (base == cc->framePointer->ordinal
+                && offset >= static_cast<std::int64_t>(layout.totalFrameSize))
+                incomingOffFp = true;
+        }
+        EXPECT_TRUE(incomingOffFp)
+            << "the incoming va area (the overflow area, or the Win64 home space) is addressed off the "
+               "frame pointer at or past the fixed frame's top";
+    }
 }
 
 // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that is a SEH PARENT (guards a
@@ -5923,7 +6005,7 @@ countSpStoresInOffsetRange(Lir const& lir, LirFuncId fn, std::uint16_t storeOp,
 // pieces — the silent split — would land the struct bytes in rsi/rdx/rcx, NOT the
 // outgoing area, so countStoresInOffsetRange would see 0 → red.)
 TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs) {
-    auto bundle = lowerThroughRewrite(
+    auto bundle = lowerThroughWideCallArgsAndRewrite(
         "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
         "long combine(int n, ...) { return n; }\n"    // DEFINED so the symbol binds
         "long use(void) {\n"
@@ -5933,6 +6015,9 @@ TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs
     ASSERT_TRUE(bundle.lowered.lir.ok)
         << (bundle.lowered.lirReporter.all().empty()
                 ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.wide.ok)
+        << (bundle.regallocRep.all().empty()
+                ? "" : bundle.regallocRep.all()[0].actual);
     ASSERT_TRUE(bundle.alloc.ok());
     ASSERT_TRUE(bundle.rewritten.ok);
     DiagnosticReporter ccRep;
@@ -5950,14 +6035,15 @@ TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs
     EXPECT_EQ(cc->shadowSpaceBytes, 0u);
 
     // BLOCKER-2: the caller's outgoing-args area is sized for the 24B struct =
-    // ceil(24/8)*8 = 24 bytes. The naive pre-scan (counting the carrier's address
-    // Reg as ONE GPR arg → 0 overflow) would under-reserve to 0 → this goes red.
+    // ceil(24/8)*8 = 24 bytes — the furthest byte the wide-call pass's copy
+    // stores reach. A pre-scan that counted none of them would under-reserve to
+    // 0 → this goes red.
     FrameLayout const* callerLayout = soleCallerLayout(result);
     ASSERT_NE(callerLayout, nullptr);
     EXPECT_GE(callerLayout->outgoingArgAreaSize, 24u)
         << "BLOCKER-2: the outgoing-args area must reserve ceil(24/8)*8 = 24 bytes "
-           "for the by-value-stack aggregate (computeMaxOutgoingStackArgs accounts "
-           "for the carrier's overflow slots)";
+           "for the by-value-stack aggregate (computeMaxOutgoingStackArgs counts "
+           "the bytes the wide-call pass's copy stores reach)";
 
     // BLOCKER-1: the struct's bytes are byte-COPIED into the outgoing area at
     // [sp + 0 .. 24) (shadowSpaceBytes=0) — three 8-byte SP-relative stores. NO
@@ -5985,7 +6071,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggStructVarargForcedToOverflowWithFreeRegs
 // register pieces lands the first piece in a register + splits → the 16B contiguous
 // stack copy vanishes → red.
 TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOverflow) {
-    auto bundle = lowerThroughRewrite(
+    auto bundle = lowerThroughWideCallArgsAndRewrite(
         "struct LL { long a; long b; };\n"            // 16B → InRegisters (2 GPR)
         "long combine(int n, ...) { return n; }\n"
         "long use(void) {\n"
@@ -5993,6 +6079,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOver
         "  return combine(1, 100L, 200L, 300L, 400L, 500L, p);\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.wide.ok);
     ASSERT_TRUE(bundle.alloc.ok());
     ASSERT_TRUE(bundle.rewritten.ok);
     DiagnosticReporter ccRep;
@@ -6028,41 +6115,28 @@ TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOver
            "SP-relative stores [sp+0,sp+8] — never a register/stack split";
 }
 
-// FOLD (adversarial-review BLOCKER-3, silent miscompile) red-on-disable: the by-value-
-// stack aggregate byte-copy scratch GPR must AVOID the SOURCE registers of the pending
-// register arg-moves. The byte-copies are emitted in the stack-store phase BEFORE the
-// register arg-moves read their `.src` (lir_callconv.cpp: copies ~line 2300 vs arg-moves
-// ~line 2310); if an outgoing scalar arg VALUE lives in the chosen scratch, the byte-copy
-// clobbers it before its `mov dest, src` reads it → that argument SILENTLY receives the
-// struct's bytes.
+// FOLD (adversarial-review BLOCKER-3, silent miscompile) — REBUILT IN THE POST-PASS
+// FORM by the carrier's stage rule (P69, lane `cs`, fold f26c). The hazard this pin
+// was written for: callconv used to byte-copy a stacked by-value aggregate into the
+// outgoing area AFTER allocation, through a caller-saved scratch register it picked
+// itself, in the stack-store phase BEFORE the register arg-moves read their `.src` —
+// so a scratch that coincided with an argument's source clobbered that argument with
+// the struct's bytes (the fold added an avoid-set of arg-move sources). That copy no
+// longer exists: `lowerWideCallArgs` copies the aggregate BEFORE allocation, in
+// virtual registers whose live ranges end at their `store_outgoing_arg`, and takes
+// the carrier off the Call; the LIR verifier refuses a post-pass module that still
+// carries one, so callconv holds no copy and picks no scratch.
 //
-// This is a SYNTHETIC-LIR pin (not driven through regalloc) for full control over which
-// physical register is a live arg-move source — the hazard requires an arg-move SOURCE to
-// coincide with the scratch picker's choice, and the register allocator systematically
-// parks call-surviving arg sources in callee-saved registers (away from the caller-saved
-// scratch pool), so a regalloc-driven C shape cannot deterministically force the collision.
-// Here we hand-build a variadic call whose arg 1 source is rcx — the FIRST caller-saved
-// GPR the (reverted) scratch picker would choose after skipping the variadic-count reg
-// (rax) — so reverting the avoid-set deterministically aliases the scratch with a live
-// source.
-//
-// The invariant pinned is the PRECISE one the fix enforces: the byte-copy scratch ∉
-// {sources of the arg-passing moves}. (We deliberately do NOT assert ∉ cc.argGprs — an
-// argGpr that is only an arg-move DEST is written AFTER the copy stores to memory, so the
-// copy's transient write to it is dead; blanket-rejecting the whole argGpr pool would
-// falsely fail-loud on the legitimate register-exhaustion carrier — see
-// examples/c/varargs_struct_split — so the fix and this pin both track only the
-// live SOURCE set.)
-//
-// RED-ON-DISABLE: revert the avoid-set extension in lir_callconv.cpp (the `liveArgSrc`
-// build + the `liveArgSrc.contains(*ord)` rejection). The scratch picker walks
-// cc.callerSaved = [rax, rcx, ...] and chooses the first GPR not in {rax (variadic count),
-// callee, carrier addr} → rcx. But rcx is arg 1's source (`mov rsi, rcx`), so the byte-
-// copy `load rcx,[addr]; store [sp],rcx` clobbers it before the arg-move reads it: the
-// silent arg-clobber miscompile, and the load-bearing assertion (scratch ∉ arg-move
-// sources) goes red. With the fix, rcx ∈ liveArgSrc is rejected and the scratch falls
-// through to rdx (a non-source) → green.
-TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
+// What the pin asserts now is the same property over the module callconv is
+// actually handed: a post-allocation call whose stacked 24-byte aggregate is the
+// pass's copy — three `load rdx, [r12 + k]` / `store_outgoing_arg rdx @k` pairs, the
+// chunk register an allocator gives a value live from its load to its store — with
+// arg 0 in r13 and arg 1 in rcx (rcx is the register the old scratch picker chose
+// first). callconv must accept it (the verifier's stage rule holds), write the three
+// eightbytes at [sp+0, 24) from rdx and from nothing else (it adds no copy of its
+// own), and write NEITHER argument's source register anywhere between its first
+// outgoing store and the call (no argument receives the struct's bytes).
+TEST(LirCallconvAbi, SysVStackedAggregateCopyIsTheWideCallPassesAndClobbersNoArgumentSource) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     TargetSchema const& sch = **target;
@@ -6070,57 +6144,64 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
     auto const callOp = sch.opcodeByMnemonic("call");
     auto const retOp  = sch.opcodeByMnemonic("ret");
     auto const storeOpId = sch.opcodeByMnemonic("store");
+    auto const storeOutOp = sch.opcodeByMnemonic("store_outgoing_arg");
+    auto const gprLoadOp =
+        sch.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load);
     ASSERT_TRUE(callOp.has_value());
     ASSERT_TRUE(retOp.has_value());
     ASSERT_TRUE(storeOpId.has_value());
+    ASSERT_TRUE(storeOutOp.has_value());
+    ASSERT_TRUE(gprLoadOp.has_value());
 
     auto const* cc = sch.callingConvention(0);
     ASSERT_NE(cc, nullptr);
     ASSERT_EQ(cc->name, "sysv_amd64");
-    ASSERT_FALSE(cc->slotAligned);
     ASSERT_TRUE(cc->stackPointer.has_value());
-    ASSERT_TRUE(cc->variadicVectorCountReg.has_value());  // SysV rax (AL)
     std::uint16_t const spOrd = cc->stackPointer->ordinal;
 
-    // Pin the register roles the scenario depends on. r12/r13 are callee-saved (stable
-    // arg-source homes that the scratch picker WOULD pass over anyway); rcx is the
-    // critical one — it is BOTH a live arg-move source here AND the first caller-saved GPR
-    // the reverted scratch picker selects (after the rax variadic-count reg).
-    auto const rcxOrd = sch.registerByName("rcx");
-    auto const r12Ord = sch.registerByName("r12");   // carrier address reg
+    auto const rcxOrd = sch.registerByName("rcx");   // arg 1 source
+    auto const rdxOrd = sch.registerByName("rdx");   // the copy's chunk register
+    auto const r12Ord = sch.registerByName("r12");   // the aggregate's temp address
     auto const r13Ord = sch.registerByName("r13");   // arg 0 source
-    ASSERT_TRUE(rcxOrd.has_value());
-    ASSERT_TRUE(r12Ord.has_value());
-    ASSERT_TRUE(r13Ord.has_value());
+    ASSERT_TRUE(rcxOrd.has_value() && rdxOrd.has_value());
+    ASSERT_TRUE(r12Ord.has_value() && r13Ord.has_value());
     LirReg const rcx = makePhysicalReg(*rcxOrd, LirRegClass::GPR);
+    LirReg const rdx = makePhysicalReg(*rdxOrd, LirRegClass::GPR);
     LirReg const r12 = makePhysicalReg(*r12Ord, LirRegClass::GPR);
     LirReg const r13 = makePhysicalReg(*r13Ord, LirRegClass::GPR);
+    auto const chunkWidth = lirInstWidthFlagForBits(64);
+    ASSERT_TRUE(chunkWidth.has_value());
 
     LirBuilder b{sch};
     b.addFunction(SymbolId{71});
     LirBlockId const block = b.createBlock();
     b.beginBlock(block);
-    // A variadic call:
-    //   call <sym>, r13, rcx, r12, byval#24
-    //     arg 0 (fixed)  src = r13          -> dest argGprs[0] = rdi  : mov rdi, r13
-    //     arg 1 (vararg) src = rcx          -> dest argGprs[1] = rsi  : mov rsi, rcx
-    //     arg 2 (vararg) = (r12, byval#24)  -> 24B by-value-stack carrier, byte-copied
-    //                                          from [r12] into the outgoing area
-    // fixedOperandCount = 1 (only arg 0 is a named param). The carrier address r12 and the
-    // arg sources {r13, rcx} are all distinct; the arg-moves {rdi<-r13, rsi<-rcx} form no
-    // cycle (no source equals a dest), so materialization emits them in order.
+    for (std::int32_t off = 0; off < 24; off += 8) {
+        std::array<LirOperand, 3> const ld{LirOperand::makeReg(r12),
+                                           LirOperand::makeMemBase(1),
+                                           LirOperand::makeMemOffset(off)};
+        b.addInst(*gprLoadOp, rdx, ld, /*payload=*/0, *chunkWidth);
+        std::array<LirOperand, 1> const so{LirOperand::makeReg(rdx)};
+        b.addInst(*storeOutOp, InvalidLirReg, so,
+                  static_cast<std::uint32_t>(off), *chunkWidth);
+    }
+    // The shrunken, placed variadic Call: arg 0 (fixed) = r13, arg 1 (vararg) = rcx.
     std::uint32_t const variadicPayload =
         call_payload::encode(/*isVariadic=*/true, /*fixedOperandCount=*/1u);
-    std::array<LirOperand, 5> callOps{
+    std::array<LirOperand, 3> callOps{
         LirOperand::makeSymbolRef(13),
         LirOperand::makeReg(r13),
         LirOperand::makeReg(rcx),
-        LirOperand::makeReg(r12),
-        LirOperand::makeByValueStackAgg(24),
     };
-    b.addInst(*callOp, InvalidLirReg, callOps, variadicPayload);
+    b.addInst(*callOp, InvalidLirReg, callOps, variadicPayload,
+              kLirInstFlagOutgoingArgsPlaced);
     b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
     Lir lir = std::move(b).finish();
+
+    DiagnosticReporter verifyRep;
+    EXPECT_TRUE(verifyLirPostRegalloc(lir, sch, verifyRep))
+        << "the post-pass form must satisfy the carrier's stage rule: "
+        << (verifyRep.all().empty() ? "" : verifyRep.all()[0].actual);
 
     LirAllocation alloc;
     alloc.perFunc.emplace_back();
@@ -6132,56 +6213,55 @@ TEST(LirCallconvAbi, SysVByValueStackAggByteCopyScratchAvoidsArgMoveSources) {
     DiagnosticReporter ccRep;
     auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
     ASSERT_TRUE(result.ok())
-        << "the by-value-stack carrier must materialize cleanly: "
+        << "the post-pass aggregate copy must materialize cleanly: "
         << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
     EXPECT_EQ(ccRep.errorCount(), 0u);
 
-    // The byte-copy scratch is the VALUE register of each SP-relative store into the
-    // outgoing area [sp+0, 24). store layout: [value_reg, base_reg, MemBase, MemOffset].
-    // (The carrier pins above already prove a 24B carrier emits exactly these SP stores.)
+    // Walk the caller in order: the outgoing-area stores [sp+0, 24) and their value
+    // registers, and every register an instruction WRITES from the first such store
+    // up to the call. store layout: [value_reg, base_reg, MemBase, MemOffset].
     LirFuncId const fn = result.lir.funcAt(0);
     Lir const& out = result.lir;
-    std::unordered_set<std::uint16_t> scratchOrds;
-    for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn); ++bi) {
+    std::vector<std::int32_t> outgoingOffsets;
+    std::unordered_set<std::uint16_t> outgoingValueOrds;
+    std::unordered_set<std::uint16_t> writtenBeforeTheCall;
+    bool inArgSetup = false;
+    bool sawCall = false;
+    for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn) && !sawCall; ++bi) {
         LirBlockId const blk = out.funcBlockAt(fn, bi);
         for (std::uint32_t i = 0; i < out.blockInstCount(blk); ++i) {
             LirInstId const inst = out.blockInstAt(blk, i);
-            if (out.instOpcode(inst) != *storeOpId) continue;
+            std::uint16_t const op = out.instOpcode(inst);
+            if (op == *callOp) { sawCall = true; break; }
             auto const ops = out.instOperands(inst);
-            if (ops.size() == 4
+            if (op == *storeOpId && ops.size() == 4
                 && ops[0].kind == LirOperandKind::Reg && ops[0].reg.isPhysical != 0
                 && ops[1].kind == LirOperandKind::Reg && ops[1].reg.isPhysical != 0
                 && ops[1].reg.id == spOrd
                 && ops[3].kind == LirOperandKind::MemOffset
-                && ops[3].offset >= 0 && ops[3].offset < 24)
-                scratchOrds.insert(ops[0].reg.id);
+                && ops[3].offset >= 0 && ops[3].offset < 24) {
+                outgoingOffsets.push_back(ops[3].offset);
+                outgoingValueOrds.insert(ops[0].reg.id);
+                inArgSetup = true;
+            }
+            LirReg const res = out.instResult(inst);
+            if (inArgSetup && res.valid() && res.isPhysical != 0)
+                writtenBeforeTheCall.insert(res.id);
         }
     }
-    ASSERT_FALSE(scratchOrds.empty())
-        << "precondition: the 24B struct carrier must byte-copy into [sp+0,24) — the "
-           "scratch value-reg is read from those SP stores (else the pin is vacuous)";
-
-    // The arg-move SOURCE set: rcx (arg 1) and r13 (arg 0) are the registers the arg-
-    // passing moves READ after the byte-copy. We assert against rcx by name (the one the
-    // reverted scratch picker collides with) plus the structural source set for breadth.
-    std::unordered_set<std::uint16_t> argMoveSrcOrds{*rcxOrd, *r13Ord};
-
-    // THE LOAD-BEARING ASSERTION (red-on-disable): the byte-copy scratch must NOT be a
-    // source of any arg-passing move. Reverting the liveArgSrc avoid-set lands the scratch
-    // on rcx (arg 1's source) → the byte-copy clobbers it before `mov rsi, rcx` reads it:
-    // the silent arg-clobber miscompile.
-    for (std::uint16_t const ord : scratchOrds) {
-        EXPECT_FALSE(argMoveSrcOrds.contains(ord))
-            << "the by-value-stack byte-copy scratch must not be a SOURCE of any arg-"
-               "passing move — the copy clobbers it before the arg-move reads it, so that "
-               "outgoing scalar arg silently receives the struct's bytes "
-               "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)";
-    }
-    // Specifically: rcx (the reverted picker's first choice + arg 1's source) must have
-    // been rejected in favor of a non-source scratch.
-    EXPECT_EQ(scratchOrds.count(*rcxOrd), 0u)
-        << "the scratch must not be rcx — rcx is arg 1's live source; choosing it (the "
-           "reverted behavior) corrupts the rsi argument with the struct's bytes";
+    ASSERT_TRUE(sawCall) << "the caller must still make its call";
+    EXPECT_EQ(outgoingOffsets, (std::vector<std::int32_t>{0, 8, 16}))
+        << "the three eightbytes are written once each, at the offsets the wide-call "
+           "pass placed them at — callconv places and copies nothing of its own";
+    EXPECT_EQ(outgoingValueOrds, (std::unordered_set<std::uint16_t>{*rdxOrd}))
+        << "every outgoing eightbyte comes from the copy's own chunk register; another "
+           "value register means callconv made a copy of its own through a scratch";
+    EXPECT_FALSE(writtenBeforeTheCall.contains(*rcxOrd))
+        << "rcx is arg 1's source: written between the outgoing stores and the call, "
+           "the rsi argument receives something else (the silent arg-clobber)";
+    EXPECT_FALSE(writtenBeforeTheCall.contains(*r13Ord))
+        << "r13 is arg 0's source: written between the outgoing stores and the call, "
+           "the rdi argument receives something else";
 }
 
 // D-FC12C-AAPCS64-HFA-STRUCT-VARARG (Step 5.1, LIR) — an HFA `{double,double}` vararg
@@ -6259,7 +6339,8 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
     // The CALLER `use` is declared FIRST (function index 0 for the layout query);
     // `sink` is DEFINED after via a forward reference that merges with the leading
     // prototype (D-CSUBSET-FN-PROTOTYPE) — a real defined function so the call binds.
-    auto bundle = lowerThroughRewrite(
+    // The pipeline's order: the carrier lives only until the wide-call pass.
+    auto bundle = lowerThroughWideCallArgsAndRewrite(
         "struct LL { long a; long b; };\n"
         "long sink(int n, ...);\n"                     // forward prototype (merges below)
         "long use(void) {\n"                            // the caller — function 0
@@ -6271,6 +6352,7 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VarArgNonHfaStructStackAfterExhaustion) {
     ASSERT_TRUE(bundle.lowered.lir.ok)
         << (bundle.lowered.lirReporter.all().empty()
                 ? "" : bundle.lowered.lirReporter.all()[0].actual);
+    ASSERT_TRUE(bundle.wide.ok);
     ASSERT_TRUE(bundle.alloc.ok());
     ASSERT_TRUE(bundle.rewritten.ok);
 

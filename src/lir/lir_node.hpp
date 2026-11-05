@@ -344,18 +344,15 @@ enum class LirOperandKind : std::uint8_t {
     // outgoing-argument area (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES)
     // — is the form that pass USED to leave on the Call for `lir_callconv` to
     // copy after allocation. No pass produces it any more, and
-    // `lowerWideCallArgs` refuses an input that states one. Both forms are
-    // still ACCEPTED by the consumers a hand-built module reaches without that
-    // pass (tests/lir, tests/asm): register allocation and the rewrite (the Reg
-    // is an ordinary use, the descriptors are skipped), the text form, the
-    // verifier, and `lir_callconv`, which copies a triple at its stated offset,
-    // places a pair itself on a Call NOT stamped
-    // `kLirInstFlagOutgoingArgsPlaced`, and REFUSES a pair on a stamped one —
-    // re-placing it from a second cursor, over a list the first pass had
-    // already shortened, is the silent miscompile that row records. Dropping
-    // those arms together, with the verifier stating the stage invariant, is
-    // owned by
-    // D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
+    // `lowerWideCallArgs` refuses an input that states one.
+    //
+    // ★ THE STAGE RULE (P69, lane `cs`, fold f26c): neither form survives
+    // `lowerWideCallArgs`. The LIR verifier states it —
+    // `verifyLirStackedAggregatesLowered`, run by that pass on its own output
+    // and inside `verifyLirPostRegalloc` — so the allocator, the rewrite and
+    // `lir_callconv` hold no arm for the form. Its only readers are that pass
+    // and the text codec, which writes and reads every datum of the marker
+    // (size, alignment, exhaust class) for a pre-pass module.
     //
     // ⚠ The trailing `MemOffset` is NOT an addressing mode. It is the same
     // "spread a wide descriptor across uniform 8-byte pool slots" convention the
@@ -587,32 +584,44 @@ struct LirOperand {
     // 1 GPR, 2 FPR) — SysV passes 0, AAPCS64 passes the straddling aggregate's class.
     //
     // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: `align` is the carried datum's OWN
-    // byte alignment, or 0 = NOT STATED. It rides `argNaturalBytes`, the padding
-    // byte a `Reg` operand uses for its natural size and which a `ByValueStackAgg`
-    // has always left at 0 — the same per-kind repurposing `byValueAggExhaust` and
-    // `spillSlotClass` already do, so `LirOperand` stays 8 bytes (asserted above).
+    // byte alignment — a power of two — or 0 = NOT STATED. It rides
+    // `argNaturalBytes`, the padding byte a `Reg` operand uses for its natural size
+    // and which a `ByValueStackAgg` has always left at 0 — the same per-kind
+    // repurposing `byValueAggExhaust` and `spillSlotClass` already do, so
+    // `LirOperand` stays 8 bytes (asserted above).
+    // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // the byte holds the alignment's LOG2 + 1 (0 = not stated), so every power of
+    // two an aggregate can request survives — an aggregate's own alignment now
+    // reaches the marker (the MIR carrier's `payload2`), and `_Alignas(256)` would
+    // not fit the byte as a byte count. An `align` that is no power of two is
+    // encoded NOT STATED, and none reaches here: the MIR verifier refuses a
+    // `ByValueStackArg` whose `payload2` is neither 0 nor a power of two.
     // ⚠ 0 IS A REAL ANSWER, NOT A FAILURE: the cursor floors an unstated alignment
     // at the slot, which is the classic flat stride, so a producer that cannot
     // compute an alignment gets exactly the pre-existing placement rather than a
     // guess. What it may NOT do is state a WRONG one — see
-    // `MirToLir::byValueCarrierAlignment`, which fails loud rather than guessing
-    // for a datum whose alignment it cannot derive AND whose CC would honour it.
+    // `MirToLir::byValueCarrierAlignment`.
     [[nodiscard]] static constexpr LirOperand
     makeByValueStackAgg(std::uint32_t bytes, std::uint8_t exhaust = 0,
-                        std::uint8_t align = 0) noexcept {
+                        std::uint32_t align = 0) noexcept {
         LirOperand o{};
         o.kind             = LirOperandKind::ByValueStackAgg;
         o.byValueAggExhaust = exhaust;
-        o.argNaturalBytes  = align;
+        std::uint8_t log2PlusOne = 0;
+        if (align != 0 && (align & (align - 1u)) == 0) {
+            log2PlusOne = 1;
+            for (std::uint32_t a = align; a > 1u; a >>= 1u) ++log2PlusOne;
+        }
+        o.argNaturalBytes  = log2PlusOne;
         o.byValueAggBytes  = bytes;
         return o;
     }
     // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the carried datum's own alignment
-    // (0 = not stated). Named so no walk reads `argNaturalBytes` off a marker and
-    // has to remember what that byte means on THIS kind.
+    // in bytes (0 = not stated). Named so no walk reads `argNaturalBytes` off a
+    // marker and has to remember what that byte means on THIS kind (its log2 + 1).
     [[nodiscard]] constexpr std::uint32_t byValueAggAlign() const noexcept {
-        return kind == LirOperandKind::ByValueStackAgg
-                   ? static_cast<std::uint32_t>(argNaturalBytes) : 0u;
+        if (kind != LirOperandKind::ByValueStackAgg || argNaturalBytes == 0) return 0u;
+        return argNaturalBytes > 32u ? 0u : (1u << (argNaturalBytes - 1u));
     }
     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a spilled register-passed call-arg
     // reference — its stack slot (`slotV` = LirSpillSlot.v) + its register class
@@ -631,19 +640,17 @@ struct LirOperand {
 static_assert(sizeof(LirOperand) == 8, "LirOperand POD must stay 8 bytes");
 static_assert(std::is_trivially_copyable_v<LirOperand>);
 
-// ── THE BY-VALUE STACKED-AGGREGATE CARRIER, AS ONE SHAPE INSTEAD OF FOUR ─────
+// ── THE BY-VALUE STACKED-AGGREGATE CARRIER, AS ONE SHAPE ────────────────────
 //
 // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES.
 //
-// FOUR walks over a Call's argument list have to agree on where a carrier
-// begins, which of its operands are DESCRIPTIVE (consumed with the carrier and
-// never an argument position of their own), and where it was placed:
-// `lir_wide_call_args::lowerOneFunc`, `lir_callconv::computeMaxOutgoingStackArgs`,
-// `lir_callconv::materializeOneFunc`'s call arm, and
-// `lir_rewrite::classifyCallRegArgs`. Each of them used to spell the lookahead
-// out by hand — the same "a promise four copies keep" shape that
-// `ArgCursors` and `StackArgCursor` were minted to end on the register and byte
-// axes. So the shape is stated ONCE, here, beside the operand kind it is about.
+// Four walks over a Call's argument list once had to agree, each by its own
+// hand-spelled lookahead, on where a carrier begins, which of its operands are
+// DESCRIPTIVE (consumed with the carrier and never an argument position of
+// their own), and where it was placed. Since the carrier's stage rule (the LIR
+// verifier's `verifyLirStackedAggregatesLowered`) only the pass that removes
+// the carrier reads it — `lir_wide_call_args::lowerOneFunc` — and the shape is
+// still stated ONCE, here, beside the operand kind it is about.
 
 // True iff `ops[k]` is the Reg that CARRIES a by-value stacked aggregate — i.e.
 // it is immediately followed by the `ByValueStackAgg` marker describing it.
@@ -677,14 +684,6 @@ lirByValueStackAggPlacedOffset(std::span<LirOperand const> ops,
     if ((k + 2) < ops.size() && ops[k + 2].kind == LirOperandKind::MemOffset)
         return ops[k + 2].offset;
     return std::nullopt;
-}
-
-// How many operands the carrier at `k` occupies: 2 unplaced, 3 placed.
-// Precondition: `lirIsByValueStackAggCarrier(ops, k)`.
-[[nodiscard]] constexpr std::size_t
-lirByValueStackAggCarrierOperands(std::span<LirOperand const> ops,
-                                  std::size_t k) noexcept {
-    return lirByValueStackAggPlacedOffset(ops, k).has_value() ? 3u : 2u;
 }
 
 // ── per-INSTRUCTION register-constraint pool ─────────────────────

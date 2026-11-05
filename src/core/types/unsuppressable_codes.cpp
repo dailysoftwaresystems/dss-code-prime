@@ -470,8 +470,8 @@ constexpr MembershipReason kWhyInlineAsmLabelSection{
     "which operand role becomes a guess"};
 constexpr MembershipReason kWhyVlaNonLeafFrame{
     MembershipProng::WrongArtifactShipsGreen,
-    "silenced, a non-leaf VLA frame places outgoing call arguments inside "
-    "the VLA region, an ABI break"};
+    "silenced, a frame whose stack pointer moved at run time addresses its "
+    "fixed slots off that stack pointer, a stack miscompile"};
 constexpr MembershipReason kWhyRegallocInvariant{
     MembershipProng::WrongArtifactShipsGreen,
     "a register-allocation calling-convention / class invariant; "
@@ -1523,10 +1523,11 @@ constexpr std::array<UnsuppressableEntry, 203> kUnsuppressableCodes{{
     // slot path and silently emit a `lea` of a 1-slot scalar for the whole VLA — a
     // stack miscompile (MINOR-3). Same load-bearing-boundary class as the L_ band.
     {DiagnosticCode::L_VlaDynamicAllocaUnsupported, kWhyVlaDynamicAlloca},
-    // L_VlaNonLeafFrameUnsupported (VLA C1b LEAF gate, D-CSUBSET-VLA-NONLEAF-CALL-FRAME):
-    // a VLA function that ALSO calls / uses va_start. A member: suppressed, a non-leaf
-    // VLA would place outgoing call args INSIDE the VLA region under the moved SP (an
-    // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
+    // L_VlaNonLeafFrameUnsupported (born as the VLA C1b LEAF gate): a frame whose SP
+    // moves at run time with a fixed-frame reference left SP-relative (the frame-base
+    // verifier), or that is a SEH `__try` parent. A member: suppressed, the function
+    // addresses its frame off a stack pointer that moved — a silent stack miscompile.
+    // Same load-bearing-boundary class.
     {DiagnosticCode::L_VlaNonLeafFrameUnsupported, kWhyVlaNonLeafFrame},
     {DiagnosticCode::L_TerminatorSuccessorMismatch, kWhyTerminatorSuccessors},
 

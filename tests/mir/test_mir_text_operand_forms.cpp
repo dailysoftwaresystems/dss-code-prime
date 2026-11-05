@@ -268,6 +268,59 @@ TEST(MirTextOperandForms, ByValueStackArgCarriesSizeAndExhaustClass) {
         << rt.secondEmit;
 }
 
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// the two secondary payloads the fold adds round-trip by name. A `byvaluestackarg`
+// carrying an AGGREGATE states its own alignment (`align=16`, the one spelling of an
+// instruction's secondary payload); a `recvbyvaluestackparam` states its call-operand
+// POSITION (`position 2`, stored as 3) — no alignment, so the generic arm's `align=3`
+// would have been refused by its own reader. And a carrier whose alignment is no
+// power of two is refused by the reader, naming the instruction.
+TEST(MirTextOperandForms, AStackCarrierAndAStackReceptionRoundTripTheirSecondaryPayloads) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
+    TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+
+    MirBuilder b;
+    b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const home = b.addConst(i32Lit(0), i32);
+    std::array<MirInstId, 1> carrier{home};
+    (void)b.addInst(MirOpcode::ByValueStackArg, carrier, vptr, /*payload=*/std::uint32_t{32},
+                    MirInstFlags::None, /*payload2=*/16);
+    (void)b.addInst(MirOpcode::RecvByValueStackParam, {}, vptr, /*payload=*/16,
+                    MirInstFlags::None, /*payload2=*/3);
+    (void)b.addInst(MirOpcode::RecvByValueStackParam, {}, vptr, /*payload=*/0,
+                    MirInstFlags::None, /*payload2=*/1);
+    b.addReturn(home);
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "bv"};
+    RoundTrip const rt = roundTrip(m, ti, names);
+    EXPECT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    EXPECT_NE(rt.secondEmit.find("size 32 exhaust none align=16"), std::string::npos)
+        << rt.secondEmit;
+    EXPECT_NE(rt.secondEmit.find("payload 16 position 2"), std::string::npos) << rt.secondEmit;
+    EXPECT_NE(rt.secondEmit.find("position 0"), std::string::npos) << rt.secondEmit;
+    EXPECT_EQ(rt.secondEmit.find("align=3"), std::string::npos)
+        << "a position is never spelled as an alignment: " << rt.secondEmit;
+
+    // The reader refuses a carrier alignment that is no power of two.
+    std::string bad = rt.firstEmit;
+    auto const at = bad.find("align=16");
+    ASSERT_NE(at, std::string::npos);
+    bad.replace(at, 8, "align=12");
+    DiagnosticReporter rep;
+    auto const parsed = parseMir(bad, CompilationUnitId{1}, rep);
+    EXPECT_FALSE(parsed->ok);
+    bool named = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("byvaluestackarg alignment 12") != std::string::npos) named = true;
+    EXPECT_TRUE(named) << "the refusal names the instruction and the value";
+}
+
 // ── the same class in the TYPE grammar, found while fixing the above ────────
 //
 // `appendType` and `parseType` are the other write-then-read pair in this file,

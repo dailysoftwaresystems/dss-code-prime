@@ -599,13 +599,14 @@ TEST(AttributeTypePositions, DeclaratorABadAlignmentOperandBesideTheNameIsRefuse
 
 TEST(AttributeTypePositions, AnAttributeThatChangesTheTypeAndCannotBeHonouredIsRefusedByName) {
     // Was: a warning that the name was unknown, and `sizeof(v4)` 4 where every
-    // reference gives 16.
+    // reference gives 16. (P69, fold f26c: `int x __attribute__((mode(DI)));` left
+    // this list — machine modes are implemented, and their pins and refusals are
+    // test_machine_mode_attribute.cpp's.)
     for (char const* src : {
              "typedef int v4 __attribute__((vector_size(16)));\n",
              "int __attribute__((vector_size(16))) g;\n",
              "char a[sizeof(__attribute__((vector_size(16))) int)];\n",
-             "int * __attribute__((vector_size(16))) p;\n",
-             "int x __attribute__((mode(DI)));\n" }) {
+             "int * __attribute__((vector_size(16))) p;\n" }) {
         auto m = analyzeC({ src });
         EXPECT_TRUE(m.hasErrors()) << src;
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u)
@@ -630,7 +631,8 @@ TEST(AttributeTypePositions, ACallingConventionNameWithNoPairInScopeIsRefusedByN
 //              a per-function convention is not something this compiler emits;
 //   UNKNOWN  — no id is known to the target at all: an unknown word, warned
 //              (`aarch64_vector_pcs` on x86-64, where every reference ignores it).
-// The whole matrix, seven names on the four shipped pairs.
+// The whole matrix, seven names on the five shipped pairs (Mach-O x86_64's `sysv_amd64_darwin`, Apple's
+// realization of SysV, answers as Linux's SysV does: P69 lane `cs`, fold f26c, main's ledger 454).
 //
 // RED-ON-DISABLE, one per answer: drop the "is the active convention" test and
 // every ACTIVE cell is refused; drop the foreign refusal and every FOREIGN cell is
@@ -643,28 +645,29 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
         char const*      convention;
         ObjectFormatKind format;
     };
-    constexpr Pair kPairs[4] = {
+    constexpr Pair kPairs[5] = {
         {"x86_64", "sysv_amd64", ObjectFormatKind::Elf},
+        {"x86_64", "sysv_amd64_darwin", ObjectFormatKind::MachO},
         {"x86_64", "ms_x64", ObjectFormatKind::Pe},
         {"arm64", "aapcs64", ObjectFormatKind::Elf},
         {"arm64", "apple_arm64", ObjectFormatKind::MachO}};
     struct Name {
         char const* name;
-        Answer      on[4];   // one per pair, in `kPairs` order
+        Answer      on[5];   // one per pair, in `kPairs` order
     };
     constexpr Answer A = Answer::Active;
     constexpr Answer F = Answer::Foreign;
     constexpr Answer U = Answer::Unknown;
     constexpr Name kNames[7] = {
-        {"ms_abi", {F, A, F, F}},
-        {"sysv_abi", {A, F, U, U}},
-        {"vectorcall", {F, F, U, U}},
-        {"regcall", {F, F, U, U}},
-        {"preserve_most", {F, F, F, F}},
-        {"preserve_all", {F, F, F, F}},
-        {"aarch64_vector_pcs", {U, U, F, F}}};
+        {"ms_abi", {F, F, A, F, F}},
+        {"sysv_abi", {A, A, F, U, U}},
+        {"vectorcall", {F, F, F, U, U}},
+        {"regcall", {F, F, F, U, U}},
+        {"preserve_most", {F, F, F, F, F}},
+        {"preserve_all", {F, F, F, F, F}},
+        {"aarch64_vector_pcs", {U, U, U, F, F}}};
     std::size_t seen[3] = {0, 0, 0};
-    for (std::size_t p = 0; p < 4; ++p) {
+    for (std::size_t p = 0; p < 5; ++p) {
         auto const target = TargetSchema::loadShipped(kPairs[p].target);
         ASSERT_TRUE(target.has_value()) << kPairs[p].target;
         ASSERT_NE((*target)->callingConventionByName(kPairs[p].convention), nullptr)
@@ -720,9 +723,9 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
         }
     }
     // The matrix exercises every answer (a table that lost one would still pass).
-    EXPECT_EQ(seen[static_cast<std::size_t>(A)], 2u);
-    EXPECT_EQ(seen[static_cast<std::size_t>(F)], 18u);
-    EXPECT_EQ(seen[static_cast<std::size_t>(U)], 8u);
+    EXPECT_EQ(seen[static_cast<std::size_t>(A)], 3u);
+    EXPECT_EQ(seen[static_cast<std::size_t>(F)], 23u);
+    EXPECT_EQ(seen[static_cast<std::size_t>(U)], 9u);
 }
 
 // A CONVENTION ID OF THE LANGUAGE'S TABLE THAT NO SHIPPED TARGET KNOWS would select

@@ -2803,3 +2803,39 @@ TEST(MirVerifierVerdict, ACleanModuleVerifiedTwiceIntoOneReporterPassesBothTimes
     EXPECT_TRUE(verifier.verify(shared));
     EXPECT_EQ(shared.errorCount(), 0u);
 }
+
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// a stack carrier's secondary payload is the carried aggregate's OWN alignment, which the outgoing cursor rounds
+// to — 0 (not stated) or an alignment the `Alignment` type holds. 12 is refused by name (a garbled alignment would
+// place the aggregate where the callee does not read it, in silence); 16 and 0 are not.
+TEST(MirVerifier, AStackCarrierWhoseAlignmentIsNoPowerOfTwoIsRefused) {
+    for (std::uint32_t const align : {12u, 16u, 0u}) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i64   = interner.primitive(TypeKind::I64);
+        TypeId const ptr   = interner.pointer(i64);
+        TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                            CallConv::CcSysV);
+        MirBuilder b;
+        (void)b.addFunction(fnSig, SymbolId{1});
+        MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(entry);
+        MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, ptr, /*payload=*/24,
+                                         MirInstFlags::None, /*payload2=*/0);
+        std::array<MirInstId, 1> const carrierOps{slot};
+        (void)b.addInst(MirOpcode::ByValueStackArg, carrierOps, ptr, /*payload=*/24,
+                        MirInstFlags::None, /*payload2=*/align);
+        b.addReturn();
+        Mir m = std::move(b).finish();
+
+        DiagnosticReporter r;
+        MirVerifier v{m, &interner};
+        (void)v.verify(r);
+        bool const said = saidThat(r, "byvaluestackarg alignment payload " + std::to_string(align)
+                                          + " is not a power of two");
+        if (align == 12u) {
+            EXPECT_TRUE(said) << "an alignment of 12 must be refused by name";
+        } else {
+            EXPECT_FALSE(said) << "alignment " << align << " is legal and must not be refused";
+        }
+    }
+}

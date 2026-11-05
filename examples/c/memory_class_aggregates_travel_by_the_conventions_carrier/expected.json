@@ -1,0 +1,16 @@
+{
+  "$comment": "A MEMORY-CLASS AGGREGATE ARGUMENT TRAVELS BY ITS CALLING CONVENTION'S CARRIER, AND AN X87-CLASS RESULT COMES BACK AS A SCALAR LONG DOUBLE (P69 round 1, lane cs, fold f26c, D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET). x86_64 SysV (`aggregateMemoryArgument: stack`, psABI 3.2.3) passes a struct over 16 bytes as its bytes on the stack at its own alignment, consuming no register, and returns `struct { long double x; }` (and a union of two long doubles) in st0; Win64 and AAPCS64 (`callerCopy`) pass a pointer to a caller copy. DSS calls DSS here, so the program returns 42 only if the caller's placement and the callee's reception agree on every shape: a 24-byte struct then a register `long`, the struct between register arguments of both classes, the x87 struct returned and passed, a 16-aligned struct after one stacked eightbyte (+16, not +8), a 32-aligned member, a variadic fixed struct parameter and a struct read by va_arg. The cross-compiler half (DSS against gcc and clang objects, both directions) is pinned by the native two-unit cells in tests/link. The release arm inlines the inlinable callees: the inliner maps a stacked reception to the caller's carrier, so the spliced bodies must read the same values. Each return before 42 names the first fact that failed.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

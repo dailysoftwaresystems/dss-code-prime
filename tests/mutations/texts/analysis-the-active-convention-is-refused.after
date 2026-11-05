@@ -1,2 +1,2 @@
-            if (std::ranges::find(row->conventions, active)
-                != row->conventions.end() && false) {
+                    return s.target->callingConventionIsOrDerivesFrom(active, id);
+                }) && false) {

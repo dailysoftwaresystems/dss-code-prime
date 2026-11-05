@@ -817,6 +817,41 @@ TEST(AttributeSecondSpelling, DllimportOnADefinitionIsRefusedByName) {
     }
 }
 
+// ★★ P69 (lane `cs`, fold f26c — the review of fold f26b, F4): `dllimport` ON AN INLINE FUNCTION
+// DEFINITION is IGNORED and said (the row's `ignoredOnInlineDefinition`), never refused: the definition
+// keeps its inline meaning. ✔MEASURED (lane `cs` probe dl, every cell RUN; mingw-w64 gcc 13.2.0 -O0 and
+// -O2, cl 19.51 /Od and /O2): gcc warns "inline function declared as dllimport: attribute ignored" and
+// builds `__inline`, `inline`, `extern inline` and gnu_inline definitions (42 wherever the body is
+// expanded or the unit provides the external definition); cl accepts each and runs 42 at /O2. Fold f26b
+// refused every one ("this declaration defines"). CONTROL: a non-inline definition stays refused.
+//
+// RED-ON-DISABLE: drop the row's `ignoredOnInlineDefinition`, or the gate's reading of it, and each
+// inline definition is refused again.
+TEST(AttributeSecondSpelling, DllimportOnAnInlineDefinitionIsIgnoredAndSaid) {
+    for (char const* src : {
+             "__declspec(dllimport) __inline int twice(int v) { return 2 * v; }\n"
+             "int main(void) { return twice(21); }\n",
+             "__declspec(dllimport) inline int twice(int v) { return 2 * v; }\n"
+             "int main(void) { return twice(21); }\n",
+             "__declspec(dllimport) extern inline int twice(int v) { return 2 * v; }\n"
+             "int main(void) { return twice(21); }\n",
+         }) {
+        auto m = analyzePe({src});
+        EXPECT_FALSE(m.hasErrors()) << src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                              "'twice' is an inline definition, and the body it gives is this unit's own"),
+                  1u)
+            << src << everyDiagnostic(m);
+        EXPECT_EQ(m.diagnostics().all().size(), 1u) << src << everyDiagnostic(m);
+    }
+    auto control = analyzePe({"__declspec(dllimport) int twice(int v) { return 2 * v; }\n"});
+    EXPECT_TRUE(control.hasErrors()) << everyDiagnostic(control);
+    EXPECT_EQ(countSaying(control, DiagnosticCode::S_AttributeNotHonoured,
+                          "cannot be honoured: this declaration defines"),
+              1u)
+        << everyDiagnostic(control);
+}
+
 // `selectany` ON AN ALIAS is ignored and said (the row's `ignoredOnAlias`): an alias
 // is one more name on its target's storage, with no copy of its own for the link to
 // select, and it stays the name its own binding makes it. ✔MEASURED (lane `cs` probe
@@ -1037,10 +1072,11 @@ TEST(AttributeSecondSpelling, TheGnuSpellingOfDllimportIsAnImportOnPeAndAnUnknow
 // (`__imp___emutls_v.x`) — its own thread-storage model, not the native one this compiler
 // keeps on pe with cl — so cl's answer is taken, one rule for every spelling of the
 // storage. CONTROLS: an import after a plain `extern` or prototype holds (mingw-w64 gcc
-// imports; cl refuses — one working reference); a block import before a LATER file-scope
-// definition runs on both (the definition's value); a block-scope plain `extern` of a
-// file-scope import compiles on both (cl keeps the import, mingw-w64 gcc warns and drops
-// it; this compiler writes the plain reference either way, which the link routes).
+// imports; cl refuses — one working reference). ACCEPTED AND SAID (fold f26c: the pair is one
+// entity, so the import is decided across it): a block import before a LATER file-scope
+// definition runs on both (the definition's value; mingw-w64 gcc warns), and a block-scope
+// plain `extern` of a file-scope import compiles on both (cl keeps the import, mingw-w64 gcc
+// warns and drops it) — the import ended, warned, as mingw-w64 gcc reads it.
 //
 // RED-ON-DISABLE: drop the record-time refusal and the storage cells compile; drop the
 // merge's refusal and the file-scope redeclaration cells do; drop the block-scope check and
@@ -1086,10 +1122,6 @@ TEST(AttributeSecondSpelling, AnImportIsRefusedWhereNoOtherImageCanHoldTheDefini
                   "__declspec(dllimport) int x;\n__declspec(dllimport) int x;\n", ""},
              Case{"CONTROL: a file-scope `extern`, then a block import",
                   "extern int x;\nint g(void) { __declspec(dllimport) int x; return x; }\n", ""},
-             Case{"CONTROL: a block import, then a later definition",
-                  "int main(void) { __declspec(dllimport) int x; return x; }\nint x = 5;\n", ""},
-             Case{"CONTROL: a file-scope import, then a block-scope plain `extern`",
-                  "__declspec(dllimport) int x;\nint g(void) { extern int x; return x; }\n", ""},
          }) {
         SCOPED_TRACE(c.what);
         auto m = analyzePe({c.src});
@@ -1105,6 +1137,27 @@ TEST(AttributeSecondSpelling, AnImportIsRefusedWhereNoOtherImageCanHoldTheDefini
             << c.src << everyDiagnostic(m);
         for (SymbolRecord const* r : symsNamed(m, "x"))
             EXPECT_FALSE(r->isImportedDeclaration) << c.src << ": a refused import imports nothing";
+    }
+    // ACCEPTED AND SAID (fold f26c, the review of f26b's F2: a block declaration and a file-scope one
+    // of the name are ONE entity, so the import is decided across them as across a pair in one scope):
+    // a block import, then a later definition — ✔MEASURED (lane `cs` probe ih cell 8): mingw-w64 gcc
+    // warns "'x' redeclared without dllimport attribute after being referenced with dll linkage", cl
+    // is silent, both build it; a file-scope import, then a block-scope plain `extern` — mingw-w64 gcc
+    // warns "previous dllimport ignored" and writes `x` unimported (probe ih cell 2). The import is
+    // ended, and said once.
+    for (char const* src : {
+             "int main(void) { __declspec(dllimport) int x; return x; }\nint x = 5;\n",
+             "__declspec(dllimport) int x;\nint g(void) { extern int x; return x; }\n",
+         }) {
+        auto m = analyzePe({src});
+        EXPECT_FALSE(m.hasErrors()) << src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                              "the import on a prior declaration of 'x' is ignored"),
+                  1u)
+            << src << everyDiagnostic(m);
+        EXPECT_EQ(m.diagnostics().all().size(), 1u) << src << everyDiagnostic(m);
+        for (SymbolRecord const* r : symsNamed(m, "x"))
+            EXPECT_FALSE(r->isImportedDeclaration) << src << ": the import is ended";
     }
     // The import after a plain non-defining declaration HOLDS, on both records.
     auto held = analyzePe({"extern int x;\n__declspec(dllimport) int x;\n"});
@@ -1218,4 +1271,44 @@ TEST(AttributeSecondSpelling, AnImportedObjectsAddressIsNoAddressConstant) {
     EXPECT_FALSE(ended.hasErrors()) << everyDiagnostic(ended);
     EXPECT_EQ(countCode(ended.diagnostics(), DiagnosticCode::S_StaticInitializerNotConstant), 0u)
         << everyDiagnostic(ended);
+}
+
+// ★★ P69 (lane `cs`, fold f26c — the review of fold f26b, F2): AN IMPORT ACROSS A BLOCK DECLARATION AND
+// A FILE-SCOPE ONE OF ONE OBJECT is the ENTITY's, decided in source order. ✔MEASURED (lane `cs` probe ih,
+// object mode; mingw-w64 gcc 13.2.0 -Wall, cl 19.51 /W4): after `extern int x;`, a block's
+// `__declspec(dllimport) int x;` imports x for every later use — `static int *p = &x;` in the block,
+// after the block in its function, at file scope after the function — and mingw-w64 gcc refuses each
+// ("initializer element is not constant"), cl too (C2370); the mirror, the file-scope import then the
+// block's plain `extern int x;` with the initializer in the block, mingw-w64 gcc builds, the import
+// dropped and warned ("previous dllimport ignored"), cl refuses (C2099): one working reference, so it is
+// built. Before fold f26c the import history was keyed by the binding scope: the first four were
+// accepted as address constants and the mirror refused.
+//
+// RED-ON-DISABLE: drop the joining of the absorbed declaration's history and the refused cells are
+// accepted; drop the import's decision across the pair and the mirror is refused.
+TEST(AttributeSecondSpelling, AnImportAcrossABlockAndAFileScopeDeclarationIsTheEntitys) {
+    for (char const* src : {
+             "extern int x;\nint *g(void) { __declspec(dllimport) int x; static int *p = &x; return p; }\n",
+             "extern int x;\nint *g(void) { __declspec(dllimport) extern int x; static int *p = &x; return p; }\n",
+             "extern int x;\nvoid f(void) { __declspec(dllimport) int x; (void)x; }\nint *q = &x;\n",
+             "extern int x;\n"
+             "int *g(void) { { __declspec(dllimport) int x; (void)x; } static int *p = &x; return p; }\n",
+         }) {
+        auto m = analyzePe({src});
+        EXPECT_TRUE(m.hasErrors()) << src << everyDiagnostic(m);
+        EXPECT_EQ(countSaying(m, DiagnosticCode::S_StaticInitializerNotConstant,
+                              "which another image defines"),
+                  1u)
+            << src << everyDiagnostic(m);
+    }
+    char const* mirror =
+        "__declspec(dllimport) int x;\nint *g(void) { extern int x; static int *p = &x; return p; }\n";
+    auto m = analyzePe({mirror});
+    EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
+    EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                          "a declaration without the import ends it"),
+              1u)
+        << everyDiagnostic(m);
+    for (SymbolRecord const* r : symsNamed(m, "x"))
+        EXPECT_FALSE(r->isImportedDeclaration) << "the import is ended for the entity";
 }

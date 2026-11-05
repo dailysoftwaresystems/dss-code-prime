@@ -4,10 +4,6 @@
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
-// D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the shared by-value-stack-arg
-// exhaust-class constants (the ByValueStackAgg marker's `byValueAggExhaust` values),
-// defined at the MIR-boundary alongside the op whose payload carries them.
-#include "mir/mir_opcode.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -210,6 +206,13 @@ computeFrameLayout(LirFuncAllocation const& alloc,
                    // up to the required boundary, and to fail loud past the slot
                    // bound. Sourced from MIR (types) via SymbolId-keyed metadata.
                    std::uint32_t maxLocalAlign,
+                   // ★ P69 (lane `cs`, fold f26c, main's ledger 495): the alignment the
+                   // OUTGOING-argument area must keep in a function MIR→LIR realigned for
+                   // a stacked argument aligned past the stack (`LirFuncLocalAlignment::
+                   // stackedArgAlignBytes`; 0 = none). The dynamic frame's SP captures read
+                   // `SP + outgoingArgAreaSize`, and the realignment computes its descent
+                   // off one, so the area is a whole multiple of it.
+                   std::uint32_t outgoingAreaAlign,
                    DiagnosticReporter& reporter) {
     // ── D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING ──────
     //
@@ -289,6 +292,10 @@ computeFrameLayout(LirFuncAllocation const& alloc,
         ? (static_cast<std::uint32_t>(cc.shadowSpaceBytes)
             + outgoingArgSlots * layout.outgoingSlotSize)
         : 0u;
+    if (hasCalls && outgoingAreaAlign > 1u)
+        layout.outgoingArgAreaSize =
+            (layout.outgoingArgAreaSize + outgoingAreaAlign - 1u) / outgoingAreaAlign
+            * outgoingAreaAlign;
     layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
     // THE SAVED-REGISTER AREA'S OWN ALIGNMENT (`FrameLayout::savedRegAreaOffset`):
     // the widest save the prologue will make into it, asked of the owner the
@@ -709,16 +716,13 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 ::dss::call_payload::fixedOperandCount(payload);
 
             // Single pass over the arg operands (ops[1..]) that MIRRORS the
-            // materialize placement loop exactly. A by-value-stack aggregate is a
-            // (Reg, ByValueStackAgg) pair: the Reg is NOT a register arg (it does not
-            // consume a class pool slot) and the pair occupies ceil(bytes / slot)
-            // OVERFLOW slots UNCONDITIONALLY (FC12a-struct,
-            // D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT). `byValSlots` accumulates
-            // those; the CURSOR WALK counts only ordinary register args;
-            // `forcedVarargs` counts the always-stacked variadic region (carriers
-            // excluded — already in byValSlots). `argRegionIdx` (the materialize
-            // loop's index, advanced once per ARG-position incl. a carrier) gates
-            // the forced-vararg region.
+            // materialize placement loop exactly. ⓘ No by-value stacked-aggregate
+            // carrier reaches this walk: `lowerWideCallArgs` copied each one into
+            // its outgoing bytes — its `store_outgoing_arg` stores, counted above
+            // — and took it off the Call (the LIR verifier's stage rule,
+            // `verifyLirStackedAggregatesLowered`). The CURSOR WALK counts ordinary
+            // register args; `argRegionIdx` (the materialize loop's index,
+            // advanced once per ARG-position) gates the forced-vararg region.
             // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR:
             // the class tallies and the three overflow formulas below used to be
             // written out per class — `gprArgs`/`fprArgs`/`slotArgs` plus a
@@ -733,61 +737,14 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             // hand-summed counters (`byValSlots + forcedVarargs + regOverflow`)
             // are now ONE monotonic byte cursor — the SAME object the placement
             // loop and `lowerWideCallArgs` walk. Under a `Slot`-packing CC each
-            // item advances exactly one slot (a carrier its rounded span), so the
+            // item advances exactly one slot, so the
             // total is byte-for-byte the old sum; under a `Natural` one the sum
             // could not have been written at all, because the size of an item now
             // depends on the item.
             StackArgCursor stackCursor{cc, outgoingSlotSize};
-            // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
-            // byte past the end of the furthest STATED aggregate placement. A
-            // placed carrier does NOT advance the cursor — its offset was decided
-            // by `lowerWideCallArgs` over the complete argument list, and this
-            // walk sees the shortened one — so the reservation takes the max of
-            // what the cursor consumed and what the statements reach.
-            std::uint32_t statedEndBytes = 0;
             std::uint32_t argRegionIdx = 0;             // 0-based arg position
             for (std::size_t k = 1; k < ops.size(); ++k) {
                 LirOperand const& argOp = ops[k];
-                if (lirIsByValueStackAggDescriptor(ops, k)) {
-                    // Accounted with the preceding Reg; never a position.
-                    continue;
-                }
-                // A Reg immediately FOLLOWED by a ByValueStackAgg marker is a
-                // by-value-stack aggregate carrier (the address Reg). It occupies
-                // overflow slots, NOT a register; advance argRegionIdx (it IS an arg
-                // position for the forced-vararg boundary) but skip the class tally.
-                if (lirIsByValueStackAggCarrier(ops, k)) {
-                    std::uint32_t const aggBytes = ops[k + 1].byValueAggBytes;
-                    if (auto const placed =
-                            lirByValueStackAggPlacedOffset(ops, k)) {
-                        std::uint32_t const span =
-                            ((aggBytes + outgoingSlotSize - 1u) / outgoingSlotSize)
-                            * outgoingSlotSize;
-                        std::uint32_t const end =
-                            static_cast<std::uint32_t>(*placed) + span;
-                        if (end > statedEndBytes) statedEndBytes = end;
-                    } else {
-                        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the RESERVATION
-                        // pre-scan must consume the same pad the placement walk
-                        // inserts, or an over-aligned stacked argument is written
-                        // past the end of the area this function reserves — stack
-                        // corruption, strictly worse than the misplacement it fixes.
-                        // Same object, same carrier, same stated alignment.
-                        (void)stackCursor.placeNamedAggregate(
-                            aggBytes, ops[k + 1].byValueAggAlign());
-                    }
-                    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
-                    // EXHAUSTS the carrier's class — a later same-class arg also stacks.
-                    // PAD the class count up to its pool so the "count - pool" overflow
-                    // below counts those later args (mirrors the materialize clamp).
-                    std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
-                    if (ex == kByValueStackArgExhaustGpr)
-                        argCursors.exhaust(LirRegClass::GPR);
-                    else if (ex == kByValueStackArgExhaustFpr)
-                        argCursors.exhaust(LirRegClass::FPR);
-                    ++argRegionIdx;
-                    continue;
-                }
                 // FC12c always-stack: a vararg (arg position past the fixed ones) under
                 // such a CC is stacked regardless of class/pool. Count it as forced
                 // overflow and do NOT add it to the class tallies (it never fills a
@@ -798,7 +755,7 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                     continue;
                 }
                 // Ordinary register arg. Gate on Reg-kind only (silent-failure H1
-                // audit fold, 2026-06-02): a non-Reg/non-marker operand is a future
+                // audit fold, 2026-06-02): a non-Reg operand is a future
                 // isel bug the materialize gate reports loud — don't silently count it.
                 if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
                 // ★ ONE CURSOR WALK REPLACES THREE OVERFLOW FORMULAS. A slot
@@ -820,16 +777,10 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 ++argRegionIdx;
             }
 
-            // The cursor already accounts carriers, forced varargs and
-            // pool-overflowing register args, in placement order — plus, for a
-            // call whose placements were STATED upstream, the furthest byte any
-            // statement reaches.
-            std::uint32_t const cursorBytes = stackCursor.slotAlignedBytes();
-            std::uint32_t const endBytes =
-                std::max(cursorBytes,
-                         ((statedEndBytes + outgoingSlotSize - 1u)
-                          / outgoingSlotSize) * outgoingSlotSize);
-            std::uint32_t const overflow = endBytes / outgoingSlotSize;
+            // The cursor accounts forced varargs and pool-overflowing register
+            // args, in placement order.
+            std::uint32_t const overflow =
+                stackCursor.slotAlignedBytes() / outgoingSlotSize;
             if (overflow > maxOverflow) maxOverflow = overflow;
         }
     }
@@ -3327,8 +3278,10 @@ functionNeedsBodyFrameScratch(Lir const& src, LirFuncId fn,
 // subtracts it from rsp, for a VLA and `__builtin_alloca` both; MSVC calls
 // `__chkstk` for `_alloca` (it has no VLA). Both helpers walk the pages below SP one
 // page at a time and touch the final address. DSS emits that walk INLINE, as the
-// fixed-frame probe already does — a DSS image links neither helper (`__chkstk` is a
-// CRT object, `___chkstk_ms` is libgcc), and an inline walk needs no symbol at all.
+// fixed-frame probe already does — DSS's own code calls neither helper (`__chkstk` is a
+// CRT object, `___chkstk_ms` is libgcc); an image links them only when a foreign object
+// names them, from the shipped runtime (pe_compiler_support_x86_64.s), and an inline
+// walk needs no symbol at all.
 //
 // THE SHAPE is `___chkstk_ms`'s loop with SP itself as the pointer and the size
 // register as the counter — the descent's own two operands and nothing else (W is
@@ -3572,11 +3525,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                    // with no over-aligned local; its length MUST equal the
                    // function's alloca count (checked loud below).
                    std::span<std::uint32_t const> perAllocaAligns,
+                   // ★ P69 (fold f26c, ledger 495): the alignment MIR→LIR realigned this
+                   // function's stack pointer to for a stacked argument (0 = none); the
+                   // outgoing area is sized to a multiple of it (`computeFrameLayout`).
+                   std::uint32_t stackedArgAlign,
                    // D-CSUBSET-VLA-WIN64-UNWIND (C1b): is THIS function a SEH parent
                    // (it guards a `__try`, so it emits `.pdata`/`.xdata` unwind info)?
-                   // A VLA function's dynamic frame is NOT describable by the static
-                   // unwind info, so a VLA + SEH function fails loud (never mis-unwind).
-                   // Only ever true on PE (SEH is Windows-only), so no format branch.
+                   // A VLA + SEH function fails loud -- not because its dynamic frame is
+                   // undescribable (it is: UWOP_SET_FPREG, measured in P59), but because
+                   // its funclets' establisher frame is unwitnessed for a frame-register
+                   // parent (the gate's own comment below). Only ever true on PE (SEH is
+                   // Windows-only), so no format branch.
                    bool isSehParent,
                    // D-CSUBSET-VLA-WIN64-STACK-PROBE: receives the id of every
                    // page touch this function's guard-page walks emit — the
@@ -3703,11 +3662,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // single `if (cc.name == …)`, `if (arch == …)` or `if (format == …)`.
     //
     // ⚠ WHAT STILL REFUSES, and it is NARROWER, not re-worded: `hasVla &&
-    // usesVaStart` (below) — the va-area `lea`s are still SP-relative and the
-    // frame-base switch does not cover them — and `hasVla && isSehParent` (below).
+    // isSehParent` (below). (`hasVla && usesVaStart` refused too until P69 fold f26c;
+    // its va-area `lea`s and the variadic spill are now the frame base's, below.)
     // The frame-base VERIFIER at the end of `materializeCallingConvention` is the
-    // backstop for both: it fails loud on any SP-based frame reference outside the
-    // two zones that are legitimately SP-relative.
+    // backstop: it fails loud on any SP-based frame reference outside the two zones
+    // that are legitimately SP-relative.
     //
     // (`vlaWatermarkBias`, the value of this paragraph, is bound immediately after
     // `computeFrameLayout` below — it IS `outLayout.outgoingArgAreaSize`, which does
@@ -3830,20 +3789,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         functionUsesVaStart(src, fn, h.vaRegSaveArea, h.vaHomeArgArea,
                             h.vaOverflowArgArea)
         && cc.vaListLayout.has_value();
-    // D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate, va-arm): a VLA function that
-    // ALSO calls va_start is non-leaf-shaped — its va-area address leas are SP-
-    // relative body references that the runtime `sub sp,<vlaSize>` invalidates (and
-    // the frame-pointer switch does not cover the va-overflow area, which lives ABOVE
-    // the entry SP). Fail loud (same deferral family as the call case above).
-    if (hasVla && usesVaStart) {
-        report(reporter, DiagnosticCode::L_VlaNonLeafFrameUnsupported,
-               DiagnosticSeverity::Error,
-               std::format("a variable-length-array function (calling convention "
-                           "'{}') ALSO calls va_start — the VLA + variadic frame "
-                           "model is not built; C1b supports a LEAF non-variadic VLA "
-                           "only (D-CSUBSET-VLA-NONLEAF-CALL-FRAME)", cc.name));
-        return false;
-    }
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495): A FRAME WHOSE SP MOVES AT RUN
+    // TIME ALSO CALLS `va_start`. This was a refusal ("the VLA + variadic frame model is
+    // not built"), on the ground that the va-area address leas were SP-relative body
+    // references the runtime `sub sp` invalidates and the frame-pointer switch did not
+    // cover. Both halves are now the frame base's: the prologue spill into the save
+    // area / home space runs after the FP capture and off `frameBase`, and every
+    // `va_reg_save_area` / `va_overflow_arg_area` / `va_home_arg_area` lea is
+    // FP-relative in such a frame (the overflow area, above the entry SP, is a
+    // positive offset from the fixed-frame base like every incoming stack argument).
+    // A function realigned for an over-aligned stacked argument is such a frame, and a
+    // variadic one must work (no new refusal); a variadic function with a VLA gets the
+    // same frame. The completeness verifier below still fails loud on any fixed-frame
+    // reference left SP-based.
     // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that ALSO guards a `__try`
     // (SEH parent) still fails loud — but ⚠ NOT FOR THE REASON THIS GATE USED TO
     // GIVE, AND THE OLD REASON WAS MEASURABLY FALSE.
@@ -3908,6 +3866,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                   perAllocaAligns,
                                   vaRegSaveAreaBytes,
                                   maxLocalAlign,
+                                  stackedArgAlign,
                                   reporter);
     };
     auto layoutOpt = layoutFor(usedSaved);
@@ -4167,16 +4126,6 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                          h.stackProbe, boundaryCtx, outCfiFn.ops, reporter,
                          prologueOk);
             if (!prologueOk) return false;
-            // FC12a/b/c: a function that calls va_start spills its arg registers
-            // immediately after the prologue's SP-adjust + saved-reg stores (so the
-            // save-area / home space, addressed by va_start, points at live values).
-            // The spill is strategy-dispatched (SysV register-save / Win64 home /
-            // AAPCS64 GR+VR save / Apple no-op); straight-line stores — no CFG.
-            if (usesVaStart
-                && !emitVariadicPrologueSpill(b, outLayout, schema, cc, sp,
-                                              h.add,
-                                              boundaryCtx, reporter))
-                return false;
             // D-CSUBSET-VLA CRITICAL-3 (C1b): the frame-pointer setup goes AFTER the
             // prologue's `sub sp,F` + saved-reg stores (incl. the caller's rbp/x29
             // via CRITICAL-2). At THIS point SP == the fixed-frame base FB (no VLA
@@ -4203,6 +4152,22 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                              CfiOpKind::DefCfaRegister,
                              CfiRegRef::physical(fp.id), CfiRegRef{}, 0});
             }
+            // FC12a/b/c: a function that calls va_start spills its arg registers
+            // immediately after the prologue's SP-adjust + saved-reg stores (so the
+            // save-area / home space, addressed by va_start, points at live values).
+            // The spill is strategy-dispatched (SysV register-save / Win64 home /
+            // AAPCS64 GR+VR save / Apple no-op); straight-line stores — no CFG.
+            // ★ P69 (lane `cs`, fold f26c, main's ledger 495): AFTER the frame-
+            // pointer capture above and off `frameBase` -- the save area and the home
+            // space are FIXED-frame zones, and in a frame whose SP moves at run time
+            // (a VLA, a realignment for a stacked argument) every fixed-frame
+            // reference is FP's (the completeness verifier holds every one to it).
+            // SP == FP == the fixed-frame base here, so the bytes are the same.
+            if (usesVaStart
+                && !emitVariadicPrologueSpill(b, outLayout, schema, cc, frameBase,
+                                              h.add,
+                                              boundaryCtx, reporter))
+                return false;
             // Everything emitted above is prologue. Recorded HERE, where the
             // fact is known, rather than reconstructed by a consumer.
             outCfiFn.prologueOpCount =
@@ -4713,7 +4678,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                            "+ a physical-reg result (D-FC12A-VARIADIC-CALLEE)");
                     return false;
                 }
-                emitFrameAddr(b, h.lea, result, sp,
+                // ★ P69 (fold f26c, ledger 495): a FIXED-frame address, so off
+                // `frameBase` -- FP in a frame whose SP moves at run time (a VLA, or a
+                // realignment for a stacked argument), SP otherwise (byte-identical).
+                emitFrameAddr(b, h.lea, result, frameBase,
                               static_cast<std::int32_t>(outLayout.vaRegSaveAreaOffset()));
                 continue;
             }
@@ -4748,7 +4716,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     + static_cast<std::uint32_t>(cc.callPushBytes)
                     + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
                     + fixedStackBytes);
-                emitFrameAddr(b, h.lea, result, sp, ovfOffset);
+                emitFrameAddr(b, h.lea, result, frameBase, ovfOffset);   // ★ P69: as above
                 continue;
             }
             // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a fixed by-value
@@ -4808,7 +4776,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     outLayout.totalFrameSize
                     + static_cast<std::uint32_t>(cc.callPushBytes)
                     + namedArgCount * outLayout.outgoingSlotSize);
-                emitFrameAddr(b, h.lea, result, sp, homeOffset);
+                emitFrameAddr(b, h.lea, result, frameBase, homeOffset);  // ★ P69: as above
                 continue;
             }
 
@@ -4930,43 +4898,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // store every `Slot`-packing CC emits).
                     std::uint8_t widthFlags = 0;
                 };
-                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a by-value-
-                // stack aggregate arg — byte-copy `bytes` from [addr] into the
-                // outgoing area at `dstOffset`. Emitted in the stack-store phase
-                // (before any register move) so the source `addr` reg is read while
-                // still intact. `addr` is the carrier's (already-physical) Reg.
-                //
-                // ★ P69 round 4 — NOT REACHED BY THE PIPELINE TODAY, AND KEPT ON
-                // PURPOSE. The wide-call pass (`lir_wide_call_args.cpp`) runs over
-                // EVERY Call before register allocation, copies each stacked
-                // by-value aggregate into its placed outgoing bytes there, and takes
-                // the `(Reg, ByValueStackAgg)` carrier off the Call — so no Call the
-                // pipeline lowers reaches this pass carrying one, and the placed
-                // triple `(Reg, ByValueStackAgg, MemOffset)` is no longer produced by
-                // any pass (the wide-call pass REFUSES an input that states one).
-                // This copy stays because the carrier is still an operand FORM that
-                // four other consumers accept — register allocation, the rewrite, the
-                // text form and the verifier — and hand-built modules reach all of
-                // them (tests/lir/test_lir_callconv.cpp,
-                // tests/lir/test_lir_outgoing_arg_cursor.cpp, tests/asm): one consumer
-                // of five refusing a form the other four take would be the defect.
-                // Its two known limits are loud, by name, never a wrong byte:
-                // `L_VirtualRegInPostRegalloc` (the rewriter's reload scratch
-                // exhausted by spilled carrier addresses at one call) and
-                // `L_CcRegLookupFailed` (no free caller-saved general register to copy
-                // through). Its REMOVAL — the stage invariant "after the wide-call
-                // pass no Call carries the form", stated by the verifier, with every
-                // consumer's arm dropped together and the hand-built tests building
-                // the post-pass form — is owned by
-                // D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET.
-                struct ByValStackCopy {
-                    LirReg       addr;
-                    std::int32_t dstOffset;  // from THIS fn's SP-post-prologue
-                    std::uint32_t bytes;
-                };
                 std::vector<ArgMove> argMoves;
                 std::vector<StackArgStore> stackStores;
-                std::vector<ByValStackCopy> byValStackCopies;
                 argMoves.reserve(ops.size());
                 // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, PART 5): Win64 passes each FP
                 // VARARG in BOTH the XMM and the matching integer (home) register; the
@@ -5035,10 +4968,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // `lowerWideCallArgs` and the pre-scan walk, so the three cannot
                 // drift; under a `Slot`-packing CC it yields `idx * slot` exactly.
                 StackArgCursor stackCursor{cc, outLayout.outgoingSlotSize};
-                // FC12a-struct: arg POSITION (advanced once per arg, incl. a by-value-
-                // stack aggregate carrier; NOT per raw operand — a carrier is a Reg +
-                // a ByValueStackAgg marker, two operands but ONE arg). The forced-
-                // vararg boundary + the pre-scan both index by this, so they agree.
+                // Arg POSITION, advanced once per arg. The forced-vararg boundary +
+                // the pre-scan both index by this, so they agree.
                 std::uint32_t argRegionIdx = 0;
                 // D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE (with c77
                 // D-AS-REGALLOC-DIRECT-ARG-RELOAD): the SysV variadic vector-count
@@ -5073,20 +5004,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     lirCallOutgoingArgsArePlaced(src.instFlags(inst));
                 for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
                     LirOperand const& argOp = ops[i];
-                    // FC12a-struct: the ByValueStackAgg marker — and the MemOffset
-                    // stating where its aggregate was placed — are consumed WITH
-                    // the preceding Reg (below), never on their own.
-                    if (lirIsByValueStackAggDescriptor(ops, i)) continue;
+                    // ⓘ No by-value stacked-aggregate carrier reaches this walk —
+                    // `lowerWideCallArgs` took each one off its Call (the LIR
+                    // verifier's stage rule, `verifyLirStackedAggregatesLowered`);
+                    // its bytes are `store_outgoing_arg` stores. Every operand
+                    // is one argument.
                     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef is a
                     // SPILLED register-passed arg the rewriter deferred. Its class
                     // rides `spillSlotClass`; it has no source register (it loads
                     // from its stack slot directly into its ABI arg register). It
                     // advances the arg cursors EXACTLY as a Reg arg of that class
-                    // would (the rewriter's classifier used the same walk), and is
-                    // never a by-value carrier (a carrier is a Reg + marker; the
-                    // rewriter never defers a carrier). Handled uniformly below via
-                    // `isSpillRef` — the register-resident branch pushes a mem-src
-                    // ArgMove. A SpillSlotRef must NEVER land in the overflow region
+                    // would (the rewriter's classifier used the same walk). Handled
+                    // uniformly below via `isSpillRef` — the register-resident
+                    // branch pushes a mem-src ArgMove. A SpillSlotRef must NEVER land in the overflow region
                     // (lowerWideCallArgs removed overflow args pre-regalloc, and the
                     // rewriter only defers args the cc passes in a register) — a
                     // defensive fail-loud guards that below.
@@ -5108,74 +5038,6 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     LirRegClass const cls = isSpillRef
                         ? static_cast<LirRegClass>(argOp.spillSlotClass)
                         : srcReg.regClass();
-                    // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a Reg
-                    // immediately FOLLOWED by a ByValueStackAgg marker is the by-value-
-                    // stack aggregate carrier. It is passed ENTIRELY in the overflow
-                    // area by a byte-copy from its address reg — UNCONDITIONALLY, never
-                    // in a register, never split (SysV §3.2.3/§3.5.7). It consumes NO
-                    // arg register (the class/slot counters do NOT advance) and reserves
-                    // ceil(bytes / slot) overflow slots. This is the force-to-stack
-                    // lever the greedy register-then-overflow placement otherwise lacks.
-                    if (!isSpillRef && lirIsByValueStackAggCarrier(ops, i)) {
-                        std::uint32_t const aggBytes = ops[i + 1].byValueAggBytes;
-                        // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES:
-                        // READ the placement, never re-derive it. `lowerWideCallArgs`
-                        // decided it over the call's COMPLETE argument list; this walk
-                        // sees the list with every stacked scalar already removed, so a
-                        // cursor here restarts at a byte the scalars already own — the
-                        // exact overlap this row records (`stur x20,[sp]` for the
-                        // scalar, then the aggregate's first eightbyte over the same
-                        // bytes, on both shipped pipelines, silently).
-                        auto const placed = lirByValueStackAggPlacedOffset(ops, i);
-                        if (!placed.has_value() && outgoingArgsPlaced) {
-                            report(reporter,
-                                   DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                                   DiagnosticSeverity::Error,
-                                   std::format(
-                                       "callconv: call inst {} arg {} is a by-value "
-                                       "stacked aggregate with no stated "
-                                       "outgoing-argument placement, on a call whose "
-                                       "outgoing arguments were already laid out by "
-                                       "lowerWideCallArgs. Placing it here would use "
-                                       "a cursor that cannot see the stacked scalars "
-                                       "that pass removed, and would overlap them",
-                                       inst.v, argRegionIdx));
-                            return false;
-                        }
-                        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the residual
-                        // (un-placed) arm walks the same cursor with the same
-                        // carrier-stated alignment, so the two producers of an
-                        // offset cannot disagree about the pad.
-                        std::uint32_t const relOffset =
-                            placed.has_value()
-                                ? static_cast<std::uint32_t>(*placed)
-                                : stackCursor.placeNamedAggregate(
-                                      aggBytes, ops[i + 1].byValueAggAlign());
-                        std::int32_t const dstOffset =
-                            static_cast<std::int32_t>(
-                                static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                                + relOffset);
-                        byValStackCopies.push_back({srcReg, dstOffset, aggBytes});
-                        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
-                        // EXHAUSTS the carrier's class (NGRN/NSRN←pool) — CLAMP the
-                        // matching arg cursor so a SUBSEQUENT same-class arg/vararg gets
-                        // argIndex >= poolSize → routed to the overflow too (matching the
-                        // callee's va_start __gr_offs/__vr_offs clamp + the pre-scan pad).
-                        // SysV (exhaust 0) leaves the cursor = backfill. Independent-
-                        // counter CCs only (a straddling carrier never arises slot-aligned).
-                        std::uint8_t const ex = ops[i + 1].byValueAggExhaust;
-                        // ★ THE CLAMP NAMES A CLASS, NOT A CURSOR. Handing
-                        // `exhaust` the class is what makes clamping the WRONG
-                        // counter unwritable — and on a target whose FPR and VR
-                        // pools are one register file it clamps the shared
-                        // cursor once instead of leaving the sibling view free.
-                        if (ex == kByValueStackArgExhaustGpr)
-                            argCursors.exhaust(LirRegClass::GPR);
-                        else if (ex == kByValueStackArgExhaustFpr)
-                            argCursors.exhaust(LirRegClass::FPR);
-                        ++argRegionIdx;
-                        continue;
-                    }
                     // ⚠ `nullopt` here is "this class names NO arg pool at
                     // all" (`None`/`Flags`), which is a DIFFERENT fact from an
                     // exhausted cursor — exhaustion returns a slot whose index
@@ -5220,10 +5082,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // non-variadic call has `fixedOperandCnt == 0`, which would make
                         // the `argRegionIdx >= fixedOperandCnt` vararg predicate true for
                         // every FP arg. It is the SAME vararg predicate the Win64 FP-dup
-                        // below uses; a by-value MEMORY-class struct vararg never reaches
-                        // this branch (it `continue`s into byValStackCopies) and an FP
-                        // vararg past the SSE pool falls to the overflow branch — both
-                        // correctly excluded.
+                        // below uses; an FP vararg past the SSE pool falls to the
+                        // overflow branch — correctly excluded.
                         if (isVariadicCall && cls == LirRegClass::FPR
                             && argRegionIdx >= fixedOperandCnt) {
                             ++fpVarargsInVectorArgRegs;
@@ -5486,138 +5346,6 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        bodyCtx, s.widthFlags) == InvalidLirInst)
                         return false;
                 }
-                // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): emit the by-
-                // value-stack aggregate byte-copies — ALSO in the stack-store phase
-                // (before any register move), so each carrier's source ADDRESS reg is
-                // read while still intact. Each copy reads chunks from [addr + off] and
-                // writes them to the outgoing area at [sp + dstOffset + off], via a
-                // caller-saved scratch GPR. The scratch must avoid: SP, the indirect
-                // callee reg, the variadic vector-count reg, AND every carrier's
-                // address reg (a later carrier's address must survive an earlier copy).
-                // GPR-chunked (load/store class GPR) — the byte size rounds to whole
-                // outgoing slots, so the copy can over-read into the temp's own padding
-                // (the temp is a 16-rounded freshAggregateTemp) but never past it.
-                if (!byValStackCopies.empty()) {
-                    auto const gpLoad = classOpHandle(
-                        schema, LirRegClass::GPR, RegClassOp::Load,
-                        "materializeOneFunc: by-value-stack agg copy load", reporter);
-                    auto const gpStore = classOpHandle(
-                        schema, LirRegClass::GPR, RegClassOp::Store,
-                        "materializeOneFunc: by-value-stack agg copy store", reporter);
-                    if (!gpLoad.has_value() || !gpStore.has_value()) return false;
-                    std::uint32_t const chunk =
-                        widthForClass(schema, LirRegClass::GPR);
-                    if (chunk == 0) {
-                        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
-                               DiagnosticSeverity::Error,
-                               "callconv: by-value-stack aggregate copy requires a "
-                               "nonzero GPR width (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
-                        return false;
-                    }
-                    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
-                    // the loop STEPS by `chunk` and the memory ops must ACCESS
-                    // `chunk`, so the two come off one number rather than off a
-                    // step here and a defaulted 64 at the emit call. They agree
-                    // on every shipped target; a target whose GPR is not 8
-                    // bytes would previously have stepped by its own width and
-                    // copied 8 bytes each time — overlapping or gapping the
-                    // aggregate with no diagnostic.
-                    auto const chunkWidth = lirInstWidthFlagForBits(chunk * 8u);
-                    if (!chunkWidth.has_value()) {
-                        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
-                               DiagnosticSeverity::Error,
-                               std::format("callconv: by-value-stack aggregate copy "
-                                           "steps {} bytes at a time, which is not a "
-                                           "width the LIR instruction model can state "
-                                           "— the copy would access some other width "
-                                           "than it advances",
-                                           chunk));
-                        return false;
-                    }
-                    // FOLD (adversarial-review BLOCKER-3, silent miscompile): the
-                    // byte-copies are emitted HERE, in the stack-store phase, BEFORE the
-                    // register arg-moves (`argMoves`, below) and the Win64 FP-vararg
-                    // duplications (`fpDupMoves`, below) read their `.src`. So the scratch
-                    // must additionally avoid every register those LATER moves still read
-                    // as a SOURCE — otherwise, if regalloc parked an outgoing scalar arg
-                    // VALUE in the chosen scratch, the byte-copy would clobber it before
-                    // its `mov dest, src` could read it, and that argument would silently
-                    // receive the struct's bytes. The sret indirect-result source is
-                    // ALREADY appended to `argMoves` above (so iterating argMove sources
-                    // covers it); `fpDupMove` sources are XMM/FPR regs (never GPR
-                    // candidates) but are included for completeness.
-                    //
-                    // NOTE the avoid-set is the precise SOURCE set, NOT the whole
-                    // `cc.argGprs` pool: an arg-move's DEST register (e.g. an argGpr that
-                    // only RECEIVES a value) is written by that move AFTER this copy
-                    // finishes storing to memory, so the copy's transient write to it is
-                    // already dead — it is safe scratch. Blanket-rejecting all argGprs
-                    // (the lir_rewrite collectAllocatable precedent, which guards a
-                    // DIFFERENT mechanism: a spill-reload that lands BETWEEN the
-                    // not-yet-emitted arg moves) would here falsely fail-loud on a valid
-                    // register-exhaustion call that legitimately fills every argGpr as a
-                    // DEST (see examples/c/varargs_struct_split: 1 fixed + 5 longs
-                    // exhaust rdi..r9, all dests) — so we exclude only argGprs that are
-                    // ALSO a live source, which `liveArgSrc` already captures.
-                    std::unordered_set<std::uint16_t> liveArgSrc;
-                    for (auto const& m : argMoves)
-                        if (m.src.isPhysical != 0) liveArgSrc.insert(m.src.id);
-                    for (auto const& m : fpDupMoves)
-                        if (m.src.isPhysical != 0) liveArgSrc.insert(m.src.id);
-                    // Pick a caller-saved GPR scratch avoiding the hazard set above.
-                    std::optional<LirReg> scratch;
-                    for (std::string_view const name : cc.callerSaved) {
-                        auto const ord = schema.registerByName(name);
-                        if (!ord.has_value()) continue;
-                        auto const* rinfo = schema.registerInfo(*ord);
-                        if (rinfo == nullptr
-                            || rinfo->regClass != TargetRegClass::GPR) continue;
-                        bool clash = false;
-                        if (calleeIsReg && *ord == calleeOp.reg.id) clash = true;
-                        if (!clash
-                            && ::dss::call_payload::isVariadic(payload)
-                            && cc.variadicVectorCountReg.has_value()
-                            && cc.variadicVectorCountReg->ordinal == *ord)
-                            clash = true;
-                        if (!clash)
-                            for (auto const& cpy : byValStackCopies)
-                                if (cpy.addr.id == *ord) { clash = true; break; }
-                        // FOLD: reject any reg a later arg-move/FP-dup source reads
-                        // (the silent arg-clobber avoid-set).
-                        if (!clash && liveArgSrc.contains(*ord)) clash = true;
-                        if (clash) continue;
-                        scratch = makePhysicalReg(*ord, LirRegClass::GPR);
-                        break;
-                    }
-                    if (!scratch.has_value()) {
-                        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
-                               DiagnosticSeverity::Error,
-                               std::format("callconv: call inst {} found no free caller-"
-                                           "saved scratch GPR for a by-value-stack "
-                                           "aggregate copy "
-                                           "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)",
-                                           inst.v));
-                        return false;
-                    }
-                    for (auto const& cpy : byValStackCopies) {
-                        // Copy ceil(bytes/chunk)*chunk bytes in `chunk`-wide steps. The
-                        // dst slots were reserved as whole outgoing slots (= chunk), so
-                        // the tail step writes a full slot (reading the temp's padding)
-                        // — bounded by the 16-rounded temp + the reserved slot span.
-                        std::uint32_t off = 0;
-                        for (; off < cpy.bytes; off += chunk) {
-                            if (emitFrameLoad(b, *gpLoad, *scratch, cpy.addr,
-                                              static_cast<std::int32_t>(off),
-                                              bodyCtx, *chunkWidth)
-                                    == InvalidLirInst
-                                || emitFrameStore(
-                                       b, *gpStore, *scratch, sp,
-                                       cpy.dstOffset + static_cast<std::int32_t>(off),
-                                       bodyCtx, *chunkWidth) == InvalidLirInst)
-                                return false;
-                        }
-                    }
-                }
                 // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS: emit the arg-passing register moves as a PARALLEL COPY
                 // — orderable moves in dependency order, each remaining cycle broken
                 // with a class-correct scratch register (FC2 Part B: every move's
@@ -5716,9 +5444,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // prologue `test al,al` skipped saving xmm0-7 → `va_arg(double)`
                     // read garbage (the fpconv1 release miscompile). The placement tally
                     // counts a spilled FP vararg IDENTICALLY (it still consumed a vector
-                    // arg register), still EXCLUDES a by-value MEMORY-class struct vararg
-                    // (never register-resident — it `continue`s into byValStackCopies)
-                    // and any FP vararg past the SSE pool (routed to overflow), and is
+                    // arg register), still EXCLUDES any FP vararg past the SSE pool
+                    // (routed to overflow), and is
                     // capped at the pool bound by construction (only the register-
                     // resident branch increments it).
                     std::uint32_t const vectorArgsInVararg = fpVarargsInVectorArgRegs;
@@ -6218,9 +5945,12 @@ materializeCallingConvention(Lir const&           src,
     // pass's lifetime) avoids copying the vectors.
     std::unordered_map<std::uint32_t, std::span<std::uint32_t const>>
         symToPerAllocaAligns;
+    // ★ P69 (fold f26c, ledger 495): the stacked-argument realignment, same keying.
+    std::unordered_map<std::uint32_t, std::uint32_t> symToStackedArgAlign;
     for (auto const& fa : funcLocalAlignments) {
         symToMaxLocalAlign[fa.funcSymbol.v]    = fa.maxLocalAlignBytes;
         symToPerAllocaAligns[fa.funcSymbol.v]  = fa.perAllocaAlignBytes;
+        symToStackedArgAlign[fa.funcSymbol.v]  = fa.stackedArgAlignBytes;
     }
 
     auto opcodes = resolveOpcodes(schema, reporter);
@@ -6360,11 +6090,17 @@ materializeCallingConvention(Lir const&           src,
             it != symToPerAllocaAligns.end()) {
             perAllocaAligns = it->second;
         }
+        std::uint32_t stackedArgAlign = 0;
+        if (auto it = symToStackedArgAlign.find(rewrittenSymbol);
+            it != symToStackedArgAlign.end()) {
+            stackedArgAlign = it->second;
+        }
         bool const isSehParent = sehParentSymbols.contains(rewrittenSymbol);
         LirFuncCfi funcCfi;
         if (!materializeOneFunc(src, fn, schema, *cc, funcAlloc, b, *opcodes,
                                 layout, funcCfi, out.perFunc, parentLayoutIndex,
-                                maxLocalAlign, perAllocaAligns, isSehParent,
+                                maxLocalAlign, perAllocaAligns, stackedArgAlign,
+                                isSehParent,
                                 probeTouches, out.blockEntryImage, reporter)) {
             return LirCallconvResult{};
         }

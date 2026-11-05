@@ -64,6 +64,31 @@ visibleChildren(Tree const& tree, NodeId parent) {
     return out;
 }
 
+// Whether `i` is a position `decl` names for one of its roles — every field the
+// row's numbering is authored for, `kindByChild`'s first step among them.
+[[nodiscard]] inline bool isRolePosition(DeclarationRule const& decl,
+                                         std::size_t i) {
+    auto const at = [i](std::optional<std::uint32_t> const& p) {
+        return p.has_value() && *p == i;
+    };
+    return at(decl.nameChild) || at(decl.typeChild) || at(decl.initChild)
+        || at(decl.headChild) || at(decl.declaratorListChild)
+        || at(decl.declaratorChild) || at(decl.paramsChild) || at(decl.bodyChild)
+        || (decl.kindByChild.has_value() && !decl.kindByChild->childPath.empty()
+            && decl.kindByChild->childPath.front() == i);
+}
+
+// Whether `n` is a node of one of `decl`'s attribute slots
+// (`declarationAttrSlotRules`).
+[[nodiscard]] inline bool isAttrSlotNode(Tree const& tree, NodeId n,
+                                         DeclarationRule const& decl) {
+    if (tree.kind(n) != NodeKind::Internal) return false;
+    for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+        if (tree.rule(n).v == sr.rule.v) return true;
+    }
+    return false;
+}
+
 } // namespace decl_prefix_detail
 
 // The declaration's specifier-prefix subtree, or InvalidNode when the rule
@@ -84,6 +109,21 @@ specifierPrefixChild(Tree const& tree, NodeId node,
 // A declaration's "role children" — its visible children with a leading
 // declaration-specifier prefix stripped per the strip rule above. Positional
 // name/type/init/params/body/kindByChild indices resolve against THESE.
+//
+// ★ P69 (lane `cs`, fold f26c) — A ROLE IS NEVER ONE OF THE ROW'S ATTRIBUTE
+// SLOTS. A row's `declarationAttrSlotRules` are read by RULE, over the raw
+// children, and no position a row names is a slot's: a row counts a slot only
+// where one always stands (c's `declAttrRun` is a node even when empty). So a
+// slot standing AT a role's position has moved up into it — an OPTIONAL role
+// before it is absent — and the role children END there, since nothing from
+// that slot on stands where the row's numbering puts it. ✔MEASURED (lane `cs`'s
+// probe np): `void f(int __attribute__((unused)));` is [declHeadForParam,
+// paramTrailingAttrRun], and the `param` row's `declarator: 1` read the
+// attribute run as the parameter's declarator — the signature lost the
+// parameter's type (H_TypeUnresolved; beside a definition,
+// S_IncompatibleRedeclaration), where gcc 13.3.0, clang 18.1.3, mingw-w64 gcc
+// 13.2.0 and Apple clang 21.0.0 run it. Every reader of a role resolves it
+// here, so a role read cannot land on a slot anywhere.
 [[nodiscard]] inline std::vector<NodeId>
 declRoleChildren(Tree const& tree, NodeId node, DeclarationRule const& decl) {
     auto kids = decl_prefix_detail::visibleChildren(tree, node);
@@ -91,6 +131,13 @@ declRoleChildren(Tree const& tree, NodeId node, DeclarationRule const& decl) {
         && tree.kind(kids.front()) == NodeKind::Internal
         && tree.rule(kids.front()) == *decl.specifierPrefixRule) {
         kids.erase(kids.begin());
+    }
+    for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (decl_prefix_detail::isRolePosition(decl, i)
+            && decl_prefix_detail::isAttrSlotNode(tree, kids[i], decl)) {
+            kids.resize(i);
+            break;
+        }
     }
     return kids;
 }

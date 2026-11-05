@@ -29,6 +29,7 @@
 // or a slip to any other CRT export — reds immediately.
 
 #include "asm/asm.hpp"
+#include "core/types/config_path_walk.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -663,6 +664,58 @@ TEST(LK10EntrySliceC, MachOX64TrampolinePrologueIsSubRsp8) {
         << "the Mach-O x86_64 trampoline must lead with `sub rsp, 8`: dyld CALLED the "
            "entry, so the stack is 8 off the 16-byte quantum until the trampoline "
            "realigns it before its first call";
+}
+
+// The Mach-O x86_64 exec's entry runs under the image's own convention,
+// `sysv_amd64_darwin`, which DERIVES from `sysv_amd64` and states only the
+// X87UP aggregate rule Apple's ABI does not keep — a rule no trampoline reads.
+// So the trampoline under the derived name must be the base's BYTE FOR BYTE:
+// the same document with the entry convention renamed to the base is loaded
+// beside the shipped one and both trampolines are compared whole. RED where the
+// derivation drops a key the trampoline reads (its registers, its alignment,
+// its shadow space), or where the document stops naming the derived convention.
+TEST(LK10EntrySliceC, MachOX64TrampolineUnderTheDerivedConventionIsTheBasesByteForByte) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* derived = (*target)->callingConventionByName("sysv_amd64_darwin");
+    ASSERT_NE(derived, nullptr);
+    ASSERT_EQ(derived->bases, std::vector<std::string>{"sysv_amd64"});
+    auto shipped = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(shipped.has_value());
+    ASSERT_EQ((*shipped)->entryCallingConvention(), "sysv_amd64_darwin");
+
+    auto path = findShippedConfig(ShippedConfigLocator{
+        "macho64-x86_64-darwin-exec", "object-formats", ".format.json", "object format",
+        DiagnosticCode::C_InvalidFormatName});
+    ASSERT_TRUE(path.has_value());
+    std::ifstream in{*path};
+    ASSERT_TRUE(in.is_open()) << path->string();
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string text = buf.str();
+    std::string const from = R"("entryCallingConvention": "sysv_amd64_darwin")";
+    std::string const to   = R"("entryCallingConvention": "sysv_amd64")";
+    auto const at = text.find(from);
+    ASSERT_NE(at, std::string::npos) << "the document no longer spells `" << from << "`";
+    ASSERT_EQ(text.find(from, at + 1), std::string::npos) << "two entry conventions";
+    text.replace(at, from.size(), to);
+    auto base = ObjectFormatSchema::loadFromText(text, "<macho64-x86_64-darwin-exec, entry sysv_amd64>");
+    ASSERT_TRUE(base.has_value());
+    ASSERT_EQ((*base)->entryCallingConvention(), "sysv_amd64");
+
+    auto trampolineOf = [&](ObjectFormatSchema const& format) {
+        auto mod = makeReturn42Module();
+        DiagnosticReporter rep;
+        EXPECT_TRUE(linker::injectEntryTrampoline(mod, **target, format, rep));
+        EXPECT_EQ(rep.errorCount(), 0u);
+        return mod.functions.empty() ? std::vector<std::uint8_t>{} : mod.functions[0].bytes;
+    };
+    auto const underDerived = trampolineOf(**shipped);
+    auto const underBase    = trampolineOf(**base);
+    ASSERT_FALSE(underDerived.empty());
+    EXPECT_EQ(underDerived, underBase)
+        << "the entry trampoline under `sysv_amd64_darwin` differs from the one under its base "
+           "`sysv_amd64`: the derivation lost a key the trampoline reads";
 }
 
 // ── D-RUNTIME-MAIN-ARGC-ARGV (c88): shipped-ELF argc/argv byte pins ──

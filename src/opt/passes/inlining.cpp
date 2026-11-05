@@ -400,14 +400,33 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // silent-miscompile fix, not a speculative guard.
             if (op == MirOpcode::ReadIndirectResult) return std::nullopt;
             // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a fixed by-value
-            // aggregate received WHOLLY from the incoming stack (it straddled the
-            // reg/stack boundary) reads the CALLEE's incoming overflow area via a
-            // frame-relative `RecvByValueStackParam`; spliced into the caller it would
-            // bind to the CALLER's incoming frame (garbage — the caller is not the one
-            // that stacked the aggregate). Refuse, like ReadIndirectResult (fail-SAFE:
-            // forgoes the optimization, never miscompiles). Reachable under the shipped
-            // release.pipeline.json (which runs Inlining), so a real fix not a guard.
-            if (op == MirOpcode::RecvByValueStackParam) return std::nullopt;
+            // aggregate received WHOLLY from the incoming stack reads the CALLEE's
+            // incoming overflow area via a frame-relative `RecvByValueStackParam`;
+            // spliced AS IT STANDS into the caller it would bind to the CALLER's
+            // incoming frame (garbage — the caller is not the one that stacked it).
+            // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // so a reception that STATES its flat call-operand position (`payload2` =
+            // position + 1, mir_node.hpp — every aggregate reception) is MAPPED rather
+            // than refused: the caller's operand at that position is the
+            // `ByValueStackArg` carrier, whose value IS the address of the caller's
+            // private copy — exactly what the reception yields in the callee's frame —
+            // and the splice (`emitCalleeInst`) maps it there as it maps an `Arg`. A
+            // SysV MEMORY-class aggregate parameter is received this way since the
+            // fold (it was a pointer `Arg`), so the old blanket refusal would have
+            // silently stopped inlining every SysV function taking a struct over 16
+            // bytes. Refused still (fail-SAFE): a reception stating no position (the
+            // x87 `long double` scalar parameter), and one whose operand is not a
+            // carrier of its type — a structural call/signature mismatch.
+            if (op == MirOpcode::RecvByValueStackParam) {
+                std::uint32_t const p2 = mir.instPayload2(cid);
+                if (p2 == 0 || p2 - 1u >= callArgCount) return std::nullopt;
+                MirInstId const actual = callOps[1 + (p2 - 1u)];
+                if (mir.instOpcode(actual) != MirOpcode::ByValueStackArg
+                    || !mir.instType(cid).valid()
+                    || mir.instType(cid).v != mir.instType(actual).v) {
+                    return std::nullopt;
+                }
+            }
             // D-OPT-VARIADIC-RELEASE-MISCOMPILE: refuse to inline a callee that CALLS
             // va_start. The three va_start leaves (VaRegSaveAreaAddr /
             // VaOverflowArgAreaAddr / VaHomeArgAreaAddr) materialize in lir_callconv to
@@ -755,6 +774,22 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
             return;
         }
         local.emplace(cid.v, actualArgs[pos]);
+        return;
+    }
+    // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // a stacked by-value aggregate's reception maps to the caller's operand at the
+    // position it states (`payload2` = position + 1) — the `ByValueStackArg`
+    // carrier, whose value is the address of the caller's private copy. The gate
+    // admitted only such a reception; anything else here is the defensive
+    // fail-loud guard the `Arg` arm keeps.
+    if (cop == MirOpcode::RecvByValueStackParam) {
+        std::uint32_t const p2 = src.instPayload2(cid);
+        if (p2 == 0 || p2 - 1u >= actualArgs.size()) {
+            malformed = true;
+            if (!actualArgs.empty()) local.emplace(cid.v, actualArgs[0]);
+            return;
+        }
+        local.emplace(cid.v, actualArgs[p2 - 1u]);
         return;
     }
     if (cop == MirOpcode::Const) {

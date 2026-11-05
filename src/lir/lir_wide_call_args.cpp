@@ -9,6 +9,7 @@
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg.hpp"
+#include "lir/lir_verifier.hpp"
 
 #include <algorithm>
 #include <array>
@@ -60,9 +61,9 @@ using dss::report;
 // ★ THE PROTOTYPE NOTE THIS REPLACED said a production version would fold ALL
 // overflow placement into this single pre-regalloc site. That is what happened —
 // and since P69 round 4 the aggregate's MATERIALIZATION is here too, so the one
-// site that decides where an outgoing byte lands also writes it. `lir_callconv`
-// still copies a carrier it is handed (a hand-built module's); the pipeline no
-// longer hands it one.
+// site that decides where an outgoing byte lands also writes it — and no later
+// pass reads a carrier: the LIR verifier's stage rule, run on this pass's own
+// output (`lowerWideCallArgs`, below), refuses a module in which one survived.
 
 // The outgoing-arg slot QUANTUM — the unit the overflow area is reserved and
 // aligned in. Every current ABI (SysV/Win64/AAPCS64/Apple) uses a pointer-width
@@ -513,6 +514,13 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
     }
     out.lir = std::move(b).finish();
     out.ok = out.lir.moduleFuncCount() == funcCount;
+    // ★ THE CARRIER'S STAGE RULE, stated on this pass's own output: no
+    // instruction leaves here carrying a by-value stacked-aggregate marker, so
+    // no later pass holds an arm for one. A terminator Call's operands are
+    // carried verbatim above — were one ever to carry the form, it is refused
+    // here, by name, instead of reaching the allocator.
+    if (out.ok && !verifyLirStackedAggregatesLowered(out.lir, schema, reporter))
+        out.ok = false;
     return out;
 }
 

@@ -13658,3 +13658,134 @@ TEST(HirLoweringC, AnAttributeMayLeadABlockScopeExternDeclaration) {
         EXPECT_EQ(imports, 1u) << body << ": the block-scope `extern` re-homes to one import";
     }
 }
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-POINTER-TO-AN-ARRAY-OF-UNKNOWN-SIZE-IS-WARNED-INCOMPATIBLE, item (3)):
+// A CONDITIONAL OF POINTERS TO COMPATIBLE TYPES HAS A POINTER TO THEIR COMPOSITE (C 6.5.15p6, 6.2.7p3), and
+// BOTH ARMS ARE CONVERTED TO IT. ✔MEASURED (lane `cs` probe ft cells 23, 24 and 15, each RUN): gcc 13.3.0,
+// clang 18.1.3 and mingw-w64 gcc 13.2.0 read `sizeof *(one ? pu : p3)` over `int (*)[]` / `int (*)[3]` as 12,
+// the same through two function pointers, and take `one ? g3 : gu` into an `int (*(*)(void))[3]` in silence;
+// cl 19.51 reads the first arm's incomplete type (C4034) — a meaning split, decided for C 6.5.15p6 and the three.
+// Each cell: the semantic tier folds the size of the composite (no "sizeof of an incomplete array" warning), and
+// the HIR's ONE ternary is typed the composite — a pointer whose pointee chain ends in `int[3]` — with each arm
+// typed it too. The example examples/c/a_conditional_of_compatible_pointers_has_their_composite_type RUNS the
+// same three cells on the four exec targets.
+//
+// RED-ON-DISABLE: drop the HIR `combineTernary`'s composite arm and each ternary keeps the stamped composite
+// over arms of their own types (the arms' type assertion reds); drop the semantic arm and the size reads the
+// first arm's incomplete array (warned) and the ternary is typed it.
+TEST(HirLoweringC, AConditionalOfPointersToCompatibleTypesHasTheirCompositeType) {
+    struct Cell {
+        char const* what;
+        char const* src;
+        bool        throughAFunction;
+    };
+    for (Cell const c : {
+             Cell{"pointers to int[] and int[3] (cell 23)",
+                  // The `sizeof` operand folds and is never lowered, so the cell also
+                  // EVALUATES the conditional (store is zero-initialized): the HIR holds
+                  // that one ternary.
+                  "static int store[3];\n"
+                  "int f(int one) { int (*pu)[] = (int (*)[])store; int (*p3)[3] = &store;\n"
+                  "  return (int)sizeof *(one ? pu : p3) + (*(one ? pu : p3))[0] + 30; }\n",
+                  false},
+             Cell{"two function pointers (cell 24)",
+                  "int (*g3(void))[3];\nint (*gu(void))[];\n"
+                  "int f(int one) { int (*(*fu)(void))[] = gu; int (*(*f3)(void))[3] = g3;\n"
+                  "  return (int)sizeof *(one ? fu : f3)() + (*(one ? fu : f3)())[0] + 30; }\n",
+                  true},
+             Cell{"two function designators (cell 15)",
+                  "int (*g3(void))[3];\nint (*gu(void))[];\n"
+                  "int f(int one) { int (*(*fp)(void))[3] = one ? g3 : gu; return fp != 0; }\n",
+                  true},
+         }) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_SizeofIncompleteArrayIsZero), 0u)
+            << "the size read is the composite's, not the first arm's incomplete array";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion), 0u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        // The composite's pointee chain: a pointer to int[3], or a pointer to a function returning one.
+        auto const endsInIntOfThree = [&](TypeId t) {
+            if (!t.valid() || in.kind(t) != TypeKind::Ptr || in.operands(t).empty()) return false;
+            TypeId p = in.operands(t)[0];
+            if (c.throughAFunction) {
+                if (in.kind(p) != TypeKind::FnSig) return false;
+                TypeId const res2 = in.fnResult(p);
+                if (!res2.valid() || in.kind(res2) != TypeKind::Ptr || in.operands(res2).empty()) return false;
+                p = in.operands(res2)[0];
+            }
+            return in.kind(p) == TypeKind::Array && !in.isIncompleteArray(p) && !in.scalars(p).empty()
+                && in.scalars(p)[0] == 3;
+        };
+        std::size_t ternaries = 0;
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Ternary) continue;
+            ++ternaries;
+            TypeId const t = res->hir.typeId(n);
+            EXPECT_TRUE(endsInIntOfThree(t)) << "the conditional is typed the composite";
+            auto const kids = res->hir.children(n);
+            ASSERT_EQ(kids.size(), 3u);
+            EXPECT_EQ(res->hir.typeId(kids[1]).v, t.v) << "the then arm is converted to the composite";
+            EXPECT_EQ(res->hir.typeId(kids[2]).v, t.v) << "the else arm is converted to the composite";
+        }
+        EXPECT_EQ(ternaries, 1u);
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION): A FUNCTION A
+// CALL DECLARED IMPLICITLY — the unit declares it nowhere — LOWERS TO ONE ExternFunction BOUND TO NO LIBRARY, not
+// eager, as an unabsorbed bare prototype does (c86), so the link binds it to the unit that defines it; its
+// signature is the analyzer's (the first call's promoted arguments, the implicit `int` result, not variadic).
+// Two calls of the name are one import. CONTROL: a later definition in the unit is the function called, so no
+// import is emitted for the name. The example examples/c/two_units_implicit_function_declaration RUNS it.
+//
+// RED-ON-DISABLE: drop `lowerToHir`'s implicit-declaration loop and the call names a function no declaration of
+// the module holds (no ExternFunction, no import row).
+TEST(HirLoweringC, AFunctionACallDeclaredImplicitlyIsAnExternNoLibraryBinds) {
+    SemanticModel model = analyzeC("int b(void) { return g(40) + g(2); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    ASSERT_EQ(model.implicitDeclarations().size(), 1u);
+    SymbolId const g = model.implicitDeclarations()[0];
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& in = model.lattice().interner();
+    std::size_t externs = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::ExternFunction) continue;
+        if (res->hir.payload(d) != g.v) continue;
+        ++externs;
+        TypeId const t = res->hir.typeId(d);
+        ASSERT_EQ(in.kind(t), TypeKind::FnSig);
+        EXPECT_EQ(in.kind(in.fnResult(t)), TypeKind::I32);
+        ASSERT_EQ(in.fnParams(t).size(), 1u);
+        EXPECT_EQ(in.kind(in.fnParams(t)[0]), TypeKind::I32);
+        EXPECT_FALSE(in.fnIsVariadic(t));
+    }
+    EXPECT_EQ(externs, 1u) << "one ExternFunction for the implicitly declared `g`";
+    std::size_t rows = 0;
+    for (auto const& e : res->externDecls) {
+        if (e.canonicalName != "g") continue;
+        ++rows;
+        EXPECT_TRUE(e.noLibraryBinding) << "another unit defines it: no library binds it";
+        EXPECT_FALSE(e.isEagerImport);
+        EXPECT_TRUE(e.libraryOverride.empty());
+    }
+    EXPECT_EQ(rows, 1u) << "two calls, one import";
+
+    SemanticModel later = analyzeC("int b(void) { return f(40) + 2; }\nint f(int v) { return v; }\n");
+    ASSERT_FALSE(later.hasErrors());
+    EXPECT_TRUE(later.implicitDeclarations().empty()) << "the later definition is the function called";
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(later, r2);
+    ASSERT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
+    for (auto const& e : res2->externDecls) EXPECT_NE(e.canonicalName, "f") << "f is the unit's own";
+}

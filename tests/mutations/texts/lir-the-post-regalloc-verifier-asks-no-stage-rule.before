@@ -1,0 +1,2 @@
+    // module in hand is downstream of `lowerWideCallArgs`.
+    checkNoStackedAggregateCarrier(lir, schema, verdict);

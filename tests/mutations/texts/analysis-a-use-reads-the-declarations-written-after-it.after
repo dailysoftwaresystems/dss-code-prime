@@ -1,1 +1,1 @@
-        if (own == s.ownDeclaredAt.end()) continue;   // no place, or written after the use
+        if (own == s.ownDeclaredRank.end()) continue;   // no place, or written after the use

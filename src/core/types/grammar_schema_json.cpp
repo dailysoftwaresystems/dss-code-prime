@@ -9689,7 +9689,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 24>
+                    static constexpr std::array<std::string_view, 25>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -9743,7 +9743,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "plainSlotRule",
                             // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the OPTIONAL rule
                             // carrying an explicit assembler name for a declarator.
-                            "asmLabelRule"};
+                            "asmLabelRule",
+                            // P69 (lane `cs`, fold f26c): the OPTIONAL boolean — a use
+                            // sees only a declaration whose declarator completed before it.
+                            "scopeBeginsAfterDeclarator"};
                     DSS_CHECK_KEY_VOCABULARY(kDeclaratorKeys);
                     bool dOk = true;
                     if (!checkKeysAgainst(dj, kDeclaratorKeys, dPath,
@@ -9915,6 +9918,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // init-detection scan degrades to its pre-TF-C88 behavior.
                     readOptionalRuleRole("asmLabelRule", dc.asmLabelRule,
                                          dc.asmLabelRuleName);
+                    // P69 (lane `cs`, fold f26c): `scopeBeginsAfterDeclarator` (C 6.2.1p7) —
+                    // OPTIONAL, a boolean; absent ⇒ a scope's names are seen from its start.
+                    if (dj.contains("scopeBeginsAfterDeclarator")) {
+                        json const& v = dj.at("scopeBeginsAfterDeclarator");
+                        if (!v.is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/scopeBeginsAfterDeclarator",
+                                      "'scopeBeginsAfterDeclarator' must be a BOOLEAN: whether a "
+                                      "use sees only a declaration whose declarator completed "
+                                      "before it");
+                            dOk = false;
+                        } else {
+                            dc.scopeBeginsAfterDeclarator = v.get<bool>();
+                        }
+                    }
                     // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
                     // abstract direct-declarator role — same optional-role
                     // discipline (absent ⇒ no abstract type-name declarator).
@@ -14860,6 +14878,51 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                             }
                         }
+                        // P69 (lane `cs`, fold f26c): `implicitDeclarationResult` — a
+                        // callee that names no declaration in scope is declared
+                        // implicitly, returning this builtin type.
+                        if (entry.contains("implicitDeclarationResult")) {
+                            json const& v = entry.at("implicitDeclarationResult");
+                            if (!v.is_string() || v.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/implicitDeclarationResult",
+                                          "'implicitDeclarationResult' must be a non-empty "
+                                          "STRING: the builtin type an implicitly declared "
+                                          "function returns");
+                            } else {
+                                rule.implicitDeclarationResult = v.get<std::string>();
+                            }
+                        }
+                        // …and `implicitDeclarationBuiltinPrefixes`: the spellings a call never
+                        // declares (the builtin families the implementation owns); each a
+                        // non-empty string, read only beside `implicitDeclarationResult`.
+                        if (entry.contains("implicitDeclarationBuiltinPrefixes")) {
+                            json const& v = entry.at("implicitDeclarationBuiltinPrefixes");
+                            std::string const where = path + "/implicitDeclarationBuiltinPrefixes";
+                            if (!v.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, where,
+                                          "'implicitDeclarationBuiltinPrefixes' must be an "
+                                          "ARRAY of non-empty strings: the prefixes of the "
+                                          "builtin families no call declares");
+                            } else if (rule.implicitDeclarationResult.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, where,
+                                          "'implicitDeclarationBuiltinPrefixes' narrows the "
+                                          "implicit declaration, and this call rule states no "
+                                          "'implicitDeclarationResult': nothing would read it");
+                            } else {
+                                for (json const& p : v) {
+                                    if (!p.is_string() || p.get<std::string>().empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, where,
+                                                  "'implicitDeclarationBuiltinPrefixes' must "
+                                                  "be an ARRAY of non-empty strings");
+                                        rule.implicitDeclarationBuiltinPrefixes.clear();
+                                        break;
+                                    }
+                                    rule.implicitDeclarationBuiltinPrefixes.push_back(
+                                        p.get<std::string>());
+                                }
+                            }
+                        }
                         cfg.callRules.push_back(std::move(rule));
                     }
                 }
@@ -16046,7 +16109,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 16>
+                            std::pair<std::string_view, AttributeEffect>, 17>
                             kEffectVerbs{{
                                 {"callingConvention",
                                  AttributeEffect::CallingConvention},
@@ -16125,6 +16188,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                  AttributeEffect::TentativeMayBeCommon},
                                 {"tentativeNeverCommon",
                                  AttributeEffect::TentativeNeverCommon},
+                                // P69 (lane `cs`, fold f26c): GNU `mode(M)` -- the
+                                // declared type replaced by the type of a machine
+                                // mode, as the row's `machineModes` table maps it.
+                                {"machineMode",    AttributeEffect::MachineMode},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 
@@ -16145,14 +16212,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // explicit validation further down — is-array, non-empty,
                         // every entry a string, every value a known kind, no
                         // duplicates.
-                        static constexpr std::array<std::string_view, 13>
+                        static constexpr std::array<std::string_view, 15>
                             kEffectRowKeys{"names", "effect", "appliesTo",
                                            "conventions", "reason",
                                            "withinDeclarator", "withoutOperand",
                                            "onTypeAlias", "repeated",
                                            "leadingDecoratesDefinitionOf",
                                            "refusedOnDefinition", "ignoredOnAlias",
-                                           "availableObjectFormats"};
+                                           "ignoredOnInlineDefinition",
+                                           "availableObjectFormats",
+                                           "machineModes"};
                         DSS_CHECK_KEY_VOCABULARY(kEffectRowKeys);
 
                         // Every name seen so far, dunder-normalized → the verb
@@ -16434,6 +16503,166 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         out.reason,
                                         "why the attribute cannot be honoured; it "
                                         "is the refusal's own text");
+                            // P69 (lane `cs`, fold f26c): `machineModes` -- the
+                            // `machineMode` verb's table (`MachineModeRow`). Required
+                            // and non-empty on its verb, refused on any other; each
+                            // row names one or more modes (non-empty strings, written
+                            // without surrounding double underscores, never named by
+                            // two rows) and states EXACTLY ONE answer: `integerBytes`
+                            // (1, 2, 4, 8, 16, or "pointer" -- the target's pointer
+                            // width) or `core` (a floating representation: F32, F64,
+                            // F80, F128). Every refusal is C_InvalidSemantics, by path.
+                            {
+                                bool const modeVerb =
+                                    out.effect == AttributeEffect::MachineMode;
+                                auto const mmPath = rowPath + "/machineModes";
+                                if (!row.contains("machineModes")) {
+                                    if (modeVerb) {
+                                        coll.emit(
+                                            DiagnosticCode::C_InvalidSemantics, mmPath,
+                                            std::format(
+                                                "'machineModes' is REQUIRED on an "
+                                                "'effects' row whose effect is '{}' -- "
+                                                "the machine modes the attribute can "
+                                                "name, each with the type it selects",
+                                                verb));
+                                    }
+                                } else if (!modeVerb) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics, mmPath,
+                                        std::format(
+                                            "'machineModes' belongs to the "
+                                            "'machineMode' verb's row; on a row whose "
+                                            "effect is '{}' it would be read by "
+                                            "nothing", verb));
+                                } else if (!row.at("machineModes").is_array()
+                                           || row.at("machineModes").empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics, mmPath,
+                                        "'machineModes' must be a non-empty ARRAY of "
+                                        "{ names, integerBytes | core } rows -- a "
+                                        "table that maps no mode would refuse every "
+                                        "use of the attribute");
+                                } else {
+                                    std::vector<std::string> seenModes;
+                                    auto const& table = row.at("machineModes");
+                                    for (std::size_t mi = 0; mi < table.size(); ++mi) {
+                                        json const& m = table[mi];
+                                        auto const mPath =
+                                            std::format("{}/{}", mmPath, mi);
+                                        bool const shaped =
+                                            m.is_object() && m.contains("names")
+                                            && m.at("names").is_array()
+                                            && !m.at("names").empty();
+                                        if (!shaped) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics,
+                                                mPath,
+                                                "each 'machineModes' row must be an "
+                                                "object with a non-empty 'names' array");
+                                            continue;
+                                        }
+                                        for (auto const& [k, unused] : m.items()) {
+                                            (void)unused;
+                                            if (k != "names" && k != "integerBytes"
+                                                && k != "core" && !k.starts_with('$')) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    mPath + "/" + k,
+                                                    std::format(
+                                                        "unknown key '{}' in a "
+                                                        "'machineModes' row (accepted: "
+                                                        "names, integerBytes, core)", k));
+                                            }
+                                        }
+                                        MachineModeRow mm;
+                                        bool namesOk = true;
+                                        for (json const& n : m.at("names")) {
+                                            std::string const text =
+                                                n.is_string() ? n.get<std::string>()
+                                                              : std::string{};
+                                            if (text.empty() || text.starts_with("__")
+                                                || text.ends_with("__")) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    mPath + "/names",
+                                                    "each machine-mode name must be a "
+                                                    "non-empty string written without "
+                                                    "surrounding double underscores (the "
+                                                    "operand is dunder-normalized before "
+                                                    "it is looked up)");
+                                                namesOk = false;
+                                                continue;
+                                            }
+                                            if (std::ranges::find(seenModes, text)
+                                                != seenModes.end()) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    mPath + "/names",
+                                                    std::format(
+                                                        "machine mode '{}' is named by two "
+                                                        "'machineModes' rows -- one name, "
+                                                        "one replacement", text));
+                                                namesOk = false;
+                                                continue;
+                                            }
+                                            seenModes.push_back(text);
+                                            mm.names.push_back(text);
+                                        }
+                                        bool const hasBytes = m.contains("integerBytes");
+                                        bool const hasCore  = m.contains("core");
+                                        if (hasBytes == hasCore) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics, mPath,
+                                                "a 'machineModes' row states EXACTLY ONE "
+                                                "of 'integerBytes' (an integer mode) and "
+                                                "'core' (a floating mode)");
+                                            continue;
+                                        }
+                                        if (hasBytes) {
+                                            json const& b = m.at("integerBytes");
+                                            if (b.is_string()
+                                                && b.get<std::string>() == "pointer") {
+                                                mm.pointerWidth = true;
+                                            } else if (b.is_number_unsigned()
+                                                       && (b.get<std::uint64_t>() == 1
+                                                           || b.get<std::uint64_t>() == 2
+                                                           || b.get<std::uint64_t>() == 4
+                                                           || b.get<std::uint64_t>() == 8
+                                                           || b.get<std::uint64_t>() == 16)) {
+                                                mm.integerBytes = static_cast<std::uint32_t>(b.get<std::uint64_t>());
+                                            } else {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    mPath + "/integerBytes",
+                                                    "'integerBytes' must be 1, 2, 4, 8, 16 "
+                                                    "or \"pointer\" (the target's pointer "
+                                                    "width)");
+                                                continue;
+                                            }
+                                        } else {
+                                            json const& c = m.at("core");
+                                            auto const k = c.is_string()
+                                                ? typeKindFromName(c.get<std::string>())
+                                                : std::nullopt;
+                                            if (!k.has_value()
+                                                || (*k != TypeKind::F32 && *k != TypeKind::F64
+                                                    && *k != TypeKind::F80
+                                                    && *k != TypeKind::F128)) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    mPath + "/core",
+                                                    "'core' must name a floating "
+                                                    "representation: F32, F64, F80 or "
+                                                    "F128");
+                                                continue;
+                                            }
+                                            mm.floatCore = *k;
+                                        }
+                                        if (namesOk) out.machineModes.push_back(std::move(mm));
+                                    }
+                                }
+                            }
                             // P69 round 4 (lane `cs`): `withinDeclarator` — whose
                             // the attribute is when it is written inside a
                             // declarator beside the declared name (see
@@ -16748,6 +16977,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         "no 'appliesTo': nothing would read it");
                                 } else {
                                     out.ignoredOnAlias = v.get<std::string>();
+                                }
+                            }
+                            // P69 (lane `cs`, fold f26c): `ignoredOnInlineDefinition`
+                            // — the attribute, on an INLINE function definition, is
+                            // ignored and said, the text being the reason, where
+                            // `refusedOnDefinition` refuses every other definition.
+                            // Read beside it, so held to the same two rules.
+                            if (row.contains("ignoredOnInlineDefinition")) {
+                                json const& v = row.at("ignoredOnInlineDefinition");
+                                if (!v.is_string() || v.get<std::string>().empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/ignoredOnInlineDefinition",
+                                        "'ignoredOnInlineDefinition' must be a non-empty "
+                                        "STRING: why an inline definition does not take "
+                                        "the attribute; it is the warning's own text");
+                                } else if (out.appliesTo.empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/ignoredOnInlineDefinition",
+                                        "'ignoredOnInlineDefinition' is read by the "
+                                        "declaration-kind gate, and this row states "
+                                        "no 'appliesTo': nothing would read it");
+                                } else if (!row.contains("refusedOnDefinition")) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        rowPath + "/ignoredOnInlineDefinition",
+                                        "'ignoredOnInlineDefinition' is the exception to "
+                                        "'refusedOnDefinition', and this row states none: "
+                                        "nothing would read it");
+                                } else {
+                                    out.ignoredOnInlineDefinition = v.get<std::string>();
                                 }
                             }
                             // P69 (lane `cs`, fold f26b): `availableObjectFormats` —

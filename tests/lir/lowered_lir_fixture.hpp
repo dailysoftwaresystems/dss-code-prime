@@ -284,16 +284,13 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     if (auto const* cc = target->callingConvention(mirCcIndex)) {
         mirCfg.aggregateLayout           = target->aggregateLayout();
         mirCfg.aggregateLayoutLoaded     = target->aggregateLayoutLoaded();
-        mirCfg.aggregateClassification   = cc->aggregateClassification;
-        mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+        mirCfg.aggregate = cc->aggregate;   // the convention's aggregate rules, whole
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
         mirCfg.argSlotAligned            = cc->slotAligned;
         mirCfg.argGprCount               =
             static_cast<std::uint32_t>(cc->argGprs.size());
         mirCfg.argFprCount               =
             static_cast<std::uint32_t>(cc->argFprs.size());
-        mirCfg.aggregateStackExhaustsRegisters =
-            cc->aggregateStackExhaustsRegisters;
         // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
         // packing rules decide `va_start`'s overflow base for a callee whose named
         // params overflow the arg registers. ⚠ THREADED HERE AS PART OF ADDING THE

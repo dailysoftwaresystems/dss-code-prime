@@ -941,19 +941,21 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // sret mechanism follows the CC's indirect-result register (absent ⇒ hidden
     // first INTEGER arg, SysV/Win64; present ⇒ x8, AAPCS64 — C3).
     if (auto const* cc = target.callingConvention(callingConventionIndex)) {
-        mirCfg.aggregateClassification  = cc->aggregateClassification;
-        mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
+        // The convention's by-value aggregate rules, WHOLE (`AggregateConventionRules`: the FC7 strategy and
+        // register-size bound, the stack-exhaust policy of D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS,
+        // the MEMORY-class argument carrier of D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET
+        // and the X87UP rule) -- one assignment, so a key the row gains reaches the classifier with no
+        // second edit here (P69 lane `cs`, fold f26c, main's ledger 455).
+        mirCfg.aggregate = cc->aggregate;
         mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
         mirCfg.argSlotAligned           = cc->slotAligned;
         // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register
         // pool counts (the agnostic source for the all-or-nothing fit check on
-        // every call) + the stack-exhaust policy (SysV backfill vs AAPCS64 clamp).
+        // every call); the stack-exhaust policy rides in `aggregate` above.
         mirCfg.argGprCount              =
             static_cast<std::uint32_t>(cc->argGprs.size());
         mirCfg.argFprCount              =
             static_cast<std::uint32_t>(cc->argFprs.size());
-        mirCfg.aggregateStackExhaustsRegisters =
-            cc->aggregateStackExhaustsRegisters;
         // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
         // packing rules — HIR→MIR needs them for `va_start`'s overflow base, which
         // is the byte span of the named params that overflowed onto the incoming
@@ -1167,7 +1169,7 @@ static std::optional<CuHirModule> buildCuHirImpl(
     }
     // P69 fold f26b: a visibility this format cannot write becomes the one its
     // document states, before any tier reads it, and the program is told.
-    settleVisibilitiesWrittenAs(*hir, format.visibilityStandIns(), format.name(),
+    settleVisibilitiesWrittenAs(*hir, format, format.name(),
                                 [&](SymbolId s) {
                                     SymbolRecord const* r = model.recordFor(s);
                                     return r != nullptr ? r->name : std::string{};
@@ -1756,7 +1758,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     for (auto const& a : lir.funcLocalAlignments) {
         funcLocalAligns.push_back(
             LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
-                                  a.perAllocaAlignBytes});
+                                  a.perAllocaAlignBytes, a.stackedArgAlignBytes});
     }
     auto cc = materializeCallingConvention(*ccInput, target, alloc, reporter,
                                            sehFuncletParents,

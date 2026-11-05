@@ -1,0 +1,22 @@
+{
+  "$comment": "A CALL WHOSE CALLEE THE UNIT DECLARES NOWHERE DECLARES IT IMPLICITLY (C90 6.3.2.2; P69 round 1, lane cs, fold f26c, D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION). MEASURED by lane cs's probes ip and ip2 (each built and RUN): a call to a function only another unit defines runs 42 on gcc 13.3.0 (its default standard and -std=c2x), mingw-w64 gcc 13.2.0 and cl 19.51, each warning the implicit declaration ('implicit declaration of function', C4013); clang 18.1.3 refuses it ('call to undeclared function'), and so do gcc 14 and later by default (not measured: no leg has one). One working reference makes it required. Before this fold DSS refused every such call, S_UndeclaredIdentifier. The `float` and `short` arguments pin the default argument promotions and the non-variadic call. Every return before 42 names the first fact that failed. The release arm pins that the optimizer keeps the promotions.",
+  "language": "c",
+  "sources": ["main.c", "other.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "$expectWarningsComment": "One warning per NAME, at its first call: g, h, k (g's second call says nothing). The entries are `positioned:false` because the manifest has two sources and a position names one buffer; the analyzer pin SemanticAnalyzerC.ACallBeforeAnyDeclarationDeclaresItsCalleeImplicitly asserts the warning exactly once per name.",
+  "expectWarnings": [
+    { "code": "S_ImplicitFunctionDeclaration", "line": 0, "col": 0, "positioned": false, "$comment": "g" },
+    { "code": "S_ImplicitFunctionDeclaration", "line": 0, "col": 0, "positioned": false, "$comment": "h" },
+    { "code": "S_ImplicitFunctionDeclaration", "line": 0, "col": 0, "positioned": false, "$comment": "k" }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -329,7 +329,7 @@ struct EngineState {
     // decides what is generated.
     //
     // ★ THE SCOPE IS PART OF THE KEY, NOT AN ASSUMPTION. `subtreeType` resolves an
-    // IDENTIFIER leaf by `scopes.lookup(scope, text)`, so the derived type of a
+    // IDENTIFIER leaf by `lookupOrdinaryUse(scope, leaf)`, so the derived type of a
     // subtree is a function of `(node, scope)` — the same node typed under a
     // different (or an invalid) scope is a DIFFERENT question and gets its own
     // answer. An entry whose recorded scope does not match the asking scope is a
@@ -643,7 +643,8 @@ struct EngineState {
     // scope the declarations bind in and the name. An import's effect at a point of
     // the unit is the latest declaration's before that point (`importInEffectAt`): a
     // later declaration that does not import ends it, but a use written between the
-    // two was made while it held. Only names with an import are recorded.
+    // two was made while it held. Only names with an import are recorded. A position is
+    // a stream rank (`streamRank`, fold f26c).
     struct ImportHistoryEntry {
         std::uint64_t position = 0;
         bool          imports  = false;
@@ -652,12 +653,38 @@ struct EngineState {
     // P69 (lane `cs`, fold f26b): every BLOCK-scope declaration of a function (a bare
     // prototype or an `extern` one — both have external linkage), keyed by its tree and
     // name, in source order: what a CALL whose callee names nothing visible resolves to
-    // (`blockFunctionDeclarationBefore`, cl's and clang's rule).
+    // (`blockFunctionDeclarationBefore`, cl's and clang's rule). A position is a stream
+    // rank (`streamRank`, fold f26c).
     struct BlockFunctionDeclaration {
         std::uint64_t position = 0;
         SymbolId      symbol{};
     };
     std::unordered_map<std::string, std::vector<BlockFunctionDeclaration>> blockFunctionDeclarations;
+    // ★★ P69 (lane `cs`, fold f26c): each tree's TOKEN-STREAM ORDER — every node's rank in a
+    // pre-order walk of the tree, indexed by `NodeId::v`, built on first ask (`streamRank`).
+    // Where a declaration stands relative to a use is asked in this order, never by byte
+    // offset: a token a macro's expansion copied from its body carries the span of the BODY,
+    // where the `#define` is written, so byte order is not the order C reads the unit in
+    // (✔MEASURED, lane `cs`'s run f26c-s2: the shipped runtime's `DSS_EMIT_PIECE`, defined
+    // above `render_spec` and expanded in it, named `render_spec`'s parameters at bytes before
+    // their declarations, and the position-aware lookup refused every one as undeclared).
+    mutable std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> streamRankByTree;
+    // ★★ P69 (lane `cs`, fold f26c — the TAG form of the NAME-USED-BEFORE row): where each scope's
+    // struct or union TAG is first written WITHOUT a body, keyed by the scope (the one a declaration the
+    // reference makes lands in, `floatToNamespaceScope`) and the tag: the first reference, and the first
+    // declaration of the form `struct S;` (C 6.7.2.3p7), each a stream rank (`streamRank`, 0 = none).
+    // Recorded by Pass 1's pre-order, so it is whole before any use resolves (`lookupTagUse`).
+    struct TagFirstWritten {
+        std::uint32_t reference = 0;
+        std::uint32_t tagOnlyDeclaration = 0;
+    };
+    std::map<std::pair<std::uint32_t, std::string>, TagFirstWritten> tagFirstWritten;
+    // ★★ P69 (lane `cs`, fold f26c): the function a call declared IMPLICITLY, keyed by its
+    // tree and name (`blockFunctionDeclarationKey`) — one entity however many calls of the
+    // unit make it (`implicitlyDeclaredCallee`) — and the names whose implicit declaration
+    // was already said, so each is warned once (as gcc and cl warn it).
+    std::unordered_map<std::string, SymbolId> implicitDeclarationOf;
+    std::unordered_set<std::string>           implicitDeclarationSaid;
     // P69 round 4 (lane `cs`): the attribute SPECIFIER nodes a declaration's own
     // fold has already judged (`scanAttributeSemantics` with `emitUnknown` — the
     // once-per-declaration, diagnostic-owning scan), keyed (TreeId.v << 32) |
@@ -666,6 +693,11 @@ struct EngineState {
     // layer, a parenthesized declarator), so no specifier is judged twice and none
     // is judged by nobody.
     std::unordered_set<std::uint64_t> attrSpecifiersJudgedByADeclaration;
+    // P69 (lane `cs`, fold f26c): the GNU `mode(M)` clauses a declaration has judged
+    // against a declared type (`declaredTypeUnderMachineMode`), keyed like the set
+    // above. A declaration-level clause reaches every declarator and its refusal is
+    // said once; Pass 2 refuses only a clause no declaration judged.
+    std::unordered_set<std::uint64_t> machineModeClausesJudged;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -721,12 +753,14 @@ struct EngineState {
     // the merge the composite, and `typeVisibleAt` needs what each one said alone.
     std::unordered_map<std::uint32_t /*SymbolId.v*/, TypeId> ownDeclaredType;
     // P69 (lane `cs`, fold f26b): where in its tree each such record's declaration
-    // starts (kept beside `ownDeclaredType`), and the composite of the merge's
+    // starts — its `streamRank` (fold f26c: it was a byte offset, and a declaration
+    // whose name a paste produced started "after" every use, so a later `sizeof` read
+    // the incomplete array, probe fp6) — kept beside `ownDeclaredType`, and the composite of the merge's
     // declarations VISIBLE just after each record's own — every one of another tree,
     // and those of its own tree written no later. `composeArrayRedeclaration` builds
     // it (the composite may be a type neither declaration spells, which only a
     // builder that interns can make); `typeVisibleAt` reads it at a use.
-    std::unordered_map<std::uint32_t /*SymbolId.v*/, std::uint32_t> ownDeclaredAt;
+    std::unordered_map<std::uint32_t /*SymbolId.v*/, std::uint32_t> ownDeclaredRank;
     std::unordered_map<std::uint32_t /*SymbolId.v*/, TypeId>        compositeVisibleAfter;
 
     // Select the index bundle for `schema` before processing one of its trees.
@@ -2045,10 +2079,16 @@ paramRowSpellsUninternedQualifier(EngineState& s, SemanticConfig const& cfg,
     return false;
 }
 
+// The token-stream order (defined with `streamRanksOf`, below): every "is A written before B" question this
+// analyzer asks reads it, never a byte offset.
+[[nodiscard]] std::uint32_t streamRank(EngineState const& s, Tree const& tree, NodeId n);
+[[nodiscard]] std::uint32_t streamRankPast(EngineState const& s, Tree const& tree, NodeId n);
+
 // ── A COMPOSITE'S COMPLETENESS AT A POINT (P68 round 8, lane `ht`, part 2) ──────
 //
-// Is `t` — a struct or union, qualifier skins seen through — INCOMPLETE at byte
-// offset `point` of `tree`? C 6.2.5p1 makes completeness a property of a POINT in
+// Is `t` — a struct or union, qualifier skins seen through — INCOMPLETE at stream
+// rank `pointRank` of `tree` (`streamRank` of a node to ask at its start,
+// `streamRankPast` to ask just after it)? C 6.2.5p1 makes completeness a property of a POINT in
 // the translation unit, and C 6.7.2.1p8 completes a composite only after the `}`
 // that closes its member list. Pass 1.5 completes composites in source order, but a
 // Pass 2 check runs after EVERY completion, so the interner's flag alone would call a
@@ -2059,9 +2099,15 @@ paramRowSpellsUninternedQualifier(EngineState& s, SemanticConfig const& cfg,
 // definition ENDS; completed with no recorded site (complete-at-once: a shipped
 // descriptor, a reinterned or text-read type) or in ANOTHER tree (no source order
 // spans trees) ⇒ complete. Anything but a struct or union is never incomplete here.
+// ★ P69 (lane `cs`, fold f26c): the point and the definition's end are STREAM RANKS.
+// They were byte offsets, and a token the preprocessor materializes — a paste's
+// product — lives in the synth buffer's product tail, past every source byte: a
+// struct whose tag was pasted (`struct S##N { … };`) ended "after" every later
+// function, so its parameter and its result were refused as incomplete (probe fp6,
+// DSS; gcc, clang, mingw-w64 gcc, Apple clang and cl take them).
 [[nodiscard]] bool
 compositeIncompleteAt(EngineState const& s, Tree const& tree, TypeId t,
-                      ByteOffset point) {
+                      std::uint32_t pointRank) {
     if (!t.valid()) return false;
     TypeInterner const& in = s.lattice.interner();
     TypeKind const k = in.kind(t);
@@ -2071,7 +2117,7 @@ compositeIncompleteAt(EngineState const& s, Tree const& tree, TypeId t,
     if (it == s.compositeScopeByType.end() || !it->second.valid()) return false;
     ScopeRecord const& sc = s.scopes.scopes()[it->second.v];
     if (!sc.anchor.valid() || sc.tree.v != tree.id().v) return false;
-    return tree.span(sc.anchor).end() > point;
+    return streamRankPast(s, tree, sc.anchor) > pointRank;
 }
 
 // The spelling of a struct/union TYPE in a diagnostic sentence — `struct S` /
@@ -3646,6 +3692,48 @@ pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 [[nodiscard]] bool pointeeSpinesDiverge(std::optional<QualifierSpine> const& a,
                                         std::optional<QualifierSpine> const& b);
 
+// ★★ P69 (lane `cs`, fold f26c): THE RANK OF `n` IN `tree`'S TOKEN STREAM — its place in a pre-order walk of
+// the tree (the parser appends each child in the order it reads the unit, so pre-order IS that order) — and
+// (`streamRankPast`) the rank just past every node of `n`'s subtree: a node `u` is read after the whole of `d`
+// iff `streamRank(u) >= streamRankPast(d)`. Built once per tree (`EngineState::streamRankByTree`), with an
+// explicit work stack (no recursion proportional to the input). The ONE order in which this analyzer asks
+// whether a declaration is written before a use — byte offsets are not that order (a token a macro's expansion
+// copied from its body carries the body's span).
+[[nodiscard]] std::vector<std::uint32_t> const& streamRanksOf(EngineState const& s, Tree const& tree) {
+    auto [it, fresh] = s.streamRankByTree.try_emplace(tree.id().v);
+    std::vector<std::uint32_t>& rank = it->second;
+    if (!fresh) return rank;
+    rank.assign(tree.nodeCount() + 1, 0);
+    NodeId const root = tree.root();
+    if (!root.valid()) return rank;
+    std::uint32_t next = 1;
+    std::vector<NodeId> work{root};
+    substrate::WalkSteps steps{tree.nodeCount() + 1, "streamRanksOf"};
+    while (!work.empty()) {
+        steps.step();
+        NodeId const n = work.back();
+        work.pop_back();
+        rank.at(n.v) = next++;
+        auto const kids = tree.children(n);
+        for (auto k = kids.rbegin(); k != kids.rend(); ++k) work.push_back(*k);
+    }
+    return rank;
+}
+
+[[nodiscard]] std::uint32_t streamRank(EngineState const& s, Tree const& tree, NodeId n) {
+    return streamRanksOf(s, tree).at(n.v);
+}
+
+[[nodiscard]] std::uint32_t streamRankPast(EngineState const& s, Tree const& tree, NodeId n) {
+    NodeId last = n;
+    substrate::WalkSteps steps{tree.nodeCount() + 1, "streamRankPast"};
+    for (auto kids = tree.children(last); !kids.empty(); kids = tree.children(last)) {
+        steps.step();
+        last = kids.back();
+    }
+    return streamRank(s, tree, last) + 1;
+}
+
 // ★ P69 L2 (lane `lm`): WHERE AN ORDINARY IDENTIFIER'S SCOPE BEGINS, in its own tree
 // (C 6.2.1p7): "just after the completion of its declarator" — the outermost
 // declarator around its name node (the name climbs through the declarator, its
@@ -3657,20 +3745,22 @@ pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // The scope tree binds a whole block's declarations up front, so this position is
 // what tells a declaration BEFORE a use from one after it.
 //
-// THE CONTRACT (self-contained: one rule, no state; a caller compares, this decides
-// nothing else):
+// THE CONTRACT (one rule; a caller compares, this decides nothing else):
 //   * it reads only `cfg.declarators` (the declarator, direct-declarator and group
-//     rules), `tree` (parents, rules, spans) and the record's `tree`, `declNode` and
-//     `declRuleNode` - no scope, symbol table or analysis state;
+//     rules), `tree` (parents, rules, children), the tree's token-stream order
+//     (`streamRankPast`, the only state it asks) and the record's `tree`, `declNode`
+//     and `declRuleNode` - no scope or symbol table;
 //   * the record must sit in `tree`, the USE's own tree; otherwise std::nullopt;
-//   * the answer is the END of the completed declarator: climbed from `declNode`
-//     through the declarator, direct-declarator and group rules, the outermost
-//     declarator reached; with no declarator, the end of the declaration-rule node,
-//     else of `declNode` itself;
-//   * a use whose own span starts at byte `u` of `tree` sees the record iff the
+//   * the answer is the stream rank just past the completed declarator: climbed from
+//     `declNode` through the declarator, direct-declarator and group rules, the
+//     outermost declarator reached; with no declarator, the declaration-rule node,
+//     else `declNode` itself;
+//   * a use whose node has stream rank `u` (`streamRank`) sees the record iff the
 //     answer is present and at or before `u` (the caller's `*begins <= useAt`).
-[[nodiscard]] std::optional<ByteOffset>
-ordinaryScopeBeginsAt(SemanticConfig const& cfg, Tree const& tree,
+//     (P69, lane `cs`, fold f26c: it answered a byte offset, which a token a macro's
+//     expansion copied from its body does not order.)
+[[nodiscard]] std::optional<std::uint32_t>
+ordinaryScopeBeginsAt(EngineState const& s, SemanticConfig const& cfg, Tree const& tree,
                       SymbolRecord const& rec) {
     if (rec.tree.v != tree.id().v || !rec.declNode.valid()) return std::nullopt;
     NodeId declarator = InvalidNode;
@@ -3689,7 +3779,133 @@ ordinaryScopeBeginsAt(SemanticConfig const& cfg, Tree const& tree,
     NodeId const completed = declarator.valid()            ? declarator
                              : rec.declRuleNode.valid()    ? rec.declRuleNode
                                                            : rec.declNode;
-    return tree.span(completed).end();
+    return streamRankPast(s, tree, completed);
+}
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE): WHETHER A USE
+// AT STREAM RANK `useAt` OF `tree` (`streamRank`) SEES THE ORDINARY BINDING `bound` THAT `scope` HOLDS — the one answer every lookup
+// of a use asks (`lookupOrdinaryUse`). The scope tree binds a whole scope's declarations up front; C 6.2.1p7
+// begins an identifier's scope just after its declarator completes. A scope's binding of a name is therefore
+// seen from the end of the FIRST declaration of the name IN THAT SCOPE: the earliest, by
+// `ordinaryScopeBeginsAt`, of the binding's own record and of every record it was merged with (Pass 1's
+// redeclaration merge, the block-extern sweep — `redeclarationPartners`, followed to the end of the group)
+// that sits in that scope. The binding a block's declaration was REPOINTED at (a file-scope record) is so seen
+// from the block's own declaration. A binding with no record of that scope (one injected from another unit's
+// tree, a lifted member) is judged by its own record, and one with no position in `tree` (another tree's, a
+// builtin, a seed) is seen everywhere. Before `redeclarationPartners` is built (Pass 1) a record stands alone.
+[[nodiscard]] bool ordinaryBindingBegunAt(EngineState const& s, SemanticConfig const& cfg, Tree const& tree,
+                                          ScopeId scope, SymbolId bound, std::uint32_t useAt) {
+    std::optional<std::uint32_t> earliest;
+    bool anyInScope = false;
+    bool seenEverywhere = false;
+    std::vector<SymbolId> work{bound};
+    std::unordered_set<std::uint32_t> visited{bound.v};
+    while (!work.empty()) {
+        SymbolId const id = work.back();
+        work.pop_back();
+        SymbolRecord const& r = s.symbols.at(id);
+        if (r.scope.v == scope.v) {
+            anyInScope = true;
+            std::optional<std::uint32_t> const b = ordinaryScopeBeginsAt(s, cfg, tree, r);
+            if (!b.has_value()) seenEverywhere = true;
+            else if (!earliest.has_value() || *b < *earliest) earliest = *b;
+        }
+        if (auto const p = s.redeclarationPartners.find(id.v); p != s.redeclarationPartners.end()) {
+            for (SymbolId const q : p->second)
+                if (q.valid() && visited.insert(q.v).second) work.push_back(q);
+        }
+    }
+    if (!anyInScope) {
+        std::optional<std::uint32_t> const b =
+            ordinaryScopeBeginsAt(s, cfg, tree, s.symbols.at(bound));
+        return !b.has_value() || *b <= useAt;
+    }
+    return seenEverywhere || (earliest.has_value() && *earliest <= useAt);
+}
+
+// The ORDINARY binding a USE of `name` at `useNode` sees from `here`: the innermost binding whose scope has
+// begun at the use (`ordinaryBindingBegunAt`), a binding not begun passed over for the enclosing scope's — or
+// InvalidSymbol, where no declaration of the name is in scope (C 6.5.1p2). Every site that resolves a use of
+// an ordinary identifier asks this; a lookup that is no use (a declaration's own name, a scope's survey) does
+// not.
+[[nodiscard]] SymbolId lookupOrdinaryUse(EngineState const& s, Tree const& tree, ScopeId here,
+                                         std::string_view name, NodeId useNode) {
+    SemanticConfig const* cfg = s.idx().cfg;
+    // A language whose document does not state C 6.2.1p7 (`declarators.scopeBeginsAfterDeclarator`)
+    // sees a scope's names from its start: the toy language and the synthetic grammars declare
+    // after use.
+    if (cfg == nullptr || !useNode.valid() || !cfg->declarators.has_value()
+        || !cfg->declarators->scopeBeginsAfterDeclarator)
+        return s.scopes.lookup(here, name);
+    std::uint32_t const useAt = streamRank(s, tree, useNode);
+    return s.scopes.lookupIf(here, name, [&](SymbolId cand, ScopeId at) {
+        return ordinaryBindingBegunAt(s, *cfg, tree, at, cand, useAt);
+    });
+}
+
+// ★★ P69 (lane `cs`, fold f26c — the TAG form of D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE):
+// THE TAG A USE OF `name` AT `useNode` SEES FROM `here`. C 6.2.1p7 begins a tag's scope just after the tag
+// appears in the type specifier that declares it, and a reference names the tag VISIBLE there (C 6.7.2.3p9):
+// a block that declares its own `struct S` after a use does not capture the use, which names the enclosing
+// one (✔MEASURED, probe tg: this analyzer took the later tag — a `sizeof` silently wrong — where gcc,
+// clang, MinGW gcc and cl take the visible one). The scope tree binds a whole scope's tags up front, so
+// each scope's tag is seen from where that scope FIRST declares it: its binding's own tag (a definition's
+// name, a minted tag's reference), a `struct S;` of the scope (C 6.7.2.3p7: a new tag, whatever an
+// enclosing scope declares), or the first reference written there that saw no enclosing tag (C 6.7.2.3p8
+// declares it there) — `EngineState::tagFirstWritten`, judged from the outermost scope in, so a reference
+// that saw an enclosing tag declares nothing. The innermost scope whose tag has begun answers; one whose
+// `struct S;` has begun with no binding yet answers InvalidSymbol (the caller mints that scope's own tag).
+// With no tag begun anywhere the answer is the one this lookup always gave, the nearest binding: a tag
+// declared later in the use's own scope is the same tag (C 6.7.2.3p5: one scope, one tag, one type), and a
+// prototype's reference takes a file-scope tag declared later, as cl reads it. A binding of another tree
+// (an import) or with no position is seen everywhere. A language whose document does not state C 6.2.1p7
+// (`declarators.scopeBeginsAfterDeclarator`) sees a scope's tags from its start.
+[[nodiscard]] SymbolId lookupTagUse(EngineState const& s, Tree const& tree, ScopeId here,
+                                    std::string_view name, NodeId useNode) {
+    SemanticConfig const* cfg = s.idx().cfg;
+    if (cfg == nullptr || !useNode.valid() || !cfg->declarators.has_value()
+        || !cfg->declarators->scopeBeginsAfterDeclarator)
+        return s.scopes.lookup(here, name, SymbolNamespace::Tag);
+    std::uint32_t const useAt = streamRank(s, tree, useNode);
+    auto const& scs = s.scopes.scopes();
+    std::vector<ScopeId> chain;   // innermost first
+    for (ScopeId at = here; at.valid() && at.v < scs.size(); at = scs[at.v].parent) chain.push_back(at);
+    constexpr std::uint32_t kNever = std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> begins(chain.size(), kNever);
+    std::vector<std::uint32_t> declaredOnly(chain.size(), kNever);
+    std::vector<SymbolId> bound(chain.size(), InvalidSymbol);
+    std::uint32_t enclosing = kNever;   // the earliest an enclosing scope's tag is seen
+    for (std::size_t i = chain.size(); i-- > 0;) {
+        ScopeRecord const& rec = scs[chain[i].v];
+        std::uint32_t b = kNever;
+        if (auto const hit = rec.tagBindings.find(name); hit != rec.tagBindings.end()) {
+            bound[i] = hit->second;
+            SymbolRecord const& r = s.symbols.at(hit->second);
+            b = (r.tree.v != tree.id().v || !r.declNode.valid())
+                    ? 0
+                    : streamRankPast(s, tree, r.declNode);
+        }
+        if (!s.tagFirstWritten.empty()) {
+            auto const w = s.tagFirstWritten.find({chain[i].v, std::string{name}});
+            if (w != s.tagFirstWritten.end()) {
+                if (w->second.tagOnlyDeclaration != 0) {
+                    declaredOnly[i] = w->second.tagOnlyDeclaration;
+                    b = std::min(b, w->second.tagOnlyDeclaration);
+                }
+                if (w->second.reference != 0 && w->second.reference < enclosing)
+                    b = std::min(b, w->second.reference);
+            }
+        }
+        begins[i] = b;
+        enclosing = std::min(enclosing, b);
+    }
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        if (begins[i] > useAt) continue;
+        if (bound[i].valid()) return bound[i];
+        if (declaredOnly[i] <= useAt) return InvalidSymbol;
+        break;
+    }
+    return s.scopes.lookup(here, name, SymbolNamespace::Tag);
 }
 
 // ★ P69 L2 (lane `lm`): A STRUCTURE OR UNION MEMBER is no ordinary identifier — each
@@ -4036,8 +4252,9 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                           cfg.identifierToken,
                                           cfg.bracketIdentifierToken);
                 if (!rn.name.empty()) {
-                    SymbolId const tagSym =
-                        s.scopes.lookup(scope, rn.name, SymbolNamespace::Tag);
+                    // ★★ P69 (lane `cs`, fold f26c): the tag VISIBLE at the reference, in the
+                    // order the unit is read (`lookupTagUse`) — not a tag its block declares later.
+                    SymbolId const tagSym = lookupTagUse(s, tree, scope, rn.name, node);
                     if (tagSym.valid()) {
                         auto const& rec = s.symbols.at(tagSym);
                         if (rec.kind == DeclarationKind::Type && rec.type.valid()) {
@@ -4893,15 +5110,30 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // and its scope has begun at the use (`ordinaryScopeBeginsAt`): the arm
         // returns InvalidType and the caller's miss reports it. One declared after
         // the use, or in another tree, is still skipped as before.
+        //
+        // ★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE, its
+        // typedef form): "its type is not resolved yet" is no proxy for "declared after the use" where the
+        // use is resolved AFTER Pass 1.5 — a `sizeof(T)` in an initializer, met by Pass 2 once every
+        // declaration's type is resolved, took `typedef char T;` declared below it in its block over the
+        // file's `typedef int T;` (✔MEASURED, lane `cs`'s tree at checkpoint 35: `int r = (int)sizeof(T);
+        // typedef char T; return r == 4 ? 42 : 1;` ran 1; gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0
+        // and cl 19.51 run 42). A typedef is seen from the end of its declarator as every ordinary binding
+        // is (`ordinaryBindingBegunAt`, the one answer `lookupOrdinaryUse` asks), and its type must be
+        // resolved besides.
         if (scope.valid()) {
-            ByteOffset const useAt = tree.span(node).start();
+            std::uint32_t const useAt = streamRank(s, tree, node);
+            bool const ordered = cfg.declarators.has_value()
+                              && cfg.declarators->scopeBeginsAfterDeclarator;
             SymbolId const aliasSym =
-                s.scopes.lookupIf(scope, text, [&s, &cfg, &tree, useAt](SymbolId cand) {
+                s.scopes.lookupIf(scope, text, [&s, &cfg, &tree, useAt, ordered](SymbolId cand,
+                                                                                 ScopeId at) {
                     auto const& r = s.symbols.at(cand);
-                    if (r.kind == DeclarationKind::Type) return r.type.valid();
+                    if (r.kind == DeclarationKind::Type)
+                        return r.type.valid()
+                            && (!ordered || ordinaryBindingBegunAt(s, cfg, tree, at, cand, useAt));
                     if (namesAMember(cfg, tree, r)) return false;   // not ordinary
-                    std::optional<ByteOffset> const begins =
-                        ordinaryScopeBeginsAt(cfg, tree, r);
+                    std::optional<std::uint32_t> const begins =
+                        ordinaryScopeBeginsAt(s, cfg, tree, r);
                     return begins.has_value() && *begins <= useAt;
                 });
             if (aliasSym.valid()
@@ -5091,8 +5323,8 @@ fixedValueTokenMap(Tree const& tree) {
 [[nodiscard]] std::optional<CstResolvedSymbol>
 resolveConstSymbolInit(EngineState const& s, Tree const& tree,
                        SemanticConfig const& cfg,
-                       ScopeId fromScope, std::string_view name) {
-    SymbolId const sym = s.scopes.lookup(fromScope, name);
+                       ScopeId fromScope, std::string_view name, NodeId useNode) {
+    SymbolId const sym = lookupOrdinaryUse(s, tree, fromScope, name, useNode);
     if (!sym.valid()) return std::nullopt;
     auto const& rec = s.symbols.at(sym);
     if (!rec.isConst) return std::nullopt;
@@ -5170,14 +5402,14 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
         env.resolveSymbolValue = [&s, &tree](NodeId identTok, std::uint32_t curScopeOpaque)
             -> std::optional<HirLiteralValue> {
             SymbolId const sym =
-                s.scopes.lookup(ScopeId{curScopeOpaque}, tree.text(identTok));
+                lookupOrdinaryUse(s, tree, ScopeId{curScopeOpaque}, tree.text(identTok), identTok);
             if (!sym.valid()) return std::nullopt;
             return constantLiteralForSymbol(s.symbols.at(sym), s.lattice.interner());
         };
         env.resolveSymbolInit = [&s, &tree, cfg](NodeId identTok, std::uint32_t curScopeOpaque)
             -> std::optional<CstResolvedSymbol> {
             return resolveConstSymbolInit(s, tree, *cfg, ScopeId{curScopeOpaque},
-                                          tree.text(identTok));
+                                          tree.text(identTok), identTok);
         };
         // P69 (C23 6.6p6-p7): a compound literal constant, and the `.member` of a
         // structure or union constant — read from the scope the engine is in, like a
@@ -6282,12 +6514,12 @@ constexprScalarInitIsConstant(EngineState& s, SemanticConfig const& cfg,
     SymbolId sym{};
     if (tree.kind(value) == NodeKind::Token) {
         if (tree.tokenKind(value).v != cfg.identifierToken.v) return false;
-        sym = s.scopes.lookup(here, tree.text(value));
+        sym = lookupOrdinaryUse(s, tree, here, tree.text(value), value);
     } else {
         auto const named = extractNameNode(tree, value, NameMatchMode::Self,
                                            cfg.identifierToken);
         if (!named.node.valid()) return false;
-        sym = s.scopes.lookup(here, named.name);
+        sym = lookupOrdinaryUse(s, tree, here, named.name, named.node);
     }
     if (!sym.valid()) return false;
     SymbolRecord const& rec = s.symbols.at(sym);
@@ -7598,7 +7830,10 @@ scanSpecifierStorage(SemanticConfig const& cfg, Tree const& tree, NodeId prefix,
                         && tree.rule(c).v == cfg.stdAttrRule.v)))
                 skip = true;
             if (skip) continue;
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            // Pushed last-first, so the walk pops them in the order they were read:
+            // the subtree's pre-order, which is the token-stream order (`streamRank`).
+            auto const kids = visibleChildren(tree, c);
+            for (auto g = kids.rbegin(); g != kids.rend(); ++g) stack.push_back(*g);
             continue;
         }
         auto it = specifiers.find(std::string{tree.text(c)});
@@ -7618,13 +7853,12 @@ scanSpecifierStorage(SemanticConfig const& cfg, Tree const& tree, NodeId prefix,
                                &it->second.compatibleWith});
     }
     // C 6.7.1p2 — at most ONE DISTINCT member of a group per declaration.
-    // ★ THE SORT IS LOAD-BEARING, not cosmetic: the DFS above pops children in
-    // REVERSE source order, so the raw hit order would name the LATER specifier
-    // first and point the diagnostic at the wrong end of the declaration.
-    std::sort(grouped.begin(), grouped.end(),
-              [&](GroupHit const& a, GroupHit const& b) {
-                  return tree.span(a.node).start() < tree.span(b.node).start();
-              });
+    // ★ THE ORDER IS LOAD-BEARING, not cosmetic: the hits must be in source order or
+    // the diagnostic names the LATER specifier first and points at the wrong end of
+    // the declaration. The walk above collects them in the token-stream order. ★ P69
+    // (lane `cs`, fold f26c): it collected them in reverse and a SORT BY BYTE OFFSET
+    // restored the order — which a token the preprocessor materializes (a paste's
+    // product, in the synth buffer's product tail) does not keep.
     for (std::size_t i = 0; i + 1 < grouped.size() && out.conflictGroup.empty();
          ++i) {
         for (std::size_t j = i + 1; j < grouped.size(); ++j) {
@@ -7865,6 +8099,11 @@ struct AttributeSemanticsFacts {
     NodeId commonNameToken{};
     NodeId noCommonClause{};
     NodeId noCommonNameToken{};
+    // P69 (lane `cs`, fold f26c): the LAST `machineMode` clause folded (GNU
+    // `mode(M)`) and its row — of two modes on one declaration the last stands.
+    // Judged against the declared type by `declaredTypeUnderMachineMode`.
+    NodeId                       machineModeClause{};
+    AttributeSemanticsRow const* machineModeRow = nullptr;
 
     // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT): EVERY MATCHED
     // CLAUSE, kept as itself so the decl-kind gate can REPORT.
@@ -8599,14 +8838,15 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
 //     and GNU `aligned`'s) — the larger stands, nothing is discarded;
 //   * a row that takes the LAST (`alignRepeatTakesLast`) — the one written later in
 //     the source stands, and the other is returned as DISCARDED so the emitting
-//     visit can say so. Source order is read from the spans, never from the order
-//     the roots happen to be scanned in: a declaration's attribute positions are
-//     visited prefix first and declarator runs last, which is not always the order
-//     they were written in.
+//     visit can say so. Source order is the token-stream order (`streamRank`),
+//     never the order the roots happen to be scanned in: a declaration's attribute
+//     positions are visited prefix first and declarator runs last, which is not
+//     always the order they were written in. (P69, lane `cs`, fold f26c: it was
+//     read from the spans' byte offsets, which a materialized token does not keep.)
 // The same clause met twice (a declaration-level request copied into each
 // declarator's facts and then seen again) is not a repeat.
 [[nodiscard]] NodeId
-foldAlignmentRequest(Tree const& tree, AttributeSemanticsRow const& row,
+foldAlignmentRequest(EngineState const& s, Tree const& tree, AttributeSemanticsRow const& row,
                      std::optional<std::uint32_t>& value, NodeId& standing,
                      std::uint32_t want, NodeId clauseNode) {
     if (!value.has_value()) {
@@ -8624,7 +8864,7 @@ foldAlignmentRequest(Tree const& tree, AttributeSemanticsRow const& row,
     }
     bool const thisIsLater =
         !standing.valid()
-        || tree.span(clauseNode).start() >= tree.span(standing).start();
+        || streamRank(s, tree, clauseNode) >= streamRank(s, tree, standing);
     NodeId const discarded = thisIsLater ? standing : clauseNode;
     if (thisIsLater) {
         value    = want;
@@ -9055,7 +9295,7 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                                              : out.alignmentClause;
                 auto const meet = [&](std::uint32_t want) {
                     NodeId const discarded = foldAlignmentRequest(
-                        tree, *row, slotValue, slotClause, want, clauseNode);
+                        s, tree, *row, slotValue, slotClause, want, clauseNode);
                     if (discarded.valid() && emitUnknown) {
                         reportDiscardedAlignmentRequest(s, tree, discarded,
                                                         clause->name);
@@ -9278,6 +9518,13 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 out.noCommonClause    = clauseNode;
                 out.noCommonNameToken = clause->nameToken;
                 break;
+            case AttributeEffect::MachineMode:
+                // P69 (lane `cs`, fold f26c): kept, not judged — what the mode
+                // means depends on the declared type it replaces, which this fold
+                // does not have (`declaredTypeUnderMachineMode`). The last stands.
+                out.machineModeClause = clauseNode;
+                out.machineModeRow    = row;
+                break;
             case AttributeEffect::CallingConvention:
             case AttributeEffect::Unsupported:
                 break;   // not reached: returned above, judged once by Pass 2
@@ -9305,6 +9552,489 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
         bool const stdForm = collectAttrClauses(cfg, tree, an, clauses);
         for (NodeId cl : clauses) foldClause(cl, stdForm);
     }
+}
+
+// ★★ P69 (lane `cs`, fold f26c) — GNU `mode(M)`: THE TYPE A MACHINE MODE MAKES OF `ty`.
+//
+// The language document's row names the modes and what each is
+// (`AttributeSemanticsRow::machineModes`); this is the ONE substitution that reads it.
+// ✔MEASURED (lane `cs`'s probes md and md2: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc
+// 13.2.0, Apple clang, aarch64 gcc 13.3.0):
+//   * an INTEGER mode on an integer type is the integer type of that width with the
+//     declared type's signedness -- plain `char`'s is the target's, an enumeration's its
+//     underlying type's -- and its IDENTITY is the first standard type of that width
+//     (`_Generic` picks `long` for DI on LP64 and `long long` on LLP64, `signed char` for
+//     QI): the first `typeSpecifiers` row, in document order, whose core is that kind;
+//   * `_Bool` takes clang's answer, an unsigned integer of the width (gcc refuses);
+//   * a FLOATING mode on a floating type is the first type of that representation; a
+//     target whose C has no such type refuses it by name (gcc and clang give TF on
+//     x86_64 and XF on pe64 a type of their own -- a split, stated in the row);
+//   * a POINTER keeps its type when the mode is the pointer's width (gcc), and is
+//     refused otherwise (gcc refuses every other width, clang every pointer mode);
+//   * qualifiers and an alignment the declared type carries stay on the result;
+//   * REFUSED BY NAME, as every reference refuses them: no operand, a name the row does
+//     not map (a vector mode among them: this compiler has no vector types), a floating
+//     mode on an integer type and the reverse, an array, a function, a structure.
+// A refusal returns `ty` unchanged (the build fails on the error); `report` says
+// whether this call is the one that says it.
+[[nodiscard]] TypeId
+machineModeType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                NodeId clauseNode, AttributeSemanticsRow const& row, TypeId ty,
+                bool report) {
+    if (!ty.valid()) return ty;
+    TypeInterner& in = s.lattice.interner();
+    auto const refuse = [&](std::string why) {
+        if (report) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_AttributeNotHonoured;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(clauseNode);
+            d.actual   = std::move(why);
+            s.reporter.report(std::move(d));
+        }
+        return ty;
+    };
+    // The operand: ONE identifier, dunder-normalized (`__DI__` is `DI`).
+    NodeId const operand = attrClauseArgOperand(cfg, tree, clauseNode);
+    std::string_view written = operand.valid() ? tree.text(operand) : std::string_view{};
+    while (!written.empty() && (written.front() == ' ' || written.front() == '\t'))
+        written.remove_prefix(1);
+    while (!written.empty() && (written.back() == ' ' || written.back() == '\t'))
+        written.remove_suffix(1);
+    auto const identChar = [](char c, bool first) {
+        return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (!first && c >= '0' && c <= '9');
+    };
+    bool isIdent = !written.empty();
+    for (std::size_t i = 0; isIdent && i < written.size(); ++i)
+        isIdent = identChar(written[i], i == 0);
+    if (!isIdent) {
+        return refuse("attribute 'mode' takes ONE operand, the name of a machine "
+                      "mode (`mode(DI)`), and here it has none that is a name");
+    }
+    std::string_view const name = stripDunder(written);
+    MachineModeRow const* mm = nullptr;
+    for (MachineModeRow const& r : row.machineModes) {
+        if (std::ranges::find(r.names, name) != r.names.end()) { mm = &r; break; }
+    }
+    if (mm == nullptr) {
+        std::string known;
+        for (MachineModeRow const& r : row.machineModes)
+            for (std::string const& n : r.names) {
+                if (!known.empty()) known += ", ";
+                known += n;
+            }
+        return refuse(std::format(
+            "'{}' is not a machine mode this compiler maps to a type (it maps {}); a "
+            "vector mode would need vector types, which this compiler does not have",
+            written, known));
+    }
+    TypeId const material = in.stripVolatile(ty);
+    std::int64_t const quals = in.qualifierBits(ty);
+    std::uint32_t const skinAlign = in.typeAlignOverride(ty);
+    auto const requalify = [&](TypeId t) {
+        return quals != 0 || skinAlign != 0 ? in.qualified(t, quals, skinAlign) : t;
+    };
+    TypeKind const k = in.kind(material);
+    auto const pointerBytes = [&]() -> std::optional<std::uint64_t> {
+        if (!s.aggregateLayout.has_value()) return std::nullopt;
+        auto const lay = computeLayout(in.pointer(in.primitive(TypeKind::Void)), in,
+                                       *s.aggregateLayout, s.dataModel);
+        if (!lay.has_value()) return std::nullopt;
+        return static_cast<std::uint64_t>(lay->size);
+    };
+    auto const firstTypeOf = [&](TypeKind want) -> TypeId {
+        for (TypeSpecifierRule const& ts : cfg.typeSpecifiers) {
+            if (ts.complex) continue;
+            auto const core = ts.resolveCore(s.dataModel, s.longDoubleFormat);
+            if (core.has_value() && *core == want) return in.primitive(want, ts.name);
+        }
+        return InvalidType;
+    };
+    if (k == TypeKind::Ptr) {
+        auto const width = pointerBytes();
+        if (!mm->isFloat() && width.has_value()
+            && (mm->pointerWidth || mm->integerBytes == *width)) {
+            return ty;
+        }
+        return refuse(std::format(
+            "mode '{}' cannot be applied to a pointer: a pointer is {} bytes here and "
+            "cannot be made another width or a floating type",
+            written, width.has_value() ? std::to_string(*width) : std::string{"?"}));
+    }
+    // An integer type: its kind, its enumeration's underlying kind, `_Bool`, plain `char`.
+    std::optional<bool> integerSigned;
+    switch (in.kind(enumUnderlyingOrSelf(in, material))) {
+        case TypeKind::Bool: integerSigned = false; break;
+        case TypeKind::Char: integerSigned = !s.charIsUnsigned.value_or(false); break;
+        case TypeKind::I8: case TypeKind::I16: case TypeKind::I32: case TypeKind::I64:
+        case TypeKind::I128: integerSigned = true; break;
+        case TypeKind::U8: case TypeKind::U16: case TypeKind::U32: case TypeKind::U64:
+        case TypeKind::U128: integerSigned = false; break;
+        default: break;
+    }
+    bool const floating = k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
+                       || k == TypeKind::F80 || k == TypeKind::F128;
+    if (!integerSigned.has_value() && !floating) {
+        std::string_view noun = "a type that is neither an integer, a floating nor a "
+                                "pointer type";
+        switch (k) {
+            case TypeKind::FnSig:   noun = "a function type"; break;
+            case TypeKind::Array:   noun = "an array type"; break;
+            case TypeKind::Struct:  noun = "a structure type"; break;
+            case TypeKind::Union:   noun = "a union type"; break;
+            case TypeKind::Void:    noun = "void"; break;
+            case TypeKind::Complex: noun = "a complex type"; break;
+            case TypeKind::BitInt:  noun = "a bit-precise integer type"; break;
+            default: break;
+        }
+        return refuse(std::format(
+            "mode '{}' cannot be applied to {}: a machine mode replaces an integer, a "
+            "floating or a pointer type", written, noun));
+    }
+    if (mm->isFloat()) {
+        if (!floating) {
+            return refuse(std::format(
+                "mode '{}' is a floating mode, and the type it would replace is an "
+                "integer type", written));
+        }
+        TypeId const t = firstTypeOf(mm->floatCore);
+        if (!t.valid()) {
+            return refuse(std::format(
+                "mode '{}' is the floating representation {}, and this target's C has "
+                "no type of it", written, typeKindNameOrEmpty(mm->floatCore)));
+        }
+        return requalify(t);
+    }
+    if (!integerSigned.has_value()) {
+        return refuse(std::format(
+            "mode '{}' is an integer mode, and the type it would replace is a floating "
+            "type", written));
+    }
+    std::optional<std::uint64_t> const bytes =
+        mm->pointerWidth ? pointerBytes()
+                         : std::optional<std::uint64_t>{mm->integerBytes};
+    std::optional<TypeKind> want;
+    switch (bytes.value_or(0)) {
+        case 1:  want = *integerSigned ? TypeKind::I8   : TypeKind::U8;   break;
+        case 2:  want = *integerSigned ? TypeKind::I16  : TypeKind::U16;  break;
+        case 4:  want = *integerSigned ? TypeKind::I32  : TypeKind::U32;  break;
+        case 8:  want = *integerSigned ? TypeKind::I64  : TypeKind::U64;  break;
+        case 16: want = *integerSigned ? TypeKind::I128 : TypeKind::U128; break;
+        default: break;
+    }
+    TypeId const t = want.has_value() ? firstTypeOf(*want) : InvalidType;
+    if (!t.valid()) {
+        return refuse(std::format(
+            "mode '{}' is an integer of {} bytes, and this target's C has no integer "
+            "type of that width", written,
+            bytes.has_value() ? std::to_string(*bytes) : std::string{"?"}));
+    }
+    return requalify(t);
+}
+
+// ★ P69 (lane `cs`, fold f26c) — THE DECLARATION-LEVEL ATTRIBUTE ROOTS of one
+// declaration, folded into `out` in source order. ONE walk with two readers: the
+// definitive visit (`resolveDeclTypesPost`, emitting, once per declaration) and the
+// machine-mode read (`declaredTypeUnderMachineMode`, silent) — so a mode is read at
+// exactly the positions every other attribute of the declaration is read at.
+void foldDeclarationAttributeRoots(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId node,
+                                   DeclarationRule const& decl, ScopeId here,
+                                   bool emitUnknown, AttributeSemanticsFacts& out) {
+    scanAttributeSemantics(
+        s, cfg, tree, specifierPrefixChild(tree, node, decl),
+        emitUnknown, out, here,
+        /*owningDecl=*/&decl);
+    // ★★ P69 round 4 (lane `cs`) — ROOTS (a'): THE RUNS WRITTEN
+    // INSIDE THE HEAD (`headAttributeRuns`: among the type's
+    // specifiers, after a tag that is only referred to). In a
+    // declaration they are the DECLARATION's, exactly as the
+    // prefix is: ✔MEASURED (probe ta3; gcc 13.3.0, clang 18.1.3,
+    // Apple clang, mingw-w64 gcc) `unsigned __attribute__((aligned
+    // (16))) int v;` makes `v` a 4-byte object aligned to 16,
+    // `unsigned __attribute__((aligned(16))) int *q;` a 16-aligned
+    // POINTER to a 4-aligned int, and a member written so sits at
+    // offset 16 — the entity, never the specifier's type. They come
+    // after the prefix and before the slots, which is their source
+    // order (first-non-empty-wins must keep meaning the leftmost
+    // spelling).
+    // ⚠ BEFORE THIS CYCLE THE SECOND OF THE TWO WAS READ AS A TAG
+    // NAME: `struct S __attribute__((aligned(16))) w;` looked up a
+    // tag called `aligned`, and with a `struct aligned` in scope
+    // `w` silently took THAT structure's size.
+    for (NodeId run : headAttributeRuns(
+             cfg, tree, declarationHeadNode(tree, node, decl))) {
+        scanAttributeSemantics(s, cfg, tree, run,
+                               emitUnknown, out,
+                               here, /*owningDecl=*/&decl);
+    }
+    // ★★★ P56
+    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+    // ONLY THE `declaration`-GRAIN SLOTS FOLD INTO THE SHARED
+    // FACTS. This loop used to take every slot the row named,
+    // which for `structField`/`unionField` meant folding a run
+    // written AFTER the member declarator list into facts that
+    // are then COPIED ONTO EVERY MEMBER. ✔MEASURED, gcc 13.3.0
+    // and clang 18.1.3 both give `struct S { int p, q
+    // __attribute__((deprecated)); };` to `q` ALONE. The
+    // `declarator`-grain slots are folded per declarator below,
+    // onto the LAST one — the same split `declNoreturn` /
+    // `declaratorSlotNamesNoreturn` makes, from the same key, so
+    // the two folds cannot see different sets of positions.
+    // ⓘ WHY THIS DID NOT ALREADY SHOW AS AN OVER-APPLICATION:
+    // `structMemberAttrList` reached here but nothing conferred
+    // from it at all — the FC17 facts were built and then the
+    // member loop never consulted a per-declarator slot root —
+    // so the observable bug was a DROP (below the union) on `q`
+    // rather than a leak onto `p`. Both halves are fixed here.
+    // ★★★ P66
+    // (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+    // — PER ATTRIBUTE NODE, NOT PER SLOT. A declaration slot
+    // names a RUN CONTAINER, and c's `typedefAttrRun` holds
+    // BOTH spellings under one rule name — so the slot's grain
+    // could only be all-or-nothing while the references answer
+    // the two spellings differently. Splitting the slot's
+    // attribute nodes here and resolving each through the
+    // shared `attrNodeAppertainment` is what makes the
+    // per-spelling grain readable at a container slot.
+    // ⓘ ORDER IS UNCHANGED: `collectAttrNodes` is the SAME walk
+    // `scanAttributeSemantics` ran internally over this slot, so
+    // the nodes that still confer fold into `out` in
+    // exactly the order they did before — first-non-empty-wins
+    // cannot have shifted.
+    std::vector<NodeId> slotAttrNodes;
+    for (NodeId slot : visibleChildren(tree, node)) {
+        if (tree.kind(slot) != NodeKind::Internal) continue;
+        AttrRunRule const* slotRule = nullptr;
+        for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
+            if (sr.appertainsTo != AttrAppertainment::Declaration) {
+                continue;
+            }
+            if (tree.rule(slot).v == sr.rule.v) {
+                slotRule = &sr;
+                break;
+            }
+        }
+        if (slotRule == nullptr) continue;
+        slotAttrNodes.clear();
+        collectAttrNodes(cfg, tree, slot, slotAttrNodes);
+        for (NodeId an : slotAttrNodes) {
+            bool const toType =
+                attrNodeAppertainment(
+                    cfg, tree, an, *slotRule,
+                    /*declaratorIsTypeDerived=*/false)
+                == AttrAppertainment::Type;
+            // The sink is never read; the scan returns before
+            // folding anything into it. It is explicit rather
+            // than reusing `out` so a future arm added
+            // above that return cannot leak into the real facts.
+            AttributeSemanticsFacts typeGrainSink;
+            scanAttributeSemantics(
+                s, cfg, tree, an, emitUnknown,
+                toType ? typeGrainSink : out, here,
+                /*owningDecl=*/&decl,
+                /*appertainsToType=*/toType);
+        }
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c) — ONE DECLARATOR'S OWN ATTRIBUTE ROOTS (beside its
+// name, after it, and — on the last declarator — the declaration's declarator-grain
+// slots), folded into `out` after the declaration's. The same two readers as
+// `foldDeclarationAttributeRoots`, for the same reason. `dNode` may be invalid: a
+// parameter declared by its type alone has no declarator, and its declarator-grain
+// slot (`int __attribute__((mode(QI)))`) is then its only declarator's — gcc 13.3.0,
+// clang 18.1.3, mingw-w64 gcc 13.2.0 and Apple clang 21.0.0 give that parameter the
+// mode (✔MEASURED, lane `cs`'s probe np: a `signed char` definition agrees with it,
+// an `int` one conflicts).
+void foldDeclaratorAttributeRoots(EngineState& s, SemanticConfig const& cfg,
+                                  Tree const& tree, NodeId node,
+                                  DeclarationRule const& decl, NodeId dNode,
+                                  bool isLastDeclarator, ScopeId here,
+                                  bool emitUnknown, AttributeSemanticsFacts& out) {
+    // ★★ P69 round 4 (lane `cs`) — THE SPECIFIERS WRITTEN INSIDE
+    // THIS DECLARATOR, BESIDE ITS NAME (`int * __attribute__
+    // ((weak)) p;`, `static void * __attribute__((constructor))
+    // init(void)`). `nameAdjacentAttributeSpecifiers` says which
+    // they are — the same answer the noreturn fold above and the
+    // lowering's linkage fold read — and they fold HERE, into
+    // this declarator's private copy and before its trailing
+    // run (source order), as that run folds: `int *
+    // __attribute__((weak)) p = 0, q = 0;` is weak for `p`
+    // alone on gcc and clang. `withinDeclarator` leaves on the
+    // TYPE the few names whose row says they stay there
+    // (`aligned`, `packed`, `unused`, `deprecated`); Pass 2 says
+    // what there is to say about those.
+    for (NodeId an :
+             nameAdjacentAttributeSpecifiers(tree, cfg, dNode)) {
+        scanAttributeSemantics(
+            s, cfg, tree, an, emitUnknown, out,
+            here, /*owningDecl=*/&decl,
+            /*appertainsToType=*/false,
+            /*withinDeclarator=*/true);
+    }
+    if (cfg.declarators.has_value() && dNode.valid()
+        && tree.kind(dNode) == NodeKind::Internal) {
+        DeclaratorConfig const& dcHere = *cfg.declarators;
+        // Read once per declarator, not per run: the shape
+        // question ("does this declarator derive an array or
+        // function type?") is a property of the declarator.
+        bool const derivesTy =
+            declaratorDerivesType(tree, dNode, dcHere);
+        for (NodeId ac : visibleChildren(tree, dNode)) {
+            if (tree.kind(ac) != NodeKind::Internal) continue;
+            AttrRunRule const* run = nullptr;
+            for (AttrRunRule const& ar :
+                     dcHere.afterDeclaratorAttrRules) {
+                if (tree.rule(ac).v == ar.rule.v) {
+                    run = &ar;
+                    break;
+                }
+            }
+            if (run == nullptr) continue;   // asm label, init
+            // emitUnknown=true: this run is THIS declarator's own
+            // distinct spelling, so its unknown-name diagnostic is
+            // the first and only one for that text.
+            // ★ `owningDecl` is THIS declaration's row, exactly as
+            // for the prefix and slot scans above: an attribute
+            // must not mean two different things depending on which
+            // side of the declarator it is written, and the
+            // unknown-name verdict is part of what it means.
+            // ★ P66: the grain now comes from the SHARED
+            // `attrNodeAppertainment`, which composes the
+            // spelling axis with this one. Here the two are
+            // the same question — `afterDeclaratorAttrRules`
+            // names `attrSpec` and `stdAttr` DIRECTLY, so
+            // per-rule already IS per-spelling and the
+            // spelling half is a no-op — but reading one
+            // helper is what stops this fold and the
+            // declaration-slot fold above from drifting.
+            AttributeSemanticsFacts typeGrainSink;
+            AttrAppertainment const grain =
+                attrNodeAppertainment(cfg, tree, ac, *run,
+                                      derivesTy);
+            bool const confers =
+                grain == AttrAppertainment::Declarator;
+            scanAttributeSemantics(
+                s, cfg, tree, ac, emitUnknown,
+                confers ? out : typeGrainSink, here,
+                /*owningDecl=*/&decl,
+                /*appertainsToType=*/
+                grain == AttrAppertainment::Type);
+        }
+    }
+    // ★★★ P56
+    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+    // — THE `declarator`-GRAIN DECLARATION SLOTS, ON THE LAST
+    // DECLARATOR. c's `structMemberAttrList` is written AFTER
+    // the member declarator list, so it appertains to the last
+    // member and nothing else. Before the key carried a grain
+    // this slot reached the DECLARATION-level fold above and
+    // conferred on nobody, so DSS was BELOW the union here:
+    // ✔MEASURED at this base, `struct S { int p, q
+    // __attribute__((deprecated)); };` flagged NEITHER member,
+    // where gcc 13.3.0 and clang 18.1.3 both flag `q` and both
+    // leave `p` clean. Folding into the PRIVATE per-declarator
+    // copy is what keeps `p` clean.
+    if (isLastDeclarator) {
+        // ★ P66: per attribute NODE, for the same reason as
+        // the declaration-grain loop above — this slot is a
+        // run container too. c's `typedefTrailingAttrRun`
+        // declares no per-spelling override and is
+        // byte-identical under this loop; reading the grain
+        // through the shared helper here is what keeps a
+        // future override from being silently unread at one
+        // of the two container sites.
+        // ✔MEASURED 2026-09-09 that this slot's answer is
+        // genuinely different from the post-head one and
+        // must stay conferring: `typedef int A, B
+        // [[deprecated]];` warns at a use of **B** and is
+        // clean at a use of **A** on gcc 13.3.0, clang
+        // 18.1.3 AND MSVC 19.51.36257 alike.
+        std::vector<NodeId> trailingAttrNodes;
+        for (NodeId slot : visibleChildren(tree, node)) {
+            if (tree.kind(slot) != NodeKind::Internal) continue;
+            AttrRunRule const* trailingRule = nullptr;
+            for (AttrRunRule const& sr :
+                     decl.declarationAttrSlotRules) {
+                if (sr.appertainsTo
+                    != AttrAppertainment::Declarator) {
+                    continue;
+                }
+                if (tree.rule(slot).v == sr.rule.v) {
+                    trailingRule = &sr;
+                    break;
+                }
+            }
+            if (trailingRule == nullptr) continue;
+            trailingAttrNodes.clear();
+            collectAttrNodes(cfg, tree, slot,
+                             trailingAttrNodes);
+            for (NodeId an : trailingAttrNodes) {
+                bool const toType =
+                    attrNodeAppertainment(
+                        cfg, tree, an, *trailingRule,
+                        /*declaratorIsTypeDerived=*/false)
+                    == AttrAppertainment::Type;
+                AttributeSemanticsFacts typeGrainSink;
+                scanAttributeSemantics(
+                    s, cfg, tree, an, emitUnknown,
+                    toType ? typeGrainSink : out, here,
+                    /*owningDecl=*/&decl,
+                    /*appertainsToType=*/toType);
+            }
+        }
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c) — ONE DECLARATOR'S DECLARED TYPE UNDER GNU `mode(M)`.
+// The clause is found by the two root walks above, run here in SILENCE (their
+// diagnostics are the definitive visit's own, given once), and the last mode written
+// stands (✔MEASURED, gcc 13.3.0 and clang 18.1.3: `mode(QI), mode(DI)` is 8 bytes,
+// the reverse 1). `declLevel` is the declaration-level facts when the caller has them
+// (the definitive visit), null to fold them here (the prototype's parameter harvest,
+// a parameter declared by its type alone). `dNode` may be invalid — a parameter
+// declared by its type alone: then its roots are the declaration's and its
+// declarator-grain slot (`foldDeclaratorAttributeRoots` reads both shapes). A
+// refusal is said only when `report` is set, and once
+// per clause (`EngineState::machineModeClausesJudged`, which also tells Pass 2 that a
+// declaration judged it): a declaration-level clause reaches every declarator.
+[[nodiscard]] TypeId
+declaredTypeUnderMachineMode(EngineState& s, SemanticConfig const& cfg,
+                             Tree const& tree, NodeId node,
+                             DeclarationRule const& decl, NodeId dNode,
+                             bool isLastDeclarator, ScopeId here,
+                             AttributeSemanticsFacts const* declLevel, TypeId ty,
+                             bool report) {
+    if (!ty.valid()) return ty;
+    if (std::ranges::none_of(cfg.attributeEffects, [](AttributeSemanticsRow const& r) {
+            return r.effect == AttributeEffect::MachineMode;
+        })) {
+        return ty;
+    }
+    AttributeSemanticsFacts facts;
+    auto const snap = s.reporter.snapshotForRollback();
+    if (declLevel != nullptr) {
+        facts.machineModeClause = declLevel->machineModeClause;
+        facts.machineModeRow    = declLevel->machineModeRow;
+    } else {
+        foldDeclarationAttributeRoots(s, cfg, tree, node, decl, here,
+                                      /*emitUnknown=*/false, facts);
+    }
+    foldDeclaratorAttributeRoots(s, cfg, tree, node, decl, dNode,
+                                 isLastDeclarator, here,
+                                 /*emitUnknown=*/false, facts);
+    s.reporter.truncateTo(snap);
+    if (facts.machineModeRow == nullptr) return ty;
+    bool const say = report
+        && s.machineModeClausesJudged
+               .insert((static_cast<std::uint64_t>(tree.id().v) << 32)
+                       | facts.machineModeClause.v)
+               .second;
+    return machineModeType(s, cfg, tree, facts.machineModeClause,
+                           *facts.machineModeRow, ty, say);
 }
 
 // ★★ P69 round 4 (lane `cs`) — `aligned(N)` WRITTEN AT A TYPE POSITION.
@@ -9608,8 +10338,14 @@ void judgeAttributeSpecifier(EngineState& s, SemanticConfig const& cfg,
                 continue;
             }
             std::string const& active = *s.activeCallingConvention;
-            if (std::ranges::find(row->conventions, active)
-                != row->conventions.end()) {
+            // ★ P69 (lane `cs`, fold f26c, main's ledger 456): the pair's own
+            // convention IS one the name selects, or DERIVES from one (the target
+            // document's `derivesFrom`: Mach-O x86_64's `sysv_amd64_darwin` answers
+            // for `sysv_amd64`, `apple_arm64` for `aapcs64`) -- asked of the target,
+            // never listed in the language's rows.
+            if (std::ranges::any_of(row->conventions, [&](std::string const& id) {
+                    return s.target->callingConventionIsOrDerivesFrom(active, id);
+                })) {
                 // The convention the pair already compiles for: the attribute
                 // states what every call of this unit already is. Silent, as gcc
                 // and clang are.
@@ -9655,6 +10391,26 @@ void judgeAttributeSpecifier(EngineState& s, SemanticConfig const& cfg,
         }
         if (!(onATypeUnfolded
               || (besideAName && row->staysWithTypeInDeclarator))) {
+            continue;
+        }
+        if (row->effect == AttributeEffect::MachineMode) {
+            // P69 (lane `cs`, fold f26c): a machine mode is applied to the type of
+            // a declared object, typedef, member or parameter
+            // (`declaredTypeUnderMachineMode`) and to an enumeration's (its
+            // completion). One no declaration judged stands where a type is formed
+            // with nothing declared — a type name, an inner pointer layer — and is
+            // refused by name rather than left to a size nobody asked for.
+            if (!s.machineModeClausesJudged.contains(
+                    (static_cast<std::uint64_t>(tree.id().v) << 32) | cl.v)) {
+                reportAt(cl, DiagnosticCode::S_AttributeNotHonoured,
+                         DiagnosticSeverity::Error,
+                         std::format(
+                             "attribute '{}' cannot be honoured here: a machine mode "
+                             "replaces the type of a declared object, typedef, member "
+                             "or parameter, or an enumeration's, and this one stands "
+                             "where a type is formed with nothing declared",
+                             clause->name));
+            }
             continue;
         }
         if (row->effect == AttributeEffect::Align) {
@@ -9876,6 +10632,11 @@ struct CompositeAttrFacts {
     // the write, exactly as it does for `packed` / `alignment`.
     bool                         deprecated = false;
     std::string                  deprecatedMessage;
+    // P69 (lane `cs`, fold f26c): the LAST GNU `mode(M)` clause of the
+    // composite's own lists, and its row — judged by the completion against what
+    // it completes (an enumeration's width; refused on a structure or union).
+    NodeId                       machineModeClause{};
+    AttributeSemanticsRow const* machineModeRow = nullptr;
 };
 
 // ★★ P69 (lane `cs`) — AN ALIGNMENT REQUEST WRITTEN BEFORE A DEFINITION, AMONG ITS
@@ -9967,13 +10728,15 @@ leadingDefinitionAlignmentRequests(EngineState& s, SemanticConfig const& cfg,
             if (tree.rule(slot).v == sr.rule.v) { roots.push_back(slot); break; }
         }
     }
-    auto const definitionStart = tree.span(specNode).start();
+    // In the token-stream order (`streamRank`), never by byte offset (P69, lane `cs`,
+    // fold f26c: a materialized token does not keep that order).
+    std::uint32_t const definitionBegins = streamRank(s, tree, specNode);
     std::vector<NodeId> attrNodes;
     for (NodeId root : roots) collectAttrNodes(cfg, tree, root, attrNodes);
     std::vector<NodeId> clauses;
     for (NodeId an : attrNodes) {
         // Written after the definition began: the declared entities', as ever.
-        if (!(tree.span(an).start() < definitionStart)) continue;
+        if (!(streamRank(s, tree, an) < definitionBegins)) continue;
         clauses.clear();
         (void)collectAttrClauses(cfg, tree, an, clauses);
         for (NodeId cl : clauses) {
@@ -10124,7 +10887,7 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                    std::string_view name, bool report) {
         bool const takesLast = row.alignRepeatTakesLast;
         NodeId const discarded = foldAlignmentRequest(
-            tree, row, takesLast ? lastRequest : largestRequest,
+            s, tree, row, takesLast ? lastRequest : largestRequest,
             takesLast ? lastRequestClause : largestRequestClause, want, clauseNode);
         if (discarded.valid() && report) {
             reportDiscardedAlignmentRequest(s, tree, discarded, name);
@@ -10240,6 +11003,15 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 facts.deprecated = true;
                 if (facts.deprecatedMessage.empty() && clause->message.has_value())
                     facts.deprecatedMessage = *clause->message;
+                continue;
+            }
+            // P69 (lane `cs`, fold f26c): GNU `mode(M)` after a composite's body —
+            // kept (the last stands) for the completion, which knows what it
+            // completes. Records a fact and emits nothing, like the arm above.
+            if (clause->row != nullptr
+                && clause->row->effect == AttributeEffect::MachineMode) {
+                facts.machineModeClause = cl;
+                facts.machineModeRow    = clause->row;
                 continue;
             }
             // ★★ TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED) — THE COMPOSITE `aligned(N)`
@@ -10784,13 +11556,20 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // present-length suffix (`int (*p)[n]` → the pointee keeps `[n]`); the
                 // adjustment below then rewrites any top-level array to Ptr<element>.
                 // Mirrors the definitive visit's identical sequence so the FnSig agrees.
-                TypeId const t = declaratorDeclaredType(
-                    s, cfg, tree, kids[*decl.declaratorChild], head, scope,
-                    emitOnMiss,
-                    /*allowFlexibleArray=*/false,
-                    /*allowInitInferredArray=*/false,
-                    /*paramDecay=*/decl.paramAdjustments,
-                    /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
+                // P69 (lane `cs`, fold f26c): a parameter's machine mode is part of
+                // the signature; the parameter's definitive visit says a refusal,
+                // this harvest reads it in silence.
+                TypeId const t = declaredTypeUnderMachineMode(
+                    s, cfg, tree, declNode, decl, kids[*decl.declaratorChild],
+                    /*isLastDeclarator=*/true, scope, /*declLevel=*/nullptr,
+                    declaratorDeclaredType(
+                        s, cfg, tree, kids[*decl.declaratorChild], head, scope,
+                        emitOnMiss,
+                        /*allowFlexibleArray=*/false,
+                        /*allowInitInferredArray=*/false,
+                        /*paramDecay=*/decl.paramAdjustments,
+                        /*typeAliasRow=*/decl.kind == DeclarationKind::Type),
+                    /*report=*/false);
                 return adjustParamDeclaredType(s, cfg, tree, decl,
                                                kids[*decl.declaratorChild], t);
             }
@@ -10805,7 +11584,12 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // (`sqlite3_vmprintf(const char*, va_list)` abstract vs the
             // named caller param; va_list itself is EXCLUDED inside the
             // helper, see its comment).
-            return adjustParamDeclaredType(s, cfg, tree, decl, NodeId{}, head);
+            return adjustParamDeclaredType(
+                s, cfg, tree, decl, NodeId{},
+                declaredTypeUnderMachineMode(s, cfg, tree, declNode, decl, NodeId{},
+                                             /*isLastDeclarator=*/true, scope,
+                                             /*declLevel=*/nullptr, head,
+                                             /*report=*/false));
         }
         return InvalidType;   // a LIST row has no single param type
     }
@@ -12268,7 +13052,7 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
     auto const calleeIsDefinedHere = [&](NodeId callee) {
         NodeId const id = identifierOf(peel(callee));
         if (!id.valid()) return false;
-        SymbolId const sym = s.scopes.lookup(here, tree.text(id));
+        SymbolId const sym = lookupOrdinaryUse(s, tree, here, tree.text(id), id);
         if (!sym.valid()) return false;
         SymbolRecord const& r = s.symbols.at(sym);
         return r.kind == DeclarationKind::Function && r.tree.v == tree.id().v
@@ -12600,7 +13384,7 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
             continue;
         }
         if (NodeId const id = identifierOf(cur); id.valid()) {
-            SymbolId const sym = s.scopes.lookup(here, tree.text(id));
+            SymbolId const sym = lookupOrdinaryUse(s, tree, here, tree.text(id), id);
             if (!sym.valid()) continue;   // S_UndeclaredIdentifier's
             SymbolRecord const& rec = s.symbols.at(sym);
             if (rec.kind == DeclarationKind::Function) {
@@ -12627,10 +13411,12 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
                 // cl (C2099) and mingw-w64 gcc ("initializer element is not
                 // constant") refuse `&x` of an imported `x` in a file-scope and in a
                 // block `static` initializer, also when a later definition ends the
-                // import; both take an imported FUNCTION's address there (its thunk) —
-                // read by the TYPE, since a prototype's record is of the object kind.
-                bool const isFunction = rec.type.valid() && in.kind(rec.type) == TypeKind::FnSig;
-                if (!isFunction && importInEffectAt(s, rec, tree.span(cur).start())) {
+                // import; both take an imported FUNCTION's address there (its thunk), and
+                // no function reaches this arm: the `Function` arm above takes it, every
+                // prototype being of that kind once Pass 1.5 typed it. (P69, lane `cs`, fold
+                // f26c: a test of the type here was unreachable — its mutation SURVIVED the
+                // sweep with the `f` and `&f` controls green — and is gone.)
+                if (importInEffectAt(s, rec, streamRank(s, tree, cur))) {
                     prove(cur, std::format("takes the address of '{}', which another "
                                            "image defines: its address is read from "
                                            "the import table when the program runs, "
@@ -12663,9 +13449,12 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
                 prove(cur, std::format("reads the value of '{}', a volatile object", name));
                 continue;
             }
-            auto const init = resolveConstSymbolInit(s, tree, cfg, here, tree.text(id));
+            auto const init = resolveConstSymbolInit(s, tree, cfg, here, tree.text(id), id);
+            // Visible: written before the use, in the token-stream order (P69, lane `cs`,
+            // fold f26c: by byte offset, an initializer a paste produced was "after"
+            // every use — probe fp6, `static const int k = CAT(4, 2); static int g = k;`).
             if (!init.has_value() || !init->initExpr.valid()
-                || tree.span(init->initExpr).start() > tree.span(id).start()) {
+                || streamRank(s, tree, init->initExpr) > streamRank(s, tree, id)) {
                 prove(cur, std::format("reads the value of '{}', whose initializer is not visible "
                                        "here", name));
                 continue;
@@ -12864,8 +13653,11 @@ void refuseBlockImportOfADefinedName(EngineState& s, Tree const& tree, ScopeId f
     s.symbols.at(importId).isImportedDeclaration = false;
 }
 
-// The third: the history the static-initializer judge reads. A declaration is
-// recorded when it imports, or when an earlier declaration of the name did.
+// The third: the history the static-initializer judge reads — every declaration of the
+// name in its scope, at its position, and whether it imports. Every one is recorded
+// (P69, lane `cs`, fold f26c — the review of f26b, F2): the block-extern sweep joins a
+// block declaration's history to the entity's it absorbs it into (`analyzeImpl`), and
+// a declaration that does not import is what ends an earlier one's import there too.
 [[nodiscard]] std::string importHistoryKey(ScopeId scope, std::string_view name) {
     std::string key = std::to_string(scope.v);
     key += ':';
@@ -12875,13 +13667,7 @@ void refuseBlockImportOfADefinedName(EngineState& s, Tree const& tree, ScopeId f
 
 void recordImportHistory(EngineState& s, ScopeId scope, std::string const& name,
                          std::uint64_t position, bool imports) {
-    std::string const key = importHistoryKey(scope, name);
-    auto it = s.importHistory.find(key);
-    if (it == s.importHistory.end()) {
-        if (!imports) return;
-        it = s.importHistory.emplace(key, std::vector<EngineState::ImportHistoryEntry>{}).first;
-    }
-    it->second.push_back({position, imports});
+    s.importHistory[importHistoryKey(scope, name)].push_back({position, imports});
 }
 
 // Whether the name `rec` binds is IMPORTED at `position` of the unit: its latest
@@ -12928,7 +13714,12 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
 }
 
 // The latest block-scope declaration of `name` in `tree` written before `position`, or
-// InvalidSymbol.
+// InvalidSymbol — as the ENTITY it declares: a declaration the block-extern sweep
+// absorbed (into a file-scope declaration of the name, or into the first block
+// declaration of it) answers with the record it was absorbed into, which its block's
+// binding was repointed at, so the call's use lands where every other use of the entity
+// does (the review of fold f26b's note; P69, lane `cs`, fold f26c). An absorbed record
+// is absorbed once, into a record the sweep never absorbs, so one step reaches it.
 [[nodiscard]] SymbolId blockFunctionDeclarationBefore(EngineState const& s, TreeId tree,
                                                       std::string_view name,
                                                       std::uint64_t position) {
@@ -12939,26 +13730,217 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
         if (d.position >= position) break;
         found = d.symbol;
     }
+    if (found.valid()) {
+        SymbolRecord const& rec = s.symbols.at(found);
+        if (rec.isAbsorbedProto && rec.scope.valid()) {
+            auto const& bindings = s.scopes.scopes()[rec.scope.v].bindings;
+            auto const b = bindings.find(rec.name);
+            if (b != bindings.end() && b->second.valid()) return b->second;
+        }
+    }
     return found;
 }
 
 // Whether the name token `nameNode` is the CALLEE of the call that is the nearest call
 // among `refNode`'s ancestors — the position an out-of-scope declaration may answer
 // (an implicit declaration in the references that make one arises only there).
-[[nodiscard]] bool isTheCalleeOfACall(EngineState const& s, SemanticConfig const& cfg,
-                                      Tree const& tree, NodeId refNode, NodeId nameNode) {
+// The call rule of that call, or nullptr where the name is no call's callee.
+[[nodiscard]] CallRule const* callRuleOfCallee(EngineState const& s, SemanticConfig const& cfg,
+                                               Tree const& tree, NodeId refNode, NodeId nameNode) {
     for (NodeId a = tree.parent(refNode); a.valid(); a = tree.parent(a)) {
         if (tree.kind(a) != NodeKind::Internal) continue;
         auto const callIt = s.idx().callByRule.find(tree.rule(a).v);
         if (callIt == s.idx().callByRule.end()) continue;
         CallRule const& call = cfg.callRules[callIt->second];
         auto const kids = visibleChildren(tree, a);
-        if (call.calleeChild >= kids.size()) return false;
+        if (call.calleeChild >= kids.size()) return nullptr;
         auto const callee = extractNameNode(tree, kids[call.calleeChild], NameMatchMode::Self,
                                             cfg.identifierToken);
-        return callee.node.valid() && callee.node.v == nameNode.v;
+        return callee.node.valid() && callee.node.v == nameNode.v ? &call : nullptr;
     }
-    return false;
+    return nullptr;
+}
+
+[[nodiscard]] bool isTheCalleeOfACall(EngineState const& s, SemanticConfig const& cfg,
+                                      Tree const& tree, NodeId refNode, NodeId nameNode) {
+    return callRuleOfCallee(s, cfg, tree, refNode, nameNode) != nullptr;
+}
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION): A CALL
+// WHOSE CALLEE NAMES NO DECLARATION IN SCOPE AT THE CALL declares it implicitly, where the call rule states it
+// (`implicitDeclarationResult`) — C90 6.3.2.2's `extern int name();` in the innermost block. ✔MEASURED (lane
+// `cs` probes ip, ip2 and ip3; each program built and RUN): gcc 13.3.0 at its default standard and at
+// -std=c2x, mingw-w64 gcc 13.2.0 and cl 19.51 make the declaration, warned ("implicit declaration of function
+// 'f'", C4013), and the call reaches the function the unit or another unit defines; clang 18.1.3 refuses
+// (gcc 14 and later refuse by default too — NOT measured here: no leg has one). One working reference makes
+// it required. The warning is said ONCE per name (`EngineState::implicitDeclarationSaid`), at its first call.
+//   * Where the unit DECLARES the name as a function — written later in a scope of the call, or in a block
+//     anywhere in the unit (C 6.2.2p4: one entity with the implicit declaration's) — that declaration is the
+//     function called, and it is held to the implicit one by the measured rule — the result: probe ip3's
+//     `double f(double v)` after the call is refused by every reference that makes the declaration
+//     (S_ImplicitDeclarationConflicts), while cl takes `int f(char)` and `int f(int, ...)`, so only the result
+//     is held. The call is then checked against that declaration's parameters.
+//   * Where the unit declares NO function of the name, the declaration is MINTED (`isImplicitDeclaration`):
+//     bound in the call's innermost block from the call on, one entity for every call of the unit
+//     (`EngineState::implicitDeclarationOf`), its type completed at the first call
+//     (`completeImplicitDeclaration`); the CST→HIR lowering emits it as an external function no library binds.
+//   * Where the unit declares no function of the name and the platform's C library does, the library's
+//     function is the one called; a name of a builtin family is declared by no call (below).
+// Returns the declaration the call takes, or InvalidSymbol where the name is bound, but not to a function (an
+// object declared later: the call names an undeclared identifier), the name is a builtin family's, or the
+// document names no builtin result.
+[[nodiscard]] SymbolId implicitlyDeclaredCallee(EngineState& s, Tree const& tree, ScopeId here,
+                                                std::string const& name, NodeId nameNode,
+                                                CallRule const& call) {
+    auto& in = s.lattice.interner();
+    auto const resultIt = s.idx().builtinTypeIds.find(call.implicitDeclarationResult);
+    if (resultIt == s.idx().builtinTypeIds.end()) {
+        // The loader holds the key to a non-empty string; a type the language does not
+        // build in is the document's mistake, said where it bites.
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::C_InvalidSemantics;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = std::format("the call rule's 'implicitDeclarationResult' '{}' names no builtin "
+                                 "type of this language", call.implicitDeclarationResult);
+        s.reporter.report(std::move(d));
+        return InvalidSymbol;
+    }
+    std::string const key = blockFunctionDeclarationKey(tree.id(), name);
+    SymbolId later = s.scopes.lookup(here, name);
+    if (!later.valid())
+        later = blockFunctionDeclarationBefore(s, tree.id(), name,
+                                               std::numeric_limits<std::uint64_t>::max());
+    if (!later.valid()) {
+        if (auto const it = s.implicitDeclarationOf.find(key); it != s.implicitDeclarationOf.end())
+            later = it->second;
+    }
+    // Where the unit declares no function of the name: a name of a builtin family the references implement
+    // inside the compiler (`implicitDeclarationBuiltinPrefixes`) is declared by no call — a reference that
+    // runs such a call runs it because it implements the builtin, which a declaration made here would not,
+    // and no library defines it — so it stays an undeclared identifier, loud (any other reserved name,
+    // C 7.1.3, is declared: gcc 13 and cl run it where another unit defines it). A name the platform's C library declares
+    // (`EngineState::resolveLibraryFunction`, asked silently: `at` is no node) is the call's function with
+    // the library's own type — gcc's answer, which knows the library's functions ("incompatible implicit
+    // declaration of built-in function"), and the one that WORKS where the implicit `int` result would cut
+    // a 64-bit result. Only then is the declaration minted.
+    bool library = false;
+    if (!later.valid()) {
+        for (std::string const& prefix : call.implicitDeclarationBuiltinPrefixes)
+            if (name.starts_with(prefix)) return InvalidSymbol;
+        if (s.resolveLibraryFunction) {
+            later   = s.resolveLibraryFunction(tree, name, InvalidNode);
+            library = later.valid();
+            if (library) (void)s.scopes.bind(here, name, later, SymbolNamespace::Ordinary);
+        }
+    }
+    bool const minted = !later.valid();
+    if (minted) {
+        SymbolRecord rec;
+        rec.name                  = name;
+        rec.kind                  = DeclarationKind::Function;
+        rec.tree                  = tree.id();
+        rec.scope                 = here;
+        rec.declNode              = nameNode;
+        rec.isProtoDeclaration    = true;
+        rec.isImplicitDeclaration = true;
+        later = s.symbols.mint(rec);
+        (void)s.scopes.bind(here, name, later, SymbolNamespace::Ordinary);
+        s.implicitDeclarationOf.emplace(key, later);
+    }
+    SymbolRecord const& rec = s.symbols.at(later);
+    if (!rec.isImplicitDeclaration
+        && (!(rec.kind == DeclarationKind::Function || rec.isProtoDeclaration) || !rec.type.valid()
+            || in.kind(rec.type) != TypeKind::FnSig))
+        return InvalidSymbol;
+    auto const related = [&](ParseDiagnostic& d, char const* what) {
+        if (!rec.isImplicitDeclaration && rec.tree.v == tree.id().v)
+            d.related.push_back(RelatedLocation{tree.source().id(), tree.span(rec.declNode), what});
+    };
+    if (s.implicitDeclarationSaid.insert(key).second) {
+        ParseDiagnostic w;
+        w.code     = DiagnosticCode::S_ImplicitFunctionDeclaration;
+        w.severity = DiagnosticSeverity::Warning;
+        w.buffer   = tree.source().id();
+        w.span     = tree.span(nameNode);
+        w.actual   = library
+            ? std::format("implicit declaration of function '{}': no declaration of it is in scope here; "
+                          "the call takes the C library's function of the name, with the library's type",
+                          name)
+            : std::format("implicit declaration of function '{}': no declaration of it is in scope "
+                          "here, so the call declares it, returning '{}'", name,
+                          call.implicitDeclarationResult);
+        related(w, "its declaration, later in the unit, is the function called");
+        s.reporter.report(std::move(w));
+    }
+    if (!library && !rec.isImplicitDeclaration && in.fnResult(rec.type).v != resultIt->second.v) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ImplicitDeclarationConflicts;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = std::format("conflicting types for '{}': the call declared it implicitly, "
+                                 "returning '{}', and its later declaration returns another type",
+                                 name, call.implicitDeclarationResult);
+        related(d, "the later declaration is here");
+        s.reporter.report(std::move(d));
+    }
+    return later;
+}
+
+// The type of an implicitly declared function (`implicitlyDeclaredCallee`), completed at a CALL of it: the
+// implicit result and, as its parameters, the call's arguments after the default argument promotions (C
+// 6.5.2.2p6: an array or a function decays to a pointer, `float` becomes `double`, an integer narrower than
+// `int` is promoted), not variadic — so the call passes each promoted argument as a non-variadic call does
+// (on arm64 Darwin a variadic call passes its arguments on the stack, where a non-variadic definition does not
+// read them). The FIRST call completes it; a later call whose promoted arguments differ in number or in
+// representation is refused (S_ImplicitDeclarationConflicts): at most one of two such calls can match the
+// definition, and a call that does not is undefined (C 6.5.2.2p6) — the union over what WORKS, as F1's
+// incompatible-object pair was decided. Returns the function type, or InvalidType where an argument has none.
+[[nodiscard]] TypeId completeImplicitDeclaration(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                                                 SymbolId sym, NodeId nameNode,
+                                                 std::span<NodeId const> args, ScopeId scope,
+                                                 CallRule const& call) {
+    auto& in = s.lattice.interner();
+    std::optional<ResolvedArithmeticRules> const& arith = s.arithRulesFor(cfg);
+    std::vector<TypeId> promoted;
+    promoted.reserve(args.size());
+    for (NodeId const a : args) {
+        TypeId t = subtreeType(s, tree, a, scope);
+        if (!t.valid()) return InvalidType;
+        t = arrayToPointerDecay(in, t);
+        if (in.kind(t) == TypeKind::FnSig) t = in.pointer(t);
+        if (in.kind(t) == TypeKind::F32) t = in.primitive(TypeKind::F64);
+        else if (arith.has_value()) t = integerPromotedType(in, t, *arith);
+        promoted.push_back(t);
+    }
+    SymbolRecord& rec = s.symbols.at(sym);
+    if (!rec.type.valid()) {
+        auto const resultIt = s.idx().builtinTypeIds.find(call.implicitDeclarationResult);
+        if (resultIt == s.idx().builtinTypeIds.end()) return InvalidType;   // said by the mint
+        rec.type = in.fnSig(promoted, resultIt->second, CallConv::CcSysV, /*isVariadic=*/false);
+        return rec.type;
+    }
+    auto const params = in.fnParams(rec.type);
+    bool same = params.size() == promoted.size();
+    for (std::size_t i = 0; same && i < promoted.size(); ++i)
+        same = in.sameRepresentation(params[i], promoted[i]);
+    if (!same) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ImplicitDeclarationConflicts;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = std::format("conflicting calls of '{}': the unit declares it nowhere, an earlier call "
+                                 "declared it implicitly with {} promoted argument(s), and this call passes "
+                                 "{} that do not match them — at most one of the two can match its "
+                                 "definition", rec.name, params.size(), promoted.size());
+        d.related.push_back(RelatedLocation{tree.source().id(), tree.span(rec.declNode),
+                                            "the call that declared it"});
+        s.reporter.report(std::move(d));
+    }
+    return rec.type;
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -13417,6 +14399,76 @@ void checkVariadicMarkerTerminatesParamList(EngineState& s,
     s.reporter.report(std::move(d));
 }
 
+// ★★ P69 (lane `cs`, fold f26c): WHETHER the body-less tag reference `node` IS A DECLARATION OF THE FORM
+// `struct-or-union identifier ;` (C 6.7.2.3p7) — the nearest declaration row around it declares objects
+// with named declarators (not a parameter, not a member) and this one names no identifier but the tag.
+[[nodiscard]] bool isTagOnlyDeclaration(EngineState const& s, SemanticConfig const& cfg, Tree const& tree,
+                                        NodeId node) {
+    NodeId decl = InvalidNode;
+    substrate::WalkSteps climb{tree.nodeCount() + 1, "isTagOnlyDeclaration's climb"};
+    for (NodeId up = tree.parent(node); up.valid(); up = tree.parent(up)) {
+        climb.step();
+        std::optional<RuleId> const r = tree.ruleIfInternal(up);
+        if (!r.has_value()) return false;
+        if (s.idx().declByRule.find(r->v) != s.idx().declByRule.end()) {
+            decl = up;
+            break;
+        }
+    }
+    if (!decl.valid()) return false;
+    auto const& row = cfg.declarations[s.idx().declByRule.find(tree.rule(decl).v)->second];
+    if (row.kind != DeclarationKind::Variable || !row.requireNamedDeclarators || row.paramAdjustments
+        || row.anonymousNameAllowed || row.bitfieldSuffix.has_value() || row.fieldChildren.has_value())
+        return false;
+    std::vector<NodeId> work{decl};
+    substrate::WalkSteps steps{tree.nodeCount() + 1, "isTagOnlyDeclaration"};
+    while (!work.empty()) {
+        steps.step();
+        NodeId const n = work.back();
+        work.pop_back();
+        if (n.v == node.v) continue;   // the reference itself, the tag's own name
+        if (tree.kind(n) == NodeKind::Token) {
+            auto const tk = tree.tokenKind(n);
+            if ((cfg.identifierToken.valid() && tk == cfg.identifierToken)
+                || (cfg.bracketIdentifierToken.has_value() && cfg.bracketIdentifierToken->valid()
+                    && tk == *cfg.bracketIdentifierToken))
+                return false;
+            continue;
+        }
+        auto const kids = tree.children(n);
+        for (auto k = kids.rbegin(); k != kids.rend(); ++k) work.push_back(*k);
+    }
+    return true;
+}
+
+// ★★ P69 (lane `cs`, fold f26c): RECORDS where the scope a body-less struct or union tag reference
+// declares into (`floatToNamespaceScope`) first has the tag written (`EngineState::tagFirstWritten`), and
+// whether that is a `struct S;` — Pass 1's pre-order visits every reference before any use resolves, so
+// `lookupTagUse` reads whole records. An enumeration's tag is declared by its definition only.
+void noteTagWrittenWithoutBody(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                               ScopeId current) {
+    if (!cfg.declarators.has_value() || !cfg.declarators->scopeBeginsAfterDeclarator) return;
+    auto const refIt = s.idx().refByRule.find(tree.rule(node).v);
+    if (refIt == s.idx().refByRule.end()) return;
+    auto const& ref = cfg.references[refIt->second];
+    if (!ref.isTagReference || ref.compositeKind == CompositeKind::Enum) return;
+    if (auto const dIt = s.idx().declByRule.find(tree.rule(node).v);
+        dIt != s.idx().declByRule.end()
+        && isDefinitionAtNode(cfg.declarations[dIt->second], tree, node))
+        return;
+    auto const rn = extractNameNode(tree, node, ref.nameMatch, cfg.identifierToken,
+                                    cfg.bracketIdentifierToken);
+    if (rn.name.empty()) return;
+    ScopeId const own = floatToNamespaceScope(s, cfg, tree, current, node);
+    if (!own.valid()) return;
+    std::uint32_t const at = streamRank(s, tree, node);
+    EngineState::TagFirstWritten& w = s.tagFirstWritten[{own.v, std::string{rn.name}}];
+    if (w.reference == 0 || at < w.reference) w.reference = at;
+    if ((w.tagOnlyDeclaration == 0 || at < w.tagOnlyDeclaration)
+        && isTagOnlyDeclaration(s, cfg, tree, node))
+        w.tagOnlyDeclaration = at;
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
 // pass1 PER-NODE work for ONE node — extracted for the iterative driver below
 // (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). PRE-order: resolves this
@@ -13457,6 +14509,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             declIsDefiningHere =
                 isDefinitionAtNode(cfg.declarations[gIt->second], tree, node);
         }
+        // ★★ P69 (lane `cs`, fold f26c): where this scope's tag is first written without a body.
+        noteTagWrittenWithoutBody(s, cfg, tree, node, current);
 
         // c32 D-CSUBSET-FNPTR-PARAM-SCOPE: the scope-open decision is the SHARED
         // `nodeOpensChildScope` predicate (a `scopes`-rule definition OR a
@@ -13897,18 +14951,15 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // A function PROTOTYPE is a function DECLARATION, never an
                         // "unused variable" — suppress warnIfUnused for it. This
                         // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-PROTOTYPE),
-                        // whose local declaration rule sets
-                        // warnIfUnused; absorbed by a file-scope declaration (the
-                        // block-extern sweep repoints its binding, so its own use-set
-                        // stays empty — the call resolves to the definition), it would
-                        // otherwise emit a spurious S_UnusedVariable. A file-scope proto is
-                        // unaffected (topLevelDecl already declares warnIfUnused
-                        // false), so this is byte-identical there.
-                        // P69 (lane `cs`, fold f26b): nor is an IMPORT one — it declares
-                        // an object another image defines, as `extern` does, and a
-                        // block-scope one that a file-scope declaration absorbs (the
-                        // block-extern sweep repoints its binding) never sees its own
-                        // uses. cl is silent on an unused one; gcc warns.
+                        // whose local declaration rule sets warnIfUnused. A file-scope
+                        // proto is unaffected (topLevelDecl already declares
+                        // warnIfUnused false), so this is byte-identical there.
+                        // P69 (lane `cs`, fold f26b; restated in f26c, the review of
+                        // f26b's F10): nor is an IMPORT one — it declares an object
+                        // another image defines, as `extern` does. cl is silent on an
+                        // unused one; gcc warns. (A declaration the block-extern sweep
+                        // absorbs is passed over by the unused sweep itself, keyed on
+                        // the absorption: its uses are the entity's.)
                         rec.warnIfUnused =
                             decl.warnIfUnused && !isProto && !importReading.honoured;
                         rec.fieldIndex   = static_cast<std::uint32_t>(
@@ -14226,14 +15277,14 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // name's import history — read where an import's effect
                         // depends on WHERE it is asked about (`importInEffectAt`).
                         recordImportHistory(s, bindScope, name,
-                                            tree.span(nameNode).start(),
+                                            streamRank(s, tree, nameNode),
                                             s.symbols.at(newId).isImportedDeclaration);
                         // P69 (lane `cs`, fold f26b): a block-scope function
                         // declaration, for a call outside its block that names
                         // nothing visible (`blockFunctionDeclarationBefore`).
                         if (isProto && bindScope.v != fileScopeOf(s, tree, current).v)
                             recordBlockFunctionDeclaration(s, tree.id(), name,
-                                                           tree.span(nameNode).start(), newId);
+                                                           streamRank(s, tree, nameNode), newId);
                         // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99
                         // 6.4.2.2): a function DEFINITION (Function-kind, its
                         // decl opened the param/body scope `here`) binds one
@@ -14725,13 +15776,13 @@ void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
     };
     for (SymbolId const r : group) {
         SymbolRecord const& rec = s.symbols.at(r);
-        auto const          at  = s.ownDeclaredAt.find(r.v);
-        if (rec.kind != DeclarationKind::Variable || at == s.ownDeclaredAt.end()) continue;
+        auto const          at  = s.ownDeclaredRank.find(r.v);
+        if (rec.kind != DeclarationKind::Variable || at == s.ownDeclaredRank.end()) continue;
         TypeId visible = InvalidType;
         for (SymbolId const o : group) {
             SymbolRecord const& other = s.symbols.at(o);
-            auto const          oAt   = s.ownDeclaredAt.find(o.v);
-            if (other.tree.v == rec.tree.v && oAt != s.ownDeclaredAt.end() && oAt->second > at->second)
+            auto const          oAt   = s.ownDeclaredRank.find(o.v);
+            if (other.tree.v == rec.tree.v && oAt != s.ownDeclaredRank.end() && oAt->second > at->second)
                 continue;   // written after `r`
             TypeId const w = written(o);
             if (!w.valid() || (in.kind(w) != TypeKind::Array && in.kind(w) != TypeKind::Ptr)) continue;
@@ -14784,13 +15835,13 @@ void composeArrayRedeclaration(EngineState& s, SymbolId sym) {
                              [&](SymbolId g) { return g.v == p.v; }) == group.end())
                 group.push_back(p);
     }
-    auto const where = tree.span(at).start();
+    std::uint32_t const     where = streamRank(s, tree, at);   // the token-stream order
     std::optional<SymbolId> last;
-    ByteOffset              lastAt = 0;
+    std::uint32_t           lastAt = 0;
     for (SymbolId const r : group) {
         if (s.symbols.at(r).tree.v != tree.id().v) continue;
-        auto const own = s.ownDeclaredAt.find(r.v);
-        if (own == s.ownDeclaredAt.end() || own->second > where) continue;   // no place, or written after the use
+        auto const own = s.ownDeclaredRank.find(r.v);
+        if (own == s.ownDeclaredRank.end() || own->second > where) continue;   // no place, or written after the use
         if (!last.has_value() || own->second >= lastAt) {
             last   = r;
             lastAt = own->second;
@@ -16021,12 +17072,12 @@ resolveConstantSubobject(EngineState& s, Tree const& tree, SemanticConfig const&
         }
         if (!id.valid() || tree.kind(id) != NodeKind::Token
             || tree.tokenKind(id).v != cfg.identifierToken.v) return std::nullopt;
-        SymbolId const sym = s.scopes.lookup(at, tree.text(id));
+        SymbolId const sym = lookupOrdinaryUse(s, tree, at, tree.text(id), id);
         if (!sym.valid()) return std::nullopt;
         SymbolRecord const& rec = s.symbols.at(sym);
         if (rec.kind != DeclarationKind::Variable || !rec.type.valid()
             || in.isVolatileObjectType(rec.type)) return std::nullopt;
-        auto const init = resolveConstSymbolInit(s, tree, cfg, at, tree.text(id));
+        auto const init = resolveConstSymbolInit(s, tree, cfg, at, tree.text(id), id);
         if (!init.has_value() || !init->initExpr.valid()) return std::nullopt;
         return Root{init->initExpr, rec.type, ScopeId{init->initScopeOpaque}};
     };
@@ -16713,7 +17764,13 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                 if (decl.declaratorChild.has_value()
                     && (!carrierIdx.has_value() || *carrierIdx >= kids.size())
                     && headTy.valid()) {
-                    s.nodeToType.set(node, headTy);
+                    // P69 (lane `cs`, fold f26c): its declaration's machine mode
+                    // too — this is the parameter's definitive visit, so it says a
+                    // refusal (the signature's harvest reads the same, in silence).
+                    s.nodeToType.set(node, declaredTypeUnderMachineMode(
+                        s, cfg, tree, node, decl, NodeId{},
+                        /*isLastDeclarator=*/true, here, /*declLevel=*/nullptr,
+                        headTy, /*report=*/true));
                 }
                 if (!inferenceRejected
                     && carrierIdx.has_value() && *carrierIdx < kids.size()) {
@@ -16826,101 +17883,12 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // `visibleChildren` order — because the fold is
                     // first-non-empty-wins, and that must mean the LEFTMOST spelling.
                     AttributeSemanticsFacts declAttrFacts;
-                    scanAttributeSemantics(
-                        s, cfg, tree, specifierPrefixChild(tree, node, decl),
-                        /*emitUnknown=*/true, declAttrFacts, here,
-                        /*owningDecl=*/&decl);
-                    // ★★ P69 round 4 (lane `cs`) — ROOTS (a'): THE RUNS WRITTEN
-                    // INSIDE THE HEAD (`headAttributeRuns`: among the type's
-                    // specifiers, after a tag that is only referred to). In a
-                    // declaration they are the DECLARATION's, exactly as the
-                    // prefix is: ✔MEASURED (probe ta3; gcc 13.3.0, clang 18.1.3,
-                    // Apple clang, mingw-w64 gcc) `unsigned __attribute__((aligned
-                    // (16))) int v;` makes `v` a 4-byte object aligned to 16,
-                    // `unsigned __attribute__((aligned(16))) int *q;` a 16-aligned
-                    // POINTER to a 4-aligned int, and a member written so sits at
-                    // offset 16 — the entity, never the specifier's type. They come
-                    // after the prefix and before the slots, which is their source
-                    // order (first-non-empty-wins must keep meaning the leftmost
-                    // spelling).
-                    // ⚠ BEFORE THIS CYCLE THE SECOND OF THE TWO WAS READ AS A TAG
-                    // NAME: `struct S __attribute__((aligned(16))) w;` looked up a
-                    // tag called `aligned`, and with a `struct aligned` in scope
-                    // `w` silently took THAT structure's size.
-                    for (NodeId run : headAttributeRuns(
-                             cfg, tree, declarationHeadNode(tree, node, decl))) {
-                        scanAttributeSemantics(s, cfg, tree, run,
-                                               /*emitUnknown=*/true, declAttrFacts,
-                                               here, /*owningDecl=*/&decl);
-                    }
-                    // ★★★ P56
-                    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
-                    // ONLY THE `declaration`-GRAIN SLOTS FOLD INTO THE SHARED
-                    // FACTS. This loop used to take every slot the row named,
-                    // which for `structField`/`unionField` meant folding a run
-                    // written AFTER the member declarator list into facts that
-                    // are then COPIED ONTO EVERY MEMBER. ✔MEASURED, gcc 13.3.0
-                    // and clang 18.1.3 both give `struct S { int p, q
-                    // __attribute__((deprecated)); };` to `q` ALONE. The
-                    // `declarator`-grain slots are folded per declarator below,
-                    // onto the LAST one — the same split `declNoreturn` /
-                    // `declaratorSlotNamesNoreturn` makes, from the same key, so
-                    // the two folds cannot see different sets of positions.
-                    // ⓘ WHY THIS DID NOT ALREADY SHOW AS AN OVER-APPLICATION:
-                    // `structMemberAttrList` reached here but nothing conferred
-                    // from it at all — the FC17 facts were built and then the
-                    // member loop never consulted a per-declarator slot root —
-                    // so the observable bug was a DROP (below the union) on `q`
-                    // rather than a leak onto `p`. Both halves are fixed here.
-                    // ★★★ P66
-                    // (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
-                    // — PER ATTRIBUTE NODE, NOT PER SLOT. A declaration slot
-                    // names a RUN CONTAINER, and c's `typedefAttrRun` holds
-                    // BOTH spellings under one rule name — so the slot's grain
-                    // could only be all-or-nothing while the references answer
-                    // the two spellings differently. Splitting the slot's
-                    // attribute nodes here and resolving each through the
-                    // shared `attrNodeAppertainment` is what makes the
-                    // per-spelling grain readable at a container slot.
-                    // ⓘ ORDER IS UNCHANGED: `collectAttrNodes` is the SAME walk
-                    // `scanAttributeSemantics` ran internally over this slot, so
-                    // the nodes that still confer fold into `declAttrFacts` in
-                    // exactly the order they did before — first-non-empty-wins
-                    // cannot have shifted.
-                    std::vector<NodeId> slotAttrNodes;
-                    for (NodeId slot : visibleChildren(tree, node)) {
-                        if (tree.kind(slot) != NodeKind::Internal) continue;
-                        AttrRunRule const* slotRule = nullptr;
-                        for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
-                            if (sr.appertainsTo != AttrAppertainment::Declaration) {
-                                continue;
-                            }
-                            if (tree.rule(slot).v == sr.rule.v) {
-                                slotRule = &sr;
-                                break;
-                            }
-                        }
-                        if (slotRule == nullptr) continue;
-                        slotAttrNodes.clear();
-                        collectAttrNodes(cfg, tree, slot, slotAttrNodes);
-                        for (NodeId an : slotAttrNodes) {
-                            bool const toType =
-                                attrNodeAppertainment(
-                                    cfg, tree, an, *slotRule,
-                                    /*declaratorIsTypeDerived=*/false)
-                                == AttrAppertainment::Type;
-                            // The sink is never read; the scan returns before
-                            // folding anything into it. It is explicit rather
-                            // than reusing `declAttrFacts` so a future arm added
-                            // above that return cannot leak into the real facts.
-                            AttributeSemanticsFacts typeGrainSink;
-                            scanAttributeSemantics(
-                                s, cfg, tree, an, /*emitUnknown=*/true,
-                                toType ? typeGrainSink : declAttrFacts, here,
-                                /*owningDecl=*/&decl,
-                                /*appertainsToType=*/toType);
-                        }
-                    }
+                    // P69 (lane `cs`, fold f26c): the roots below are ONE walk,
+                    // `foldDeclarationAttributeRoots` -- the same walk the machine-mode
+                    // read takes (`declaredTypeUnderMachineMode`), so the two cannot see
+                    // different positions.
+                    foldDeclarationAttributeRoots(s, cfg, tree, node, decl, here,
+                                                  /*emitUnknown=*/true, declAttrFacts);
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
                     bool alignasContextReported = false;
@@ -17055,6 +18023,15 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             /*allowInitInferredArray=*/initNode.valid(),
                             /*paramDecay=*/decl.paramAdjustments,
                             /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
+                        // P69 (lane `cs`, fold f26c): GNU `mode(M)` replaces the
+                        // declared type before anything below reads it — an
+                        // object's, a typedef's, a member's and a parameter's alike.
+                        // This is the definitive visit: it says a refusal.
+                        declTy = declaredTypeUnderMachineMode(
+                            s, cfg, tree, node, decl, dNode,
+                            /*isLastDeclarator=*/!declarators.empty()
+                                && dNode.v == declarators.back().v,
+                            here, &declAttrFacts, declTy, /*report=*/true);
                         // Complete an inferred `[]` from its initializer (string
                         // length + NUL, or brace top-level element count). A
                         // non-array / already-sized / no-init type passes through
@@ -17147,7 +18124,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 && s.redeclarationPartners.contains(sym.v)) {
                                 s.ownDeclaredType[sym.v] = declTy;
                                 if (NodeId const declNode = s.symbols.at(sym).declNode; declNode.valid())
-                                    s.ownDeclaredAt[sym.v] = tree.span(declNode).start();
+                                    s.ownDeclaredRank[sym.v] = streamRank(s, tree, declNode);
                                 composeArrayRedeclaration(s, sym);
                             }
                             // VLA C4b (D-CSUBSET-VLA, design-audit I1): a VLA-typedef
@@ -17256,13 +18233,23 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     }
                                 }
                                 if (aliasTok.valid() && here.valid()) {
-                                    // SAME scope-resolution the type resolver used
-                                    // (resolveTypeNodeImpl's alias arm: ordinary-namespace
-                                    // `s.scopes.lookup(scope, text)` with scope == here),
-                                    // so this recovers EXACTLY the typedef symbol that
-                                    // produced `headTy`.
-                                    std::string const nm{tree.text(aliasTok)};
-                                    SymbolId const aliasSym = s.scopes.lookup(here, nm);
+                                    // The typedef the type resolver CHOSE for this token,
+                                    // as it recorded it (`typedefNamedByToken`, set where
+                                    // `resolveTypeNodeImpl`'s alias arm resolved the head) —
+                                    // so this is EXACTLY the typedef that produced `headTy`.
+                                    // ★ P69 (lane `cs`, fold f26c — a neighbour of
+                                    // D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE):
+                                    // it used to re-look the alias's NAME up from `here`,
+                                    // order-blind, while the resolver is ordered (a typedef is
+                                    // seen from the end of its declarator) — so with a
+                                    // same-named typedef declared LATER in an inner block
+                                    // (`typedef int R[n]; { R a; typedef int R[m]; }`) it
+                                    // recovered THAT one, and `a` copied its size from a
+                                    // bound captured after `a` is allocated.
+                                    SymbolId const* const recorded =
+                                        s.typedefNamedByToken.tryGet(aliasTok);
+                                    SymbolId const aliasSym =
+                                        recorded != nullptr ? *recorded : InvalidSymbol;
                                     if (aliasSym.valid()) {
                                         auto const& arec = s.symbols.at(aliasSym);
                                         if (arec.kind == DeclarationKind::Type
@@ -17993,140 +18980,14 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // decl-kind gate across four more verbs", answered by not
                         // moving them at all.
                         AttributeSemanticsFacts attrFacts = declAttrFacts;
-                        // ★★ P69 round 4 (lane `cs`) — THE SPECIFIERS WRITTEN INSIDE
-                        // THIS DECLARATOR, BESIDE ITS NAME (`int * __attribute__
-                        // ((weak)) p;`, `static void * __attribute__((constructor))
-                        // init(void)`). `nameAdjacentAttributeSpecifiers` says which
-                        // they are — the same answer the noreturn fold above and the
-                        // lowering's linkage fold read — and they fold HERE, into
-                        // this declarator's private copy and before its trailing
-                        // run (source order), as that run folds: `int *
-                        // __attribute__((weak)) p = 0, q = 0;` is weak for `p`
-                        // alone on gcc and clang. `withinDeclarator` leaves on the
-                        // TYPE the few names whose row says they stay there
-                        // (`aligned`, `packed`, `unused`, `deprecated`); Pass 2 says
-                        // what there is to say about those.
-                        for (NodeId an :
-                                 nameAdjacentAttributeSpecifiers(tree, cfg, dNode)) {
-                            scanAttributeSemantics(
-                                s, cfg, tree, an, /*emitUnknown=*/true, attrFacts,
-                                here, /*owningDecl=*/&decl,
-                                /*appertainsToType=*/false,
-                                /*withinDeclarator=*/true);
-                        }
-                        if (cfg.declarators.has_value()
-                            && tree.kind(dNode) == NodeKind::Internal) {
-                            DeclaratorConfig const& dcHere = *cfg.declarators;
-                            // Read once per declarator, not per run: the shape
-                            // question ("does this declarator derive an array or
-                            // function type?") is a property of the declarator.
-                            bool const derivesTy =
-                                declaratorDerivesType(tree, dNode, dcHere);
-                            for (NodeId ac : visibleChildren(tree, dNode)) {
-                                if (tree.kind(ac) != NodeKind::Internal) continue;
-                                AttrRunRule const* run = nullptr;
-                                for (AttrRunRule const& ar :
-                                         dcHere.afterDeclaratorAttrRules) {
-                                    if (tree.rule(ac).v == ar.rule.v) {
-                                        run = &ar;
-                                        break;
-                                    }
-                                }
-                                if (run == nullptr) continue;   // asm label, init
-                                // emitUnknown=true: this run is THIS declarator's own
-                                // distinct spelling, so its unknown-name diagnostic is
-                                // the first and only one for that text.
-                                // ★ `owningDecl` is THIS declaration's row, exactly as
-                                // for the prefix and slot scans above: an attribute
-                                // must not mean two different things depending on which
-                                // side of the declarator it is written, and the
-                                // unknown-name verdict is part of what it means.
-                                // ★ P66: the grain now comes from the SHARED
-                                // `attrNodeAppertainment`, which composes the
-                                // spelling axis with this one. Here the two are
-                                // the same question — `afterDeclaratorAttrRules`
-                                // names `attrSpec` and `stdAttr` DIRECTLY, so
-                                // per-rule already IS per-spelling and the
-                                // spelling half is a no-op — but reading one
-                                // helper is what stops this fold and the
-                                // declaration-slot fold above from drifting.
-                                AttributeSemanticsFacts typeGrainSink;
-                                AttrAppertainment const grain =
-                                    attrNodeAppertainment(cfg, tree, ac, *run,
-                                                          derivesTy);
-                                bool const confers =
-                                    grain == AttrAppertainment::Declarator;
-                                scanAttributeSemantics(
-                                    s, cfg, tree, ac, /*emitUnknown=*/true,
-                                    confers ? attrFacts : typeGrainSink, here,
-                                    /*owningDecl=*/&decl,
-                                    /*appertainsToType=*/
-                                    grain == AttrAppertainment::Type);
-                            }
-                        }
-                        // ★★★ P56
-                        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
-                        // — THE `declarator`-GRAIN DECLARATION SLOTS, ON THE LAST
-                        // DECLARATOR. c's `structMemberAttrList` is written AFTER
-                        // the member declarator list, so it appertains to the last
-                        // member and nothing else. Before the key carried a grain
-                        // this slot reached the DECLARATION-level fold above and
-                        // conferred on nobody, so DSS was BELOW the union here:
-                        // ✔MEASURED at this base, `struct S { int p, q
-                        // __attribute__((deprecated)); };` flagged NEITHER member,
-                        // where gcc 13.3.0 and clang 18.1.3 both flag `q` and both
-                        // leave `p` clean. Folding into the PRIVATE per-declarator
-                        // copy is what keeps `p` clean.
-                        if (!declarators.empty()
-                            && dNode.v == declarators.back().v) {
-                            // ★ P66: per attribute NODE, for the same reason as
-                            // the declaration-grain loop above — this slot is a
-                            // run container too. c's `typedefTrailingAttrRun`
-                            // declares no per-spelling override and is
-                            // byte-identical under this loop; reading the grain
-                            // through the shared helper here is what keeps a
-                            // future override from being silently unread at one
-                            // of the two container sites.
-                            // ✔MEASURED 2026-09-09 that this slot's answer is
-                            // genuinely different from the post-head one and
-                            // must stay conferring: `typedef int A, B
-                            // [[deprecated]];` warns at a use of **B** and is
-                            // clean at a use of **A** on gcc 13.3.0, clang
-                            // 18.1.3 AND MSVC 19.51.36257 alike.
-                            std::vector<NodeId> trailingAttrNodes;
-                            for (NodeId slot : visibleChildren(tree, node)) {
-                                if (tree.kind(slot) != NodeKind::Internal) continue;
-                                AttrRunRule const* trailingRule = nullptr;
-                                for (AttrRunRule const& sr :
-                                         decl.declarationAttrSlotRules) {
-                                    if (sr.appertainsTo
-                                        != AttrAppertainment::Declarator) {
-                                        continue;
-                                    }
-                                    if (tree.rule(slot).v == sr.rule.v) {
-                                        trailingRule = &sr;
-                                        break;
-                                    }
-                                }
-                                if (trailingRule == nullptr) continue;
-                                trailingAttrNodes.clear();
-                                collectAttrNodes(cfg, tree, slot,
-                                                 trailingAttrNodes);
-                                for (NodeId an : trailingAttrNodes) {
-                                    bool const toType =
-                                        attrNodeAppertainment(
-                                            cfg, tree, an, *trailingRule,
-                                            /*declaratorIsTypeDerived=*/false)
-                                        == AttrAppertainment::Type;
-                                    AttributeSemanticsFacts typeGrainSink;
-                                    scanAttributeSemantics(
-                                        s, cfg, tree, an, /*emitUnknown=*/true,
-                                        toType ? typeGrainSink : attrFacts, here,
-                                        /*owningDecl=*/&decl,
-                                        /*appertainsToType=*/toType);
-                                }
-                            }
-                        }
+                        // P69 (lane `cs`, fold f26c): this declarator's own roots are
+                        // ONE walk, `foldDeclaratorAttributeRoots` -- the same walk the
+                        // machine-mode read takes (`declaredTypeUnderMachineMode`).
+                        foldDeclaratorAttributeRoots(
+                            s, cfg, tree, node, decl, dNode,
+                            /*isLastDeclarator=*/!declarators.empty()
+                                && dNode.v == declarators.back().v,
+                            here, /*emitUnknown=*/true, attrFacts);
                         // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the
                         // declaration's folded attribute facts to THIS
                         // declarator's symbol (C23 6.7.13: an attribute in the
@@ -18367,6 +19228,27 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // object ("definition is marked dllimport") and compiles the
                         // function into a program that does not link (`__imp_f`
                         // undefined) — no reference makes a program of either.
+                        //
+                        // ★★ P69 (lane `cs`, fold f26c — the review of f26b, F4): AN
+                        // INLINE FUNCTION DEFINITION is not refused where the row states
+                        // `ignoredOnInlineDefinition`: the clause is IGNORED, said with
+                        // that text, and recorded so the linkage fold does not apply it;
+                        // the definition keeps its inline meaning (C 6.7.4p7).
+                        // ✔MEASURED (lane `cs` probe dl, every cell RUN; mingw-w64 gcc
+                        // 13.2.0 -O0 and -O2, cl 19.51 /Od and /O2): mingw-w64 gcc warns
+                        // "inline function declared as dllimport: attribute ignored" and
+                        // builds `__inline`, `inline`, `extern inline` and gnu_inline
+                        // definitions, running 42 wherever the body is expanded or the
+                        // unit provides the external definition (`extern inline` at
+                        // -O0 too), and failing to link only where C's inline rule leaves
+                        // no external definition (`inline` at -O0); cl accepts each
+                        // silently and runs 42 at /O2, every call not expanded going to
+                        // the import (`__imp_twice` unresolved at /Od). Decided for gcc's
+                        // reading, the union over what works: it builds every program
+                        // cl's does and the `extern inline` one at every level besides,
+                        // and with the import ignored a call not expanded reaches the
+                        // inline function's external definition, the import library's
+                        // thunk of the DLL's, or neither — as C's inline rule says.
                         {
                             bool const definesHere = isFunctionForm || initNode.valid();
                             for (auto const& ksc : attrFacts.kindScopedClauses) {
@@ -18382,6 +19264,26 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     (static_cast<std::uint64_t>(tree.id().v) << 32)
                                     | ksc.clauseNode.v;
                                 if (!s.attributeClausesReported.insert(key).second) continue;
+                                if (isFunctionForm && declInline.present
+                                    && !ksc.row->ignoredOnInlineDefinition.empty()) {
+                                    if (ksc.nameToken.valid())
+                                        s.attributeNamesIgnoredForKind.set(ksc.nameToken, true);
+                                    ParseDiagnostic w;
+                                    w.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                                    w.severity = DiagnosticSeverity::Warning;
+                                    w.buffer   = tree.source().id();
+                                    w.span     = tree.span(ksc.clauseNode.valid() ? ksc.clauseNode
+                                                           : nameNode.valid()     ? nameNode
+                                                                                  : node);
+                                    w.actual   = std::format(
+                                        "attribute '{}' is ignored on this declaration and its "
+                                        "effect was discarded: '{}' is an inline definition, "
+                                        "and {}",
+                                        ksc.name, tree.text(nameNode),
+                                        ksc.row->ignoredOnInlineDefinition);
+                                    s.reporter.report(std::move(w));
+                                    continue;
+                                }
                                 ParseDiagnostic d;
                                 d.code     = DiagnosticCode::S_AttributeNotHonoured;
                                 d.severity = DiagnosticSeverity::Error;
@@ -19274,7 +20176,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 TypeInterner const& ti = s.lattice.interner();
                                 TypeId const ret = ti.fnResult(declTy);
                                 if (compositeIncompleteAt(s, tree, ret,
-                                                          tree.span(nameNode).start())) {
+                                                          streamRank(s, tree, nameNode))) {
                                     ParseDiagnostic d;
                                     d.code = DiagnosticCode::S_IncompleteReturnType;
                                     d.severity = DiagnosticSeverity::Error;
@@ -19351,7 +20253,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         continue;
                                     }
                                     if (compositeIncompleteAt(s, tree, pTy,
-                                                              tree.span(pNode).end())) {
+                                                              streamRankPast(s, tree, pNode))) {
                                         refuseParam(
                                             DiagnosticCode::S_IncompleteTypeObject,
                                             "a parameter of a function definition must "
@@ -20110,6 +21012,25 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         + std::string{srec.name} + "`";
                                     s.reporter.report(std::move(d));
                                 }
+                                if ((ck == CompositeKind::Struct
+                                     || ck == CompositeKind::Union)
+                                    && composedAttrs.machineModeRow != nullptr) {
+                                    // P69 (lane `cs`, fold f26c): every reference
+                                    // refuses a machine mode on a structure or union.
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_AttributeNotHonoured;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(composedAttrs.machineModeClause);
+                                    d.actual   = std::format(
+                                        "attribute 'mode' cannot be applied to the {} "
+                                        "'{}': a machine mode replaces an integer, a "
+                                        "floating or a pointer type",
+                                        ck == CompositeKind::Struct ? "structure"
+                                                                    : "union",
+                                        srec.name);
+                                    s.reporter.report(std::move(d));
+                                }
                                 if (ck == CompositeKind::Struct
                                     || ck == CompositeKind::Union) {
                                     // ★ THE LAYOUT CHANNELS ARE STRUCT/UNION-ONLY,
@@ -20848,6 +21769,70 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                                     continue;
                                                 reportOutOfRange(s.symbols.at(ordered[i].second));
                                                 break;
+                                            }
+                                        }
+                                        // ★ P69 (lane `cs`, fold f26c): GNU `mode(M)` after
+                                        // the body sets the enumeration's WIDTH — the
+                                        // integer type of the mode, with the signedness
+                                        // of the type it was given above. ✔MEASURED
+                                        // (probes md, md2): `enum E { EA = 1, EB = 2 }
+                                        // __attribute__((mode(QI)))` is 1 byte on gcc
+                                        // 13.3.0, clang 18.1.3, mingw-w64 gcc, Apple clang
+                                        // and aarch64 gcc; an enumerator the width cannot
+                                        // hold (`GB = 300`) is refused by gcc and converted
+                                        // by clang — refused here, by name (a value the
+                                        // program wrote is never silently changed). With a
+                                        // FIXED underlying type the two would state two
+                                        // widths; no reference was measured there, and it
+                                        // is refused by name.
+                                        if (composedAttrs.machineModeRow != nullptr) {
+                                            NodeId const modeClause =
+                                                composedAttrs.machineModeClause;
+                                            auto const refuseMode = [&](std::string why) {
+                                                ParseDiagnostic d;
+                                                d.code = DiagnosticCode::S_AttributeNotHonoured;
+                                                d.severity = DiagnosticSeverity::Error;
+                                                d.buffer   = tree.source().id();
+                                                d.span     = tree.span(modeClause);
+                                                d.actual   = std::move(why);
+                                                s.reporter.report(std::move(d));
+                                            };
+                                            if (hasExplicitUnderlying) {
+                                                refuseMode(std::format(
+                                                    "attribute 'mode' cannot set the width of "
+                                                    "the enumeration '{}': its underlying type "
+                                                    "is fixed by its enum type specifier",
+                                                    srec.name));
+                                            } else {
+                                                TypeId const moded = machineModeType(
+                                                    s, cfg, tree, modeClause,
+                                                    *composedAttrs.machineModeRow,
+                                                    compositeTy, /*report=*/true);
+                                                if (moded.valid()
+                                                    && moded.v != compositeTy.v) {
+                                                    TypeKind const mk = enumIn.kind(moded);
+                                                    bool fits = true;
+                                                    for (std::size_t i = 0;
+                                                         i < values.size()
+                                                         && i < ordered.size();
+                                                         ++i) {
+                                                        if (enumeratorValueFitsKind(values[i], mk))
+                                                            continue;
+                                                        fits = false;
+                                                        refuseMode(std::format(
+                                                            "the enumerator '{}' does not fit "
+                                                            "in the {}-byte integer the machine "
+                                                            "mode makes the enumeration '{}'",
+                                                            s.symbols.at(ordered[i].second).name,
+                                                            intKindBits(mk) / 8, srec.name));
+                                                        break;
+                                                    }
+                                                    if (fits) {
+                                                        compositeTy = enumIn.enumType(
+                                                            srec.name, mk, moded,
+                                                            TypeInterner::EnumUnderlyingOrigin::Chosen);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -22175,7 +23160,7 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
                 return {};
             }
             return {symbolConstAt(
-                s.scopes.lookup(here, std::string{tree.text(cur)}), levels),
+                lookupOrdinaryUse(s, tree, here, tree.text(cur), cur), levels),
                     false};
         }
         // A parser recovery (Error) node designates nothing: no claim
@@ -22375,7 +23360,7 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
             named.node.valid() && tree.kind(named.node) == NodeKind::Token
             && cfg.identifierToken.valid()
             && tree.tokenKind(named.node) == cfg.identifierToken) {
-            return {symbolConstAt(s.scopes.lookup(here, named.name), levels),
+            return {symbolConstAt(lookupOrdinaryUse(s, tree, here, named.name, named.node), levels),
                     false};
         }
         // A transparent wrapper (a paren group, a single-child expression rule):
@@ -22444,7 +23429,7 @@ void reportWriteToConstLvalue(EngineState& s, SemanticConfig const& cfg,
         && tree.kind(resolved.node) == NodeKind::Token
         && cfg.identifierToken.valid()
         && tree.tokenKind(resolved.node) == cfg.identifierToken) {
-        SymbolId const sym = s.scopes.lookup(here, resolved.name);
+        SymbolId const sym = lookupOrdinaryUse(s, tree, here, resolved.name, resolved.node);
         if (sym.valid() && s.symbols.at(sym).isConst) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_ConstViolation;
@@ -23022,7 +24007,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         ref.isTagReference ? SymbolNamespace::Tag
                                            : SymbolNamespace::Ordinary;
                     SymbolId found =
-                        s.scopes.lookup(here, resolved.name, lookupNs);
+                        lookupNs == SymbolNamespace::Ordinary
+                            ? lookupOrdinaryUse(s, tree, here, resolved.name, resolved.node)
+                            : lookupTagUse(s, tree, here, resolved.name, node);
                     // ★ P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN):
                     // a LIBRARY builtin (`__builtin_strlen`) is bound by no scope; its first
                     // use in the tree binds it to the library function it calls
@@ -23042,7 +24029,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         && !libraryBuiltinRefused
                         && isTheCalleeOfACall(s, cfg, tree, node, resolved.node)) {
                         found = blockFunctionDeclarationBefore(
-                            s, tree.id(), resolved.name, tree.span(resolved.node).start());
+                            s, tree.id(), resolved.name, streamRank(s, tree, resolved.node));
                         if (found.valid()) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_OutOfScopeDeclarationUsed;
@@ -23060,6 +24047,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                     tree.source().id(), tree.span(decl.declNode),
                                     "previous declaration is here"});
                             s.reporter.report(std::move(d));
+                        }
+                    }
+                    // ★★ P69 (lane `cs`, fold f26c): and where nothing at all is in scope,
+                    // the call rule's implicit declaration (`implicitlyDeclaredCallee`).
+                    if (!found.valid() && lookupNs == SymbolNamespace::Ordinary
+                        && !libraryBuiltinRefused) {
+                        if (CallRule const* call =
+                                callRuleOfCallee(s, cfg, tree, node, resolved.node);
+                            call != nullptr && !call->implicitDeclarationResult.empty()) {
+                            found = implicitlyDeclaredCallee(s, tree, here, resolved.name,
+                                                             resolved.node, *call);
                         }
                     }
                     if (found.valid()) {
@@ -25710,7 +26708,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // convert), and BEFORE the arity check so neither fact hides the other; an
     // argument refused here is not judged again for assignability below.
     if (TypeId const resultTy = s.lattice.interner().fnResult(fnSig);
-        compositeIncompleteAt(s, tree, resultTy, tree.span(node).start())) {
+        compositeIncompleteAt(s, tree, resultTy, streamRank(s, tree, node))) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_IncompleteReturnType;
         d.severity = DiagnosticSeverity::Error;
@@ -25726,7 +26724,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     for (std::size_t i = 0; i < argNodes.size(); ++i) {
         TypeId const argTy = subtreeType(s, tree, argNodes[i]);
         if (!compositeIncompleteAt(s, tree, argTy,
-                                   tree.span(argNodes[i]).start()))
+                                   streamRank(s, tree, argNodes[i])))
             continue;
         argIncomplete[i] = true;
         ParseDiagnostic d;
@@ -26104,7 +27102,7 @@ designateBuiltinOperand(EngineState& s, SemanticConfig const& cfg, Tree const& t
             if (!lvalue || !cfg.identifierToken.valid()
                 || tree.tokenKind(n).v != cfg.identifierToken.v)
                 return std::nullopt;
-            SymbolId const sym = s.scopes.lookup(here, tree.text(n));
+            SymbolId const sym = lookupOrdinaryUse(s, tree, here, tree.text(n), n);
             if (!sym.valid()) return std::nullopt;
             auto const& rec = s.symbols.at(sym);
             if (rec.kind != DeclarationKind::Variable) return std::nullopt;
@@ -26364,7 +27362,7 @@ builtinCalleeOf(EngineState& s, SemanticConfig const& cfg, Tree const& tree, Nod
         return InvalidSymbol;
     SymbolId sym = InvalidSymbol;
     if (SymbolId const* bound = s.nodeToSymbol.tryGet(resolved.node)) sym = *bound;
-    if (!sym.valid()) sym = s.scopes.lookup(here, resolved.name);
+    if (!sym.valid()) sym = lookupOrdinaryUse(s, tree, here, resolved.name, resolved.node);
     if (!sym.valid() || s.symbols.at(sym).builtinLowering == BuiltinLowering::None)
         return InvalidSymbol;
     if (argsOut != nullptr && call.argsChild < kids.size())
@@ -26845,7 +27843,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             && cfg.identifierToken.valid()
             && tree.tokenKind(cur) == cfg.identifierToken) {
             SymbolId sym =
-                s.scopes.lookup(scope, std::string{tree.text(cur)});
+                lookupOrdinaryUse(s, tree, scope, tree.text(cur), cur);
             // P69 (lane `cs`): `(__builtin_strlen)(s)` — the library builtin's binding.
             if (!sym.valid()
                 && !cfg.libraryBuiltins.libraryFunctionOf(tree.text(cur)).empty())
@@ -26920,7 +27918,34 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         s.reporter.report(std::move(d));
         return;
     }
-    SymbolId calleeSym = s.scopes.lookup(scope, resolved.name);
+    SymbolId calleeSym = lookupOrdinaryUse(s, tree, scope, resolved.name, resolved.node);
+    // P69 (lane `cs`, fold f26c): the declaration Pass 2's reference resolution gave a callee
+    // that names nothing in scope — an earlier block's (`blockFunctionDeclarationBefore`) or
+    // the implicit declaration's later one (`implicitlyDeclaredCallee`) — is the one checked.
+    if (!calleeSym.valid()) {
+        if (SymbolId const* bound = s.nodeToSymbol.tryGet(resolved.node)) calleeSym = *bound;
+    }
+    // …and a function the call declared implicitly takes its type from this call's arguments
+    // the first time, and holds every later call to it (`completeImplicitDeclaration`).
+    if (calleeSym.valid() && s.symbols.at(calleeSym).isImplicitDeclaration) {
+        std::vector<NodeId> argNodes;
+        if (call.argsChild < kids.size()) gatherArgExpressions(tree, kids[call.argsChild], argNodes);
+        TypeId const fnTy = completeImplicitDeclaration(s, cfg, tree, calleeSym, resolved.node,
+                                                        argNodes, scope, call);
+        if (!fnTy.valid()) return;   // an argument with no type: its own diagnostic said it
+        // The reference arm ran before this call completed the type, so it stamped nothing:
+        // the type goes on the name and on every wrapper up to the callee (the reference node
+        // the lowering reads — the callee names solely an identifier, C90 6.3.2.2, so the
+        // chain holds only single-child wrappers).
+        std::vector<NodeId> chain;
+        for (NodeId n = resolved.node; n.valid() && n.v != node.v; n = tree.parent(n)) {
+            chain.push_back(n);
+            if (n.v == calleeNode.v) {
+                for (NodeId const c : chain) s.nodeToType.set(c, fnTy);
+                break;
+            }
+        }
+    }
     // P69 (lane `cs`): a library builtin's binding, made (and cached per tree) where Pass 2
     // first met the name — the same answer here, never a second report.
     if (!calleeSym.valid() && !cfg.libraryBuiltins.libraryFunctionOf(resolved.name).empty())
@@ -27476,7 +28501,7 @@ subtreeType(EngineState& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
             return InvalidType;            // a literal/operator token — not a name
         }
         if (!scope.valid()) return InvalidType;
-        SymbolId const sym = s.scopes.lookup(scope, tree.text(tok));
+        SymbolId const sym = lookupOrdinaryUse(s, tree, scope, tree.text(tok), tok);
         if (!sym.valid()) return InvalidType;
         return typeVisibleAt(s, tree, sym, tok);
     };
@@ -27845,6 +28870,30 @@ subtreeType(EngineState& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
                 && (interner.kind(thenT) == TypeKind::Array
                     || interner.kind(elseT) == TypeKind::Array)) {
                 return thenD;
+            }
+        }
+        // ★★ P69 (lane `cs`, fold f26c — D-C-A-POINTER-TO-AN-ARRAY-OF-UNKNOWN-SIZE-IS-WARNED-INCOMPATIBLE,
+        // item (3)): C 6.5.15p6 — two arms that are pointers to COMPATIBLE types (after an array or a
+        // function designator decays) give a pointer to their COMPOSITE (C 6.2.7p3): `one ? pu : p3`
+        // over `int (*)[]` / `int (*)[3]` is an `int (*)[3]`, so `sizeof *(one ? pu : p3)` is 12, and
+        // `one ? g3 : gu` over functions returning those two is a pointer to a function returning
+        // `int (*)[3]`. ✔MEASURED (lane `cs` probe ft cells 15, 23 and 24, each RUN): gcc 13.3.0,
+        // clang 18.1.3 and mingw-w64 gcc 13.2.0 read the composite (42); cl 19.51 reads the first
+        // arm's incomplete type (30, C4034) — a MEANING split, DECIDED for C 6.5.15p6 and the three.
+        // Before this the conditional fell to the first arm's type. The HIR `combineTernary`
+        // converts each arm to the same composite.
+        {
+            auto const decayToPointer = [&](TypeId t) -> TypeId {
+                if (t.valid() && interner.kind(t) == TypeKind::FnSig) return interner.pointer(t);
+                return decayArray(t);
+            };
+            TypeId const thenD = decayToPointer(thenT);
+            TypeId const elseD = decayToPointer(elseT);
+            if (thenD.valid() && elseD.valid() && thenD != elseD
+                && interner.kind(thenD) == TypeKind::Ptr && interner.kind(elseD) == TypeKind::Ptr) {
+                TypeId const composite =
+                    compositeType(interner, thenD, elseD, ArraysCompared::BelowAPointer);
+                if (composite.valid()) return composite;
             }
         }
         // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE part 2) C 6.5.15p6, the
@@ -28858,10 +29907,10 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
     // node wrapping exactly one — `extractNameNode`'s Self test), else invalid.
     auto const namedSymbol = [&](NodeId n) -> SymbolId {
         if (!n.valid()) return {};
-        if (isIdentifier(n)) return s.scopes.lookup(here, tree.text(n));
+        if (isIdentifier(n)) return lookupOrdinaryUse(s, tree, here, tree.text(n), n);
         auto const named = extractNameNode(tree, n, NameMatchMode::Self, cfg.identifierToken);
         if (!named.node.valid() || !isIdentifier(named.node)) return {};
-        return s.scopes.lookup(here, named.name);
+        return lookupOrdinaryUse(s, tree, here, named.name, named.node);
     };
     // A symbol's own spine with level 0 answered by `isConst`.
     auto const symbolSpine = [&](SymbolId sym) -> Base {
@@ -28931,7 +29980,7 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
              cur.valid(); steps.step()) {
             if (tree.kind(cur) == NodeKind::Token) {
                 if (isIdentifier(cur)) {
-                    out.base = symbolSpine(s.scopes.lookup(here, tree.text(cur)));
+                    out.base = symbolSpine(lookupOrdinaryUse(s, tree, here, tree.text(cur), cur));
                     return out;
                 }
                 TypeId const t = s.typeAt(cur);   // a literal: Pass-2-stamped
@@ -29114,7 +30163,7 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
             if (auto named = extractNameNode(tree, cur, NameMatchMode::Self,
                                              cfg.identifierToken);
                 named.node.valid() && isIdentifier(named.node)) {
-                out.base = symbolSpine(s.scopes.lookup(here, named.name));
+                out.base = symbolSpine(lookupOrdinaryUse(s, tree, here, named.name, named.node));
                 return out;
             }
             // A literal (an operand wrapping tokens only): unqualified, of its type.
@@ -29758,8 +30807,10 @@ void settleNoCommon(EngineState& s, std::span<Tree const> trees) {
     auto const positionOf = [&](SymbolRecord const& rec) {
         auto const t = treeOrder.find(rec.tree.v);
         std::size_t const tree = t == treeOrder.end() ? trees.size() : t->second;
+        // In its tree's token-stream order (P69, lane `cs`, fold f26c: a byte offset,
+        // which a declaration whose name a paste produced does not keep).
         std::uint32_t const at = (t != treeOrder.end() && rec.declNode.valid())
-                                     ? trees[tree].span(rec.declNode).start()
+                                     ? streamRank(s, trees[tree], rec.declNode)
                                      : 0u;
         return std::pair{tree, at};
     };
@@ -31656,6 +32707,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     {
         std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
         for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        // Every {entity, absorbed block declaration} pair the two passes below make.
+        std::vector<std::pair<SymbolId, SymbolId>> absorbedAcrossScopes;
         // Symbol ids are dense and minted from 1; the store only grows.
         for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
             SymbolId const sid{sv};
@@ -31688,6 +32741,97 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             rec.isAbsorbedProto = true;
             s.scopes.injectBinding(rec.scope, rec.name, target);
             s.mergedFnDecls.push_back({target, sid});
+            absorbedAcrossScopes.push_back({target, sid});
+        }
+        // ★★ P69 (lane `cs`, fold f26c — the review of f26b, F1): BLOCK-SCOPE
+        // DECLARATIONS OF ONE EXTERNAL NAME WITH NO FILE-SCOPE DECLARATION OF IT are
+        // still ONE entity (C 6.2.2p2 and p4: each declaration of an identifier with
+        // external linkage denotes the same object or function), so their types must
+        // agree (C 6.2.7p2). The pass above meets a block declaration only with a
+        // FILE-scope binding of its name; two blocks that alone declare `g` met nothing,
+        // each lowered its own import row of one link name, and an incompatible pair
+        // was a silent miscompile. Here every such declaration of the unit's tree is
+        // absorbed into the FIRST one written (the lowest id: Pass 1 mints in source
+        // order) exactly as the pass above absorbs into a file-scope one — its binding
+        // repointed, the pair riding `mergedFnDecls` — so the compatibility sweep after
+        // Pass 1.5 judges them and one import row stands for the name. ✔MEASURED (lane
+        // `cs` probe bb, object mode; gcc 13.3.0 and clang 18.1.3 -Wall on Linux,
+        // mingw-w64 gcc 13.2.0, cl 19.51 /W4): every reference REFUSES two incompatible
+        // FUNCTION declarations in two functions, in sibling blocks and in nested
+        // blocks ("conflicting types for 'g'", C2371), a function and an object of one
+        // name (C2373, "redeclared as different kind of symbol"), and two return types
+        // only; gcc, clang and mingw-w64 gcc refuse two incompatible extern OBJECTS
+        // ("conflicting types for 'x'"), which cl accepts — decided for the refusal: the
+        // two declarations name one object and any access through either is undefined
+        // (C 6.2.7p2), so cl's acceptance makes no program work that the refusal loses.
+        // Compatible declarations are accepted by all four, and here too.
+        {
+            std::unordered_map<std::string, SymbolId> firstBlockDeclaration;
+            for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
+                SymbolId const sid{sv};
+                auto& rec = s.symbols.at(sid);
+                if (!(rec.isExternDeclaration || rec.isProtoDeclaration) || rec.isAbsorbedProto)
+                    continue;
+                if (rec.kind == DeclarationKind::Type || rec.kind == DeclarationKind::Table)
+                    continue;
+                auto const tIt = treeById.find(rec.tree.v);
+                if (tIt == treeById.end()) continue;
+                ScopeId const fileScope = fileScopeOf(s, *tIt->second, rec.scope);
+                if (!fileScope.valid() || fileScope.v == rec.scope.v) continue;
+                auto const& fileBindings = s.scopes.scopes()[fileScope.v].bindings;
+                if (fileBindings.contains(rec.name)) continue;   // the pass above's case
+                std::string key = std::to_string(rec.tree.v);
+                key += ':';
+                key += rec.name;
+                auto const [first, inserted] = firstBlockDeclaration.emplace(std::move(key), sid);
+                if (inserted) continue;
+                SymbolId const survivor = first->second;
+                rec.isAbsorbedProto = true;
+                s.scopes.injectBinding(rec.scope, rec.name, survivor);
+                s.mergedFnDecls.push_back({survivor, sid});
+                absorbedAcrossScopes.push_back({survivor, sid});
+            }
+        }
+        // ★★ P69 (lane `cs`, fold f26c — the review of f26b, F2): AN IMPORT ACROSS
+        // THE PAIR, which Pass 1's merge never saw (two scopes). Each pair is one
+        // entity, so (1) the import is decided across it as across a pair in one
+        // scope (`reconcileImportAcrossRedeclaration`, the earlier declaration in
+        // source order the prior — the import of a block declaration after a plain
+        // file-scope one holds for the entity, a later declaration without the import
+        // ends an earlier one's, warned), and (2) the absorbed declaration's history
+        // joins the entity's, in position order, so a use anywhere after the block's
+        // import — inside the block (bound to the entity now) or after it — reads it.
+        // ✔MEASURED (lane `cs` probe ih, object mode; mingw-w64 gcc 13.2.0 -Wall, cl
+        // 19.51 /W4): `extern int x;` then a block's `__declspec(dllimport) int x;`
+        // and `static int *p = &x;` in the block, after the block in its function, or
+        // at file scope after the function — mingw-w64 gcc refuses each ("initializer
+        // element is not constant"), cl each too (C2370); the mirror — the file-scope
+        // import, then the block's plain `extern int x;` and the initializer in the
+        // block — mingw-w64 gcc builds, warning "previous dllimport ignored" and
+        // writing `x` unimported, cl refuses (C2099): one working reference, so it is
+        // built as mingw-w64 gcc reads it. A refusal of the pair cannot arise here: a
+        // block import of a name the file scope already DEFINES was refused in Pass 1
+        // (`refuseBlockImportOfADefinedName`), and its import cleared.
+        for (auto const& [entity, absorbed] : absorbedAcrossScopes) {
+            SymbolRecord const& ab = s.symbols.at(absorbed);
+            SymbolRecord const& en = s.symbols.at(entity);
+            auto const from = s.importHistory.find(importHistoryKey(ab.scope, ab.name));
+            if (from != s.importHistory.end()) {
+                std::vector<EngineState::ImportHistoryEntry> const joined = from->second;
+                auto& into = s.importHistory[importHistoryKey(en.scope, en.name)];
+                into.insert(into.end(), joined.begin(), joined.end());
+                std::ranges::stable_sort(into, {}, &EngineState::ImportHistoryEntry::position);
+            }
+            if (ab.tree.v != en.tree.v || !ab.declNode.valid() || !en.declNode.valid()) continue;
+            auto const tIt = treeById.find(ab.tree.v);
+            if (tIt == treeById.end()) continue;
+            Tree const& tree = *tIt->second;
+            bool const absorbedFirst =
+                streamRank(s, tree, ab.declNode) < streamRank(s, tree, en.declNode);
+            SymbolId const earlier = absorbedFirst ? absorbed : entity;
+            SymbolId const later   = absorbedFirst ? entity : absorbed;
+            reconcileImportAcrossRedeclaration(s, tree, ab.name, s.symbols.at(later).declNode,
+                                               earlier, later, std::string{});
         }
     }
 
@@ -32730,6 +33874,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         auto const key = std::make_pair(tree.id().v, std::string{lib});
         std::string const name{lib};
         auto const reportRefusal = [&] {
+            // Asked with no node (an implicit declaration's silent question,
+            // `implicitlyDeclaredCallee`): the answer is the caller's to act on.
+            if (!at.valid()) return;
             SourceSpan const span = tree.span(at);
             if (!libraryRefusalReportedAt.emplace(tree.id().v, span.start(), span.end())
                      .second)
@@ -32924,6 +34071,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // its symbols OUT of the unused warning — the whole point of the
             // attribute. Same engine, same empty use-set, no warning.
             if (rec.isMaybeUnused) continue;
+            // P69 (lane `cs`, fold f26c — the review of f26b, F10): a declaration the
+            // block-extern sweep ABSORBED had its binding repointed at the record it
+            // joined, so every use of the name lands there and its own use-set says
+            // nothing; the entity's record is the one asked.
+            if (rec.isAbsorbedProto) continue;
             auto useIt = s.usesBySymbol.find(static_cast<std::uint32_t>(i));
             if (useIt != s.usesBySymbol.end() && !useIt->second.empty()) continue;
             auto treeIt = treeById.find(rec.tree.v);

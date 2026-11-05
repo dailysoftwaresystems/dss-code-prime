@@ -2670,6 +2670,10 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
                                            // `nocommon`).
                                            "symbolAlias", "tentativeMayBeCommon",
                                            "tentativeNeverCommon",
+                                           // P69 (lane `cs`, fold f26c): GNU
+                                           // `mode(M)` -- the declared type
+                                           // replaced by a machine mode's.
+                                           "machineMode",
                                            "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
@@ -2709,6 +2713,10 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
         } else if (verb == "unsupported") {
             probeRow = R"([ { "names": ["aligned"], "effect": "unsupported",
                               "reason": "this language cannot honour it" } ])";
+        } else if (verb == "machineMode") {
+            // P69 (lane `cs`, fold f26c): the verb requires its own table.
+            probeRow = R"([ { "names": ["aligned"], "effect": "machineMode", "appliesTo": ["variable"],
+                              "machineModes": [ { "names": ["QI"], "integerBytes": 1 } ] } ])";
         } else {
             probeRow = std::format(R"([ {{ "names": ["aligned"],
                                            "appliesTo": ["variable"],
@@ -3844,11 +3852,34 @@ TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere
                  nullptr},
              // P69 fold f26b: `refusedOnDefinition` — the refusal's text, read by the
              // declaration-kind gate, so only beside a kind axis.
+             // P69 fold f26c: `ignoredOnInlineDefinition` beside them (an inline
+             // function definition is not refused: the attribute is ignored and said).
              Row{"an inert row refused on a definition and ignored on an alias, with reasons",
                  R"([ { "names": ["imp"], "appliesTo": ["variable", "function"],
                         "effect": "none", "refusedOnDefinition": "it is another image's",
-                        "ignoredOnAlias": "it has no storage" } ])",
+                        "ignoredOnAlias": "it has no storage",
+                        "ignoredOnInlineDefinition": "its body is this unit's" } ])",
                  nullptr},
+             // P69 fold f26c: `ignoredOnInlineDefinition` — the warning's text, read
+             // beside `refusedOnDefinition`, under the same two rules.
+             Row{"ignoredOnInlineDefinition that is no string",
+                 R"([ { "names": ["imp"], "appliesTo": ["function"], "effect": "none",
+                        "ignoredOnInlineDefinition": false } ])",
+                 "'ignoredOnInlineDefinition' must be a non-empty STRING"},
+             Row{"an empty ignoredOnInlineDefinition",
+                 R"([ { "names": ["imp"], "appliesTo": ["function"], "effect": "none",
+                        "ignoredOnInlineDefinition": "" } ])",
+                 "'ignoredOnInlineDefinition' must be a non-empty STRING"},
+             Row{"ignoredOnInlineDefinition on a row with no kind axis",
+                 R"([ { "names": ["imp"], "effect": "none",
+                        "ignoredOnInlineDefinition": "its body is this unit's" } ])",
+                 "'ignoredOnInlineDefinition' is read by the declaration-kind gate"},
+             // …and it is the exception to a refusal: with no `refusedOnDefinition`
+             // nothing reads it.
+             Row{"ignoredOnInlineDefinition with no refusedOnDefinition",
+                 R"([ { "names": ["imp"], "appliesTo": ["function"], "effect": "none",
+                        "ignoredOnInlineDefinition": "its body is this unit's" } ])",
+                 "'ignoredOnInlineDefinition' is the exception to 'refusedOnDefinition'"},
              // P69 fold f26b: `ignoredOnAlias` — the warning's text, read beside
              // `refusedOnDefinition`, under the same two rules.
              Row{"ignoredOnAlias that is no string",
@@ -3950,6 +3981,8 @@ TEST(GrammarSchema, AnEffectsRowsVerbKeysAreRequiredWhereReadAndRefusedElsewhere
             } else if (effects[0].effect == AttributeEffect::None) {
                 EXPECT_EQ(effects[0].refusedOnDefinition, "it is another image's") << row.what;
                 EXPECT_EQ(effects[0].ignoredOnAlias, "it has no storage") << row.what;
+                EXPECT_EQ(effects[0].ignoredOnInlineDefinition, "its body is this unit's")
+                    << row.what;
                 EXPECT_EQ(effects[0].appliesTo.size(), 2u) << row.what;
             } else {
                 EXPECT_TRUE(effects[0].staysWithTypeInDeclarator) << row.what;
@@ -8587,6 +8620,9 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
     EXPECT_EQ(dllimport->availableObjectFormats,
               (std::vector<ObjectFormatKind>{ObjectFormatKind::Pe}));
     EXPECT_FALSE(dllimport->refusedOnDefinition.empty());
+    // P69 fold f26c: an INLINE function definition is not refused — the import is
+    // ignored and said (mingw-w64 gcc's reading, lane `cs` probe dl).
+    EXPECT_FALSE(dllimport->ignoredOnInlineDefinition.empty());
 
     // The thread-storage request of the qualified spelling: every row that can
     // declare an object carries it, and on each it yields to a declaration of the
@@ -9850,4 +9886,87 @@ TEST(GrammarSchema, AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt) {
                 && d.message.find(b.needle) != std::string::npos;
         })) << b.why << " — got: " << r.error()[0].message;
     }
+}
+
+// ★★ P69 (lane `cs`, fold f26c): the call rule's IMPLICIT DECLARATION keys —
+// `implicitDeclarationResult` (a non-empty string: the builtin type a function a call
+// declares returns) and `implicitDeclarationBuiltinPrefixes` (an array of non-empty strings,
+// read only beside the result: the builtin families no call declares). Each malformed
+// spelling is refused C_InvalidSemantics, never read as absent; the well-formed pair is read
+// exactly. RED-ON-DISABLE: drop either loader's refusal → its rows load.
+TEST(GrammarSchema, SemanticsCallRulesImplicitDeclarationKeys) {
+    auto const cfg = [](std::string_view extra) {
+        std::string s = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "callRules": [
+        { "rule": "root", "callee": 0, "args": 0%EXTRA% }
+      ] }
+    })JSON";
+        s.replace(s.find("%EXTRA%"), 7, extra);
+        return s;
+    };
+    for (char const* extra : {
+             R"(, "implicitDeclarationResult": 7)",
+             R"(, "implicitDeclarationResult": "")",
+             R"(, "implicitDeclarationResult": "int", "implicitDeclarationBuiltinPrefixes": "__builtin_")",
+             R"(, "implicitDeclarationResult": "int", "implicitDeclarationBuiltinPrefixes": ["__builtin_", ""])",
+             R"(, "implicitDeclarationResult": "int", "implicitDeclarationBuiltinPrefixes": [7])",
+             R"(, "implicitDeclarationBuiltinPrefixes": ["__builtin_"])",
+         }) {
+        auto r = GrammarSchema::loadFromText(cfg(extra));
+        ASSERT_FALSE(r.has_value()) << extra;
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics)) << extra;
+    }
+    auto r = GrammarSchema::loadFromText(cfg(
+        R"(, "implicitDeclarationResult": "int", "implicitDeclarationBuiltinPrefixes": ["__builtin_", "__atomic_"])"));
+    ASSERT_TRUE(r.has_value()) << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    ASSERT_EQ((*r)->semantics().callRules.size(), 1u);
+    auto const& rule = (*r)->semantics().callRules[0];
+    EXPECT_EQ(rule.implicitDeclarationResult, "int");
+    EXPECT_EQ(rule.implicitDeclarationBuiltinPrefixes,
+              (std::vector<std::string>{"__builtin_", "__atomic_"}));
+    auto none = GrammarSchema::loadFromText(cfg(""));
+    ASSERT_TRUE(none.has_value());
+    EXPECT_TRUE((*none)->semantics().callRules[0].implicitDeclarationResult.empty());
+    EXPECT_TRUE((*none)->semantics().callRules[0].implicitDeclarationBuiltinPrefixes.empty());
+}
+
+// ★★ P69 (lane `cs`, fold f26c): the declarators' `scopeBeginsAfterDeclarator` (C 6.2.1p7:
+// a use sees only a declaration whose declarator completed before it) is a BOOLEAN, absent =
+// false (the toy language and the synthetic grammars declare after use); any other JSON type
+// is refused C_InvalidSemantics. RED-ON-DISABLE: drop the loader's read → `true` reads false.
+TEST(GrammarSchema, DeclaratorsScopeBeginsAfterDeclaratorIsABoolean) {
+    std::string const base = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true,
+             "requiredSpecifierToken": "InfKw" })");
+    auto const with = [&](std::string_view v) {
+        std::string s = base;
+        std::string_view const anchor = R"("listRule":           "dlist")";
+        auto const at = s.find(anchor);
+        if (at == std::string::npos) return std::string{};
+        s.insert(at + anchor.size(), std::format(", \"scopeBeginsAfterDeclarator\": {}", v));
+        return s;
+    };
+    ASSERT_FALSE(with("true").empty()) << "the fixture's declarators block moved";
+    for (char const* v : {"1", "\"yes\"", "null"}) {
+        auto r = GrammarSchema::loadFromText(with(v));
+        ASSERT_FALSE(r.has_value()) << v;
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics)) << v;
+    }
+    for (auto const& [v, want] : {std::pair<char const*, bool>{"true", true},
+                                  std::pair<char const*, bool>{"false", false}}) {
+        auto r = GrammarSchema::loadFromText(with(v));
+        ASSERT_TRUE(r.has_value()) << v << ": "
+            << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+        ASSERT_TRUE((*r)->semantics().declarators.has_value());
+        EXPECT_EQ((*r)->semantics().declarators->scopeBeginsAfterDeclarator, want) << v;
+    }
+    auto r = GrammarSchema::loadFromText(base);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE((*r)->semantics().declarators.has_value());
+    EXPECT_FALSE((*r)->semantics().declarators->scopeBeginsAfterDeclarator);
 }

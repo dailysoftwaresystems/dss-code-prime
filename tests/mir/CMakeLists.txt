@@ -282,3 +282,14 @@ dss_add_test(NAME mir/test_summary_index_alias
 # are refused by name; a lone tentative definition is sized by nobody; module-private definitions stay apart.
 dss_add_test(NAME mir/test_mir_merge_tentative_fold
              SOURCES test_mir_merge_tentative_fold.cpp)
+
+# P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET) — a
+# by-value aggregate crosses the DSS/reference boundary as its convention says: a caller unit and a callee unit, each
+# compiled by DSS and by the host's `cc`, linked in all four pairings by the host's linker and RUN (SysV on Linux x86_64
+# and Mach-O x86_64 under Rosetta; AAPCS64 on Linux aarch64 and the Mac as controls). Its Rosetta arm runs through the
+# cross-arch gate, whose table is JSON; an arm the gate skips for want of the translator is red under strict verdicts.
+dss_add_test(NAME mir/test_sysv_memory_class_reference_link
+             SOURCES test_sysv_memory_class_reference_link.cpp)
+target_link_libraries(dss_mir_test_sysv_memory_class_reference_link
+                      PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(mir/test_sysv_memory_class_reference_link)

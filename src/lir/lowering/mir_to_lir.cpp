@@ -937,6 +937,24 @@ struct Lowerer {
     // reserved room for (a silent overrun of the neighbouring slot).
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
                                     allocaSlotAlignByFunc_;
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495) — A CALLER PLACES EVERY
+    // STACK-PASSED ARGUMENT WHERE THE CALLEE'S ABI EXPECTS IT, AT ITS DECLARED
+    // ALIGNMENT, WHATEVER SP'S OWN ALIGNMENT IS AT THE CALL. The outgoing cursor
+    // places a stacked by-value carrier at its alignment RELATIVE to SP
+    // (`StackArgCursor::placeNamedAggregate`), and SP is only `stackAlignment`-
+    // aligned, so a carrier aligned past it landed misaligned in absolute terms,
+    // where gcc's and clang's callees use the bytes in place (✔MEASURED, the native
+    // witness in run f26c-s22: their `&s` misplaced for 32, 64 and 256, every value
+    // right). `stackedArgAlign_` is THIS function's widest carrier alignment
+    // (`functionStackedArgAlignment`, 0 = none past the stack's); when it exceeds the
+    // stack alignment the function runs on the ONE dynamic frame model -- the VLA
+    // frame-pointer model, "SP moves at run time" -- realigned once after its
+    // parameters are received (`emitPendingStackRealign`), every VLA of it rounded to
+    // the same alignment, and the frame's outgoing area sized to it
+    // (`FuncLocalAlignment::stackedArgAlignBytes`). Reset per function.
+    std::uint32_t                   stackedArgAlign_ = 0;
+    bool                            stackRealignPending_ = false;
+    std::unordered_map<std::uint32_t, std::uint32_t> stackedArgAlignByFunc_;
     // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: for the SEH
     // filter funclet currently being lowered, the MIR function whose frame its
     // `RecoverParentFrameSlot` ops read. Set per function from the scope records
@@ -7150,8 +7168,12 @@ struct Lowerer {
         // now the SHARED `emitAlignUpToPowerOfTwo` primitive, which this sequence
         // used to spell inline. Its docblock carries the agnosticism argument for
         // the reg-reg `and` + materialized negative mask.
+        // ★ P69 (fold f26c, ledger 495): in a function realigned for a stacked argument
+        // (`emitPendingStackRealign`), the descent is a multiple of THAT alignment, so
+        // SP keeps the boundary every later call's outgoing area needs.
+        std::uint32_t const descentAlign = std::max(stackAlign, stackedArgAlign_);
         std::optional<LirReg> const size16Opt =
-            emitAlignUpToPowerOfTwo(sizeWithHeadroom, stackAlign,
+            emitAlignUpToPowerOfTwo(sizeWithHeadroom, descentAlign,
                                     "a variable-length array's runtime byte size");
         if (!size16Opt.has_value()) { poisonValue(id); return; }
         LirReg size16 = *size16Opt;
@@ -7211,6 +7233,84 @@ struct Lowerer {
             base = *alignedBase;
         }
         defineValue(id, base);
+    }
+
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495): the widest alignment a
+    // stacked by-value carrier of `mf`'s calls states -- the SAME answer each
+    // carrier's `ByValueStackAgg` marker states (`byValueCarrierAlignment`), so the
+    // frame realigns to exactly what the outgoing cursor places by. 0 when `mf`
+    // passes nothing on the stack by value.
+    [[nodiscard]] std::uint32_t functionStackedArgAlignment(MirFuncId mf) const {
+        std::uint32_t widest = 0;
+        std::uint32_t const bc = mir.funcBlockCount(mf);
+        for (std::uint32_t bi = 0; bi < bc; ++bi) {
+            MirBlockId const mb = mir.funcBlockAt(mf, bi);
+            std::uint32_t const n = mir.blockInstCount(mb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const id = mir.blockInstAt(mb, i);
+                if (mir.instOpcode(id) != MirOpcode::ByValueStackArg) continue;
+                widest = std::max(widest,
+                                  byValueCarrierAlignment(
+                                      mir.instType(id),
+                                      mir.instPayload(id) & kByValueStackArgSizeMask,
+                                      mir.instPayload2(id)));
+            }
+        }
+        return widest;
+    }
+
+    // ★ P69 (fold f26c, ledger 495): REALIGN SP to `stackedArgAlign_` -- once, in the
+    // entry block, after the parameters are received (their `arg` reads take ABI
+    // registers this sequence's own registers may not clobber first) and before any
+    // call, VLA or scope watermark:
+    //     w = sp_copy SP          (the dynamic frame's capture: SP + the outgoing area,
+    //                              which lir_callconv sizes to a multiple of the
+    //                              alignment, so w ≡ SP mod it)
+    //     d = w & (align - 1)     (the reg-reg `and` with a materialized mask, as
+    //                              `emitAlignUpToPowerOfTwo` spells it, both ISAs' form)
+    //     sub_sp_reg SP, d        (SP descends to the boundary)
+    // The `sub_sp_reg` is the dynamic frame model's own signal, so the function takes
+    // the frame-pointer frame lir_callconv builds for a VLA -- the fixed frame off FP,
+    // the frame pointer saved and kept out of allocation, the CFA rule moved to it,
+    // `SP<-FP` before the epilogue -- with no second model. Every later SP move keeps
+    // the boundary: a VLA rounds its size to the same alignment (`lowerVlaAlloca`) and
+    // a watermark is captured after this point.
+    void emitPendingStackRealign() {
+        stackRealignPending_ = false;
+        auto const subOp  = opcode(MnemonicSlot::SubSpReg);
+        auto const copyOp = opcode(MnemonicSlot::SpCopy);
+        auto const andOp  = opcode(MnemonicSlot::And);
+        auto const* cc = target.callingConvention(0);
+        if (!subOp.has_value() || !copyOp.has_value() || !andOp.has_value() || cc == nullptr
+            || !cc->stackPointer.has_value() || !cc->framePointer.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_VlaDynamicAllocaUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "a call of this function passes an argument on the stack aligned to {} "
+                "bytes, past the stack's {}, and target '{}' declares no dynamic stack "
+                "frame (`sub_sp_reg`, `sp_copy`, `and`, a frame pointer) to realign the "
+                "stack pointer by: the argument cannot be placed where the callee reads "
+                "it", stackedArgAlign_, ccStackAlignment(), target.name());
+            reporter.report(std::move(d));
+            return;
+        }
+        LirReg const sp = makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        LirReg const w = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
+            emitInst(*copyOp, w, ops, /*payload=*/0, /*flags=*/0);
+        }
+        std::optional<LirReg> const mask =
+            emitBareConstToFresh(static_cast<std::int64_t>(stackedArgAlign_) - 1);
+        if (!mask.has_value()) return;
+        LirReg const d = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{LirOperand::makeReg(w), LirOperand::makeReg(*mask)};
+            emitInst(*andOp, d, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        std::array<LirOperand, 2> ops{LirOperand::makeReg(sp), LirOperand::makeReg(d)};
+        emitInst(*subOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
     }
 
     // VLA C5 (D-CSUBSET-VLA): capture SP into a fresh vreg — the scope-entry
@@ -10716,9 +10816,11 @@ struct Lowerer {
     // build the `ByValueStackAgg` size marker — it never needs a register. The carrier
     // is only ever consumed by a Call (it sits in the Call's operand list at the
     // aggregate's argument position); aliasing the address keeps the value-map total
-    // without an extra mov. (A stray ByValueStackArg whose result is consumed by
-    // anything OTHER than a Call's by-value-stack arm would simply read the address,
-    // which is harmless — but no such source path exists.)
+    // without an extra mov. A ByValueStackArg whose result is consumed by anything
+    // OTHER than a Call's by-value-stack arm reads the address, which is what it is:
+    // since P69 fold f26c the inliner maps a spliced callee's `RecvByValueStackParam`
+    // to its caller's carrier, so the spliced body byte-copies from the caller's
+    // private copy through exactly this alias.
     // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the OWN byte alignment of the datum
     // a `ByValueStackArg` carrier carries, for the `ByValueStackAgg` marker. 0 means
     // NOT STATED, and the overflow cursor floors an unstated alignment at the slot —
@@ -10728,29 +10830,28 @@ struct Lowerer {
     // producer (`appendByValueStackArg` and the F80 scalar arm of
     // `finishScalarCallArg`), so the datum's kind is one operand away.
     //
-    // ★ WHY A SCALAR CAN BE ANSWERED HERE AND AN AGGREGATE CANNOT. A scalar's
-    // alignment is the config's bounded-natural rule — `min(size, maxAlignment)`,
-    // both read from `aggregateLayout`, no arch branch — and the size is the payload
-    // this marker already carries. An aggregate's alignment is a LAYOUT result
-    // (max over its members, raised by an `alignas`), and this tier deliberately has
-    // no layout engine: the carrier exists precisely because the LIR tier cannot
-    // compute layouts. So an aggregate states NOTHING and gets the slot.
-    //
-    // ⚠ THAT SILENCE IS SAFE ONLY WHILE AN OVER-ALIGNED AGGREGATE CANNOT REACH HERE,
-    // and it cannot: an aggregate's alignment exceeds the 8-byte slot only if it has
-    // a `long double` / `_BitInt(128)` / `alignas(16)` member, and a long-double-leaf
-    // aggregate is walled loud upstream (D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI). The
-    // day that wall lifts, the alignment must be stated at the MIR tier rather than
-    // re-derived here — the marker already has the byte for it.
-    [[nodiscard]] std::uint8_t byValueCarrierAlignment(TypeId carrierPtrTy,
-                                                       std::uint32_t bytes) const {
+    // ★ WHO ANSWERS IT. An AGGREGATE's alignment is a LAYOUT result (max over its
+    // members, raised by an `alignas`), and this tier deliberately has no layout
+    // engine — so the MIR tier STATES it, in the carrier's secondary payload
+    // (`payload2`, set by `appendByValueStackArg`; mir_node.hpp's one statement of
+    // `payload2`), and a stated alignment is returned as it stands. ★ P69 (lane
+    // `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // before it no producer stated one, which was safe only while no over-aligned
+    // aggregate could reach a carrier; a SysV MEMORY-class argument (a `long double`
+    // member, an `_Alignas(32)` one) now does. A SCALAR carrier (the F80 arm of
+    // `finishScalarCallArg`) states none, and is answered here: its alignment is the
+    // config's bounded-natural rule — `min(size, maxAlignment)`, both read from
+    // `aggregateLayout`, no arch branch — and the size is the payload this marker
+    // already carries. Anything else states nothing and gets the slot.
+    [[nodiscard]] std::uint32_t byValueCarrierAlignment(TypeId carrierPtrTy,
+                                                        std::uint32_t bytes,
+                                                        std::uint32_t statedAlign) const {
+        if (statedAlign != 0) return statedAlign;
         if (!carrierPtrTy.valid()) return 0;
         auto const ptrOps = interner.operands(carrierPtrTy);
         if (ptrOps.empty()) return 0;
         if (!isPrimitiveTypeKind(interner.kind(ptrOps[0]))) return 0;
-        std::uint32_t const a =
-            naturalScalarAlignment(bytes, target.aggregateLayout());
-        return a > 0xFFu ? std::uint8_t{0} : static_cast<std::uint8_t>(a);
+        return naturalScalarAlignment(bytes, target.aggregateLayout());
     }
 
     void lowerByValueStackArg(MirInstId id) {
@@ -11138,10 +11239,11 @@ struct Lowerer {
                         (bvPayload >> kByValueStackArgExhaustShift) & 0x3u),
                     // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: state the carried
                     // datum's OWN alignment so the overflow cursor can honour the
-                    // boundary the CC declares. Derived from the carrier's own MIR
-                    // type, which is `pointer(datum)` — this is the last tier that
-                    // still has it.
-                    byValueCarrierAlignment(mir.instType(operandMir), bvBytes)));
+                    // boundary the CC declares: the alignment the MIR carrier states
+                    // (an aggregate's), else derived from the carrier's own MIR type,
+                    // which is `pointer(datum)` (a scalar's).
+                    byValueCarrierAlignment(mir.instType(operandMir), bvBytes,
+                                            mir.instPayload2(operandMir))));
                 // ★ THE CARRIER CLAMPS the class it exhausts, exactly as
                 // `lir_callconv`'s walk does with the same marker — a later
                 // F128 must not be handed a register that walk will not.
@@ -16036,6 +16138,7 @@ struct Lowerer {
         reserveWideFloatPhiHomes();
         std::uint32_t const n = mir.blockInstCount(mb);
         if (n == 0) {
+            if (stackRealignPending_) emitPendingStackRealign();
             // Empty MIR block — defensive seal so the LIR module finishes.
             if (opcode(MnemonicSlot::Ret).has_value()) {
                 emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
@@ -16051,8 +16154,19 @@ struct Lowerer {
         //     no-ops Phi by design so we must catch mis-positioned Phis
         //     loud here)
         MirInstId const term = mir.blockInstAt(mb, n - 1);
+        // ★ P69 (fold f26c, ledger 495): the stack realignment's place -- the entry
+        // block (lowered first, and the only block lowered while it is pending), just
+        // after its last parameter reception.
+        std::uint32_t realignBefore = 0;
+        if (stackRealignPending_)
+            for (std::uint32_t i = 0; i + 1 < n; ++i) {
+                MirOpcode const op = mir.instOpcode(mir.blockInstAt(mb, i));
+                if (op == MirOpcode::Arg || op == MirOpcode::RecvByValueStackParam)
+                    realignBefore = i + 1;
+            }
         bool sawNonPhi = false;
         for (std::uint32_t i = 0; i + 1 < n; ++i) {
+            if (stackRealignPending_ && i == realignBefore) emitPendingStackRealign();
             MirInstId const inst = mir.blockInstAt(mb, i);
             MirOpcode const op = mir.instOpcode(inst);
             if (isMirTerminator(op)) {
@@ -16078,6 +16192,8 @@ struct Lowerer {
             if (op != MirOpcode::Phi) sawNonPhi = true;
             lowerInst(inst);
         }
+        // An entry block that only receives its parameters realigns before its jump.
+        if (stackRealignPending_) emitPendingStackRealign();
         // Then the terminator (which is also responsible for PLACING the
         // phi-edge moves for all its MIR successors — inline ahead of itself
         // when it has one successor, in per-edge split blocks when it has
@@ -16344,6 +16460,11 @@ struct Lowerer {
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: same per-function lifetime as
         // the counter it is indexed by.
         allocaSlotAlign_.clear();
+        // ★ P69 (fold f26c, ledger 495): this function's widest stacked-carrier
+        // alignment, known BEFORE its body is lowered, because a VLA anywhere in it
+        // rounds to it and the realignment precedes every call.
+        stackedArgAlign_     = functionStackedArgAlignment(mf);
+        stackRealignPending_ = stackedArgAlign_ > ccStackAlignment();
         // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: if this
         // function is a filter funclet, the parent whose frame its recovered locals
         // live in. Empty for every other function, which is why an ordinary function
@@ -16418,6 +16539,7 @@ struct Lowerer {
         // skew. Keyed by MIR function id so the harvest can find it without
         // depending on either walk's ordering.
         allocaSlotAlignByFunc_[mf.v] = allocaSlotAlign_;
+        stackedArgAlignByFunc_[mf.v] = stackedArgAlign_;
     }
 
     // Record the LIR inst → source MIR inst mapping. Resizes the
@@ -16607,8 +16729,9 @@ struct Lowerer {
         // source (via lirToMir → the Alloca's instPayload2 effective-alignment
         // channel); a SYNTHETIC scratch alloca (whose source is not a MIR Alloca)
         // has natural alignment ≤ word → 0 (its alignUp is a no-op). SPARSE: only
-        // a function with an over-aligned local (maxLocalAlign > the GPR word)
-        // gets an entry. For a 1:1 MIR↔LIR alloca function (every case before
+        // a function with an over-aligned local (maxLocalAlign > the GPR word) --
+        // or (P69 fold f26c) one realigned for a stacked argument, below -- gets an
+        // entry. For a 1:1 MIR↔LIR alloca function (every case before
         // this cycle) this is byte-identical to the prior MIR scan.
         std::uint32_t gprWidth = 0;
         for (auto const& reg : target.registers())
@@ -16674,10 +16797,25 @@ struct Lowerer {
                         perAllocaAlign.size(), rec->second.size(), fi);
                     reporter.report(std::move(d));
                 }
-                if (maxLocalAlign > gprWidth)
-                    funcLocalAlignments.push_back(
-                        FuncLocalAlignment{frozen.funcSymbol(fn), maxLocalAlign,
-                                           std::move(perAllocaAlign)});
+                // ★ P69 (fold f26c, ledger 495/497): a row also for a function whose
+                // only reason is a stacked argument aligned past the stack -- its frame
+                // sizes the outgoing area to that alignment -- with no local
+                // alignment stated, so its local layout is the row-less one.
+                std::uint32_t const stackedAlign =
+                    (fi < mir.moduleFuncCount())
+                        ? [&] {
+                              auto const s = stackedArgAlignByFunc_.find(mir.funcAt(fi).v);
+                              return s != stackedArgAlignByFunc_.end() ? s->second : 0u;
+                          }()
+                        : 0u;
+                bool const overAlignedLocal = maxLocalAlign > gprWidth;
+                bool const realignsForArgs  = stackedAlign > ccStackAlignment();
+                if (overAlignedLocal || realignsForArgs)
+                    funcLocalAlignments.push_back(FuncLocalAlignment{
+                        frozen.funcSymbol(fn), overAlignedLocal ? maxLocalAlign : 0u,
+                        overAlignedLocal ? std::move(perAllocaAlign)
+                                         : std::vector<std::uint32_t>{},
+                        realignsForArgs ? stackedAlign : 0u});
             }
         }
         // Designated initializers prevent a future field reorder

@@ -219,7 +219,7 @@ TEST(TargetVocabularyProjection, ShippedTargetsDeclareTheProbedVocabularies) {
             }
             if (namesContain(kAggClassNames,
                          dss::aggregateClassKindName(
-                             cc.aggregateClassification))) {
+                             cc.aggregate.classification))) {
                 ++aggClassSeen;
             }
         }

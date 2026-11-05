@@ -1,1 +1,1 @@
-                if (false && !isFunction && importInEffectAt(s, rec, tree.span(cur).start())) {
+                if (false && importInEffectAt(s, rec, streamRank(s, tree, cur))) {

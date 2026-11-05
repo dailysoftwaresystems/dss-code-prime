@@ -165,7 +165,7 @@
     "src/dss-config/object-formats/macho64-arm64-darwin-staticlib.format.json": 1,
     "src/dss-config/object-formats/macho64-arm64-darwin.format.json": 1,
     "src/dss-config/object-formats/macho64-x86_64-darwin-dylib.format.json": 1,
-    "src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json": 6,
+    "src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json": 3,
     "src/dss-config/object-formats/macho64-x86_64-darwin-staticlib.format.json": 1,
     "src/dss-config/object-formats/macho64-x86_64-darwin.format.json": 1,
     "src/dss-config/object-formats/pe64-x86_64-windows-dll.format.json": 1,

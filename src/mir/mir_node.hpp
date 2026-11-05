@@ -375,14 +375,29 @@ struct MirInst {
     //   * `Alloca` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the slot's EFFECTIVE
     //     alignment in bytes. For a fixed local, the max of natural and `alignas`
     //     (`payload` carries the byte size); for a runtime-sized (VLA) alloca, the
-    //     ELEMENT's (the size is the operand); 8 for the 8-byte slots that hold a
-    //     VLA's frozen level size or stride. MIR→LIR reads it for each slot and
-    //     for each function's max local alignment (the frame layout). 0 = the
-    //     type's natural alignment, derivable, nothing over-aligned recorded.
+    //     ELEMENT's (the size is the operand); for an anonymous aggregate temp,
+    //     its type's; 8 for the 8-byte slots that hold a VLA's frozen level size
+    //     or stride. HIR→MIR states it for every typed slot through ONE home
+    //     (`frameSlotAlignment`). MIR→LIR reads it for each slot and for each
+    //     function's max local alignment (the frame layout), and DERIVES NOTHING:
+    //     0 = nothing stated (no aggregateLayout config, or a synthesized word
+    //     slot), and such a slot is promised only the stack's own alignment.
     //   * `AtomicLoad` / `AtomicStore` / `AtomicCas` (D-CSUBSET-PACKED-ATOMIC-MEMBER):
     //     the accessed lvalue's PROVABLE alignment in bytes, which MIR→LIR compares
     //     with the access width to choose the native form or the atomics runtime
     //     (`atomicAccessIsUnderAligned`). 0 = unknown, treated as aligned.
+    //   * `ByValueStackArg` (P69 fold f26c, D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    //     the carried AGGREGATE's own alignment in bytes (a power of two), which
+    //     MIR→LIR hands the outgoing cursor on the `ByValueStackAgg` marker so a
+    //     stacked aggregate begins where the convention honours its alignment.
+    //     0 = not stated: a SCALAR carrier (the x87 `long double` arm), whose
+    //     alignment MIR→LIR derives from its size.
+    //   * `RecvByValueStackParam` (same fold): the reception's flat call-operand
+    //     POSITION + 1 (`arg_payload.hpp`'s position), so the inliner can map it to
+    //     the call's operand at that position — the `ByValueStackArg` carrier,
+    //     whose value IS the address of the caller's copy — as it maps an `Arg`.
+    //     0 = none (the x87 `long double` scalar parameter), and such a callee is
+    //     refused inlining.
     //   * every other opcode: 0.
     // (This note said "Currently used ONLY by `Alloca`" long after the atomics
     // began stamping it; the `.dssir` text carried neither use until P68.)

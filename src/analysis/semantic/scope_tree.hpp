@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -72,6 +73,12 @@ public:
     // inner one is not yet usable. Plain `lookup` (nearest binding wins,
     // period) stays the default; nothing here is language-, target-, or
     // format-specific — `accept` is entirely the caller's predicate.
+    //
+    // `accept` is called with the binding, or — where it takes two arguments — with
+    // the binding and the scope that holds it (P69, lane `cs`, fold f26c: whether a
+    // use sees a binding depends on where THAT scope's declarations of the name are,
+    // which the binding alone does not say when the scope's binding was repointed at
+    // another scope's record).
     template <typename Accept>
     [[nodiscard]] SymbolId
     lookupIf(ScopeId scope, std::string_view name, Accept&& accept,
@@ -79,7 +86,11 @@ public:
         while (scope.valid() && scope.v < scopes_.size()) {
             ScopeRecord const& rec = scopes_[scope.v];
             SymbolId const found = bindingIn(rec, name, ns);
-            if (found.valid() && accept(found)) return found;
+            if constexpr (std::is_invocable_v<Accept&, SymbolId, ScopeId>) {
+                if (found.valid() && accept(found, scope)) return found;
+            } else {
+                if (found.valid() && accept(found)) return found;
+            }
             scope = rec.parent;
         }
         return InvalidSymbol;

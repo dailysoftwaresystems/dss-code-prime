@@ -1628,6 +1628,30 @@ private:
                 out_ += std::format(" size {} exhaust {}",
                                     payload & kByValueStackArgSizeMask,
                                     clsName.empty() ? std::string_view{"?"} : clsName);
+                // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+                // the carried aggregate's OWN alignment (`payload2`, mir_node.hpp),
+                // spelled `align=N` as every instruction's secondary payload is,
+                // and only when stated (a scalar carrier states none).
+                if (std::uint32_t const align = mir_.instPayload2(id); align != 0) {
+                    out_ += std::format(" {}={}", kMirTextAlignAttr, align);
+                    spelledPayload2 = true;
+                }
+                break;
+            }
+            // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // `%vN = recvbyvaluestackparam : <ptr> [payload <offset>] [position <P>]`.
+            // Its `payload2` is NO alignment: it is the reception's flat call-operand
+            // position + 1 (0 = none; mir_node.hpp), the operand the inliner maps it
+            // to — so it is spelled as the position it is. The generic arm would
+            // have written `align=P+1`, and its reader refuses an alignment that is
+            // no power of two.
+            case MirOpcode::RecvByValueStackParam: {
+                if (std::uint32_t const payload = mir_.instPayload(id); payload != 0)
+                    out_ += std::format(" payload {}", payload);
+                if (std::uint32_t const p2 = mir_.instPayload2(id); p2 != 0) {
+                    out_ += std::format(" position {}", p2 - 1u);
+                    spelledPayload2 = true;
+                }
                 break;
             }
             default: {
@@ -4489,15 +4513,28 @@ private:
                 std::uint32_t const bytes = parseNumber<std::uint32_t>(
                     szTok.text, "byvaluestackarg byte size");
                 if (bytes > kByValueStackArgSizeMask) {
+                    // The size field is the payload's low `kByValueStackArgExhaustShift`
+                    // bits (the exhaust class has the two above it). This said
+                    // `32 - shift` — a 2-bit field — until P69 fold f26c.
                     emitMalformed(std::format(
                         "byvaluestackarg size {} does not fit the {}-bit size field",
-                        bytes, 32 - kByValueStackArgExhaustShift));
+                        bytes, kByValueStackArgExhaustShift));
                 }
                 if (!expectIdent("exhaust")) return;
                 Tok const clsTok = lex_.take();
                 std::uint8_t const cls = orUnknownName(
                     kMirTextExhaustTable, clsTok.text, "byvaluestackarg exhaust class",
                     kByValueStackArgExhaustNone);
+                // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+                // the writer's optional `align=N` — the carried aggregate's own
+                // alignment, read by the one reader of that spelling.
+                std::uint32_t payload2 = 0;
+                if (peekIdent(kMirTextAlignAttr)) {
+                    lex_.take();
+                    std::optional<std::uint32_t> const align = takeAlignValue(mnemonic);
+                    if (!align.has_value()) break;
+                    payload2 = *align;
+                }
                 if (refusals_ != refusalsAtStart) break;   // this line's refusal only (see indirectbr)
                 if (refuseOperandCount(op, mnemonic, operands.size())) break;
                 MirInstId const id = builder_.addInst(
@@ -4505,7 +4542,38 @@ private:
                     (bytes & kByValueStackArgSizeMask)
                         | (static_cast<std::uint32_t>(cls)
                            << kByValueStackArgExhaustShift),
-                    flags);
+                    flags, payload2);
+                if (resultSlot != 0) valueMap_[resultSlot] = id;
+                break;
+            }
+            // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // `%vN = recvbyvaluestackparam : <ptr> [payload <offset>] [position <P>]` —
+            // the writer's arm above; `position P` is stored as `payload2` = P + 1.
+            case MirOpcode::RecvByValueStackParam: {
+                std::uint32_t payload = 0;
+                if (peekIdent("payload")) {
+                    lex_.take();
+                    Tok n = lex_.take();
+                    payload = parseNumber<std::uint32_t>(n.text, "payload");
+                }
+                std::uint32_t payload2 = 0;
+                if (peekIdent("position")) {
+                    lex_.take();
+                    Tok n = lex_.take();
+                    std::uint32_t const position = parseNumber<std::uint32_t>(
+                        n.text, "recvbyvaluestackparam position");
+                    if (position == 0xFFFFFFFFu) {
+                        emitMalformed(std::format(
+                            "recvbyvaluestackparam position {} has no successor to "
+                            "store (the field holds the position + 1)", position));
+                        break;
+                    }
+                    payload2 = position + 1u;
+                }
+                if (refusals_ != refusalsAtStart) break;   // this line's refusal only (see indirectbr)
+                if (refuseOperandCount(op, mnemonic, 0)) break;
+                MirInstId const id = builder_.addInst(op, {}, resultType, payload, flags,
+                                                      payload2);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }

@@ -11,6 +11,7 @@
 #include <format>
 #include <iterator>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -25,27 +26,32 @@
 // right after the unit is lowered to HIR and before any tier reads its linkage (`buildCuHirImpl`,
 // program/compile_pipeline.cpp), with the target format's statement handed in as plain data: every declaration —
 // and every alias — whose visibility the format cannot write is given the one the document states, and the program
-// is told, as the format's compilers tell it (`H_VisibilityWrittenAsAnother`, a warning). So the writers only ever
+// is told, by a warning on EVERY stand-in (`H_VisibilityWrittenAsAnother`): louder than a reference where one is
+// silent — Apple clang writes `internal` as N_PEXT with nothing said (lane `cs` probe pv, the measurement beside
+// `VisibilityStandIn`), and this step says it for every declaration it settles (P69 fold f26c, the review of f26b's
+// F9). So the writers only ever
 // see a visibility their format writes, and what is written is the document's answer, never a writer's own mapping:
 // a document that states another stand-in writes another symbol.
 //
-// `standIns`: any range of records with `.unwritable` and `.writtenAs` (`SymbolVisibility`) —
-// `ObjectFormatSchema::visibilityStandIns()`; empty, nothing is settled. `nameOf`: a symbol's declared name, for the
-// warning. Diagnostics come in declaration order (node id), the aliases after. An alias's linkage is held twice —
-// on its declaration and on the alias record the writers read (`HirSymbolAlias`) — and both are settled; the
-// program is told ONCE, at the declaration, and by the alias's name only where its declaration was not told.
+// `format`: the target's format document — `ObjectFormatSchema`, or anything with its two readers: what it writes
+// for a stated visibility (`visibilityWrittenFor`, THE lookup — this step has none of its own; P69 fold f26c, the
+// review of f26b's F9) and its stand-ins (`visibilityStandIns()`), none of which means nothing is settled.
+// `nameOf`: a symbol's declared name, for the warning. Diagnostics come in declaration order (node id), the aliases
+// after. An alias's linkage is held twice — on its declaration and on the alias record the writers read
+// (`HirSymbolAlias`) — and both are settled; the program is told ONCE, at the declaration, and by the alias's name
+// only where its declaration was not told.
 namespace dss {
 
-template <class StandIns, class NameOf>
-void settleVisibilitiesWrittenAs(CstToHirResult& unit, StandIns const& standIns, std::string_view formatName,
+template <class Format, class NameOf>
+void settleVisibilitiesWrittenAs(CstToHirResult& unit, Format const& format, std::string_view formatName,
                                  NameOf&& nameOf, DiagnosticReporter& reporter) {
-    auto const standInFor = [&](SymbolVisibility v) -> std::optional<SymbolVisibility> {
-        for (auto const& s : standIns) {
-            if (s.unwritable == v) return s.writtenAs;
-        }
-        return std::nullopt;
+    // What the format writes in place of `v`, where that is another visibility: the document's own answer.
+    auto const writtenInPlaceOf = [&](SymbolVisibility v) -> std::optional<SymbolVisibility> {
+        SymbolVisibility const written = format.visibilityWrittenFor(v);
+        if (written == v) return std::nullopt;
+        return written;
     };
-    if (std::begin(standIns) == std::end(standIns)) return;
+    if (std::ranges::empty(format.visibilityStandIns())) return;
 
     Hir const& hir      = unit.hir;
     auto const symbolOf = [&](HirNodeId node) -> SymbolId {
@@ -75,14 +81,14 @@ void settleVisibilitiesWrittenAs(CstToHirResult& unit, StandIns const& standIns,
 
     std::vector<HirNodeId> settled;
     for (auto const& [id, attr] : unit.linkageMap) {
-        if (standInFor(attr.visibility).has_value()) settled.push_back(id);
+        if (writtenInPlaceOf(attr.visibility).has_value()) settled.push_back(id);
     }
     std::sort(settled.begin(), settled.end(), [](HirNodeId a, HirNodeId b) { return a.v < b.v; });
     std::unordered_set<std::uint32_t> told;   // the symbols whose declaration was told
     for (HirNodeId const node : settled) {
         LinkageAttr&           attr    = unit.linkageMap.get(node);
         SymbolVisibility const stated  = attr.visibility;
-        SymbolVisibility const written = *standInFor(stated);
+        SymbolVisibility const written = *writtenInPlaceOf(stated);
         attr.visibility                = written;
         SymbolId const   sym  = symbolOf(node);
         if (sym.valid()) told.insert(sym.v);
@@ -91,7 +97,7 @@ void settleVisibilitiesWrittenAs(CstToHirResult& unit, StandIns const& standIns,
              unit.sourceMap.has(node) ? &unit.sourceMap.get(node) : nullptr);
     }
     for (HirSymbolAlias& alias : unit.symbolAliases) {
-        auto const written = standInFor(alias.linkage.visibility);
+        auto const written = writtenInPlaceOf(alias.linkage.visibility);
         if (!written.has_value()) continue;
         SymbolVisibility const stated = alias.linkage.visibility;
         alias.linkage.visibility      = *written;

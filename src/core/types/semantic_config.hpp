@@ -1046,6 +1046,14 @@ struct DSS_EXPORT DeclaratorConfig {
     std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA
     std::vector<std::string> arraySuffixOutermostOnlyTokenNames;   // P68 round 10
     std::string   arrayStarSuffixRuleName;                    // VLA C4c D-CSUBSET-VLA-PARAM-STAR
+    // ★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE):
+    // `scopeBeginsAfterDeclarator` — an ordinary identifier's scope begins just after the
+    // completion of its declarator (an enumeration constant's after its enumerator), C 6.2.1p7,
+    // so a USE sees only a declaration written before it, in the order the unit is read; a
+    // binding not yet begun is passed over for the enclosing scope's. Off (the default) ⇒ a
+    // scope's bindings are seen from its start, the language's names order-free (a language
+    // whose declarations may follow their uses: the toy language, the synthetic grammars).
+    bool          scopeBeginsAfterDeclarator = false;
 };
 
 // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): is rule `r` a FUNCTION suffix — either the
@@ -1555,6 +1563,19 @@ struct DSS_EXPORT CallRule {
     // (e.g. c) whose `postfixExpr` is shared across `++`/`--`/`[]`
     // AND call shapes; the call site is the one with `(`.
     std::optional<SchemaTokenId> operatorToken;
+    // P69 (lane `cs`, fold f26c): non-empty ⇒ a call whose callee names NO declaration
+    // in scope at the call declares it implicitly — a function returning this builtin
+    // type (`implicitDeclarationResult`; C: `int`, C90 6.3.2.2), its parameters the
+    // call's arguments after the default argument promotions, warned
+    // (S_ImplicitFunctionDeclaration). Empty ⇒ such a call names an undeclared
+    // identifier.
+    std::string   implicitDeclarationResult;
+    // …except for a callee spelled with one of these prefixes (C: the builtin FAMILIES the
+    // references implement inside the compiler — `__builtin_`, `__atomic_`, `__sync_`,
+    // `__c11_atomic_`): a builtin this implementation does not declare stays undeclared, never
+    // a function the program declared (`__builtin_frame_address`, an unshipped `__atomic_*`
+    // spelling).
+    std::vector<std::string> implicitDeclarationBuiltinPrefixes;
     std::string   ruleName;
 };
 
@@ -3144,7 +3165,35 @@ enum class AttributeEffect : std::uint8_t {
     // is still a wrong size.
     CallingConvention,
     Unsupported,
+    // ★ P69 (lane `cs`, fold f26c): GNU `mode(M)` — the declared entity's type
+    // REPLACED by the type of the named machine mode, as the row's `machineModes`
+    // table maps it (an integer of N bytes keeping the declared type's signedness,
+    // or the floating type of a format). Applied by ONE substitution
+    // (`machineModeType`) at the two places a declarator's type is formed; a mode
+    // the table does not map, or a type the mode cannot replace, is refused by name.
+    MachineMode,
     None,
+};
+
+// ★ P69 (lane `cs`, fold f26c): ONE row of a `machineMode` effects row's
+// `machineModes` table — the machine-mode names (`QI`, `DI`, `SF`, `word`, …) that
+// select ONE replacement. Exactly one of the two answers is stated:
+//   • an INTEGER mode: `integerBytes` (1, 2, 4, 8, 16), or `pointerWidth` — the
+//     target's pointer width (gcc's `pointer`, `word` and `unwind_word`; ✔MEASURED
+//     8 on every reference for every shipped pair). The replacement keeps the
+//     declared type's signedness (plain `char` by the target's own);
+//   • a FLOATING mode: `floatCore`, the representation the replacement has
+//     (F32 / F64 / F80 / F128); a target with no C floating type of that
+//     representation refuses the mode by name.
+// A name is written WITHOUT surrounding double underscores; the operand is
+// dunder-normalized (`__DI__` ≡ `DI`) before it is looked up.
+struct DSS_EXPORT MachineModeRow {
+    std::vector<std::string> names;
+    std::uint32_t            integerBytes = 0;
+    bool                     pointerWidth = false;
+    TypeKind                 floatCore    = TypeKind::Void;   // Void ⇒ an integer mode
+
+    [[nodiscard]] bool isFloat() const noexcept { return floatCore != TypeKind::Void; }
 };
 
 // Whether a row of this verb ADVERTISES its names — what a program that asks first
@@ -3303,6 +3352,12 @@ struct DSS_EXPORT AttributeSemanticsRow {
     // the reason, and its effect is not applied (`ignoredOnAlias`). Read beside
     // `refusedOnDefinition`, and refused by the loader on a row with no kind axis.
     std::string              ignoredOnAlias;
+    // P69 (lane `cs`, fold f26c): non-empty ⇒ on an INLINE function definition the
+    // attribute is ignored, said with this text as the reason, and its effect is not
+    // applied (`ignoredOnInlineDefinition`) — where `refusedOnDefinition` would refuse
+    // any other definition. Read beside it, and refused by the loader on a row with no
+    // kind axis.
+    std::string              ignoredOnInlineDefinition;
     // ★★ P69 (lane `cs`, fold f26b): non-empty ⇒ the row's names are attribute
     // vocabulary ONLY for these object formats (`availableObjectFormats`, sorted,
     // unique). On any other format — and where no format is in scope, so the question
@@ -3313,6 +3368,9 @@ struct DSS_EXPORT AttributeSemanticsRow {
     // and warned and ignored by gcc, clang and Apple clang everywhere else (✔MEASURED,
     // lane `cs` probe di5). Empty (every row before the key) ⇒ every format.
     std::vector<ObjectFormatKind> availableObjectFormats;
+    // ★ P69 (lane `cs`, fold f26c): the `machineMode` verb's table (required on
+    // that verb, refused on every other). See `MachineModeRow`.
+    std::vector<MachineModeRow> machineModes;
 
     // Whether the row's names are vocabulary for `format` — the spelling rows' rule:
     // with no format in scope a row that names its formats is NOT available.

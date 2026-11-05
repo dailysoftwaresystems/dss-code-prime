@@ -534,6 +534,30 @@ dss_add_test(NAME analysis/semantic/test_attribute_second_spelling
 target_include_directories(dss_analysis_semantic_test_attribute_second_spelling
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane `cs`, fold f26c): GNU `mode(M)` — the declared type replaced by a
+# machine mode's, from the C document's `machineModes` table. Until this fold the
+# attribute was refused by name, and before that refusal `int x
+# __attribute__((mode(DI)));` was a 4-byte object where every reference makes it 8.
+# The reference matrix (gcc, clang, mingw-w64 gcc, Apple clang, aarch64 gcc) as
+# pins: every integer mode × signedness × spelling × position, the type's identity,
+# the floating modes per `long double` representation, pointers, enumerations, the
+# refusals, and the table reader's refusals. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_machine_mode_attribute
+             SOURCES test_machine_mode_attribute.cpp)
+target_include_directories(dss_analysis_semantic_test_machine_mode_attribute
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ★ P69 (lane `cs`, fold f26c) — EVERY "IS A WRITTEN BEFORE B" QUESTION READS THE
+# TOKEN STREAM (`streamRank`), never a byte offset: a token a paste produced lives
+# in the synth buffer's product tail, so a pasted tag, name or initializer was
+# ordered after everything written later (incomplete composites, a `sizeof` that
+# missed the completing declaration, a const read refused). Every order question ×
+# {plain, pasted} × the role the pasted token plays. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_order_reads_the_token_stream
+             SOURCES test_order_reads_the_token_stream.cpp)
+target_include_directories(dss_analysis_semantic_test_order_reads_the_token_stream
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # ★★★ P66 (lane `at`) — THE ADVERTISEMENT GUARD, the instrument half of
 # [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]].
 # DSS answered `__has_extension(c_atomic)` = 1 while the GNU `__atomic_*`

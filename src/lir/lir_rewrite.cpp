@@ -2,11 +2,6 @@
 
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
-// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the by-value-stack-arg exhaust-class
-// constants — the rewriter's call-arg classifier advances the arg cursors past a
-// by-value aggregate carrier EXACTLY as lir_callconv / lir_wide_call_args do, so a
-// spilled scalar arg's register-vs-overflow decision matches theirs.
-#include "mir/mir_opcode.hpp"
 #include "lir/lir_asm_region.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_callconv.hpp"
@@ -230,14 +225,16 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
 // instruction as a REGISTER-PASSED scalar arg (→ its LirRegClass) or not
 // (→ nullopt). Only a register-passed scalar arg is eligible to be DEFERRED to
 // callconv as a `SpillSlotRef` when spilled — the callee (ops[0]), the sret
-// pointer (ops[1] when hasIrr), a by-value-aggregate carrier (Reg + marker), the
-// marker itself, and any overflow scalar arg (already removed pre-regalloc by
-// lowerWideCallArgs) all keep the ordinary scratch-reload path.
+// pointer (ops[1] when hasIrr) and any overflow scalar arg (already removed
+// pre-regalloc by lowerWideCallArgs) keep the ordinary scratch-reload path. No
+// by-value stacked-aggregate carrier reaches here: `lowerWideCallArgs` took
+// each one off its Call (the LIR verifier's stage rule,
+// `verifyLirStackedAggregatesLowered`).
 //
 // This MIRRORS the arg-placement cursor of lir_callconv / lir_wide_call_args
 // EXACTLY (same monotonic NSAA cursor, same slot-aligned vs independent-counter
-// pool logic, same ByValueStackAgg-carrier skip + class-exhaust clamp, same
-// hasIndirectResult / firstArgIdx / variadicForcesStack handling) so the
+// pool logic, same hasIndirectResult / firstArgIdx / variadicForcesStack
+// handling) so the
 // register-vs-overflow verdict here is byte-identical to the one callconv reaches
 // — a spilled arg the rewriter defers is exactly one callconv will arg-move.
 // Config-driven from the cc descriptor; no arch/format branch.
@@ -264,21 +261,6 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
-        // The marker, and the MemOffset stating where its aggregate was placed,
-        // are consumed WITH the carrier below — never argument positions of their
-        // own (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES).
-        if (lirIsByValueStackAggDescriptor(ops, k)) continue;
-        if (lirIsByValueStackAggCarrier(ops, k)) {
-            // Wholly-stacked aggregate — NOT a register arg (keep scratch path).
-            // Advance the shared cursors + class-exhaust clamp as callconv does.
-            std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
-            if (ex == kByValueStackArgExhaustGpr)
-                argCursors.exhaust(LirRegClass::GPR);
-            else if (ex == kByValueStackArgExhaustFpr)
-                argCursors.exhaust(LirRegClass::FPR);
-            ++argRegionIdx;
-            continue;
-        }
         if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
         LirRegClass const cls = argOp.reg.regClass();
         // ⚠ A class with no pool row gets index 0 / poolSize 0, i.e. NOT

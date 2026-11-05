@@ -190,7 +190,11 @@ struct DSS_EXPORT SehScopeDescriptor {
 // to `computeFrameLayout` to align the local area (and fail loud on a local
 // needing MORE than one stack-slot's worth of alignment). SPARSE: only functions
 // with a local whose effective alignment EXCEEDS the frame slot width appear (an
-// ordinary function needs no entry — the slot width already covers every scalar).
+// ordinary function needs no entry — the slot width already covers every scalar),
+// and — P69 fold f26c, main's ledgers 495/497 — every function a call of which
+// passes a STACKED argument aligned past the stack (`stackedArgAlignBytes`), its
+// local fields then left at their defaults when no local is over-aligned. A row is
+// emitted when EITHER exceeds its default.
 struct DSS_EXPORT FuncLocalAlignment {
     SymbolId      funcSymbol{};        // the owning function's declared SymbolId
     std::uint32_t maxLocalAlignBytes = 0;  // max effective alignment over its locals
@@ -207,6 +211,13 @@ struct DSS_EXPORT FuncLocalAlignment {
     // over-aligned local (the same `maxLocalAlignBytes > word` sparse gate) —
     // an ordinary function needs no per-alloca adjustment and gets no entry.
     std::vector<std::uint32_t> perAllocaAlignBytes;
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 495): the widest alignment a
+    // stacked by-value argument of this function's calls states, when it exceeds the
+    // convention's stack alignment (else 0). MIR→LIR has realigned the function's
+    // stack pointer to it (the dynamic frame model); `lir_callconv` sizes the
+    // function's outgoing-argument area to a multiple of it, so the area that
+    // travels with SP keeps the boundary.
+    std::uint32_t stackedArgAlignBytes = 0;
 };
 
 struct DSS_EXPORT MirToLirResult {
@@ -249,9 +260,10 @@ struct DSS_EXPORT MirToLirResult {
     // the stamp was made from.
     std::vector<std::uint32_t> readThroughSlotSymbols;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: per-function max local alignment for
-    // functions with an over-aligned local (SPARSE — see FuncLocalAlignment).
-    // Consumed by `compile_pipeline.cpp` → `materializeCallingConvention` →
-    // `computeFrameLayout`. Empty when no function has an over-aligned local.
+    // functions with an over-aligned local (SPARSE — see FuncLocalAlignment), and
+    // (P69 fold f26c) for functions passing a stacked argument aligned past the
+    // stack. Consumed by `compile_pipeline.cpp` → `materializeCallingConvention` →
+    // `computeFrameLayout`. Empty when no function has either.
     std::vector<FuncLocalAlignment> funcLocalAlignments;
     bool                   ok = true;
 };

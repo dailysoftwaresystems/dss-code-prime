@@ -1,1 +1,1 @@
-    if (false) settleVisibilitiesWrittenAs(*hir, format.visibilityStandIns(), format.name(),
+    if (false) settleVisibilitiesWrittenAs(*hir, format, format.name(),

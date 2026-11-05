@@ -11,6 +11,9 @@
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg.hpp"
 #include "lir/lir_verifier.hpp"
+// The by-value stacked-aggregate marker's exhaust-class values, spelled by the
+// `byval#` operand's `:exhaust=` suffix.
+#include "mir/mir_opcode.hpp"
 
 #include <array>
 #include <cctype>
@@ -245,14 +248,39 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
                        : std::format("{}", op.offset);
         case LirOperandKind::LiteralIndex:
             return std::format("lit#{}", op.litIndex);
-        case LirOperandKind::ByValueStackAgg:
-            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the marker's
-            // `byValueAggExhaust` (the AAPCS64 exhaust class) is NOT round-tripped in
-            // LIR text — the parser reconstructs it as 0. This is debug/fixture text
-            // only; the REAL MIR→LIR path (mir_to_lir.cpp) threads it correctly. A
-            // LIR-text fixture that needs to witness the clamp must build it via the
-            // structured operand, not the textual codec.
-            return std::format("byval#{}", op.byValueAggBytes);
+        case LirOperandKind::ByValueStackAgg: {
+            // The marker exists only BEFORE `lowerWideCallArgs` (the LIR
+            // verifier's stage rule), so this is the PRE-pass form a module
+            // written from MIR→LIR's output carries — and every datum that pass
+            // places from is spelled: the size, then, when stated, the
+            // aggregate's own alignment (`:align=N`) and the class the carrier
+            // EXHAUSTS (`:exhaust=gpr|fpr`,
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS). The parser
+            // reads all three back, so a pre-pass module read from text places
+            // each aggregate where the module it was written from does. (Until
+            // P69 the text dropped the exhaust class and, once the marker carried
+            // it, the alignment — a read-back module placed an over-aligned
+            // aggregate at the slot, with no diagnostic.) An unstated field
+            // writes nothing, so `byval#24` is the classic form, byte for byte.
+            std::string s = std::format("byval#{}", op.byValueAggBytes);
+            if (std::uint32_t const a = op.byValueAggAlign(); a != 0)
+                s += std::format(":align={}", a);
+            if (op.byValueAggExhaust == kByValueStackArgExhaustGpr) {
+                s += ":exhaust=gpr";
+            } else if (op.byValueAggExhaust == kByValueStackArgExhaustFpr) {
+                s += ":exhaust=fpr";
+            } else if (op.byValueAggExhaust != kByValueStackArgExhaustNone) {
+                dss::report(
+                    reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Warning,
+                    std::format("emitLir: a by-value stacked-aggregate marker "
+                                "states exhaust class {}, which names no "
+                                "register class (substrate corruption)",
+                                static_cast<unsigned>(op.byValueAggExhaust)));
+                s += ":exhaust=?";
+            }
+            return s;
+        }
         case LirOperandKind::SpillSlotRef:
             // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a spilled register-passed
             // call-arg reference (slot + class). Debug/intermediate-LIR text
@@ -2076,6 +2104,49 @@ private:
         return SymbolAddressPart::Whole;
     }
 
+    // The `byval#<bytes>` operand's optional suffixes, in the order the emitter
+    // writes them: `:align=<power of two>` (the aggregate's own alignment) and
+    // `:exhaust=gpr|fpr` (the register class the carrier exhausts). Anything
+    // else after a `:` — an unknown key, an alignment that is no power of two,
+    // an unknown class — is refused by name (`I_TextMalformed`), never read as
+    // "not stated": a dropped datum places the aggregate somewhere else.
+    [[nodiscard]] LirOperand parseByValueStackAggSuffixes(std::uint32_t bytes) {
+        std::uint32_t align = 0;
+        std::uint8_t exhaust = kByValueStackArgExhaustNone;
+        while (lex_.peek().kind == TokKind::Colon) {
+            lex_.take();
+            Tok const key = lex_.take();
+            (void)expect(TokKind::Eq);
+            Tok const value = lex_.take();
+            if (key.kind == TokKind::Ident && key.text == "align") {
+                align = parseNumber<std::uint32_t>(value.text, "ByValueStackAgg align");
+                if (align == 0 || (align & (align - 1u)) != 0) {
+                    emit(DiagnosticCode::I_TextMalformed,
+                         std::format("byval#{} states alignment {}, which is not a "
+                                     "power of two", bytes, value.text));
+                    align = 0;
+                }
+            } else if (key.kind == TokKind::Ident && key.text == "exhaust") {
+                if (value.text == "gpr") {
+                    exhaust = kByValueStackArgExhaustGpr;
+                } else if (value.text == "fpr") {
+                    exhaust = kByValueStackArgExhaustFpr;
+                } else {
+                    emit(DiagnosticCode::I_TextMalformed,
+                         std::format("byval#{} states exhaust class '{}' — the "
+                                     "classes a carrier exhausts are gpr and fpr",
+                                     bytes, value.text));
+                }
+            } else {
+                emit(DiagnosticCode::I_TextMalformed,
+                     std::format("byval#{} carries an unknown suffix '{}' — a "
+                                 "by-value stacked-aggregate marker states 'align' "
+                                 "and 'exhaust'", bytes, key.text));
+            }
+        }
+        return LirOperand::makeByValueStackAgg(bytes, exhaust, align);
+    }
+
     [[nodiscard]] LirOperand parseOperand() {
         Tok pk = lex_.peek();
         switch (pk.kind) {
@@ -2153,7 +2224,7 @@ private:
                     lex_.take();
                     (void)expect(TokKind::Hash);
                     Tok n = lex_.take();
-                    return LirOperand::makeByValueStackAgg(
+                    return parseByValueStackAggSuffixes(
                         parseNumber<std::uint32_t>(n.text, "ByValueStackAgg bytes"));
                 }
                 if (pk.text == "memsym") {
