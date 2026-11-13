@@ -1,1 +1,1 @@
-            if (listError != ERROR_SUCCESS) note(top.path, winError(listError));
+            if (listError != ERROR_SUCCESS) note(top.path, winError(listError), fs::path{top.spelled});

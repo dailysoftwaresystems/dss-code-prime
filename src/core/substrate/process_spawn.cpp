@@ -1,7 +1,6 @@
 #include "core/substrate/process_spawn.hpp"
 
-#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, genericSpellingU8
-#include "core/substrate/os_path_spelling.hpp"   // a child's image and directory as the OS spells them
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, genericSpellingU8, a child's image and directory
 
 #include <algorithm>
 #include <cstddef>
@@ -1044,7 +1043,10 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // failure (Windows) or as a child that dies after fork (POSIX).
     if (!cwd.empty()) {
         std::error_code ec;
-        if (core::reachedKind(cwd, ec) != core::EntryKind::Directory || ec) {
+        // The child's current directory is a CONTAINER (P69 H6b): asked, measured and handed to CreateProcessW in its
+        // container form (`core::containerSpelling`), which names the directory every relative name of the child
+        // lies in -- `cwd` resolved as a leaf is ANOTHER directory for a last name ending in a space (✔MEASURED).
+        if (core::reachedKind(core::containerSpelling(cwd), ec) != core::EntryKind::Directory || ec) {
             out.diagnostic = self + "working directory '" + cwd.string()
                            + "' is not a directory"
                            + (ec ? ": " + ec.message() : std::string{});
@@ -1055,9 +1057,13 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         // opaque CreateProcessW failure. ✔MEASURED 2026-11-04 (probe-reference-cc run 20261104-220446-62443cb7):
         // CreateProcessW takes a current directory of at most MAX_PATH - 2 = 258 characters WITH its trailing
         // separator, and refuses a longer one in EVERY spelling (`\\?\` counts its prefix and gains nothing),
-        // ERROR_DIRECTORY. Measured on the directory as the OS resolves it: its full spelling (`osFullPathSpelling`,
-        // os_path_spelling.hpp); one the OS will not resolve is left to CreateProcessW to refuse.
-        std::wstring resolved = osFullPathSpelling(cwd.wstring());
+        // ERROR_DIRECTORY. Measured on the directory as the OS resolves it: its container form's full spelling (the
+        // substrate's normalization of it, the OS's own answer on Windows); one the OS will not resolve is left to
+        // CreateProcessW to refuse.
+        std::error_code    absoluteEc;
+        std::wstring       resolved =
+            core::normalizeKeepingRoot(core::absoluteKeepingRoot(core::containerSpelling(cwd), absoluteEc)).wstring();
+        if (absoluteEc) resolved.clear();
         if (!resolved.empty() && resolved.back() != L'\\') resolved += L'\\';
         if (resolved.size() > std::size_t{MAX_PATH - 2}) {
             out.diagnostic = self + "working directory '" + cwd.string() + "' is "
@@ -1116,10 +1122,10 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     commandBuffer.push_back(L'\0');
 
     std::wstring const exePath = exe->wstring();
-    std::wstring const cwdPath = cwd.empty() ? std::wstring{} : cwd.wstring();
-    // ★ THE IMAGE AT ANY LENGTH (P69 H6): `osApplicationName` (os_path_spelling.hpp) -- its extended-length spelling
-    // exactly where its plain one cannot start (the header measures both, and why a shorter image keeps its name).
-    std::wstring const startPath = osApplicationName(exePath);
+    std::wstring const cwdPath = cwd.empty() ? std::wstring{} : core::containerSpelling(cwd).wstring();   // a container
+    // ★ THE IMAGE AT ANY LENGTH (P69 H6): `core::applicationNameSpelling` -- its extended-length spelling exactly where
+    // its plain one cannot start (path_identity.hpp measures both, and why a shorter image keeps its name).
+    std::wstring const startPath = core::applicationNameSpelling(std::filesystem::path{exePath}).wstring();
 
     // The environment arm: the child's own block when something is withheld,
     // built BEFORE any handle is opened so a failure here has nothing to clean

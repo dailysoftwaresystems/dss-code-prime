@@ -846,6 +846,25 @@ round's close; each checkpoint's commit message says what was and was not run on
   checkpoint 39's two windows-x86_64-debug reds (the long-path class): the merged tree's suite must read them green.
   Balance unchanged: 687 open against 620 at `71648598`. Fold order now: f26c2 / H6b (whichever is ready first) → 3e →
   3f → L2b2 → f26d → H7.
+- **Checkpoint 42 (2026-11-13) = the harness lane's fold H6b**, the walk-up class's HOME AUDIT (H6's third send-back):
+  every Win32 call on a path takes its reference spelling, taken ONCE by use (a leaf, or the container a walk or a
+  directory make goes through), and every walk cuts that spelling literally, never re-resolving a level
+  (`referenceSpelling`/`levelAbove` in src/core/substrate/path_identity.cpp; `os_path_spelling.hpp` deleted into it; nine
+  callers moved; `createDirectories` confirms each level it made; `\??\` parses as a verbatim root); the pin runs the
+  256-cell universe MEASURED on cl and g++ (generated table), leaf and container. A several-unit step reports every
+  unit's errors before it fails: ONE verb, `dss::runEveryUnit` (src/program/every_unit.hpp), at buildCuMir's merge, the
+  encode route's archive branch, the input-language claim and the static archive's members (its request asked once);
+  three more sites of the class are xa's in 3e. `_fltused`'s arm RETIRED on a measurement (no DSS link reads it; cl's
+  link.exe needs it). 3 rows amended, none closed, none new (real net 0). ✔MEASURED by the lane: every changed binary
+  run whole on windows-x86_64-debug 148/148 (MinGW gcc 13.2), windows-x86_64-release 148/148 (cl 19.51),
+  linux-x86_64-debug 120, macos-arm64-debug 120; its examples run, 7 examples × both runners, windows-x86_64-debug 16 of
+  16. **OPEN RISK, named:** the examples' macos-arm64-debug half is UNREAD — every remote leg is refused since the
+  operator moved every source tree from `C:\Source` to `D:\Source` (2026-11-13) and the connection files lost their
+  private ACL; the merged tree's five-leg suite reads it before any other fold (ledger 565). The move also needed the
+  lane worktrees' git links repaired, the cycle's scripts rewritten to `D:` and every Windows build directory cleaned
+  (ledger 561). DssHarness 0.6.19's `check-anchor-arms` is now a step of the round's close (`anchors.historyForms`
+  declares X8's one history spelling; ledger 564). Balance unchanged: 687 open against 620 at `71648598`. Fold order
+  now: f26c2 → 3e → L2b2 → f26d → 3f → 3g → 3h → L2b3 (wherever ready, before H7) → H7.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

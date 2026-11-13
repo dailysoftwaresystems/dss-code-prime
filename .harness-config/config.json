@@ -1578,6 +1578,14 @@
       "packaging",
       "integrated_tests",
       "tests"
+    ],
+    // A row NAMES its arms and cites no run as a standing pass: an arm's verdict lives in the mutation record, keyed
+    // by what it was judged on, and a quoted run goes stale the moment that key moves (the skill's mutation-arms.md).
+    // A closed row may say where it closed, as HISTORY only, in this one spelling; `dssharness check-anchor-arms`
+    // (DssHarness 0.6.19, a step of the round's close) reads a run cited inside it as history and reports every other
+    // pass citation.
+    "historyForms": [
+      "closed at `{commit}` on sweep {run}"
     ]
   },
   // RED-ON-DISABLE IS `dssharness check-mutations`: every pin is an ARM of the registry below, driven in worker

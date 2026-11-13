@@ -25,7 +25,17 @@
 
 #if !defined(_WIN32)
 #include <sys/stat.h>   // mkfifo: the special file a POSIX host can make
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // the walk universe's objects, made through `\\?\` as the OS makes them
+#endif
+#include <cstring>
+#include <iostream>
 #include <optional>
 #include <system_error>
 
@@ -676,7 +686,13 @@ TEST(DirectoryTree, EverySpellingOfAVolumeWalksUpToItsRootDirectory) {
     std::error_code edgeEc;
     fs::path const  climbed =
         dss::core::reachedPath(fs::path{L"\\\\.\\" + drive + L"\\..\\" + below + L"\\held.txt"}, edgeEc);
-    EXPECT_NE(climbed, expectedHeld) << "a `..` under \\\\.\\ climbs over the volume, and reaches no drive file";
+    // The OS's answer, asserted as a VALUE (P69 H6b, the review of H6's N6): GetFullPathNameW climbs the `..` over
+    // the volume to `\\.\<below>\held.txt`, which opens nothing -- so nothing of it is reached and the answer is that
+    // whole, with no error. (Any answer but the held file passed the NE this replaced, an error included.)
+    ASSERT_FALSE(edgeEc) << edgeEc.message();
+    EXPECT_EQ(climbed, fs::path{L"\\\\.\\" + below + L"\\held.txt"})
+        << "a `..` under \\\\.\\ climbs over the volume, and reaches no drive file: reached " << climbed.string();
+    EXPECT_NE(climbed, expectedHeld);
     for (std::wstring const& literal : {L"\\\\?\\" + drive + L"\\" + below + L"\\sub\\..\\held.txt",
                                         L"\\\\?\\" + drive + L"\\" + below + L"\\held.txt."}) {
         fs::path const reached = dss::core::reachedPath(fs::path{literal}, edgeEc);
@@ -1010,3 +1026,247 @@ TEST(DirectoryTree, EveryOperationReachesAPathOf300CharactersAsBelow260) {
     std::error_code ec;
     EXPECT_EQ(dss::core::entryKind(deep, ec), EntryKind::Absent) << "the deep tree was not removed";
 }
+
+// ════ THE WALK-UP UNIVERSE, EVERY MEASURED CELL (P69 H6b) ════
+// The 256 cells the probe measured -- kinds {drive, cwd-relative, drive-relative, rooted, share, `\\?\`, `\\.\`,
+// `\??\`} x the step's last name {`d `, `e.`, `f\..`, `NUL`} x separators {`\`, `/`, mixed, trailing} x {short,
+// past MAX_PATH} -- each asked of the substrate's walks in BOTH uses, its expected values the measured answers of
+// the one-cut reference (walk_universe_cells.inc, GENERATED from the probe's log, never from this code):
+//   LEAF      the child `<step>\x.txt`: reachedPath of a name absent beside it reaches the directory `ref`;
+//             containingDirectory(child) is that directory; createDirectoriesFor(child) makes `made`;
+//   CONTAINER the step itself: walkTree lists the directory `step`; createDirectories makes `step` (dotdot: the
+//             area itself, nothing).
+// The objects are made through `\\?\` beside their trimmed twins (`d ` beside `d`, `e.` beside `e`), the review of
+// H6's scenario. A cell whose whole names nothing (the OS refused its reference) owes no level; the share's NUL
+// directory is the SMB server's refusal (ERROR_ACCESS_DENIED) in every spelling, pinned as that boundary.
+#ifdef _WIN32
+namespace {
+
+struct WalkCell {
+    int         cell;
+    bool        isLong;
+    char const* kind;
+    char const* name;
+    char const* sep;
+    char const* ref;
+    char const* step;
+    char const* made;
+    int         refused;
+};
+
+constexpr WalkCell kWalkCells[] = {
+#include "walk_universe_cells.inc"
+};
+
+[[nodiscard]] std::wstring wide(char const* s) { return std::wstring(s, s + std::strlen(s)); }
+[[nodiscard]] std::wstring verbatimOf(std::wstring const& abs) { return L"\\\\?\\" + abs; }
+
+void makeVerbatim(std::wstring const& abs) { ::CreateDirectoryW(verbatimOf(abs).c_str(), nullptr); }
+void putVerbatim(std::wstring const& abs, char const* text) {
+    HANDLE const h = ::CreateFileW(verbatimOf(abs).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    ::WriteFile(h, text, static_cast<DWORD>(std::strlen(text)), &written, nullptr);
+    ::CloseHandle(h);
+}
+// The names a directory holds, read through `\\?\` (the OS's own listing, no name re-resolved).
+[[nodiscard]] std::vector<std::wstring> namesIn(std::wstring const& absDir) {
+    std::vector<std::wstring> out;
+    WIN32_FIND_DATAW          found{};
+    HANDLE const h = ::FindFirstFileExW((verbatimOf(absDir) + L"\\*").c_str(), FindExInfoBasic, &found,
+                                        FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::wstring const n = found.cFileName;
+        if (n != L"." && n != L"..") out.push_back(n);
+    } while (::FindNextFileW(h, &found));
+    ::FindClose(h);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+// The cell's spelling of `rel` under the base `base` (an absolute drive path) in kind `kind`; `cwdRel` is the same
+// object spelled relative to the process's directory -- the probe's own construction.
+[[nodiscard]] std::wstring spelled(std::wstring const& kind, std::wstring const& base, std::wstring const& rel,
+                                   std::wstring const& cwdRel) {
+    std::wstring const noDrive = base.substr(2);
+    if (kind == L"abs") return base + L"\\" + rel;
+    if (kind == L"cwd") return cwdRel;
+    if (kind == L"drv") return base.substr(0, 2) + cwdRel;
+    if (kind == L"root") return noDrive + L"\\" + rel;
+    if (kind == L"share") return L"\\\\localhost\\" + base.substr(0, 1) + L"$" + noDrive + L"\\" + rel;
+    if (kind == L"verb") return L"\\\\?\\" + base + L"\\" + rel;
+    if (kind == L"dev") return L"\\\\.\\" + base + L"\\" + rel;
+    return L"\\??\\" + base + L"\\" + rel;
+}
+[[nodiscard]] std::wstring separated(std::wstring s, std::wstring const& sep, std::size_t at) {
+    if (sep == L"fs") std::replace(s.begin(), s.end(), L'\\', L'/');
+    if (sep == L"mixed" && at < s.size() && s[at] == L'\\') s[at] = L'/';
+    return s;
+}
+// The process's directory, put back however a cell left it.
+struct CurrentDirectoryKept {
+    std::wstring was;
+    CurrentDirectoryKept() {
+        std::wstring buf(MAX_PATH, L'\0');
+        DWORD const  n = ::GetCurrentDirectoryW(MAX_PATH, buf.data());
+        was            = buf.substr(0, n);
+    }
+    ~CurrentDirectoryKept() { ::SetCurrentDirectoryW(was.c_str()); }
+};
+[[nodiscard]] std::wstring markOf(std::wstring const& dir) {
+    if (dir.empty()) return L"base.mark";
+    if (dir == L"d ") return L"space.mark";
+    if (dir == L"d") return L"plain-d.mark";
+    if (dir == L"e.") return L"dot.mark";
+    if (dir == L"e") return L"plain-e.mark";
+    if (dir == L"NUL") return L"nul.mark";
+    return dir + L".mark";
+}
+
+}  // namespace
+
+TEST(DirectoryTree, EveryWalkReachesTheWholesLevelInEveryMeasuredCell) {
+    ScratchDir           scratch{Location::Temp, "directory_tree_walk_universe"};
+    CurrentDirectoryKept kept;
+    std::wstring const   S = scratch.path().native();
+    ASSERT_TRUE(S.size() >= 3 && S[1] == L':' && S.size() < 200) << "the scratch lies on no drive, or too deep";
+    std::wstring chain;
+    for (int i = 0; i < 28; ++i) chain += (i < 10 ? L"\\long-level-0" : L"\\long-level-") + std::to_wstring(i);
+    std::wstring const L = S + chain;
+    for (std::size_t at = 1; at <= chain.size(); ++at)
+        if (at == chain.size() || chain[at] == L'\\') makeVerbatim(S + chain.substr(0, at));
+    struct Made { wchar_t const* dir; char const* tag; };
+    for (std::wstring const& base : {S, L}) {
+        putVerbatim(base + L"\\base.mark", "BASE");
+        for (Made const m : {Made{L"d ", "SPACE"}, Made{L"d", "PLAIN-D"}, Made{L"e.", "DOT"}, Made{L"e", "PLAIN-E"},
+                             Made{L"NUL", "NUL"}, Made{L"f", "F"}, Made{L"g", "G"}}) {
+            makeVerbatim(base + L"\\" + m.dir);
+            putVerbatim(base + L"\\" + m.dir + L"\\x.txt", m.tag);
+            putVerbatim(base + L"\\" + m.dir + L"\\" + markOf(m.dir), m.tag);
+        }
+        makeVerbatim(base + L"\\mk");
+    }
+    // The share reaches this scratch only where the host serves its drive's administrative share; the share's cells
+    // are asked where it does, and counted where it does not.
+    std::error_code    shareEc;
+    bool const         shareServed = dss::core::reachedKind(fs::path{spelled(L"share", S, L"d", L"")}, shareEc)
+                             == EntryKind::Directory;
+    std::size_t        asked = 0, owedNothing = 0, shareNotServed = 0, serverRefused = 0;
+    for (WalkCell const& c : kWalkCells) {
+        SCOPED_TRACE("cell " + std::to_string(c.cell) + " " + (c.isLong ? "long " : "short ") + c.kind + " " + c.name
+                     + " " + c.sep);
+        std::wstring const kind = wide(c.kind), name = wide(c.name), sep = wide(c.sep);
+        if (kind == L"share" && !shareServed) {
+            ++shareNotServed;
+            continue;
+        }
+        if (c.ref == nullptr) {   // the whole names nothing: the OS refused its reference, so no level is owed
+            ++owedNothing;
+            continue;
+        }
+        bool const         dotdot   = name == L"dotdot";
+        std::wstring const step     = dotdot ? L"f\\.." : (name == L"space" ? L"d " : name == L"dot" ? L"e." : L"NUL");
+        std::wstring const childRel = dotdot ? L"f\\..\\g\\x.txt" : step + L"\\x.txt";
+        std::wstring const base     = c.isLong ? L : S;
+        // A cell spelled under `under`, relative to the process's directory `cwd` (a long base cannot be one).
+        auto const cellSpelling = [&](std::wstring const& under, std::wstring const& rel, std::size_t stepSize) {
+            std::wstring const cwdPrefix = c.isLong ? under.substr(S.size() + 1) + L"\\" : L"";
+            std::wstring const bare      = spelled(kind, under, rel, cwdPrefix + rel);
+            return separated(bare, sep, stepSize);
+        };
+        auto const stepSpelling = [&](std::wstring const& under) {
+            std::wstring const cwdPrefix = c.isLong ? under.substr(S.size() + 1) + L"\\" : L"";
+            std::wstring const bare      = spelled(kind, under, step, cwdPrefix + step);
+            std::wstring       out       = separated(bare, sep, bare.find_last_of(L'\\'));
+            if (sep == L"trail") out += L"\\";
+            return out;
+        };
+        auto const stepSize = [&](std::wstring const& under) {
+            std::wstring const cwdPrefix = c.isLong ? under.substr(S.size() + 1) + L"\\" : L"";
+            return spelled(kind, under, step, cwdPrefix + step).size();
+        };
+        ::SetCurrentDirectoryW((c.isLong ? S : base).c_str());
+        std::wstring const child = cellSpelling(base, childRel, stepSize(base));
+        if (c.refused != 0) {
+            // THE SERVER'S BOUNDARY: every level is refused with the error the OS gave the probe.
+            std::error_code ec;
+            static_cast<void>(dss::core::reachedKind(dss::core::containingDirectory(fs::path{child}), ec));
+            EXPECT_EQ(ec.value(), c.refused) << "the share's refusal of its NUL directory, as measured";
+            ++serverRefused;
+            continue;
+        }
+        ++asked;
+        std::wstring const ref = wide(c.ref), stepDir = wide(c.step), made = wide(c.made);
+        // LEAF: a name absent beside the child is reached through the child's own directory.
+        std::wstring absent = child;
+        absent.replace(absent.size() - 5, 5, L"absent.txt");
+        std::error_code reachEc;
+        fs::path const  reached = dss::core::reachedPath(fs::path{absent}, reachEc);
+        EXPECT_FALSE(reachEc) << reachEc.message();
+        EXPECT_EQ(reached.parent_path().filename().native(), ref) << "reached " << reached.string();
+        // LEAF: the directory the child is in.
+        fs::path const in = dss::core::containingDirectory(fs::path{child});
+        std::error_code inEc;
+        EXPECT_EQ(dss::core::reachedKind(in, inEc), EntryKind::Directory) << in.string() << " " << inEc.message();
+        EXPECT_EQ(in.filename().native(), ref) << in.string();
+        // CONTAINER: the step's listing names the step's own directory.
+        std::vector<std::wstring> marks;
+        auto const walk = dss::core::walkTree(fs::path{stepSpelling(base)}, [&](TreeEntry const& e) {
+            std::wstring const n = e.path.filename().native();
+            if (n.size() > 5 && n.substr(n.size() - 5) == L".mark") marks.push_back(n);
+            return e.kind == EntryKind::Directory ? WalkStep::Prune : WalkStep::Continue;
+        });
+        EXPECT_FALSE(walk.error) << walk.where.string() << ": " << walk.error.message();
+        EXPECT_EQ(marks, std::vector<std::wstring>{markOf(stepDir)});
+        // LEAF and CONTAINER creations, each in a fresh area of its own.
+        for (bool const container : {false, true}) {
+            std::wstring const area = base + L"\\mk\\" + (container ? L"c" : L"p") + std::to_wstring(c.cell);
+            makeVerbatim(area);
+            if (dotdot) makeVerbatim(area + L"\\f");
+            ::SetCurrentDirectoryW((c.isLong ? S : area).c_str());
+            std::wstring const spelling = container ? stepSpelling(area) : cellSpelling(area, childRel, stepSize(area));
+            std::error_code    mkEc;
+            static_cast<void>(container ? dss::core::createDirectories(fs::path{spelling}, mkEc)
+                                        : dss::core::createDirectoriesFor(fs::path{spelling}, mkEc));
+            ::SetCurrentDirectoryW(S.c_str());
+            EXPECT_FALSE(mkEc) << (container ? "createDirectories " : "createDirectoriesFor ") << mkEc.message();
+            std::vector<std::wstring> held = namesIn(area);
+            if (dotdot) held.erase(std::remove(held.begin(), held.end(), std::wstring{L"f"}), held.end());
+            std::vector<std::wstring> const expected =
+                container ? (dotdot ? std::vector<std::wstring>{} : std::vector<std::wstring>{stepDir})
+                          : std::vector<std::wstring>{made};
+            EXPECT_EQ(held, expected) << (container ? "the container made " : "the creation for the file made ")
+                                      << held.size() << " name(s)";
+        }
+    }
+    // DESCENT: a LISTED directory is walked by its own verbatim spelling -- its parent's, `\`, the listed name -- never
+    // by its path re-resolved: each directory of either base, listed one level down, holds its own mark alone (`d `
+    // re-resolved lists `d`'s, and NUL re-resolved is the device).
+    for (std::wstring const& base : {S, L}) {
+        SCOPED_TRACE(base == S ? "descent below the short base" : "descent below the long base");
+        std::vector<std::pair<std::wstring, std::wstring>> found;   // (the directory listed one level down, a mark in it)
+        auto const walk = dss::core::walkTree(fs::path{base}, [&](TreeEntry const& e) {
+            std::wstring const n = e.path.filename().native();
+            if (e.depth == 0) return e.kind == EntryKind::Directory && n != L"mk" ? WalkStep::Continue : WalkStep::Prune;
+            if (n.size() > 5 && n.substr(n.size() - 5) == L".mark") found.emplace_back(e.path.parent_path().filename().native(), n);
+            return WalkStep::Prune;
+        });
+        EXPECT_FALSE(walk.error) << walk.where.string() << ": " << walk.error.message();
+        std::vector<std::pair<std::wstring, std::wstring>> expected;
+        for (wchar_t const* d : {L"d ", L"d", L"e.", L"e", L"NUL", L"f", L"g"}) expected.emplace_back(d, markOf(d));
+        std::sort(found.begin(), found.end());
+        std::sort(expected.begin(), expected.end());
+        EXPECT_EQ(found, expected) << "a directory listed one level down was walked as another directory";
+    }
+    // Every cell is accounted for: asked, owed nothing, the server's boundary, or a share this host does not serve.
+    EXPECT_EQ(asked + owedNothing + serverRefused + shareNotServed, std::size(kWalkCells));
+    EXPECT_EQ(owedNothing, 32u) << "the measured table holds 32 cells whose whole names nothing";
+    EXPECT_GE(asked, 192u) << "every non-share owed cell is asked";
+    std::cout << "walk universe: " << asked << " cell(s) asked, " << owedNothing << " owe nothing, " << serverRefused
+              << " the server's refusal, " << shareNotServed << " share cell(s) on a host that serves no share\n";
+    // The scratch holds names plain Win32 cannot remove: the substrate's removal takes them (through handles).
+    ::SetCurrentDirectoryW(kept.was.c_str());
+    auto const removal = dss::core::removeTree(scratch.path());
+    EXPECT_EQ(removal.failures, 0u) << removal.firstPath.string() << ": " << removal.firstError.message();
+}
+#endif

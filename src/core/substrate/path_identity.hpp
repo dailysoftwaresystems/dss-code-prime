@@ -169,7 +169,7 @@ struct RootSpelling {
         Share,           // `\\server\share\x` (Win32)
         Authority,       // `//x` (POSIX: implementation-defined, kept apart from `/x`)
         Device,          // `\\.\`, `//./`, `//?/`: a device path Win32 normalizes
-        Verbatim,        // `\\?\`: a device path Win32 passes unparsed
+        Verbatim,        // `\\?\`, and its NT twin `\??\`: a device path Win32 passes unparsed (P69 H6b, N4)
     };
     Kind        kind      = Kind::Relative;
     std::size_t prefix    = 0;      // code units a normalization keeps whole: what a `..` never climbs into
@@ -203,7 +203,7 @@ struct RootSpelling {
 // `C:\a\b\..\` is `C:\a\`, `C:\d\..` is `C:\`). In the Win32 grammar a LAST name `NUL` (any case, every trailing
 // period, space and `:` dropped) is the device `\\.\NUL` below every root but a share's and a device path's.
 // ★ UNDER WIN32 THIS IS GetFullPathNameW's ANSWER, PINNED EQUAL to it on both Windows legs over F3's universe
-// (✔MEASURED, runs 20261104-222037-6ef9b98e and 20261104-223135-5f04ee9f; the OS's side is os_path_spelling.hpp) --
+// (✔MEASURED, runs 20261104-222037-6ef9b98e and 20261104-223135-5f04ee9f; the OS's side is path_identity.cpp's) --
 // the model a host with no Win32 answers by; on a Windows host `normalizeKeepingRoot` asks the OS itself. A verbatim
 // spelling comes back as written; an empty one empty; one with nothing left `.`.
 [[nodiscard]] DSS_EXPORT std::wstring normalizedSpelling(std::wstring_view native, PathGrammar grammar);
@@ -237,9 +237,12 @@ struct RootSpelling {
 //     calls, streams and the C runtime -- NEVER to a std::filesystem operation; this file's operations below are Win32
 //     on Windows for that reason.
 //
-// THE SPELLING, ONE RULE AT EVERY LENGTH, AND IT IS THE OS'S: `substrate::osExtendedSpelling`
-// (core/substrate/os_path_spelling.hpp, the rule's ONE home, header-only so a target that links no DSS library takes
-// it too). `p`'s full spelling as the OS resolves it -- GetFullPathNameW: the caller's directories for a relative
+// THE SPELLING, ONE RULE AT EVERY LENGTH, AND IT IS THE OS'S, asked in path_identity.cpp alone (P69 H6b, F4: the
+// rule's one home is this canonicalizer; integrated_tests compiles it and carries src/ on its include path, so no
+// header-only second home is owed). `p` names what its WHOLE spelling names, taken ONCE -- the LEAF reference: a
+// verbatim spelling as written, `\??\` as its `\\?\` twin (N4: ✔MEASURED 2026-11-05, every file call reads `\??\`
+// verbatim, GetFullPathNameW reads it rooted, and CreateDirectoryW takes only `\\?\` past MAX_PATH); otherwise
+// `p`'s full spelling as the OS resolves it -- GetFullPathNameW: the caller's directories for a relative
 // spelling, the separators, `.` and `..` (under `\\.\` the climb over the volume), the trim, a reserved name to its
 // device -- prefixed: `\\?\` before a drive, `\\?\UNC\` in place of a share's `\\`, `\\?\` in place of a device
 // spelling's `\\.\` (a reserved name the OS resolved, `\\.\NUL`, so becomes `\\?\NUL`: the same device). A device
@@ -248,7 +251,29 @@ struct RootSpelling {
 // dot, a `..`, the climb, `\\.\C:\d\NUL` (a file in both), `\\.\NUL`, `\\.\CONIN$`, an absent `\\.\COM1`, GLOBALROOT,
 // `\\.\UNC\` and `\\.\pipe\`). Kept as written: a verbatim spelling (already literal), one the OS refuses to resolve,
 // and every spelling on a POSIX host, which has no such limit.
+// ⚠ A LEAF'S SPELLING, NEVER A WALK'S: the resolution of a cut is not the cut of the resolution. GetFullPathNameW
+// trims ONE trailing period from every segment but a trailing space and a device name from the LAST alone (✔MEASURED
+// 2026-11-05 over 256 cells: kinds {drive, cwd-relative, drive-relative, rooted, share, `\\?\`, `\\.\`, `\??\`} x last
+// names {`d `, `e.`, `f\..`, `NUL`} x separators {`\`, `/`, mixed, trailing} x {short, 469 characters}, runs
+// 20261105-062441-7bd17744 / 062514-83af17c8 (cl) and 062546-4ccf610b / 062603-16841970 (g++), byte-identical). So
+// a walk never re-extends a level: every walk below takes the whole's reference once and cuts it LITERALLY.
 [[nodiscard]] DSS_EXPORT std::filesystem::path extendedLengthSpelling(std::filesystem::path const& p);
+
+// THE CONTAINER FORM of `dir` (P69 H6b, ledger 541): `dir` with a separator after it, the spelling that names the
+// directory every `dir \ name` lies in. ✔MEASURED (the universe above): resolved with no segment last, `C:\o\d \` is
+// `d ` and `C:\o\NUL\` a directory, exactly as every child composed from it means them, where `C:\o\d ` alone is
+// `C:\o\d` and `C:\o\NUL` the device. A spelling USED as a container -- a directory to make, to list, to start a
+// process in -- is asked in this form; one used as a LEAF -- an open, a kind, a removal's target -- as given. `dir`
+// itself when it already ends in a separator, is empty, or on POSIX (which resolves no name by its position).
+[[nodiscard]] DSS_EXPORT std::filesystem::path containerSpelling(std::filesystem::path const& dir);
+
+// THE DIRECTORY `file` IS IN, as every file call names it: the level above `file`'s last name in `file`'s own leaf
+// reference -- extended once and cut literally (only `\` separates under `\\?\`; a volume root keeps its separator) --
+// so the directory its write will name, whatever its last name is. Never `file.parent_path()`: re-resolved as a whole
+// that is another directory when its last name ends in a space or is a device name, and at `\\?\D:\a.exe` it is
+// `\\?\D:`, the volume's DEVICE. Windows: an extended spelling, which every substrate call takes as written (spell a
+// message from `file`); empty for a file at no level (a volume root itself). POSIX: `parentWithinRoot(file)`.
+[[nodiscard]] DSS_EXPORT std::filesystem::path containingDirectory(std::filesystem::path const& file);
 
 // The spelling a process's IMAGE takes as CreateProcessW's application name: its extended-length spelling exactly
 // where its plain one cannot start, and as given everywhere else. ✔MEASURED 2026-11-04 (probe-reference-cc runs
@@ -256,16 +281,23 @@ struct RootSpelling {
 // = 259 characters and fails from 260 (ERROR_PATH_NOT_FOUND, where CreateFileW's open fails too); `\\?\` starts at any
 // length -- but the child then reads its OWN image name verbatim (GetModuleFileNameW: `\\?\...`, at 80 characters as
 // at 322), so an image a plain spelling starts keeps the name the child reads as it was given. The length is the
-// OS's full spelling's (a relative image is resolved against the caller's directory). It is
-// `substrate::osApplicationName` (os_path_spelling.hpp), which every spawn of the tree takes -- the process spawner's
-// and the test harness's (tests/test_support/run_binary.hpp) alike. POSIX: `p`.
+// OS's full spelling's (a relative image is resolved against the caller's directory). Every spawn of the tree takes
+// it -- the process spawner's (process_spawn.cpp) and the test harness's (tests/test_support/run_binary.hpp) alike.
+// POSIX: `p`.
 [[nodiscard]] DSS_EXPORT std::filesystem::path applicationNameSpelling(std::filesystem::path const& p);
 
 // The file-system OPERATIONS a site would otherwise ask of std::filesystem, at any length: Win32 on Windows, through
 // `extendedLengthSpelling` (see above for why never the library there), std::filesystem elsewhere. Each answers as the
 // std::filesystem call of the same name does, `ec` included.
 //   * `createDirectories`: every missing directory of `p`; true when it made one; a level that exists as a file is
-//     an error (ERROR_ALREADY_EXISTS on Windows, as the library's EEXIST).
+//     an error (ERROR_ALREADY_EXISTS on Windows, as the library's EEXIST). ★ `p` IS A CONTAINER (P69 H6b): it is
+//     walked in its container form (`containerSpelling`), so it makes the directory every `p \ name` is written into
+//     -- the library's create_directories resolves `p` as a leaf and makes ANOTHER directory for a last name ending in
+//     a space, the device for `NUL` (✔MEASURED: 50 of 224 cells made another directory, 52 none). And a level
+//     reported made is CONFIRMED a directory, opened as one: CreateDirectoryW of a device succeeds and makes nothing
+//     (✔MEASURED, `\\?\NUL`), which is refused here, never passed as made.
+//   * `createDirectoriesFor`: every missing directory `file` is to be written into -- `createDirectories` of
+//     `containingDirectory(file)`; false, `ec` clear, when that is no level (a volume root's file).
 //   * `removeEntry`: the file, link or EMPTY directory at `p` (a link itself, never what it reaches); false, with `ec`
 //     clear, when nothing is there; a read-only file is removed as MS STL's `remove` removes one.
 //   * `copyFile`: the file `from` reaches, copied to a NEW file `to` -- refused when `to` exists, as
@@ -275,6 +307,7 @@ struct RootSpelling {
 //     spelling on Windows, which takes it under both libraries); null when the open is refused, `errno` as it left it.
 [[nodiscard]] DSS_EXPORT std::FILE* openFileStream(std::filesystem::path const& p, char const* mode);
 [[nodiscard]] DSS_EXPORT bool createDirectories(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT bool createDirectoriesFor(std::filesystem::path const& file, std::error_code& ec);
 [[nodiscard]] DSS_EXPORT bool removeEntry(std::filesystem::path const& p, std::error_code& ec);
 DSS_EXPORT void copyFile(std::filesystem::path const& from, std::filesystem::path const& to, std::error_code& ec);
 
@@ -330,7 +363,7 @@ absoluteKeepingRoot(std::filesystem::path const& p, std::error_code& ec);
 // with each (`\\.\C:\..\x` is `\\.\x`). Every kind of root takes `normalizedSpelling` under the host's grammar -- the
 // library's `lexically_normal()` keeps what Win32 trims and climbs where the OS does not -- and ON A WINDOWS HOST an
 // absolute plain spelling (a drive, a share, a device path) is the OS's own answer, GetFullPathNameW
-// (`substrate::osFullPathSpelling`), which that normalization is pinned equal to wherever every Windows release agrees;
+// (asked in path_identity.cpp), which that normalization is pinned equal to wherever every Windows release agrees;
 // a relative, rooted or drive-relative one stays the text's, never resolved against a directory here.
 [[nodiscard]] DSS_EXPORT std::filesystem::path
 normalizeKeepingRoot(std::filesystem::path const& p);
@@ -592,6 +625,12 @@ struct TreeWalk {
 // tree costs memory, never call stack. The first directory it cannot list ends the walk (`error`,
 // `where`), and so does a link whose reach it cannot examine unless the options hand it out; the
 // order within a directory is the filesystem's.
+// ★ ITS LISTINGS NAME THE DIRECTORIES THE ENTRIES ARE IN (P69 H6b, F3): `root` is a CONTAINER, listed by its container
+// reference (`containerSpelling`, resolved once), and a listed directory by its parent's verbatim spelling extended
+// literally with its name; a link's reach is asked by that spelling too -- never `entry.path` re-resolved, which
+// names ANOTHER entry for a name ending in a space or a period, or a device name (✔MEASURED, the walk-up universe:
+// the step extended then listed reached another directory in 38 cells and was refused in 36). Each entry is still
+// NAMED from `root` as given, `root / name / ...`.
 [[nodiscard]] DSS_EXPORT TreeWalk walkTree(std::filesystem::path const&                  root,
                                            std::function<WalkStep(TreeEntry const&)> const& visit,
                                            TreeWalkOptions                               options = {});

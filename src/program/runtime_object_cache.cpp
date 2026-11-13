@@ -1553,8 +1553,11 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
 
     std::error_code ec;
     if (!directory.empty()) {
-        static_cast<void>(core::createDirectories(directory, ec));
-        if (std::error_code dirEc; ec && core::reachedKind(directory, dirEc) != core::EntryKind::Directory) {
+        // The directory the artifact's own write names (`core::createDirectoriesFor`, P69 H6b): `directory`, the
+        // library's parent, re-resolved as a whole is another directory for a last name ending in a space.
+        static_cast<void>(core::createDirectoriesFor(destination, ec));
+        if (std::error_code dirEc;
+            ec && core::reachedKind(core::containingDirectory(destination), dirEc) != core::EntryKind::Directory) {
             // The arm an INSTALLED compiler hits when the resolved root is not
             // writable — a read-only volume, a quota, a path whose parent is
             // not a directory. It carries the OS reason verbatim, because

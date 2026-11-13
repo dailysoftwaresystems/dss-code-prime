@@ -72,9 +72,10 @@
 #include "../../src/core/substrate/windows_command_line.hpp"
 
 // The spelling a child's IMAGE takes as CreateProcessW's application name, at any length -- the process spawner's own
-// rule, at its one home, reached by the same relative spelling for the same reason (header-only, dependency-free;
-// Windows-only declarations, so it is included unconditionally and compiles to nothing elsewhere).
-#include "../../src/core/substrate/os_path_spelling.hpp"
+// rule, at its one home (`core::applicationNameSpelling`, P69 H6b's F4): every consumer of this header compiles or
+// links path_identity.cpp (integrated_tests compiles it and carries src/ on its include path, MEASURED by the review
+// of H6), so the rule has no second, header-only home.
+#include "../../src/core/substrate/path_identity.hpp"
 
 // The suite's wall-clock budget vocabulary — `kRunBudget` (this header's default
 // timeout) and `kAdmissionBudget` are DEFINED there, with the measurements that
@@ -737,9 +738,9 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // AT ANY LENGTH (P69 H6): a plain application name starts only below
     // MAX_PATH, so an image at 260 characters or more takes its extended-length
     // spelling, and every shorter one keeps the name it was given -- the child
-    // reads its own image name as the parent spelled it (os_path_spelling.hpp
-    // states the measurements).
-    appName = ::dss::substrate::osApplicationName(appName);
+    // reads its own image name as the parent spelled it (path_identity.hpp's
+    // `applicationNameSpelling` states the measurements).
+    appName = ::dss::core::applicationNameSpelling(std::filesystem::path{appName}).wstring();
 
     // Pipe for capturing child stdout (+ stderr merged). The
     // WRITE end is marked inheritable via SECURITY_ATTRIBUTES so

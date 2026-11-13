@@ -1,1 +1,1 @@
-    const bool unc = !path.root_name().empty();
+    const bool unc = path.root_name().native().size() > 1 && (path.root_name().native()[0] == '/' || path.root_name().native()[0] == '\\');

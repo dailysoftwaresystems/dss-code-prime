@@ -23,6 +23,7 @@
 #include "diagnostic_count.hpp"
 #include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
+#include "relocatable_documents.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -101,7 +102,10 @@ struct Cascade {
 }  // namespace
 
 TEST(ThinImportStageRounds, EveryCascadesImportStageConvergesInOneRoundAndReportsNothing) {
-    for (char const* target : {"x86_64:elf64-x86_64-linux", "x86_64:pe64-x86_64-windows", "arm64:elf64-aarch64-linux"}) {
+    // EVERY shipped relocatable document (P69 H6b, the review of H6's N2): the stage takes the format's C symbol
+    // decoration (Mach-O's leading `_`) as an input, so the table is the censused vocabulary, never a hand list.
+    for (dss::test_support::RelocatableDocument const& document : dss::test_support::kRelocatableDocuments) {
+        std::string const target = document.target();
         for (Cascade const& cascade : cascades()) {
             SCOPED_TRACE(std::string{cascade.what} + " on " + target);
             dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "thin-import-rounds"};

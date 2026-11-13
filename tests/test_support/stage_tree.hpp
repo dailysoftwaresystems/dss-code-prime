@@ -129,7 +129,9 @@ namespace fs = std::filesystem;
             // inside it, so that an example may ship an intentionally EMPTY
             // directory (an output dir its program writes into) and still find
             // it waiting in the scratch tree.
-            fs::create_directories(to, ec);
+            // The substrate's (P69 H6b, A3): `to` is composed from the caller's directory and a name the tree on
+            // disk holds, so it is made as the directory the staged files are written into, at any length.
+            static_cast<void>(dss::core::createDirectories(to, ec));
             if (ec) {
                 failure = "cannot create the staged directory '"
                         + to.generic_string() + "': " + ec.message();
@@ -156,7 +158,7 @@ namespace fs = std::filesystem;
         }
         if (rel.generic_string() == "expected.json") return dss::core::WalkStep::Continue;
 
-        fs::create_directories(to.parent_path(), ec);
+        static_cast<void>(dss::core::createDirectoriesFor(to, ec));   // the directory `to`'s copy names (A3)
         if (ec) {
             failure = "cannot create the staged directory '"
                     + to.parent_path().generic_string() + "': " + ec.message();

@@ -1,1 +1,1 @@
-    if (plain.empty() || isVerbatimSpelling(plain)) return plain;
+    if (plain.empty()) return plain;

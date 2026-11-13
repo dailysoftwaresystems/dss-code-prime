@@ -416,7 +416,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
 
     // ── MARK INCOMPLETE BEFORE ONE BYTE OF THE TREE IS WRITTEN ──────────────
     if (!markedOurs) {
-        static_cast<void>(core::createDirectories(marker.parent_path(), ec));
+        static_cast<void>(core::createDirectoriesFor(marker, ec));   // the directory the marker's write names
         std::FILE* const claimed =
             ec ? nullptr : linker::detail::createExclusiveBinary(marker);
         if (claimed == nullptr || std::fclose(claimed) != 0) {
@@ -580,7 +580,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // down only when the checkout succeeded.
     bool refreshLeftTreeIncomplete = false;
     if (acq.ok && hasCheckout) {
-        static_cast<void>(core::createDirectories(marker.parent_path(), ec));
+        static_cast<void>(core::createDirectoriesFor(marker, ec));   // the directory the marker's write names
         std::FILE* const claimed =
             ec ? nullptr : linker::detail::createExclusiveBinary(marker);
         if (claimed == nullptr || std::fclose(claimed) != 0) {

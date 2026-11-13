@@ -1,2 +1,2 @@
-            entry.reaches = reachedKind(entry.path, entry.reachError);
+            entry.reaches = reachedKind(listed.spelled[i], entry.reachError);
             entry.reachError.clear();

@@ -82,6 +82,10 @@ Four obligations follow, and each is a gate:
    yet passed: `<arm ids>`"*, a row that would have closed keeps its status, and the report lists every arm with
    its state — written and unswept, and on which leg; or read in the lane's own tree, with the run id and the
    bytes it read. The rows close when the orchestrator's sweep has read the arms `passed` (obligation 3).
+   ★ **A row names its arms and cites no run.** An arm's verdict lives in the tool's record, keyed by what it was
+   judged on, and a row that quoted a run as a standing pass would go stale the moment that key moved. A CLOSED
+   row may say where it closed, as history only — *"closed at `<commit>` on sweep `<run>`"* — never as a per-arm
+   pass that still holds; whether the arm still passes is asked of `dssharness check-mutations --list`.
 
 ★ **Why the verb and not a careful hand.** Every check a reading by hand asked a person to remember is one the tool
 makes itself, on every arm, and refuses to pass without: the before-text stands in its site exactly once; the

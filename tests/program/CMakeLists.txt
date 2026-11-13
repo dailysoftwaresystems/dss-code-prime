@@ -631,6 +631,14 @@ dss_add_test(NAME program/test_image_runpath_build
 dss_add_test(NAME program/test_archive_definition_visibility
              SOURCES test_archive_definition_visibility.cpp)
 
+# P69 H6b (the review of H6's N1): the one home of "a several-unit step reports
+# every unit before it fails" -- `runEveryUnit` (src/program/every_unit.hpp),
+# both cells: every unit failing, and a valid unit before an invalid one -- and
+# the input-language claim's cell (every unclaimed input named). In-process on
+# every leg: nothing is run.
+dss_add_test(NAME program/test_every_unit
+             SOURCES test_every_unit.cpp)
+
 # D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: the four faces end to
 # end at the baseline and at release — a static-library member keeps its hidden
 # definitions, an image keeps the hidden definition an object input or a sibling

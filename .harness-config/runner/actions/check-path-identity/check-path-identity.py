@@ -32,9 +32,11 @@ without a decision" gate rather than a claim that path code is rare. Rule 2
 below is what actually watches the existing 50.
 
 RULE 2 (secondary, and yes it IS an enumeration): a RESOLUTION call outside
-`core/substrate/path_identity.cpp` -- whose header-only OS side,
-`core/substrate/os_path_spelling.hpp`, is granted GetFullPathName and nothing
-else (P69 H6). It is a net under the net -- to bypass both
+`core/substrate/path_identity.cpp`, with NO grant anywhere else (P69 H6b, F4: the
+OS's own spelling -- GetFullPathNameW -- lives inside the chokepoint; the header-only
+second home H6 gave it exported the resolution under names this rule did not list,
+and its premise, "integrated_tests links no DSS library", was false: it compiles
+path_identity.cpp and carries src/ on its include path). It is a net under the net -- to bypass both
 you would have to already be on the allowlist AND use a spelling nobody listed,
 and rule 1 is what makes the allowlist the thing you have to edit.
 
@@ -108,18 +110,14 @@ SRC = REPO / "src"
 # The ONE file allowed to resolve paths. Everything else asks it.
 CHOKEPOINT = "core/substrate/path_identity.cpp"
 
-# ★ ITS OS SIDE, GRANTED THE ONE CALL IT EXISTS FOR AND NOTHING ELSE (P69 H6).
-# `os_path_spelling.hpp` is the one home of the OS's own spelling of a plain
-# Windows path -- GetFullPathNameW, the resolution every Win32 call applies before
-# the NT namespace sees a spelling -- and the chokepoint's long-path spellings are
-# built on it. It cannot live inside the chokepoint: `integrated_tests` links no
-# DSS library and reaches it through `tests/test_support/run_binary.hpp`'s relative
-# include, so it is header-only and dependency-free. The grant is per CALL, not
-# per file: a `weakly_canonical` or a GetFinalPathNameByHandle there would be a
-# second canonicalizer and is refused as anywhere else.
-CHOKEPOINT_OS_SIDE: dict[str, frozenset[str]] = {
-    "core/substrate/os_path_spelling.hpp": frozenset({"GetFullPathName"}),
-}
+# ★ NO OS SIDE OUTSIDE IT (P69 H6b, F4). The OS's own spelling of a plain Windows
+# path -- GetFullPathNameW, the resolution every Win32 call applies before the NT
+# namespace sees a spelling -- is asked INSIDE the chokepoint; every other file
+# takes the chokepoint's exports (extendedLengthSpelling, applicationNameSpelling,
+# containerSpelling, containingDirectory). H6 granted a header-only second home the
+# one call, and the review measured the grant bypassed by name: the header exported
+# the resolution as three functions rule 2 did not list, called from
+# process_spawn.cpp. A grant per call cannot see a wrapper; one home can.
 
 # Resolution spellings for rule 2. Deliberately NOT the primary guarantee --
 # see the module docstring on why an enumeration cannot be one.
@@ -155,8 +153,7 @@ def refused_calls(r: str, code: str) -> list[str]:
     already stripped) makes that the file `r` is not granted."""
     if r == CHOKEPOINT or r in RESOLUTION_EXEMPT:
         return []
-    granted = CHOKEPOINT_OS_SIDE.get(r, frozenset())
-    return [call for call in RESOLUTION_CALLS if call in code and call not in granted]
+    return [call for call in RESOLUTION_CALLS if call in code]
 
 # Files that legitimately touch <filesystem> today. Generated from the tree with
 # --reprint; a NEW entry is a decision, which is the entire point.
@@ -272,9 +269,8 @@ def scan() -> list[str]:
         for call in refused_calls(r, code):
             problems.append(
                 f"{r}: calls `{call}` outside the one canonicalizer "
-                f"({CHOKEPOINT}; its OS side "
-                f"{', '.join(sorted(CHOKEPOINT_OS_SIDE))} holds only "
-                f"the calls granted it).\n"
+                f"({CHOKEPOINT}, which alone asks the OS how a path "
+                f"resolves).\n"
                 f"    A second resolver is a second owner of one fact, "
                 f"and the two disagree silently — which is precisely "
                 f"how 8.3 short names split every path key in the "
@@ -311,16 +307,18 @@ def selftest() -> int:
         failures.append("a RAW string's body was treated as a call (the private copy's reading)")
     if strip_comments_and_strings.__module__ != "_no_abort_in_tests":
         failures.append("the comment/string scanner is not the SHARED one")
-    # The OS side's grant is ONE CALL, never the file: its own call passes, any
-    # other resolution call there is refused, and the same call anywhere else is.
-    os_side = next(iter(sorted(CHOKEPOINT_OS_SIDE)))
+    # The OS's own resolution is the chokepoint's alone (P69 H6b, F4): asked there
+    # it passes; asked in the substrate beside it -- the header H6 granted it, the
+    # spawner that called that header's wrappers -- it is refused like anywhere else.
     full_path_call = "DWORD n = ::GetFullPathNameW(p, 0, nullptr, nullptr);\n"
-    if refused_calls(os_side, strip_comments_and_strings(full_path_call)):
-        failures.append("the OS side was refused the one call it is granted")
-    if refused_calls(os_side, strip_comments_and_strings(bad_call)) != ["weakly_canonical"]:
-        failures.append("the OS side's grant reached past its one call (a weakly_canonical there passed)")
-    if refused_calls("core/elsewhere.cpp", strip_comments_and_strings(full_path_call)) != ["GetFullPathName"]:
-        failures.append("GetFullPathName outside the OS side was not refused")
+    if refused_calls(CHOKEPOINT, strip_comments_and_strings(full_path_call)):
+        failures.append("the chokepoint was refused the OS's own resolution")
+    if refused_calls("core/substrate/os_path_spelling.hpp",
+                     strip_comments_and_strings(full_path_call)) != ["GetFullPathName"]:
+        failures.append("GetFullPathName in a header beside the chokepoint was not refused (a second home)")
+    if refused_calls("core/substrate/process_spawn.cpp",
+                     strip_comments_and_strings(full_path_call)) != ["GetFullPathName"]:
+        failures.append("GetFullPathName in the spawner, outside the chokepoint, was not refused")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}")

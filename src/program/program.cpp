@@ -49,6 +49,7 @@
 #include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
+#include "program/every_unit.hpp"           // runEveryUnit: every unit's step, before a several-unit build fails
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
 #include "core/types/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
@@ -1180,9 +1181,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // normalises to as well. An artifact name carrying that root would then
     // match the basis and be judged CONTAINED while resolving onto the local
     // drive — the escape this block exists to refuse, admitted by the
-    // comparison rather than by the rule. `normalizeKeepingRoot` is identical to
-    // `lexically_normal()` for every path with a run below 2, so the `--output .`
-    // repair described above is untouched.
+    // comparison rather than by the rule. Both sides of the comparison below take
+    // the SAME normalization, `normalizeKeepingRoot` -- the substrate's one rule,
+    // which since P69 H6 trims what Win32 trims, maps a last `NUL` to its device
+    // and, on Windows, is the OS's own full spelling of a drive path -- so what it
+    // does to one side it does to the other; and it drops a `.` component as
+    // `lexically_normal()` does, so the `--output .` repair described above is
+    // untouched.
     auto const containmentBasis =
         core::normalizeKeepingRoot(outDir / "dss-containment-probe")
             .parent_path();
@@ -1790,16 +1795,21 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             if ((*formatR)->isStaticArchive()) {
                 std::vector<AssembledModule> units;
                 units.reserve(cus.size());
-                for (std::size_t i = 0; i < cus.size(); ++i) {
+                // EVERY unit is assembled and reports its own errors before the build fails (`runEveryUnit`, the one
+                // home: P69 H6b, the review of H6's N1), and nothing is packaged when any unit failed. The fail-loud
+                // net stays, and fires only when nothing was reported at all.
+                bool const everyUnitAssembled = runEveryUnit(cus.size(), [&](std::size_t i) {
                     auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
                                                 reporter, perCuOpts);
                     if (!unit) {
                         emitNullNoDiagnostic("the assembly unit build "
                                              "(assembleAsmUnit)");
-                        return std::nullopt;
+                        return false;
                     }
                     units.push_back(std::move(*unit));
-                }
+                    return true;
+                });
+                if (!everyUnitAssembled) return std::nullopt;
                 if (analysisOnly) return std::nullopt;
                 return packageUnitsAsStaticArchive(std::move(units));
             }
@@ -1949,12 +1959,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // Merge each CU's diagnostics into `reporter` in CU (index) ORDER — deterministic,
         // independent of which CU finished first. Merge EVERY CU BEFORE the failure check so a
         // failing build surfaces every CU's errors deterministically (not just the first-to-
-        // fail's — an improvement the parallel model makes free: every CU is always built).
-        bool allBuilt = true;
-        for (std::size_t i = 0; i < cus.size(); ++i) {
+        // fail's — an improvement the parallel model makes free: every CU is always built). The verb is
+        // `runEveryUnit`, the one home every several-unit step takes (P69 H6b).
+        bool const allBuilt = runEveryUnit(cus.size(), [&](std::size_t i) {
             copyDiagnostics(cuScratch[i], reporter);
-            if (!cuMirSlots[i].has_value()) allBuilt = false;
-        }
+            return cuMirSlots[i].has_value();
+        });
         if (!allBuilt) {
             emitNullNoDiagnostic("a per-CU build (buildCuMir)");
             return std::nullopt;  // ≥1 front-half tier failure — all diagnostics reported
@@ -2979,14 +2989,16 @@ struct CuBuildKey {
     // Every input must be claimed by the language the TARGET chose. The
     // comparison is case-insensitive on the extension INCLUDING its dot, the
     // same rule `UnitBuilder::schemasForPath_` applies, so `foo.S` and `foo.s`
-    // route identically on every host filesystem.
-    for (auto const& file : sourceFiles) {
+    // route identically on every host filesystem. EVERY unclaimed input is named before the build fails
+    // (`runEveryUnit`, P69 H6b: the several-unit class's one home) -- never the first alone.
+    bool const everyInputClaimed = runEveryUnit(sourceFiles.size(), [&](std::size_t i) {
+        std::string const& file = sourceFiles[i];
         std::string const ext = asciiLowerCopy(fs::path{file}.extension().string());
         bool claimed = false;
         for (std::string_view declaredExt : schema->fileExtensions()) {
             if (asciiLowerCopy(declaredExt) == ext) { claimed = true; break; }
         }
-        if (claimed) continue;
+        if (claimed) return true;
         std::string known;
         for (std::string_view declaredExt : schema->fileExtensions()) {
             if (!known.empty()) known += ", ";
@@ -3001,8 +3013,9 @@ struct CuBuildKey {
             + " and not '" + (ext.empty() ? std::string{"<none>"} : ext)
             + "'. Pass --language <name> to name the source language "
               "explicitly.");
-        return nullptr;
-    }
+        return false;
+    });
+    if (!everyInputClaimed) return nullptr;
     return schema;
 }
 

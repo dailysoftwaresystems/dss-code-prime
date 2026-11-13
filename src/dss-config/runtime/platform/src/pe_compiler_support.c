@@ -25,11 +25,19 @@
  * that routine refuses to leave in place. */
 uintptr_t __security_cookie = 0x00002B992DDFA232ull;
 
-/* Defined in `pe_compiler_support_x86_64.s`: it changes nothing but %r10 and the flags. */
+/* Defined in `pe_compiler_support_x86_64.s`: it changes nothing but the flags (it compares %rcx with the cookie in
+ * memory, `cmpq __security_cookie(%rip), %rcx`). */
 void __security_check_cookie(uintptr_t cookie);
 
 /* A floating-point object of cl's names this so the linker brings in the floating-point support of the runtime that
- * defines it; DSS's runtime needs none, so it is only the definition, with the value MSVC's runtime gives it. */
+ * defines it; DSS's runtime needs none, so it is only the definition, with the value MSVC's runtime gives it.
+ * WHICH LINK READS IT (✔MEASURED 2026-11-05, P69 H6b): cl writes it as an undefined symbol that NO relocation names
+ * (dumpbin /symbols /relocations of a cl 19.51 /O2 float object, probe-reference-cc run 20261105-195712-b7273d0a), so
+ * DSS's own link, which drops an undefined name nothing reads, never asks for it -- every link case of the compiler-
+ * support runtime stayed green with this definition removed (run 20261105-012107-61651e58), and no DSS case can pin it.
+ * cl's link.exe DOES: the same object linked with no C runtime (/NODEFAULTLIB) is refused, LNK2001 unresolved external
+ * symbol _fltused, and links once this definition stands beside it (the same run). It is a REFERENCE toolchain's
+ * requirement of the runtime that stands in for MSVC's, kept for a cl object's link by that toolchain. */
 int _fltused = 0x9875;
 
 /* gcc's `main` calls `__main` first: mingw-w64's runs the `.ctors` table there (`__do_global_ctors`, once) and

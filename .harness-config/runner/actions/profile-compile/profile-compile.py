@@ -125,11 +125,17 @@ SUPPORT_REL = (".harness-config", "runner", "actions", "profile-compile",
 PATH_PROBES = ("/opt/homebrew/bin", "/usr/local/bin")
 
 # The `--time` report dsscp writes (program.cpp `emitPhaseTimeReport`): its first line `dsscp: compile time ...`, then
-# a table whose header and every row -- each phase, `[other]`, a violation -- begin `dsscp:   `. The report is that
-# BLOCK: the first line and every line after it that begins with the table's prefix. ⚠ The pattern this replaced
+# a table whose header and every row -- each phase, `[other]`, a violation's `!` line, the pre-scan memo, a batch --
+# begin `dsscp:   `, and, on a run whose accounting is broken, the violation BANNER `dsscp: *** ...` before the `!`
+# lines. The report is that BLOCK: the first line and every line after it that begins with either prefix. ⚠ The pattern this replaced
 # matched `^dsscp:   phase`, the HEADER alone, so the report printed a table's head with no row under it (P69 H6).
 _REPORT_FIRST = re.compile(r"^dsscp: compile time ")
 _REPORT_ROW   = "dsscp:   "
+# The writer's OTHER prefix inside the block (program.cpp `emitPhaseTimeReport`): the invariant-violation banner,
+# `dsscp: *** --time INVARIANT VIOLATION ... ***`, one space after the colon -- its `!` lines, the pre-scan memo row
+# and the per-batch rows follow it under `_REPORT_ROW` (P69 H6b, the review of H6's F6: a block ended at the banner
+# showed a broken run's report as a clean table missing its `[other]` row).
+_REPORT_BANNER = "dsscp: *** "
 
 
 def _flush():
@@ -469,7 +475,7 @@ def report_lines(text):
         if _REPORT_FIRST.match(line):
             out.append(line)
             inside = True
-        elif inside and line.startswith(_REPORT_ROW):
+        elif inside and (line.startswith(_REPORT_ROW) or line.startswith(_REPORT_BANNER)):
             out.append(line)
         else:
             inside = False
@@ -506,7 +512,7 @@ def list_artifacts(image_dir, limit):
 # ── THE COMMAND LINE'S OWN SELF-TEST: no kit, no build ───────────────────────────
 SELFTEST_MARKER = "profile-compile self-test: "
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 7
+EXPECTED_ARMS = 9
 # A compile log's `--time` report as dsscp writes it (program.cpp `emitPhaseTimeReport`'s own lines), with a trace line
 # before it and an optimizer trace line after it, which are no part of it.
 _REPORT_SAMPLE = (
@@ -517,7 +523,19 @@ _REPORT_SAMPLE = (
     "dsscp:   optimize                    0.80s       0.81s      1       1\n"
     "dsscp:   [other]                                 0.34s\n"
     "opt: fixpoint release converged after 2 iteration(s)\n")
-_REQUIRED = ["--kit", "kit", "--target", "x86_64:elf64-x86_64-linux-exec", "--label", "leg"]
+# The same report from a run whose accounting is broken (program.cpp's own lines): the banner, its `!` lines, then the
+# pre-scan memo and a batch row -- the rows a block ended at the banner dropped.
+_REPORT_VIOLATION_SAMPLE = (
+    "dsscp: compile time 1.25s  (process wall)\n"
+    "dsscp:   phase                         cpu        wall   peak    runs\n"
+    "dsscp:   parse                       0.10s       0.10s      1       1\n"
+    "dsscp: *** --time INVARIANT VIOLATION — the phase accounting is inconsistent with itself, so the unattributed "
+    "remainder is NOT reported ***\n"
+    "dsscp:   ! 1 phase scope(s) are still LIVE at the report\n"
+    "dsscp:   pre-scan memo             3 built      9 hit   (12 include request(s), 75.0% served)\n"
+    "dsscp:   compile-units        width 4    jobs 2     batch      0.50s  Σjobs      0.90s\n"
+    "opt: fixpoint release converged after 2 iteration(s)\n")
+_REQUIRED =["--kit", "kit", "--target", "x86_64:elf64-x86_64-linux-exec", "--label", "leg"]
 
 
 def self_test():
@@ -572,6 +590,14 @@ def self_test():
     arm("the phase report shows the `compile time` line and nothing of the traces around it (the control)",
         shown[:1] == ["dsscp: compile time 1.25s  (process wall)"] and not any(l.startswith("opt:") for l in shown),
         "reported %r" % (shown,))
+    broken = report_lines(_REPORT_VIOLATION_SAMPLE)
+    arm("a broken run's report shows the violation banner, each `!` line, and the memo and batch rows after them",
+        any(l.startswith(_REPORT_BANNER) and "INVARIANT VIOLATION" in l for l in broken)
+        and any(l.startswith(_REPORT_ROW + "! ") for l in broken)
+        and any("pre-scan memo" in l for l in broken) and any("compile-units" in l for l in broken),
+        "reported %r" % (broken,))
+    arm("a broken run's report still ends at the first line of neither prefix (the control)",
+        len(broken) == 7 and not any(l.startswith("opt:") for l in broken), "reported %r" % (broken,))
     failed = ran.count(False)
     if len(ran) != EXPECTED_ARMS:
         print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))

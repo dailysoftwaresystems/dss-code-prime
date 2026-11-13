@@ -17,7 +17,6 @@
 
 #include "core/substrate/path_identity.hpp"
 
-#include "core/substrate/os_path_spelling.hpp"
 #include "scratch_dir.hpp"
 #include "unc_spelling.hpp"
 
@@ -509,6 +508,12 @@ TEST(PathIdentitySubstrate, EveryWin32RootIsParsedOnceAndNormalizedAsWin32Does) 
         {L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\x", RK::Verbatim, 38, 38, false,
          L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\x"},
         {L"\\\\?\\globalroot\\Device\\V\\x", RK::Verbatim, 24, 24, false, L"\\\\?\\globalroot\\Device\\V\\x"},
+        // `\??\`, backslashes exactly, is the NT namespace's own spelling of `\\?\` (P69 H6b, N4): CreateFileW opens the
+        // rest literally and refuses a `..` under it, as under `\\?\` (runs 20261105-062441-7bd17744, 20261105-062514-
+        // 83af17c8), so it is verbatim, its volume read as `\\?\`'s
+        {L"\\??\\C:\\a\\..\\x", RK::Verbatim, 7, 7, false, L"\\??\\C:\\a\\..\\x"},
+        {L"\\??\\UNC\\h\\s\\x", RK::Verbatim, 12, 12, true, L"\\??\\UNC\\h\\s\\x"},
+        {L"\\??\\GLOBALROOT\\Device\\V\\x", RK::Verbatim, 24, 24, false, L"\\??\\GLOBALROOT\\Device\\V\\x"},
         // what the normalized namespace trims (run 20261104-210843-61c9329b), and what it keeps
         {L"C:\\d.\\x.txt", RK::Drive, 3, 3, false, L"C:\\d\\x.txt"},
         {L"C:\\d..\\x.txt", RK::Drive, 3, 3, false, L"C:\\d..\\x.txt"},
@@ -642,9 +647,9 @@ TEST(PathIdentitySubstrate, TheLexicalKeyOfANameWin32TrimsIsTheTrimmedNamesKey) 
 
 // ★ THE SPELLING A FILE CALL TAKES, AT ANY LENGTH (P69 H6, [[D-LINK-A-DEEP-OUTPUT-DIRECTORY-FAILS-THE-WINDOWS-IMAGE-WRITE]]):
 // every Win32 spelling to the one extended-length spelling that opens what it means -- the OS's full spelling of it
-// (GetFullPathNameW, os_path_spelling.hpp), then `\\?\` / `\\?\UNC\`, a device's `\\.\` replaced. Kept as written: a
+// (GetFullPathNameW, asked in path_identity.cpp), then `\\?\` / `\\?\UNC\`, a device's `\\.\` replaced. Kept as written: a
 // verbatim spelling and an empty one. POSIX: every spelling as given. A reserved name other than `NUL` is no row: which
-// of them the OS maps is the release's (os_path_spelling.hpp), and the rule follows the OS either way.
+// of them the OS maps is the release's (path_identity.cpp asks the OS), and the rule follows the OS either way.
 TEST(PathIdentitySubstrate, EverySpellingTakesTheExtendedLengthSpellingThatOpensWhatItMeans) {
     using dss::core::extendedLengthSpelling;
 #ifdef _WIN32
@@ -697,7 +702,7 @@ TEST(PathIdentitySubstrate, EverySpellingTakesTheExtendedLengthSpellingThatOpens
 }
 
 // ★ THE ONE NORMALIZATION IS THE OS'S ANSWER (P69 H6): over F3's universe the Win32 grammar's text normalization
-// EQUALS GetFullPathNameW -- the OS asked live, through the rule's one home (os_path_spelling.hpp) -- on every
+// EQUALS GetFullPathNameW -- the OS asked live, directly (its one home in the tree is path_identity.cpp) -- on every
 // Windows leg, so the model a host without Win32 answers by and the OS a Windows host asks cannot drift apart. The
 // cells are every absolute cell the OS was measured on (runs 20261104-222037-6ef9b98e and 20261104-223135-5f04ee9f:
 // each root kind, its climbs, the trim, where a separator ends the answer, the device name `NUL`), a relative spelling
@@ -742,8 +747,11 @@ TEST(PathIdentitySubstrate, TheWin32NormalizationEqualsTheOsFullSpellingOfEveryC
     }
     for (std::wstring const& cell : asked) {
         SCOPED_TRACE(ascii(cell));
-        std::wstring const os = dss::substrate::osFullPathSpelling(cell);
-        ASSERT_FALSE(os.empty()) << "the OS resolved no full spelling of the cell";
+        // The OS asked here directly, never through the substrate: the pin holds the model EQUAL to the OS.
+        std::wstring os(4096, L'\0');
+        DWORD const  n = ::GetFullPathNameW(cell.c_str(), static_cast<DWORD>(os.size()), os.data(), nullptr);
+        ASSERT_TRUE(n != 0 && n < os.size()) << "the OS resolved no full spelling of the cell";
+        os.resize(n);
         std::wstring const ours = dss::core::normalizedSpelling(cell, dss::core::PathGrammar::Win32);
         EXPECT_EQ(ours, os) << "normalized as " << ascii(ours) << ", the OS's " << ascii(os);
     }

@@ -1,2 +1,2 @@
-        listEntries(dir, depth, listed.entries, ec);
+        listEntries(dir, spelledDir, depth, listed.entries, listed.spelled, ec);
         if (ec) {

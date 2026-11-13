@@ -1,1 +1,1 @@
-    return full.size() >= std::size_t{MAX_PATH} ? osExtendedSpelling(plain) : plain;
+    return full.size() >= std::size_t{MAX_PATH} ? extendedLengthSpelling(p) : p;

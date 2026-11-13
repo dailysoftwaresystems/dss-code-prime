@@ -59,6 +59,7 @@
 #include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (UCRT-P4: the argv spine)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
+#include "program/every_unit.hpp"   // runEveryUnit: every unit's step, before a several-unit build fails
 // D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT:
 // `resolveArchiveSiblingFormat` -- the declared-property lookup that answers
 // "which object format wrote this archive's members", reused rather than respelt.
@@ -4777,15 +4778,21 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                                    reporter);
     ImageRequest memberRequest = request;
     memberRequest.runpaths.clear();
-    for (std::size_t i = 0; i < modules.size(); ++i) {
-        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `request` rides each member link
-        // so the capability gate fires on the archive path too. No archive
-        // format declares a stack-reserve capability (an `ar` member carries no
-        // image headers), so a request here is REFUSED on the first member —
-        // never silently swallowed by a build that reports success.
+    // ★ THE REQUEST IS THE ARCHIVE'S, ASKED ONCE (P69 H6b; the orchestrator's ledger 550). Its capability gate
+    // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: no archive format declares a stack-reserve capability, an `ar` member
+    // carries no image headers) is asked HERE, of the whole archive, by the gate every link asks -- so a refusal is
+    // said ONCE, never once per member now that every member is linked whatever an earlier one answered, and never
+    // silently swallowed by a build that reports success. A request the gate passes still rides every member link,
+    // where the same gate passes it again.
+    if (!enforceImageRequest(memberRequest, format, "linkAndWriteStaticArchive", reporter)) return false;
+    // EVERY member is linked and reports its own errors before the archive fails (`runEveryUnit`, the several-unit
+    // class's one home): a member that fails never stops the members after it, and each member's cleanliness is
+    // counted from its own start, not from the archive's.
+    bool const everyMemberLinked = runEveryUnit(modules.size(), [&](std::size_t i) {
+        auto const memberEntry = reporter.errorCount();
         auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
                                   target, format, reporter, memberRequest);
-        if (!image.ok() || !tierClean(reporter, entry)) {
+        if (!image.ok() || !tierClean(reporter, memberEntry)) {
             return false;
         }
         std::vector<std::string> exported;
@@ -4802,7 +4809,9 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
         }
         members.push_back(link::format::ArMemberInput{
             memberNames[i], std::move(image.bytes), std::move(exported)});
-    }
+        return true;
+    });
+    if (!everyMemberLinked) return false;
 
     // c169/c171 (D-FF1-AR-COFF-WRITER + D-FF1-AR-STATICLIB-DRIVER-WIRING):
     // the archive FLAVOR is the format ecosystem's `ar` variant — Microsoft

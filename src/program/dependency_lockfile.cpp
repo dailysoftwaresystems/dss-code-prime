@@ -230,7 +230,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
     fs::path const dir = lockPath.parent_path();
     if (!dir.empty()) {
         std::error_code ec;
-        static_cast<void>(core::createDirectories(dir, ec));   // at any length
+        static_cast<void>(core::createDirectoriesFor(lockPath, ec));   // at any length: the directory its write names
         // `createDirectories` reports "already exists" as NO error, so a true
         // `ec` here means the directory genuinely could not be established.
         if (ec) {

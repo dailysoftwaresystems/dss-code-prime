@@ -1,0 +1,1 @@
+        return plain[1] == L'?' ? L"\\\\?\\" + plain.substr(4) : plain;   // `\??\` -> its `\\?\` twin

@@ -1013,11 +1013,14 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
                    "supply a fully-qualified output file path.");
         return false;
     }
-    // Precondition: parent directory exists.
+    // Precondition: parent directory exists -- the directory the image's own write names, asked as the level of the
+    // image's reference spelling (`core::containingDirectory`, P69 H6b, the review of H6's F2), never `parent_path()`
+    // re-resolved: that is another directory for a last name ending in a space or a device name, and at
+    // `\\?\D:\a.exe` the volume's DEVICE. `parent` stays the caller's spelling, for the message.
     auto const parent = path.parent_path();
-    if (!parent.empty()) {
+    if (std::filesystem::path const level = core::containingDirectory(path); !parent.empty() && !level.empty()) {
         std::error_code ec;
-        bool const exists = core::reachedKind(parent, ec) != core::EntryKind::Absent;
+        bool const exists = core::reachedKind(level, ec) != core::EntryKind::Absent;
         if (ec) {
             emit(reporter, DiagnosticCode::K_ImageWriteParentMissing,
                  std::string{"link::writeBytes: failed to stat "

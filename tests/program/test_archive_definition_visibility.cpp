@@ -41,6 +41,7 @@
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
 #include "program/compile_pipeline.hpp"   // extractStaticArchiveMembers, readObjectInputModules: the readers a link uses
+#include "relocatable_documents.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -389,16 +390,11 @@ constexpr ArchiveDocument kArchiveDocuments[] = {
 };
 
 // Every shipped RELOCATABLE-object document (neither an image nor an archive), with its target: the universe of the
-// two relocatable cases below. Censused, like `kArchiveDocuments`, by
+// two relocatable cases below, and of every other pin over the object formats -- ONE table in tests/test_support
+// (P69 H6b, N2), censused, like `kArchiveDocuments`, by
 // `ArchivePackaging.TheTablesHoldEveryShippedArchiveAndRelocatableDocument`.
-struct RelocatableDocument {
-    char const* arch;     // the target
-    char const* format;   // the relocatable document
-};
-constexpr RelocatableDocument kRelocatableDocuments[] = {
-    {"x86_64", "elf64-x86_64-linux"},  {"x86_64", "pe64-x86_64-windows"}, {"x86_64", "macho64-x86_64-darwin"},
-    {"arm64", "elf64-aarch64-linux"}, {"arm64", "macho64-arm64-darwin"},
-};
+using dss::test_support::kRelocatableDocuments;
+using dss::test_support::RelocatableDocument;
 
 // The unit, in C or in the document's assembly dialect: two external functions, `unit_api` and `unit_helper`.
 [[nodiscard]] std::pair<std::string, std::string> unitOf(ArchiveDocument const& d, bool assembly) {
@@ -652,6 +648,98 @@ TEST(ArchivePackaging, SeveralUnitsArePackagedAsOneMemberEachInEitherLanguage) {
                 EXPECT_TRUE(defined.front().ends_with(stem + "_api")) << defined.front();
             }
         }
+    }
+}
+
+// EVERY UNIT'S ERRORS, AND NO ARCHIVE (P69 H6b, the review of H6's N1): a several-unit assembly build into an archive
+// assembles EVERY unit and reports what each one says before it fails -- a failed unit never stops the units after it
+// -- and a build any unit failed packages nothing. Two cells per archive document: both units invalid, each refused by
+// its own unknown mnemonic; and one valid unit before one invalid, the invalid one refused and no archive written for
+// the valid one alone.
+TEST(ArchivePackaging, EveryUnitsErrorsAreReportedAndABuildAnyUnitFailedWritesNoArchive) {
+    for (ArchiveDocument const& d : kArchiveDocuments) {
+        for (bool const mixed : {false, true}) {
+            SCOPED_TRACE(std::string{d.format} + (mixed ? " / one valid unit, then one invalid" : " / two invalid units"));
+            ScratchDir scratch{Location::InsideRepo, "archive-units-invalid"};
+            std::vector<std::string> sources;
+            std::vector<std::string> refused;   // each invalid unit's own mnemonic
+            for (char const* stem : {"first", "second"}) {
+                std::string const fn = std::string{stem} + "_api";
+                std::string text = std::string{"\t.text\n\t.globl\t"} + fn + "\n\t.type\t" + fn + ", " + d.marker + "\n"
+                                 + fn + ":\n";
+                if (mixed && std::string_view{stem} == "first") {
+                    text += d.asmBody;
+                } else {
+                    std::string const mnemonic = std::string{"nosuchmnemonic_"} + stem;
+                    text += "\t" + mnemonic + "\n";
+                    refused.push_back(mnemonic);
+                }
+                fs::path const file = scratch.path() / (std::string{stem} + ".s");
+                writeText(file, text);
+                sources.push_back(file.string());
+            }
+            Program p;
+            p.setOutputDir(scratch.path());
+            DiagnosticReporter rep;
+            int const rc = p.compileUnits(sources, d.assembly, {std::string{d.arch} + ":" + d.format}, rep);
+            std::string said;
+            for (auto const& diag : rep.all()) said += "\n  " + diag.actual;
+            EXPECT_NE(rc, 0) << "a build with an invalid unit succeeded" << said;
+            for (std::string const& mnemonic : refused) {
+                bool named = false;
+                for (auto const& diag : rep.all()) {
+                    if (diag.code == DiagnosticCode::A_AsmTextUnsupported
+                        && diag.actual.find("'" + mnemonic + "'") != std::string::npos)
+                        named = true;
+                }
+                EXPECT_TRUE(named) << "the unit that writes `" << mnemonic << "` was not refused by its own diagnostic; "
+                                      "the build said:" << said;
+            }
+            for (auto const& artifact : p.artifactPaths()) {
+                EXPECT_FALSE(artifact.has_value()) << "the failed build names an artifact: " << artifact->string();
+            }
+            std::error_code walkEc;
+            for (auto it = fs::recursive_directory_iterator{scratch.path(), walkEc};
+                 !walkEc && it != fs::recursive_directory_iterator{}; it.increment(walkEc)) {
+                if (!it->is_regular_file()) continue;
+                auto const bytes = readFileBytes(it->path());
+                EXPECT_FALSE(bytes.size() >= 8 && std::string(bytes.begin(), bytes.begin() + 8) == "!<arch>\n")
+                    << "the failed build wrote an archive: " << it->path().string();
+            }
+            EXPECT_FALSE(walkEc) << "the scratch could not be listed: " << walkEc.message();
+        }
+    }
+}
+
+// THE ARCHIVE'S REQUEST IS ASKED ONCE (P69 H6b; the orchestrator's ledger 550): every member of an archive is linked
+// whatever an earlier one answered, so the request's capability gate is asked of the WHOLE archive -- a stack reserve
+// no archive format can carry is refused once for a two-unit archive, never once per member. The reporter drops no
+// repeat, so a second refusal would be counted.
+TEST(ArchivePackaging, AnArchivesRequestIsRefusedOnceForTheWholeArchive) {
+    for (ArchiveDocument const& d : kArchiveDocuments) {
+        SCOPED_TRACE(d.format);
+        ScratchDir scratch{Location::InsideRepo, "archive-request-once"};
+        std::vector<std::string> sources;
+        for (char const* stem : {"first", "second"}) {
+            fs::path const file = scratch.path() / (std::string{stem} + ".c");
+            writeText(file, "int " + std::string{stem} + "_api(void) { return 1; }\n");
+            sources.push_back(file.string());
+        }
+        Program p;
+        p.setOutputDir(scratch.path());
+        p.setStackReserveBytes(std::uint64_t{1} << 20);
+        DiagnosticReporter::Config everyRepeat;
+        everyRepeat.dedupWindow = 0;
+        DiagnosticReporter rep{everyRepeat};
+        EXPECT_NE(p.compileUnits(sources, "c", {std::string{d.arch} + ":" + d.format}, rep), 0)
+            << "a stack reserve was taken by an archive";
+        std::size_t refusals = 0;
+        std::string said;
+        for (auto const& diag : rep.all()) {
+            said += "\n  " + diag.actual;
+            if (diag.code == DiagnosticCode::K_FormatLacksStackReserveControl) ++refusals;
+        }
+        EXPECT_EQ(refusals, 1u) << "the archive's stack reserve was refused " << refusals << " time(s); said:" << said;
     }
 }
 

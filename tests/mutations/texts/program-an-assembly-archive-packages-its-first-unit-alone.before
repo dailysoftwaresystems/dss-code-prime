@@ -1,2 +1,1 @@
-                for (std::size_t i = 0; i < cus.size(); ++i) {
-                    auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
+                bool const everyUnitAssembled = runEveryUnit(cus.size(), [&](std::size_t i) {

@@ -1,2 +1,2 @@
-            if (listError != ERROR_SUCCESS) note(top.path, winError(listError));
+            if (listError != ERROR_SUCCESS) note(top.path, winError(listError), fs::path{top.spelled});
             if (work.size() == 1) moveLastEntryLast(top.names);   // the target's own listing

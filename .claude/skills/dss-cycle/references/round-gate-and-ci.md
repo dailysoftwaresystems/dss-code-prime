@@ -52,6 +52,11 @@ RED — that is the sweep's half, and a round owes both:
   declined leg of the eight has.
 - **A row that rests on a pin closes only on arms that passed on the bytes it closes on.** A fold is handed
   back with its arms written and unswept: it names them, and closes nothing that rests on one until they passed.
+- ★ **After the sweeps, `dssharness check-anchor-arms` reads 0 findings.** It asks what the rows SAY about arms
+  of the mutation record: every arm a done row names is unmoved with a recorded `passed` on its leg, no row states
+  a run's pass as standing (only as history, *"closed at `<commit>` on sweep `<run>`"*), and no row names an arm the
+  registry retired or renamed. A finding is fixed in the row (`set-anchor`, or the lane's cell file where a lane
+  holds the row) or by sweeping the pending arm, never waved through; a leg the sweep could not reach is STATED.
 
 The declaration of an arm, the verdicts, the command lines, what a sweep costs and which trees a leg can be
 swept from are in `mutation-arms.md`.

@@ -38,7 +38,11 @@ namespace {
     X(ThePhaseReportShowsTheTablesHeaderAndEveryRowUnderIt,                                                            \
       "the phase report shows the table's header AND every row under it")                                              \
     X(ThePhaseReportShowsTheCompileTimeLineAndNothingOfTheTracesAroundItTheControl,                                    \
-      "the phase report shows the `compile time` line and nothing of the traces around it (the control)")
+      "the phase report shows the `compile time` line and nothing of the traces around it (the control)")              \
+    X(ABrokenRunsReportShowsTheViolationBannerEachLineAndTheMemoAndBatchRowsAfterThem,                                 \
+      "a broken run's report shows the violation banner, each `!` line, and the memo and batch rows after them")       \
+    X(ABrokenRunsReportStillEndsAtTheFirstLineOfNeitherPrefixTheControl,                                               \
+      "a broken run's report still ends at the first line of neither prefix (the control)")
 
 #define DSS_PROFILE_COMPILE_SELFTEST_ARM_NAME(caseName, armName) armName,
 constexpr std::string_view kArmNames[] = {DSS_PROFILE_COMPILE_SELFTEST_ARMS(DSS_PROFILE_COMPILE_SELFTEST_ARM_NAME)};

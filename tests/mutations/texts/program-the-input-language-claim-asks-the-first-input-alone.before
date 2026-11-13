@@ -1,0 +1,1 @@
+    bool const everyInputClaimed = runEveryUnit(sourceFiles.size(), [&](std::size_t i) {
