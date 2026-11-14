@@ -892,6 +892,31 @@ round's close; each checkpoint's commit message says what was and was not run on
   label (ledger 584); the sqlite self-test's cross-volume relative path (ledger 582); plan 30's PR #59 set keeps a row
   until it closes (ledger 589). Balance: 688 open against 620 at `71648598` (+1, the disclosed row). Fold order now:
   3e → L2b2 → f26d → 3f → 3g → 3h → L2b4 → L2b3 → H6c → H6d → H7 (L2b4, L2b3 and H6c wherever ready, before H7).
+  Its post-fold readings (ledgers 598–601), ✔MEASURED, every leg read by name, 2939 tests each: macos-arm64-debug 3
+  red, linux-x86_64-debug, linux-arm64-debug, windows-x86_64-debug and windows-x86_64-release 1 red each (known defect
+  (13) below). The repo-guard label passed 25, the configure wrote 24 declarations, and the three entries the name
+  scan had skipped RAN and passed on both Windows legs. The sweep of its 250 Mac arms: 233 passed; the 17 others are
+  cs's, in f26d.
+- **Checkpoint 44 (2026-11-14) = the object-format lane's fold 3e**, the review of 3d's answer:
+  - ONE entry election over every input kind and grammar (`resolveProgramEntry` over `entryLinkNames`). The asm
+    lowering's own election and the trampoline's single-function fallback are deleted; an archive member is pulled for
+    an entry; `main` beside `wmain` is ranked by the document's `entryPrecedence`.
+  - One address class per writer, its widths from the data model (X9).
+  - Every unit before a several-unit step fails, closed as a class across H6b and 3e
+    (`dss::substrate::runEveryUnit`, moved to src/core).
+  - A foreign object's libc reference binds the platform's export, in part; it closes at 3f.
+  - An input section read as its row by the format's data, the Mach-O section-relative relocation and its
+    ARM64_RELOC_ADDEND record.
+  - A refusal of one input names the input.
+  - 77 new arms, 61 changed, all unswept; 20 rows carried, none new, the REAL net 0. Six rows have their fixes folded
+    and close only on their arms.
+  - ✔MEASURED by the lane on the refreshed bytes: windows-x86_64-release (MSVC 19.52) 200/200 and linux-arm64-debug 199.
+    Linux x86_64, macos-arm64 and mingw last read the bytes before the refresh, so the post-fold suite reads them.
+  - Main's own: the emitted-anchor-id inventory lowered where 3e burned sites down (semantic_analyzer.cpp 11 → 10,
+    macho_object_reader.cpp 5 → 4), read red by the pre-fold repo-guard on the lane's tree; the doc census repaired by
+    its writer.
+  - Balance: 689 open against 620 at `71648598`. The one created since checkpoint 43 is the reopened row of known
+    defect (13).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -941,6 +966,17 @@ round's close; each checkpoint's commit message says what was and was not run on
   first element (`static const int z[2] = {0, 7}; if (!z) ...` folds true, so reachable code is marked unreachable).
   The library lane's next fold, first items: a folded constant states its C type, and braces are stepped through
   only for a scalar's initializer.
+  (13) IN MAIN SINCE CHECKPOINT 43, ✔MEASURED by its five-leg suite and its macos-arm64-debug sweep; both in the C
+  front end and convention lane's next fold (f26d), first items:
+  - A REGRESSION on apple_arm64. The last FIXED by-value argument of a variadic callee is stacked by the caller and
+    read from registers by the callee, because `processOneCallArg`'s "through `...`" test counted the callee as an
+    argument. The corpus example `varargs_struct_straddle_fixed` is red in both runners on macos-arm64-debug.
+  - `analysis/semantic/test_redeclaration_compat` is red on every leg. A redeclaration pair against a declaration
+    without a prototype is no longer judged, and a call's arity is no longer checked against the prototype in force.
+    The references, measured: cl builds and runs the pairs, and every reference refuses the arity.
+  - 17 of the checkpoint's 250 arms do not read `passed` on macos-arm64-debug.
+  - The row D-C-A-BLOCK-SCOPE-FUNCTION-DECLARATION-HIDES-NOTHING-IN-ITS-BLOCK is REOPENED: one of its nine arms is
+    violated.
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the

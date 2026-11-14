@@ -500,32 +500,44 @@ TEST(MachoObjectReader, UnknownRelocNativeIdFailsLoud) {
     EXPECT_TRUE(saw);
 }
 
+// P69 fold 3e (D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC): an r_extern=0 SECTION-INDEX relocation is no longer refused
+// as a shape -- it binds to the atom that owns the byte its field names (Apple clang's x86_64 literals:
+// tests/link/test_input_section_names.cpp). Two forms of it stay refused by name, each pinned here on DSS's own
+// BRANCH26 object with its r_extern bit cleared: one whose field holds INSTRUCTION BITS (a BL's imm26 names no offset
+// in a section), and one naming a section the object does not have.
 TEST(MachoObjectReader, RExternZeroSectionRelocFailsLoud) {
     auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
-    auto obj = validArm64Object(loaded);
-    // Clear the __text reloc entry's r_extern bit (bit 27 -> 0x08 in the high
-    // r_info byte). DSS output is always symbol-relative (r_extern=1); an
-    // r_extern=0 SECTION-INDEX reloc is the foreign-clang shape the reader
-    // rejects (D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC).
-    std::uint32_t const reloff = rd32(obj, kTextReloffField);
+    auto const valid = validArm64Object(loaded);
+    std::uint32_t const reloff = rd32(valid, kTextReloffField);
     ASSERT_GT(reloff, 0u);
-    ASSERT_LT(static_cast<std::size_t>(reloff) + 8u, obj.size());
-    obj[reloff + 7] &= static_cast<std::uint8_t>(~0x08u);   // clear r_extern
-    DiagnosticReporter rep;
-    EXPECT_FALSE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value());
-    bool sawCode = false;
-    bool sawAnchor = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_UnsupportedBinaryFormat) sawCode = true;
-        if (d.actual.find("D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC")
-            != std::string::npos) {
-            sawAnchor = true;
+    ASSERT_LT(static_cast<std::size_t>(reloff) + 8u, valid.size());
+    struct Cell {
+        char const*    label;
+        bool           noSuchSection;   // r_symbolnum -> 9 (the object has one section)
+        DiagnosticCode code;
+        char const*    says;
+    };
+    Cell const cells[] = {
+        {"through a field of instruction bits", false, DiagnosticCode::F_UnsupportedBinaryFormat, "instruction bits"},
+        {"naming no section of the object", true, DiagnosticCode::F_CorruptedBinary, "names section #9"},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.label);
+        auto obj = valid;
+        obj[reloff + 7] &= static_cast<std::uint8_t>(~0x08u);   // clear r_extern (bit 27 of r_info)
+        if (c.noSuchSection) {
+            obj[reloff + 4] = 9u;   // r_symbolnum, bits 0..23, little-endian
+            obj[reloff + 5] = 0u;
+            obj[reloff + 6] = 0u;
         }
+        DiagnosticReporter rep;
+        EXPECT_FALSE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value())
+            << "the object is read";
+        auto const said = rep.all();
+        EXPECT_TRUE(std::any_of(said.begin(), said.end(), [&](auto const& d) {
+            return d.code == c.code && d.actual.find(c.says) != std::string::npos;
+        })) << "no " << diagnosticCodeName(c.code) << " saying '" << c.says << "'";
     }
-    EXPECT_TRUE(sawCode) << "an r_extern=0 reloc must emit F_UnsupportedBinaryFormat";
-    EXPECT_TRUE(sawAnchor)
-        << "the diagnostic must name the D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC "
-           "follow-up anchor";
 }
 
 // -- 4. Non-Mach-O format schema -------------------------------------
@@ -2692,4 +2704,120 @@ TEST(MachOObjectReader, ASectionAlignmentNoAlignmentHoldsIsRefusedByName) {
                  && d.actual.find("'__DATA,__data' declares alignment 2^32,") != std::string::npos);
     }
     EXPECT_TRUE(named) << "refused by name at the section header: " << whatItSaid(rep);
+}
+
+// ── An addend an instruction field cannot hold: the ADDEND record (P69 fold 3e) ──────────────────────────────────
+//
+// arm64's PAGE21 / PAGEOFF12 fields hold instruction bits, so `sym + n` travels as an ARM64_RELOC_ADDEND entry (its
+// r_symbolnum the signed 24-bit addend) just before the entry at the same address (`macho.addendRelocation`).
+// ✔MEASURED 2026-11-13: Apple clang 21.0.0's object of a `strtol("0b1" + 2, ...)` reaches the merged literal as
+// `l_.str.1 + 2` through two such pairs (tests/link/data/foreign_libc_names_strto_arm64_macho_clang_c17_O2.o), which
+// DSS's reader refused ("relocation nativeId 2751463424 ... is not declared"). Both directions: the reference's object
+// read, and DSS's own object of `g + 8` and `g - 4` written with the records and read back with the addends.
+// RED-ON-DISABLE: drop the record's addend in the reader -> every addend reads 0; write no record -> DSS's object reads
+// back with addend 0; let a field carry the addend -> the writer refuses it.
+TEST(MachoObjectReader, AnInstructionAddendTravelsInTheAddendRecordBothWays) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_TRUE(loaded.format->macho().addendRelocation.has_value()) << "the document declares no addend record";
+    std::uint32_t const recordId = loaded.format->macho().addendRelocation->nativeId;
+
+    // The reference's object: exactly two relocations carry the record's addend 2, a PAGE21 and a PAGEOFF12 (the ADD
+    // that forms the pointer), both to one target.
+    {
+        auto const bytes = unwindFixture("foreign_libc_names_strto_arm64_macho_clang_c17_O2.o");
+        ASSERT_FALSE(bytes.empty());
+        DiagnosticReporter rep;
+        auto const mod = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(mod.has_value()) << "Apple clang's object is refused: " << whatItSaid(rep);
+        std::vector<Relocation> carried;
+        for (auto const& f : mod->functions) {
+            for (auto const& r : f.relocations) {
+                if (r.addend == 2) carried.push_back(r);
+            }
+        }
+        ASSERT_EQ(carried.size(), 2u) << "the two references to `l_.str.1 + 2`";
+        EXPECT_EQ(carried[0].target, carried[1].target);
+        std::vector<std::uint32_t> kinds{carried[0].kind.v, carried[1].kind.v};
+        std::sort(kinds.begin(), kinds.end());
+        EXPECT_EQ(kinds, (std::vector<std::uint32_t>{2u, 3u})) << "PAGE21 and PAGEOFF12 (an ADD)";
+    }
+
+    // DSS's own object: `adrp x0, g@PAGE+8; add x0, x0, g@PAGEOFF+8; adrp x1, g@PAGE-4; add x1, x1, g@PAGEOFF-4; ret`.
+    auto const objectOf = [&](std::int64_t first, std::int64_t second, DiagnosticReporter& rep) {
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x91, 0x01, 0x00, 0x00, 0x90,
+                     0x21, 0x00, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6};
+        fn.relocations = {Relocation{0u, SymbolId{2}, RelocationKind{2}, first},
+                          Relocation{4u, SymbolId{2}, RelocationKind{3}, first},
+                          Relocation{8u, SymbolId{2}, RelocationKind{2}, second},
+                          Relocation{12u, SymbolId{2}, RelocationKind{3}, second}};
+        mod.functions.push_back(std::move(fn));
+        mod.symbols = {ModuleSymbol{SymbolId{1}, "f", SymbolBinding::Global, SymbolVisibility::Default}};
+        mod.externImports = {ExternImport{SymbolId{2}, "g", "/usr/lib/libSystem.B.dylib", false}};
+        return macho::encode(mod, *loaded.target, *loaded.format, rep);
+    };
+    DiagnosticReporter wrep;
+    auto const obj = objectOf(8, -4, wrep);
+    ASSERT_FALSE(obj.empty()) << "DSS's writer refuses the object: " << whatItSaid(wrep);
+    std::uint32_t const reloff = rd32(obj, kTextReloffField);
+    std::uint32_t const nreloc = rd32(obj, kTextReloffField + 4);
+    EXPECT_EQ(nreloc, 8u) << "four relocations, each after its addend record";
+    std::vector<std::int64_t> records;
+    for (std::uint32_t e = 0; e < nreloc && reloff + 8u * e + 8u <= obj.size(); ++e) {
+        std::uint32_t const info = rd32(obj, reloff + 8u * e + 4u);
+        if ((info & 0xFF000000u) != recordId) continue;
+        std::int64_t v = static_cast<std::int64_t>(info & 0x00FFFFFFu);
+        if ((v & 0x800000) != 0) v -= 0x1000000;
+        records.push_back(v);
+    }
+    EXPECT_EQ(records, (std::vector<std::int64_t>{8, 8, -4, -4})) << "one record before each relocation";
+    DiagnosticReporter rrep;
+    auto const back = macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value()) << whatItSaid(rrep);
+    ASSERT_EQ(back->functions.size(), 1u);
+    std::vector<std::pair<std::uint32_t, std::int64_t>> read;
+    for (auto const& r : back->functions[0].relocations) read.emplace_back(r.offset, r.addend);
+    std::sort(read.begin(), read.end());
+    EXPECT_EQ(read, (std::vector<std::pair<std::uint32_t, std::int64_t>>{{0u, 8}, {4u, 8}, {8u, -4}, {12u, -4}}));
+
+    // An addend r_symbolnum's 24 bits cannot hold is refused by the writer, by name.
+    DiagnosticReporter frep;
+    EXPECT_TRUE(objectOf(std::int64_t{1} << 23, 0, frep).empty()) << "an addend of 2^23 is written";
+    EXPECT_NE(whatItSaid(frep).find("does not fit the 24-bit addend record"), std::string::npos) << whatItSaid(frep);
+}
+
+// The loader holds the record to the wire and to its readers: refused at its own path when an image document states
+// it, when its id sets r_extern or is a relocation row's, and when its addend is wider than r_symbolnum.
+// RED-ON-DISABLE: take any addend width -> the 25-bit cell loads.
+TEST(MachoObjectReader, TheLoaderHoldsTheAddendRecordToItsRules) {
+    struct Cell {
+        char const* label;
+        char const* stem;
+        char const* path;
+        void (*mutate)(nlohmann::json&);
+    };
+    Cell const cells[] = {
+        {"an image document states it", "macho64-arm64-darwin-exec", "/macho/addendRelocation",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"] = {{"nativeId", 2751463424u}, {"addendBits", 24}}; }},
+        {"its id sets r_extern", "macho64-arm64-darwin", "/macho/addendRelocation/nativeId",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["nativeId"] = 2751463424u | (1u << 27); }},
+        {"its id is PAGE21's", "macho64-arm64-darwin", "/macho/addendRelocation/nativeId",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["nativeId"] = 889192448u; }},
+        {"its addend is 25 bits", "macho64-arm64-darwin", "/macho/addendRelocation/addendBits",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["addendBits"] = 25; }},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.label);
+        auto const text = shippedFormatText(c.stem);
+        ASSERT_FALSE(text.empty());
+        ASSERT_TRUE(ObjectFormatSchema::loadFromText(text, c.stem).has_value()) << "the control loads";
+        nlohmann::json doc = nlohmann::json::parse(text);
+        c.mutate(doc);
+        auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), c.stem);
+        EXPECT_GE(countAtPath(loaded, c.path), 1u) << rejectSummary(loaded);
+    }
 }

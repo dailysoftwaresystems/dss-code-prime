@@ -1,5 +1,6 @@
 #include "link/format/ar.hpp"
 
+#include "core/substrate/every_unit.hpp"   // runEveryUnit -- every member before the write fails
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 
@@ -116,26 +117,28 @@ writeArArchive(std::span<ArMemberInput const> members,
     // -- Validate member names + size fields; classify short vs long names. --
     // A long-named member (name > 15 bytes) records its real name in the "//"
     // table and its ar_hdr name field becomes "/N" (N = byte offset into "//").
-    std::vector<std::string> nameFields;        // the 16-byte name spelling per member
-    nameFields.reserve(members.size());
-    std::vector<std::uint8_t> longNameTable;    // the "//" payload ("<name>/\n" x)
-
-    for (ArMemberInput const& m : members) {
+    // ★ EVERY MEMBER IS VALIDATED, AND REPORTS EACH OF ITS OWN DEFECTS, BEFORE
+    // THE WRITE FAILS (`dss::substrate::runEveryUnit`, the several-unit class's
+    // one home; site (m) of the orchestrator's ledger 568, P69 fold 3e): a member
+    // whose name, payload or exported symbol cannot be stored never stops the
+    // members after it, so one run names every member to fix. The loops below
+    // build the archive from members this pass accepted.
+    bool const everyMemberStorable = dss::substrate::runEveryUnit(members.size(), [&](std::size_t mi) {
+        ArMemberInput const& m = members[mi];
+        bool storable = true;
         if (m.name.empty()) {
             emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
                  "ar writer: a member has an empty file name -- an ar member "
                  "must carry a non-empty name (D-LK-STATIC-ARCHIVE-WRITER)");
-            return {};
+            storable = false;
         }
-        for (char const c : m.name) {
-            if (isFramingReservedByte(c)) {
-                emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                     "ar writer: member name '" + m.name + "' contains a byte "
-                     "reserved by the archive framing ('/', newline, or NUL) -- "
-                     "the container would mis-resolve it "
-                     "(D-LK-STATIC-ARCHIVE-WRITER)");
-                return {};
-            }
+        if (std::any_of(m.name.begin(), m.name.end(), isFramingReservedByte)) {
+            emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
+                 "ar writer: member name '" + m.name + "' contains a byte "
+                 "reserved by the archive framing ('/', newline, or NUL) -- "
+                 "the container would mis-resolve it "
+                 "(D-LK-STATIC-ARCHIVE-WRITER)");
+            storable = false;
         }
         if (m.objectBytes.size() > kMaxArFieldSize) {
             emit(reporter, DiagnosticCode::K_ArchiveFieldOverflow,
@@ -143,9 +146,33 @@ writeArArchive(std::span<ArMemberInput const> members,
                  + std::to_string(m.objectBytes.size())
                  + " bytes) exceeds the 10-digit ASCII ar_hdr size field "
                    "(D-LK-STATIC-ARCHIVE-WRITER)");
-            return {};
+            storable = false;
         }
+        for (std::string const& sym : m.exportedSymbols) {
+            if (sym.empty()) {
+                emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
+                     "ar writer: member '" + m.name + "' exports an "
+                     "empty symbol name -- an armap entry must be named "
+                     "(D-LK-STATIC-ARCHIVE-WRITER)");
+                storable = false;
+            } else if (sym.find('\0') != std::string::npos) {
+                emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
+                     "ar writer: an exported symbol name of member '"
+                     + m.name + "' contains a NUL, which would "
+                     "truncate the armap name blob "
+                     "(D-LK-STATIC-ARCHIVE-WRITER)");
+                storable = false;
+            }
+        }
+        return storable;
+    });
+    if (!everyMemberStorable) return {};
 
+    std::vector<std::string> nameFields;        // the 16-byte name spelling per member
+    nameFields.reserve(members.size());
+    std::vector<std::uint8_t> longNameTable;    // the "//" payload ("<name>/\n" x)
+
+    for (ArMemberInput const& m : members) {
         if (m.name.size() <= kMaxInlineNameLen) {
             nameFields.push_back(m.name + "/");     // inline "name/"
         } else {
@@ -181,23 +208,6 @@ writeArArchive(std::span<ArMemberInput const> members,
     std::vector<std::uint8_t> armapNameBlob;
     for (std::size_t mi = 0; mi < members.size(); ++mi) {
         for (std::string const& sym : members[mi].exportedSymbols) {
-            if (sym.empty()) {
-                emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                     "ar writer: member '" + members[mi].name + "' exports an "
-                     "empty symbol name -- an armap entry must be named "
-                     "(D-LK-STATIC-ARCHIVE-WRITER)");
-                return {};
-            }
-            for (char const c : sym) {
-                if (c == '\0') {
-                    emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                         "ar writer: an exported symbol name of member '"
-                         + members[mi].name + "' contains a NUL, which would "
-                         "truncate the armap name blob "
-                         "(D-LK-STATIC-ARCHIVE-WRITER)");
-                    return {};
-                }
-            }
             symbolMember.push_back(mi);
             symbolName.push_back(sym);
             for (char const c : sym)

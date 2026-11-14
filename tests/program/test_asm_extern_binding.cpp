@@ -78,6 +78,21 @@ constexpr std::string_view kCallsUnderscorePutchar =
     "\taddq\t$40, %rsp\n"
     "\tret\n";
 
+// The Mach-O entry (`_main`, the dialect's `main` in the format's decoration) calling the BARE `putchar`, which is
+// no C symbol under Mach-O's decoration: the entry is elected (P69 fold 3e: one election, which refuses a bare
+// `main` on Mach-O before any binding is asked), so what is refused is the reference alone.
+constexpr std::string_view kMachOEntryCallsBarePutchar =
+    "\t.text\n"
+    "\t.globl\t_main\n"
+    "\t.type\t_main, @function\n"
+    "_main:\n"
+    "\tsubq\t$40, %rsp\n"
+    "\tmovl\t$42, %edi\n"
+    "\tcall\tputchar\n"
+    "\tmovl\t$0, %eax\n"
+    "\taddq\t$40, %rsp\n"
+    "\tret\n";
+
 // pe realizes `mtx_lock` as a COMPILER-SYNTHESIZED shim over kernel32 (no pe
 // image exports `mtx_lock`), and the `encode` tier runs no MIR synthesis.
 // Binding it would link clean and die at LOAD with 0xC0000139. (★ P69: this
@@ -343,7 +358,7 @@ TEST(AsmExternBinding, MachOBindsTheDecoratedNameAndRefusesTheBareOne) {
     {
         ScratchDir scratch{Location::InsideRepo, "asm-extern"};
         scratch.useAsCwd();
-        auto const src = writeFile(scratch.path(), "bare.s", kCallsPutchar);
+        auto const src = writeFile(scratch.path(), "bare.s", kMachOEntryCallsBarePutchar);
         DiagnosticReporter rep;
         Program            prog;
         int const rc = prog.compileFiles({src.generic_string()},

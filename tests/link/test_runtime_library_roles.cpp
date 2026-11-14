@@ -233,6 +233,7 @@ constexpr PeFlavour kPeFlavours[] = {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};   // mov eax, 42 ; ret
     mod.functions.push_back(std::move(fn));
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     return mod;
 }
 

@@ -28,6 +28,7 @@
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/entry_names.hpp"   // realizedEntryNames -- the ONE vocabulary of a program's entry names
 #include "core/types/grammar_schema.hpp"
 #include "core/types/bit_int_value.hpp"
 #include "core/types/integer_literal_ladder.hpp"
@@ -609,6 +610,10 @@ struct EngineState {
     // P69 (lane `cs`): whether the active format's document states commons
     // (`analyze()`'s parameter). False ⇒ the `common` attribute is refused by name.
     bool formatStatesCommons = true;
+    // P69 fold 3e (lane `xa`, N3): the pair's format's realized entry verbs
+    // (`analyze()`'s parameter); `nullopt` ⇒ no pair, every declared verb counts.
+    // The entry gate asks `realizedEntryNames` of them.
+    std::optional<std::vector<EntryMaterialization>> realizedEntryVerbs;
     // P69 (lane `cs`): every file-scope declaration that wrote an `alias("target")`
     // its declarator could keep, in source order — the declarator's own symbol (the
     // survivor of its redeclaration merge or an absorbed record of it), the target's
@@ -20412,7 +20417,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 }
                             }
                             // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the
-                            //    PER-DEFINITION PROGRAM-ENTRY SHAPE CHECK ──
+                            //    PER-DEFINITION PROGRAM-ENTRY CHECK ──
                             //
                             // This is the SEMANTIC-TIER OWNER of the entry
                             // signature, and it is here because here is the only
@@ -20422,33 +20427,42 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // carries no `BufferId`/`SourceSpan` for a function,
                             // so it could only name the entry by symbol name.
                             //
-                            // ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY, and that
-                            // is not an oversight to be "improved" later. Two
-                            // separate reasons:
-                            //   * The question it asks — "does the definition in
-                            //     front of me have one of the signatures this
-                            //     LANGUAGE declares for this name" — needs no
-                            //     target at all. A signature the language does
-                            //     not declare — `int main(int, char**, int)` — is
-                            //     refused on a relocatable `.o` too, because no
-                            //     format realizes an undeclared shape and no later
-                            //     translation unit can make it legal.
-                            //   * The format-dependent question ("does the active
-                            //     format realize this row's verb") MUST NOT be
-                            //     answered here even though `s.activeFormat`
-                            //     exists. On ELF, `wmain` is not a program-entry
-                            //     candidate — but it is NOT an error either: a
-                            //     program defining BOTH `main` and `wmain` has to
-                            //     BUILD on ELF and take `main`. A per-definition
-                            //     "unrealized verb" error would make that program
-                            //     impossible. Candidacy is a whole-program
-                            //     decision and lives at entry resolution.
-                            //
-                            // ★ SO WHAT THIS STAMPS IS THE ANSWER, NOT THE
-                            // QUESTION: on a match it records the row's VERB on
-                            // the symbol, and entry resolution intersects that
-                            // verb with the format's declared set. One
-                            // classification in the whole compiler.
+                            // ★ THE ROWS THAT COUNT ARE THE ONES THE PAIR'S FORMAT
+                            // REALIZES (P69 fold 3e, lane `xa`, class C's N3), read
+                            // from the ONE vocabulary the driver's election reads
+                            // (`realizedEntryNames`, core/types/entry_names.hpp).
+                            // ✔MEASURED before (cl 19.44, clang-cl 19.1.5, MinGW
+                            // gcc 13.2, gcc 13.3, clang 18.1.3): this check was
+                            // format-independent and REFUSED every signature the
+                            // language declares no row for -- `int wmain(int,
+                            // unsigned int **)` beside a `main`, which every
+                            // reference links (an ordinary function where the
+                            // format realizes no wide verb), and `int main(int,
+                            // double)`, which gcc (-Wmain) and cl link and run. So:
+                            //   * a signature that is one of the name's REALIZED
+                            //     rows stamps that row's verb;
+                            //   * a definition of a name the format realizes, whose
+                            //     signature is none of those rows, is an entry all
+                            //     the same, as every reference's startup calls any
+                            //     `main`: it is stamped with the RICHEST realized
+                            //     row (the arguments the format's startup passes),
+                            //     called with that row's signature, and WARNED --
+                            //     gcc's -Wmain, suppressible as gcc's is;
+                            //   * a name the format realizes no row of is not an
+                            //     entry there, but a signature that matches a
+                            //     declared row is still stamped with it: entry
+                            //     resolution never elects it (it intersects with
+                            //     the format's verbs) and names it as the near-miss
+                            //     when the program has no entry (`wmain` alone on
+                            //     ELF), and a relocatable's `main` keeps its row;
+                            //   * on a format that starts no program a definition
+                            //     whose signature matches no declared row is warned
+                            //     as gcc warns on `-c`, and stamped with nothing:
+                            //     the program that links it calls it as an object's
+                            //     entry, with the richest row its format realizes.
+                            // `realizedEntryVerbs` is the pair's; a caller with no
+                            // pair (the language server, a direct-API test) counts
+                            // every verb the grammar declares.
                             if (isFnSig && bodyNode.valid()
                                 && !decl.entryFunctions.empty()) {
                                 std::string_view const fnName =
@@ -20461,6 +20475,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     }
                                 }
                                 if (nameIsEntry) {
+                                    std::vector<EntryMaterialization> const verbs =
+                                        s.realizedEntryVerbs.has_value()
+                                            ? *s.realizedEntryVerbs
+                                            : declaredEntryVerbs(tree.schema());
+                                    auto const realizes =
+                                        [&](EntryMaterialization v) {
+                                            return std::find(verbs.begin(),
+                                                             verbs.end(), v)
+                                                   != verbs.end();
+                                        };
+                                    std::optional<EntryMaterialization> richest;
+                                    for (RealizedEntryName const& n :
+                                         realizedEntryNames(tree.schema(), verbs)) {
+                                        if (n.name == fnName) {
+                                            richest = n.verb;
+                                            break;
+                                        }
+                                    }
                                     auto const& intern =
                                         s.lattice.interner();
                                     // Classify STRUCTURALLY. The vocabulary says
@@ -20511,84 +20543,114 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             classified = false;
                                         }
                                     }
+                                    // The first declared row the signature IS,
+                                    // a realized one before any other.
                                     EntryFunctionShape const* hit = nullptr;
+                                    EntryFunctionShape const* unrealizedHit = nullptr;
                                     if (classified) {
                                         for (auto const& row :
                                              decl.entryFunctions) {
                                             if (row.name != fnName) continue;
-                                            if (row.returns == obsRet
-                                                && row.params == obsParams) {
+                                            if (row.returns != obsRet
+                                                || row.params != obsParams) {
+                                                continue;
+                                            }
+                                            if (realizes(row.verb)) {
                                                 hit = &row;
                                                 break;
                                             }
+                                            if (unrealizedHit == nullptr)
+                                                unrealizedHit = &row;
                                         }
                                     }
-                                    if (hit != nullptr) {
-                                        s.symbols.at(sym).entryVerb = hit->verb;
-                                    } else {
-                                        // Enumerate the declared rows for THIS
-                                        // name, rendered through the SAME
-                                        // renderer as the observed side, so the
-                                        // reader compares like with like.
-                                        std::string declared;
+                                    // Rendered through the SAME renderer as the
+                                    // observed side, so the reader compares like
+                                    // with like; `realizedOnly` keeps the rows
+                                    // the format realizes.
+                                    auto const rowsOf = [&](bool realizedOnly) {
+                                        std::string out;
                                         for (auto const& row :
                                              decl.entryFunctions) {
                                             if (row.name != fnName) continue;
-                                            if (!declared.empty())
-                                                declared += "; ";
-                                            declared +=
-                                                entrySignatureSpelling(row);
-                                            declared += " [";
-                                            declared +=
-                                                entryMaterializationName(
-                                                    row.verb);
-                                            declared += "]";
+                                            if (realizedOnly && !realizes(row.verb))
+                                                continue;
+                                            if (!out.empty()) out += "; ";
+                                            out += entrySignatureSpelling(row);
+                                            out += " [";
+                                            out += entryMaterializationName(
+                                                row.verb);
+                                            out += "]";
                                         }
-                                        // When a parameter fell OUTSIDE the
-                                        // vocabulary, a partial rendering would
-                                        // print a shape the entry does not have —
-                                        // say so explicitly instead.
-                                        std::string const observed =
-                                            classified
-                                                ? entrySignatureSpelling(
-                                                      obsRet, obsParams)
-                                                : std::format(
-                                                      "fn(<{} parameter(s), at "
-                                                      "least one of a type no "
-                                                      "declared entry shape can "
-                                                      "name>) -> <see source>",
-                                                      ps.size());
+                                        return out.empty() ? std::string{"<none>"}
+                                                           : out;
+                                    };
+                                    // When a parameter fell OUTSIDE the
+                                    // vocabulary, a partial rendering would print
+                                    // a shape the entry does not have — say so
+                                    // explicitly instead.
+                                    auto const observed = [&] {
+                                        return classified
+                                                   ? entrySignatureSpelling(
+                                                         obsRet, obsParams)
+                                                   : std::format(
+                                                         "fn(<{} parameter(s), at "
+                                                         "least one of a type no "
+                                                         "declared entry shape can "
+                                                         "name>) -> <see source>",
+                                                         ps.size());
+                                    };
+                                    auto const warn = [&](std::string text) {
                                         ParseDiagnostic d;
                                         d.code = DiagnosticCode::
                                             S_EntryShapeNotDeclared;
                                         d.severity =
-                                            DiagnosticSeverity::Error;
+                                            DiagnosticSeverity::Warning;
                                         d.buffer = tree.source().id();
                                         d.span   = tree.span(
                                             nameNode.valid() ? nameNode : node);
-                                        d.actual = std::format(
-                                            "'{}' is a PROGRAM ENTRY name for "
-                                            "this source language, and this "
-                                            "definition's signature {} is not "
-                                            "one the language declares for it. "
-                                            "Declared for '{}': {}. That set is "
-                                            "CONFIG-DECLARED — it is the "
-                                            "`entryFunctions` mapping on this "
-                                            "declaration form in the language's "
-                                            "`.lang.json`, so the remedy is a "
-                                            "config row (plus a materialization "
-                                            "arm for its verb), not a compiler "
-                                            "change. C23 5.1.2.2.1 permits an "
-                                            "implementation-defined entry set "
-                                            "and 3.4.1 requires the "
-                                            "implementation to DOCUMENT it; that "
-                                            "mapping is the documentation. "
-                                            "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
-                                            fnName, observed, fnName,
-                                            declared.empty()
-                                                ? std::string{"<none>"}
-                                                : declared);
+                                        d.actual = std::move(text);
                                         s.reporter.report(std::move(d));
+                                    };
+                                    if (hit != nullptr) {
+                                        s.symbols.at(sym).entryVerb = hit->verb;
+                                    } else if (richest.has_value()) {
+                                        s.symbols.at(sym).entryVerb = *richest;
+                                        s.symbols.at(sym)
+                                            .entryCalledWithTheVerbsSignature = true;
+                                        warn(std::format(
+                                            "'{}' is a PROGRAM ENTRY on this "
+                                            "format, and this definition's "
+                                            "signature {} is none of the rows the "
+                                            "format realizes for it ({}). It is the "
+                                            "program's entry all the same, as every "
+                                            "reference's startup calls any `{}`: "
+                                            "called with the richest of them, '{}', "
+                                            "its parameters receiving those "
+                                            "arguments (gcc warns -Wmain and links "
+                                            "it, MSVC links it, clang refuses it). "
+                                            "The rows are the language's "
+                                            "`entryFunctions` in its `.lang.json`, "
+                                            "intersected with the format's "
+                                            "`entryVerbs`; C23 5.1.2.2.1 permits an "
+                                            "implementation-defined entry, and that "
+                                            "mapping documents it.",
+                                            fnName, observed(), rowsOf(true), fnName,
+                                            entryMaterializationName(*richest)));
+                                    } else if (unrealizedHit != nullptr) {
+                                        s.symbols.at(sym).entryVerb =
+                                            unrealizedHit->verb;
+                                    } else if (verbs.empty()) {
+                                        warn(std::format(
+                                            "'{}' is a PROGRAM ENTRY name for this "
+                                            "source language, and this "
+                                            "definition's signature {} is none of "
+                                            "the rows the language declares for it "
+                                            "({}). A program that links it is "
+                                            "entered here with the richest row its "
+                                            "format realizes, as every reference's "
+                                            "startup calls any `{}`.",
+                                            fnName, observed(), rowsOf(false),
+                                            fnName));
                                     }
                                 }
                             }
@@ -31255,7 +31317,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  EnumCompatibleTypeRule enumCompatibleTypeRule,
                                  std::optional<std::string_view> activeCallingConvention,
                                  std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
-                                 bool formatStatesCommons);
+                                 bool formatStatesCommons,
+                                 std::optional<std::vector<EntryMaterialization>> realizedEntryVerbs);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DiagnosticBudget budget,
@@ -31271,7 +31334,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       EnumCompatibleTypeRule enumCompatibleTypeRule,
                       std::optional<std::string_view> activeCallingConvention,
                       std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
-                      bool formatStatesCommons) {
+                      bool formatStatesCommons,
+                      std::optional<std::vector<EntryMaterialization>> realizedEntryVerbs) {
     // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
     // `activeFormat` and `roleResolver` are two statements about the SAME format,
     // and nothing but this check makes them agree. A caller passing one format's
@@ -31323,7 +31387,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                                std::move(activeTarget), longDoubleFormat, target,
                                roleResolver, enumCompatibleTypeRule,
                                activeCallingConvention, symbolAliasUnsupported,
-                               formatStatesCommons);
+                               formatStatesCommons, std::move(realizedEntryVerbs));
         });
 }
 
@@ -31340,7 +31404,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  EnumCompatibleTypeRule enumCompatibleTypeRule,
                                  std::optional<std::string_view> activeCallingConvention,
                                  std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported,
-                                 bool formatStatesCommons) {
+                                 bool formatStatesCommons,
+                                 std::optional<std::vector<EntryMaterialization>> realizedEntryVerbs) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -31369,6 +31434,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         s.activeCallingConvention = std::string{*activeCallingConvention};
     s.symbolAliasUnsupported = symbolAliasUnsupported;
     s.formatStatesCommons = formatStatesCommons;
+    s.realizedEntryVerbs = std::move(realizedEntryVerbs);
 
     // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
     // carry it for honesty) — no exercised 32-bit width path exists, so

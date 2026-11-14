@@ -161,6 +161,8 @@ constexpr char const* kPeEntryGetenv  = "object_entry_getenv_x86_64_pe_cl_MD_O2.
 constexpr char const* kElfEntryPuts   = "object_entry_puts_x86_64_elf_gcc_O2.o";
 constexpr char const* kElfEntryGetenv = "object_entry_getenv_x86_64_elf_gcc_O2.o";
 constexpr char const* kElfExec        = "x86_64:elf64-x86_64-linux-exec";
+constexpr char const* kMachoObject    = "arm64:macho64-arm64-darwin";
+constexpr char const* kMachoExec      = "arm64:macho64-arm64-darwin-exec";
 
 // DSS's image of `objects` alone, in that order, for `target`: the image's path, or empty with `rep` holding why.
 [[nodiscard]] fs::path dssImageOfObjects(fs::path const& dir, std::vector<char const*> const& objects,
@@ -276,7 +278,53 @@ TEST(ForeignObjectLibraryBinding, TheEntrysObjectInABuildOfObjectsAloneIsBoundOn
     }
 }
 
-// ══ THE ARCHIVED OBJECT, under lib.exe's long name ═══════════════════════════════════════════════════════════════
+// Every leg: an arm64 Mach-O object defining `main`, which calls `puts`, linked ALONE for a Mach-O executable. Of the
+// formats here it is the one whose all-object link compiles nothing (READ: dyld hands `main` its arguments, so the
+// link makes no init for it -- program.cpp's `compileForeignEntryStartup`), so the entry's object stands FIRST among
+// the link's modules, where PE's and ELF's links hold their compiled startup. Its `_puts` is bound to the C library,
+// and the image loads libSystem. The object is DSS's own relocatable one: an object file records a library reference
+// by its NAME alone, whoever wrote it (READ, `bindForeignImports`). RED-ON-DISABLE: bind the link's modules from its
+// second one on -> the entry's object is the one left unbound, and the link refuses "undefined symbol '_puts'".
+TEST(ForeignObjectLibraryBinding, TheEntrysObjectInABuildOfObjectsAloneIsBoundOnMachO) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "foreign-object-entry-macho"};
+    auto const objectDir = scratch.path() / "object";
+    fs::create_directories(objectDir / "dss.out");
+    auto const source = objectDir / "entry_puts.c";
+    std::ofstream(source, std::ios::binary)
+        << "int puts(char const *s);\nint main(void) { return puts(\"entry object\") >= 0 ? 42 : 7; }\n";
+    DiagnosticReporter objectRep;
+    Program            objectBuild;
+    objectBuild.setOutputDir(objectDir / "dss.out");
+    ASSERT_EQ(objectBuild.compileFiles(std::vector<std::string>{source.string()}, "c",
+                                       std::vector<std::string>{kMachoObject}, objectRep),
+              0)
+        << diagnosticsOf(objectRep);
+    fs::path object;
+    for (auto const& e : fs::directory_iterator(objectDir / "dss.out")) {
+        if (e.is_regular_file()) object = e.path();
+    }
+    ASSERT_FALSE(object.empty()) << "DSS writes the relocatable object";
+
+    auto const imageDir = scratch.path() / "image";
+    fs::create_directories(imageDir);
+    DiagnosticReporter rep;
+    Program            link;
+    link.setOutputDir(imageDir);
+    ASSERT_EQ(link.compileFiles(std::vector<std::string>{object.string()}, "c", std::vector<std::string>{kMachoExec},
+                                rep),
+              0)
+        << "ld64 links an object defining `main` that calls `puts`:" << diagnosticsOf(rep);
+    fs::path image;
+    for (auto const& e : fs::directory_iterator(imageDir)) {
+        if (e.is_regular_file() && e.path().extension().empty()) image = e.path();
+    }
+    ASSERT_FALSE(image.empty()) << "the link writes one image";
+    auto const dylibs = test_support::machoLoadedDylibs(bytesOf(image));
+    EXPECT_EQ(test_support::dependencyOccurrences(dylibs, "/usr/lib/libSystem.B.dylib"), 1u)
+        << "the image loads the C library once; it loads: " << test_support::joinDependencies(dylibs);
+}
+
+// ══ THE ARCHIVED OBJECT, under lib.exe's long name═══════════════════════════════════════════════════════════════
 
 // lib.exe's archive of the cl /MD object, the member under its own 52-character name: read to that name, searched,
 // and its library call bound.

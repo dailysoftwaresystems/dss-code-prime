@@ -1,0 +1,1 @@
+        bool const everyCommonAnswered = substrate::runEveryUnit(roundEnd, [&](std::size_t k) {

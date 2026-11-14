@@ -1940,9 +1940,10 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
 // and the retired code split into four:
 //
 //   * `S_EntryShapeNotDeclared` (0xE061, SEMANTIC tier, per-definition, with a real
-//     source span) — "a function whose name the language declares as an entry
-//     spelling has a signature no declared row for that name has". THAT is where a
-//     3-param `main` and a `void main()` are refused now. Emitted from
+//     source span) — "a definition of a name the format realizes as an entry has a
+//     signature none of its realized rows has". THAT is where a `main(int, char**,
+//     int)` and a `void main()` are WARNED now (P69 fold 3e: entered with the
+//     richest realized row, as gcc and MSVC run them). Emitted from
 //     src/analysis/semantic/semantic_analyzer.cpp.
 //   * `K_ProgramEntryUndefined` (0x801F) / `K_ProgramEntryAmbiguous` (0x8020) —
 //     entry RESOLUTION, which intersects the language's declared entry rows with
@@ -2032,25 +2033,30 @@ inline void expectDiagContains(DiagnosticReporter const& rep, std::string_view n
 //
 // OWNER OF THE COVERAGE, VERIFIED PRESENT RATHER THAN ASSUMED:
 // `S_EntryShapeNotDeclared`, emitted from src/analysis/semantic/semantic_analyzer.cpp
-// and pinned END-TO-END by examples/c/entry_main_int_third_param_refused_positioned,
-// expecting that code with `positioned: true` at an EXACT line:col. That example
+// and pinned END-TO-END by examples/c/entry_main_int_third_param_warned_positioned
+// (a WARNING since P69 fold 3e: the definition is entered with the richest row its
+// format realizes, as gcc and MSVC run it), expecting that code at an EXACT
+// line:col. That example
 // asserts strictly MORE than the test deleted here could: the span it demands is
 // exactly what the MIR tier cannot supply, so if the check ever regresses back to a
 // span-less tier the example goes RED even though the same diagnostic code is still
 // emitted. Its siblings cover the other two halves of the split --
 // entry_wmain_only_refused_elf (`K_ProgramEntryUndefined`, a wmain-only ELF build:
 // `argc-wargv` is not in any ELF format's `entryVerbs`, so `wmain` does not survive
-// candidate selection) and entry_main_and_wmain_ambiguous_pe
-// (`K_ProgramEntryAmbiguous`).
+// candidate selection) and entry_main_and_wmain_pe_takes_main
+// (`K_ProgramEntryChosenByPrecedence`: since P69 fold 3e the format's stated
+// precedence elects `main`, as its reference linkers do).
 //
 // ★ AND THE 3-PARAMETER `main` ITSELF IS NOW SUPPORTED
 // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the language declares its row with the
 // `argc-argv-envp` verb, every exec format realizes it, and
 // examples/c/entry_main_envp RUNS it on every leg. The
-// positioned refusal therefore moved to `int main(int, char**, int)`, a third
-// parameter no reference gives a meaning (clang 18.1.3 refuses it, MEASURED
-// 2026-09-24). The MEASURED fault above is closed by SUPPORT now; the refusal still
-// guards every signature the language does not declare.
+// positioned check therefore moved to `int main(int, char**, int)`, a third
+// parameter no reference gives a meaning (clang 18.1.3 refuses it, gcc warns and
+// MSVC links it, MEASURED 2026-09-24). The MEASURED fault above is closed by
+// SUPPORT; since P69 fold 3e a signature none of the realized rows has is entered
+// with the richest of them and warned, so the entry's own arguments are always the
+// ones the startup passes.
 
 // ── ⓧ REMOVED: RealizeEntryShape.VoidReturnMainRefusedByTheSameCheck ──────────
 //
@@ -2125,20 +2131,23 @@ TEST(RealizeEntryShape, ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop) {
 TEST(RealizeEntryShape, EveryEntryRefusalCodeIsUnsuppressable) {
     // The retired `K_EntryShapeNotDeclared` was unsuppressable, and its
     // unsuppressability assertion lived inside the deleted 3-param pin. The code
-    // split into four, so the assertion follows the split — ALL FOUR, because
+    // split into four; three of them still REFUSE, so the assertion follows them —
     // `--suppress` reaching any ONE of them hands back a member of the same family
     // of accepted-then-faulting binaries the whole split exists to refuse:
-    //   * S_EntryShapeNotDeclared     — the definition's signature is not a declared
-    //                                   entry spelling (`int main(int, char**, int)`,
-    //                                   `void main()`);
     //   * K_ProgramEntryUndefined     — an exec-flavored format with NO realizable
     //                                   entry candidate;
     //   * K_ProgramEntryAmbiguous     — more than one realizable candidate;
     //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
     //                                   disagree (the pin above).
+    // The fourth, S_EntryShapeNotDeclared, is a WARNING since P69 fold 3e (class
+    // C's N3): a definition of an entry name whose signature is none of the rows
+    // its format realizes is entered all the same, with the richest of them, as
+    // gcc (-Wmain) and MSVC run `int main(int, double)` (✔MEASURED, lane `xa`).
+    // It is suppressible, as gcc's -Wmain is: a silenced one leaves the program
+    // every reference makes.
     // Asserted individually rather than as a count, so a code dropped from
     // `kUnsuppressableCodes` names itself here.
-    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_EntryShapeNotDeclared));
+    EXPECT_FALSE(isUnsuppressable(DiagnosticCode::S_EntryShapeNotDeclared));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_ProgramEntryUndefined));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_ProgramEntryAmbiguous));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_EntryVerbUnmaterializable));

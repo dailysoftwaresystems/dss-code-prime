@@ -15,7 +15,10 @@
 // ★ THE NAME REACHES EVERY COMPILE WHOSE OUTPUT CAN END IN AN IMAGE. A DSS unit compiled `-c`, or into a static
 // library, ends in an image as surely as one compiled into it, so every pe64 document states the name -- the
 // relocatable and archive ones for the image their objects end in, the exec and DLL ones for the image they write.
-// Each compile then reads a reference to it DIRECT, never through an import slot.
+// Each compile then keeps the name out of its import-slot sets: its read never takes an import slot. (P69 fold 3e,
+// the review of fold 3d's X11, restated this sentence, which said the read is DIRECT: ✔MEASURED, a `-c` object's
+// read loads the address from a slot of the object's own, one IMAGE_REL_AMD64_ADDR64 naming the name; see
+// `EveryRelocatableAndArchiveObjectReadsTheImageBaseThroughNoImportSlot`.)
 //
 // THE UNIVERSE: {an EXE, a DLL} x {the reader a unit of the image's own compile, a `-c` object linked later, a static
 // library's member linked later} x {a DSS unit that reads `__ImageBase`, cl's switch object, both}. Each cell links on
@@ -49,6 +52,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -286,13 +290,102 @@ void expectNotImported(fs::path const& image, char const* name) {
 constexpr char const* kPeDocuments[] = {"pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll", "pe64-x86_64-windows",
                                         "pe64-x86_64-windows-staticlib"};
 
+// ── A COFF OBJECT'S NAMES AND RELOCATIONS, READ FROM ITS BYTES (pe-coff: the file header, the section headers'
+// relocation tables, the symbol table and its string table) -- what the object SAYS, independent of DSS's reader ──
+struct CoffSymbol {
+    std::string  name;
+    std::int16_t section = 0;   // 0: undefined in this object
+};
+struct CoffRelocation {
+    std::uint16_t type = 0;
+    std::string   target;
+};
+struct CoffObject {
+    std::uint16_t               machine = 0;
+    std::vector<CoffSymbol>     symbols;
+    std::vector<CoffRelocation> relocations;
+};
+
+[[nodiscard]] std::optional<CoffObject> coffObjectOf(std::span<std::uint8_t const> b) {
+    auto const in = [&](std::size_t at, std::size_t n) { return at <= b.size() && n <= b.size() - at; };
+    auto const u  = [&](std::size_t at, std::size_t n) {
+        std::uint32_t v = 0;
+        for (std::size_t k = 0; k < n; ++k) v |= std::uint32_t{b[at + k]} << (8u * k);
+        return std::size_t{v};
+    };
+    if (!in(0, 20)) return std::nullopt;
+    std::size_t const sections = u(2, 2), symtab = u(8, 4), count = u(12, 4), optional = u(16, 2);
+    if (!in(symtab, 18 * count) || !in(symtab + 18 * count, 4)) return std::nullopt;
+    std::size_t const strtab = symtab + 18 * count;
+    auto const nameAt = [&](std::size_t rec) {
+        std::string s;
+        if (u(rec, 4) == 0u) {
+            for (std::size_t k = strtab + u(rec + 4, 4); k < b.size() && b[k] != 0; ++k) s += static_cast<char>(b[k]);
+        } else {
+            for (std::size_t k = 0; k < 8 && b[rec + k] != 0; ++k) s += static_cast<char>(b[rec + k]);
+        }
+        return s;
+    };
+    CoffObject o;
+    o.machine = static_cast<std::uint16_t>(u(0, 2));
+    std::vector<std::string> byIndex(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::size_t const rec = symtab + 18 * i;
+        byIndex[i] = nameAt(rec);
+        o.symbols.push_back({byIndex[i], static_cast<std::int16_t>(u(rec + 12, 2))});
+        i += b[rec + 17];   // its auxiliary records name nothing
+    }
+    for (std::size_t s = 0; s < sections; ++s) {
+        std::size_t const header = 20 + optional + 40 * s;
+        if (!in(header, 40)) return std::nullopt;
+        std::size_t const table = u(header + 24, 4), n = u(header + 32, 2);
+        if (!in(table, 10 * n)) return std::nullopt;
+        for (std::size_t r = 0; r < n; ++r) {
+            std::size_t const symbol = u(table + 10 * r + 4, 4);
+            if (symbol >= count) return std::nullopt;
+            o.relocations.push_back({static_cast<std::uint16_t>(u(table + 10 * r + 8, 2)), byIndex[symbol]});
+        }
+    }
+    return o;
+}
+
+// The COFF objects of a compile's artifact: the artifact itself for an object, and for an `ar` archive every member
+// whose machine is `machine` (the linker members and the long-name member are not objects).
+[[nodiscard]] std::vector<CoffObject> coffObjectsIn(std::vector<std::uint8_t> const& b, std::uint16_t machine) {
+    std::vector<CoffObject> out;
+    std::string_view const magic{"!<arch>\n"};
+    if (b.size() < magic.size() || !std::equal(magic.begin(), magic.end(), b.begin())) {
+        if (auto o = coffObjectOf(b)) out.push_back(std::move(*o));
+        return out;
+    }
+    for (std::size_t at = magic.size(); at + 60 <= b.size();) {
+        std::size_t size = 0;
+        for (std::size_t k = 48; k < 58 && b[at + k] >= '0' && b[at + k] <= '9'; ++k) {
+            size = size * 10 + static_cast<std::size_t>(b[at + k] - '0');
+        }
+        std::size_t const data = at + 60;
+        if (size > b.size() - data) {
+            ADD_FAILURE() << "an archive member runs past the archive's end";
+            return out;
+        }
+        std::span<std::uint8_t const> const member{b.data() + data, size};
+        if (size >= 2 && static_cast<std::uint16_t>(member[0] | (member[1] << 8u)) == machine) {
+            if (auto o = coffObjectOf(member)) out.push_back(std::move(*o));
+            else ADD_FAILURE() << "an archive member of the machine is not a readable object";
+        }
+        at = data + size + (size & 1u);
+    }
+    return out;
+}
+
 }  // namespace
 
 // ══ THE DOCUMENTS ════════════════════════════════════════════════════════════════════════════════════════════════
 
 // Every pe64 document states `__ImageBase` at the header of the image it ends in, and the EXE and DLL documents
 // declare the ADDR32NB row the relocatable document does. RED LEVER: drop the key from the relocatable document ->
-// its row reads none here, and `EveryCellLinks...`'s `-c` cells read the name through a slot.
+// its row reads none here, and `EveryRelocatableAndArchiveObjectReadsTheImageBaseThroughNoImportSlot`'s object
+// takes the document's data-import slot for the name.
 TEST(PeImageDefinedSymbols, EveryPe64DocumentStatesTheImageBase) {
     for (char const* name : kPeDocuments) {
         SCOPED_TRACE(name);
@@ -344,11 +437,67 @@ TEST(PeImageDefinedSymbols, TheLoaderRefusesEveryMalformedRow) {
     }
 }
 
+// ══ THE OBJECTS ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+// A pe64 `-c` object, and a static library's member, of a unit that reads `__ImageBase` reach the name by an
+// IMAGE_REL_AMD64_ADDR64 naming it, and take no import slot for it: no symbol of the object is named for the name but
+// the name itself, undefined, for the image's link to define. ✔MEASURED P69 fold 3e (llvm-objdump of DSS's object of
+// a read, with the relocatable document's row and without it): with the row the read loads the address from a local
+// datum of the object's own; without it, from the document's data-import slot, the COMDAT `.refptr.__ImageBase`
+// (`objectImportSlot`). DSS's link, link.exe, lld-link and GNU ld bind both, so the row decides only what the object
+// says, and this TEST is its pin. RED-ON-DISABLE: drop the row from either document -> that document's object names
+// `.refptr.__ImageBase`; let a stated name join a compile's import-slot sets (`lowerToLir`'s `imageDefinedNames`)
+// -> both objects do.
+TEST(PeImageDefinedSymbols, EveryRelocatableAndArchiveObjectReadsTheImageBaseThroughNoImportSlot) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-image-base-objects"};
+    auto const reader = writeUnit(scratch.path(), "reader", kReaderUnit);
+    auto const f      = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    ASSERT_TRUE(f.has_value());
+    auto const rows   = (*f)->relocations();
+    auto const addr64 = std::find_if(rows.begin(), rows.end(), [](ObjectFormatRelocationInfo const& r) {
+        return r.name == "IMAGE_REL_AMD64_ADDR64";
+    });
+    ASSERT_NE(addr64, rows.end()) << "the relocatable document's absolute 64-bit row";
+    struct Compile {
+        char const* target;
+        char const* tag;
+        char const* extension;
+    };
+    std::uint16_t machine = 0;
+    for (Compile const c : {Compile{kObject, "object", ".obj"}, Compile{kArchive, "library", ".lib"}}) {
+        SCOPED_TRACE(c.target);
+        DiagnosticReporter rep;
+        auto const artifact = dssCompile(scratch.path(), c.tag, {reader.string()}, 1, c.target, c.extension, rep);
+        ASSERT_FALSE(artifact.empty()) << diagnosticsOf(rep);
+        auto const bytes = bytesOf(artifact);
+        ASSERT_GE(bytes.size(), 2u);
+        if (machine == 0u) machine = static_cast<std::uint16_t>(bytes[0] | (bytes[1] << 8u));   // the `-c` object's
+        auto const objects = coffObjectsIn(bytes, machine);
+        ASSERT_EQ(objects.size(), 1u) << "the artifact holds the reader's one object";
+        CoffObject const& o = objects.front();
+        EXPECT_GE(std::count_if(o.relocations.begin(), o.relocations.end(),
+                                [&](CoffRelocation const& r) {
+                                    return r.type == addr64->nativeId && r.target == "__ImageBase";
+                                }),
+                  1)
+            << "the object reaches the name by an IMAGE_REL_AMD64_ADDR64 naming it";
+        EXPECT_TRUE(std::any_of(o.symbols.begin(), o.symbols.end(), [](CoffSymbol const& s) {
+            return s.name == "__ImageBase" && s.section == 0;
+        })) << "the object names `__ImageBase` undefined, for the image's link to define";
+        for (CoffSymbol const& s : o.symbols) {
+            bool const namedForIt = s.name != "__ImageBase" && s.name.find("__ImageBase") != std::string::npos;
+            EXPECT_FALSE(namedForIt) << "the object takes a slot named for a name the image defines: " << s.name;
+        }
+    }
+}
+
 // ══ THE LINK, ON EVERY LEG ═══════════════════════════════════════════════════════════════════════════════════════
 
 // Every cell of the universe links, with `__ImageBase` defined in the image, never imported. RED-ON-DISABLE: resolve
-// no stated name to the image -> each cell is refused, "undefined symbol '__ImageBase'"; read no stated name direct
-// in a compile -> its reference takes an import slot, which the image link refuses.
+// no stated name to the image -> each cell is refused, "undefined symbol '__ImageBase'"; let a stated name join a
+// compile's import-slot sets -> an image document's unit reads it through an import slot no library fills, which
+// the image link refuses (a `-c` or library unit's read takes the relocatable document's `.refptr` slot instead,
+// which links: MEASURED, fold 3e).
 TEST(PeImageDefinedSymbols, EveryCellLinksWithTheImageBaseDefinedInTheImage) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-image-base-cells"};
     for (Cell const& c : theUniverse()) {

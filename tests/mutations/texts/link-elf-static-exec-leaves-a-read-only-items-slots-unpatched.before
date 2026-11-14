@@ -2,4 +2,4 @@
             && !link::format::applyDataItemRelocations(
                    rodataLayout.bytes, module.dataItems, rodataLayout,
                    rodataSectionVa, symbolVa, targetSchema,
-                   "elf::encode (ET_EXEC)", reporter)) {
+                   "elf::encode (ET_EXEC)", kElf64AddressBytes, reporter)) {

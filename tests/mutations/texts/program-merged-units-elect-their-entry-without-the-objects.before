@@ -1,1 +1,2 @@
+    std::size_t const unitCandidates = cands.size();
     for (ForeignEntryCandidate const& c : objectEntries) cands.push_back(c.candidate);

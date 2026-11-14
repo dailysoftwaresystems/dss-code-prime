@@ -37,6 +37,7 @@
 
 #include "link/object_format_identity_doc.hpp"
 
+#include <algorithm>   // std::find — a startup's verbs are distinct
 #include <array>
 #include <cctype>    // std::tolower — directive options compare without regard to case
 #include <cstdint>
@@ -307,16 +308,40 @@ void readLinkerDirectives(nlohmann::json const&           block,
                     }
                 }
                 if (onlyOn("runtimeStartups", LinkerDirectiveMeaning::EntryPoint)) {
+                    // {"<startup>": ["<verb>", ...]} — each startup with the materialization verbs it calls an
+                    // entry with (P69 fold 3e, class C's N5): an object that states it restricts the program's
+                    // entry election to them, so a startup with no verb, or with a verb named twice, states nothing
+                    // the election could read.
                     auto const& t = r.at("runtimeStartups");
-                    bool good = t.is_array() && !t.empty();
-                    for (std::size_t k = 0; good && k < t.size(); ++k) {
-                        good = t[k].is_string() && !t[k].get<std::string>().empty();
-                        if (good) row.runtimeStartups.push_back(t[k].get<std::string>());
-                    }
-                    if (!good) {
+                    if (!t.is_object() || t.empty()) {
                         emit(at + "/runtimeStartups",
-                             "'runtimeStartups' must be a non-empty array of non-empty names");
+                             "'runtimeStartups' must be a non-empty object of startup name -> the materialization "
+                             "verbs that startup calls an entry with");
                         ok = false;
+                    } else {
+                        for (auto it = t.begin(); it != t.end(); ++it) {
+                            PeRuntimeStartup startup{it.key(), {}};
+                            bool good = !it.key().empty() && it.value().is_array() && !it.value().empty();
+                            for (std::size_t k = 0; good && k < it.value().size(); ++k) {
+                                auto const& v    = it.value()[k];
+                                auto const  verb = v.is_string() ? entryMaterializationFromName(v.get<std::string>())
+                                                                 : std::nullopt;
+                                good = verb.has_value()
+                                    && std::find(startup.verbs.begin(), startup.verbs.end(), *verb)
+                                           == startup.verbs.end();
+                                if (good) startup.verbs.push_back(*verb);
+                            }
+                            if (!good) {
+                                emit(std::format("{}/runtimeStartups/{}", at, it.key()),
+                                     std::format("each startup must be a non-empty name with a non-empty array of "
+                                                 "distinct materialization verbs, each one of {}",
+                                                 ::dss::detail::renderAllowedList(
+                                                     allNames(kEntryMaterializationTable), " / ")));
+                                ok = false;
+                                continue;
+                            }
+                            row.runtimeStartups.push_back(std::move(startup));
+                        }
                     }
                 } else if (*meaning == LinkerDirectiveMeaning::EntryPoint) {
                     emit(at + "/runtimeStartups",

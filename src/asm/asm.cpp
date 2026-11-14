@@ -2902,17 +2902,19 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // + an ABSOLUTE-64 relocation against the target symbol; the linker writes
         // the target's VA into the slot. Dispatch on the literal VARIANT (the same
         // discriminator the string / aggregate arms use), BEFORE the TypeKind-keyed
-        // primitive gate. The 8-byte width matches the abs64 reloc (widthBytes 8);
-        // all shipped targets are 64-bit-pointer (a 32-bit-pointer target would
-        // declare abs32 + a 4-byte slot — anchored future, no shipped consumer).
+        // primitive gate. The slot is the data model's pointer width, and its
+        // fixup the target's address-slot row of that width
+        // (`addressSlotRelocationKind`, chosen by the caller). P69 fold 3e (X9
+        // R8/R13): this said "all shipped targets are 64-bit-pointer" and wrote 8.
         if (std::holds_alternative<MirSymbolAddrValue>(v.value)) {
             auto const& sa = std::get<MirSymbolAddrValue>(v.value);
             if (!absPtrRelocKind.has_value()) {
                 emit(DiagnosticCode::K_NoMatchingObjectFormat,
                      std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} "
                                  "}} is initialized to a symbol address, but the "
-                                 "target declares no absolute-64 relocation "
-                                 "(widthBytes==8 && !pcRelative) — cannot emit the "
+                                 "target states no one row that fills an address "
+                                 "slot of the data model's pointer width "
+                                 "(addressSlotRelocationKind) — cannot emit the "
                                  "pointer fixup (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL).",
                                  sym.v));
                 continue;
@@ -2939,8 +2941,9 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // silently make the pointer ONE process-shared slot — the exact
             // storage-duration miscompile the section-select guards against.
             d.section = relocBearingGlobalSection(isThreadLocal, isConstGlobal);
-            d.bytes.assign(8, 0);                       // pointer-width zero slot
-            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(8));
+            std::uint64_t const pointerBytes = scalarByteSize(TypeKind::Ptr, dataModel).value_or(0);
+            d.bytes.assign(pointerBytes, 0);            // pointer-width zero slot
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(pointerBytes));
             d.relocations.push_back(Relocation{
                 /*offset=*/0u,
                 /*target=*/SymbolId{sa.symbol},

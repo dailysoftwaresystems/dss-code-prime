@@ -349,7 +349,12 @@ TEST(CoffDirectiveImageRequests, EachImageRequestReadsAsLinkExeReadsIt) {
     EXPECT_EQ(std::get<UnitSubsystemRequest>(i[4].value).setting, (SubsystemSetting{3, std::nullopt}))
         << "names and options compare without regard to case";
     EXPECT_TRUE(std::get<UnitEntryRequest>(i[5].value).runtimeStartup);
+    EXPECT_EQ(std::get<UnitEntryRequest>(i[5].value).verbs,
+              (std::vector<EntryMaterialization>{EntryMaterialization::None, EntryMaterialization::ArgcArgv,
+                                                 EntryMaterialization::ArgcArgvEnvp}))
+        << "a runtime startup carries the verbs its vocabulary row states (P69 fold 3e)";
     EXPECT_FALSE(std::get<UnitEntryRequest>(i[6].value).runtimeStartup);
+    EXPECT_TRUE(std::get<UnitEntryRequest>(i[6].value).verbs.empty());
     EXPECT_EQ(std::get<UnitEntryRequest>(i[6].value).symbol, "dss_entry");
     auto const& section = std::get<UnitSectionAttributeRequest>(i[7].value).request;
     EXPECT_EQ(section.section, ".data");
@@ -388,7 +393,7 @@ TEST(CoffDirectiveImageRequests, WhatLinkExeReplacesWithItsDefaultIsWarnedAndRep
 TEST(CoffDirectiveImageRequests, WhatADssImageCannotCarryIsARequestTheImageLinkRefuses) {
     auto const r = pe::parseCoffLinkerDirectives(
         " /MERGE:.rdata=.text \"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls'\""
-        " /ENTRY:wmainCRTStartup /SUBSYSTEM:NATIVE /EXPORT:f,@3 /EXPORT:g,@4,NONAME /EXPORT:h=otherdll.h",
+        " /ENTRY:WinMainCRTStartup /SUBSYSTEM:NATIVE /EXPORT:f,@3 /EXPORT:g,@4,NONAME /EXPORT:h=otherdll.h",
         vocabulary());
     ASSERT_TRUE(r.has_value()) << r.error();
     ASSERT_EQ(r->image.size(), 7u);
@@ -398,8 +403,8 @@ TEST(CoffDirectiveImageRequests, WhatADssImageCannotCarryIsARequestTheImageLinkR
     std::vector<std::string> reasons;
     for (auto const& req : r->image) {
         if (auto const* entry = std::get_if<UnitEntryRequest>(&req.value)) {
-            EXPECT_EQ(req.spelled, "/ENTRY:wmainCRTStartup");
-            EXPECT_EQ(entry->symbol, "wmainCRTStartup");
+            EXPECT_EQ(req.spelled, "/ENTRY:WinMainCRTStartup");
+            EXPECT_EQ(entry->symbol, "WinMainCRTStartup");
             EXPECT_FALSE(entry->runtimeStartup);
             reasons.push_back(entry->unsupported);
         } else if (auto const* subsystem = std::get_if<UnitSubsystemRequest>(&req.value)) {
@@ -414,7 +419,7 @@ TEST(CoffDirectiveImageRequests, WhatADssImageCannotCarryIsARequestTheImageLinkR
     EXPECT_NE(reasons[0].find("changes what a program MEANS"), std::string::npos) << reasons[0];
     EXPECT_NE(reasons[0].find("D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE"), std::string::npos);
     EXPECT_NE(reasons[1].find("manifest"), std::string::npos) << reasons[1];
-    EXPECT_NE(reasons[2].find("calls `wmain`"), std::string::npos) << reasons[2];
+    EXPECT_NE(reasons[2].find("calls `WinMain("), std::string::npos) << reasons[2];
     EXPECT_NE(reasons[3].find("NtProcessStartup"), std::string::npos) << reasons[3];
     EXPECT_NE(reasons[4].find("ORDINAL or NONAME ('@3')"), std::string::npos) << reasons[4];
     EXPECT_NE(reasons[5].find("ORDINAL or NONAME"), std::string::npos) << reasons[5];
@@ -1112,11 +1117,11 @@ TEST(CoffDirectiveImageRequests, TheDecisionReadsEachRequestsSharedLibraryAnswer
 // pulls loses it with the warning, a later one loses to the first — and it is refused only where it would stand. The
 // same holds for a subsystem no DSS image starts under: one a later `/SUBSYSTEM:` replaces links, as link.exe's does.
 TEST(CoffDirectiveImageRequests, AnUnsupportedStartupOrSubsystemIsRefusedOnlyWhereItStands) {
-    UnitLinkerRequests pulled = statedBy(requestsOf(" /ENTRY:wmainCRTStartup"), "lib.a(wide.obj)");
+    UnitLinkerRequests pulled = statedBy(requestsOf(" /ENTRY:WinMainCRTStartup"), "lib.a(gui.obj)");
     linker::dropPulledMemberEntryRequests(pulled);
     EXPECT_TRUE(pulled.image.empty()) << "a pulled member names no entry, whatever it names";
     ASSERT_EQ(pulled.warnings.size(), 1u);
-    EXPECT_NE(pulled.warnings[0].find("'lib.a(wide.obj)': the directive '/ENTRY:wmainCRTStartup' names the image's "
+    EXPECT_NE(pulled.warnings[0].find("'lib.a(gui.obj)': the directive '/ENTRY:WinMainCRTStartup' names the image's "
                                       "entry, and the archive search pulled that member"),
               std::string::npos)
         << pulled.warnings[0];
@@ -1128,17 +1133,17 @@ TEST(CoffDirectiveImageRequests, AnUnsupportedStartupOrSubsystemIsRefusedOnlyWhe
     }
     {   // Named to the link, it stands: refused by name with the row's reason.
         auto const l =
-            linkExe({programUnit(), requestingUnit(2, statedBy(requestsOf(" /ENTRY:wmainCRTStartup"), "wide.obj"))});
+            linkExe({programUnit(), requestingUnit(2, statedBy(requestsOf(" /ENTRY:WinMainCRTStartup"), "gui.obj"))});
         EXPECT_TRUE(l->image.bytes.empty());
         EXPECT_EQ(countCode(l->rep, DiagnosticCode::K_LinkerDirectiveUnhonourable), 1u) << diagnosticsOf(l->rep);
-        EXPECT_TRUE(sawText(l->rep, "'wide.obj': the directive '/ENTRY:wmainCRTStartup' cannot be honoured by this "
+        EXPECT_TRUE(sawText(l->rep, "'gui.obj': the directive '/ENTRY:WinMainCRTStartup' cannot be honoured by this "
                                     "image"))
             << diagnosticsOf(l->rep);
-        EXPECT_TRUE(sawText(l->rep, "calls `wmain`")) << diagnosticsOf(l->rep);
+        EXPECT_TRUE(sawText(l->rep, "calls `WinMain(")) << diagnosticsOf(l->rep);
     }
     {   // After another unit's entry it loses to the first, as link.exe keeps the first: warned, and the image links.
         auto const l = linkExe({programUnit(), requestingUnit(2, requestsOf(" /ENTRY:dss_entry")),
-                                extraUnit(3, requestsOf(" /ENTRY:wmainCRTStartup"))});
+                                extraUnit(3, requestsOf(" /ENTRY:WinMainCRTStartup"))});
         ASSERT_TRUE(l->pe.has_value()) << diagnosticsOf(l->rep);
         EXPECT_EQ(l->pe->bytesAt(l->pe->entry(), 6),
                   (std::vector<std::uint8_t>{std::begin(kEntryBody), std::end(kEntryBody)}));
@@ -1276,8 +1281,9 @@ TEST(CoffDirectiveImageRequests, AnEntryANamedObjectDoesNotDefineIsARequiredRefe
     }
     linker::requireEntryReference(stating);
     EXPECT_EQ(stating.externImports.size(), 1u) << "the row it made is the name's reference: flagged, not doubled";
-    // CONTROLS: no reference for an entry the unit defines, the C runtime's startup, or a startup no DSS image has.
-    for (char const* text : {" /ENTRY:dss_entry", " /ENTRY:mainCRTStartup", " /ENTRY:wmainCRTStartup"}) {
+    // CONTROLS: no reference for an entry the unit defines, the C runtime's startups, or a startup no DSS image has.
+    for (char const* text :
+         {" /ENTRY:dss_entry", " /ENTRY:mainCRTStartup", " /ENTRY:wmainCRTStartup", " /ENTRY:WinMainCRTStartup"}) {
         SCOPED_TRACE(text);
         AssembledModule m = requestingUnit(2, requestsOf(text));
         linker::requireEntryReference(m);

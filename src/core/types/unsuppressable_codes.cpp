@@ -806,7 +806,13 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // joins under `kWhyMirVerifier`, a member like every I_* verifier invariant (a Phi that does not
 // take its value from every way into its block). Written from main's 202; a fold landing another
 // member first reconciles the count.
-constexpr std::array<UnsuppressableEntry, 203> kUnsuppressableCodes{{
+// ⓘ EXTENT 203 → 202 (2026-11-05, P69 fold 3e, lane `xa`, class C's N3): `S_EntryShapeNotDeclared`
+// LEAVES. It is a WARNING now -- a definition of an entry name whose signature is none of the rows its
+// format realizes is the program's entry all the same, called with the richest row, as gcc (-Wmain) and
+// MSVC link and run it -- so suppressing it hides advice while the build proceeds to the program every
+// reference makes: it fails both prongs, as gcc's -Wmain is suppressible. The program-entry block below
+// is rewritten in place. Written from main's 203; a fold landing another member first reconciles the count.
+constexpr std::array<UnsuppressableEntry, 202> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1437,7 +1443,8 @@ constexpr std::array<UnsuppressableEntry, 203> kUnsuppressableCodes{{
     {DiagnosticCode::K_FormatLacksProcessExit, kWhyEntryTrampoline},
     {DiagnosticCode::K_ExecEntryNotTrampolined, kWhyEntryTrampoline},
     // The PROGRAM-ENTRY RESOLUTION family (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE,
-    // 2026-08-10) — four codes, one rule, and the rule is that EVERY outcome of
+    // 2026-08-10) — three codes since P69 fold 3e (four before: see the shape
+    // check's bullet), one rule, and the rule is that EVERY outcome of
     // entry resolution other than "exactly one candidate" must be undroppable.
     // Suppression here restores a MEASURED fault rather than a hypothetical one:
     // before these codes existed, `int main(int, char**, char**)` compiled rc=0
@@ -1448,12 +1455,14 @@ constexpr std::array<UnsuppressableEntry, 203> kUnsuppressableCodes{{
     // allow, and suppression would hand exactly that binary back. A silently
     // miscompiled entry has NO other trace: the build reports success.
     //
-    // ★ WHY ALL FOUR AND NOT JUST THE SHAPE CHECK. Each is a distinct way to end
-    // up running the wrong code, or none, with a successful-looking build:
-    //   * S_EntryShapeNotDeclared — the definition has the wrong signature for its
-    //     name. (The measured 3-param-main fault above is closed by SUPPORT
-    //     now — the language declares that row — so what this code refuses
-    //     is every signature the language does NOT declare for an entry name.)
+    // ★ WHY THESE THREE. Each is a distinct way to end up running the wrong code,
+    // or none, with a successful-looking build:
+    //   * (S_EntryShapeNotDeclared LEFT this family in P69 fold 3e. It refused
+    //     every signature the language declares no row for an entry name; it now
+    //     WARNS where the definition is entered all the same, with the richest row
+    //     its format realizes, as gcc (-Wmain) and MSVC run `int main(int,
+    //     double)` and `int main(int, char**, int)` (✔MEASURED, lane `xa`). A
+    //     silenced warning leaves the program every reference makes: no prong.)
     //   * K_ProgramEntryUndefined — an exec build with NO candidate. Suppressed,
     //     the build proceeds to a link-tier "symbol not found" at best, and the
     //     explanation of WHY (the verb this format cannot realize) is lost.
@@ -1463,7 +1472,6 @@ constexpr std::array<UnsuppressableEntry, 203> kUnsuppressableCodes{{
     //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
     //     disagree. Suppressed, the materializer reads past the end of the
     //     parameter list.
-    {DiagnosticCode::S_EntryShapeNotDeclared, kWhyProgramEntry},
     {DiagnosticCode::K_ProgramEntryUndefined, kWhyProgramEntry},
     {DiagnosticCode::K_ProgramEntryAmbiguous, kWhyProgramEntry},
     {DiagnosticCode::K_EntryVerbUnmaterializable, kWhyProgramEntry},

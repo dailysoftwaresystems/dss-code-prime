@@ -46,6 +46,15 @@ using namespace dss::test_support::asm_text;
 
 namespace {
 
+// Whether the lowered module EXPORTS a function named `name` -- what the one
+// election reads off an assembly unit (`collectObjectEntryCandidates`, P69 fold
+// 3e: the lowering itself elects no entry).
+[[nodiscard]] bool exportsFunction(AsmTextModule const& m, std::string_view name) {
+    return std::any_of(m.symbols.begin(), m.symbols.end(), [&](ModuleSymbol const& s) {
+        return s.name == name && s.binding == SymbolBinding::Global;
+    });
+}
+
 // The two shipped dialects, paired with the target each one spells and the
 // function-entry marker each one writes. Every test below runs over BOTH —
 // a mechanism witnessed by one dialect is the weaker claim.
@@ -1290,7 +1299,7 @@ TEST(AsmShippedDialects, DirectiveSpellingsFoldOnBothDialects) {
         EXPECT_EQ(a[1].section, DataSectionKind::Data) << d.language;
 
         // The exported entry survived `.GLOBL` + `.TYPE`.
-        EXPECT_TRUE(up->module->userEntrySymbol.has_value())
+        EXPECT_TRUE(exportsFunction(*up->module, "main"))
             << d.language
             << ": `.GLOBL`/`.TYPE` did not export the entry — the fold reached "
                "the spelling but lost the verb";
@@ -1316,7 +1325,7 @@ TEST(AsmShippedDialects, TheFunctionEntryMarkerStaysCaseSensitive) {
             d, "\t.globl main\n\t.type main, " + marker + "\nmain:\n\tret\n");
         ASSERT_TRUE(ok->module.has_value())
             << d.language << ": " << messages(*ok);
-        ASSERT_TRUE(ok->module->userEntrySymbol.has_value()) << d.language;
+        ASSERT_TRUE(exportsFunction(*ok->module, "main")) << d.language;
 
         auto const bad = lowerShipped(
             d, "\t.globl main\n\t.type main, " + shouted + "\nmain:\n\tret\n");
@@ -1394,32 +1403,36 @@ TEST(AsmShippedDialects, SymbolNamesStayCaseSensitive) {
     }
 }
 
-// ★★ THE SAME CONTROL AT THE ENTRY-ELECTION TIER, WHICH IS WHERE FOLDING A
-// SYMBOL WOULD DO THE MOST DAMAGE. `entryLabels: ["main"]` is dialect config
-// matched against a PROGRAM label, so it is a symbol comparison and must stay
-// exact: if it folded, a file whose only exported function is `MAIN` would be
-// silently elected as the program entry.
+// ★★ THE SAME CONTROL AT THE ENTRY-LABEL TIER, WHERE FOLDING A SYMBOL WOULD DO
+// THE MOST DAMAGE. The dialect's `entryLabels` rows are config matched against a
+// PROGRAM label, so the comparison is a symbol comparison and must stay exact.
+// At this tier the comparison is the export check (P69 fold 3e: the lowering
+// elects nothing; the election's own exact match is pinned with the elections,
+// `ObjectEntry.AnAssemblyUnitsEntryIsElectedWithTheObjects`): a NON-exported
+// `main` is refused as an entry with local linkage, and a non-exported `MAIN`
+// is an ordinary local function -- if the match folded, `MAIN` would be refused
+// too.
 TEST(AsmShippedDialects, TheEntryLabelMatchStaysCaseSensitive) {
     for (auto const& d : {kX86, kArm}) {
         std::string const marker{d.functionMarker};
         auto const lower = lowerShipped(
-            d, "\t.globl main\n\t.type main, " + marker + "\nmain:\n\tret\n");
-        ASSERT_TRUE(lower->module.has_value())
+            d, "\t.type main, " + marker + "\nmain:\n\tret\n");
+        ASSERT_TRUE(parsedCleanly(*lower)) << d.language << ": "
+                                           << parseMessages(*lower);
+        EXPECT_FALSE(lower->module.has_value())
+            << d.language << ": a non-exported `main` must be refused by name";
+        EXPECT_NE(messages(*lower).find("not exported"), std::string::npos)
             << d.language << ": " << messages(*lower);
-        EXPECT_TRUE(lower->module->userEntrySymbol.has_value())
-            << d.language << ": `main` must be elected as the entry";
 
         auto const upper = lowerShipped(
-            d, "\t.globl MAIN\n\t.type MAIN, " + marker + "\nMAIN:\n\tret\n");
+            d, "\t.type MAIN, " + marker + "\nMAIN:\n\tret\n");
         ASSERT_TRUE(parsedCleanly(*upper)) << d.language << ": "
                                            << parseMessages(*upper);
         ASSERT_TRUE(upper->module.has_value())
-            << d.language << ": a function called `MAIN` is perfectly legal "
-                             "assembly and must lower: " << messages(*upper);
-        EXPECT_FALSE(upper->module->userEntrySymbol.has_value())
-            << d.language
-            << ": `MAIN` was elected as the program entry — the entry-label "
-               "match is folding, and a symbol match must not";
+            << d.language << ": a local function called `MAIN` is perfectly "
+                             "legal assembly and must lower — the entry-label "
+                             "match is folding, and a symbol match must not: "
+            << messages(*upper);
     }
 }
 

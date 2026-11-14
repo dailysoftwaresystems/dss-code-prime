@@ -21,11 +21,12 @@
  * observable rather than a crash — so this example fails LOUD on a wrong
  * selection instead of merely failing to build.
  *
- * ★ THE SAME SOURCE IS DELIBERATELY REFUSED ON pe64, and that is not an
- * inconsistency: pe64 realizes BOTH verbs (the UCRT publishes a wide vector), so
- * both candidates survive and picking one silently is the defect. That half is
- * pinned by the sibling example `entry_main_and_wmain_ambiguous_pe`. The two
- * examples together are the actual claim: candidacy is per-format DATA.
+ * ★ ON pe64 THE SAME SOURCE TAKES `main` TOO, BUT WITH A WARNING, and that is
+ * not an inconsistency: pe64 realizes BOTH verbs (the UCRT publishes a wide
+ * vector), so both candidates survive, and the format's stated precedence --
+ * the references' answer (P69 fold 3e) -- elects `main` and names `wmain`. That
+ * half is pinned by the sibling example `entry_main_and_wmain_pe_takes_main`.
+ * The two examples together are the actual claim: candidacy is per-format DATA.
  *
  * `argv` is spelled `unsigned short**`, never `wchar_t**` — wchar_t is 16-bit on
  * Windows and 32-bit on Linux, so a wchar_t spelling would silently change shape

@@ -1255,6 +1255,22 @@
           {
             "when": {
               "dataModel": "LP64",
+              "format": "elf",
+              "arch": "x86_64"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "arm64"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
               "format": "macho"
             },
             "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> i64 \"long\""
@@ -1271,6 +1287,7 @@
       "kind": "function",
       "linkage": "external",
       "availableObjectFormats": [
+        "elf",
         "pe",
         "macho"
       ],
@@ -1280,6 +1297,22 @@
       "name": "__dss_platform_strtoumax",
       "signature": {
         "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "x86_64"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "arm64"
+            },
+            "value": "fn(ptr<const<char>>, ptr<ptr<char>>, i32) -> u64 \"unsigned long\""
+          },
           {
             "when": {
               "dataModel": "LP64",
@@ -1299,6 +1332,7 @@
       "kind": "function",
       "linkage": "external",
       "availableObjectFormats": [
+        "elf",
         "pe",
         "macho"
       ],
@@ -1308,6 +1342,22 @@
       "name": "__dss_platform_wcstoimax",
       "signature": {
         "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "x86_64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> i64 \"long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "arm64"
+            },
+            "value": "fn(ptr<const<u32>>, ptr<ptr<u32>>, i32) -> i64 \"long\""
+          },
           {
             "when": {
               "format": "macho",
@@ -1327,6 +1377,7 @@
       "kind": "function",
       "linkage": "external",
       "availableObjectFormats": [
+        "elf",
         "pe",
         "macho"
       ],
@@ -1336,6 +1387,22 @@
       "name": "__dss_platform_wcstoumax",
       "signature": {
         "variants": [
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "x86_64"
+            },
+            "value": "fn(ptr<const<i32>>, ptr<ptr<i32>>, i32) -> u64 \"unsigned long\""
+          },
+          {
+            "when": {
+              "dataModel": "LP64",
+              "format": "elf",
+              "arch": "arm64"
+            },
+            "value": "fn(ptr<const<u32>>, ptr<ptr<u32>>, i32) -> u64 \"unsigned long\""
+          },
           {
             "when": {
               "format": "macho",
@@ -1355,6 +1422,7 @@
       "kind": "function",
       "linkage": "external",
       "availableObjectFormats": [
+        "elf",
         "pe",
         "macho"
       ],

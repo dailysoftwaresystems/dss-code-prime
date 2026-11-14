@@ -639,7 +639,7 @@ TEST(AsmTemplateToLir, TemplateAndStandaloneAgreeByteForByte) {
 
     DiagnosticReporter rep;
     auto const mod = lowerAsmTextToLir(unit.trees()[0], *dialect, **targetR,
-                                       dialect->assembly().entryLabels, rep);
+                                       dialect->assembly().entryLabelNames(), rep);
     ASSERT_TRUE(mod.has_value()) << [&] {
         std::string s;
         for (auto const& d : rep.all()) { s += d.actual; s += '\n'; }
@@ -710,7 +710,7 @@ TEST(AsmTemplateToLir, Arm64CounterReadIsOneVerbAcrossBothFrontEnds) {
 
     DiagnosticReporter rep;
     auto const mod = lowerAsmTextToLir(unit.trees()[0], *dialect, **targetR,
-                                       dialect->assembly().entryLabels, rep);
+                                       dialect->assembly().entryLabelNames(), rep);
     ASSERT_TRUE(mod.has_value()) << [&] {
         std::string s;
         for (auto const& d : rep.all()) { s += d.actual; s += '\n'; }
@@ -1524,7 +1524,7 @@ TEST(AsmTemplateToLir, EscapedPercentAndPlainPercentReachIdenticalBytes) {
     ASSERT_FALSE(unit.trees().empty());
     DiagnosticReporter rep;
     auto const mod = lowerAsmTextToLir(unit.trees()[0], *dialect, **targetR,
-                                       dialect->assembly().entryLabels, rep);
+                                       dialect->assembly().entryLabelNames(), rep);
     ASSERT_TRUE(mod.has_value()) << [&] {
         std::string s;
         for (auto const& d : rep.all()) { s += d.actual; s += '\n'; }

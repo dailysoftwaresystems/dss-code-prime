@@ -1,6 +1,7 @@
 #include "link/format/coff_object_reader.hpp"
 #include "link/format/coff_linker_directives.hpp"   // parseCoffLinkerDirectives — (3b)
 #include "link/format/foreign_section_alignment.hpp"
+#include "link/format/input_section_names.hpp"   // inputSectionRow, isInputSubsectionOf
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/record_symbol_ids.hpp"
 #include "link/format/object_format_backends.hpp"
@@ -905,17 +906,15 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // way or by its `$` group, belongs to the unwind families (7.5) or to
         // the directive section (3b), is refused below by Gate 2, or is a
         // discardable debug section.
-        std::string base = sec.name.substr(0, sec.name.find('$'));
-        if (!nameToKind.contains(base)) {
-            std::size_t bestLen = 0;
-            for (auto const& row : objectFormatSchema.sections()) {
-                std::size_t const n = row.name.size();
-                if (base.size() > n + 1 && base[n] == '.' && base.compare(0, n, row.name) == 0 && n > bestLen) {
-                    bestLen = n;
-                }
-            }
-            if (bestLen != 0) base.resize(bestLen);
-        }
+        //
+        // ★ BOTH RULES ARE NOW THE DOCUMENT'S (P69 fold 3e, the orchestrator's
+        // ledger 577): the row a name reads as is `inputSectionRow`'s answer --
+        // the exact row, else the longest row the name is a part of under the
+        // document's `subsectionSeparators` (`$` and `.` for COFF) -- the one
+        // function every reader asks. That answer names the ROW, never the kind
+        // alone, so the reloc-presence split of `.rdata` below still decides.
+        auto const row = link::format::inputSectionRow(objectFormatSchema, {}, sec.name);
+        std::string const base = row.has_value() ? objectFormatSchema.sections()[*row].name : sec.name;
         if (auto it = nameToKind.find(base); it != nameToKind.end()) {
             sec.kind = it->second;
         }
@@ -3121,8 +3120,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // refusal above answers it.
                 // Running them is D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN.
                 namespace win64 = link::format::win64;
-                if (win64::isSectionOf(sec.name, win64::kFunctionTableSection)
-                    || win64::isSectionOf(sec.name, win64::kUnwindInfoSection)
+                if (link::format::isInputSubsectionOf(objectFormatSchema, sec.name,
+                                                      win64::kFunctionTableSection)
+                    || link::format::isInputSubsectionOf(objectFormatSchema, sec.name,
+                                                         win64::kUnwindInfoSection)
                     || (sec.chars & kScnNotForTheImage) != 0u) {
                     continue;
                 }
@@ -3241,8 +3242,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         std::vector<bool>        inEitherFamily(sections.size(), false);
         std::vector<bool>        holdsUnwindInfo(sections.size(), false);
         for (std::size_t si = 0; si < sections.size(); ++si) {
-            bool const table = win64::isSectionOf(sections[si].name, win64::kFunctionTableSection);
-            bool const info  = win64::isSectionOf(sections[si].name, win64::kUnwindInfoSection);
+            bool const table = link::format::isInputSubsectionOf(objectFormatSchema, sections[si].name,
+                                                                 win64::kFunctionTableSection);
+            bool const info  = link::format::isInputSubsectionOf(objectFormatSchema, sections[si].name,
+                                                                 win64::kUnwindInfoSection);
             if (table) tableSections.push_back(si);
             holdsUnwindInfo[si] = info;
             inEitherFamily[si]  = table || info;

@@ -54,9 +54,12 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"
 #include "core/substrate/phase_timers.hpp"
 #include "host_native_target.hpp"
+#include "link/object_format_schema.hpp"
 #include "pe_image_readers.hpp"
+#include "program/compile_pipeline.hpp"   // extractStaticArchiveMembers: the archive-member pins' reader
 #include "program/program.hpp"
 #include "program/runtime_object_cache.hpp"   // kRuntimeCacheOverrideVariable
 #include "run_binary.hpp"
@@ -71,6 +74,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -476,19 +480,26 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteRunsTheProgramStageOptimize) {
 //
 // ★ WHY `main` + `wmain` AND NOT ANY OTHER PAIR: `pe64-x86_64-windows-exec` is
 // the only shipped format whose declared `entryVerbs` contain `argc-wargv`, so
-// this is the one pair that is BOTH realizable on one format — making the
-// correct answer `K_ProgramEntryAmbiguous` — and reduced to first-match-wins by
-// an empty span. On ELF the `wmain` row does not survive the intersection at
-// all, so the same source there resolves to `main` and witnesses nothing.
+// this is the one pair that is BOTH realizable on one format, and reduced to
+// first-match-wins by an empty span. On ELF the `wmain` row does not survive the
+// intersection at all, so the same source there resolves to `main` and
+// witnesses nothing.
+// ★ P69 fold 3e (the review of fold 3d's X2): the pair is no longer refused. The
+// format RANKS the two startups (`entryPrecedence`), as link.exe, lld-link and
+// MinGW-w64 do (✔MEASURED, each runs `main`), so the election takes `main` and
+// says so, `K_ProgramEntryChosenByPrecedence`. The witness stays exact: `wmain`
+// is unit 0 and `main` unit 1, so an EMPTY verb span (first-match-wins) elects
+// `wmain` with no warning, and a route that supplied the verbs but not the
+// precedence refuses the pair as ambiguous -- both red here.
 TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsEntryVerbs) {
     ScratchDir scratch{Location::InsideRepo, "driver-arg-supply"};
     scratch.useAsCwd();
-    auto const a = writeSrc(scratch.path(), "entry_main.c",
-                            "int main(int argc, char** argv) {\n"
+    auto const a = writeSrc(scratch.path(), "entry_wmain.c",
+                            "int wmain(int argc, unsigned short** argv) {\n"
                             "    return argc + (argv != 0);\n"
                             "}\n");
-    auto const b = writeSrc(scratch.path(), "entry_wmain.c",
-                            "int wmain(int argc, unsigned short** argv) {\n"
+    auto const b = writeSrc(scratch.path(), "entry_main.c",
+                            "int main(int argc, char** argv) {\n"
                             "    return argc + (argv != 0);\n"
                             "}\n");
 
@@ -498,17 +509,18 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsEntryVerbs) {
     int const rc = prog.compileUnits({a.generic_string(), b.generic_string()},
                                      "c", {std::string{kPeExecSpec}},
                                      rep);
-    EXPECT_NE(rc, 0)
-        << "two realizable program entries in one pe64 program must be "
-           "REFUSED; a zero exit means one of them was silently chosen\n"
+    EXPECT_EQ(rc, 0)
+        << "`main` beside `wmain` on pe64 links and starts at `main`, as every "
+           "reference linker of the format does\n"
         << allDiagnosticText(rep);
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_ProgramEntryAmbiguous))
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_ProgramEntryChosenByPrecedence))
         << "the merged driver path must hand `resolveProgramEntry` the "
-           "FORMAT's declared entryVerbs. An empty span takes the "
-           "'this format starts no program' arm, which resolves by name with "
-           "no ambiguity check and returns candidate 0 — first-match-wins on "
-           "an exec format, with no diagnostic\n"
+           "FORMAT's declared entryVerbs AND its precedence. An empty verb span "
+           "takes the 'this format starts no program' arm, which resolves by "
+           "name and returns candidate 0 (`wmain`) with no diagnostic; verbs "
+           "without the precedence refuse the pair\n"
         << allDiagnosticText(rep);
+    EXPECT_FALSE(sawCode(rep, DiagnosticCode::K_ProgramEntryAmbiguous)) << allDiagnosticText(rep);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1096,6 +1108,68 @@ void suppliesTheFormatsDataImportBinding(Route const route) {
 
 TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataImportBinding) { suppliesTheFormatsDataImportBinding(Route::MergedUnits); }
 TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsDataImportBinding) { suppliesTheFormatsDataImportBinding(Route::SoleUnit); }
+
+// ★ THE TWIN WHERE THE BINDING IS THE ONLY ROUTE (P69 fold 3e, lane `xa`). On pe64 the `indirect-slot` dispatch puts
+// EVERY extern import in a slot whatever `dataImportBinding` says (READ, mir_to_lir.cpp's P54 arm), so the pe64 image
+// above cannot tell a dropped binding: ✔MEASURED, the sole-CU route's mutant SURVIVED checkpoint 39's
+// windows-x86_64-debug sweep. A Mach-O executable reaches a call through a stub, never through a data slot, so its
+// `got-indirect` binding is the one road to an extern DATUM's value: `stdout` (`__stdoutp` on Mach-O) read through its
+// `__got` slot is the C library's FILE, whose descriptor `fileno` reports as 1. One indirection short, the program
+// holds the SLOT's address instead, and `fileno` of that is not the standard output's.
+namespace {
+constexpr std::string_view kMachoArm64ExecSpec = "arm64:macho64-arm64-darwin-exec";
+
+void suppliesTheFormatsDataImportBindingOnMachO(Route const route) {
+    SCOPED_TRACE(routeName(route));
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-dataimport-macho"};
+    scratch.useAsCwd();
+    auto const out = scratch.path() / "dataimport_macho_out";
+    DiagnosticReporter rep;
+    ASSERT_EQ(buildOnRoute(route,
+                  scratch, "dataimport_a.c",
+                  "#include <stdio.h>\n"
+                  "int dib_check(void) {\n"
+                  "    FILE *viaImport = stdout;\n"
+                  "    if (viaImport == 0) return 2;\n"
+                  "    if (fileno(viaImport) != 1) return 4;\n"
+                  "    return 42;\n"
+                  "}\n",
+                  "dataimport_b.c",
+                  "extern int dib_check(void);\n"
+                  "int main(void) { return dib_check(); }\n",
+                  kMachoArm64ExecSpec, out, rep),
+              0)
+        << "the Mach-O extern DATA build must succeed\n"
+        << allDiagnosticText(rep);
+
+    auto const exe = out / "dataimport_a";
+    auto const img = readAllBytes(exe);
+    ASSERT_FALSE(img.empty()) << "the Mach-O artifact must exist";
+    // The premise: the data object is really imported, so the binding this pin is about really was consulted.
+    EXPECT_GE(countBytes(img, "___stdoutp"), 1u) << "the emitted image must import the extern DATA object";
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    auto const r = dss::test_support::runBinary(exe, dss::test_support::kRunBudget);
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_FALSE(r.timedOut) << r.diagnostic;
+    EXPECT_EQ(r.exitCode, 42u)
+        << "the Mach-O extern DATA read through its slot: exit 4 is the AGREEMENT rung, `fileno` of what the "
+           "program read as `stdout` is not the standard output's, which is what a dropped `dataImportBinding` "
+           "produces -- the address materialization stops one indirection short and yields the `__got` SLOT's "
+           "address instead of the FILE's. Exit 2 would mean the slot was never filled";
+#else
+    GTEST_SKIP() << "an arm64 Mach-O image only RUNS on an arm64 Mac. The build and import-premise assertions above "
+                    "still run on every leg.";
+#endif
+}
+} // namespace
+
+TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataImportBindingOnMachO) {
+    suppliesTheFormatsDataImportBindingOnMachO(Route::MergedUnits);
+}
+TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsDataImportBindingOnMachO) {
+    suppliesTheFormatsDataImportBindingOnMachO(Route::SoleUnit);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // `externAddrBinding` — how an undefined extern's ADDRESS-AS-A-VALUE
@@ -2416,4 +2490,136 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheImageDefinedNames) {
 }
 TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheImageDefinedNames) {
     suppliesTheImageDefinedNames(Route::SoleUnit);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE ARCHIVE-MEMBER CALL (P69 fold 3e, X6 of the review of fold 3d): three of
+// the arguments the driver hands each static-archive member's own
+// `lowerCuMirToAssembly` -- `sehPersonality` (from which the call derives the
+// member's SEH scopes), `wideFloatSoftcallLibrary` and `atomicsRuntime` -- each
+// witnessed in the ARCHIVE the build writes. A member is final (a foreign linker
+// pulls it whole), so what it owes is in its own bytes, read back through the
+// production member reader (`extractStaticArchiveMembers`). Two sources, so the
+// archive has two members and the build takes the archive route, never the
+// sole-CU one. (The fourth cell, `cuId`, has no consequence on this call: the
+// header's section C.)
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// Build the pair into the static-library document `targetSpec` names; the
+// archive's path, or nullopt with the failure recorded.
+[[nodiscard]] std::optional<fs::path> buildArchiveOfPair(ScratchDir& scratch, std::string_view nameA,
+                                                         std::string_view srcA, std::string_view nameB,
+                                                         std::string_view srcB, std::string_view targetSpec,
+                                                         DiagnosticReporter& rep) {
+    auto const a = writeSrc(scratch.path(), nameA, srcA);
+    auto const b = writeSrc(scratch.path(), nameB, srcB);
+    Program prog;
+    prog.setOutputDir(scratch.path() / "archive_out");
+    if (prog.compileUnits({a.generic_string(), b.generic_string()}, "c", {std::string{targetSpec}}, rep) != 0) {
+        ADD_FAILURE() << "the two-unit static library " << targetSpec << " must build\n" << allDiagnosticText(rep);
+        return std::nullopt;
+    }
+    if (prog.artifactPaths().size() != 1u || !prog.artifactPaths().front().has_value()) {
+        ADD_FAILURE() << "one target, one artifact";
+        return std::nullopt;
+    }
+    return *prog.artifactPaths().front();
+}
+
+}  // namespace
+
+// `sehPersonality` -> the member's SEH scopes: a pe64 member whose function holds
+// `__try`/`__except` names its exception handler in that function's UNWIND_INFO,
+// so the COFF reader reads the function back WITH a language handler. Without
+// the personality the unit is either refused or its member names no handler;
+// both red here.
+TEST(DriverArgumentSupply, ArchiveMemberRouteSuppliesTheSehScopes) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-archive-seh"};
+    scratch.useAsCwd();
+    DiagnosticReporter rep;
+    auto const archive = buildArchiveOfPair(scratch, "aseh_a.c",
+                                            "#include <windows.h>\n"
+                                            "int aseh_guarded(void) {\n"
+                                            "    void *p = VirtualAlloc(0, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);\n"
+                                            "    if (p == 0) return 10;\n"
+                                            "    int rc = 0;\n"
+                                            "    __try { rc = *(volatile int *)p; }\n"
+                                            "    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION) { rc = 42; }\n"
+                                            "    return rc;\n"
+                                            "}\n",
+                                            "aseh_b.c",
+                                            "extern int aseh_guarded(void);\n"
+                                            "int aseh_entry(void) { return aseh_guarded(); }\n",
+                                            "x86_64:pe64-x86_64-windows-staticlib", rep);
+    ASSERT_TRUE(archive.has_value());
+    auto const target = dss::TargetSchema::loadShipped("x86_64");
+    auto const format = dss::ObjectFormatSchema::loadShipped("pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(target.has_value() && format.has_value());
+    DiagnosticReporter readRep;
+    auto const members = dss::extractStaticArchiveMembers(std::span<fs::path const>{&*archive, 1}, **target,
+                                                          **format, readRep);
+    ASSERT_TRUE(members.has_value()) << "the archive does not read back\n" << allDiagnosticText(readRep);
+    ASSERT_EQ(members->modules.size(), 2u) << "one member per unit";
+    std::size_t guarded = 0;
+    for (auto const& unit : members->modules) {
+        for (auto const& ms : unit.symbols) {
+            if (ms.name != "aseh_guarded") continue;
+            for (auto const& fn : unit.functions) {
+                if (fn.symbol != ms.symbol) continue;
+                ++guarded;
+                EXPECT_TRUE(fn.languageHandler.has_value())
+                    << "the member's guarded function names no exception handler in its unwind info: the member was "
+                       "lowered with no SEH scopes, it builds, and the system has nothing to dispatch the fault to";
+            }
+        }
+    }
+    EXPECT_EQ(guarded, 1u) << "the premise: exactly one member defines `aseh_guarded`";
+}
+
+// `wideFloatSoftcallLibrary`: an aarch64 ELF member doing IEEE-binary128
+// arithmetic mints the `__addtf3` family, and with no library binding the
+// lowering refuses (L_RequiredLirOpcodeMissing), so the archive building at all
+// is the witness and the member naming `__addtf3` is its premise. (A member
+// records names only; which library answers them is the image's, read by the
+// sole-CU and merged pins.)
+TEST(DriverArgumentSupply, ArchiveMemberRouteSuppliesTheWideFloatSoftcallLibrary) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-archive-widefloat"};
+    scratch.useAsCwd();
+    DiagnosticReporter rep;
+    auto const archive = buildArchiveOfPair(scratch, "awf_a.c",
+                                            "long double awf_lhs;\n"
+                                            "long double awf_rhs;\n"
+                                            "int awf_sum(void) { awf_lhs = 20.0L; awf_rhs = 22.0L; "
+                                            "return (int)(awf_lhs + awf_rhs); }\n",
+                                            "awf_b.c",
+                                            "extern int awf_sum(void);\n"
+                                            "int awf_entry(void) { return awf_sum(); }\n",
+                                            "arm64:elf64-aarch64-linux-staticlib", rep);
+    ASSERT_TRUE(archive.has_value())
+        << "a refusal naming the runtime-library binding means the archive-member call stopped supplying it";
+    EXPECT_GE(countBytes(readAllBytes(*archive), "__addtf3"), 1u)
+        << "the premise: the member really mints an F128 softcall";
+}
+
+// `atomicsRuntime`: an under-aligned `_Atomic` load in an x86_64 ELF member
+// calls the document's generic `__atomic_load`; without the runtime the member
+// keeps the native load, builds, and loses atomicity with no diagnostic.
+TEST(DriverArgumentSupply, ArchiveMemberRouteSuppliesTheFormatsAtomicsRuntime) {
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-archive-atomics"};
+    scratch.useAsCwd();
+    DiagnosticReporter rep;
+    auto const archive = buildArchiveOfPair(scratch, "apar_a.c",
+                                            "struct __attribute__((packed)) PA { char pad; _Atomic int a; };\n"
+                                            "struct PA apar_g;\n"
+                                            "int apar_load(void) { return apar_g.a; }\n",
+                                            "apar_b.c",
+                                            "extern int apar_load(void);\n"
+                                            "int apar_entry(void) { return apar_load(); }\n",
+                                            "x86_64:elf64-x86_64-linux-staticlib", rep);
+    ASSERT_TRUE(archive.has_value());
+    EXPECT_GE(countBytes(readAllBytes(*archive), "__atomic_load"), 1u)
+        << "the member's under-aligned `_Atomic` load must call the document's generic `__atomic_load`. A member "
+           "that names no such entry kept the native form: the archive-member call handed the lower half no atomics "
+           "runtime";
 }

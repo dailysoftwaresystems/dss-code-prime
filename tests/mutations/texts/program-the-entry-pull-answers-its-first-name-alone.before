@@ -1,0 +1,1 @@
+    bool const everyNameAnswered = substrate::runEveryUnit(names.size(), [&](std::size_t n) {

@@ -1,5 +1,6 @@
 #include "ffi/ingest.hpp"
 
+#include "core/substrate/input_named_diagnostics.hpp"  // readNamingTheInput: a refusal of one input names it
 #include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/abi/abi_catalog.hpp"
@@ -572,15 +573,29 @@ bool checkMergedLibraryInputsMatchTargetFormat(
 // `bindAsmExternImports` in `program/compile_pipeline.cpp` (the encode tier) --
 // the same two-binder shape, and the same one-function remedy, as
 // `recordedImportIdentity` above.
+//
+// ★ A REFUSAL OF ONE LIBRARY NAMES THE LIBRARY (P69 fold 3e, the orchestrator's
+// ledger 583): the FF1 readers report what is wrong with the bytes, and a PE
+// reader's "export-directory RVA ... does not lie in any section's raw data"
+// names no file -- two unreadable libraries read as ONE refusal, the second
+// dropped as a recent duplicate (✔MEASURED, the every-unit pin of the encode
+// tier's binder on the Mac leg). Every diagnostic of this read goes through the
+// class's one home with the library's path in front, here, so neither binder
+// that calls this chokepoint wraps the call itself.
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readImportsForTargetFormat(std::filesystem::path const& libraryPath,
                            ObjectFormatSchema const&    format,
                            DiagnosticReporter&          reporter) {
-    if (auto rejected =
-            checkLibraryMatchesTargetFormat(libraryPath, format, reporter)) {
-        return std::unexpected(std::move(*rejected));
-    }
-    return readImports(libraryPath, reporter);
+    return substrate::readNamingTheInput(
+        core::genericSpelling(libraryPath), reporter,
+        [&](DiagnosticReporter& libraryReporter)
+            -> std::expected<std::vector<ImportSurface>, BinaryReadError> {
+            if (auto rejected = checkLibraryMatchesTargetFormat(
+                    libraryPath, format, libraryReporter)) {
+                return std::unexpected(std::move(*rejected));
+            }
+            return readImports(libraryPath, libraryReporter);
+        });
 }
 
 namespace {

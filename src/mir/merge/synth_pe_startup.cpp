@@ -123,14 +123,16 @@ entryCallConv(TypeInterner const& interner, TypeId entrySig) {
     return InvalidType;   // the loader refuses a `none` shape: no verb row holds one
 }
 
-// The one body of both doors below. `userEntrySymbol` set: the entry is a
-// function of `mir`. Unset with `foreignEntryName` named: the entry is a
-// function ANOTHER input of the link defines under that name, and the init calls
-// it through an import row of the module, by that name.
+// The one body of the three doors below. `userEntrySymbol` set: the entry is a
+// function of `mir`, called with its own signature, or -- `callWithTheVerbs-
+// Signature` -- with the verb's. Unset with `foreignEntryName` named: the entry is
+// a function ANOTHER input of the link defines under that name, and the init calls
+// it through an import row of the module, by that name, with the verb's signature.
 [[nodiscard]] bool materializeEntryShape(Mir&                              mir,
                                          TypeInterner&                     interner,
                                          std::optional<SymbolId>&          userEntrySymbol,
                                          std::string_view                  foreignEntryName,
+                                         bool                              callWithTheVerbsSignature,
                                          std::vector<ExternImport>&        externImports,
                                          EntryMaterialization              verb,
                                          std::optional<ProcessArgs> const& processArgs,
@@ -141,6 +143,20 @@ entryCallConv(TypeInterner const& interner, TypeId entrySig) {
     // No resolved entry (a library TU with no `main`) — nothing to gate and
     // nothing to materialize.
     if (!userEntrySymbol.has_value() && !foreign) return true;
+
+    // ★ THE VERB'S OWN SIGNATURE: the language row's parameter shapes and `int`,
+    // the row's result. Its convention is the one the semantic tier gives every
+    // function it types, the canonical MIR-tier placeholder the calling-convention
+    // pass replaces with the target's at materialize time (`functionTypeOfParams`),
+    // so the init and the call it makes are given the target's C convention exactly
+    // as a source entry's are.
+    auto const verbsSignature = [&] {
+        std::vector<TypeId> params;
+        for (EntryParamShape const shape : entryVerbParams(verb)) {
+            params.push_back(typeOfEntryParamShape(interner, shape));
+        }
+        return interner.fnSig(params, interner.primitive(TypeKind::I32), CallConv::CcSysV);
+    };
 
     // Locate the entry function + its signature in the module — or, for an
     // entry another input defines, its signature from the verb (below).
@@ -160,23 +176,19 @@ entryCallConv(TypeInterner const& interner, TypeId entrySig) {
         // extern) — leave it; the trampoline's own resolution reports that case
         // with `K_EntryPointResolvesToExtern`, which is the accurate diagnostic.
         if (!entryFn.valid() || !entrySig.valid()) return true;
+        // ★ A DEFINITION WHOSE SIGNATURE IS NONE OF ITS NAME'S ROWS (P69 fold 3e,
+        // class C's N3: the semantic tier's `entryCalledWithTheVerbsSignature`) is
+        // called as every reference's startup calls any `main` -- with the verb's
+        // signature, its own parameters receiving those arguments. ✔MEASURED
+        // before: gcc 13.3 and cl 19.44 link `int main(int, double)` and run it.
+        if (callWithTheVerbsSignature) entrySig = verbsSignature();
     } else {
         // ★ AN ENTRY FROM AN OBJECT HAS NO SIGNATURE IN THE INPUT — an assembled
         // function carries no type — so the init calls it with the signature of
-        // the verb it was elected with: the language row's parameter shapes and
-        // `int`, the row's result (P69 fold 3d,
+        // the verb it was elected with (P69 fold 3d,
         // D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS; the verb is
-        // the richest the format realizes, `collectObjectEntryCandidates`). Its
-        // convention is the one the semantic tier gives every function it types,
-        // the canonical MIR-tier placeholder the calling-convention pass replaces
-        // with the target's at materialize time (`functionTypeOfParams`), so the
-        // init and the call it makes are given the target's C convention exactly
-        // as a source entry's are.
-        std::vector<TypeId> params;
-        for (EntryParamShape const shape : entryVerbParams(verb)) {
-            params.push_back(typeOfEntryParamShape(interner, shape));
-        }
-        entrySig = interner.fnSig(params, interner.primitive(TypeKind::I32), CallConv::CcSysV);
+        // the richest the format realizes, `collectObjectEntryCandidates`).
+        entrySig = verbsSignature();
     }
 
     // ── MATERIALIZE: dispatch on the DECIDED verb × the declared MECHANISM ──
@@ -314,7 +326,9 @@ entryCallConv(TypeInterner const& interner, TypeId entrySig) {
     // has no C signature IN THE INPUT; its signature above is BUILT from the verb,
     // and agrees with it by construction. Whether the object's `main` declares
     // fewer parameters is the case every reference startup also passes through
-    // (it passes every value to every `main`).
+    // (it passes every value to every `main`). The same holds for a definition
+    // whose signature is none of its name's rows (`callWithTheVerbsSignature`,
+    // P69 fold 3e): it is called with the verb's signature, built the same way.
     auto const params = interner.fnParams(entrySig);
     if (params.size() < verbParams.size()) {
         // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
@@ -653,8 +667,21 @@ bool realizeEntryShape(Mir&                              mir,
                        CSymbolDecorationScheme           scheme,
                        std::string_view                  formatName,
                        DiagnosticReporter&               reporter) {
-    return materializeEntryShape(mir, interner, userEntrySymbol, {}, externImports, verb,
-                                 processArgs, scheme, formatName, reporter);
+    return materializeEntryShape(mir, interner, userEntrySymbol, {}, /*callWithTheVerbsSignature=*/false,
+                                 externImports, verb, processArgs, scheme, formatName, reporter);
+}
+
+bool realizeEntryShapeWithTheVerbsSignature(Mir&                              mir,
+                                            TypeInterner&                     interner,
+                                            std::optional<SymbolId>&          userEntrySymbol,
+                                            std::vector<ExternImport>&        externImports,
+                                            EntryMaterialization              verb,
+                                            std::optional<ProcessArgs> const& processArgs,
+                                            CSymbolDecorationScheme           scheme,
+                                            std::string_view                  formatName,
+                                            DiagnosticReporter&               reporter) {
+    return materializeEntryShape(mir, interner, userEntrySymbol, {}, /*callWithTheVerbsSignature=*/true,
+                                 externImports, verb, processArgs, scheme, formatName, reporter);
 }
 
 bool realizeForeignEntryShape(Mir&                              mir,
@@ -669,8 +696,8 @@ bool realizeForeignEntryShape(Mir&                              mir,
                               DiagnosticReporter&               reporter) {
     init.reset();
     if (entryLinkName.empty()) return true;   // no entry: nothing to materialize
-    return materializeEntryShape(mir, interner, init, entryLinkName, externImports, verb,
-                                 processArgs, scheme, formatName, reporter);
+    return materializeEntryShape(mir, interner, init, entryLinkName, /*callWithTheVerbsSignature=*/true,
+                                 externImports, verb, processArgs, scheme, formatName, reporter);
 }
 
 } // namespace dss

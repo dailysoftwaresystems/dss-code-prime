@@ -23015,26 +23015,67 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
-            // ── entryLabels ── optional; the names that start a program.
+            // ── entryLabels ── optional; the labels that start a program, each
+            // with the materialization verbs a program entered there may take:
+            // `{"<label>": ["<verb>", ...], ...}` -- a language's
+            // `entryFunctions` rows less the signature (P69 fold 3e). Refused
+            // row by row at the row's own path: a label with no verb, a verb this
+            // build has no word for, or a verb twice. ⓘ NO `$` CARVE-OUT, for the
+            // reason the language's `entryFunctions` map records: a key here is a
+            // LABEL of the configured dialect, and `$` is a legal symbol
+            // character to the assemblers DSS follows; prose for this map is a
+            // `$`-prefixed sibling of `entryLabels` in the `assembly` block.
             if (as.contains("entryLabels")) {
-                json const& arr = as.at("entryLabels");
-                if (!arr.is_array()) {
+                json const& obj = as.at("entryLabels");
+                if (!obj.is_object()) {
                     coll.emit(DiagnosticCode::C_InvalidHirLowering,
                               "/assembly/entryLabels",
-                              "'entryLabels' must be an array of label names");
+                              "'entryLabels' must be an object mapping each label "
+                              "that starts a program to the array of "
+                              "materialization verbs a program entered there may "
+                              "take (`{\"main\": [\"none\", \"argc-argv\"]}`)");
                     assemblyClean = false;
                 } else {
-                    for (std::size_t i = 0; i < arr.size(); ++i) {
-                        if (!arr[i].is_string()
-                            || arr[i].get<std::string>().empty()) {
-                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                      std::format("/assembly/entryLabels/{}", i),
-                                      "each entry label must be a non-empty "
-                                      "name");
+                    for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        std::string const& label = it.key();
+                        std::string const path = std::format("/assembly/entryLabels/{}", label);
+                        if (label.empty() || !it.value().is_array() || it.value().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each entry label must be a non-empty name "
+                                      "mapped to a non-empty array of "
+                                      "materialization verbs");
                             assemblyClean = false;
                             continue;
                         }
-                        cfg.entryLabels.push_back(arr[i].get<std::string>());
+                        AssemblyConfig::EntryLabel row{label, {}};
+                        bool rowClean = true;
+                        for (std::size_t v = 0; v < it.value().size(); ++v) {
+                            json const& spelled = it.value()[v];
+                            std::optional<EntryMaterialization> const verb =
+                                spelled.is_string()
+                                    ? entryMaterializationFromName(spelled.get<std::string>())
+                                    : std::nullopt;
+                            if (!verb.has_value()
+                                || std::ranges::find(row.verbs, *verb) != row.verbs.end()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          std::format("{}/{}", path, v),
+                                          verb.has_value()
+                                              ? std::string{"a materialization verb "
+                                                            "stated twice for one label"}
+                                              : std::format("unknown materialization verb "
+                                                            "(accepted: {})",
+                                                            renderAllowedList(allNames(
+                                                                kEntryMaterializationTable))));
+                                rowClean = false;
+                                continue;
+                            }
+                            row.verbs.push_back(*verb);
+                        }
+                        if (!rowClean) {
+                            assemblyClean = false;
+                            continue;
+                        }
+                        cfg.entryLabels.push_back(std::move(row));
                     }
                 }
             }

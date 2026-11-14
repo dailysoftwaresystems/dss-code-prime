@@ -1,0 +1,1 @@
+        bool const everyCheckoutAcquired = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {

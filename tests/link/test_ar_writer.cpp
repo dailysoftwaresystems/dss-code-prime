@@ -397,6 +397,37 @@ TEST(ArWriter, RejectsEmptyExportedSymbolName) {
     EXPECT_TRUE(saw);
 }
 
+// EVERY member is validated, and each of its defects reported, before the write fails (`dss::substrate::runEveryUnit`,
+// the several-unit class's one home; site (m) of the orchestrator's ledger 568, P69 fold 3e): every member invalid --
+// an empty name, a framing byte, an empty exported symbol, a NUL in one -- is four refusals; a valid member, an invalid
+// one and a valid one after it is one; neither writes a byte. On both flavours.
+TEST(ArWriter, EveryMemberIsValidatedBeforeTheWriteFails) {
+    for (auto const flavor : {dss::link::format::ArArchiveFlavor::SysV, dss::link::format::ArArchiveFlavor::Coff}) {
+        for (bool const mixed : {false, true}) {
+            SCOPED_TRACE(std::string{flavor == dss::link::format::ArArchiveFlavor::Coff ? "coff" : "sysv"}
+                         + (mixed ? " / valid, invalid, valid" : " / every member invalid"));
+            std::vector<ArMemberInput> members;
+            if (mixed) {
+                members = {{"first.o", {0x00u}, {"first"}}, {"bad/second.o", {0x00u}, {"second"}},
+                           {"third.o", {0x00u}, {"third"}}};
+            } else {
+                members = {{"", {0x00u}, {}},
+                           {"bad/second.o", {0x00u}, {}},
+                           {"third.o", {0x00u}, {""}},
+                           {"fourth.o", {0x00u}, {std::string{"four\0th", 7}}}};
+            }
+            DiagnosticReporter rep;
+            auto const ar = writeArArchive(std::span<ArMemberInput const>{members}, rep, flavor);
+            EXPECT_TRUE(ar.empty()) << "an archive of an invalid member was written";
+            std::size_t refused = 0;
+            for (auto const& d : rep.all()) {
+                if (d.code == DiagnosticCode::K_ArchiveMemberNameInvalid) ++refused;
+            }
+            EXPECT_EQ(refused, mixed ? 1u : 4u) << "a member's defect was not reported, or was reported twice";
+        }
+    }
+}
+
 // -- End-to-end through the shipped pipeline composition ----------------------
 
 TEST(ArWriter, PipelineStaticArchiveFromRealDssObject) {

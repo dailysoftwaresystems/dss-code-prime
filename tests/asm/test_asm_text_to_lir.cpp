@@ -905,14 +905,16 @@ TEST(AsmTextToLir, InstructionAfterTerminatorBeginsABlockOfItsOwn) {
 
 // ★ THE HEADER SAID `.globl`-EXPORTED AND THE CODE ELECTED ON NAME ALONE.
 // Reconciled toward the header: an entry-named label that is not exported is a
-// diagnostic, because leaving `userEntrySymbol` unset instead would send the
-// trampoline to functions[0].
+// diagnostic, because the election reads only EXPORTED functions (P69 fold 3e:
+// the lowering elects nothing; `collectObjectEntryCandidates` reads the unit).
 TEST(AsmTextToLir, EntryNamedLabelMustBeExported) {
     auto const exported = lowerAsmText(baseDialectDoc(), src(
         ".globl main\n.func main\nmain:\n  ret\n"));
     ASSERT_TRUE(parsedCleanly(*exported)) << parseMessages(*exported);
     ASSERT_TRUE(exported->module.has_value()) << messages(*exported);
-    EXPECT_TRUE(exported->module->userEntrySymbol.has_value());
+    ASSERT_EQ(exported->module->symbols.size(), 1u);
+    EXPECT_EQ(exported->module->symbols[0].name, "main");
+    EXPECT_EQ(exported->module->symbols[0].binding, SymbolBinding::Global);
 
     // The same file WITHOUT the export. Deliberately no `.globl`.
     auto const local = lowerAsmText(baseDialectDoc(), src(
@@ -1963,7 +1965,6 @@ TEST(AsmTextToLir, DirectiveOnALabelLineIsApplied) {
     ASSERT_EQ(run->module->symbols.size(), 1u);
     EXPECT_EQ(run->module->symbols[0].binding, SymbolBinding::Global)
         << "the `.globl` on the label's own line was dropped";
-    EXPECT_TRUE(run->module->userEntrySymbol.has_value());
 }
 
 // ══ D-ASM-NO-DATA-DEFINING-DIRECTIVE ═══════════════════════════════════════

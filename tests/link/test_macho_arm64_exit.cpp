@@ -351,6 +351,7 @@ TEST(MachOArm64Exit, TrampolineEmitsDirectBlForExitImport) {
     user.symbol = SymbolId{1};
     user.bytes  = {0x40, 0x05, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6};
     mod.functions.push_back(std::move(user));
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
 
     DiagnosticReporter rep;
     bool const ok = linker::injectEntryTrampoline(mod, *target, *fmt, rep);

@@ -1,0 +1,3 @@
+                                        s.realizedEntryVerbs.has_value()
+                                            ? *s.realizedEntryVerbs
+                                            : declaredEntryVerbs(tree.schema());

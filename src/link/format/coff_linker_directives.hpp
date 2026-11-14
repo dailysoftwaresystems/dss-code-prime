@@ -586,9 +586,15 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                         std::format("it names the C runtime's '{}' startup: {}", value, unsupported->reason)});
                     break;
                 }
-                bool const runtimeStartup = std::find(row->runtimeStartups.begin(), row->runtimeStartups.end(),
-                                                      value) != row->runtimeStartups.end();
-                image(UnitEntryRequest{std::string{value}, runtimeStartup});
+                // The C runtime's own startup carries the verbs it calls an entry with: the standing one restricts
+                // the program's entry election to them (P69 fold 3e, class C's N5).
+                auto const startup = std::find_if(row->runtimeStartups.begin(), row->runtimeStartups.end(),
+                                                  [&](PeRuntimeStartup const& s) { return s.name == value; });
+                if (startup != row->runtimeStartups.end()) {
+                    image(UnitEntryRequest{std::string{value}, true, {}, startup->verbs});
+                } else {
+                    image(UnitEntryRequest{std::string{value}, false});
+                }
                 break;
             }
             case LinkerDirectiveMeaning::SectionAttributes: {

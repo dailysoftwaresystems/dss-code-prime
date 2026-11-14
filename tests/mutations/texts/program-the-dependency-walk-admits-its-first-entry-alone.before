@@ -1,0 +1,1 @@
+    bool const everyEntryAdmitted = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {

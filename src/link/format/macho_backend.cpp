@@ -345,9 +345,11 @@ public:
                 // left the field it names at its default.
                 // 4 -> 5 (P69): `differenceRelocations`, the relocation pairs a
                 // reader of this format applies (`MachODifferenceRelocation`).
-                static constexpr std::array<std::string_view, 5> kMachoBlockKeys{
+                // 5 -> 6 (P69 fold 3e): `addendRelocation`, the record that
+                // carries the next entry's addend (`MachOAddendRelocation`).
+                static constexpr std::array<std::string_view, 6> kMachoBlockKeys{
                     "cputype", "cpusubtype", "flags", "filetype",
-                    "differenceRelocations"};
+                    "differenceRelocations", "addendRelocation"};
                 DSS_CHECK_KEY_VOCABULARY(kMachoBlockKeys);
                 closeBlock(m, kMachoBlockKeys, "/macho", "the 'macho' block", coll);
                 auto readU32 = [&](char const* field, std::uint32_t& out) {
@@ -420,6 +422,43 @@ public:
                                 MachODifferenceRelocation{
                                     static_cast<std::uint32_t>(sub),
                                     static_cast<std::uint32_t>(min)});
+                        }
+                    }
+                }
+                // `addendRelocation` (P69 fold 3e): the record that carries the
+                // next entry's addend. The SHAPE here; what it must BE is
+                // `validateIdentity`'s.
+                if (m.contains("addendRelocation")) {
+                    auto const& a = m.at("addendRelocation");
+                    static constexpr std::array<std::string_view, 2>
+                        kAddendRelocationKeys{"nativeId", "addendBits"};
+                    DSS_CHECK_KEY_VOCABULARY(kAddendRelocationKeys);
+                    bool shaped = a.is_object();
+                    for (std::string_view const key : kAddendRelocationKeys) {
+                        shaped = shaped && a.contains(key)
+                              && a.at(key).is_number_integer();
+                    }
+                    if (!shaped) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/macho/addendRelocation",
+                                  "'addendRelocation' is { \"nativeId\": <wire id>, "
+                                  "\"addendBits\": <the signed addend's width in "
+                                  "r_symbolnum> }");
+                    } else {
+                        closeBlock(a, kAddendRelocationKeys, "/macho/addendRelocation",
+                                   "the 'addendRelocation' block", coll);
+                        std::int64_t const id   = a.at("nativeId").get<std::int64_t>();
+                        std::int64_t const bits = a.at("addendBits").get<std::int64_t>();
+                        if (id < 0 || id > 0xFFFFFFFFLL || bits < 0 || bits > 0xFFFFFFFFLL) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/macho/addendRelocation",
+                                      std::format("nativeId ({}) and addendBits ({}) "
+                                                  "must each be in [0, 2^32)",
+                                                  id, bits));
+                        } else {
+                            data.macho.addendRelocation = MachOAddendRelocation{
+                                static_cast<std::uint32_t>(id),
+                                static_cast<std::uint32_t>(bits)};
                         }
                     }
                 }
@@ -1184,6 +1223,77 @@ public:
                              "type would be both the start of a pair and the "
                              "end of one",
                              p.subtrahendNativeId, j));
+                }
+            }
+        }
+        // `addendRelocation` (P69 fold 3e, `MachOAddendRelocation`): a record
+        // that names no symbol and patches no field, carrying the next entry's
+        // addend in its r_symbolnum. Its id is held to the wire as a relocation
+        // row's is; it is not pc-relative (it has no field whose place could
+        // matter); its addend fits r_symbolnum's 24 bits; no relocation row and
+        // no difference pair may claim its id -- the reverse map would then
+        // read it as a reference -- and only a document the object reader and
+        // writer are handed states it.
+        if (macho.addendRelocation.has_value()) {
+            auto const& a = *macho.addendRelocation;
+            std::string const path = "/macho/addendRelocation";
+            if (macho.filetype != MachOObjectType::Object) {
+                fail(path,
+                     std::format(
+                         "'addendRelocation' is read by the object READER and "
+                         "written by the object WRITER, which are handed '{}' "
+                         "documents only; this document's filetype is '{}', so "
+                         "nothing would read the record",
+                         machoObjectTypeName(MachOObjectType::Object),
+                         machoObjectTypeName(macho.filetype)));
+            }
+            if ((a.nativeId & (dss::macho::kRInfoExternBit
+                               | dss::macho::kRInfoSymbolnumMask)) != 0u) {
+                fail(path + "/nativeId",
+                     std::format(
+                         "0x{:08X} sets bits that belong to ONE relocation entry "
+                         "(bit 27 = r_extern, bits 0..23 = r_symbolnum, which holds "
+                         "the record's addend); a wire id packs only r_type, "
+                         "r_length and r_pcrel",
+                         a.nativeId));
+            }
+            if ((a.nativeId & dss::macho::kRInfoPcrelBit) != 0u) {
+                fail(path + "/nativeId",
+                     std::format(
+                         "0x{:08X} is pc-relative (r_pcrel = 1): an addend record "
+                         "patches no field, so no place enters its arithmetic",
+                         a.nativeId));
+            }
+            if (a.addendBits == 0u || a.addendBits > 24u) {
+                fail(path + "/addendBits",
+                     std::format(
+                         "{} is no width of a signed addend in r_symbolnum, which "
+                         "holds 24 bits: it is in [1, 24]",
+                         a.addendBits));
+            }
+            for (auto const& r : relocations) {
+                bool claims = r.nativeId == a.nativeId;
+                for (auto const& e : r.nativeIdByBytesAfterField) {
+                    claims = claims || e.nativeId == a.nativeId;
+                }
+                if (claims) {
+                    fail(path + "/nativeId",
+                         std::format(
+                             "wire id {} is also relocation '{}''s: an addend "
+                             "record decodes to no RelocationKind, so no "
+                             "relocation row may claim its wire id",
+                             a.nativeId, r.name));
+                }
+            }
+            for (std::size_t j = 0; j < macho.differenceRelocations.size(); ++j) {
+                auto const& q = macho.differenceRelocations[j];
+                if (q.subtrahendNativeId == a.nativeId || q.minuendNativeId == a.nativeId) {
+                    fail(path + "/nativeId",
+                         std::format(
+                             "wire id {} is an entry of "
+                             "/macho/differenceRelocations/{}: one entry type is "
+                             "either half of a difference or an addend record",
+                             a.nativeId, j));
                 }
             }
         }

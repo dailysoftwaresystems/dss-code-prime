@@ -1,0 +1,20 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE (P69 fold 3e, lane `xa`, class C's N3; renamed from entry_main_int_third_param_refused_positioned): a `main` whose signature is none of the rows its format realizes is the program's ENTRY all the same, called with the RICHEST realized row (argc, argv, the environment; Mach-O's four values), and WARNED at its declarator with a REAL SPAN (S_EntryShapeNotDeclared). MEASURED 2026-09-24 on `int main(int, char**, int)`: clang 18.1.3 refuses it, gcc 13.3.0 and mingw-w64 gcc 13.2.0 warn (-Wmain) and link it, MSVC 19.51 links it silently; MEASURED 2026-11-05 (lane `xa`, d131) on `int main(int, double)`: gcc and cl link and run it, clang and clang-cl refuse it. By the union of the references the program works, so DSS makes it, on every exec format, and runs it to 5. * THE SPAN IS THE POINT, hence the exact line:col: the predecessor check ran at the MIR tier, where `Mir` carries no BufferId/SourceSpan for a function. * RED-ON-DISABLE: drop the semantic tier's richest-row stamp -> every target refuses the program (K_ProgramEntryUndefined); make the warning an error again -> refused as it was.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 5,
+  "expectWarnings": [
+    { "code": "S_EntryShapeNotDeclared", "line": 27, "col": 5 }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "x86_64:elf64-x86_64-linux-pie", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false }
+  ]
+}

@@ -1,1 +1,1 @@
-            (void)bestLen;
+        std::string const base = row.has_value() && false ? objectFormatSchema.sections()[*row].name : sec.name.substr(0, sec.name.find('$'));

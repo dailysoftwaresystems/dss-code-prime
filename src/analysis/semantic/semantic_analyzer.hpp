@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 // Phase #8 entry point: drive symbol/scope/type analysis over a built
 // CompilationUnit and return a SemanticModel. The implementation is
@@ -196,6 +197,17 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // refused by name: a common cannot be stated there. The default (and a
         // direct-API caller with no pair) is true — `common` then adds nothing to a
         // tentative definition, which is what it adds on every format that has one.
-        bool formatStatesCommons = true);
+        bool formatStatesCommons = true,
+        // P69 fold 3e (lane `xa`, class C's N3): the materialization verbs the
+        // pair's format REALIZES (`ObjectFormatSchema::entryVerbs`; empty for a
+        // format that starts no program). The entry gate asks the one vocabulary
+        // (`realizedEntryNames`, core/types/entry_names.hpp) which names are a
+        // program's entry on that format: a definition of another name is an
+        // ordinary function, and a definition of an entry name whose signature
+        // is none of the realized rows is entered with the richest of them and
+        // WARNED (S_EntryShapeNotDeclared). `nullopt` (the default: a direct-API
+        // or language-server caller with no pair) counts every verb the grammar
+        // declares as realized.
+        std::optional<std::vector<EntryMaterialization>> realizedEntryVerbs = std::nullopt);
 
 } // namespace dss

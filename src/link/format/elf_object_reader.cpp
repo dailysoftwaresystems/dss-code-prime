@@ -1,6 +1,7 @@
 #include "link/format/elf_object_reader.hpp"
 #include "link/format/dwarf_cfi_decode.hpp"
 #include "link/format/foreign_section_alignment.hpp"
+#include "link/format/input_section_names.hpp"   // inputSectionRow: the row an input section reads as
 #include "link/format/section_relative_target.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/record_symbol_ids.hpp"
@@ -8,6 +9,7 @@
 #include "link/format/relocation_addend.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize -- the data model's pointer width
 #include "core/types/section_kind.hpp"
 #include "core/types/symbol_attrs.hpp"
 
@@ -441,14 +443,17 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     std::uint64_t const shstrOff = secs[eShstrndx].offset;
     std::uint64_t const shstrEnd = shstrOff + secs[eShstrndx].size;  // in-bounds (SHT_STRTAB checked)
-    // Resolve each section's name + universal SectionKind (name -> kind via
-    // the FORMAT SCHEMA rows: agnostic, no hardcoded ".rodata"). An
-    // unmapped name (`.comment`, `.eh_frame`, `.note.*`) leaves kind = nullopt.
-    std::unordered_map<std::string, SectionKind> nameToKind;
-    for (auto const& row : objectFormatSchema.sections()) nameToKind.emplace(row.name, row.kind);
+    // Resolve each section's name + universal SectionKind: the row the name
+    // reads as, by the document's data (`inputSectionRow`, the one function
+    // every reader asks: the exact row, else a part of one -- `.rodata.str1.1`,
+    // `.text.startup`, `.data.rel.ro.local` -- by the document's subsection
+    // separators, the longest row winning). An unmapped name (`.comment`,
+    // `.note.gnu.property`) leaves kind = nullopt.
     for (auto& s : secs) {
         s.name = rdName(bytes, shstrOff, shstrEnd, s.nameOff);
-        if (auto it = nameToKind.find(s.name); it != nameToKind.end()) s.kind = it->second;
+        if (auto const row = link::format::inputSectionRow(objectFormatSchema, {}, s.name); row.has_value()) {
+            s.kind = objectFormatSchema.sections()[*row].kind;
+        }
     }
 
     // -- (3) Locate .symtab + its .strtab (by TYPE, not name) --------
@@ -600,28 +605,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // typically built with -ffunction-sections / -fdata-sections, so a code /
     // data body lives in `.text.<fn>` / `.rodata.str1.1` / `.data.rel.ro.local`
     // / TLS `.tdata`/`.tbss` -- names the format schema does NOT declare
-    // verbatim. Recovery precedence: (1) exact schema-name match (already in
-    // `sec.kind`); (2) the LONGEST schema-name prefix (`<name>.` -- so
-    // `.data.rel.ro.local` binds RelRoConst, not the shorter `.data`); (3) the
+    // verbatim. Recovery precedence: (1) the row the name reads as (already in
+    // `sec.kind`: the exact row, or the longest row the name is a part of by
+    // the document's subsection separators -- `.data.rel.ro.local` binds
+    // RelRoConst, not the shorter `.data`; `inputSectionRow`); (2) the
     // sh_flags/type fallback (SHF_EXECINSTR -> Text; SHF_TLS -> Tdata/Tbss;
-    // SHF_ALLOC[+WRITE] -> Bss(NOBITS)/Data/Rodata). Without this, such a
-    // defined FUNC/OBJECT would silently reduce to a bodiless ModuleSymbol
-    // (contradicting the "never a silent partial reconstruction" contract) --
-    // the caller fails loud instead when this returns nullopt for a body.
+    // SHF_ALLOC[+WRITE] -> Bss(NOBITS)/Data/Rodata), the ELF wire's own rule.
+    // Without this, such a defined FUNC/OBJECT would silently reduce to a
+    // bodiless ModuleSymbol (contradicting the "never a silent partial
+    // reconstruction" contract) -- the caller fails loud instead when this
+    // returns nullopt for a body.
     auto resolveSectionKind = [&](Shdr const& sec) -> std::optional<SectionKind> {
-        if (sec.kind.has_value()) return sec.kind;                 // (1) exact
-        std::optional<SectionKind> best;                           // (2) longest prefix
-        std::size_t bestLen = 0;
-        for (auto const& row : objectFormatSchema.sections()) {
-            std::size_t const n = row.name.size();
-            if (sec.name.size() > n + 1 && sec.name[n] == '.'
-                && sec.name.compare(0, n, row.name) == 0 && n + 1 > bestLen) {
-                best = row.kind;
-                bestLen = n + 1;
-            }
-        }
-        if (best.has_value()) return best;
-        if (sec.flags & kShfExecInstr) return SectionKind::Text;   // (3) flags
+        if (sec.kind.has_value()) return sec.kind;                 // (1) by name
+        if (sec.flags & kShfExecInstr) return SectionKind::Text;   // (2) flags
         if (sec.flags & kShfTls)
             return (sec.type == kShtNobits) ? SectionKind::ThreadBss
                                             : SectionKind::ThreadData;
@@ -1281,8 +1277,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     //          into it is corrupt -> step 7 fails loud, never fabricates a code
     //          atom from padding). A section fully covered by named symbols
     //          (every DSS-written `.o`) yields NO gaps -- this is inert there.
-    // A section's kind resolved ONLY by DECLARED name (exact schema row or a
-    // `<row>.`-style prefix -- `.rodata` / `.rodata.str1.1` / `.data.rel.ro`),
+    // A section's kind resolved ONLY by DECLARED name (the row it reads as,
+    // `inputSectionRow` -- `.rodata` / `.rodata.str1.1` / `.data.rel.ro`),
     // NEVER the SHF_ALLOC flags fallback. Gap-filling must not fire on an
     // allocated METADATA section the flags fallback would mis-type as Rodata
     // (`.eh_frame` is SHF_ALLOC PROGBITS): fabricating a data atom there would
@@ -1291,18 +1287,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // loop (a real OBJECT there is genuine data); only ANONYMOUS gap-fill is
     // restricted to declared data sections.
     auto declaredDataKind = [&](Shdr const& sec) -> std::optional<DataSectionKind> {
-        std::optional<SectionKind> k = sec.kind;                    // exact schema name
-        if (!k.has_value()) {                                       // longest `<row>.` prefix
-            std::size_t bestLen = 0;
-            for (auto const& row : objectFormatSchema.sections()) {
-                std::size_t const n = row.name.size();
-                if (sec.name.size() > n + 1 && sec.name[n] == '.'
-                    && sec.name.compare(0, n, row.name) == 0 && n + 1 > bestLen) {
-                    k = row.kind;
-                    bestLen = n + 1;
-                }
-            }
-        }
+        std::optional<SectionKind> const k = sec.kind;              // the row it reads as
         return k.has_value() ? dataSectionKindOf(*k) : std::nullopt;
     };
     for (std::uint16_t si = 0; si < eShnum; ++si) {
@@ -2060,14 +2045,23 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 }
                 AssembledData const& slot = mod.dataItems[target->index];
                 Relocation const*    held = nullptr;
+                // The slot holds the routine's ADDRESS: its fixup is one of the rows that fill an
+                // address slot of the data model's pointer width (`addressSlotCandidates`, the one
+                // rule). P69 fold 3e (the review of fold 3d's X9, R1): this spelled the rule by
+                // hand, at a literal 8.
+                std::optional<std::uint64_t> const pointerBytes =
+                    scalarByteSize(TypeKind::Ptr, objectFormatSchema.dataModel());
+                std::vector<TargetRelocationInfo const*> const slotRows =
+                    pointerBytes.has_value()
+                        ? addressSlotCandidates(targetSchema.relocations(),
+                                                static_cast<std::uint8_t>(*pointerBytes))
+                        : std::vector<TargetRelocationInfo const*>{};
                 for (auto const& rel : slot.relocations) {
                     if (static_cast<std::int64_t>(rel.offset) != target->residual) continue;
-                    auto const* tri = targetSchema.relocationInfo(rel.kind);
-                    if (tri != nullptr && tri->formulaKind == RelocFormulaKind::Linear
-                        && !tri->pcRelative && !tri->tls && !tri->imageRelative
-                        && tri->widthBytes == 8u && rel.addend == 0) {
-                        held = &rel;
-                    }
+                    bool const fillsAnAddressSlot = std::any_of(
+                        slotRows.begin(), slotRows.end(),
+                        [&](TargetRelocationInfo const* r) { return r->kind == rel.kind; });
+                    if (fillsAnAddressSlot && rel.addend == 0) held = &rel;
                 }
                 if (held == nullptr) {
                     failed = true;

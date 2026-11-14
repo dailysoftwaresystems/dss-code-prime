@@ -1,1 +1,1 @@
-             && loaderRebasesTheField(*tri) && tri->widthBytes != 8) {
+             && loaderRebasesTheField(*tri) && tri->widthBytes != kPeLookupEntrySize) {

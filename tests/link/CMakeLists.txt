@@ -415,6 +415,13 @@ dss_add_test(NAME link/test_pe_image_defined_symbols
 target_link_libraries(dss_link_test_pe_image_defined_symbols
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# P69 fold 3e (lane `xa`; the review of fold 3d's X11): every shape by which a reference compiler's object
+# reaches a name the image defines -- direct (gcc's PC32), through a GOT slot (clang's x86_64 and aarch64
+# gcc's PIE objects), through a slot the object defines (MinGW-w64 gcc's `.refptr`) -- links beside a DSS
+# `main`, the name defined in the image; natively each runs to 42.
+dss_add_test(NAME link/test_image_defined_reference_shapes
+             SOURCES test_image_defined_reference_shapes.cpp)
+
 # P69 fold 3d (lane `xa`) — the ELF and Mach-O neighbours of the same class: `__ehdr_start` and
 # `__executable_start` (ELF), `__mh_execute_header`, `__mh_dylib_header` and `___dso_handle` (Mach-O), at the
 # image's own header. The universe {each ISA} x {each image flavor} x {each name, the Mach-O cross name refused} x
@@ -423,6 +430,14 @@ target_link_libraries(dss_link_test_pe_image_defined_symbols
 dss_add_test(NAME link/test_image_header_symbols
              SOURCES test_image_header_symbols.cpp)
 target_link_libraries(dss_link_test_image_header_symbols
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# A writer writes ONE class: each writer's entry refuses, by name, every shipped
+# document of its family with a 4-byte data model (built in memory, never shipped),
+# and the pe-indexed TLS stride is the document's data model's pointer width.
+dss_add_test(NAME link/test_writer_address_class
+             SOURCES test_writer_address_class.cpp)
+target_link_libraries(dss_link_test_writer_address_class
                       PRIVATE nlohmann_json::nlohmann_json)
 
 # D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE — the
@@ -927,8 +942,55 @@ dss_add_test(NAME link/test_link_order
 # x86_64, gcc for ELF arm64, Apple clang for Mach-O arm64), elected beside the units' entries and called with its
 # arguments, on every route (objects alone, beside one source, beside two). Every leg links every family's; where the
 # family's executable target is the host's own, each program runs as `prog 7 x y` to the reference's exit code.
+# Fold 3e adds the x86_64 Mach-O family (Apple clang's `-arch x86_64` objects) and the ELF PIE documents; an x86_64
+# Mach-O image runs on an arm64 Mac through the cross-arch gate, whose table is JSON (host_translations.hpp), and an
+# arm the gate skips for want of the translator is a red under strict arm verdicts.
 dss_add_test(NAME link/test_object_entry
              SOURCES test_object_entry.cpp)
+target_link_libraries(dss_link_test_object_entry PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_object_entry)
+
+# P69 fold 3e (lane `xa`) — class C, the program's ONE entry election: an assembly unit's entry, objects alone with
+# and without a `--language`, and an image whose startup would enter at a function no election chose, on the same
+# families as link/test_object_entry, each program run where the host runs its format; and a C entry's signature
+# judged by the rows its format realizes (entered with the richest and warned, or an ordinary function).
+dss_add_test(NAME link/test_object_entry_grammars
+             SOURCES test_object_entry_grammars.cpp)
+target_link_libraries(dss_link_test_object_entry_grammars PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_object_entry_grammars)
+
+# P69 fold 3e (lane `xa`) — class C: an entry only an archive member defines (pulled as the references' startup
+# pulls it) and a pe64 program of `main` beside `wmain`, elected by the exec document's `entryPrecedence` with a
+# warning, on every route of the driver.
+dss_add_test(NAME link/test_object_entry_archive
+             SOURCES test_object_entry_archive.cpp)
+target_link_libraries(dss_link_test_object_entry_archive PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_object_entry_archive)
+
+# P69 fold 3e (lane `xa`) — class C: an object that STATES the image's entry (`/ENTRY:` in its `.drectve`, cl's
+# objects of tests/link/data/object_entry_startup.source.c): a C runtime startup elects among the functions it calls
+# (`wmain` beside `main`, pulled from an archive too), a function starts the image with no C entry, and a startup the
+# document does not support is refused by name; each program runs on Windows x86_64 hosts as link.exe's and lld-link's.
+dss_add_test(NAME link/test_object_entry_startup
+             SOURCES test_object_entry_startup.cpp)
+target_link_libraries(dss_link_test_object_entry_startup PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3e (lane `xa`) — a FOREIGN object's references to the C library bind to the functions the platform
+# exports, under the names the object references (tests/link/data/foreign_libc_names.source.c's units, built by
+# gcc, clang, cl, clang-cl, MinGW-w64 gcc and Apple clang): every leg links each beside a DSS `main` and reads the
+# image's imports; each image runs to 42 where the host runs its format.
+dss_add_test(NAME link/test_foreign_libc_names
+             SOURCES test_foreign_libc_names.cpp)
+
+# P69 fold 3e (lane `xa`) — [[D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC]]: an input section a reference toolchain emits
+# is mapped to its output kind by the format's data (`inputSectionNames`), and a writer never meets a reader-only row.
+# Every leg reads the shipped documents, the name universe of every format and the loader's refusals, and reads and
+# links Apple clang's objects of a string literal, a constant literal and a plain constant (tests/link/data/
+# macho_input_sections.source.c, both ISAs) beside a DSS `main`; each image runs to 42 where the host runs Mach-O.
+dss_add_test(NAME link/test_input_section_names
+             SOURCES test_input_section_names.cpp)
+target_link_libraries(dss_link_test_input_section_names PRIVATE nlohmann_json::nlohmann_json)
+dss_strict_arm_verdicts(link/test_input_section_names)
 
 # P69 fold 3d (lane `xa`) — [[D-LK-A-DATA-ONLY-SHARED-LIBRARY-IS-REFUSED-AS-AN-EXEC-WITH-NO-INSTRUCTIONS]]: a library
 # of data alone is written with its data alone on every library document (no PE code section, no executable ELF

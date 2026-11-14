@@ -1,0 +1,1 @@
+        every = step(cursor) && every;

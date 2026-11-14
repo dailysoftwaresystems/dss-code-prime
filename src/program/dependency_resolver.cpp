@@ -1,5 +1,6 @@
 #include "program/dependency_resolver.hpp"
 
+#include "core/substrate/every_unit.hpp"   // runEveryUnit -- every entry before a step fails
 #include "core/substrate/path_identity.hpp"
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_path_walk.hpp"   // findShippedConfigDir
@@ -688,25 +689,37 @@ bool Resolver::walkChildren_(std::size_t parent, std::size_t depth) {
         // U-3: no degraded git-less mode for a project that needs git. Emitted
         // once per build however many entries asked.
         if (!cache->requireGit(rep_)) return false;
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            if (!entries[i].git.has_value()) continue;
+        // ★ EACH STEP ASKS EVERY ENTRY BEFORE IT FAILS (`substrate::runEveryUnit`;
+        // site (l) of the orchestrator's ledger 568, P69 fold 3e): an entry whose
+        // name collides, or whose checkout cannot be acquired, is reported and the
+        // entries after it are still asked. The STEPS stay in sequence -- nothing
+        // is acquired until every name is registered collision-free, and nothing
+        // located until every checkout is in hand.
+        bool const everyNameRegistered = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {
+            if (!entries[i].git.has_value()) return true;
             auto name = cache->registerGitDependency(*entries[i].git,
                                                      entries[i].ref, rep_);
             if (!name) return false;   // 0xD020 / 0xD024 already reported
             gitNames[i] = *std::move(name);
-        }
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            if (!gitNames[i].has_value()) continue;
+            return true;
+        });
+        if (!everyNameRegistered) return false;
+        bool const everyCheckoutAcquired = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {
+            if (!gitNames[i].has_value()) return true;
             auto const got = cache->acquire(*gitNames[i], rep_);
             if (got.outcome == CacheOutcome::AcquireFailed) {
                 return false;          // 0xD01E already reported
             }
             // The checkout path replaces the name for the locate step below.
             gitNames[i] = core::genericSpelling(got.checkout);
-        }
+            return true;
+        });
+        if (!everyCheckoutAcquired) return false;
     }
 
-    for (std::size_t i = 0; i < entries.size(); ++i) {
+    // Every entry is located and admitted, and reports its own refusal, before
+    // the walk fails (site (l), as above).
+    bool const everyEntryAdmitted = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {
         auto const manifest = locateEntry_(nodes_[parent], entries[i], gitNames[i]);
         if (!manifest) return false;
         auto const child = admitNode_(parent, *manifest, depth);
@@ -717,7 +730,9 @@ bool Resolver::walkChildren_(std::size_t parent, std::size_t depth) {
         if (std::find(kids.begin(), kids.end(), *child) == kids.end()) {
             kids.push_back(*child);
         }
-    }
+        return true;
+    });
+    if (!everyEntryAdmitted) return false;
     return true;
 }
 

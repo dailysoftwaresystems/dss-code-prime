@@ -9,6 +9,7 @@
   ],
   "symbols": [
     { "name": "signal", "signature": "fn(i32, ptr<fn(i32) -> void>) -> ptr<fn(i32) -> void>", "kind": "function", "linkage": "external" },
+    { "$comment": "P69 fold 3e (lane xa), the name a FOREIGN object references: MEASURED 2026-11-05 (gcc 13.3 and clang 19, x86_64 and aarch64, -O2, each call in a unit of its own with its result and its arrays read, llvm-nm -u) and exported @@default by glibc 2.39 (readelf --dyn-syms of libc.so.6); bound as the object names it, unversioned, so the loader takes the default version. glibc's <signal.h> spells `signal` so under a strict -std (gcc's and clang's c17, clang's c2x); the object means System V's semantics, and this is that function.", "name": "__sysv_signal", "signature": "fn(i32, ptr<fn(i32) -> void>) -> ptr<fn(i32) -> void>", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
     { "name": "raise",  "signature": "fn(i32) -> i32",                                        "kind": "function", "linkage": "external" }
   ],
   "macros": [

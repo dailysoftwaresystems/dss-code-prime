@@ -109,7 +109,6 @@ public:
         AsmTextModule out;
         out.lir                 = std::move(builder_).finish();
         out.symbols             = std::move(symbols_);
-        out.userEntrySymbol     = userEntry_;
         out.externImports       = std::move(externs_);
         out.dataItems           = std::move(dataItems_);
         out.blockSymbolBindings = std::move(blockSymbolBindings_);
@@ -2599,31 +2598,25 @@ private:
                              ? SymbolBinding::Global
                              : SymbolBinding::Local;
         sym.visibility = SymbolVisibility::Default;
-        // ★ THE ENTRY MUST BE EXPORTED, AND THAT IS NOW ENFORCED RATHER THAN
-        // ONLY DOCUMENTED. The previous code elected on NAME alone while its
-        // header comment promised a `.globl`-exported label; the two disagreed,
-        // and the disagreement had a cost — a `main:` without `.globl` would be
-        // elected here and then emitted with LOCAL linkage, which is exactly
-        // the "entry symbol is local, link failure points nowhere near the
-        // cause" failure the dialect's own `.globl` note warns about. Refusing
-        // is the only arm with no silent path: leaving `userEntrySymbol` unset
-        // instead would send the trampoline to whatever landed at functions[0].
-        if (std::ranges::find(entryNames_, entry.name) != entryNames_.end()) {
-            if (sym.binding != SymbolBinding::Global) {
-                sink_.fail(entry.at,
-                     std::format("label '{}' is one of this build's "
-                                 "program-entry names but is not exported — an "
-                                 "entry symbol with local linkage is invisible "
-                                 "to the linker's entry resolution. Add this "
-                                 "dialect's global-symbol directive ({}) for "
-                                 "it{}",
-                                 entry.name,
-                                 cfg_.spellingsForVerb(
-                                     AsmDirectiveVerb::GlobalSymbol),
-                                 sink_.pairSuffix()));
-            } else if (!userEntry_.has_value()) {
-                userEntry_ = entry.symbol;
-            }
+        // ★ AN ENTRY-NAMED LABEL MUST BE EXPORTED. The election reads the
+        // unit's EXPORTED functions (`collectObjectEntryCandidates`, as it reads
+        // an object's), so a `main:` without `.globl` would be no candidate and
+        // the build would be refused as having no entry -- naming the missing
+        // entry, not the missing directive. The cause is this label's, so it is
+        // refused here, by name. Nothing here elects (P69 fold 3e).
+        if (std::ranges::find(entryNames_, entry.name) != entryNames_.end()
+            && sym.binding != SymbolBinding::Global) {
+            sink_.fail(entry.at,
+                 std::format("label '{}' is one of this build's "
+                             "program-entry names but is not exported — an "
+                             "entry symbol with local linkage is invisible "
+                             "to the linker's entry resolution. Add this "
+                             "dialect's global-symbol directive ({}) for "
+                             "it{}",
+                             entry.name,
+                             cfg_.spellingsForVerb(
+                                 AsmDirectiveVerb::GlobalSymbol),
+                             sink_.pairSuffix()));
         }
         symbols_.push_back(std::move(sym));
         openFunctionLabel_ = kNoLabel;
@@ -3028,7 +3021,6 @@ private:
     // file mint identical SymbolIds and emit identical bytes.
     std::vector<ExternImport>                    externs_;
     std::unordered_map<std::string, std::size_t> externIndex_;
-    std::optional<SymbolId>                     userEntry_;
     // Data items in SOURCE order, plus the section state each pass tracks. A
     // nullopt section means TEXT — the default a `.s` starts in.
     std::vector<AssembledData>                  dataItems_;

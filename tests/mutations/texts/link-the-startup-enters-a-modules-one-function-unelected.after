@@ -1,0 +1,2 @@
+        if (module.functions.size() == 1) return {EntryResolutionStatus::Found, module.functions[0].symbol};
+        return {EntryResolutionStatus::NotElected, SymbolId{}};

@@ -178,7 +178,21 @@ struct DSS_EXPORT SymbolRecord {
     // so it must not make a translation unit look like it has a program entry —
     // gcc's answer to a declared-but-undefined `main` is `undefined reference to
     // 'main'`, and leaving this nullopt on protos is what reproduces that.
+    //
+    // P69 fold 3e (lane `xa`, class C's N3): the rows that count are the ones the
+    // pair's format REALIZES (`realizedEntryNames`). A definition of an entry name
+    // whose signature is none of them is an entry all the same, as every
+    // reference's startup calls any `main` -- this verb is then the RICHEST row of
+    // the name the format realizes, `entryCalledWithTheVerbsSignature` is set, and
+    // S_EntryShapeNotDeclared WARNS at the declarator (gcc's -Wmain). ✔MEASURED
+    // before: `int main(int, double)` is linked and run by gcc (-Wmain) and cl,
+    // refused only by clang and clang-cl; DSS refused it on every format.
     std::optional<EntryMaterialization> entryVerb;
+    // Set with `entryVerb` when the definition's own signature is none of the rows
+    // its format realizes for its name: the startup then calls it with the VERB's
+    // signature (`int` and the verb's parameter shapes), never its own, exactly as
+    // an object's entry -- which carries no prototype -- is called.
+    bool entryCalledWithTheVerbsSignature = false;
     // SE4 const-correctness: set when the decl's `constMarker` token was
     // found in the type subtree — or, since P68 round 8, when the TYPEDEF its
     // head names is itself const-qualified (`typedef const int CI; CI x;`),

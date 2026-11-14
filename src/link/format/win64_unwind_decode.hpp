@@ -112,17 +112,14 @@ inline constexpr std::uint8_t kUwopPushMachframe  = 10;
 
 // The sections the format keeps them in, by the names its producers give them
 // and `pe.cpp` writes: the function table (one RUNTIME_FUNCTION per described
-// function) and the unwind records it points at. A producer may suffix either,
-// `$x` (cl's grouping) or `.x` (mingw-w64 gcc's `.xdata.unlikely` beside its
-// `.text.unlikely`, ✔MEASURED P69 fold 3c).
+// function) and the unwind records it points at. A producer may name a PART of
+// either -- `$x` (cl's grouping) or `.x` (mingw-w64 gcc's `.xdata.unlikely`
+// beside its `.text.unlikely`, ✔MEASURED P69 fold 3c) -- by the separators the
+// document states (`inputSectionNames`), which `isInputSubsectionOf`
+// (input_section_names.hpp) reads: the reader asks that, never a rule of its
+// own (P69 fold 3e).
 inline constexpr std::string_view kFunctionTableSection = ".pdata";
 inline constexpr std::string_view kUnwindInfoSection    = ".xdata";
-
-[[nodiscard]] constexpr bool isSectionOf(std::string_view name, std::string_view family) noexcept {
-    if (name == family) return true;
-    return name.size() > family.size() && name.substr(0, family.size()) == family
-        && (name[family.size()] == '$' || name[family.size()] == '.');
-}
 
 // UNWIND_INFO's Flags (the high five bits of its first byte).
 inline constexpr std::uint8_t kUnwFlagEHandler  = 0x1u;  // called while the dispatcher searches

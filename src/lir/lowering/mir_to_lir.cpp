@@ -1594,11 +1594,17 @@ struct Lowerer {
         // ★ P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a name
         // the IMAGE defines (`imageDefinedNames`, the document's
         // `imageDefinedSymbols`) never joins this set, under this binding or
-        // the dispatch below. It is in the image, never an import, so no slot
-        // holds its address: its reference is DIRECT, as cl's own
-        // `lea __ImageBase` is, and every unit of a link -- a DSS unit, a DSS
-        // `-c` object or library member, a cl object -- reaches it in ONE
-        // shape the link binds to the image.
+        // the dispatch below. It is in the image, never an import, so no
+        // IMPORT slot holds its address. That is all this exclusion decides:
+        // the name's address as a value still takes the slot the document's
+        // extern-address binding gives every extern (`got`, below), so a pe64
+        // `-c` object reads it from a slot of its own (one ADDR64 naming it)
+        // where, without the row, it read the `.refptr` data-import slot.
+        // ✔MEASURED P69 fold 3e (the review of fold 3d's X11 restated this
+        // paragraph, which said the reference is DIRECT and of ONE shape):
+        // the link binds every shape a unit reaches the name by -- direct, a
+        // GOT slot, a slot the object defines -- to the one image address
+        // (`linker::link`'s image-defined binding).
         auto const imageDefines = [&](ExternImport const& e) {
             return std::find(imageDefinedNames.begin(), imageDefinedNames.end(),
                              e.mangledName) != imageDefinedNames.end();
@@ -10591,15 +10597,24 @@ struct Lowerer {
             LirOperand::makeMemOffset(0)};
         emitInst(*loadOp, idxReg, idxLoadOps,
                  /*payload=*/0, /*flags=*/kLirInstFlagWidth32);
-        // Step 3 — load THIS module's TLS block base: [tp + index*8].
-        // The existing scale-8 SIB indexed-load form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL); width 64
-        // (a pointer). tp is the array base, index the module ordinal,
-        // scale 8 = sizeof(void*).
+        // Step 3 — load THIS module's TLS block base: [tp + index*W].
+        // The SIB indexed-load form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL); width 64
+        // (a pointer). tp is the array base, index the module ordinal, and
+        // the scale W the array's stride -- the data model's pointer width
+        // (`TlsAccessInfo::blockPointerBytes`; P69 fold 3e, X9 R15: a literal
+        // 8). A block that states none is refused, never indexed by zero; a
+        // scale the target cannot encode is refused by the encoder, as any.
+        if (tlsAccess_->blockPointerBytes == 0) {
+            reportTlsFormatReject(
+                "tlsAccess states no block-pointer width (the data model's "
+                "pointer width) for the pe-indexed sequence's array");
+            return;
+        }
         LirReg const blockReg = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 4> blockLoadOps{
             LirOperand::makeReg(tpReg),
             LirOperand::makeReg(idxReg),
-            LirOperand::makeMemBase(8),
+            LirOperand::makeMemBase(tlsAccess_->blockPointerBytes),
             LirOperand::makeMemOffset(0)};
         emitInst(*loadOp, blockReg, blockLoadOps, /*payload=*/0, /*flags=*/0);
         // Step 4 — the object's per-thread address: block + secrel(sym).

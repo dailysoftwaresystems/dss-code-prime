@@ -826,6 +826,12 @@ struct DSS_EXPORT TlsAccessInfo {
     // is the human-readable anchor (diagnostics + the loader's presence
     // gate) so the config stays self-describing.
     std::string    tlsIndexSlotName;
+    // The stride of the module TLS array the `pe-indexed` sequence indexes: the
+    // data model's pointer width (each entry is a block pointer). DERIVED by the
+    // format document's loader from its `dataModel`, never stated; 0 on a
+    // hand-built block, which the lowering refuses rather than index by zero
+    // (P69 fold 3e, the review of fold 3d's X9, R15: the scale was a literal 8).
+    std::uint8_t   blockPointerBytes = 0;
 };
 
 // ── Shipped-library synthesis vehicle (D-CSUBSET-C11-THREADS-MACHO) ─

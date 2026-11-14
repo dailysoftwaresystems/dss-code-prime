@@ -514,66 +514,10 @@ TEST(AsmSubstrate, LirToMirSizeMismatchFailsLoud) {
     EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_LirToMirSizeMismatch), 1u);
 }
 
-// Test `EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker`
-// removed AS3 cycle 3: both X86Variable and Fixed32 walkers are
-// now registered (cycle 1's no-walker substrate is fully populated).
-// The enum-drift fallback path still exists in asm.cpp + walkers'
-// switch statements; it's unreachable via valid JSON (the loader
-// rejects unknown shape strings) and is exercised only by future
-// enum additions where the static_assert / fall-through diagnostic
-// surfaces the maintenance gap.
-
-#if 0
-TEST(AsmSubstrate, EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker) {
-    // Synthesize a target schema whose `trap` opcode declares the
-    // `fixed32` shape — AS2 cycle 2 wires the `x86-variable` walker,
-    // but `fixed32` still has no walker registered (AS3 plugs it in).
-    // `A_NoEncodingShapeWalker` is the expected diagnostic until then.
-    constexpr char const* kJson = R"({
-        "dssTargetVersion": 1,
-        "target": { "name": "synth_arm_like", "version": "0.1" },
-        "opcodes": [
-            { "mnemonic": "invalid", "result": "none" },
-            { "mnemonic": "trap", "result": "none",
-              "terminatorKind": "unreachable",
-              "encoding": {
-                "format": "fixed32",
-                "variants": [
-                  {
-                    "guard":    { "operandKinds": [] },
-                    "template": { "opcode": [222] }
-                  }
-                ]
-              } }
-        ]
-    })";
-    auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
-    ASSERT_TRUE(schema.has_value());
-
-    // Build a tiny LIR with one function containing the `trap` opcode.
-    auto const trapOp = (*schema)->opcodeByMnemonic("trap");
-    ASSERT_TRUE(trapOp.has_value());
-    LirBuilder b{**schema};
-    (void)b.addFunction(SymbolId{1});
-    auto blk = b.createBlock();
-    b.beginBlock(blk);
-    (void)b.addUnreachable(*trapOp);
-    Lir lir = std::move(b).finish();
-
-    // `lirToMir` size must equal the LIR's instCount() — the
-    // substrate's entry-time bounds check rejects shorter spans
-    // (LirToMirSizeMismatchFailsLoud pins that path). Use a
-    // default-constructed (invalid) MirInstId per slot since this
-    // test exercises the dispatch arm, not the source-map stamping.
-    std::vector<MirInstId> lirToMir(lir.instCount());
-
-    DiagnosticReporter rep;
-    auto result = assemble(lir, **schema, lirToMir, rep);
-    EXPECT_EQ(result.functions.size(), 1u);
-    EXPECT_GT(countDiagnostics(rep, DiagnosticCode::A_NoEncodingShapeWalker), 0u);
-    EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_NoEncodingDeclared), 0u);
-}
-#endif
+// No case pins `A_NoEncodingShapeWalker` for a declared shape with no walker: every `TargetEncodingShape`
+// has one (X86Variable and Fixed32, since AS3 cycle 3), the loader refuses an unknown shape string, and the
+// dispatch in asm.cpp is a switch over the enum, so a new value without an arm is named at compile time
+// (-Wswitch); the fallback after the switch still reports the code loudly rather than returning silently.
 
 // ── Schema surface: relocations[] taxonomy ────────────────────────────
 

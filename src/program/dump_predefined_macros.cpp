@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"  // predefinedTypeFactsFor — the pair's `type-size` facts, one computation
 #include "analysis/preprocess/preprocessor.hpp"   // mergePredefinedMacros — THE owner
+#include "core/substrate/every_unit.hpp"     // runEveryUnit -- every target before the dump fails
 #include "core/substrate/path_identity.hpp"  // genericSpelling — the UNC-safe path spelling
 #include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk;
                                              // configRootOfShippedDocument — THE inverse of its composition
@@ -526,7 +527,12 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
     // not leave targets 1..N-1 on stdout looking complete.
     std::vector<std::string> sections;
     sections.reserve(args.targets.size());
-    for (std::string const& spec : args.targets) {
+    // ★ EVERY TARGET'S SECTION IS RENDERED BEFORE THE DUMP FAILS
+    // (`substrate::runEveryUnit`; site (k) of the orchestrator's ledger 568, P69
+    // fold 3e): a target that fails says why, and the targets after it are still
+    // rendered and checked -- then nothing is printed, by the rule above.
+    bool const everySectionRendered = substrate::runEveryUnit(args.targets.size(), [&](std::size_t t) {
+        std::string const& spec = args.targets[t];
         auto parsed = TargetSpec::parse(spec);
         if (!parsed) {
             emitLoud(err, DiagnosticCode::D_InvalidTargetSpec,
@@ -534,7 +540,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                      "'<targetName>:<formatName>' spec ("
                      + std::string{targetSpecErrorName(parsed.error())}
                      + ") — e.g. x86_64:elf64-x86_64-linux-exec.");
-            return 1;
+            return false;
         }
         auto targetR = TargetSchema::loadShipped(parsed->targetName);
         if (!targetR.has_value()) {
@@ -544,7 +550,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                             + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                               "src/dss-config/targets/" + parsed->targetName
                             + ".target.json).");
-            return 1;
+            return false;
         }
         auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
         if (!formatR.has_value()) {
@@ -555,7 +561,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                               "src/dss-config/object-formats/"
                             + parsed->formatName
                             + ".format.json).");
-            return 1;
+            return false;
         }
         PredefinedMacroDumpRequest req;
         req.languageName   = args.languageName;
@@ -636,7 +642,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                 for (auto const& d : reqRep.all()) {
                     emitLoud(err, d.code, "[target=" + spec + "] " + d.actual);
                 }
-                return 1;
+                return false;
             }
         }
 
@@ -649,10 +655,12 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                 emitLoud(err, DiagnosticCode::C_ConflictingPredefinedMacro,
                          "[target=" + spec + "] " + msg);
             }
-            return 1;
+            return false;
         }
         sections.push_back(std::move(*rendered));
-    }
+        return true;
+    });
+    if (!everySectionRendered) return 1;
 
     for (std::string const& s : sections) out << s;
     return 0;

@@ -120,4 +120,21 @@ DSS_EXPORT void requireEntryReference(std::span<AssembledModule> namedUnits);
 // One unit named to the link alone: the same rule, among the entries it states.
 DSS_EXPORT void requireEntryReference(AssembledModule& unit);
 
+// THE ENTRY REQUEST THAT STANDS among the units named to the link, in their
+// order, by the precedence each request's own vocabulary row states -- the
+// question `decideUnitLinkerRequests` settles for the image (`settle`: `first`
+// keeps the standing one, `last` and `inOrder` take the later), asked BEFORE the
+// link by the two that cannot wait for it: the entry's reference
+// (`requireEntryReference`) and the program's entry election
+// (`entryElectionScope`, P69 fold 3e: a stated startup restricts it, a stated
+// function leaves no C entry to elect). None when no named unit states one, or
+// when two state one under two precedences (that link the decision refuses by
+// name). A member the archive search pulls names no entry and is never asked.
+struct StandingEntryRequest {
+    std::size_t             unit    = 0;         // its index among the named units
+    UnitImageRequest const* request = nullptr;   // holds a UnitEntryRequest
+};
+[[nodiscard]] DSS_EXPORT std::optional<StandingEntryRequest>
+standingEntryRequest(std::span<AssembledModule const> namedUnits);
+
 }  // namespace dss::linker

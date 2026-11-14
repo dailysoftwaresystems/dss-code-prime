@@ -2214,6 +2214,7 @@ TEST(ElfExecWriter, PtLoadFileOffsetIsPageAligned) {
 TEST(LinkerEndToEnd, ElfExecDispatchProducesValidExecutable) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 99);
+    mod.userEntrySymbol = SymbolId{99};   // a program's module states its entry (the build's election)
     DiagnosticReporter rep;
     auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(image.ok());

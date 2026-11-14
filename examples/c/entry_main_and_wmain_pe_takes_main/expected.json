@@ -1,0 +1,16 @@
+{
+  "$comment": "P69 fold 3e (the review of fold 3d, X2): `main` + `wmain` built for pe64 STARTS AT `main` and warns, naming `wmain`. pe64-x86_64-windows-exec realizes both `argc-argv` and `argc-wargv`, so both definitions survive candidate selection, and the format RANKS them (`entryPrecedence`: the narrow startup before the wide one) -- the references' answer, MEASURED: link.exe 14.44 (LNK4067, selected 'mainCRTStartup'), lld-link 19.1.5 and MinGW-w64 GNU ld 2.42 each run `main` (exit 11 in the lane's probe). Two candidates of ONE rank (two `main`s) stay K_ProgramEntryAmbiguous. This replaces `entry_main_and_wmain_ambiguous_pe`, which pinned the refusal the references do not make. `positioned: false` because the choice is a WHOLE-PROGRAM fact with no single declaration at fault. * THE EXIT CODE IS THE WITNESS: main returns 4, wmain returns 7. * RED-ON-DISABLE: remove `entryPrecedence` from the pe64 exec document and the build is refused K_ProgramEntryAmbiguous; remove `argc-wargv` from its `entryVerbs` and the warning stops (only `main` survives), so `expectWarnings` reddens.",
+  "language": "c",
+  "source": "main.c",
+  "forbidDiagnostics": ["S_EntryShapeNotDeclared"],
+  "exitCode": 4,
+  "expectWarnings": [
+    { "code": "K_ProgramEntryChosenByPrecedence", "line": 0, "col": 0, "positioned": false }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

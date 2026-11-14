@@ -19,7 +19,10 @@
  *   clang 18.1.3 (Ubuntu 24.04) -O2 -c -D<macro>                                     -> *_x86_64_elf_clang_O2.o
  *   aarch64-linux-gnu-gcc 13.3.0 -O2 -c -D<macro>                                    -> *_arm64_elf_gcc_O2.o
  *   Apple clang 21.0.0 (macOS 26.6.2, arm64) -O2 -c -D<macro>                        -> *_arm64_macho_clang_O2.o
- * each from a copy of this file named `object_entry_arguments.c` in the build directory.
+ * each from a copy of this file named `object_entry_arguments.c` in the build directory. Fold 3e adds, built on the
+ * Mac by the harness's `probe-reference-cc` action (run 20261105-021347-91f2a2e3, each object twice, byte-identical):
+ *   Apple clang 21.0.0 -arch x86_64 -O2 -c -ffile-prefix-map=<probe dir>=. -D<macro> -> *_x86_64_macho_clang_O2.o
+ * for ENTRY_ARGS, ENTRY_VOID, ENTRY_ENVP and ENTRY_HELPER.
  */
 #if defined(ENTRY_ARGS)
 int helper(void);

@@ -913,10 +913,12 @@ struct DSS_EXPORT AssembledModule {
     // trampoline called HELPER instead of main, returning rcx
     // (= the trampoline's RCX-on-entry, which is uninitialized).
     // With this field set, `resolveUserEntrySymbol` looks it up
-    // directly — bypassing the functions[0] fallback.
+    // directly.
     //
-    // Empty optional ⇒ pre-13.5-cycle-2 fallback discipline
-    // (entryPoint or functions[0]). Set ⇒ load-bearing.
+    // Empty optional ⇒ the format's `entryPoint`, and where that is
+    // empty too, NO entry: the trampoline refuses the image (P69 fold
+    // 3e — a lone function is never taken for the entry). Set ⇒
+    // load-bearing: the election's answer (`resolveProgramEntry`).
     std::optional<SymbolId>        userEntrySymbol;     // SymbolId of user-written entry fn
 
     // Derived: true iff every function received its parallel-index slot —

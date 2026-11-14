@@ -1446,6 +1446,58 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "'subsectionsWhenDeclared' — only when the object declares it)");
     }
 
+    // ── inputSectionNames (P69 fold 3e, the orchestrator's ledger 577): how a
+    // reader maps an input section's name to a row. Every separator is
+    // non-empty and stated once; every `readAs` entry names a row of this
+    // document and is NOT one (a writer resolves its rows by kind and must never
+    // meet a reader-only name), and no input section is named twice. Absent, a
+    // reader reads exact row names alone -- what the documents tests build
+    // inline need; every SHIPPED document that declares relocations states it,
+    // which `InputSectionNames.EveryShippedDocumentThatDeclaresRelocationsStatesIt`
+    // (tests/link/test_input_section_names.cpp) holds.
+    if (inputSectionNames.has_value()) {
+        auto const isRow = [&](std::string const& segment, std::string const& name) {
+            return std::any_of(sections.begin(), sections.end(), [&](ObjectFormatSectionInfo const& s) {
+                return s.segment == segment && s.name == name;
+            });
+        };
+        std::vector<std::string> seenSeparators;
+        for (std::size_t i = 0; i < inputSectionNames->subsectionSeparators.size(); ++i) {
+            std::string const& sep = inputSectionNames->subsectionSeparators[i];
+            if (sep.empty()) {
+                fail(std::format("/inputSectionNames/subsectionSeparators/{}", i),
+                     "a subsection separator is a non-empty string");
+            } else if (std::find(seenSeparators.begin(), seenSeparators.end(), sep) != seenSeparators.end()) {
+                fail(std::format("/inputSectionNames/subsectionSeparators/{}", i),
+                     std::format("the separator '{}' is stated twice", sep));
+            }
+            seenSeparators.push_back(sep);
+        }
+        std::vector<std::pair<std::string, std::string>> seenInputs;
+        for (std::size_t i = 0; i < inputSectionNames->readAs.size(); ++i) {
+            InputSectionAlias const& a = inputSectionNames->readAs[i];
+            std::string const at = std::format("/inputSectionNames/readAs/{}", i);
+            if (a.name.empty() || a.rowName.empty()) {
+                fail(at, "a 'readAs' entry names an input section and the row it reads as");
+                continue;
+            }
+            if (isRow(a.segment, a.name)) {
+                fail(at, std::format("'{}{}{}' is a row of this document, which a writer writes: a 'readAs' "
+                                     "entry names only a section no writer of the format writes",
+                                     a.segment, a.segment.empty() ? "" : ",", a.name));
+            }
+            if (!isRow(a.rowSegment, a.rowName)) {
+                fail(at, std::format("'{}' reads as '{}{}{}', which is no row of this document", a.name,
+                                     a.rowSegment, a.rowSegment.empty() ? "" : ",", a.rowName));
+            }
+            std::pair<std::string, std::string> const key{a.segment, a.name};
+            if (std::find(seenInputs.begin(), seenInputs.end(), key) != seenInputs.end()) {
+                fail(at, std::format("the input section '{}' is read as two rows", a.name));
+            }
+            seenInputs.push_back(key);
+        }
+    }
+
     // Sections: (kind, encoding) unique cross-row + name non-empty. The format
     // walker resolves `sectionByKind(SectionKind::Text)` to find
     // the format-native section name + structural fields.
@@ -2000,6 +2052,41 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "never be consulted — and the engine reads this emptiness as "
              "\"needs no entry\", which a stray verb would falsify. "
              "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)");
+    }
+    // P69 fold 3e: a stated `entryPrecedence` PARTITIONS `entryVerbs` -- every
+    // realized verb in exactly one group, and no verb the format does not
+    // realize -- so every candidate the election ranks has a rank, and no rank
+    // names a candidate that cannot exist.
+    if (!entryPrecedence.empty()) {
+        std::vector<EntryMaterialization> seen;
+        for (std::size_t g = 0; g < entryPrecedence.size(); ++g) {
+            for (auto const v : entryPrecedence[g]) {
+                if (std::find(entryVerbs.begin(), entryVerbs.end(), v) == entryVerbs.end()) {
+                    fail(std::format("/entryPrecedence/{}", g),
+                         std::format("'entryPrecedence' ranks the verb '{}', which this "
+                                     "format does not realize (`entryVerbs`): no entry "
+                                     "of it can be a candidate to rank.",
+                                     entryMaterializationName(v)));
+                } else if (std::find(seen.begin(), seen.end(), v) != seen.end()) {
+                    fail(std::format("/entryPrecedence/{}", g),
+                         std::format("'entryPrecedence' ranks the verb '{}' twice: a "
+                                     "candidate has ONE rank.",
+                                     entryMaterializationName(v)));
+                } else {
+                    seen.push_back(v);
+                }
+            }
+        }
+        for (auto const v : entryVerbs) {
+            if (std::find(seen.begin(), seen.end(), v) == seen.end()) {
+                fail("/entryPrecedence",
+                     std::format("'entryPrecedence' leaves the realized verb '{}' "
+                                 "unranked: a stated precedence ranks every verb in "
+                                 "`entryVerbs`, or a pair holding that verb would be "
+                                 "decided by no rule.",
+                                 entryMaterializationName(v)));
+            }
+        }
     }
 
     // A materialization verb that needs argument setup is only realizable if the

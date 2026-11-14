@@ -302,6 +302,9 @@ namespace {
 //   `entryFunctions` — the key is an entry function NAME in the configured
 //       source language, and `$` is a legal identifier character in the
 //       references DSS follows.
+//   `entryLabels` (an assembly dialect's, P69 fold 3e) — the same fact in a
+//       dialect: the key is a LABEL of the configured assembly language, and
+//       `$` is a legal symbol character to the assemblers DSS follows.
 //
 // Reserving `$` in any of these would silently DELETE a legal spelling from the
 // configured language, which is a worse failure than the missing annotation:
@@ -309,7 +312,7 @@ namespace {
 // keys really are the loader's own.
 [[nodiscard]] bool keysAreSourceTextNotLoaderVocabulary(std::string_view path) {
     for (std::string_view const owner :
-         {"/tokens", "/linkageSpecifiers", "/entryFunctions"}) {
+         {"/tokens", "/linkageSpecifiers", "/entryFunctions", "/entryLabels"}) {
         if (path.size() >= owner.size() &&
             path.substr(path.size() - owner.size()) == owner) {
             return true;

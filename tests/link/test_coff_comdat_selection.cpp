@@ -1963,3 +1963,228 @@ TEST(CoffComdatSelectionNative, EachFuncletRunsWhetherItsCopyIsKeptOrDropped) {
         }
     }
 }
+
+// ══ THE FRAME UNITS' RELOCATABLE ARTIFACT: each funclet handed on with its copy (P69 fold 3e, X5) ═══════════════════
+//
+// A section group's FUNCTION member goes with its group as an item does: a relocatable link of the two frame units keeps
+// one unit's `inline` copies, and writes each kept copy's funclet as a code COMDAT ASSOCIATIVE to that copy's section,
+// its `.pdata`/`.xdata` associative to the funclet's -- the chain cl writes. Before fold 3e the PE relocatable writer
+// refused the funclet by name ("function ... is a member of section group ... and not its select-any definition").
+// THE UNIVERSE: {/Gy, /Gy-} x {A then B, B then A} x {the funclet goes with a select-any copy, with a strong
+// definition (the shared section), with no definition (refused)}; on every leg the artifact is read and DSS links it,
+// and on Windows x86_64 DSS's, link.exe's and lld-link's images of it each run every funclet. (No reference has a PE
+// `-r` that works on these objects: ✔MEASURED, lane xa d127, GNU ld 2.42's `-r` writes an object no linker takes, and
+// link.exe and lld-link have none -- so the artifact's consumers are the reference here, not a reference artifact.)
+namespace {
+
+// The 0-based ordinal of the section the chain of associative sections that starts at `i` ends at.
+[[nodiscard]] std::size_t chainRootOf(std::vector<CoffSection> const& secs, std::size_t i) {
+    for (std::size_t hops = 0; hops <= secs.size(); ++hops) {
+        CoffSection const& s = secs[i];
+        if (s.selection != kSelAssociative || s.number == 0u || s.number > secs.size()) return i;
+        i = static_cast<std::size_t>(s.number) - 1u;
+    }
+    ADD_FAILURE() << "the object's associative sections form a cycle";
+    return i;
+}
+
+// The code COMDATs of selection ASSOCIATIVE in `secs`, each by the COMDAT symbol its chain roots at.
+[[nodiscard]] std::vector<std::string> associativeCodeRoots(std::vector<CoffSection> const& secs) {
+    std::vector<std::string> roots;
+    for (std::size_t i = 0; i < secs.size(); ++i) {
+        CoffSection const& s = secs[i];
+        if ((s.chars & kScnLnkComdat) == 0u || (s.chars & kScnCntCode) == 0u || s.selection != kSelAssociative) continue;
+        roots.push_back(secs[chainRootOf(secs, i)].comdatSymbol);
+    }
+    std::sort(roots.begin(), roots.end());
+    return roots;
+}
+
+// The PE relocatable artifact DSS's link writes of `units`, with the link's diagnostics.
+struct Artifact {
+    std::vector<std::uint8_t> bytes;
+    std::string               diagnostics;
+};
+[[nodiscard]] Artifact artifactOfUnits(std::vector<AssembledModule> const& units) {
+    auto const l = load();
+    if (!l.target || !l.object) return {};
+    DiagnosticReporter rep;
+    auto const linked = linker::link(std::span<AssembledModule const>{units}, *l.target, *l.object, rep);
+    return {linked.ok() ? linked.bytes : std::vector<std::uint8_t>{}, diagnosticsOf(rep)};
+}
+
+// The units of `names` as the COFF reader reads them, in order, or empty after a failed assertion.
+[[nodiscard]] std::vector<AssembledModule> unitsOf(std::vector<std::string> const& names) {
+    auto const l = load();
+    std::vector<AssembledModule> units;
+    if (!l.target || !l.object) return units;
+    std::uint32_t cu = 1;
+    for (auto const& name : names) {
+        DiagnosticReporter rep;
+        auto unit = read(l, fixture(name), cu++, rep);
+        EXPECT_TRUE(unit.has_value()) << name << diagnosticsOf(rep);
+        if (!unit.has_value()) return {};
+        units.push_back(std::move(*unit));
+    }
+    return units;
+}
+
+// DSS links `main` beside the artifact `bytes` (written as `artifact.obj`).
+[[nodiscard]] DssLink dssLinkArtifact(fs::path const& dir, std::vector<std::uint8_t> const& bytes, char const* main) {
+    DssLink out;
+    auto const mainC = dir / "main.c";
+    std::ofstream(mainC, std::ios::binary) << main;
+    std::ofstream(dir / "artifact.obj", std::ios::binary)
+        .write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    auto const outDir = dir / "dss.out";
+    fs::create_directories(outDir);
+    Program p;
+    p.setOutputDir(outDir);
+    DiagnosticReporter rep;
+    out.rc = p.compileUnits(std::vector<std::string>{mainC.string(), (dir / "artifact.obj").string()}, "c",
+                            std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    out.diagnostics = diagnosticsOf(rep);
+    for (auto const& e : fs::directory_iterator(outDir)) {
+        if (e.is_regular_file() && e.path().extension() == ".exe") out.image = e.path();
+    }
+    return out;
+}
+
+// The unit's definition named `name`.
+[[nodiscard]] ModuleSymbol* symbolNamed(AssembledModule& m, std::string_view name) {
+    for (auto& ms : m.symbols) {
+        if (ms.name == name) return &ms;
+    }
+    ADD_FAILURE() << "the unit defines no `" << name << "`";
+    return nullptr;
+}
+
+}  // namespace
+
+// Every leg: in each flag set and order, the artifact holds the kept copies' two funclets, each a code COMDAT
+// ASSOCIATIVE whose chain roots at its copy (`seh_inline_finally`'s `__finally`, `seh_inline_except`'s filter), the
+// kept copies carry `.pdata` through their funclets' sections, and DSS's image of the artifact beside the C main
+// unwinds exactly the frames its image of the units the artifact keeps a definition of does. B defines only the
+// `inline` pair, so with A first the artifact keeps nothing of B and that image is A's alone: the two units' image
+// also holds the records of the /GS routines' runtime member, which B's DROPPED copies fetch there (an object's
+// references are read before any copy is dropped) and no definition the artifact keeps references. ✔MEASURED: the
+// artifact's image 132 bytes of `.pdata` and the two units' 240 with A first, equal with B first (run
+// 20261113-215735-5e2096b3, macos-arm64-debug); A alone 132 (fold 3d, run 20261104-222355-dd564927).
+// RED-ON-DISABLE: refuse a function member (the writer before fold 3e) -> no artifact; write it into the shared
+// `.text` -> no associative code COMDAT, and the next link keeps a funclet of a copy it discards.
+TEST(CoffComdatSelection, ARelocatableArtifactOfTheFrameUnitsHandsEachFuncletOnWithItsCopy) {
+    for (auto const& f : kSehFlags) {
+        for (auto const& order : ordersOf(f)) {
+            SCOPED_TRACE(std::string{f.label} + ", " + orderName(order));
+            auto const artifact = artifactOfUnits(unitsOf(order));
+            ASSERT_FALSE(artifact.bytes.empty()) << "DSS writes the relocatable artifact:" << artifact.diagnostics;
+            auto const secs = sectionsOf(artifact.bytes);
+            EXPECT_EQ(associativeCodeRoots(secs), (std::vector<std::string>{"seh_inline_except", "seh_inline_finally"}))
+                << "one funclet per kept `inline` copy, each a code COMDAT ASSOCIATIVE whose chain roots at its copy";
+            EXPECT_GT(inlineCopiesPdataOf(secs), 0u) << "the kept copies' frames carry `.pdata` of their own";
+            test_support::ScratchDir viaArtifact{test_support::Location::InsideRepo, "coff-seh-artifact"};
+            auto const fromArtifact = dssLinkArtifact(viaArtifact.path(), artifact.bytes, kMainSeh);
+            ASSERT_EQ(fromArtifact.rc, 0) << "DSS links the artifact beside the C main:" << fromArtifact.diagnostics;
+            test_support::ScratchDir direct{test_support::Location::InsideRepo, "coff-seh-direct"};
+            std::vector<std::string> const keptUnits = order.front() == f.a ? std::vector<std::string>{f.a} : order;
+            auto const fromUnits = dssLinkFixtures(direct.path(), keptUnits, kMainSeh);
+            ASSERT_EQ(fromUnits.rc, 0) << fromUnits.diagnostics;
+            EXPECT_EQ(pdataSizeOf(bytesOf(fromArtifact.image)), pdataSizeOf(bytesOf(fromUnits.image)))
+                << "the artifact's image unwinds the frames the image of the units it keeps a definition of does";
+        }
+    }
+}
+
+// Every leg: a funclet whose group's signature names a STRONG definition of the unit (one copy, which no link
+// discards) is written in the shared `.text`, as long-lived as its root, and the artifact links; one whose signature
+// names no definition of the unit is refused by name.
+// RED-ON-DISABLE: take a strong root for a select-any one -> the strong cell's funclet is written ASSOCIATIVE to a
+// section that is no COMDAT; refuse every member that is not ASSOCIATIVE -> the strong cell is refused.
+TEST(CoffComdatSelection, AFuncletOfAStrongRootIsSharedAndOneOfNoRootIsRefused) {
+    {
+        SCOPED_TRACE("`seh_inline_finally` made a strong definition");
+        auto units = unitsOf({kSehFlags[0].a});
+        ASSERT_EQ(units.size(), 1u);
+        auto* root = symbolNamed(units.front(), "seh_inline_finally");
+        ASSERT_NE(root, nullptr);
+        root->binding = SymbolBinding::Global;
+        auto const artifact = artifactOfUnits(units);
+        ASSERT_FALSE(artifact.bytes.empty()) << "DSS writes the artifact:" << artifact.diagnostics;
+        EXPECT_EQ(associativeCodeRoots(sectionsOf(artifact.bytes)), std::vector<std::string>{"seh_inline_except"})
+            << "only the select-any copy's funclet is ASSOCIATIVE; the strong root's lives in the shared `.text`";
+        test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-seh-strong-root"};
+        auto const image = dssLinkArtifact(scratch.path(), artifact.bytes, kMainSeh);
+        EXPECT_EQ(image.rc, 0) << "DSS links the artifact beside the C main:" << image.diagnostics;
+    }
+    {
+        SCOPED_TRACE("`seh_inline_except` renamed, so its group's signature names no definition");
+        auto units = unitsOf({kSehFlags[0].a});
+        ASSERT_EQ(units.size(), 1u);
+        auto* root = symbolNamed(units.front(), "seh_inline_except");
+        ASSERT_NE(root, nullptr);
+        root->name = "seh_inline_except_renamed";
+        auto const artifact = artifactOfUnits(units);
+        EXPECT_TRUE(artifact.bytes.empty()) << "the writer refuses a member no definition decides";
+        EXPECT_NE(artifact.diagnostics.find("no definition of this object is named 'seh_inline_except'"),
+                  std::string::npos)
+            << artifact.diagnostics;
+    }
+}
+
+// Windows x86_64: in each flag set and order, the artifact beside a C main RUNS every funclet under DSS, link.exe and
+// lld-link -- each image exits 42.
+TEST(CoffComdatSelectionNative, EachLinkerRunsEveryFuncletOfTheFrameUnitsArtifact) {
+    if (!runsOnThisHost()) GTEST_SKIP() << "the programs run only where the host is Windows x86_64";
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-seh-artifact-native"};
+    auto const dir   = scratch.path();
+    auto const run42 = [](fs::path const& image) {
+        auto const r = test_support::runBinary(image, test_support::kRunBudget);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 42u) << kSehExit;
+    };
+    struct Written {
+        std::string label;
+        std::string object;
+    };
+    std::vector<Written> artifacts;
+    std::size_t k = 0;
+    for (auto const& f : kSehFlags) {
+        for (auto const& order : ordersOf(f)) {
+            std::string const label = std::string{f.label} + ", " + orderName(order);
+            SCOPED_TRACE(label);
+            auto artifact = artifactOfUnits(unitsOf(order));
+            ASSERT_FALSE(artifact.bytes.empty()) << artifact.diagnostics;
+            auto const sub = dir / ("dss" + std::to_string(k));
+            fs::create_directories(sub);
+            auto const image = dssLinkArtifact(sub, artifact.bytes, kMainSeh);
+            ASSERT_EQ(image.rc, 0) << image.diagnostics;
+            run42(image.image);
+            std::string const obj = "artifact" + std::to_string(k++) + ".obj";
+            std::ofstream(dir / obj, std::ios::binary)
+                .write(reinterpret_cast<char const*>(artifact.bytes.data()),
+                       static_cast<std::streamsize>(artifact.bytes.size()));
+            artifacts.push_back({label, obj});
+        }
+    }
+    auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << "DSS's programs were read; link.exe's and lld-link's were NOT: " << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const tools = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(tools.ready()) << tools.describe();
+    std::ofstream(dir / "refmain.c", std::ios::binary) << kMainSeh;
+    ASSERT_TRUE(tools.run("cl /nologo /c /O2 /GS- /MD refmain.c /Forefmain.obj")) << "cl compiles the C main";
+    auto const lld = test_support::native_probe::locateLldLink(dir);
+    std::vector<std::pair<std::string, std::string>> linkers{{"link.exe", "link"}};
+    if (lld.ok()) linkers.emplace_back("lld-link", "\"" + lld.lldLink.string() + "\"");
+    for (auto const& written : artifacts) {
+        for (auto const& [who, linker] : linkers) {
+            SCOPED_TRACE(who + ", " + written.label);
+            std::string const exe = "ref" + std::to_string(k++) + ".exe";
+            ASSERT_TRUE(tools.run(linker + " /nologo /OUT:" + exe + " refmain.obj " + written.object))
+                << who << " links DSS's artifact beside the C main";
+            run42(dir / exe);
+        }
+    }
+    if (!lld.ok()) GTEST_SKIP() << "link.exe's programs were read; lld-link's were NOT: " << lld.detail;
+}

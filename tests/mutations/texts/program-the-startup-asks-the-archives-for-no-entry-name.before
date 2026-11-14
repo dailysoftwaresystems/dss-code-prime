@@ -1,0 +1,2 @@
+        std::vector<EntryLinkName> const names = entryLinkNames(grammar, **formatR, entryScope.verbs);
+        auto members = pullEntryArchiveMembers(std::span<EntryLinkName const>{names},

@@ -6,6 +6,7 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // scalarByteSize -- the TLS array's stride
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
 #include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/include_path_resolve.hpp"  // shippedConfigRelativePathEscapes — the SHARED containment check for a config-root-relative source path
@@ -459,7 +460,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // image's linker defines at its own header (PE `__ImageBase`, ELF
     // `__ehdr_start`, Mach-O `__mh_execute_header`, ...). OPTIONAL: stated by
     // the four PE, the ten ELF and the eight Mach-O documents.
-    static constexpr std::array<std::string_view, 61> kFormatDocumentKeys{
+    // 61 -> 62 (P69 fold 3e, lane `xa`): `entryPrecedence`, which of two
+    // realizable entries a program of both is entered through. OPTIONAL:
+    // stated by the PE exec document.
+    // 62 -> 63 (P69 fold 3e, lane `xa`, the orchestrator's ledger 577):
+    // `inputSectionNames`, how a relocatable-object reader maps an input
+    // section's name to a row (`InputSectionNames`: the subsection separators,
+    // and the reader-only names a reference toolchain emits). OPTIONAL at load
+    // (absent: exact row names alone, for the documents tests build inline);
+    // the 22 shipped documents that declare relocations state it in the same
+    // change, and a TEST holds every shipped one to it.
+    static constexpr std::array<std::string_view, 63> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -500,6 +511,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // strict, so a stale file carrying the old key is REFUSED AT LOAD rather
         // than loading with an empty verb set.
         "entryVerbs",
+        // P69 fold 3e: which of two realizable entry names a program starts at
+        // (`entryPrecedence`, groups of `entryVerbs`).
+        "entryPrecedence",
         // import / link contract
         "externCallDispatch", "dataImportBinding", "externAddrBinding",
         // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED: the spelling an
@@ -577,6 +591,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "weakDefinition",
         // section / relocation description
         "sections", "relocations", "relocationAddends", "inputSectionPlacement",
+        // how a reader maps an input section's name to a row — a typo would
+        // leave a document reading exact names alone, refused here instead
+        "inputSectionNames",
         "supportedDataSections",
         // what a static link's archive search does for a COMMON's name — a typo
         // would leave the document unstated, which a static link then refuses
@@ -2108,7 +2125,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                           "without it cannot lower a thread-local access");
                 ok = false;
             }
-            if (ok) data.tlsAccess = info;
+            if (ok) {
+                // The array's stride, the data model's pointer width (`dataModel`
+                // is read above, and required).
+                info.blockPointerBytes = static_cast<std::uint8_t>(
+                    scalarByteSize(TypeKind::Ptr, data.dataModel).value_or(0));
+                data.tlsAccess = info;
+            }
         }
     }
 
@@ -2712,6 +2735,47 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     break;
                 }
                 if (!dupe) data.entryVerbs.push_back(*v);
+            }
+        }
+    }
+
+    // ── P69 fold 3e: `entryPrecedence` — groups of `entryVerbs`, the first
+    // outranking the next (see the field). An ARRAY of non-empty ARRAYS of verb
+    // names; whether it partitions `entryVerbs` is `validate()`'s question.
+    if (doc.contains("entryPrecedence")) {
+        auto const& groups = doc.at("entryPrecedence");
+        if (!groups.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/entryPrecedence",
+                      "'entryPrecedence' must be an ARRAY of groups, each a non-empty "
+                      "ARRAY of materialization verb names, the first group "
+                      "outranking the next");
+        } else {
+            for (std::size_t g = 0; g < groups.size(); ++g) {
+                auto const gPath = std::format("/entryPrecedence/{}", g);
+                if (!groups[g].is_array() || groups[g].empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, gPath,
+                              "each precedence group must be a non-empty ARRAY of "
+                              "materialization verb names");
+                    continue;
+                }
+                std::vector<EntryMaterialization> group;
+                for (std::size_t k = 0; k < groups[g].size(); ++k) {
+                    auto const& row = groups[g][k];
+                    auto const  v   = row.is_string()
+                                          ? entryMaterializationFromName(row.get<std::string>())
+                                          : std::nullopt;
+                    if (!v.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/{}", gPath, k),
+                                  std::format("not an entry materialization verb — "
+                                              "accepted: {}",
+                                              allowedList(allNames(kEntryMaterializationTable),
+                                                          ", ")));
+                        continue;
+                    }
+                    group.push_back(*v);
+                }
+                data.entryPrecedence.push_back(std::move(group));
             }
         }
     }
@@ -4534,6 +4598,80 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       ", ")));
         } else {
             data.inputSectionPlacement = *placement;
+        }
+    }
+
+    // inputSectionNames — how a relocatable-object reader maps an input section's
+    // name to a row (`InputSectionNames`, P69 fold 3e). OPTIONAL; its entries
+    // are judged against the rows by `validate()`; here each key and value is
+    // read by its type.
+    if (doc.contains("inputSectionNames")) {
+        auto const& isn = doc.at("inputSectionNames");
+        static constexpr std::array<std::string_view, 2> kInputSectionNamesKeys{"subsectionSeparators", "readAs"};
+        DSS_CHECK_KEY_VOCABULARY(kInputSectionNamesKeys);
+        static constexpr std::array<std::string_view, 3> kReadAsKeys{"segment", "name", "row"};
+        DSS_CHECK_KEY_VOCABULARY(kReadAsKeys);
+        static constexpr std::array<std::string_view, 2> kRowKeys{"segment", "name"};
+        DSS_CHECK_KEY_VOCABULARY(kRowKeys);
+        if (!isn.is_object() || !isn.contains("subsectionSeparators") || !isn.contains("readAs")
+            || !isn.at("subsectionSeparators").is_array() || !isn.at("readAs").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/inputSectionNames",
+                      "'inputSectionNames' is an object of two arrays, 'subsectionSeparators' (strings) and "
+                      "'readAs' (objects of 'segment', 'name' and 'row')");
+        } else {
+            rejectUnknownKeys(isn, kInputSectionNamesKeys, "/inputSectionNames", "the 'inputSectionNames' block",
+                              coll);
+            InputSectionNames names;
+            bool well = true;
+            auto const& seps = isn.at("subsectionSeparators");
+            for (std::size_t i = 0; i < seps.size(); ++i) {
+                if (!seps[i].is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/inputSectionNames/subsectionSeparators/{}", i),
+                              "a subsection separator is a string");
+                    well = false;
+                    continue;
+                }
+                names.subsectionSeparators.push_back(seps[i].get<std::string>());
+            }
+            auto const stringAt = [&](json const& obj, std::string const& key, std::string const& at,
+                                      bool required) -> std::optional<std::string> {
+                if (!obj.contains(key)) {
+                    if (!required) return std::string{};
+                    coll.emit(DiagnosticCode::C_MalformedJson, at, std::format("'{}' is required", key));
+                    return std::nullopt;
+                }
+                if (!obj.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, at + "/" + std::string{key},
+                              std::format("'{}' is a string", key));
+                    return std::nullopt;
+                }
+                return obj.at(key).get<std::string>();
+            };
+            auto const& readAs = isn.at("readAs");
+            for (std::size_t i = 0; i < readAs.size(); ++i) {
+                std::string const at = std::format("/inputSectionNames/readAs/{}", i);
+                auto const& e = readAs[i];
+                if (!e.is_object() || !e.contains("row") || !e.at("row").is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, at,
+                              "a 'readAs' entry is an object of 'segment' (optional), 'name' and 'row' "
+                              "('segment' optional, 'name')");
+                    well = false;
+                    continue;
+                }
+                rejectUnknownKeys(e, kReadAsKeys, at, "a 'readAs' entry", coll);
+                rejectUnknownKeys(e.at("row"), kRowKeys, at + "/row", "a 'readAs' entry's row", coll);
+                auto const segment    = stringAt(e, "segment", at, false);
+                auto const name       = stringAt(e, "name", at, true);
+                auto const rowSegment = stringAt(e.at("row"), "segment", at + "/row", false);
+                auto const rowName    = stringAt(e.at("row"), "name", at + "/row", true);
+                if (!segment || !name || !rowSegment || !rowName) {
+                    well = false;
+                    continue;
+                }
+                names.readAs.push_back(InputSectionAlias{*segment, *name, *rowSegment, *rowName});
+            }
+            if (well) data.inputSectionNames = std::move(names);
         }
     }
 

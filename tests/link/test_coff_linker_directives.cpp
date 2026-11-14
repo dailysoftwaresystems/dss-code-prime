@@ -987,9 +987,28 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
          "/pe/linkerDirectives/directives/12/runtimeStartups", "names no 'runtimeStartups'"},
         {"an unsupported startup with no reason", "pe64-x86_64-windows",
          [](nlohmann::json& d) {
-             d["pe"]["linkerDirectives"]["directives"][12]["unsupportedStartups"]["wmainCRTStartup"] = "";
+             d["pe"]["linkerDirectives"]["directives"][12]["unsupportedStartups"]["WinMainCRTStartup"] = "";
          },
-         "/pe/linkerDirectives/directives/12/unsupportedStartups/wmainCRTStartup", "a non-empty reason"},
+         "/pe/linkerDirectives/directives/12/unsupportedStartups/WinMainCRTStartup", "a non-empty reason"},
+        // P69 fold 3e (class C's N5): each runtime startup states the verbs it calls an entry with, which a stated
+        // startup restricts the program's entry election to -- a list of names states none.
+        {"runtime startups listed without their verbs", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][12]["runtimeStartups"] = nlohmann::json::array({"mainCRTStartup"});
+         },
+         "/pe/linkerDirectives/directives/12/runtimeStartups", "a non-empty object of startup name"},
+        {"a runtime startup with a verb that is none", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][12]["runtimeStartups"]["wmainCRTStartup"] =
+                 nlohmann::json::array({"argc-wargv", "wide-argv"});
+         },
+         "/pe/linkerDirectives/directives/12/runtimeStartups/wmainCRTStartup", "distinct materialization verbs"},
+        {"a runtime startup with a verb stated twice", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][12]["runtimeStartups"]["mainCRTStartup"] =
+                 nlohmann::json::array({"argc-argv", "argc-argv"});
+         },
+         "/pe/linkerDirectives/directives/12/runtimeStartups/mainCRTStartup", "distinct materialization verbs"},
         {"runtime symbols on another row", "pe64-x86_64-windows",
          [](nlohmann::json& d) {
              d["pe"]["linkerDirectives"]["directives"][1]["runtimeSymbols"] = nlohmann::json{{"_tls_used", "x"}};

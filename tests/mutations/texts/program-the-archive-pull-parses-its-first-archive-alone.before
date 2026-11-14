@@ -1,0 +1,1 @@
+    bool const everyArchiveParsed = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {

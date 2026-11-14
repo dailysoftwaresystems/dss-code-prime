@@ -1,0 +1,2 @@
+        std::vector<EntryLinkName> const names{};
+        auto members = pullEntryArchiveMembers(std::span<EntryLinkName const>{names},

@@ -336,6 +336,35 @@ inline constexpr EnumNameTable<InputSectionPlacement, 2>
     }}};
 DSS_CHECK_ENUM_NAME_TABLE(kInputSectionPlacementTable);
 
+// ★★★ HOW AN INPUT SECTION'S NAME MAPS TO A ROW — a FORMAT fact, the root key
+// `inputSectionNames` (P69 fold 3e, the orchestrator's ledger 577). A reference
+// toolchain's object names its sections by conventions no writer of the format
+// follows, and every relocatable-object reader asks ONE function which row such a
+// section reads as (`link/format/input_section_names.hpp`, `inputSectionRow`):
+//   * `subsectionSeparators` — the separators by which a producer names a PART of a
+//     row's section, `<row><separator><anything>`: ELF `.` (`.rodata.str1.1`,
+//     `.text.startup`), COFF `$` and `.` (`.text$mn`, `.rdata$r`; mingw-w64 gcc's
+//     `.text.startup`). Empty on a format whose names have no parts (Mach-O's
+//     16-byte section names).
+//   * `readAs` — an input section a reference toolchain emits that no writer of the
+//     format writes, and the row it reads as (Apple clang's `__TEXT,__cstring` and
+//     `__TEXT,__literal{4,8,16}`, read as `__TEXT,__const`). An entry is never a row
+//     (`validate()` refuses one that is), so a writer, which resolves its rows by
+//     kind, never meets it.
+// OPTIONAL at load: absent, a reader reads exact row names alone (what the
+// documents tests build inline need). Every SHIPPED document that declares
+// relocations states it, which tests/link/test_input_section_names.cpp holds.
+struct InputSectionAlias {
+    std::string segment;      // the input section's segment; empty for ELF/PE
+    std::string name;         // the input section's name
+    std::string rowSegment;   // the row it reads as
+    std::string rowName;
+};
+struct InputSectionNames {
+    std::vector<std::string>       subsectionSeparators;
+    std::vector<InputSectionAlias> readAs;
+};
+
 // ★★★ WHAT AN ARCHIVE SEARCH DOES FOR A NAME THE LINK HOLDS AS A COMMON — a
 // FORMAT fact, the root key `archiveCommonResolution` (P69 round 3,
 // D-LK-ARCHIVE-SEARCH-FETCHED-A-DEFINITION-FOR-A-COMMON), stated by the document
@@ -1450,10 +1479,12 @@ enum class LinkerDirectiveMeaning : std::uint8_t {
     Subsystem,
     // `symbol` — the image's entry (`/ENTRY:`). A name in the row's
     // `runtimeStartups` is the C runtime's startup, which in a DSS image is the
-    // target's own (it calls the language's entry); any other must be a
-    // function the link defines, and the image starts THERE, with no runtime
-    // startup, its return value the exit status (✔MEASURED 2026-10-07, both
-    // linkers: 42). A name in `unsupportedStartups` is refused by name, and so
+    // target's own: it calls the language's entry the program's election
+    // chooses, among the functions of the startup's verbs alone (P69 fold 3e);
+    // any other must be a function the link defines, and the image starts
+    // THERE, with no runtime startup and no C entry elected, its return value
+    // the exit status (✔MEASURED 2026-10-07, both linkers: 42; 2026-11-05, beside
+    // `main` too: 66). A name in `unsupportedStartups` is refused by name, and so
     // is a DATUM (both linkers take one, and both images fault at start,
     // 0xC0000005, ✔MEASURED 2026-10-07).
     EntryPoint,
@@ -1531,6 +1562,18 @@ struct DSS_EXPORT PeDirectiveNamedValue {
     friend bool operator==(PeDirectiveNamedValue const&, PeDirectiveNamedValue const&) = default;
 };
 
+// A name an `entryPoint` row reads as the C runtime's own startup, with the
+// materialization verbs that startup calls an entry with (P69 fold 3e, class C's
+// N5). An object that STATES it restricts the program's entry election to those
+// verbs (`entryElectionScope`): link.exe 14.44 and lld-link 19.1.5 start `wmain`
+// beside `main` under `/ENTRY:wmainCRTStartup`, in either order, and pull it from
+// an archive for it (✔MEASURED 2026-11-05).
+struct DSS_EXPORT PeRuntimeStartup {
+    std::string                       name;
+    std::vector<EntryMaterialization> verbs;
+    friend bool operator==(PeRuntimeStartup const&, PeRuntimeStartup const&) = default;
+};
+
 struct DSS_EXPORT PeLinkerDirectiveRow {
     std::string            option;   // compared without regard to case
     LinkerDirectiveMeaning meaning = LinkerDirectiveMeaning::Ignored;
@@ -1549,8 +1592,9 @@ struct DSS_EXPORT PeLinkerDirectiveRow {
     // version kept.
     std::optional<VersionPair>         minimumVersion;
     // `entryPoint` rows only (required there): the names that mean the C
-    // runtime's own startup — the target's startup in a DSS image.
-    std::vector<std::string>           runtimeStartups;
+    // runtime's own startup — the target's startup in a DSS image — each with
+    // the verbs it calls an entry with.
+    std::vector<PeRuntimeStartup>      runtimeStartups;
     // `entryPoint` rows only: runtime startups a DSS image does not provide,
     // each refused by name with its `reason`.
     std::vector<PeDirectiveNamedValue> unsupportedStartups;
@@ -1717,6 +1761,21 @@ struct DSS_EXPORT MachODifferenceRelocation {
     std::uint32_t minuendNativeId    = 0;  // the entry that follows it at the same address
 };
 
+// ── Mach-O's ADDEND record (P69 fold 3e, D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC's neighbour) ──
+//
+// A relocation entry that names NO symbol and patches NO field: its r_symbolnum holds a signed addend, and it
+// carries that addend for the NEXT entry of the table, at the same address, whose field holds instruction bits and
+// so cannot hold one (arm64's ARM64_RELOC_ADDEND, type 10, before a PAGE21 / PAGEOFF12: `adrp x8, l_.str@PAGE+2`).
+// ✔MEASURED 2026-11-13, Apple clang 21.0.0 `-arch arm64 -O2`: a call of `strtol("0b1"+2, ...)` reaches the merged
+// literal as `l_.str.1 + 2` through two such pairs, and DSS's reader refused the object ("relocation nativeId
+// 2751463424 ... is not declared"). The JSON key `macho.addendRelocation`; absent = the format has no such record (an
+// x86_64 field holds its own addend), and a reader then refuses the entry as an undeclared wire id. Read by the object
+// reader and written by the object writer, so it is declared by the `filetype: object` documents alone.
+struct DSS_EXPORT MachOAddendRelocation {
+    std::uint32_t nativeId   = 0;    // the record's wire id, packed as a relocation row's is
+    std::uint32_t addendBits = 0;    // the signed addend's width in r_symbolnum (at most 24)
+};
+
 struct DSS_EXPORT MachOIdentity {
     std::uint32_t cputype = 0;       // CPU_TYPE_X86_64=0x01000007
                                      // / CPU_TYPE_ARM64=0x0100000C
@@ -1747,6 +1806,9 @@ struct DSS_EXPORT MachOIdentity {
     // `MachODifferenceRelocation`. Empty = the document declares none, and a
     // reader then refuses a call-frame section that carries a relocation.
     std::vector<MachODifferenceRelocation> differenceRelocations;
+    // The record that carries the next entry's addend -- the JSON key `macho.addendRelocation`; see
+    // `MachOAddendRelocation`. nullopt = the format has none.
+    std::optional<MachOAddendRelocation> addendRelocation;
 };
 
 // ── Mach-O image block (loaded when filetype is MH_EXECUTE or
@@ -2717,6 +2779,9 @@ struct DSS_EXPORT ObjectFormatData {
     // `InputSectionPlacement`). REQUIRED whenever `relocations` is non-empty
     // (`validate()`): a format whose objects the link reads must say it.
     std::optional<InputSectionPlacement> inputSectionPlacement;
+    // How an input section's name maps to a row (the `inputSectionNames` root key
+    // — see `InputSectionNames`). OPTIONAL: absent, exact row names alone.
+    std::optional<InputSectionNames> inputSectionNames;
     // What a static link's archive search does for a name it holds as a COMMON
     // (the `archiveCommonResolution` root key — see `ArchiveCommonResolution`).
     // OPTIONAL: absent, a static link refuses when the question arises; refused
@@ -3005,6 +3070,25 @@ struct DSS_EXPORT ObjectFormatData {
     // faulting at run) and for the C23 5.1.2.2.1 + 3.4.1 argument that makes
     // the two config declarations the conformance documentation artifact.
     std::vector<EntryMaterialization> entryVerbs;
+
+    // ── P69 fold 3e (the review of fold 3d, X2): WHICH ENTRY A PROGRAM OF TWO
+    //    ENTRY NAMES STARTS AT ─────────────────────────────────────────────
+    //
+    // Top-level `"entryPrecedence"`: `entryVerbs` partitioned into GROUPS, the
+    // first group outranking the next. Where a build's realizable entry
+    // candidates fall in more than one group, the election takes the one in the
+    // highest group -- with a warning naming the others -- when that group holds
+    // exactly ONE; two in one group (two `main`s) stay the ambiguity
+    // `K_ProgramEntryAmbiguous` names. ✔MEASURED P69 fold 3e (lane `xa`):
+    // `main` beside `wmain`, in one unit, two units and a unit with an object,
+    // links and runs `main` (exit 11) under link.exe 14.44 (LNK4067 "ambiguous
+    // entry point; selected 'mainCRTStartup'"), lld-link 19.1.5 ("found both
+    // wmain and main; using latter") and MinGW-w64 GNU ld 2.42 (`wmain` only
+    // under `-municode`). OPTIONAL: a format that states none refuses every
+    // pair, which is right where no two entry names are realizable (ELF and
+    // Mach-O realize no wide verb). When stated it must partition `entryVerbs`
+    // exactly -- every verb in one group, none twice -- refused at load.
+    std::vector<std::vector<EntryMaterialization>> entryPrecedence;
 
     // `entryCallingConvention`: name of the calling convention the
     // trampoline emitter resolves via
@@ -3755,6 +3839,13 @@ public:
         return d_.inputSectionPlacement;
     }
 
+    // How an input section's name maps to a row (`inputSectionNames`), or null
+    // for a document that states none (exact row names alone). Read through
+    // `link::format::inputSectionRow`, the one function every reader asks.
+    [[nodiscard]] InputSectionNames const* inputSectionNames() const noexcept {
+        return d_.inputSectionNames.has_value() ? &*d_.inputSectionNames : nullptr;
+    }
+
     // What a static link's archive search does for a name it holds as a COMMON
     // (`archiveCommonResolution`), or nullopt where this document does not state
     // it. Read by the archive pull, from the document of the archive's members.
@@ -4240,6 +4331,14 @@ public:
         for (auto const d : d_.entryVerbs)
             if (d == v) return true;
         return false;
+    }
+    // `entryVerbs` partitioned into precedence groups, the first outranking the
+    // next; empty where the format states none (`entryPrecedence`, see the
+    // field). A stated precedence partitions `entryVerbs` (load-enforced), so
+    // every realized verb has a group.
+    [[nodiscard]] std::span<std::vector<EntryMaterialization> const>
+    entryPrecedence() const noexcept {
+        return d_.entryPrecedence;
     }
 
     // ── D-FFI-EXTERN-CALL-DISPATCH accessor ──────────────────────

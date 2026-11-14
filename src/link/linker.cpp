@@ -503,12 +503,25 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // answer. A unit that defines the name never reaches here -- its reference
     // was bound to that definition -- as link.exe keeps a unit's own
     // `__ImageBase` (MEASURED, the same run).
-    // ★ ONE SHAPE OF REFERENCE: every unit names the symbol DIRECTLY -- an
-    // object's own `lea __ImageBase`, and DSS's compiled code, which lowers a
-    // reference to a name the image defines without a slot (`lowerToLir`'s
-    // `imageDefinedNames`): the name is in the image, never an import. So the
-    // row's id is given the address, and a cl object's reference beside a DSS
-    // unit's resolves to the one header address, as link.exe links the two.
+    // ★ THREE SHAPES OF REFERENCE, ONE BINDING (P69 fold 3e; the review of fold
+    // 3d's X11 found that this paragraph's "one shape, never a slot" was not what
+    // the code does). The row's id is given the image's address ONCE -- the
+    // writer's `symbolVa` (`addImageDefinedSymbolVas`) -- and every shape a unit
+    // reaches the name by resolves through that one entry. ✔MEASURED P69 fold 3e
+    // (lane `xa`: the references' objects of a unit reading the name, each linked
+    // by DSS beside a DSS `main.c` and run to 42):
+    //   * DIRECT -- gcc's PC32 (-O2, PIE and -fno-pie), clang's -fno-pie PC32,
+    //     aarch64's ADR_PREL page and offset, cl's and clang-cl's REL32;
+    //   * THROUGH A GOT SLOT the link fills -- clang's PIE REX_GOTPCRELX, gcc
+    //     aarch64's PIE GOT page and offset, and DSS's own `&name` on every
+    //     document whose extern-address binding is `got` (`lowerToLir`'s
+    //     `imageDefinedNames` keeps the name out of the import-slot sets only);
+    //   * THROUGH A SLOT THE OBJECT DEFINES -- MinGW gcc's `.refptr.__ImageBase`,
+    //     an ordinary datum whose ADDR64 is bound here like any reference.
+    // So a cl object's reference beside a DSS unit's resolves to the one header
+    // address, as link.exe links the two. The ONE shape refused is a read through
+    // an IMPORT slot (`readThroughSlot`, below): only a unit lowered for a document
+    // that does not state the name makes it, and no library fills that slot.
     // Only the link of an IMAGE binds them: a relocatable link's rows state what
     // the image the object ends in will define, and its final linker defines it.
     std::vector<AssembledModule::ImageDefinedBinding> imageBound;
@@ -1988,8 +2001,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // format walker writes the sibling def's runtime address into the slot bytes.
     // Resolved ONCE; consumed only if there is at least one cross-CU reference to thunk.
     // (`absolutePointerRelocKind` — the one scan every slot-minting pass here asks.)
+    // At the data model's pointer width (P69 fold 3e, the review of fold 3d's X9,
+    // R3/R12: the kind and the slot below were both a literal 8).
+    std::uint8_t const thunkSlotBytes = static_cast<std::uint8_t>(
+        scalarByteSize(TypeKind::Ptr, objectFormatSchema.dataModel()).value_or(0));
     std::optional<RelocationKind> const absPtrKind =
-        absolutePointerRelocKind(targetSchema, 8);
+        absolutePointerRelocKind(targetSchema, thunkSlotBytes);
 
     // Per-module SymbolId.v -> EVERY `ModuleSymbol` row carrying it, in table order.
     //
@@ -2397,7 +2414,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             // format-identity branch.
             slot.section = relocBearingGlobalSection(/*isThreadLocal=*/false,
                                                      /*isConst=*/true);
-            slot.bytes.assign(8, std::uint8_t{0});  // 8 zero bytes — the abs64 fixup site
+            slot.bytes.assign(thunkSlotBytes, std::uint8_t{0});  // a pointer's zero bytes — the fixup site
             Relocation slotRel;
             slotRel.offset = 0;
             slotRel.target = SymbolId{defId};       // the sibling def's merged id

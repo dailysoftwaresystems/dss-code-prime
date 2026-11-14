@@ -81,6 +81,10 @@ namespace {
 // retired indirect-slot model. The user fn's `ret` IS reached
 // (returning into the trampoline body), but no `ret` is reachable
 // inside the trampoline itself.
+//
+// The module STATES its entry (`userEntrySymbol`), as every module the driver links into a program does: the entry
+// is the one function the build's election chose, and a module's only function is never taken for it (P69 fold 3e,
+// class C). A test of the format's `entryPoint` name resets it.
 [[nodiscard]] AssembledModule makeReturn42Module() {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -88,6 +92,7 @@ namespace {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
     mod.functions.push_back(std::move(fn));
+    mod.userEntrySymbol = SymbolId{1};
     return mod;
 }
 
@@ -98,6 +103,7 @@ namespace {
 // Little-endian byte stream: 40 05 80 D2 | C0 03 5F D6.
 // The trampoline emitter wraps this with the ELF/Syscall `_start`:
 //   call user_entry → mov x0,x0 → mov x8,#94 → SVC #0 → BRK.
+// It states its entry as makeReturn42Module does.
 [[nodiscard]] AssembledModule makeReturn42ModuleArm64() {
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -105,6 +111,7 @@ namespace {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0x40, 0x05, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6};
     mod.functions.push_back(std::move(fn));
+    mod.userEntrySymbol = SymbolId{1};
     return mod;
 }
 
@@ -452,6 +459,9 @@ TEST(LK10EntrySliceC, SymbolIdSpaceExhaustionFailsLoud) {
     fn.symbol = SymbolId{std::numeric_limits<std::uint32_t>::max()};
     fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
     mod.functions.push_back(std::move(fn));
+    // The module states its entry, the function at the boundary, so the injection reaches the mint (a module that
+    // states none is refused before it, as no program entry elected).
+    mod.userEntrySymbol = SymbolId{std::numeric_limits<std::uint32_t>::max()};
     DiagnosticReporter rep;
     ASSERT_FALSE(linker::injectEntryTrampoline(
         mod, **target, **format, rep))
@@ -1034,8 +1044,9 @@ TEST(LK10EntrySliceC, ExternAsEntryFiresDistinctDiagnostic) {
            "shipped file's entryPoint field.";
     // Module with ONE function (SymbolId{1}; entryName 'sym_42'
     // won't match it) + ONE extern (SymbolId{42}; entryName WILL
-    // match its synthesized name 'sym_42').
+    // match its synthesized name 'sym_42'). The format's `entryPoint` names the entry, so the module states none.
     auto mod = makeReturn42Module();
+    mod.userEntrySymbol.reset();
     ExternImport extern_;
     extern_.symbol      = SymbolId{42};
     extern_.mangledName = "SomeImportedFn";
@@ -1064,6 +1075,7 @@ TEST(LK10EntrySliceC, NoMatchingEntryFiresGenericUndefined) {
     auto format = loadPeExecWithEntryPoint("sym_999");
     ASSERT_NE(format, nullptr);
     auto mod = makeReturn42Module();  // only SymbolId{1} declared
+    mod.userEntrySymbol.reset();      // the format's `entryPoint` names the entry
 
     DiagnosticReporter rep;
     bool const ok = linker::injectEntryTrampoline(

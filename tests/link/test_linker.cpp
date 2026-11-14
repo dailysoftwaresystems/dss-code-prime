@@ -1497,6 +1497,7 @@ TEST(Linker, TdataItemOnNonOptedInFormatsRejectsAtAcceptsGate) {
         d.bytes     = {7, 0, 0, 0};
         d.alignment = Alignment::of<4>();
         mod.dataItems.push_back(std::move(d));
+        mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
 
         DiagnosticReporter rep;
         auto image = linker::link(mod, **target, **fmt, rep);

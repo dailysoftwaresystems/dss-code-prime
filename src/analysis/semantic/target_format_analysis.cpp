@@ -178,7 +178,11 @@ analyzeForTargetFormat(std::shared_ptr<CompilationUnit const> cu,
         format.symbolAliasUnsupportedReason(),
         // P69 (lane `cs`): whether the format's document states commons — where it
         // does not, the `common` attribute is refused by name.
-        format.statesCommons());
+        format.statesCommons(),
+        // P69 fold 3e (lane `xa`, class C's N3): the verbs the format realizes --
+        // which names are a program's entry on it, and which rows count (empty for
+        // a format that starts no program).
+        std::vector<EntryMaterialization>{format.entryVerbs().begin(), format.entryVerbs().end()});
     return TargetFormatAnalysis{std::move(model), std::move(analyzeVaLayout)};
 }
 

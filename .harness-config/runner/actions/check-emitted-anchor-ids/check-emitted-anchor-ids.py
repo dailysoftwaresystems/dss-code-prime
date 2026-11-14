@@ -78,7 +78,7 @@ STATIC_ASSERT = re.compile(r"\bstatic_assert\s*\(")
 INVENTORY = {
     "src/analysis/preprocess/preprocessor.cpp": 2,
     "src/analysis/semantic/inline_asm_facts.hpp": 1,
-    "src/analysis/semantic/semantic_analyzer.cpp": 11,
+    "src/analysis/semantic/semantic_analyzer.cpp": 10,
     "src/asm/asm.cpp": 36,
     "src/asm/format/fixed32.cpp": 2,
     "src/asm/format/walker_util.hpp": 3,
@@ -105,7 +105,7 @@ INVENTORY = {
     "src/link/format/interior_block_symbol_va.hpp": 1,
     "src/link/format/macho.cpp": 46,
     "src/link/format/macho_backend.cpp": 9,
-    "src/link/format/macho_object_reader.cpp": 5,
+    "src/link/format/macho_object_reader.cpp": 4,
     "src/link/format/object_atom_coverage.hpp": 2,
     "src/link/format/pe.cpp": 24,
     "src/link/format/pe_backend.cpp": 6,

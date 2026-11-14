@@ -1,0 +1,1 @@
+        std::ifstream in(archivePaths[ai], std::ios::binary);

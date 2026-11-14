@@ -111,7 +111,9 @@ classifyWeakNullReference(Relocation const&             rel,
     if (inCode && isBranchReference(rel, code, target, format, sites)) {
         return WeakNullReferenceClass::Branch;
     }
-    if (tri->formulaKind == RelocFormulaKind::Linear && !tri->pcRelative) {
+    // An ADDRESS field the loader moves (`loaderRebasesTheField`, the one predicate;
+    // P69 fold 3e, X9 R4 -- it was `!pcRelative`, the same answer after the cuts above).
+    if (tri->formulaKind == RelocFormulaKind::Linear && loaderRebasesTheField(*tri)) {
         return WeakNullReferenceClass::Absolute;
     }
     return WeakNullReferenceClass::PcRelative;

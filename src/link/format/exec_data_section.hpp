@@ -733,6 +733,7 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
     std::unordered_map<SymbolId, std::uint64_t> const&  symbolVa,
     TargetSchema const&                                 targetSchema,
     std::string_view                                    writerName,
+    std::uint64_t                                       addressBytes,
     DiagnosticReporter&                                 reporter,
     std::vector<std::uint64_t>*                         siteVasOut = nullptr) {
     using ::dss::link::format::detail::emit;
@@ -850,11 +851,13 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
             // (`loaderRebasesTheField`, the one predicate): a pc-relative
             // (self-relative) entry is invariant under a uniform rebase.
             if (siteVasOut != nullptr && loaderRebasesTheField(*tri)) {
-                if (tri->widthBytes != 8) {
+                // The writer's own address width (its class word; P69 fold 3e,
+                // X9 R7 -- a literal 8 here).
+                if (tri->widthBytes != addressBytes) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format("{}: data item SymbolId={{ {} }} absolute "
-                                     "relocation '{}' has width {} — only an 8-byte "
-                                     "absolute fixup has a rebase form.",
+                                     "relocation '{}' has width {} — only an "
+                                     "address-wide absolute fixup has a rebase form.",
                                      writerName, di.symbol.v, tri->name,
                                      static_cast<int>(tri->widthBytes)));
                     return false;

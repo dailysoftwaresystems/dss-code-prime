@@ -117,9 +117,15 @@ struct HeaderName {
     return d.family == Family::Elf ? "__ehdr_start" : "_mh_execute_header";
 }
 
-// What each document states: the image documents their own names, the relocatable and archive ones the union.
+// What each document states: the image documents their own names, the relocatable and archive ones NONE (P69 fold
+// 3e, the review of fold 3d's X7: their fold-3d rows changed no byte of a `-c` output -- MEASURED, every stated name's
+// address with and without them, identical objects on all eight -- because those documents read every extern's
+// address through a GOT slot whatever a row says, and the image link binds the slot to the header).
 [[nodiscard]] std::vector<std::string> statedBy(char const* doc) {
     std::string_view const s{doc};
+    if (s.ends_with("-staticlib") || s == "elf64-x86_64-linux" || s == "elf64-aarch64-linux"
+        || s == "macho64-x86_64-darwin" || s == "macho64-arm64-darwin")
+        return {};
     if (s.starts_with("elf64-")) return {"__ehdr_start", "__executable_start"};
     if (s.ends_with("-exec")) return {"__mh_execute_header", "___dso_handle"};
     if (s.ends_with("-dylib")) return {"__mh_dylib_header", "___dso_handle"};
@@ -297,9 +303,11 @@ struct RunGate {
 
 // ══ THE DOCUMENTS ════════════════════════════════════════════════════════════════════════════════════════════════
 
-// Every ELF and Mach-O document states the names, each at the image's header: an image document its flavor's own,
-// a relocatable or archive document every name the image its objects end in may define. RED LEVER: drop a row from a
-// relocatable document -> it reads one name fewer here, and that name's `-c` cells read it through a slot.
+// Every ELF and Mach-O IMAGE document states its flavor's own names, each at the image's header, and no relocatable
+// or archive document states any (P69 fold 3e: their rows changed no byte, `statedBy`). The `-c` and library cells
+// still link with the name defined (the next TEST): the object reaches it through a GOT slot, which the image link
+// binds to the header. RED LEVER: drop a row from an IMAGE document -> it reads one name fewer here, and that name's
+// cells are refused "undefined symbol".
 TEST(ImageHeaderSymbols, EveryElfAndMachODocumentStatesItsHeaderNames) {
     std::vector<std::string> docs;
     for (auto const& d : kDocs) {
@@ -327,8 +335,9 @@ TEST(ImageHeaderSymbols, EveryElfAndMachODocumentStatesItsHeaderNames) {
 
 // Every cell links with its name defined in the image, whose bytes then name no import of it; every cross cell is
 // refused by its name. RED-ON-DISABLE: resolve no stated name to the image -> each defined cell is refused,
-// "undefined symbol '<name>'"; read no stated name direct in a compile -> its reference takes a slot; give the
-// relocatable documents no row -> the `-c` and library cells' objects import the name.
+// "undefined symbol '<name>'"; read no stated name direct in an image's own compile -> its reference takes a slot.
+// The relocatable and archive documents state no name (P69 fold 3e), and their `-c` and library cells link all the
+// same: their objects reach the name through a GOT slot, which the image link binds to the header.
 TEST(ImageHeaderSymbols, EveryCellLinksWithItsNameDefinedOrTheCrossNameRefused) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "image-header-cells"};
     std::size_t k = 0;

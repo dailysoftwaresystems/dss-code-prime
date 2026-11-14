@@ -20,6 +20,13 @@
     { "name": "tolower", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
     { "name": "toupper", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external" },
     { "name": "__p__mbcasemap", "signature": "fn() -> ptr<u8>", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] },
-    { "name": "_mbcasemap",     "signature": "ptr<u8>",         "kind": "object",   "linkage": "external", "availableObjectFormats": ["pe"] }
+    { "name": "_mbcasemap",     "signature": "ptr<u8>",         "kind": "object",   "linkage": "external", "availableObjectFormats": ["pe"] },
+    { "$comment": "P69 fold 3e (lane xa), the name a FOREIGN object references: MEASURED 2026-11-05 (gcc 13.3 and clang 19, x86_64 and aarch64, -O2, each call in a unit of its own with its result and its arrays read, llvm-nm -u) and exported @@default by glibc 2.39 (readelf --dyn-syms of libc.so.6); bound as the object names it, unversioned, so the loader takes the default version. glibc's <ctype.h> classifies through this table (every is* call of gcc's and clang's objects, every mode), and maps through the next two.", "name": "__ctype_b_loc", "signature": "fn() -> ptr<ptr<const<u16>>>", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
+    { "name": "__ctype_tolower_loc", "signature": "fn() -> ptr<ptr<const<i32>>>", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
+    { "name": "__ctype_toupper_loc", "signature": "fn() -> ptr<ptr<const<i32>>>", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
+    { "$comment": "P69 fold 3e (lane xa), the name a FOREIGN object references: MEASURED 2026-11-05 (Apple clang 21.0.0, arm64 and x86_64, -O2, c17/gnu17/c2x/gnu2x and the SDK's fortify levels, each call in a unit of its own with its result and its arrays read, nm -u) and exported by libSystem (dlsym in an arm64 process; the SDK's text stubs). The SDK's <ctype.h> classifies inline through `_DefaultRuneLocale` and `__maskrune`, and maps through `__tolower`/`__toupper` (every is*/to* call, every mode).", "name": "__maskrune", "signature": "fn(i32, u64) -> u64", "kind": "function", "linkage": "external", "availableObjectFormats": ["macho"] },
+    { "name": "__tolower", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["macho"] },
+    { "name": "__toupper", "signature": "fn(i32) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["macho"] },
+    { "name": "_DefaultRuneLocale", "signature": "struct \"_RuneLocale\" opaque", "kind": "object", "linkage": "external", "availableObjectFormats": ["macho"] }
   ]
 }

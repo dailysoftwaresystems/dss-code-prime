@@ -1,1 +1,1 @@
-link.exe links these objects
+ld64 links an object defining `main` that calls `puts`

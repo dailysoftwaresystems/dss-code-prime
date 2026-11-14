@@ -367,8 +367,9 @@ struct DataField {
     std::unordered_map<SymbolId, std::uint64_t> const va{{SymbolId{2}, 0x401000ull}};
     DiagnosticReporter                                rep;
     DataField                                         out;
+    // The writer's address width: the 64-bit classes' (every shipped writer's class word, P69 fold 3e X9).
     bool const ok = link::format::applyDataItemRelocations(layout.bytes, items, layout, 0x402000ull, va, t, "test",
-                                                           rep, &out.sites);
+                                                           std::uint64_t{8}, rep, &out.sites);
     out.messages = diagnosticsOf(rep);
     if (ok) out.bytes = layout.bytes;
     return out;

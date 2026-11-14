@@ -3054,6 +3054,7 @@ TEST(LinkerEndToEnd, PeExecAcceptsAndBindsDataExternImport) {
     // (test_got_slot_lowering.cpp, section C).
     dataExt.readThroughSlot = true;
     mod.externImports.push_back(std::move(dataExt));
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
@@ -5695,6 +5696,7 @@ TEST(LinkerExternResolution, NeitherDefinedNorExternStillFailsLoud) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     // externImports is empty AND fn's reloc target isn't fn.symbol.
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
@@ -5762,6 +5764,7 @@ TEST(LinkerExternResolution, EmptyLibraryPathReferencedIsUndefinedSymbol) {
 TEST(LinkerExternResolution, EmptyLibraryPathUnreferencedIsDropped) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);  // no relocs — unreferenced
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "ExitProcess", ""});
     DiagnosticReporter rep;
@@ -5790,6 +5793,7 @@ TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected)
     mod.functions[0].relocations.push_back(rel);
     mod.externImports.push_back(
         ExternImport{SymbolId{1}, "ExitProcess", "kernel32.dll"});
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
@@ -6041,6 +6045,7 @@ namespace {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     AssembledData d;
     d.symbol  = SymbolId{42};
     d.section = kind;
@@ -6509,6 +6514,7 @@ linkTrivialExec(Loaded const&       loaded,
                 DiagnosticReporter& rep,
                 ImageRequest const& request) {
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     return linker::link(mod, *loaded.target, *loaded.format, rep, request);
 }
 
@@ -6598,6 +6604,7 @@ TEST(PeExecWriter, AbsentStackReserveRequestIsByteIdenticalToTheDefaultPath) {
 
     // The pre-feature call shape: NO request argument at all.
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     DiagnosticReporter repNoArg;
     LinkedImage const noArg =
         linker::link(mod, *loaded.target, *loaded.format, repNoArg);
@@ -6743,6 +6750,7 @@ TEST(PeExecWriter, StackReserveBoundsAreInclusiveAtBothEnds) {
 
     for (std::uint64_t const want : {kShippedMinReserve, kShippedMaxReserve}) {
         AssembledModule mod = makeTrivialModule({0xC3}, 1);
+        mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
         DiagnosticReporter rep;
         LinkedImage const img =
             linker::link(mod, *loaded.target, *loaded.format, rep,

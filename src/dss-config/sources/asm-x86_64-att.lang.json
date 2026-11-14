@@ -249,7 +249,11 @@
       "symbolPart": null
     },
 
-    "entryLabels": ["main"],
+    "$entryLabelsComment": "THE LABELS THAT START A PROGRAM, each with the materialization verbs a program entered there may take -- the same rows `c.lang.json` states as `entryFunctions`, less the signature a label does not carry (P69 fold 3e, the review of fold 3d's X1). ONE VOCABULARY: `entryLinkNames` reads these and a language's alike, keeps the verbs the format's `entryVerbs` realize, and spells each name on the binary in the format's C decoration, so a Mach-O `.s` enters at `_main` -- as ld64 enters a clang `.s` (MEASURED, lane xa: ld64 links a `_main` `.s` and refuses a `main` one, `_main` undefined). A label is elected exactly as an object's definition of the name is, with the richest verb of its name the format realizes, by the one election every route holds; `main` beside `wmain` on pe64 is the format's precedence (`entryPrecedence`).",
+    "entryLabels": {
+      "main":  ["none", "argc-argv", "argc-argv-envp", "argc-argv-envp-apple"],
+      "wmain": ["argc-wargv", "argc-wargv-wenvp"]
+    },
 
     "instructions": [
       { "$comment": "★★ THE OVERLOADED ROW. `movq` is `mov`, `load` OR `store` depending on where the memory operand sits, and the target's variant guards make the call — see the block banner. Order inside the array is NOT a priority list: the guards are mutually exclusive by operand kind, so an input matching two of them would be a target defect rather than something this ordering papers over.",

@@ -12,6 +12,7 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/types/config_path_walk.hpp"  // findShippedConfigDir -- the ONE shipped-config discovery precedence
+#include "core/types/entry_names.hpp"  // realizedEntryNames -- the ONE vocabulary of a program's entry names
 #include "core/types/object_format_kind.hpp"  // RuntimeLibraryRoleResolver (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
@@ -59,7 +60,9 @@
 #include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (UCRT-P4: the argv spine)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
-#include "program/every_unit.hpp"   // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize -- the data model's pointer width
+#include "core/substrate/every_unit.hpp"   // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/substrate/input_named_diagnostics.hpp"   // readNamingTheInput: a refusal of one input names it
 // D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT:
 // `resolveArchiveSiblingFormat` -- the declared-property lookup that answers
 // "which object format wrote this archive's members", reused rather than respelt.
@@ -1897,8 +1900,11 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // `char *p = "x"`. ✔MEASURED harmless on the shipped targets (abs64 is the
     // only 8-byte non-pc-relative row of x86_64 and of arm64), so the defect was
     // latent: D-ASM-DATA-WORD-RELOCATION-KIND-PICKED-BY-DECLARATION-ORDER.
+    // ★ P69 fold 3e (the review of fold 3d's X9, R2): at the data model's pointer
+    // width, which this function is handed, where a literal 8 stood.
+    std::uint64_t const pointerBytes = scalarByteSize(TypeKind::Ptr, dataModel).value_or(0);
     std::optional<RelocationKind> const absPtrRelocKind =
-        addressSlotRelocationKind(target.relocations(), 8);
+        addressSlotRelocationKind(target.relocations(), static_cast<std::uint8_t>(pointerBytes));
     auto dataItems = lowerMirGlobalsToDataItems(
         mir, interner, globalsLayout, dataModel, reporter, absPtrRelocKind);
     if (!tierClean(reporter, asmEntry)) {
@@ -1987,8 +1993,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         AssembledData table;
         table.symbol    = desc.tableSymbol;
         table.section   = DataSectionKind::Data;
-        table.alignment = Alignment::ofRuntimePow2(8);
-        table.bytes.assign(desc.slotCount * 8u, std::uint8_t{0});
+        // A slot per case, each a pointer of the data model (X9 R14: literal 8s).
+        table.alignment = Alignment::ofRuntimePow2(pointerBytes);
+        table.bytes.assign(desc.slotCount * pointerBytes, std::uint8_t{0});
         table.relocations.reserve(desc.slotBindings.size());
 
         bool tableOk = true;
@@ -2004,7 +2011,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             }
             // abs64 reloc at slot byte offset (slotIdx * 8) → the block symbol.
             table.relocations.push_back(Relocation{
-                static_cast<std::uint32_t>(slotIdx * 8u),
+                static_cast<std::uint32_t>(slotIdx * pointerBytes),
                 blkSym, *absPtrRelocKind, /*addend=*/0});
         }
         if (!tableOk) {
@@ -2289,29 +2296,60 @@ void collectEntryCandidates(SemanticModel const& model,
 // See the header: the entry names an object's entry may have, each with the
 // richest of its rows the format realizes.
 std::vector<EntryLinkName> entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format) {
-    std::vector<EntryLinkName> out;
-    std::vector<std::size_t>   arityOf;   // parallel to `out`
+    return entryLinkNames(grammar, format, format.entryVerbs());
+}
+
+std::vector<EntryLinkName> entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format,
+                                          std::span<EntryMaterialization const> verbs) {
+    // ★ ONE VOCABULARY (P69 fold 3e, the review of fold 3d's X1 and its N3): a
+    // language's `entryFunctions` and a dialect's `entryLabels`, intersected with
+    // the format's realized verbs, are `realizedEntryNames`' (core/types/
+    // entry_names.hpp) -- the semantic tier's entry gate asks the same function --
+    // so a `.s` unit's entry, an object's and a source's are spelled, intersected
+    // and elected alike, whatever grammar the build resolved (with no `--language`
+    // that is the target's assembly dialect). Here each is spelled on the binary.
     CSymbolDecorationScheme const scheme = format.cSymbolDecoration().scheme;
-    for (auto const& decl : grammar.semantics().declarations) {
-        for (auto const& row : decl.entryFunctions) {
-            // A row the format does not realize is no way into a program on it;
-            // a format that starts no program realizes none.
-            if (!format.realizesEntryVerb(row.verb)) continue;
-            std::string       linkName = dss::ffi::applyCMangling(row.name, scheme);
-            std::size_t const arity    = entryVerbParams(row.verb).size();
-            auto const it = std::find_if(out.begin(), out.end(),
-                                         [&](EntryLinkName const& e) { return e.linkName == linkName; });
-            if (it == out.end()) {
-                out.push_back(EntryLinkName{std::move(linkName), std::string{row.name}, row.verb});
-                arityOf.push_back(arity);
-            } else if (std::size_t const at = static_cast<std::size_t>(it - out.begin());
-                       arity > arityOf[at]) {
-                it->verb    = row.verb;   // the first row of the greatest arity
-                arityOf[at] = arity;
-            }
-        }
+    std::vector<EntryLinkName>    out;
+    for (RealizedEntryName const& n : realizedEntryNames(grammar, verbs)) {
+        out.push_back(EntryLinkName{dss::ffi::applyCMangling(n.name, scheme), n.name, n.verb});
     }
     return out;
+}
+
+// See the header: what the program's entry election may elect.
+EntryElectionScope entryElectionScope(GrammarSchema const& grammar, ObjectFormatSchema const& format,
+                                      std::span<AssembledModule const> namedObjects) {
+    EntryElectionScope scope;
+    scope.verbs.assign(format.entryVerbs().begin(), format.entryVerbs().end());
+    scope.precedence.assign(format.entryPrecedence().begin(), format.entryPrecedence().end());
+    if (scope.verbs.empty()) return scope;   // a format that starts no program elects by name
+    auto const standing = linker::standingEntryRequest(namedObjects);
+    if (!standing.has_value()) return scope;
+    UnitImageRequest const& request = *standing->request;
+    auto const&             entry   = std::get<UnitEntryRequest>(request.value);
+    if (!entry.runtimeStartup) {
+        // A function the image starts at, or a startup no DSS image provides: no C
+        // entry is elected, and the link decides the request -- the image's entry,
+        // or a refusal by name with the vocabulary's reason.
+        scope.electsNone = true;
+        return scope;
+    }
+    auto const outside = [&](EntryMaterialization v) {
+        return std::find(entry.verbs.begin(), entry.verbs.end(), v) == entry.verbs.end();
+    };
+    std::erase_if(scope.verbs, outside);
+    for (auto& group : scope.precedence) std::erase_if(group, outside);
+    std::erase_if(scope.precedence, [](std::vector<EntryMaterialization> const& g) { return g.empty(); });
+    std::string calls;
+    for (RealizedEntryName const& n : realizedEntryNames(grammar, scope.verbs)) {
+        calls += (calls.empty() ? "'" : ", '") + n.name + "'";
+    }
+    scope.restrictedBy = std::format(
+        "{} states '{}', the C runtime's startup that calls {}, so the program's entry is one of the functions it "
+        "calls (as link.exe and lld-link elect it)",
+        request.unit.empty() ? std::string{"a linked object"} : "'" + request.unit + "'", request.spelled,
+        calls.empty() ? std::string{"no entry this language declares"} : calls);
+    return scope;
 }
 
 // See the header: an OBJECT's entry candidates.
@@ -2380,9 +2418,11 @@ bool buildForeignEntryStartup(ForeignEntryCandidate const&    entry,
 std::optional<ResolvedEntry>
 resolveProgramEntry(std::span<EntryCandidate const>       candidates,
                     std::span<EntryMaterialization const> formatVerbs,
+                    std::span<std::vector<EntryMaterialization> const> precedence,
                     std::string_view                      formatName,
                     DiagnosticReporter&                   reporter,
-                    bool&                                 ok) {
+                    bool&                                 ok,
+                    std::string_view                      restrictedBy) {
     ok = true;
 
     // ── THE "THIS FORMAT STARTS NO PROGRAM" ARM ────────────────────────────
@@ -2401,7 +2441,11 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
     // arm, `dss --target x86_64:elf64-x86_64-linux` (the RELOCATABLE format)
     // refused `int main(void){return 0;}`, i.e. every object-file build in the
     // tree.
-    if (formatVerbs.empty()) {
+    //
+    // ★ A RESTRICTED set is never that answer (P69 fold 3e): a stated startup whose
+    // verbs this format realizes none of leaves nothing to elect, and is refused
+    // below as a program with no entry.
+    if (formatVerbs.empty() && restrictedBy.empty()) {
         if (candidates.empty()) return std::nullopt;
         return ResolvedEntry{0, EntryMaterialization::None};
     }
@@ -2435,16 +2479,24 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
         for (auto const i : nearMiss) {
             if (!detail.empty()) detail += "; ";
             detail += std::format("'{}' is defined here but needs the '{}' "
-                                  "materialization verb, which this format does "
-                                  "not realize",
+                                  "materialization verb, which {}",
                                   candidates[i].name,
-                                  entryMaterializationName(*candidates[i].verb));
+                                  entryMaterializationName(*candidates[i].verb),
+                                  restrictedBy.empty()
+                                      ? "this format does not realize"
+                                      : "the stated startup does not call an entry with");
         }
         std::string declared;
         for (auto const v : formatVerbs) {
             if (!declared.empty()) declared += ", ";
             declared += entryMaterializationName(v);
         }
+        std::string const admitted =
+            restrictedBy.empty()
+                ? std::format("This format realizes these materialization verbs: {}.", declared)
+                : std::format("{}; the election admits only these materialization verbs of it: {}.",
+                              restrictedBy, declared.empty() ? std::string{"<none this format realizes>"}
+                                                             : declared);
         ParseDiagnostic d;
         d.code     = DiagnosticCode::K_ProgramEntryUndefined;
         d.severity = DiagnosticSeverity::Error;
@@ -2452,13 +2504,13 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
             "no program entry is defined. Object format '{}' STARTS A PROGRAM, so "
             "the build needs exactly one function that is both an entry spelling "
             "the source language declares and realizable by this format; it found "
-            "none. This format realizes these materialization verbs: {}. {} The "
+            "none. {} {} The "
             "accepted entry set is the INTERSECTION of the language's "
             "`entryFunctions` mapping and this format's `entryVerbs`, so a "
             "definition can be a valid entry on one target and an ordinary "
             "function on another — that is by design, not a bug. "
             "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
-            formatName, declared,
+            formatName, admitted,
             detail.empty()
                 ? std::string{"No entry-named function is DEFINED in this build "
                               "at all (a prototype without a body defines "
@@ -2482,6 +2534,47 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
         if (!list.empty()) list += ", ";
         list += std::format("'{}' [{}]", candidates[i].name,
                             entryMaterializationName(*candidates[i].verb));
+    }
+    // ── THE FORMAT RANKS THEM (P69 fold 3e, the review of fold 3d's X2) ────
+    // Not a pick by order: the format STATES which startup outranks which
+    // (`entryPrecedence`), as each reference linker of it does. The candidate of
+    // the highest group holding any is the entry when it is the only one there;
+    // two there are the ambiguity below, whatever lies under them.
+    if (!precedence.empty()) {
+        auto const groupOf = [&](EntryMaterialization v) -> std::size_t {
+            for (std::size_t g = 0; g < precedence.size(); ++g) {
+                if (std::find(precedence[g].begin(), precedence[g].end(), v) != precedence[g].end()) return g;
+            }
+            return precedence.size();   // unreachable: a stated precedence partitions the verbs (load-enforced)
+        };
+        std::size_t best = precedence.size();
+        for (auto const i : realizable) best = std::min(best, groupOf(*candidates[i].verb));
+        std::vector<std::size_t> top;
+        for (auto const i : realizable) {
+            if (groupOf(*candidates[i].verb) == best) top.push_back(i);
+        }
+        if (top.size() == 1) {
+            std::string others;
+            for (auto const i : realizable) {
+                if (i == top[0]) continue;
+                if (!others.empty()) others += ", ";
+                others += std::format("'{}' [{}]", candidates[i].name,
+                                      entryMaterializationName(*candidates[i].verb));
+            }
+            ParseDiagnostic w;
+            w.code     = DiagnosticCode::K_ProgramEntryChosenByPrecedence;
+            w.severity = DiagnosticSeverity::Warning;
+            w.actual   = std::format(
+                "this program defines {} entries object format '{}' can start ({}); "
+                "the format ranks '{}' [{}] first ('entryPrecedence'), so the program "
+                "starts there and {} {} an ordinary function -- as link.exe "
+                "(LNK4067), lld-link and MinGW-w64's GNU ld choose it.",
+                realizable.size(), formatName, list, candidates[top[0]].name,
+                entryMaterializationName(*candidates[top[0]].verb), others,
+                realizable.size() == 2 ? "is" : "are each");
+            reporter.report(std::move(w));
+            return ResolvedEntry{top[0], *candidates[top[0]].verb};
+        }
     }
     ParseDiagnostic d;
     d.code     = DiagnosticCode::K_ProgramEntryAmbiguous;
@@ -2564,8 +2657,9 @@ bool synthesizeLibraryShims(CuMirModule& cuMir, DiagnosticReporter& reporter) {
 std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
-                     std::span<EntryMaterialization const> entryVerbs,
+                     EntryElectionScope const&         entryScope,
                      std::span<ForeignEntryCandidate const> entriesOfTheOtherInputs,
+                     std::optional<std::size_t>&       electedOtherInput,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
@@ -2590,23 +2684,35 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     for (ForeignEntryCandidate const& other : entriesOfTheOtherInputs) {
         cands.push_back(other.candidate);
     }
+    electedOtherInput.reset();
     bool entryOk = true;
-    auto const resolved = resolveProgramEntry(cands, entryVerbs, formatName,
-                                              reporter, entryOk);
+    // A named object's stated entry that is no C startup (P69 fold 3e) leaves no C
+    // entry to elect: the link starts the image as the request says, or refuses it.
+    auto const resolved =
+        entryScope.electsNone
+            ? std::optional<ResolvedEntry>{}
+            : resolveProgramEntry(cands, entryScope.verbs, entryScope.precedence, formatName,
+                                  reporter, entryOk, entryScope.restrictedBy);
     if (!entryOk) return std::nullopt;
 
     std::optional<SymbolId> userEntry;
     EntryMaterialization    entryVerb = EntryMaterialization::None;
     ForeignEntryCandidate const* foreignEntry = nullptr;
+    // P69 fold 3e (class C's N3): a definition whose signature is none of its
+    // name's realized rows is called with the elected verb's signature.
+    bool entryCalledWithTheVerbsSignature = false;
     if (resolved.has_value() && resolved->index < ownCandidates) {
         // `collectEntryCandidates` records each candidate's index in
         // `model.symbols()`, which IS its SymbolId on this path (the same identity
         // the pre-existing scan minted).
         userEntry = SymbolId{candSym[resolved->index]};
         entryVerb = resolved->verb;
+        entryCalledWithTheVerbsSignature =
+            model.symbols()[candSym[resolved->index]].entryCalledWithTheVerbsSignature;
     } else if (resolved.has_value()) {
-        foreignEntry = &entriesOfTheOtherInputs[resolved->index - ownCandidates];
-        entryVerb    = resolved->verb;
+        foreignEntry      = &entriesOfTheOtherInputs[resolved->index - ownCandidates];
+        entryVerb         = resolved->verb;
+        electedOtherInput = resolved->index - ownCandidates;   // the caller states it (X3)
     }
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
@@ -2633,6 +2739,11 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                                        foreignEntry->linkName, userEntry,
                                        cuMir.externImports, entryVerb, processArgs,
                                        cuMir.cSymbolDecoration, formatName, reporter)
+        : entryCalledWithTheVerbsSignature
+            ? realizeEntryShapeWithTheVerbsSignature(cuMir.mir, model.lattice().interner(),
+                                                     userEntry, cuMir.externImports, entryVerb,
+                                                     processArgs, cuMir.cSymbolDecoration,
+                                                     formatName, reporter)
             : realizeEntryShape(cuMir.mir, model.lattice().interner(),
                                 userEntry, cuMir.externImports,
                                 entryVerb, processArgs, cuMir.cSymbolDecoration,
@@ -2929,6 +3040,21 @@ constexpr std::uint8_t kArGlobalMagic[8] = {'!', '<', 'a', 'r', 'c', 'h', '>', 0
 // and the same refusal correctly stays silent. One lookup, both verdicts, no
 // second policy.
 //
+// ★★ BUT A ROW THAT REALIZES TO THE NAME ASKED OUTRANKS ONE FOUND BY ITS C
+// SPELLING (P69 fold 3e). A platform may export a facility under its C name
+// AND the corpus's canonical row under another: glibc exports `strtol`
+// (GLIBC_2.2.5, the C17 function) beside `__isoc23_strtol`, and UCRT and
+// libSystem export `strtol` itself (✔MEASURED, lane `xa`: readelf
+// --dyn-syms of glibc 2.39, llvm-readobj --coff-exports of ucrtbase.dll,
+// dlsym on macOS 26). A foreign object compiled against the platform's own
+// headers writes `strtol` and means THAT function, yet the forward hit is
+// the C23 row, whose link name is not what was written, and both binders
+// left it unbound or refused it. So a forward row realizing to ANOTHER name
+// is held back, the name is asked in REVERSE, and a row realizing to it
+// exactly (`__dss_platform_strtol`, link name `strtol`) is the answer; only
+// where none does is the held-back row returned, and the callers' refusals
+// see it exactly as before (`call time` on pe still meets `_time64`'s row).
+//
 // ★★ AMBIGUITY IS REFUSED, NEVER FIRST-MATCHED. The reverse index is built by
 // walking a hash map, so a name two rows both realize to would otherwise be
 // decided by hash order — the "decides the answer by filesystem" hazard this
@@ -3087,6 +3213,13 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // and no format name appears here — the rule is applied in both directions.
     std::vector<std::string> canonicalOf(onBinaryNames.size());
     std::vector<std::string> forwardRequest;
+    // The forward rows that realize to another name than the one asked: each
+    // the answer only where no row realizes to the name itself.
+    std::unordered_map<std::string, PlatformExternRealization> renamed;
+    auto const withRenamed = [&] {
+        for (auto& [name, held] : renamed) out.try_emplace(name, std::move(held));
+        return out;
+    };
     forwardRequest.reserve(onBinaryNames.size());
     for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
         if (onBinaryNames[i].empty()) continue;
@@ -3115,6 +3248,16 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
             if (row->second.status != answer) {
                 continue;
             }
+            // A row realizing to another name than the one asked waits for
+            // the REVERSE arm (the ★★ note above).
+            if (!row->second.linkName.empty()
+                && ffi::linkNameFor(canonicalOf[i], /*asmLabel=*/{}, scheme,
+                                    row->second.linkName)
+                       != onBinaryNames[i]) {
+                renamed.emplace(onBinaryNames[i],
+                                PlatformExternRealization{canonicalOf[i], row->second});
+                continue;
+            }
             out.emplace(onBinaryNames[i],
                         PlatformExternRealization{canonicalOf[i], row->second});
         }
@@ -3130,7 +3273,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     for (auto const& name : onBinaryNames) {
         if (!name.empty() && out.find(name) == out.end()) missing.push_back(name);
     }
-    if (missing.empty()) return out;
+    if (missing.empty()) return withRenamed();
 
     auto const allNames = ffi::collectShippedExternSymbolFormats();
     if (!allNames.has_value()) return std::nullopt;   // corpus not located
@@ -3140,7 +3283,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         (void)formats;   // availability is re-decided by the realization below
         everyName.push_back(name);
     }
-    if (everyName.empty()) return out;
+    if (everyName.empty()) return withRenamed();
     // ★ THE AGREEMENT CHECK THIS CALL RUNS IS CORPUS-WIDE, BECAUSE THE QUESTION
     // IS. Every other caller asks about a handful of names and is held to those;
     // this arm genuinely asks "realize EVERY name", because the reverse index it
@@ -3181,7 +3324,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         if (it == byLinkName.end()) continue;
         out.emplace(name, it->second);
     }
-    return out;
+    return withRenamed();
 }
 
 // ── D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY ─────────────────
@@ -3246,7 +3389,13 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
     std::unordered_map<std::string, OperatorNamedImport> bySymbol;
     if (libraries.empty()) return bySymbol;
 
-    for (auto const& lib : libraries) {
+    // ★ EVERY LIBRARY IS READ, AND REPORTS ITS OWN REFUSAL, BEFORE THE BINDING
+    // FAILS (`substrate::runEveryUnit`, the several-unit class's one home; site
+    // (f) of the orchestrator's ledger 568, P69 fold 3e): a library whose
+    // surface cannot be read never stops the libraries after it. The first row
+    // a name meets still wins (`try_emplace`, in library order).
+    bool const everyLibraryRead = substrate::runEveryUnit(libraries.size(), [&](std::size_t l) {
+        ResolveLibrarySpec const& lib = libraries[l];
         // ★ THE TARGET-AWARE READ, NOT THE BARE READER. This binder and
         // `ingest()`'s `readSource` are the paths a `--resolve-library` binary
         // reaches FF1 by, and a wrong-FORMAT library must be refused on all of
@@ -3254,7 +3403,7 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
         // formats are undecorated and the export names match verbatim
         // (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL).
         auto surface = ffi::readImportsForTargetFormat(lib.path, format, reporter);
-        if (!surface.has_value()) return std::nullopt;   // reported loud there
+        if (!surface.has_value()) return false;   // reported loud there
         std::string const basename = lib.path.filename().string();
         for (auto const& row : *surface) {
             if (row.mangledName.empty()) continue;
@@ -3274,7 +3423,9 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
                 OperatorNamedImport{std::move(identity), std::move(version),
                                     row.kind});
         }
-    }
+        return true;
+    });
+    if (!everyLibraryRead) return std::nullopt;
     return bySymbol;
 }
 
@@ -3520,6 +3671,12 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
     return cache.schema;
 }
 
+// ★ A REFUSAL OF ONE INPUT NAMES THE INPUT: every read of a named object or
+// archive input below goes through `substrate::readNamingTheInput`
+// (core/substrate/input_named_diagnostics.hpp, the class's one home), as the FF1
+// surface read of a named library does inside `ffi::readImportsForTargetFormat`.
+using substrate::readNamingTheInput;
+
 // Parse ONE `ar` member's raw bytes back into a mergeable `AssembledModule`,
 // dispatching to the per-FORMAT relocatable-object reader by the object-format
 // KIND (the closed-enum agnostic axis, never a format-name branch). A fresh,
@@ -3587,8 +3744,15 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
         reporter.report(std::move(d));
         return std::nullopt;
     }
-    auto unit = backend->readRelocatableObject(memberBytes, target, format,
-                                               reporter, memberCu);
+    // The member, named as its archive's open refusal names the archive (a
+    // named object is a member of a one-member container, named by its path).
+    std::string const input =
+        memberName == archivePath.filename().string()
+            ? core::genericSpelling(archivePath)
+            : std::format("{}({})", core::genericSpelling(archivePath), memberName);
+    auto unit = readNamingTheInput(input, reporter, [&](DiagnosticReporter& inputReporter) {
+        return backend->readRelocatableObject(memberBytes, target, format, inputReporter, memberCu);
+    });
     // P69 send-back 5 (review-xa4 NIT 11): every request the unit states names
     // the unit -- the object's file, or `archive(member)` -- from here on, so
     // each diagnostic a link makes of one says whose directive it is.
@@ -3866,7 +4030,12 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     };
     std::vector<ParsedArchive> archives;
     archives.reserve(archivePaths.size());
-    for (auto const& archivePath : archivePaths) {
+    // ★ EVERY ARCHIVE IS OPENED AND PARSED, AND REPORTS ITS OWN REFUSAL, BEFORE
+    // THE PULL FAILS (`substrate::runEveryUnit`; site (g) of the orchestrator's
+    // ledger 568, P69 fold 3e): an unreadable archive never stops the archives
+    // after it. Nothing is pulled from any archive when one failed.
+    bool const everyArchiveParsed = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {
+        std::filesystem::path const& archivePath = archivePaths[a];
         std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
@@ -3877,16 +4046,20 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                 "(D-LK-STATIC-LINK).",
                 core::genericSpelling(archivePath));
             reporter.report(std::move(d));
-            return std::nullopt;
+            return false;
         }
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
-        auto arch = ffi::readArArchive(
-            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
-            archivePath.filename().string(), reporter);
-        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+        auto arch = readNamingTheInput(
+            core::genericSpelling(archivePath), reporter, [&](DiagnosticReporter& archiveReporter) {
+                return ffi::readArArchive(std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+                                          archivePath.filename().string(), archiveReporter);
+            });
+        if (!arch) return false;   // corrupt archive -> reader fail-loud, named
         archives.push_back(ParsedArchive{std::move(bytes), std::move(*arch)});
-    }
+        return true;
+    });
+    if (!everyArchiveParsed) return std::nullopt;
 
     // Global armap: symbol name -> (archiveIdx, memberIndex). First-wins across
     // archives (standard left-to-right link order) + first-wins within one
@@ -4121,6 +4294,10 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
     // dedup so a member defining several referenced symbols is pulled once.
     std::unordered_set<std::uint64_t> pulledMembers;
+    // Whether every member the search pulled could be read (site (h) of the
+    // orchestrator's ledger 568): a member that cannot be read is reported and
+    // the search goes on; the pull fails at its fixed point.
+    bool everyPulledMemberRead = true;
     auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
         return (static_cast<std::uint64_t>(ai) << 32)
              |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
@@ -4218,21 +4395,37 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     //     refused by name). Pinned by `ArchiveSearchRoundOrder` (every leg) and
     //     `ArchiveSearchRoundOrderNative` (GNU ld on the Linux legs, Apple's ld
     //     on the Mac), `tests/link/test_common_symbols.cpp`.
-    auto const fetchDefinitionsForCommons = [&]() -> std::optional<bool> {
+    // ★ EVERY COMMON OF THE ROUND IS ASKED (`substrate::runEveryUnit`; site (h)
+    // of the orchestrator's ledger 568, P69 fold 3e): a name whose member cannot
+    // be read, or whose answer the documents leave open, is reported and the
+    // round goes on to the next name; the search fails at its fixed point
+    // (`everyPulledMemberRead`). A name stops at its own undecidable member --
+    // a later member of the same name is never fetched in its place -- in this
+    // round or a later one: a name the round reported is never asked again
+    // (`commonsRefused`), where a round after a fetch would read its unreadable
+    // member a second time, and say so twice (✔MEASURED, the every-unit pin on
+    // the Mac leg: a readable member fetched, then the unreadable member's name
+    // refused once per round).
+    bool commonRuleUnknown = false;   // the members' rule could not be read: reported once, no name decided after it
+    std::unordered_set<std::string> commonsRefused;   // reported by a round: failed, never asked again
+    auto const fetchDefinitionsForCommons = [&]() -> bool {
         bool              fetched  = false;
         std::size_t const roundEnd = commonNames.size();
-        for (std::size_t k = 0; k < roundEnd; ++k) {
-            std::string const name = commonNames[k];   // a copy: a pull grows the vector
-            if (yieldedToNames.contains(name)) continue;   // a definition replaced it
+        auto const answerCommon = [&](std::string const& name) -> bool {
+            if (yieldedToNames.contains(name)) return true;   // a definition replaced it
             auto const listed = armapEntries.find(name);
-            if (listed == armapEntries.end()) continue;   // no archive defines it: nothing to decide
+            if (listed == armapEntries.end()) return true;   // no archive defines it: nothing to decide
+            if (commonRuleUnknown) return false;   // reported, with the first name it stopped
             auto const [fai, fmi] = listed->second.front();
             std::string_view const memberName = archives[fai].archive.members[fmi].name;
             if (!commonResolutionRead) {
                 commonResolutionRead = true;
                 ObjectFormatSchema const* const memberSchema = archiveMemberFormat(
                     memberFormat, format, target, archivePaths[fai], memberName, reporter);
-                if (memberSchema == nullptr) return std::nullopt;   // reported
+                if (memberSchema == nullptr) {
+                    commonRuleUnknown = true;
+                    return false;   // reported
+                }
                 commonResolution = memberSchema->archiveCommonResolution();
             }
             if (!commonResolution.has_value()) {
@@ -4251,9 +4444,10 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                     memberFormat.schema != nullptr ? memberFormat.schema->name()
                                                    : format.name());
                 reporter.report(std::move(d));
-                return std::nullopt;
+                commonRuleUnknown = true;   // the document's gap, said once
+                return false;
             }
-            if (*commonResolution == ArchiveCommonResolution::KeepCommon) continue;
+            if (*commonResolution == ArchiveCommonResolution::KeepCommon) return true;
             // FetchDefinition. A WEAK definition already in the link, under a link
             // document that does not say whether the common yields to it, leaves
             // open whether this name is still a common at all.
@@ -4271,21 +4465,30 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                     "guess one.",
                     name, memberName, core::genericSpelling(archivePaths[fai]), format.name());
                 reporter.report(std::move(d));
-                return std::nullopt;
+                return false;
             }
             for (auto const& [cai, cmi] : listed->second) {
                 // A member already in the link has had its say: its definition of
                 // the name, if any, is one the common outranks.
                 if (pulledMembers.contains(memberKey(cai, cmi))) continue;
                 auto const qualifies = memberDefinesADatumTheCommonYieldsTo(cai, cmi, name);
-                if (!qualifies.has_value()) return std::nullopt;   // reported
+                if (!qualifies.has_value()) return false;   // reported: the name's answer is unknown
                 if (!*qualifies) continue;
                 pulledMembers.insert(memberKey(cai, cmi));
-                if (!pullMember(cai, cmi)) return std::nullopt;   // reported
+                if (!pullMember(cai, cmi)) return false;   // reported
                 fetched = true;
                 break;
             }
-        }
+            return true;
+        };
+        bool const everyCommonAnswered = substrate::runEveryUnit(roundEnd, [&](std::size_t k) {
+            std::string const name = commonNames[k];   // a copy: a pull grows the vector
+            if (commonsRefused.contains(name)) return false;   // reported by an earlier round, once
+            if (answerCommon(name)) return true;
+            commonsRefused.insert(name);
+            return false;
+        });
+        everyPulledMemberRead = everyCommonAnswered && everyPulledMemberRead;
         return fetched;
     };
 
@@ -4347,18 +4550,30 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
         }
         return runtimeRealized.count(name) != 0;
     };
+    // ★ EVERY MEMBER THE SEARCH REACHES IS READ, AND REPORTS ITS OWN REFUSAL,
+    // BEFORE THE PULL FAILS (site (h) of the orchestrator's ledger 568, P69 fold
+    // 3e): a member that cannot be read never stops the search for the names the
+    // other members answer. Its key stays in `pulledMembers`, so it is read once;
+    // its own uses never join the search; the pull fails after the fixed point.
+    // The worklist grows while it is asked -- a member's uses are the next names
+    // -- so it takes the home's GROWING form (`runEveryUnitOfAGrowingSet`).
+    // (`everyPulledMemberRead` is declared with `pulledMembers`, above: the
+    // commons round's pulls answer it too.)
     for (;;) {
-        for (; cursor < worklist.size(); ++cursor) {
-            std::string const& name = worklist[cursor];
-            if (definedNames.count(name) != 0) continue;   // already satisfied
-            auto const it = armap.find(name);
-            if (it == armap.end()) continue;   // no archive defines it -> a real FFI
-                                               // import / an undefined the linker's
-                                               // own gate handles (never pulled here)
-            auto const [ai, mi] = it->second;
-            if (!pulledMembers.insert(memberKey(ai, mi)).second) continue;  // lazy dedup
-            if (!pullMember(ai, mi)) return std::nullopt;   // reported
-        }
+        everyPulledMemberRead = substrate::runEveryUnitOfAGrowingSet(
+                                    cursor, [&] { return worklist.size(); },
+                                    [&](std::size_t k) {
+                                        std::string const& name = worklist[k];
+                                        if (definedNames.count(name) != 0) return true;   // already satisfied
+                                        auto const it = armap.find(name);
+                                        // No archive defines it -> a real FFI import / an undefined the
+                                        // linker's own gate handles (never pulled here).
+                                        if (it == armap.end()) return true;
+                                        auto const [ai, mi] = it->second;
+                                        if (!pulledMembers.insert(memberKey(ai, mi)).second) return true;   // lazy dedup
+                                        return pullMember(ai, mi);   // false: reported
+                                    })
+                             && everyPulledMemberRead;
         // THE WEAK ROUND: each weak reference the search left unresolved, by the
         // members' document — fetched as a strong reference where it says
         // `fetchMember` (ld64), left unresolved where it says `doNotFetch` (the
@@ -4426,9 +4641,9 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
         // alone: an ELF member document fetches nothing for a weak reference, and
         // a PE one neither that nor a definition for a common.
         {
-            auto const fetchedForACommon = fetchDefinitionsForCommons();
-            if (!fetchedForACommon.has_value()) return std::nullopt;   // reported
-            if (*fetchedForACommon) continue;   // the search resumes with those members' uses
+            // (A common the round could not answer is reported there and fails
+            // the pull at the fixed point, `everyPulledMemberRead`.)
+            if (fetchDefinitionsForCommons()) continue;   // the search resumes with those members' uses
         }
         // The search has answered every name it holds: offer each fallback whose A
         // it left unresolved.
@@ -4456,6 +4671,9 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
         for (std::size_t k = 0; k < pulled.size(); ++k) offerFallbacks(pulled[k]);
         if (!searchMore) break;
     }
+    // The search's fixed point is reached: a member that could not be read fails
+    // the pull now, after every member the search reached was asked (site (h)).
+    if (!everyPulledMemberRead) return std::nullopt;   // each reported
 
     // ── A PULLED MEMBER NAMES NO ENTRY (P69 round 4) ─────────────────────────
     // link.exe fixes the image's entry before it searches an archive and GNU ld
@@ -4473,6 +4691,88 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     return pulled;
 }
 
+// See the header: the archive members a program's startup pulls for its entry.
+std::optional<std::vector<AssembledModule>>
+pullEntryArchiveMembers(std::span<EntryLinkName const>         names,
+                        std::span<std::filesystem::path const> archivePaths,
+                        TargetSchema const&                    target,
+                        ObjectFormatSchema const&              format,
+                        DiagnosticReporter&                    reporter) {
+    std::vector<AssembledModule> pulled;
+    if (names.empty() || archivePaths.empty()) return pulled;
+    ArchiveMemberFormat                memberFormat;
+    std::unordered_set<std::uint64_t>  taken;   // (archive << 32) | member, each read once
+    // Per archive, in the link's order: its bytes and its index. Read lazily, so
+    // an archive after the one that answers every name is never opened.
+    struct ParsedArchive {
+        std::vector<std::uint8_t> bytes;
+        ffi::ArArchive            archive;
+    };
+    std::vector<std::optional<ParsedArchive>> archives(archivePaths.size());
+    std::vector<bool> unreadable(archivePaths.size(), false);   // reported once, when first asked
+    auto const archiveAt = [&](std::size_t ai) -> ParsedArchive const* {
+        if (archives[ai].has_value()) return &*archives[ai];
+        if (unreadable[ai]) return nullptr;   // reported when it was first asked
+        unreadable[ai] = true;   // until the read below succeeds
+        std::ifstream in(core::extendedLengthSpelling(archivePaths[ai]), std::ios::binary);
+        if (!in) {
+            report(reporter, DiagnosticCode::F_FileOpenFailed, DiagnosticSeverity::Error,
+                   std::format("static-link: failed to open archive '{}' for reading.",
+                               core::genericSpelling(archivePaths[ai])));
+            return nullptr;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = readNamingTheInput(
+            core::genericSpelling(archivePaths[ai]), reporter, [&](DiagnosticReporter& archiveReporter) {
+                return ffi::readArArchive(std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+                                          archivePaths[ai].filename().string(), archiveReporter);
+            });
+        if (!arch) return nullptr;   // corrupt archive -> reader fail-loud, named
+        archives[ai].emplace(ParsedArchive{std::move(bytes), std::move(*arch)});
+        unreadable[ai] = false;
+        return &*archives[ai];
+    };
+    // ★ EVERY ENTRY NAME IS ANSWERED BEFORE THE PULL FAILS (`substrate::runEveryUnit`;
+    // site (i) of the orchestrator's ledger 568, P69 fold 3e): a name whose
+    // archive or member cannot be read is reported and fails, and the names after
+    // it are still asked -- an archive that could not be read is said once, and a
+    // name the search reaches it for fails with no second word.
+    bool const everyNameAnswered = substrate::runEveryUnit(names.size(), [&](std::size_t n) {
+        EntryLinkName const& name = names[n];
+        // The first member the archives' indexes list for the name, archives in
+        // the link's order: the member the startup's undefined reference pulls,
+        // as `pullStaticArchiveMembers` pulls one for any reference.
+        for (std::size_t ai = 0; ai < archivePaths.size(); ++ai) {
+            ParsedArchive const* const pa = archiveAt(ai);
+            if (pa == nullptr) return false;   // reported
+            auto const listed = std::find_if(pa->archive.symbols.begin(), pa->archive.symbols.end(),
+                                             [&](auto const& sym) { return sym.name == name.linkName; });
+            if (listed == pa->archive.symbols.end()) continue;
+            std::size_t const   mi  = listed->memberIndex;
+            std::uint64_t const key = (static_cast<std::uint64_t>(ai) << 32)
+                                    | static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
+            if (taken.insert(key).second) {
+                ffi::ArMember const& member = pa->archive.members[mi];
+                std::span<std::uint8_t const> const memberBytes{
+                    pa->bytes.data() + static_cast<std::size_t>(member.dataOffset),
+                    static_cast<std::size_t>(member.size)};
+                auto mod = readArchiveMemberModule(memberBytes, target, format, memberFormat,
+                                                   archivePaths[ai], member.name, reporter);
+                if (!mod) return false;   // member-read fail-loud
+                // A member the search pulled names no entry of its own
+                // (`dropPulledMemberEntryRequests`, the lazy pull's rule).
+                linker::dropPulledMemberEntryRequests(mod->linkerRequests);
+                pulled.push_back(std::move(*mod));
+            }
+            return true;   // the name is answered by the first archive that lists it
+        }
+        return true;   // no archive lists it: the link's own gate answers the name
+    });
+    if (!everyNameAnswered) return std::nullopt;   // each reported
+    return pulled;
+}
+
 std::optional<ExtractedArchiveMembers>
 extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                             TargetSchema const&                    target,
@@ -4483,7 +4783,13 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     // lazy pull's. On this path `format` is a `container: "archive"` schema, so
     // the resolution is the identity case and costs nothing.
     ArchiveMemberFormat memberFormat;
-    for (auto const& archivePath : archivePaths) {
+    // EVERY input archive, and every member of each, is read and reports its
+    // own errors before the extraction fails (`runEveryUnit`, the several-unit
+    // class's one home: P69 H6b, the review of H6's N1; site (c) of the
+    // orchestrator's ledger 550, fold 3e): an archive that does not open or
+    // parse, or a member that does not read, never stops the ones after it.
+    bool const everyArchiveRead = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {
+        std::filesystem::path const& archivePath = archivePaths[a];
         std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
@@ -4494,14 +4800,16 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                 "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
                 core::genericSpelling(archivePath));
             reporter.report(std::move(d));
-            return std::nullopt;
+            return false;
         }
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
-        auto arch = ffi::readArArchive(
-            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
-            archivePath.filename().string(), reporter);
-        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+        auto arch = readNamingTheInput(
+            core::genericSpelling(archivePath), reporter, [&](DiagnosticReporter& archiveReporter) {
+                return ffi::readArArchive(std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+                                          archivePath.filename().string(), archiveReporter);
+            });
+        if (!arch) return false;   // corrupt archive -> reader fail-loud, named
 
         // EVERY member, in archive order -- a static LIBRARY packages all of its
         // objects (unlike the LAZY referenced-subset the exe/final-link path
@@ -4511,7 +4819,8 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
         // is carried verbatim -- cosmetic (the armap selects members by index),
         // and `ar` permits duplicate member names; a rare empty name (never from
         // a well-formed archive) is synthesized so the writer's name belt holds.
-        for (auto const& member : arch->members) {
+        return substrate::runEveryUnit(arch->members.size(), [&](std::size_t m) {
+            ffi::ArMember const& member = arch->members[m];
             std::span<std::uint8_t const> const memberBytes{
                 bytes.data() + static_cast<std::size_t>(member.dataOffset),
                 static_cast<std::size_t>(member.size)};
@@ -4519,14 +4828,16 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                 readArchiveMemberModule(memberBytes, target, format,
                                         memberFormat, archivePath, member.name,
                                         reporter);
-            if (!member_mod) return std::nullopt;   // member-read fail-loud
+            if (!member_mod) return false;   // member-read fail-loud
             out.modules.push_back(std::move(*member_mod));
             out.names.push_back(
                 member.name.empty()
                     ? ("member_" + std::to_string(out.names.size()) + ".o")
                     : member.name);
-        }
-    }
+            return true;
+        });
+    });
+    if (!everyArchiveRead) return std::nullopt;
     return out;
 }
 
@@ -4547,7 +4858,12 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     // target, which no input varies, so per-file resolution would re-scan the
     // object-format tree for every object named.
     ArchiveMemberFormat memberFormat;
-    for (auto const& objectPath : objectPaths) {
+    // EVERY named object is read and reports its own errors before the read
+    // fails (`runEveryUnit`, the several-unit class's one home: P69 H6b; site
+    // (c) of the orchestrator's ledger 550, fold 3e): an object that does not
+    // open or read never stops the objects after it.
+    bool const everyObjectRead = substrate::runEveryUnit(objectPaths.size(), [&](std::size_t o) {
+        std::filesystem::path const& objectPath = objectPaths[o];
         std::ifstream in(core::extendedLengthSpelling(objectPath), std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
@@ -4560,7 +4876,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
                 "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
                 core::genericSpelling(objectPath));
             reporter.report(std::move(d));
-            return std::nullopt;
+            return false;
         }
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
@@ -4574,9 +4890,11 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
             std::span<std::uint8_t const>{bytes.data(), bytes.size()}, target,
             linkFormat, memberFormat, objectPath,
             objectPath.filename().string(), reporter);
-        if (!object_mod) return std::nullopt;   // read fail-loud already reported
+        if (!object_mod) return false;   // read fail-loud already reported
         objects.push_back(std::move(*object_mod));
-    }
+        return true;
+    });
+    if (!everyObjectRead) return std::nullopt;
     // P69 send-back 5 (review-xa4 MINOR 3): an object NAMED to the link keeps
     // its `/ENTRY:`, and the entry's name is a reference the archive search
     // answers (`linker::requireEntryReference`). An image link decides it; a
@@ -4590,7 +4908,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     return objects;
 }
 
-bool linkAndWriteWithStaticArchives(std::optional<AssembledModule>         compiledModule,
+bool linkAndWriteWithStaticArchives(std::vector<AssembledModule>           compiledModules,
                                     std::vector<AssembledModule>           objects,
                                     std::span<std::filesystem::path const> staticArchives,
                                     std::span<ResolveLibrarySpec const>    dynamicLibraries,
@@ -4599,7 +4917,7 @@ bool linkAndWriteWithStaticArchives(std::optional<AssembledModule>         compi
                                     std::filesystem::path const&           outPath,
                                     DiagnosticReporter&                    reporter,
                                     ImageRequest const&                    request) {
-    if (!compiledModule.has_value() && objects.empty()) {
+    if (compiledModules.empty() && objects.empty()) {
         // The contract's one refusal: a caller reached the link with nothing to
         // link. Every route that produces an image hands a compiled module or at
         // least one object (the all-object route refuses an empty input before).
@@ -4615,18 +4933,17 @@ bool linkAndWriteWithStaticArchives(std::optional<AssembledModule>         compi
         return false;
     }
     if (objects.empty() && staticArchives.empty()) {
-        return linkAndWrite(std::span<AssembledModule const>{&*compiledModule, 1},
+        return linkAndWrite(std::span<AssembledModule const>{compiledModules.data(), compiledModules.size()},
                             target, format, outPath, reporter, request);
     }
 
     // The objects join the seed the lazy archive pull resolves against (the
     // header's ordering note), so an archive member an object input needs is
     // pulled rather than silently left behind.
-    std::size_t const compiledCount = compiledModule.has_value() ? 1u : 0u;
+    std::size_t const compiledCount = compiledModules.size();
     std::size_t const objectCount   = objects.size();
-    std::vector<AssembledModule> combined;
+    std::vector<AssembledModule> combined = std::move(compiledModules);
     combined.reserve(compiledCount + objectCount);
-    if (compiledModule.has_value()) combined.push_back(std::move(*compiledModule));
     for (auto& object_mod : objects) combined.push_back(std::move(object_mod));
 
     auto pulled = pullStaticArchiveMembers(
@@ -4769,7 +5086,7 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     // EVERY member is linked and reports its own errors before the archive fails (`runEveryUnit`, the several-unit
     // class's one home): a member that fails never stops the members after it, and each member's cleanliness is
     // counted from its own start, not from the archive's.
-    bool const everyMemberLinked = runEveryUnit(modules.size(), [&](std::size_t i) {
+    bool const everyMemberLinked = substrate::runEveryUnit(modules.size(), [&](std::size_t i) {
         auto const memberEntry = reporter.errorCount();
         auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
                                   target, format, reporter, memberRequest);
@@ -4867,10 +5184,11 @@ assembleUnit(CompilationUnit const&        cu,
                         reporter, cuMir->externImports)) {
         return std::nullopt;   // optimize-stage failure already reported
     }
+    std::optional<std::size_t> noOtherInput;   // one unit alone: none can win
     return lowerCuMirToAssembly(
-        *cuMir, format.processArgs(), format.entryVerbs(),
+        *cuMir, format.processArgs(), entryElectionScope(grammar, format, {}),
         // One unit assembled alone: no other input of a link stands beside it.
-        std::span<ForeignEntryCandidate const>{},
+        std::span<ForeignEntryCandidate const>{}, noOtherInput,
         format.sehPersonality(), format.name(),
         target.wideFloatSoftcallLibrary(format.kind()), reporter,
         // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics runtime, read
@@ -5147,7 +5465,6 @@ assembleAsmUnit(CompilationUnit const&     cu,
                 ObjectFormatSchema const&  format,
                 DiagnosticReporter&        reporter,
                 CompileOptions const&      opts) {
-    std::span<EntryMaterialization const> const formatVerbs = format.entryVerbs();
     // ★★★ THE `encode` TIER'S WHOLE BODY. Compare it with `assembleUnit` above:
     // no semantic analysis, no CST→HIR, no HIR→MIR, no optimizer, no MIR→LIR,
     // no liveness, no register allocation, no two-address legalization, no
@@ -5164,59 +5481,36 @@ assembleAsmUnit(CompilationUnit const&     cu,
         empty.cuId = cu.id();
         return empty;
     }
-    // ★★★ THE ENTRY NAMES ARE **NOT** INTERSECTED WITH THE FORMAT'S VERBS, AND
-    // THIS COMMENT USED TO CLAIM THEY WERE. The claim sat above a `(void)
-    // formatVerbs;` for the whole life of the function — fifteen lines
-    // describing an intersection that no line performed. Corrected rather than
-    // implemented, because the intersection is not merely unwritten: it has no
-    // subject here.
-    //
-    // ✔MEASURED in `resolveProgramEntry` (this file): the intersection is
-    // `EntryCandidate::verb ∈ formatVerbs`, and `verb` comes from
-    // `SemanticModel`'s `SymbolRecord::entryVerb` — the SEMANTIC tier's record
-    // of which declared entry SHAPE a definition's signature matched. The
-    // `encode` tier runs no semantic analysis by construction (there is no MIR
-    // module, which is the whole point of the tier), and a `.s` label carries
-    // no signature to match a shape against anyway. So an assembly label has no
-    // materialization verb, and "intersect the labels' verbs with the format's"
-    // is not a thing that can be computed — not a TODO.
-    //
-    // ⚠ WHAT `formatVerbs` CAN HONESTLY ANSWER HERE, AND NOW DOES: whether this
-    // format STARTS A PROGRAM at all. A non-empty declared verb set means it
-    // does (`ObjectFormatData::validate()` pins non-empty ⟺ exec-flavored, in
-    // both directions), and a dialect that declares no `entryLabels` can then
-    // never resolve one — every function would come back unelected and the
-    // trampoline would call whatever landed at functions[0]. That is the
-    // silently-wrong-entry outcome the previous comment named as the thing that
-    // must not happen, while the code it introduced did nothing to prevent it.
-    std::span<std::string const> const entryNames{
-        grammar.assembly().entryLabels};
-    if (!formatVerbs.empty() && entryNames.empty()) {
-        ParseDiagnostic d;
-        d.code     = DiagnosticCode::K_ProgramEntryUndefined;
-        d.severity = DiagnosticSeverity::Error;
-        d.actual = std::format(
-            "assembly dialect '{}' declares no 'assembly.entryLabels', so no "
-            "label in a '{}' file can be this program's entry — but the object "
-            "format STARTS A PROGRAM (it declares {} entry-materialization "
-            "verb(s)), so it needs one. Without an elected entry the emitted "
-            "trampoline would call whichever function happened to land first. "
-            "Add the entry spelling(s) to the dialect's 'assembly.entryLabels', "
-            "or build this unit for a relocatable format.",
-            grammar.name(), grammar.name(), formatVerbs.size());
-        reporter.report(std::move(d));
-        return std::nullopt;
-    }
+    // ★★★ THIS UNIT ELECTS NO ENTRY (P69 fold 3e, the review of fold 3d's X1).
+    // It used to: its lowering matched the dialect's own label list, a second
+    // election over a second vocabulary, which never saw an object input's
+    // `main`. The unit's module is now one candidate source among the link's
+    // inputs, read as an object's is (`collectObjectEntryCandidates`, through the
+    // one vocabulary `entryLinkNames`: the dialect's `entryLabels` rows, with the
+    // richest verb of each name the format realizes, spelled on the binary in the
+    // format's C decoration), and the driver's route elects among them all
+    // (`resolveProgramEntry`). What stays here is the label-level refusal only a
+    // lowering can make: an entry-named label that is not exported is no
+    // candidate, and is refused by name.
+    std::vector<std::string> entryNames;
+    for (EntryLinkName const& n : entryLinkNames(grammar, format)) entryNames.push_back(n.linkName);
 
     AssembledModule merged;
     merged.cuId = cu.id();
-    for (auto const& tree : cu.trees()) {
+    // EVERY tree is lowered and assembled, and reports its own errors, before
+    // the unit fails (`runEveryUnit`, the several-unit class's one home: P69
+    // H6b, the review of H6's N1; site (e) of the orchestrator's ledger 550,
+    // fold 3e): a tree that fails never stops the trees after it.
+    std::vector<AssembledModule> assembledTrees;
+    std::span<Tree const> const trees = cu.trees();
+    bool const everyTreeAssembled = substrate::runEveryUnit(trees.size(), [&](std::size_t ti) {
+        Tree const& tree = trees[ti];
         // P68 round 9: the format kind, ONLY as a key into the dialect's
         // `symbolParts` / `impliedSymbolPart` (`:lo12:` on ELF, `@PAGEOFF` on
         // Mach-O — each reference reads only its own format's spelling).
         auto lowered = lowerAsmTextToLir(tree, grammar, target, entryNames,
                                          reporter, format.kind());
-        if (!lowered) return std::nullopt;
+        if (!lowered) return false;
 
         // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
         // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER: the rows
@@ -5229,7 +5523,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
         // bound after that call would be bound too late.
         if (!bindAsmExternImports(lowered->externImports, cu, grammar, target,
                                   format, opts, reporter)) {
-            return std::nullopt;
+            return false;
         }
 
         auto const asmEntry = reporter.errorCount();
@@ -5244,11 +5538,10 @@ assembleAsmUnit(CompilationUnit const&     cu,
         auto assembled = assemble(lowered->lir, target, lirToMir, reporter,
                                   lowered->externImports);
         if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
-            return std::nullopt;
+            return false;
         }
         assembled.cuId            = cu.id();
         assembled.symbols         = std::move(lowered->symbols);
-        assembled.userEntrySymbol = lowered->userEntrySymbol;
         // D-ASM-DATA-ITEMS-NOT-WIRED-INTO-THE-DRIVER: without this line the
         // data-defining directives' bytes were COMPUTED AND DROPPED. `assemble()`
         // builds its module from the LIR, and LIR carries no data — so the only
@@ -5275,7 +5568,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
         if (lowered->cfiInitial.has_value()
             && !attachAssemblyCfi(assembled, lowered->perFuncCfi,
                                   *lowered->cfiInitial, reporter)) {
-            return std::nullopt;
+            return false;
         }
         // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: bind the block
         // symbols that only a DATA slot names (a hand-written jump table). This
@@ -5299,7 +5592,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "assembler disagree about this file's function list "
                            "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.funcIndex, assembled.functions.size()));
-                return std::nullopt;
+                return false;
             }
             AssembledFunction& outFn = assembled.functions[b.funcIndex];
             std::unordered_set<std::uint32_t> alreadyBound;
@@ -5316,24 +5609,30 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "with no address ("
                            "D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.lirBlockV));
-                return std::nullopt;
+                return false;
             }
         }
-        // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
-        // file's SymbolIds namespaced before the merge; refusing is the honest
-        // answer while that is unbuilt, because silently keeping the LAST tree
-        // would drop every function in the others.
-        if (merged.expectedFuncCount != 0 || !merged.functions.empty()) {
-            report(reporter, DiagnosticCode::A_AsmTextUnsupported,
-                   DiagnosticSeverity::Error,
-                   "a compilation unit with more than one assembly source is "
-                   "not yet lowered — each file's symbol space would have to be "
-                   "namespaced before the modules merge, and keeping only one "
-                   "of them would silently drop the others' functions");
-            return std::nullopt;
-        }
-        merged = std::move(assembled);
+        assembledTrees.push_back(std::move(assembled));
+        return true;
+    });
+    if (!everyTreeAssembled) return std::nullopt;
+    // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
+    // file's SymbolIds namespaced before the merge; refusing is the honest
+    // answer while that is unbuilt, because silently keeping the LAST tree
+    // would drop everything in the others. Asked of the trees' COUNT, after
+    // every tree was asked (fold 3e): it used to ask whether the module kept
+    // so far held a function, so a first tree of DATA alone was replaced by
+    // the second, its data dropped with no word.
+    if (assembledTrees.size() > 1) {
+        report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+               DiagnosticSeverity::Error,
+               "a compilation unit with more than one assembly source is "
+               "not yet lowered — each file's symbol space would have to be "
+               "namespaced before the modules merge, and keeping only one "
+               "of them would silently drop the others' functions and data");
+        return std::nullopt;
     }
+    if (!assembledTrees.empty()) merged = std::move(assembledTrees.front());
     return merged;
 }
 

@@ -79,8 +79,12 @@ loadEdited(std::string const& name, std::function<void(nlohmann::json&)> const& 
     return ObjectFormatSchema::loadFromText(doc.dump(), leaf);
 }
 
+// Each edit keeps a stated `entryPrecedence` (the pe64 exec document's, P69 fold 3e) a partition of `entryVerbs`,
+// which the loader requires: an added verb joins the first group, a dropped one leaves its group (and an emptied group
+// goes), so the document is refused for the edit under test alone.
 void addVerb(nlohmann::json& doc, char const* verb) {
     doc.at("entryVerbs").push_back(verb);
+    if (doc.contains("entryPrecedence")) doc.at("entryPrecedence").at(0).push_back(verb);
 }
 
 void dropVerb(nlohmann::json& doc, std::string_view verb) {
@@ -91,6 +95,16 @@ void dropVerb(nlohmann::json& doc, std::string_view verb) {
     }
     ASSERT_EQ(kept.size() + 1, verbs.size()) << "the edit must drop exactly " << verb;
     verbs = kept;
+    if (!doc.contains("entryPrecedence")) return;
+    nlohmann::json groups = nlohmann::json::array();
+    for (auto const& group : doc.at("entryPrecedence")) {
+        nlohmann::json left = nlohmann::json::array();
+        for (auto const& v : group) {
+            if (v.get<std::string>() != verb) left.push_back(v);
+        }
+        if (!left.empty()) groups.push_back(std::move(left));
+    }
+    doc.at("entryPrecedence") = std::move(groups);
 }
 
 }  // namespace

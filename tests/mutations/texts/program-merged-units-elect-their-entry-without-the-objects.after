@@ -1,1 +1,2 @@
+    std::size_t const unitCandidates = cands.size();
     (void)objectEntries;

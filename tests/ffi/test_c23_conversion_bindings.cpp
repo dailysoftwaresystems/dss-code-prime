@@ -88,6 +88,9 @@ struct Private {
     char const* peLink;
     char const* machoUnit;
     char const* machoLink;
+    // P69 fold 3e (ledger 547): the ELF link name of a row glibc's own export answers -- a foreign object's C17
+    // `strtol` (or `flockfile`) binds glibc's, under its plain name; empty: no ELF row.
+    char const* elfLink = "";
 };
 
 constexpr char const* kUcrt      = "runtime/platform/src/stdio_ucrt.c";
@@ -99,21 +102,21 @@ constexpr Private kPrivate[] = {
     {"stdio.json", "__dss_platform_vsnprintf", kUcrt, "", "", "vsnprintf"},
     {"stdio.json", "__dss_platform_vfscanf", kUcrt, "", "", "vfscanf"},
     {"stdio.json", "__dss_platform_vsscanf", kUcrt, "", "", "vsscanf"},
-    {"stdio.json", "__dss_platform_lock_file", "", "_lock_file", "", "flockfile"},
-    {"stdio.json", "__dss_platform_unlock_file", "", "_unlock_file", "", "funlockfile"},
+    {"stdio.json", "__dss_platform_lock_file", "", "_lock_file", "", "flockfile", "flockfile"},
+    {"stdio.json", "__dss_platform_unlock_file", "", "_unlock_file", "", "funlockfile", "funlockfile"},
     {"stdio.json", "__dss_platform_printf_performs_n", kUcrt, "", kLibSystem, ""},
     {"stdio.json", "__dss_platform_printf_positional", kUcrt, "", kLibSystem, ""},
     {"stdio.json", "__dss_platform_prefix_without_digits_is_zero", kUcrt, "", kLibSystem, ""},
     {"stdio.json", "__dss_platform_length_extension", kUcrt, "", kLibSystem, ""},
     {"stdio.json", "__dss_platform_conversion_extension", kUcrt, "", kLibSystem, ""},
-    {"stdlib.json", "__dss_platform_strtol", "", "strtol", "", "strtol"},
-    {"stdlib.json", "__dss_platform_strtoul", "", "strtoul", "", "strtoul"},
-    {"stdlib.json", "__dss_platform_strtoll", "", "strtoll", "", "strtoll"},
-    {"stdlib.json", "__dss_platform_strtoull", "", "strtoull", "", "strtoull"},
-    {"inttypes.json", "__dss_platform_strtoimax", "", "strtoimax", "", "strtoimax"},
-    {"inttypes.json", "__dss_platform_strtoumax", "", "strtoumax", "", "strtoumax"},
-    {"inttypes.json", "__dss_platform_wcstoimax", "", "wcstoimax", "", "wcstoimax"},
-    {"inttypes.json", "__dss_platform_wcstoumax", "", "wcstoumax", "", "wcstoumax"},
+    {"stdlib.json", "__dss_platform_strtol", "", "strtol", "", "strtol", "strtol"},
+    {"stdlib.json", "__dss_platform_strtoul", "", "strtoul", "", "strtoul", "strtoul"},
+    {"stdlib.json", "__dss_platform_strtoll", "", "strtoll", "", "strtoll", "strtoll"},
+    {"stdlib.json", "__dss_platform_strtoull", "", "strtoull", "", "strtoull", "strtoull"},
+    {"inttypes.json", "__dss_platform_strtoimax", "", "strtoimax", "", "strtoimax", "strtoimax"},
+    {"inttypes.json", "__dss_platform_strtoumax", "", "strtoumax", "", "strtoumax", "strtoumax"},
+    {"inttypes.json", "__dss_platform_wcstoimax", "", "wcstoimax", "", "wcstoimax", "wcstoimax"},
+    {"inttypes.json", "__dss_platform_wcstoumax", "", "wcstoumax", "", "wcstoumax", "wcstoumax"},
 };
 
 struct Pair {
@@ -286,7 +289,17 @@ TEST(C23ConversionBindings, ThePlatformIsReachedOnlyThroughPrivateRows) {
             ASSERT_NE(desc, nullptr) << row.header;
             ShippedSymbol const* s = rowOf(*desc, row.name, d.fmt);
             if (d.kind == ObjectFormatKind::Elf) {
-                EXPECT_EQ(s, nullptr) << "glibc needs no private row";
+                // glibc implements C23 itself, so no private row carries a DSS body there; the rows that name
+                // the platform's own export under its plain name are the ones a foreign object's reference
+                // binds (`realizePlatformExternsByOnBinaryName`), and each is an import of glibc's export.
+                if (*row.elfLink == '\0') {
+                    EXPECT_EQ(s, nullptr) << "glibc needs no private row for it";
+                    continue;
+                }
+                ASSERT_NE(s, nullptr) << row.name << " is not declared on " << d.fmt;
+                EXPECT_EQ(s->linkName, row.elfLink);
+                EXPECT_FALSE(s->realization.contains(d.fmt)) << "an import of glibc's own export";
+                EXPECT_TRUE(s->version.empty());
                 continue;
             }
             ASSERT_NE(s, nullptr) << row.name << " is not declared on " << d.fmt;

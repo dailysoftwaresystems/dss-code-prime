@@ -1,0 +1,2 @@
+            if (root.definition == fn.symbol || root.root != Root::None) continue;   // the leader, or shared
+            groupMemberFuncIndices.push_back(fi);

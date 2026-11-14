@@ -1,4 +1,5 @@
 #include "link/format/pe.hpp"
+#include "link/format/address_class_word.hpp"   // requireTheWritersAddressWidth -- one class per writer
 #include "link/format/object_format_backends.hpp"
 
 #include "asm/format/x86_variable.hpp"   // kStackProbeLoopBytes (unwind allocLen)
@@ -74,6 +75,12 @@
 namespace dss::pe {
 
 namespace {
+
+// ★ PE32+'S CLASS WORD (P69 fold 3e, the review of fold 3d's X9, R11): an import
+// lookup entry, an IAT slot and the one base relocation form this writer emits
+// (IMAGE_REL_BASED_DIR64) are each 8 bytes; `encode` refuses a document whose
+// data model's pointer is another width.
+constexpr std::size_t kPe32PlusAddressBytes = 8;
 
 using dss::report;
 using link::format::detail::appendU8;
@@ -1095,6 +1102,13 @@ encode(AssembledModule const&    module,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter,
        ImageRequest const&       request) {
+    // ★ THIS WRITER WRITES ONE CLASS, whose address is `kPe32PlusAddressBytes` (P69 fold 3e,
+    // the review of fold 3d's X9): a document whose data model's pointer is
+    // another width is refused here, by name, before any slot is sized.
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kPe32PlusAddressBytes,
+                                                           "pe::encode", reporter)) {
+        return {};
+    }
     auto const& fmt = objectFormatSchema;
     // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
     //
@@ -1542,16 +1556,29 @@ encode(AssembledModule const&    module,
     // discards, naming bytes that are not in the link -- which lld-link refuses
     // ("relocation against symbol in discarded section"; the
     // `supersededDefinition` key's select-any measurement,
-    // `object_format_schema.hpp`). Refused by name, each before a byte is laid out:
-    //   * a member item whose group's signature names no select-any definition
-    //     of the module: nothing would decide whether it is linked;
-    //   * a member that is a FUNCTION other than the leader: this writer places
-    //     a function in a section of its own only as a select-any copy, and no
-    //     producer measured writes such a member.
-    // `dataItems` indices of the members other than a leader, ascending, and the
-    // definition each goes with.
+    // `object_format_schema.hpp`).
+    // ★ ONE RULE FOR A MEMBER OF EITHER KIND (P69 fold 3e, X5 of the review of
+    // fold 3d): a FUNCTION member goes with its group exactly as an item does.
+    // ✔MEASURED (dumpbin /symbols of the committed cl 19.51 /O2 fixtures
+    // `coff_seh_comdat_{a,b}_cl_O2.obj`): a C `inline` function holding `__try`
+    // is an ANY COMDAT, and its `__finally` body and `__except` filter are
+    // FUNCLETS in `.text$x` COMDATs ASSOCIATIVE to it -- so a relocatable link of
+    // such units hands each funclet on as a code COMDAT ASSOCIATIVE to its
+    // copy's section, with its own `.pdata`/`.xdata` associative to the
+    // funclet's section (the chain cl itself writes). Where the group's
+    // signature names a definition of the module that is NOT select-any (a
+    // strong one: a merge kept it over the copies), the member goes with a
+    // definition no link discards, so it is written where that definition's
+    // kind of body lives, in the shared section -- as long-lived as its root.
+    // Refused by name, before a byte is laid out: a member whose group's
+    // signature names no definition of the module at all -- nothing would
+    // decide whether it is linked.
+    // `dataItems` / `functions` indices of the members other than a leader that
+    // go with a select-any leader, ascending, and the definition each goes with.
     std::vector<std::size_t>                    groupMemberDataIndices;
     std::unordered_map<std::size_t, SymbolId>   leaderOfGroupMember;
+    std::vector<std::size_t>                    groupMemberFuncIndices;
+    std::unordered_map<std::size_t, SymbolId>   leaderOfGroupMemberFunc;
     if (!module.sectionGroupOfInputSection.empty()) {
         auto const groupOf = [&](std::optional<InputSectionSlice> const& slice) -> std::string_view {
             if (!slice.has_value()) return {};
@@ -1564,46 +1591,57 @@ encode(AssembledModule const&    module,
         for (ModuleSymbol const& ms : module.symbols) {
             if (!ms.name.empty()) definitionNamed.try_emplace(ms.name, ms.symbol);
         }
-        // The select-any definition a signature names, when the module holds one.
-        auto const leaderOf = [&](std::string_view signature) -> std::optional<SymbolId> {
-            auto const it = definitionNamed.find(signature);
-            if (it == definitionNamed.end() || !isWeakDefinition(it->second)) return std::nullopt;
-            return it->second;
+        // How a member goes with its group: with the select-any definition the
+        // signature names (ASSOCIATIVE to its copy's section), with a strong
+        // definition of that name (the shared section: no link discards it), or
+        // with nothing (refused).
+        enum class Root : std::uint8_t { SelectAny, Strong, None };
+        struct GroupRoot {
+            Root     root = Root::None;
+            SymbolId definition{};
         };
-        for (auto const& fn : module.functions) {
+        auto const rootOf = [&](std::string_view signature) -> GroupRoot {
+            auto const it = definitionNamed.find(signature);
+            if (it == definitionNamed.end()) return {};
+            return {isWeakDefinition(it->second) ? Root::SelectAny : Root::Strong, it->second};
+        };
+        auto const refuseRootless = [&](std::string_view what, std::string const& name,
+                                        std::string_view signature) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} '{}' is a member of section group '{}', and "
+                             "no definition of this object is named '{}' -- nothing would decide "
+                             "whether the member is linked; refusing rather than write it into a "
+                             "shared section.",
+                             what, name, signature, signature));
+        };
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            AssembledFunction const& fn = module.functions[fi];
             std::string_view const signature = groupOf(fn.inputSection);
             if (signature.empty()) continue;
-            auto const leader = leaderOf(signature);
-            if (leader.has_value() && *leader == fn.symbol) continue;
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("pe::encode (Obj): function '{}' is a member of section group "
-                             "'{}' and not its select-any definition. This writer places a "
-                             "function in a section of its own only as a select-any copy, so "
-                             "it cannot write this one to go with its group's copy; refusing "
-                             "rather than write it into the shared section, where it would "
-                             "outlive a copy the next link discards.",
-                             objNames.definedName(fn.symbol, "sym_"), signature));
-            return {};
+            GroupRoot const root = rootOf(signature);
+            if (root.root == Root::None) {
+                refuseRootless("function", objNames.definedName(fn.symbol, "sym_"), signature);
+                return {};
+            }
+            if (root.definition == fn.symbol || root.root == Root::Strong) continue;   // the leader, or shared
+            groupMemberFuncIndices.push_back(fi);
+            leaderOfGroupMemberFunc.emplace(fi, root.definition);
         }
         for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
             AssembledData const& d = module.dataItems[i];
             std::string_view const signature = groupOf(d.inputSection);
             if (signature.empty()) continue;
-            auto const leader = leaderOf(signature);
-            if (leader.has_value() && *leader == d.symbol) continue;   // the leader: its own ANY COMDAT
-            if (!leader.has_value()) {
-                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                     std::format("pe::encode (Obj): data item '{}' is a member of section "
-                                 "group '{}', and no select-any definition of this object is "
-                                 "named '{}' -- nothing would decide whether the item is "
-                                 "linked; refusing rather than write it into a shared section.",
-                                 d.symbol == SymbolId{} ? std::string{"(anonymous)"}
-                                                        : objNames.definedName(d.symbol, "sym_"),
-                                 signature, signature));
+            GroupRoot const root = rootOf(signature);
+            if (root.root == Root::None) {
+                refuseRootless("data item",
+                               d.symbol == SymbolId{} ? std::string{"(anonymous)"}
+                                                      : objNames.definedName(d.symbol, "sym_"),
+                               signature);
                 return {};
             }
+            if (root.definition == d.symbol || root.root == Root::Strong) continue;   // the leader, or shared
             groupMemberDataIndices.push_back(i);
-            leaderOfGroupMember.emplace(i, *leader);
+            leaderOfGroupMember.emplace(i, root.definition);
         }
         // A member is written ASSOCIATIVE, never as a select-any copy of its own.
         std::erase_if(weakDataItemIndices,
@@ -1790,6 +1828,12 @@ encode(AssembledModule const&    module,
     std::vector<std::size_t> weakFuncIndices;
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
         auto const& fn = module.functions[fi];
+        // A section group's function member is held out the same way: it is a
+        // section of its own, ASSOCIATIVE (the group block), never a copy of its own.
+        if (leaderOfGroupMemberFunc.contains(fi)) {
+            funcTextStart.push_back(0);
+            continue;
+        }
         if (isWeakDefinition(fn.symbol)) {
             weakFuncIndices.push_back(fi);
             funcTextStart.push_back(0);
@@ -1865,7 +1909,7 @@ encode(AssembledModule const&    module,
     };
     std::vector<ComdatSectionRecord> comdats;
     comdats.reserve(weakFuncIndices.size() + weakDataItemIndices.size()
-                    + groupMemberDataIndices.size());
+                    + groupMemberDataIndices.size() + groupMemberFuncIndices.size());
     // P69 fold 3d (D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION): the selection a
     // select-any definition's COMDAT states -- the rule of the section group it
     // leads, where the unit states one (a copy kept as the largest, or the first
@@ -1956,30 +2000,55 @@ encode(AssembledModule const&    module,
     // COMDAT must follow the section it goes with (link.exe refuses a forward
     // association, LNK1243 -- see the unwind ordinals below), and ordinals are
     // assigned in this vector's order.
-    if (!groupMemberDataIndices.empty()) {
+    if (!groupMemberDataIndices.empty() || !groupMemberFuncIndices.empty()) {
         std::unordered_map<SymbolId, std::size_t> comdatOfDefinition;
         for (std::size_t ci = 0; ci < comdats.size(); ++ci) {
             comdatOfDefinition.emplace(comdats[ci].symId, ci);
         }
+        // The COMDAT a member goes with: its leader's, which every select-any
+        // definition has.
+        auto const leaderComdatOf = [&](SymbolId leader) -> std::optional<std::size_t> {
+            auto const it = comdatOfDefinition.find(leader);
+            if (it != comdatOfDefinition.end()) return it->second;
+            // The leader is a select-any definition (checked above), and every
+            // one is written as a COMDAT of its own -- unless it is no body.
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): the select-any definition '{}' that a "
+                             "section group's member goes with is written in no COMDAT "
+                             "section of this object, so the member has no section to "
+                             "go with. Substrate-invariant violation.",
+                             objNames.definedName(leader, "sym_")));
+            return std::nullopt;
+        };
         for (std::size_t const mi : groupMemberDataIndices) {
-            auto const leader = comdatOfDefinition.find(leaderOfGroupMember.at(mi));
-            if (leader == comdatOfDefinition.end()) {
-                // The leader is a select-any definition (checked above), and every
-                // one is written as a COMDAT of its own -- unless it is no item.
-                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                     std::format("pe::encode (Obj): the select-any definition '{}' that a "
-                                 "section group's member goes with is written in no COMDAT "
-                                 "section of this object, so the member has no section to "
-                                 "go with. Substrate-invariant violation.",
-                                 objNames.definedName(leaderOfGroupMember.at(mi), "sym_")));
-                return {};
-            }
+            auto const leader = leaderComdatOf(leaderOfGroupMember.at(mi));
+            if (!leader.has_value()) return {};
             auto rec = dataComdatRecord(mi);
             if (!rec.has_value()) return {};
             rec->selection          = IMAGE_COMDAT_SELECT_ASSOCIATIVE;
-            rec->associatedComdat   = leader->second;
+            rec->associatedComdat   = *leader;
             rec->hasCanonicalSymbol = rec->symId != SymbolId{};
             comdats.push_back(std::move(*rec));
+        }
+        // A FUNCTION member (a funclet): a code COMDAT of the `.text` row, as a
+        // weak function's is, ASSOCIATIVE to its leader's section. Its relocations,
+        // block symbols and `.pdata`/`.xdata` follow it through `comdatByFuncIndex`
+        // like any function in a section of its own.
+        for (std::size_t const fi : groupMemberFuncIndices) {
+            auto const leader = leaderComdatOf(leaderOfGroupMemberFunc.at(fi));
+            if (!leader.has_value()) return {};
+            ComdatSectionRecord rec;
+            rec.symId              = module.functions[fi].symbol;
+            rec.sectionName        = secText->name;
+            rec.characteristics    = secText->type | kScnLnkComdat;
+            rec.symType            = IMAGE_SYM_DTYPE_FUNCTION;
+            rec.spanSize           = static_cast<std::uint64_t>(module.functions[fi].bytes.size());
+            rec.fnIndex            = fi;
+            rec.fnBytes            = module.functions[fi].bytes;
+            rec.selection          = IMAGE_COMDAT_SELECT_ASSOCIATIVE;
+            rec.associatedComdat   = *leader;
+            rec.hasCanonicalSymbol = true;
+            comdats.push_back(std::move(rec));
         }
     }
     // `module.functions` index -> its COMDAT record, for the walks that must
@@ -4312,7 +4381,7 @@ namespace {
 // PE/COFF §6.4: an import descriptor is 20 bytes; a PE32+ lookup / IAT entry —
 // and so a loader-bound slot, which IS one — is one 8-byte pointer.
 constexpr std::size_t kPeImportDescriptorSize = 20;
-constexpr std::size_t kPeLookupEntrySize      = 8;
+constexpr std::size_t kPeLookupEntrySize      = kPe32PlusAddressBytes;
 
 // The TLS callback's calling contract (PE/COFF §6.7, `PIMAGE_TLS_CALLBACK`:
 // `(PVOID DllHandle, DWORD Reason, PVOID Reserved)`): the reason is the second
@@ -6304,7 +6373,7 @@ encodeExec(AssembledModule const&    module,
             // RVA, COFF's ADDR32NB — cl's jump tables in `.text`) does not
             // move, and needs no row (P69 fold 3d, review F4).
             if (imageIsRelocatableAtLoad && tri != nullptr
-             && loaderRebasesTheField(*tri) && tri->widthBytes != 8) {
+             && loaderRebasesTheField(*tri) && tri->widthBytes != kPeLookupEntrySize) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format(
                          "pe::encodeExec: function SymbolId={{ {} }} "
@@ -6665,7 +6734,7 @@ encodeExec(AssembledModule const&    module,
         for (auto const& rel : module.functions[fi].relocations) {
             auto const* tri = targetSchema.relocationInfo(rel.kind);
             if (tri == nullptr || !loaderRebasesTheField(*tri)) continue;
-            if (tri->widthBytes != 8) continue;   // the belt above refused it
+            if (tri->widthBytes != kPeLookupEntrySize) continue;   // the belt above refused it
             baseRelocSiteRvas.push_back(
                 secText.virtualAddress
                 + static_cast<std::uint32_t>(funcTextStart[fi])
@@ -6887,7 +6956,7 @@ encodeExec(AssembledModule const&    module,
             // representation (HIGHLOW/etc. are anchored for when a 32-bit-abs data
             // producer lands) — fail loud rather than ship an un-rebased fixup that
             // ASLR would leave pointing at the preferred-base address.
-            if (tri->widthBytes != 8) {
+            if (tri->widthBytes != kPeLookupEntrySize) {   // PE32+'s address: IMAGE_REL_BASED_DIR64
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::string{"pe::encodeExec: data-item SymbolId #"}
                      + std::to_string(di.symbol.v) + " absolute relocation '" + tri->name
@@ -7467,7 +7536,8 @@ encodeExec(AssembledModule const&    module,
     // tells the loader to skip the DllMain notification call
     // entirely (legal PE; the `link /NOENTRY` shape). The exec keeps
     // its resolved entry (the injected trampoline via
-    // imageEntryOverride, or the schema/functions[0] fallback).
+    // imageEntryOverride, or the one `resolveEntryFnIdx` names -- which
+    // refuses rather than take functions[0]).
     std::uint32_t const addressOfEntryPoint = isDll
         ? 0u
         : static_cast<std::uint32_t>(secText.virtualAddress

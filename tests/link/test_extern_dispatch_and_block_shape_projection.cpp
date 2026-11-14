@@ -507,6 +507,7 @@ TEST(LinkVocabularyProjection,
     fn.symbol = dss::SymbolId{1};
     fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};   // mov eax,42 ; ret
     mod.functions.push_back(std::move(fn));
+    mod.userEntrySymbol = dss::SymbolId{1};   // a program's module states its entry (the build's election)
 
     dss::DiagnosticReporter rep;
     bool const ok = dss::linker::injectEntryTrampoline(mod, **target, **format,

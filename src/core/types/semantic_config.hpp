@@ -1441,11 +1441,16 @@ struct DSS_EXPORT DeclarationRule {
     // config declarations IS the conformance documentation artifact.
     //
     // ★ THE PER-DEFINITION CHECK AGAINST THESE ROWS IS A SINGLE-TU FACT WITH A
-    // SPAN and the semantic tier owns it (`S_EntryShapeNotDeclared`): "a function
-    // named `main` is defined here with a signature no declared row for `main`
-    // has". Whole-program facts — "this program defines no entry at all",
-    // "two rival entries are realizable" — are NOT per-definition and live at
-    // entry resolution instead, where every CU is in hand.
+    // SPAN and the semantic tier owns it (`S_EntryShapeNotDeclared`, a WARNING
+    // since P69 fold 3e): "a function named `main` is defined here with a
+    // signature none of the rows the format realizes for `main` has" -- the
+    // definition is entered all the same, with the richest of them, as every
+    // reference's startup calls any `main`; the rows that count are the ones
+    // `realizedEntryNames` (entry_names.hpp) gives for the format, the same
+    // vocabulary entry resolution reads. Whole-program facts — "this program
+    // defines no entry at all", "two rival entries are realizable" — are NOT
+    // per-definition and live at entry resolution instead, where every CU is in
+    // hand.
     //
     // A name legitimately appears on SEVERAL rows: C's `main` is both
     // `fn() -> i32` (verb `none`) and `fn(i32, ptr-ptr-char) -> i32` (verb

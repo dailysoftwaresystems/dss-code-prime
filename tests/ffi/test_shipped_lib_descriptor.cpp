@@ -6267,7 +6267,19 @@ TEST(ShippedLibDescriptor, RealStdlibStrtollIsAFunctionOnEveryFormat) {
     EXPECT_TRUE(elf.symbol);
     EXPECT_EQ(elf.linkName, "__isoc23_strtoll") << "glibc's C23 entry point";
     EXPECT_TRUE(elf.realization.empty());
-    EXPECT_FALSE(elf.platformRow) << "glibc needs no private row";
+    // ★ THE ELF PRIVATE ROW EXISTS, AND IT IS THE C17 FUNCTION (P69 fold 3e, lane `xa`; the orchestrator's
+    // ledger 547). This line asserted "glibc needs no private row" until then -- true of DSS's OWN calls, which
+    // reach glibc's C23 entry point through the canonical row above, and false of a FOREIGN object: one compiled
+    // against glibc's headers in C17 mode references `strtoll`, the C17 function glibc exports beside the C23 one
+    // (glibc 2.39 exports both spellings on x86_64 and aarch64, MEASURED by its export table: the row
+    // D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT), and the link binds that reference to the
+    // platform row whose link name is the name it spells. The row's availability is what `scan` asks (`objectFormatInAvailabilitySet`), so
+    // `platformRow` true says it is declared on elf. ⚠ This TEST pins the C17 spelling's row only: a C23-mode
+    // object's `__isoc23_strtoll` reference is the realizer's REVERSE answer to the canonical row's link name,
+    // pinned by tests/link/test_foreign_libc_names.cpp's table and not here -- never read this row as covering both.
+    EXPECT_TRUE(elf.platformRow) << "a foreign C17 object's `strtoll` binds glibc's own C17 function through the "
+                                    "private row, declared on elf";
+    EXPECT_EQ(elf.platformLink, "strtoll") << "glibc exports the C17 strtoll under its C name";
     EXPECT_FALSE(elf.strtoi64) << "_strtoi64 is pe-gated";
 }
 

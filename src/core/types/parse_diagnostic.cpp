@@ -668,6 +668,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_CommonSymbolLargerThanItsDefinition";
         case DiagnosticCode::K_SymbolBindingNotModelled:
             return "K_SymbolBindingNotModelled";
+        case DiagnosticCode::K_ProgramEntryChosenByPrecedence:
+            return "K_ProgramEntryChosenByPrecedence";
+        case DiagnosticCode::K_PointerWidthNotTheWritersClass:
+            return "K_PointerWidthNotTheWritersClass";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

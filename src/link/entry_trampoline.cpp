@@ -33,12 +33,10 @@ namespace {
 // and failed the same way from the other pass. The two widenings and the
 // sequential-mint caller contract are recorded in full at the new home.
 
-// Resolve user-entry SymbolId from the format's `entryPoint` field.
-// Empty entryPoint defaults to `functions[0]` (cycle-2 convention
-// shared by all 3 walkers — see pe.cpp / elf.cpp / macho.cpp's
-// entry-resolution path). MUST be called BEFORE the trampoline is
-// prepended; reading `functions[0]` AFTER prepend would
-// self-reference the trampoline.
+// Resolve the user-entry SymbolId: the ELECTED entry the module states
+// (`userEntrySymbol`), else the format's `entryPoint` field. A module that
+// states neither has NO entry -- never its first or only function. MUST be
+// called BEFORE the trampoline is prepended.
 //
 // D-LK10-ENTRY-EXTERN-ENTRY-DIAG: the two failure modes (no match
 // at all vs. match resolves to an ExternImport) are semantically
@@ -51,6 +49,7 @@ enum class EntryResolutionStatus : std::uint8_t {
     Found,             // entry resolved to a defined AssembledFunction
     NotFound,          // entryName matched neither a function nor an extern
     ResolvedToExtern,  // entryName matched an ExternImport (invalid)
+    NotElected,        // the module states no entry and the format names none
 };
 
 struct EntryResolution {
@@ -90,25 +89,17 @@ struct EntryResolution {
     }
     auto const entryName = std::string{format.entryPoint()};
     if (entryName.empty()) {
-        // Silent-failure HIGH #3 + code-architect Q5 post-fold
-        // (2026-06-03): the `functions[0]` fallback is silently
-        // wrong-direction for multi-function modules whose entry
-        // isn't declared first in source order. The corpus expansion
-        // surfaced this via `int helper(int x){return x;}; int
-        // main(){return helper(42);}` returning 0 (the trampoline
-        // called helper). Single-function modules are unambiguous
-        // — keep the silent fallback there (the lone function IS
-        // the entry by construction). Multi-function modules
-        // without an explicit userEntrySymbol or format.entryPoint
-        // are a SUBSTRATE BUG: the compile pipeline failed to
-        // stamp userEntrySymbol, OR the language config didn't
-        // declare its entry-function name. Fail-loud rather than
-        // silently invoke the first-declared function.
-        if (module.functions.size() > 1) {
-            return {EntryResolutionStatus::NotFound, SymbolId{}};
-        }
-        return {EntryResolutionStatus::Found,
-                module.functions[0].symbol};
+        // ★ P69 fold 3e (D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS,
+        // the review of fold 3d): NO ENTRY WAS ELECTED, AND NOTHING HERE ELECTS
+        // ONE. A lone function used to be taken for the entry "by construction"
+        // -- and the construction was false: a link of objects with no
+        // `--language` elected nothing and the trampoline called the one function
+        // the NAMED object held, while the entry sat in an archive member.
+        // ✔MEASURED (lane `xa`, cd349db1's bytes): that pe64 image exited
+        // 298975272, where every reference links the member's `main` (42). The
+        // program's entry is the election's (`resolveProgramEntry`), stated on
+        // the module that holds it; a module that states none has none.
+        return {EntryResolutionStatus::NotElected, SymbolId{}};
     }
     // Walker-side synthesized name convention: `sym_<id>` on
     // ELF/PE; `_sym_<id>` on Mach-O. Match either form (real-name
@@ -419,6 +410,18 @@ bool injectEntryTrampoline(AssembledModule&          module,
                              "in entryPoint matches.",
                              std::string{format.name()},
                              std::string{format.entryPoint()}));
+            return false;
+        case EntryResolutionStatus::NotElected:
+            emit(reporter, DiagnosticCode::K_ProgramEntryUndefined,
+                 std::format("entry-trampoline: no program entry was elected "
+                             "for this image of format '{}' -- the linked "
+                             "module states no entry function and the format "
+                             "names none, so the startup has nothing to call. "
+                             "The entry is the one function the build's "
+                             "election chose among every input's entry "
+                             "names; a module's only function is never taken "
+                             "for it.",
+                             std::string{format.name()}));
             return false;
     }
     SymbolId const userEntrySym = entryRes.symbol;

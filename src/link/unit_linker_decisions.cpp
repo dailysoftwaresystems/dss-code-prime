@@ -402,8 +402,10 @@ void dropPulledMemberEntryRequests(UnitLinkerRequests& requests) {
             kept.push_back(std::move(request));
             continue;
         }
-        // The C runtime's own startup names the startup the image has anyway; any other entry — a function, or a
-        // runtime startup no DSS image provides — is one the image will not start at, and the link says so.
+        // The C runtime's own startup names a startup the image has anyway: its entry is the one the named inputs
+        // elect (P69 fold 3e: a startup restricts that election only where a NAMED unit states it, as link.exe fixes
+        // the entry before the search). Any other entry — a function, or a runtime startup no DSS image provides —
+        // is one the image will not start at, and the link says so.
         if (!entry->runtimeStartup) {
             requests.warnings.push_back(std::format(
                 "{}: the directive '{}' names the image's entry, and the archive search pulled that member: "
@@ -416,28 +418,30 @@ void dropPulledMemberEntryRequests(UnitLinkerRequests& requests) {
     requests.image = std::move(kept);
 }
 
-void requireEntryReference(std::span<AssembledModule> namedUnits) {
-    // WHICH request stands, by the precedence each request's own vocabulary row states — the question
-    // `decideUnitLinkerRequests` settles for the image (`settle`: `first` keeps the standing one, `last` and
-    // `inOrder` take the later), asked here of the units named to the link, in their order, before the archive
-    // search runs. Two requests of two precedences have no order between them: that link is refused by name by the
-    // decision, and nothing is required of it here.
-    AssembledModule*        standingUnit = nullptr;
-    UnitImageRequest const* standing     = nullptr;
-    for (auto& unit : namedUnits) {
-        for (auto const& request : unit.linkerRequests.image) {
+std::optional<StandingEntryRequest> standingEntryRequest(std::span<AssembledModule const> namedUnits) {
+    // WHICH request stands, by the precedence each request's own vocabulary row states, in the named units' order.
+    // Two requests of two precedences have no order between them: the decision refuses that link by name.
+    std::optional<StandingEntryRequest> standing;
+    for (std::size_t u = 0; u < namedUnits.size(); ++u) {
+        for (auto const& request : namedUnits[u].linkerRequests.image) {
             if (std::get_if<UnitEntryRequest>(&request.value) == nullptr) continue;
-            if (standing != nullptr) {
-                if (standing->precedence != request.precedence) return;
+            if (standing.has_value()) {
+                if (standing->request->precedence != request.precedence) return std::nullopt;
                 if (request.precedence == UnitRequestPrecedence::First) continue;
             }
-            standing     = &request;
-            standingUnit = &unit;
+            standing = StandingEntryRequest{u, &request};
         }
     }
-    if (standing == nullptr) return;
-    AssembledModule& unit  = *standingUnit;
-    auto const&      entry = std::get<UnitEntryRequest>(standing->value);
+    return standing;
+}
+
+void requireEntryReference(std::span<AssembledModule> namedUnits) {
+    // The request that stands (`standingEntryRequest`), asked of the units named to the link before the archive
+    // search runs; a link whose two requests have no order between them requires nothing here.
+    auto const standing = standingEntryRequest(std::span<AssembledModule const>{namedUnits.data(), namedUnits.size()});
+    if (!standing.has_value()) return;
+    AssembledModule& unit  = namedUnits[standing->unit];
+    auto const&      entry = std::get<UnitEntryRequest>(standing->request->value);
     if (entry.runtimeStartup || !entry.unsupported.empty()) return;
     std::string const name = entry.symbol;   // `standing` points into the unit this function is about to grow
     for (auto const& ms : unit.symbols) {

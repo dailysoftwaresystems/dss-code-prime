@@ -1,1 +1,1 @@
-             && !tri->pcRelative && !tri->tls && tri->widthBytes != 8) {
+             && !tri->pcRelative && !tri->tls && tri->widthBytes != kPeLookupEntrySize) {

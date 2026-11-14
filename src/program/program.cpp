@@ -49,7 +49,7 @@
 #include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
-#include "program/every_unit.hpp"           // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/substrate/every_unit.hpp"           // runEveryUnit: every unit's step, before a several-unit build fails
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
 #include "core/types/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
@@ -1435,8 +1435,66 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     }
     // The program-entry candidates the objects define, with the richest verb of
     // each name the format realizes — empty for a format that starts no program.
-    std::vector<ForeignEntryCandidate> const objectEntries = collectObjectEntryCandidates(
+    // Not const: an archive member the startup pulls for its entry joins them
+    // (`pullEntryFromArchives`, below).
+    std::vector<ForeignEntryCandidate> objectEntries = collectObjectEntryCandidates(
         std::span<AssembledModule const>{*objectModules}, grammar, **formatR);
+    // What the program's entry election may elect (P69 fold 3e, class C's N5):
+    // the format's entry verbs, restricted by the entry a NAMED object states
+    // (`entryElectionScope`), asked of the named objects before any archive
+    // member joins them -- a pulled member names no entry.
+    EntryElectionScope const entryScope =
+        entryElectionScope(grammar, **formatR, std::span<AssembledModule const>{*objectModules});
+    // Whether a candidate is one the election may elect.
+    auto const electable = [&](EntryCandidate const& c) {
+        return c.verb.has_value()
+            && std::find(entryScope.verbs.begin(), entryScope.verbs.end(), *c.verb) != entryScope.verbs.end();
+    };
+    auto const anyObjectElectable = [&] {
+        return std::any_of(objectEntries.begin(), objectEntries.end(),
+                           [&](ForeignEntryCandidate const& c) { return electable(c.candidate); });
+    };
+
+    // ── AN ENTRY IN AN ARCHIVE MEMBER (P69 fold 3e, the review of fold 3d's X4) ──
+    //
+    // Asked by each route once its NAMED inputs' candidates are known, and only
+    // when none of them is an entry the format realizes: the entry names seed
+    // the archive search, as the startup object every reference links first
+    // references the entry, and each member that answers is linked as an input
+    // and its candidates join `objectEntries`, after the named objects'
+    // (`pullEntryArchiveMembers` states the measurement). A format that starts
+    // no program pulls nothing for an entry. False after reporting a failure.
+    // A stated startup's names alone seed it (P69 fold 3e: ✔MEASURED, link.exe and
+    // lld-link pull `wmain` from an archive for `/ENTRY:wmainCRTStartup` beside a
+    // named `main`), and an entry that elects no C entry pulls nothing.
+    auto const pullEntryFromArchives = [&]() -> bool {
+        if (entryScope.verbs.empty() || entryScope.electsNone || staticArchives.empty()) return true;
+        std::vector<EntryLinkName> const names = entryLinkNames(grammar, **formatR, entryScope.verbs);
+        auto members = pullEntryArchiveMembers(std::span<EntryLinkName const>{names},
+                                               std::span<std::filesystem::path const>{staticArchives},
+                                               **targetR, **formatR, reporter);
+        if (!members) return false;   // reported
+        std::size_t const first = objectModules->size();
+        for (auto& member : *members) objectModules->push_back(std::move(member));
+        std::vector<ForeignEntryCandidate> pulled = collectObjectEntryCandidates(
+            std::span<AssembledModule const>{objectModules->data() + first, objectModules->size() - first},
+            grammar, **formatR);
+        for (ForeignEntryCandidate& c : pulled) {
+            c.object += first;   // its index among the link's objects
+            objectEntries.push_back(std::move(c));
+        }
+        return true;
+    };
+    // The one compiled module of a route, as the link's list of compiled modules.
+    auto const soleModule = [](AssembledModule m) {
+        std::vector<AssembledModule> v;
+        v.push_back(std::move(m));
+        return v;
+    };
+    // Whether any of a unit's candidates is an entry the election may elect.
+    auto const anyRealizable = [&](std::span<EntryCandidate const> cands) {
+        return std::any_of(cands.begin(), cands.end(), electable);
+    };
 
     // The LOWER half of a whole module (the merge's, or the startup's below):
     // the one call both make, with every format fact the merged route reads.
@@ -1534,6 +1592,95 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         auto lowered = lowerWholeModule(*startup, startupId, {});
         if (!lowered) return std::nullopt;   // reported
         return std::optional<AssembledModule>{std::move(*lowered)};
+    };
+
+    // ── THE ELECTION OF A LINK THAT LOWERS NO MIR UNIT (P69 fold 3e, the review
+    //    of fold 3d's X1) ──────────────────────────────────────────────────────
+    //
+    // The all-object link and the `encode` route (an assembly unit) compile no
+    // MIR unit whose semantic model names an entry, so their candidates are all
+    // read off ASSEMBLED modules, by the one reader (`collectObjectEntryCandidates`,
+    // over the one vocabulary `entryLinkNames`): the assembly unit's first, then
+    // the named objects', then -- where none of those is one -- an archive member
+    // the startup pulls (`pullEntryFromArchives`). The ONE election
+    // (`resolveProgramEntry`) chooses, and the winner is started as the unit
+    // routes start an object's entry: through a compiled startup where its verb
+    // needs a pre-main init (appended to `compiled`), else stated on the module
+    // that defines it. ✔MEASURED before (lane `xa`, fold 3d's bytes): `helper.s
+    // main.o` and objects alone with no `--language` were refused at the startup
+    // on every family where every reference links them; with no `--language` on
+    // PE an image called the wrong function. A format that starts no program
+    // elects nothing. False after reporting.
+    auto const electAssembledEntry = [&](std::vector<AssembledModule>& compiled) -> bool {
+        if ((*formatR)->entryVerbs().empty() || entryScope.electsNone) return true;
+        std::vector<ForeignEntryCandidate> const unitEntries = collectObjectEntryCandidates(
+            std::span<AssembledModule const>{compiled}, grammar, **formatR);
+        bool const unitElectable = std::any_of(unitEntries.begin(), unitEntries.end(),
+                                               [&](ForeignEntryCandidate const& c) { return electable(c.candidate); });
+        if (!unitElectable && !anyObjectElectable() && !pullEntryFromArchives()) {
+            return false;   // reported
+        }
+        std::vector<EntryCandidate> cands;
+        cands.reserve(unitEntries.size() + objectEntries.size());
+        for (ForeignEntryCandidate const& c : unitEntries) cands.push_back(c.candidate);
+        for (ForeignEntryCandidate const& c : objectEntries) cands.push_back(c.candidate);
+        if (cands.empty()) {
+            // ★ NO INPUT DEFINES AN ENTRY THE FORMAT CAN REALIZE — said in the
+            // operator's words, naming the names. gcc, clang and MSVC all refuse
+            // the same link naming the same fact. Where the grammar declares no
+            // entry name the format realizes at all, that is what is said.
+            std::vector<EntryLinkName> const names = entryLinkNames(grammar, **formatR, entryScope.verbs);
+            std::string spelled;
+            for (auto const& n : names) {
+                if (!spelled.empty()) spelled += ", ";
+                spelled += '\'' + n.linkName + '\'';
+            }
+            std::string inputs;
+            if (!compiled.empty()) inputs = "the assembly unit";
+            for (auto const& p : perCuOpts.objectInputs) {
+                if (!inputs.empty()) inputs += ", ";
+                inputs += core::genericSpelling(p);
+            }
+            emitDriver(reporter, DiagnosticCode::K_ProgramEntryUndefined,
+                       names.empty()
+                           ? "no program entry: language '" + std::string{grammar.configName()}
+                                 + "' declares no entry name that format '"
+                                 + std::string{(*formatR)->name()}
+                                 + "' can enter through, and this format starts a "
+                                   "program, so nothing in the link can be its entry."
+                           : "no program entry: none of the link's inputs (" + inputs
+                                 + ") defines an exported function named " + spelled
+                                 + " — the entry name(s) language '"
+                                 + std::string{grammar.configName()} + "' declares that format '"
+                                 + std::string{(*formatR)->name()}
+                                 + "' can enter through"
+                                 + (staticArchives.empty() ? std::string{}
+                                                           : std::string{", nor does any member of "
+                                                                         "the named archives"})
+                                 + (entryScope.restrictedBy.empty()
+                                        ? std::string{}
+                                        : " (" + entryScope.restrictedBy + ")")
+                                 + ". An object records no entry of its own, so the link "
+                                   "has nothing to call.");
+            return false;
+        }
+        bool       entryOk = true;
+        auto const elected = resolveProgramEntry(cands, entryScope.verbs, entryScope.precedence,
+                                                 (*formatR)->name(), reporter, entryOk,
+                                                 entryScope.restrictedBy);
+        if (!entryOk) return false;   // two rival entries — reported
+        bool const                   ofUnit = elected->index < unitEntries.size();
+        ForeignEntryCandidate const& winner =
+            ofUnit ? unitEntries[elected->index] : objectEntries[elected->index - unitEntries.size()];
+        auto made = compileForeignEntryStartup(winner, elected->verb);
+        if (!made.has_value()) return false;   // reported
+        if (made->has_value()) {
+            compiled.push_back(std::move(**made));   // the startup calls the winner by its name
+        } else {
+            (ofUnit ? compiled[winner.object] : (*objectModules)[winner.object]).userEntrySymbol =
+                winner.symbol;
+        }
+        return true;
     };
 
     // ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS — WHAT THIS
@@ -1798,7 +1945,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // EVERY unit is assembled and reports its own errors before the build fails (`runEveryUnit`, the one
                 // home: P69 H6b, the review of H6's N1), and nothing is packaged when any unit failed. The fail-loud
                 // net stays, and fires only when nothing was reported at all.
-                bool const everyUnitAssembled = runEveryUnit(cus.size(), [&](std::size_t i) {
+                bool const everyUnitAssembled = substrate::runEveryUnit(cus.size(), [&](std::size_t i) {
                     auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
                                                 reporter, perCuOpts);
                     if (!unit) {
@@ -1853,8 +2000,15 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // contract), so the ordinary `.s` build is unchanged and the flag
             // now has an effect on both halves.
             mod->linkPosition = unitPlace(0);   // the unit stands where its source does
+            // ★ THE UNIT'S ENTRY IS ELECTED WITH THE OBJECTS' (P69 fold 3e, the
+            // review of fold 3d's X1): the unit is one candidate source of the
+            // one election, and where its entry's verb needs a pre-main init that
+            // startup joins the compiled modules.
+            std::vector<AssembledModule> compiled;
+            compiled.push_back(std::move(*mod));
+            if (!electAssembledEntry(compiled)) return std::nullopt;   // reported
             return reported(linkAndWriteWithStaticArchives(
-                std::move(*mod),
+                std::move(compiled),
                 // D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: an
                 // assembly unit may name
                 // pre-assembled objects exactly as a C unit may — the `encode`
@@ -1961,7 +2115,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // failing build surfaces every CU's errors deterministically (not just the first-to-
         // fail's — an improvement the parallel model makes free: every CU is always built). The verb is
         // `runEveryUnit`, the one home every several-unit step takes (P69 H6b).
-        bool const allBuilt = runEveryUnit(cus.size(), [&](std::size_t i) {
+        bool const allBuilt = substrate::runEveryUnit(cus.size(), [&](std::size_t i) {
             copyDiagnostics(cuScratch[i], reporter);
             return cuMirSlots[i].has_value();
         });
@@ -2012,7 +2166,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     if ((*formatR)->isStaticArchive()) {
         std::vector<AssembledModule> units;
         units.reserve(cuMirs.size());
-        for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        // EVERY member is built and reports its own errors before the build
+        // fails (`runEveryUnit`, the several-unit class's one home: P69 H6b, the
+        // review of H6's N1; this loop is site (a) of the orchestrator's ledger
+        // 550, fold 3e), and nothing is packaged when any member failed.
+        bool const everyMemberBuilt = substrate::runEveryUnit(cuMirs.size(), [&](std::size_t i) {
             // P10: a static-archive member is the FINAL module of its own
             // artifact (nothing downstream merges it — the foreign linker
             // pulls members whole), so it gets the PROGRAM-stage schedule
@@ -2023,7 +2181,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // library shims are optimizer INPUT, as on every route (the
             // contract is on `synthesizeLibraryShims`).
             if (!synthesizeLibraryShims(cuMirs[i], reporter)) {
-                return std::nullopt;  // internal invariant breach already reported
+                return false;  // internal invariant breach already reported
             }
             if (!optimizeModule(cuMirs[i].mir, **targetR,
                                 cuMirs[i].model.lattice().interner(), compileOpts,
@@ -2033,13 +2191,16 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                 // inputs of whatever link pulls it.
                                 opt::ModuleExtent::LinkInput, {}, reporter,
                                 cuMirs[i].externImports)) {
-                return std::nullopt;  // optimize-stage failure already reported
+                return false;  // optimize-stage failure already reported
             }
+            std::optional<std::size_t> noOtherInput;   // none can win: no other input stands beside it
             auto mod = lowerCuMirToAssembly(
-                cuMirs[i], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+                cuMirs[i], (*formatR)->processArgs(),
+                // An archive starts no program: its format's own scope.
+                entryElectionScope(grammar, **formatR, {}),
                 // A member is packaged, not linked: no other input's entry is
                 // elected beside it (an archive starts no program).
-                std::span<ForeignEntryCandidate const>{},
+                std::span<ForeignEntryCandidate const>{}, noOtherInput,
                 (*formatR)->sehPersonality(), (*formatR)->name(),
                 cuMirs[i].target->wideFloatSoftcallLibrary(
                     (*formatR)->kind()),
@@ -2047,9 +2208,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
                 // block, read off the schema here exactly as sehPersonality is.
                 (*formatR)->atomicsRuntime());
-            if (!mod) return std::nullopt;  // back-half tier failure already reported
+            if (!mod) return false;  // back-half tier failure already reported
             units.push_back(std::move(*mod));
-        }
+            return true;
+        });
+        if (!everyMemberBuilt) return std::nullopt;
         // The members are packaged by the one step every unit enters (`packageUnitsAsStaticArchive`,
         // above the `encode` route): the archive-wide visibility, the names, the input archives and objects.
         return packageUnitsAsStaticArchive(std::move(units));
@@ -2114,79 +2277,15 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // prototype; see the function) — and the SAME election every route
         // holds decides among them: two objects defining `main` are the
         // ambiguity `K_ProgramEntryAmbiguous` names, never the first one read.
-        if (objectEntries.empty()) {
-            // ★ NO OBJECT DEFINES AN ENTRY THE FORMAT CAN REALIZE — and when
-            // the language DID name some, that is a refusal this arm owes the
-            // operator IN ITS OWN WORDS. Falling through would reach the
-            // trampoline, whose message talks about a synthesized `sym_<id>`
-            // convention and a SymbolId encoded in the format's `entryPoint`
-            // — true of the mechanism, and about nothing the operator can act
-            // on: they named objects, and none of them has a `main`. gcc,
-            // clang and MSVC all refuse the same link naming the same fact, so
-            // this is the union's answer and not an invented strictness.
-            //
-            // ⓘ GATED ON A NON-EMPTY NAME SET. With no `--language` the
-            // resolved grammar is the target's assembly dialect, which
-            // declares no entry rows at all — there is then no claim to make
-            // about a missing `main`, and the trampoline's own single-function
-            // fallback stays the answer, unchanged. A format that starts no
-            // program realizes no entry name, so a relocatable link of objects
-            // refuses nothing here either.
-            std::vector<EntryLinkName> const entryNames = entryLinkNames(grammar, **formatR);
-            if (!entryNames.empty() && (*formatR)->isImageFlavor()) {
-                std::string names;
-                for (auto const& n : entryNames) {
-                    if (!names.empty()) names += ", ";
-                    names += '\'' + n.linkName + '\'';
-                }
-                std::string objs;
-                for (auto const& p : perCuOpts.objectInputs) {
-                    if (!objs.empty()) objs += ", ";
-                    objs += core::genericSpelling(p);
-                }
-                emitDriver(reporter, DiagnosticCode::K_SymbolUndefined,
-                           "no program entry: none of the object inputs ("
-                           + objs + ") defines a function named "
-                           + names + " — the entry name(s) language '"
-                           + std::string{grammar.configName()}
-                           + "' declares that format '"
-                           + std::string{(*formatR)->name()}
-                           + "' can enter through. An object records no entry "
-                             "of its own, so the link has nothing to call.");
-                return std::nullopt;
-            }
-            // No object is stamped, which preserves the trampoline's own
-            // single-function fallback and, for anything else, its existing
-            // loud refusal — this arm neither invents an entry nor swallows the
-            // refusal.
-        }
-        // The program's startup: compiled only where the entry's arguments need
-        // a pre-main init (below); otherwise the link compiles nothing.
-        std::optional<AssembledModule> startup;
-        if (!objectEntries.empty()) {
-            std::vector<EntryCandidate> candidates;
-            candidates.reserve(objectEntries.size());
-            for (ForeignEntryCandidate const& c : objectEntries) candidates.push_back(c.candidate);
-            bool       entryOk = true;
-            auto const elected = resolveProgramEntry(candidates, (*formatR)->entryVerbs(),
-                                                     (*formatR)->name(), reporter, entryOk);
-            if (!entryOk) return std::nullopt;   // two objects define an entry — reported
-            // `objectEntries` is non-empty only on a format that starts a
-            // program, so the election named one.
-            ForeignEntryCandidate const& winner = objectEntries[elected->index];
-            // ── THE PROGRAM'S STARTUP, WHERE THE ENTRY'S ARGUMENTS NEED ONE (P69
-            //    fold 3d, D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS)
-            // Made only where `realizeForeignEntryShape` synthesizes the pre-main
-            // init (the CRT accessors of a PE image); anywhere else the
-            // trampoline calls the object's entry itself and the object is
-            // stamped.
-            auto made = compileForeignEntryStartup(winner, elected->verb);
-            if (!made.has_value()) return std::nullopt;   // reported
-            startup = std::move(*made);
-            if (!startup.has_value()) {
-                (*objectModules)[winner.object].userEntrySymbol = winner.symbol;
-            }
-        }
+        // The ONE election of a link that lowers no MIR unit (`electAssembledEntry`,
+        // above): the objects' candidates, then an archive member the startup
+        // pulls where none of them is one, and the startup the winner's verb needs.
+        // (P69 fold 3e: a link of objects with no `--language` used to elect
+        // nothing here and leave the trampoline its single-function fallback,
+        // which called the wrong function -- the dialect now declares the entry
+        // rows, and the trampoline takes no fallback.)
+        std::vector<AssembledModule> startup;
+        if (!electAssembledEntry(startup)) return std::nullopt;   // reported
         return reported(linkAndWriteWithStaticArchives(
             std::move(startup), std::move(*objectModules),
             std::span<std::filesystem::path const>{staticArchives},
@@ -2211,6 +2310,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         std::vector<EntryCandidate> entryCands;
         std::vector<std::uint32_t>  entryCandSym;
         collectEntryCandidates(cuMirs[0].model, entryCands, entryCandSym);
+        // An entry only an archive member defines (P69 fold 3e, X4): asked only
+        // when neither the unit nor a named object defines one the format starts.
+        if (!anyRealizable(entryCands) && !anyObjectElectable() && !pullEntryFromArchives()) {
+            return std::nullopt;   // reported
+        }
         std::vector<SymbolId> entryRoots;
         entryRoots.reserve(entryCandSym.size());
         for (std::uint32_t const s : entryCandSym) entryRoots.push_back(SymbolId{s});
@@ -2228,11 +2332,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                             cuMirs[0].externImports)) {
             return std::nullopt;  // optimize-stage failure already reported
         }
+        std::optional<std::size_t> electedObject;   // the election's own answer (X3)
         auto mod = lowerCuMirToAssembly(
-            cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+            cuMirs[0], (*formatR)->processArgs(), entryScope,
             // P69 fold 3d: an object input's entry is elected with this unit's
             // (D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED).
-            std::span<ForeignEntryCandidate const>{objectEntries},
+            std::span<ForeignEntryCandidate const>{objectEntries}, electedObject,
             (*formatR)->sehPersonality(), (*formatR)->name(),
             cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
             reporter,
@@ -2244,15 +2349,14 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         }
         mod->linkPosition = unitPlace(0);   // the unit stands where its source does
         // ★ AN OBJECT WON THE ENTRY AND NEEDED NO INIT: it is stated on that
-        // object. The election succeeded on a format that starts a program, so
-        // exactly one candidate was realizable; the unit's module names no entry
-        // only when that one was an object's, and every object candidate is
-        // realizable by construction — so there was exactly one, and it won.
-        // (Where its verb needed an init, the init is the unit's entry and calls
-        // the object's function by name.)
-        if (!(*formatR)->entryVerbs().empty() && !mod->userEntrySymbol.has_value()
-            && objectEntries.size() == 1) {
-            (*objectModules)[objectEntries[0].object].userEntrySymbol = objectEntries[0].symbol;
+        // object, the one THE ELECTION NAMED (P69 fold 3e, the review of fold
+        // 3d's X3 -- it used to be inferred from the unit's module naming none
+        // and one object candidate existing, which a precedence that elects one
+        // of several would have broken). Where its verb needed an init, the init
+        // is the unit's entry and calls the object's function by name.
+        if (electedObject.has_value() && !mod->userEntrySymbol.has_value()) {
+            ForeignEntryCandidate const& won = objectEntries[*electedObject];
+            (*objectModules)[won.object].userEntrySymbol = won.symbol;
         }
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
@@ -2261,7 +2365,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // half rides along so a pulled member's extern can rebind to a library
         // the operator named (`perCuOpts` — archives already partitioned out).
         return reported(linkAndWriteWithStaticArchives(
-            std::move(*mod),
+            soleModule(std::move(*mod)),
             std::move(*objectModules),
             std::span<std::filesystem::path const>{staticArchives},
             std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
@@ -2430,14 +2534,24 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     std::vector<EntryCandidate> cands;
     std::vector<std::uint32_t>  candSym;   // per-model record indices; unused here
     for (auto& cu : cuMirs) collectEntryCandidates(cu.model, cands, candSym);
+    // An entry only an archive member defines (P69 fold 3e, X4): asked only when
+    // neither a unit nor a named object defines one the format starts.
+    if (!anyRealizable(cands) && !anyObjectElectable() && !pullEntryFromArchives()) {
+        return std::nullopt;   // reported
+    }
     // P69 fold 3d (D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED):
     // an object input's entry is elected with the units', after them, so an index
     // past theirs names an object's.
     std::size_t const unitCandidates = cands.size();
     for (ForeignEntryCandidate const& c : objectEntries) cands.push_back(c.candidate);
     bool entryOk = true;
-    auto resolvedEntry = resolveProgramEntry(
-        cands, (*formatR)->entryVerbs(), (*formatR)->name(), reporter, entryOk);
+    // A named object's stated entry that is no C startup (P69 fold 3e) leaves no
+    // C entry to elect: the link starts the image as the request says, or refuses it.
+    auto resolvedEntry =
+        entryScope.electsNone
+            ? std::optional<ResolvedEntry>{}
+            : resolveProgramEntry(cands, entryScope.verbs, entryScope.precedence, (*formatR)->name(),
+                                  reporter, entryOk, entryScope.restrictedBy);
     if (!entryOk) return std::nullopt;   // undefined / ambiguous entry — already reported.
     ForeignEntryCandidate const* objectEntry = nullptr;
     EntryMaterialization         objectEntryVerb = EntryMaterialization::None;
@@ -2461,6 +2575,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // identity on elf/pe).
     std::vector<std::string> entryNames;
     EntryMaterialization entryVerb = EntryMaterialization::None;
+    // P69 fold 3e (class C's N3): a definition whose signature is none of its
+    // name's realized rows is called with the elected verb's signature.
+    bool entryCalledWithTheVerbsSignature = false;
     if (resolvedEntry.has_value()) {
         std::string_view const winner = cands[resolvedEntry->index].name;
         for (auto& cu : cuMirs) {
@@ -2470,6 +2587,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 if (!rec.entryVerb.has_value() || rec.name != winner) continue;
                 entryNames.push_back(dss::ffi::linkNameFor(
                     rec.name, rec.asmName, cSymDecor, rec.linkName));
+                entryCalledWithTheVerbsSignature = rec.entryCalledWithTheVerbsSignature;
                 done = true;
                 break;
             }
@@ -2558,6 +2676,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                        merged->userEntrySymbol, merged->externImports,
                                        objectEntryVerb, (*formatR)->processArgs(), cSymDecor,
                                        (*formatR)->name(), reporter)
+        : entryCalledWithTheVerbsSignature
+            ? realizeEntryShapeWithTheVerbsSignature(merged->mir, merged->host.interner(),
+                                                     merged->userEntrySymbol, merged->externImports,
+                                                     entryVerb, (*formatR)->processArgs(), cSymDecor,
+                                                     (*formatR)->name(), reporter)
             : realizeEntryShape(merged->mir, merged->host.interner(),
                                 merged->userEntrySymbol, merged->externImports,
                                 entryVerb, (*formatR)->processArgs(), cSymDecor,
@@ -2767,7 +2890,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // all three must answer — a route that kept the old argument list would
     // silently keep the gap for whichever builds happen to take it.
     return reported(linkAndWriteWithStaticArchives(
-        std::move(*mod),
+        soleModule(std::move(*mod)),
         std::move(*objectModules),
         std::span<std::filesystem::path const>{staticArchives},
         std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
@@ -2991,7 +3114,7 @@ struct CuBuildKey {
     // same rule `UnitBuilder::schemasForPath_` applies, so `foo.S` and `foo.s`
     // route identically on every host filesystem. EVERY unclaimed input is named before the build fails
     // (`runEveryUnit`, P69 H6b: the several-unit class's one home) -- never the first alone.
-    bool const everyInputClaimed = runEveryUnit(sourceFiles.size(), [&](std::size_t i) {
+    bool const everyInputClaimed = substrate::runEveryUnit(sourceFiles.size(), [&](std::size_t i) {
         std::string const& file = sourceFiles[i];
         std::string const ext = asciiLowerCopy(fs::path{file}.extension().string());
         bool claimed = false;
@@ -5372,11 +5495,19 @@ int runCusToTargets(
                 // `scratch` before and after is what turns those per-unit
                 // reports into one per-target verdict.
                 std::size_t const errorsBefore = scratch.errorCount();
-                // A language with no preprocess pass has no active format on
-                // its CU key; the realization map is FORMAT-keyed, so such a
-                // build realizes nothing — exactly as it did before the cache.
-                if (parsedForRuntime.has_value()
-                    && keyPerTarget[i].format.has_value()) {
+                // ★ EVERY BUILD OF THE SPEC, WHATEVER ITS LANGUAGE (P69 fold
+                // 3e, the review of fold 3d's class C, neighbour N2). This was
+                // keyed on the CU key's format, which only a language with a
+                // preprocess pass carries -- so a link of objects with no
+                // `--language` (the target's assembly dialect) and every `.s`
+                // program took no platform runtime. ✔MEASURED (lane `xa`,
+                // fold 3d's bytes): MinGW-w64 gcc's objects linked so were
+                // refused `__main` undefined, a routine the PE runtime defines
+                // and every reference's own runtime supplies. The runtime is a
+                // fact of the (target, format) the image is built for, which
+                // the spec names; which members a link takes stays the lazy
+                // search's answer.
+                if (parsedForRuntime.has_value()) {
                     resolvedArchives = resolveShippedRuntimeArchives(
                         spec, *targetByName.at(parsedForRuntime->targetName),
                         *formatByName.at(parsedForRuntime->formatName),
@@ -6057,34 +6188,44 @@ int Program::compileProject(
     // no duplication); such a target still fails the whole build downstream,
     // so nothing slips past silently. The format is re-loaded by the build
     // (the same benign redundancy as the grammar above).
-    for (auto const& spec : pc.targets) {
+    // ★ EVERY TARGET IS ASKED BEFORE THE BUILD FAILS (`substrate::runEveryUnit`;
+    // site (j) of the orchestrator's ledger 568, P69 fold 3e): a target whose
+    // format does not serve the profile is named, and the targets after it are
+    // still asked -- as the driver's target pre-flight and the per-target compile
+    // already do. The inventory of the formats that serve the profile is read
+    // once, by the first rejected target; when it cannot be read, that is said
+    // once and every later rejected target fails with no second word.
+    std::optional<std::expected<std::vector<std::string>, std::string>> serving;
+    bool const everyTargetServed = substrate::runEveryUnit(pc.targets.size(), [&](std::size_t t) {
+        std::string const& spec = pc.targets[t];
         auto parsed = TargetSpec::parse(spec);
-        if (!parsed.has_value()) continue;           // delegate → D_InvalidTargetSpec
+        if (!parsed.has_value()) return true;        // delegate → D_InvalidTargetSpec
         auto fmtR = ObjectFormatSchema::loadShipped(parsed->formatName);
-        if (!fmtR.has_value()) continue;             // delegate → D_SchemaLoadFailed
+        if (!fmtR.has_value()) return true;          // delegate → D_SchemaLoadFailed
         // THE TWO REJECT ARMS. The membership question is asked FIRST and
         // separately so the inventory scan is paid only by a build that is
         // already being rejected — every accepted target reads exactly the one
         // format it named, as before.
         if (artifactProfileSupported((*fmtR)->artifactProfiles(),
                                      pc.artifactProfile)) {
-            continue;
+            return true;
         }
-        auto serving = shippedFormatsServingProfile(pc.artifactProfile);
         if (!serving.has_value()) {
-            // The inventory could not be read, so WHICH reject is true is
-            // unknown — and an empty list would silently assert the stronger,
-            // possibly false one. Report what actually went wrong instead.
-            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                       serving.error() + ", so the artifact profile '"
-                       + pc.artifactProfile
-                       + "' could not be checked against the formats that serve "
-                         "it. Set DSS_CONFIG_ROOT to the directory that contains "
-                         "'src/dss-config', or run from inside the compiler's "
-                         "source tree.");
-            drainDiagnosticsToStderr(rep);
-            return 1;
+            serving.emplace(shippedFormatsServingProfile(pc.artifactProfile));
+            if (!serving->has_value()) {
+                // The inventory could not be read, so WHICH reject is true is
+                // unknown — and an empty list would silently assert the stronger,
+                // possibly false one. Report what actually went wrong instead.
+                emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                           serving->error() + ", so the artifact profile '"
+                           + pc.artifactProfile
+                           + "' could not be checked against the formats that serve "
+                             "it. Set DSS_CONFIG_ROOT to the directory that contains "
+                             "'src/dss-config', or run from inside the compiler's "
+                             "source tree.");
+            }
         }
+        if (!serving->has_value()) return false;   // said once, above
         // The verdict is already known (the predicate above is the SAME one
         // this call re-asks), so the return value carries no new information
         // and is deliberately discarded — the call's remaining job is to write
@@ -6092,7 +6233,10 @@ int Program::compileProject(
         // `if` would imply a path that cannot exist.
         (void) enforceArtifactProfileFormat((*fmtR)->artifactProfiles(),
                                             pc.artifactProfile,
-                                            parsed->formatName, *serving, rep);
+                                            parsed->formatName, **serving, rep);
+        return false;
+    });
+    if (!everyTargetServed) {
         drainDiagnosticsToStderr(rep);
         return 1;
     }

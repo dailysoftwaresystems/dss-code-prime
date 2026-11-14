@@ -632,7 +632,7 @@ dss_add_test(NAME program/test_archive_definition_visibility
              SOURCES test_archive_definition_visibility.cpp)
 
 # P69 H6b (the review of H6's N1): the one home of "a several-unit step reports
-# every unit before it fails" -- `runEveryUnit` (src/program/every_unit.hpp),
+# every unit before it fails" -- `runEveryUnit` (src/core/substrate/every_unit.hpp),
 # both cells: every unit failing, and a valid unit before an invalid one -- and
 # the input-language claim's cell (every unclaimed input named). In-process on
 # every leg: nothing is run.

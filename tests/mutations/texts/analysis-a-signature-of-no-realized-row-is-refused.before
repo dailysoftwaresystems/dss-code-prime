@@ -1,0 +1,4 @@
+                                        d.code = DiagnosticCode::
+                                            S_EntryShapeNotDeclared;
+                                        d.severity =
+                                            DiagnosticSeverity::Warning;

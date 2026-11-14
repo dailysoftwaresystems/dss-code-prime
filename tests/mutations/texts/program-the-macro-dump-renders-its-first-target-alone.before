@@ -1,0 +1,1 @@
+    bool const everySectionRendered = substrate::runEveryUnit(args.targets.size(), [&](std::size_t t) {

@@ -1,0 +1,1 @@
+    if (assembledTrees.size() > 1 && !assembledTrees.front().functions.empty()) {

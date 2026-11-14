@@ -14,10 +14,15 @@
 // unscaled field would happen to be right. 2 + 3 + 4 + 5 + 6 + 7 + 9 + 6 = 42
 // only if every load reads its own object; each address check has its own exit
 // code.
+//
+// The entry is `_main`, the name Mach-O's C startup enters: a `.s` names its
+// labels as the binary spells them, and ld64 links a clang `.s` whose entry is
+// `_main` and refuses one whose entry is `main` ("_main" undefined; P69 fold 3e,
+// lane xa, measured on Apple clang 21.0.0's ld64).
 	.text
-	.globl	main
-	.type	main, %function
-main:
+	.globl	_main
+	.type	_main, %function
+_main:
 	mov	x9, #0
 	adrp	x0, byte1@PAGE
 	add	x0, x0, byte1@PAGEOFF

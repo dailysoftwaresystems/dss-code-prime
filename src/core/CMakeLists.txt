@@ -37,6 +37,10 @@ add_library(core OBJECT
     types/asm_template_text_forms.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
+    # The ONE vocabulary of a program's entry names on a format (a language's
+    # `entryFunctions` and a dialect's `entryLabels` alike): the driver's
+    # election and the semantic tier's entry gate both ask it (P69 fold 3e).
+    types/entry_names.cpp
     types/predefined_macro_json.cpp
     # The ONE resolver of a language type NAME (`"unsigned long"` -> its
     # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor

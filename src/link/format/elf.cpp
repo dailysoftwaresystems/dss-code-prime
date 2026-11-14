@@ -1,4 +1,5 @@
 #include "link/format/elf.hpp"
+#include "link/format/address_class_word.hpp"   // requireTheWritersAddressWidth -- one class per writer
 #include "link/format/object_format_backends.hpp"
 
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert
@@ -191,7 +192,12 @@ constexpr std::uint64_t SHF_GROUP  = 0x200;
 // it — every ELF image imports libc `exit` and takes the DYNAMIC writer. The
 // link now lowers every GOT-slot-relative reference, for every image writer, to
 // a direct reference to a slot it mints as a data item (`link/got_slots.hpp`).
-constexpr std::uint64_t kGotSlotBytes = 8;
+// ★ ELF64'S CLASS WORD (P69 fold 3e, the review of fold 3d's X9, R9): this writer
+// writes ELF64 alone, whose address -- a GOT slot, a RELATIVE site, a data
+// pointer -- is 8 bytes. Every slot product reads it, and `encode` refuses a
+// document whose data model's pointer is another width.
+constexpr std::uint64_t kElf64AddressBytes = 8;
+constexpr std::uint64_t kGotSlotBytes      = kElf64AddressBytes;
 
 // ── `.note.gnu.build-id` ───────────────────────────────────────────────────
 //    D-LK-ELF-EMITS-NO-BUILD-ID-NOTE
@@ -1840,7 +1846,7 @@ encodeElfExecDynamic(
     // = numFuncExterns + externSlot[i].
     std::size_t const numGotSlots =
         numFuncExterns + (hasGotDataSlots ? numDataExterns : 0);
-    std::vector<std::uint8_t> got(numGotSlots * 8, 0);
+    std::vector<std::uint8_t> got(numGotSlots * kGotSlotBytes, 0);
 
     // ── (i) Layout: compute file offsets + VAs ─────────────────
     constexpr std::uint64_t kEhdrSize = 64;
@@ -2172,7 +2178,7 @@ encodeElfExecDynamic(
         if (module.externImports[i].isData) continue;
         std::size_t const slot = externSlot[i];
         std::uint64_t const stubVa = pltVa + slot * pltStubSize;
-        std::uint64_t const slotVa = gotVa + slot * 8;
+        std::uint64_t const slotVa = gotVa + slot * kGotSlotBytes;
         std::size_t   const stubOffset = slot * pltStubSize;
         auto const bound =
             stubBound.maxPastTextEnd.find(module.externImports[i].symbol);
@@ -2357,7 +2363,7 @@ encodeElfExecDynamic(
     relaExtern.reserve(numExterns * 24);
     for (std::size_t i = 0; i < numExterns; ++i) {
         std::uint64_t const rOffset =
-            gotVa + gotSlotIndexFor(i) * 8;
+            gotVa + gotSlotIndexFor(i) * kGotSlotBytes;
         std::uint64_t const rInfo =
             (static_cast<std::uint64_t>(dynsymIdx[i]) << 32)
             | static_cast<std::uint64_t>(canonicalStub[i] ? jumpSlotType
@@ -2643,14 +2649,17 @@ encodeElfExecDynamic(
             // construction despite their pcRelative=false rows).
             // DSS codegen reaches globals rip-relatively, so the
             // shipped pipeline never trips this; it is the belt for
-            // an absolute-in-code producer (incl. the tls-tpoff32
-            // Linear-absolute kind — TLS-in-.so is already rejected
-            // above, D-LK-DYN-TLS-MODEL).
+            // an absolute-in-code producer. ABSOLUTE is a field the loader
+            // moves (`loaderRebasesTheField`, the one predicate; P69 fold
+            // 3e, X9 R5 -- it was `!pcRelative`, which counted a
+            // thread-pointer offset in): a thread-local's offset is not an
+            // address, and a thread-local in a shared object is refused at
+            // this writer's entry (D-LK-DYN-TLS-MODEL), its one home.
             if (isDyn) {
                 auto const* triPre = targetSchema.relocationInfo(rel.kind);
                 if (triPre != nullptr
                     && triPre->formulaKind == RelocFormulaKind::Linear
-                    && !triPre->pcRelative) {
+                    && loaderRebasesTheField(*triPre)) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format(
                              "elf::encodeElfExecDynamic (ET_DYN): function "
@@ -2744,7 +2753,7 @@ encodeElfExecDynamic(
         // either. IDENTICAL on every ELF image flavour.
         bool const isData = module.externImports[i].isData;
         std::uint64_t const va =
-            isData ? gotVa + gotSlotIndexFor(i) * 8
+            isData ? gotVa + gotSlotIndexFor(i) * kGotSlotBytes
                    : pltVa + externSlot[i] * pltStubSize;
         auto const [it, inserted] = symbolVa.emplace(
             module.externImports[i].symbol, va);
@@ -2771,7 +2780,7 @@ encodeElfExecDynamic(
         // one is redundant rather than wrong, and lands on the same VA.)
         SymbolId const slotSym = module.externImports[i].addressSlotSymbol;
         if (slotSym.valid()) {
-            std::uint64_t const slotVa = gotVa + gotSlotIndexFor(i) * 8;
+            std::uint64_t const slotVa = gotVa + gotSlotIndexFor(i) * kGotSlotBytes;
             if (!symbolVa.emplace(slotSym, slotVa).second) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::string{"elf::encodeElfExecDynamic: the address "
@@ -2921,14 +2930,14 @@ encodeElfExecDynamic(
     if (hasRodataDyn
         && !link::format::applyDataItemRelocations(
                rodataDynLayout.bytes, module.dataItems, rodataDynLayout, rodataVa,
-               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", kElf64AddressBytes, reporter)) {
         return {};
     }
     std::vector<std::uint64_t> relativeSiteVas;
     if (hasDataDyn
         && !link::format::applyDataItemRelocations(
                dataDynLayout.bytes, module.dataItems, dataDynLayout, dataVa,
-               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter,
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", kElf64AddressBytes, reporter,
                isDyn ? &relativeSiteVas : nullptr)) {
         return {};
     }
@@ -3190,7 +3199,7 @@ encodeElfExecDynamic(
     if (hasTdataDyn
         && !link::format::applyDataItemRelocations(
                tdataDynLayout.bytes, module.dataItems, tdataDynLayout, tdataVa,
-               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", kElf64AddressBytes, reporter)) {
         return {};
     }
     if (!link::format::applyExecRelocations(
@@ -3729,6 +3738,13 @@ encode(AssembledModule const&    module,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter,
        ImageRequest const&       request) {
+    // ★ THIS WRITER WRITES ONE CLASS, whose address is `kElf64AddressBytes` (P69 fold 3e,
+    // the review of fold 3d's X9): a document whose data model's pointer is
+    // another width is refused here, by name, before any slot is sized.
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kElf64AddressBytes,
+                                                           "elf::encode", reporter)) {
+        return {};
+    }
     // `targetSchema` is consumed by the ET_EXEC reloc-application
     // path (LK6 cycle 1) — the structured formula on each
     // `TargetRelocationInfo` (pcRelative + addendBias + widthBytes)
@@ -4757,14 +4773,14 @@ encode(AssembledModule const&    module,
             && !link::format::applyDataItemRelocations(
                    rodataLayout.bytes, module.dataItems, rodataLayout,
                    rodataSectionVa, symbolVa, targetSchema,
-                   "elf::encode (ET_EXEC)", reporter)) {
+                   "elf::encode (ET_EXEC)", kElf64AddressBytes, reporter)) {
             return {};
         }
         if (hasData
             && !link::format::applyDataItemRelocations(
                    dataLayout.bytes, module.dataItems, dataLayout,
                    dataSectionVa, symbolVa, targetSchema,
-                   "elf::encode (ET_EXEC)", reporter)) {
+                   "elf::encode (ET_EXEC)", kElf64AddressBytes, reporter)) {
             return {};
         }
     }

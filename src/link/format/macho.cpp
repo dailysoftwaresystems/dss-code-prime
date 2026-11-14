@@ -1,4 +1,5 @@
 #include "link/format/macho.hpp"
+#include "link/format/address_class_word.hpp"   // requireTheWritersAddressWidth -- one class per writer
 #include "link/format/object_format_backends.hpp"
 
 #include "core/crypto/sha256.hpp"
@@ -716,7 +717,11 @@ constexpr std::uint8_t REBASE_TYPE_POINTER                        = 1;
 
 constexpr std::size_t kDyldInfoCommandSize = 48;
 constexpr std::size_t kDysymtabCommandSize = 80;
-constexpr std::size_t kGotSlotSize         = 8;
+// ★ MACH-O 64'S CLASS WORD (P69 fold 3e, X9 R10): the `__got` slot, a rebase
+// site and a data pointer are each 8 bytes; `encode` refuses a document whose
+// data model's pointer is another width.
+constexpr std::size_t kMachO64AddressBytes = 8;
+constexpr std::size_t kGotSlotSize         = kMachO64AddressBytes;
 
 // ── Per-cputype __stubs substrate (MIRRORS elf.cpp's emitPltStub) ──
 //
@@ -1504,6 +1509,13 @@ encode(AssembledModule const&    module,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter,
        ImageRequest const&       request) {
+    // ★ THIS WRITER WRITES ONE CLASS, whose address is `kMachO64AddressBytes` (P69 fold 3e,
+    // the review of fold 3d's X9): a document whose data model's pointer is
+    // another width is refused here, by name, before any slot is sized.
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kMachO64AddressBytes,
+                                                           "macho::encode", reporter)) {
+        return {};
+    }
     auto const& fmt = objectFormatSchema;
     // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
     //
@@ -2197,8 +2209,36 @@ encode(AssembledModule const&    module,
                                  fn.symbol.v));
                 return {};
             }
+            // ★ AN ADDEND THE FIELD CANNOT HOLD (P69 fold 3e): an instruction
+            // field (arm64's PAGE21 / PAGEOFF12 / BRANCH26) holds instruction
+            // bits, so a non-zero addend travels in the format's ADDEND record
+            // (`macho.addendRelocation`), written just before the entry it
+            // carries the addend for, at the same address -- as Apple clang
+            // writes `l_.str.1 + 2` (✔MEASURED 2026-11-13) and ld64 and DSS's
+            // reader read it. A format that declares no such record still
+            // refuses the addend, by the helper below and naming the relocation.
+            std::int64_t                 fieldAddend = rel.addend;
+            std::optional<std::uint32_t> addendRecordInfo;
+            if (fieldWidth == 0u && rel.addend != 0
+                && fmt.macho().addendRelocation.has_value()) {
+                auto const& record = *fmt.macho().addendRelocation;
+                std::uint32_t const bits = record.addendBits;
+                std::int64_t const lowest  = bits == 0u || bits > 24u ? 0 : -(std::int64_t{1} << (bits - 1u));
+                std::int64_t const highest = bits == 0u || bits > 24u ? -1 : (std::int64_t{1} << (bits - 1u)) - 1;
+                if (rel.addend < lowest || rel.addend > highest) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("Mach-O writer: relocation in symbol #{}: "
+                                     "addend {} does not fit the {}-bit addend "
+                                     "record of object format '{}'",
+                                     fn.symbol.v, rel.addend, bits, fmt.name()));
+                    return {};
+                }
+                addendRecordInfo = record.nativeId
+                                 | (static_cast<std::uint32_t>(rel.addend) & ((1u << bits) - 1u));
+                fieldAddend = 0;
+            }
             auto const placed = link::format::placeRelocationAddend(
-                *addendStorage, *tri, rel.addend,
+                *addendStorage, *tri, fieldAddend,
                 std::span<std::uint8_t>{textBody.data() + fieldAt, fieldWidth});
             if (!placed.has_value()) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
@@ -2246,6 +2286,11 @@ encode(AssembledModule const&    module,
             std::uint32_t const rInfo =
                 fmtReloc->nativeIdFor(rel.bytesAfterField) | (1u << 27)
                 | (symIdx & 0x00FFFFFFu);
+            if (addendRecordInfo.has_value()) {   // r_extern 0: it names no symbol
+                appendU32LE(textRelocs, rAddress);
+                appendU32LE(textRelocs, *addendRecordInfo);
+                ++textRelocCount;
+            }
             appendU32LE(textRelocs, rAddress);
             appendU32LE(textRelocs, rInfo);
             ++textRelocCount;
@@ -2320,12 +2365,16 @@ encode(AssembledModule const&    module,
                 // relocation_info against DATA bytes (silently corrupt
                 // output). Reject any non-Linear kind outright (c147
                 // silent-failure-review fold).
+                // An ADDRESS the loader moves (`loaderRebasesTheField`, the
+                // one predicate; P69 fold 3e, X9 R6 -- it asked `pcRelative`
+                // alone, so a thread-local or image-relative row passed).
                 if (tri->formulaKind != RelocFormulaKind::Linear
-                    || tri->pcRelative || tri->widthBytes == 0) {
+                    || !loaderRebasesTheField(*tri) || tri->widthBytes == 0) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format("macho::encode (MH_OBJECT): {} data "
                                      "item SymbolId={{ {} }} relocation '{}' "
-                                     "is pc-relative, zero-width, or a "
+                                     "is pc-relative, thread-local, "
+                                     "image-relative, zero-width, or a "
                                      "non-linear instruction fixup - a data "
                                      "pointer needs a plain absolute fixup "
                                      "with a concrete write width.",
@@ -5006,7 +5055,7 @@ encodeExecDynamic(AssembledModule const&    module,
     if (hasConst
         && !link::format::applyDataItemRelocations(
                constLayout.bytes, module.dataItems, constLayout, constSectionVa,
-               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", kMachO64AddressBytes, reporter,
                &constRebaseSiteVas)) {
         return {};
     }
@@ -5030,7 +5079,7 @@ encodeExecDynamic(AssembledModule const&    module,
     if (hasData
         && !link::format::applyDataItemRelocations(
                dataLayout.bytes, module.dataItems, dataLayout, dataSecVa,
-               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", kMachO64AddressBytes, reporter,
                &dataRebaseSiteVas)) {
         return {};
     }

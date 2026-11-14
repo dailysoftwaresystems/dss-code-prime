@@ -1277,6 +1277,7 @@ TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "main",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     return mod;
 }
 
@@ -1577,6 +1578,7 @@ namespace {
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "main",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
     return mod;
 }
 

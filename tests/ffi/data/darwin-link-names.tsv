@@ -166,8 +166,42 @@
 # LINKED on x86_64 (`nm -u` of the image names all seven) and RUN natively on
 # arm64 (exit 42), and libSystem's `dlsym` finds each, in the same run.
 # [[D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN]]
+#
+# EXTENDED 2026-11-13 (P69 fold 3e, lane `xa`) by 31 rows -- the Mach-O
+# imports the referenced-names class added: the names a FOREIGN object built by
+# Apple clang references for a C library call, bound to libSystem's export of
+# the same name (D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT).
+# MEASURED by Apple clang 21.0.0 (clang-2100.4.1.1) on the operator's Mac, both
+# arches, through `dssharness run probe-reference-cc` on macos-arm64-debug, by a
+# DIFFERENT method from the `&SYM` probe above, because most of these names are
+# declared by no SDK header (the probe above would read `<compile-failed>`):
+# each corpus row CALLED in a unit of its own through its descriptor's header,
+# its result and each pointer argument's own array escaped so -O2 keeps the
+# call, in c17 gnu17 c2x gnu2x and with known-size arrays at the SDK's fortify
+# levels 0, default and 2, then `nm -u` (start run 20261105-201025-43fdf2ab,
+# results run 20261105-201428-25e549a3). The cell is the undefined name the
+# compiler emitted for the platform function the row names -- through the
+# SDK's fortifying macros for the `__*_chk` rows, through the inline <ctype.h>
+# for `__maskrune` `__tolower` `__toupper`, and through no header at all for
+# `__stack_chk_fail`, which the compiler mints in every guarded frame (also
+# read in the fixture batch 20261105-202902-b2874be3), and `__stpcpy_chk`
+# apart (run 20261113-215314-3999d9bb: a `stpcpy` into a known-size array at
+# the SDK's default fortify level, `_stpcpy` with _FORTIFY_SOURCE=0). NONE
+# diverges: each is the plain decorated name on BOTH arches. The private `__dss_platform_<x>`
+# rows name libSystem's own printf/scanf functions (their C rows realize to
+# DSS's C23 bodies), so their cell is the platform name, as the fifteen above.
+# `dup2` (unistd.h) and `mkstemp` (stdlib.h), the corpus rows the same class added for gcc's and
+# clang's ELF objects, were probed through their own header by the same tool (`cc -c -O2` at c17
+# and gnu17 on both arches, `nm -u`, run 20261113-222953-be1503a0): each the plain decorated name.
 _Exit	stdlib.h	__Exit	__Exit
+__dss_platform_fprintf	stdio.h	_fprintf	_fprintf
+__dss_platform_fscanf	stdio.h	_fscanf	_fscanf
 __dss_platform_lock_file	stdio.h	_flockfile	_flockfile
+__dss_platform_printf	stdio.h	_printf	_printf
+__dss_platform_scanf	stdio.h	_scanf	_scanf
+__dss_platform_snprintf	stdio.h	_snprintf	_snprintf
+__dss_platform_sprintf	stdio.h	_sprintf	_sprintf
+__dss_platform_sscanf	stdio.h	_sscanf	_sscanf
 __dss_platform_strtoimax	inttypes.h	_strtoimax	_strtoimax
 __dss_platform_strtol	stdlib.h	_strtol	_strtol
 __dss_platform_strtoll	stdlib.h	_strtoll	_strtoll
@@ -177,12 +211,34 @@ __dss_platform_strtoumax	inttypes.h	_strtoumax	_strtoumax
 __dss_platform_unlock_file	stdio.h	_funlockfile	_funlockfile
 __dss_platform_vfprintf	stdio.h	_vfprintf	_vfprintf
 __dss_platform_vfscanf	stdio.h	_vfscanf	_vfscanf
+__dss_platform_vprintf	stdio.h	_vprintf	_vprintf
+__dss_platform_vscanf	stdio.h	_vscanf	_vscanf
 __dss_platform_vsnprintf	stdio.h	_vsnprintf	_vsnprintf
 __dss_platform_vsprintf	stdio.h	_vsprintf	_vsprintf
 __dss_platform_vsscanf	stdio.h	_vsscanf	_vsscanf
 __dss_platform_wcstoimax	inttypes.h	_wcstoimax	_wcstoimax
 __dss_platform_wcstoumax	inttypes.h	_wcstoumax	_wcstoumax
 __error	errno.h	___error	___error
+__maskrune	ctype.h	___maskrune	___maskrune
+__memccpy_chk	string.h	___memccpy_chk	___memccpy_chk
+__memcpy_chk	string.h	___memcpy_chk	___memcpy_chk
+__memmove_chk	string.h	___memmove_chk	___memmove_chk
+__memset_chk	string.h	___memset_chk	___memset_chk
+__snprintf_chk	stdio.h	___snprintf_chk	___snprintf_chk
+__sprintf_chk	stdio.h	___sprintf_chk	___sprintf_chk
+__stack_chk_fail	stdlib.h	___stack_chk_fail	___stack_chk_fail
+__stpcpy_chk	string.h	___stpcpy_chk	___stpcpy_chk
+__strcat_chk	string.h	___strcat_chk	___strcat_chk
+__strcpy_chk	string.h	___strcpy_chk	___strcpy_chk
+__strlcat_chk	string.h	___strlcat_chk	___strlcat_chk
+__strlcpy_chk	string.h	___strlcpy_chk	___strlcpy_chk
+__strncat_chk	string.h	___strncat_chk	___strncat_chk
+__strncpy_chk	string.h	___strncpy_chk	___strncpy_chk
+__tolower	ctype.h	___tolower	___tolower
+__toupper	ctype.h	___toupper	___toupper
+__vsnprintf_chk	stdio.h	___vsnprintf_chk	___vsnprintf_chk
+__vsprintf_chk	stdio.h	___vsprintf_chk	___vsprintf_chk
+_exit	unistd.h	__exit	__exit
 abort	stdlib.h	_abort	_abort
 abs	stdlib.h	_abs	_abs
 access	unistd.h	_access	_access
@@ -234,6 +290,7 @@ dlclose	dlfcn.h	_dlclose	_dlclose
 dlerror	dlfcn.h	_dlerror	_dlerror
 dlopen	dlfcn.h	_dlopen	_dlopen
 dlsym	dlfcn.h	_dlsym	_dlsym
+dup2	unistd.h	_dup2	_dup2
 exit	stdlib.h	_exit	_exit
 exp	math.h	_exp	_exp
 expf	math.h	_expf	_expf
@@ -340,6 +397,7 @@ memcpy	memory.h	_memcpy	_memcpy
 memmove	memory.h	_memmove	_memmove
 memset	memory.h	_memset	_memset
 mkdir	sys/stat.h	_mkdir	_mkdir
+mkstemp	stdlib.h	_mkstemp	_mkstemp
 mktime	time.h	_mktime	_mktime
 mmap	sys/mman.h	_mmap	_mmap
 munmap	sys/mman.h	_munmap	_munmap

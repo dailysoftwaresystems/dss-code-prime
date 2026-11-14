@@ -1549,61 +1549,49 @@ enum class DiagnosticCode : std::uint16_t {
     // that depends on this conversion is ABI-correct by construction, unlike the
     // layout constraints that block belongs to.
     S_IncompatiblePointerIntegerPointee = 0xE060,
-    // S_EntryShapeNotDeclared (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): a function whose
-    //   name the SOURCE LANGUAGE declares as a program-entry spelling is defined
-    //   with a signature no declared row for that name has.
+    // S_EntryShapeNotDeclared (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): a WARNING (since P69
+    //   fold 3e, lane `xa`, class C's N3) at the declarator of a function defined
+    //   with a name the SOURCE LANGUAGE declares as a program-entry spelling, whose
+    //   signature is none of the rows that name has on the pair's format -- the
+    //   rows the format REALIZES (`realizedEntryNames`, core/types/entry_names.hpp).
+    //   The definition is the program's entry all the same, as every reference's
+    //   startup calls any `main`: it is called with the RICHEST realized row of
+    //   its name, its own parameters receiving those arguments. On a format that
+    //   starts no program (`-c`) it warns a signature that is none of the rows the
+    //   language declares, as gcc's -Wmain warns there.
     //   ★ THIS IS THE SEMANTIC-TIER OWNER OF THE ENTRY SIGNATURE, and it is a
-    //   SINGLE-TU fact: "the definition in front of me has the wrong shape for its
-    //   name". It therefore carries a REAL SOURCE SPAN, at the declarator. Its
-    //   predecessor (`K_EntryShapeNotDeclared`, now retired to a narrow MIR-tier
-    //   backstop) fired from the MIR tier where `Mir` carries no `BufferId` or
-    //   `SourceSpan` for a function, so it could only name the entry by symbol
-    //   name — the weakest possible report of what is a plain declaration
-    //   mistake with an obvious location.
+    //   SINGLE-TU fact: "the definition in front of me has a shape none of its
+    //   name's rows has". It therefore carries a REAL SOURCE SPAN, at the
+    //   declarator. Its predecessor (`K_EntryShapeNotDeclared`, now retired to a
+    //   narrow MIR-tier backstop) fired from the MIR tier where `Mir` carries no
+    //   `BufferId` or `SourceSpan` for a function, so it could only name the entry
+    //   by symbol name.
+    //   ★ WHY A WARNING, ✔MEASURED (lane `xa`, d131: cl 19.44, clang-cl 19.1.5,
+    //   MinGW gcc 13.2, gcc 13.3, clang 18.1.3): `int main(int, double)` is linked
+    //   and run by gcc (-Wmain) and cl, refused only by clang and clang-cl; `int
+    //   wmain(int, unsigned int **)` beside `main` is linked by every reference --
+    //   an ordinary function where the format realizes no wide verb, which this
+    //   code no longer reaches at all. By the union of the references the program
+    //   works, so DSS makes it, and says what it did. It was an ERROR that refused
+    //   every such signature on every format.
     //   ★ THE MEASURED FAULT THAT CREATED IT (2026-08-10, HEAD `3e86a187`,
     //   `build-dbg`): `int main(int argc, char **argv, char **envp)` compiled
     //   **rc=0 with ZERO diagnostics** on BOTH `pe64-x86_64-windows-exec` and
-    //   `elf64-x86_64-linux-exec`, and both images FAULTED — observed `argc=3
-    //   argv=0x…7D10 envp=0x0000000000000004`, dereferencing envp gave
-    //   `0xC0000005` on pe and SIGSEGV (rc=139) on elf, while gcc compiled the
-    //   identical source and it worked. (The ORIGIN of the `0x4` is
-    //   UNDETERMINED; the "argc left in a leftover register" explanation is
-    //   REFUTED — that run had argc=3 with envp still 0x4. Do NOT put a mechanism
-    //   claim into this diagnostic's text.) That form is SUPPORTED now: the
-    //   language declares its row and every exec format realizes its verb
-    //   (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE), so what this code refuses is every
-    //   signature the language does NOT declare for an entry name —
-    //   `int main(int, char**, int)`, `void main()`.
-    //   ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY. An undeclared signature is
-    //   refused on a relocatable `.o` too, because no format realizes a shape the
-    //   language does not declare and no translation unit can make it legal
-    //   later — the check needs no target and so runs wherever the declaration
-    //   is seen. What IS format-dependent is
-    //   CANDIDACY ("does this format realize the verb this row needs"), and that
-    //   deliberately lives at entry resolution instead: on ELF, `wmain` is not a
-    //   candidate but it is NOT an error either — a program defining `main` and
-    //   `wmain` must BUILD there and take `main`. Making "unrealized verb" a
-    //   per-definition error would make that program impossible.
-    //   ★ ALSO REFUSES `void main()` — through the SAME check with no second
-    //   mechanism: no declared row spells a `void` return (C23 5.1.2.2.1: the
-    //   return type shall be int), so it simply fails to match.
-    //   ★ C23 IS WHAT MAKES THIS A DEFECT RATHER THAN A PREFERENCE. 5.1.2.2.1
-    //   permits `main` "in some other IMPLEMENTATION-DEFINED MANNER", so
-    //   SUPPORTING 3-param main is conforming and REFUSING it is conforming —
-    //   accepting it and faulting is the one outcome C23 rules out, and that was
-    //   the shipped behaviour. 3.4.1 then defines implementation-defined behavior
-    //   as behavior each implementation DOCUMENTS, which is why the accepted set
-    //   is declared in config — the language file's `entryFunctions` mapping —
-    //   and why this message ENUMERATES it and says where it lives.
-    //   ★ THE MESSAGE MUST NAME THREE THINGS and the third is the easy one to
-    //   drop: (i) the entry and its OBSERVED signature; (ii) the ENUMERATED
-    //   declared rows for that NAME; (iii) that the set is CONFIG-DECLARED, so the
-    //   reader knows the remedy is a config row and not a compiler patch. With
-    //   (i) and (ii) but not (iii) it reads as "the compiler does not support
-    //   this", which is the wrong conclusion.
-    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE. A silently
-    //   miscompiled program ENTRY is the worst class there is, and `--suppress`
-    //   must not be able to restore an accepted-then-faulting binary.
+    //   `elf64-x86_64-linux-exec`, and both images FAULTED on the first envp
+    //   dereference, while gcc compiled the identical source and it worked. (Do
+    //   NOT put a mechanism claim for the observed `0x4` into this diagnostic's
+    //   text: its origin is undetermined.) That form is SUPPORTED: the language
+    //   declares its row and every exec format realizes its verb. What made it
+    //   fault -- a definition called with arguments its startup did not make -- is
+    //   what calling every entry with its elected verb's own signature rules out.
+    //   ★ C23 5.1.2.2.1 permits `main` "in some other IMPLEMENTATION-DEFINED
+    //   MANNER", and 3.4.1 defines implementation-defined behavior as behavior each
+    //   implementation DOCUMENTS: the accepted set is declared in config -- the
+    //   language file's `entryFunctions` mapping, intersected with the format's
+    //   `entryVerbs` -- and this message enumerates it and says where it lives.
+    //   ★ NOT IN `kUnsuppressableCodes` since fold 3e: suppressing it hides advice
+    //   while the build proceeds to the program every reference makes, which is
+    //   neither prong of that table's criterion, and gcc's -Wmain is suppressible.
     S_EntryShapeNotDeclared = 0xE061,
 
     // ★★ D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): a GNU
@@ -5685,7 +5673,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   program 5 where GNU ld's and ld.lld's is 41). Always an Error, so it needs
     //   no row in the unsuppressable table.
     K_SymbolBindingNotModelled     = 0x8030,
-    // K-NEXT-SLOT: 0x8031 — grep this marker before adding a K_* code.
+    // K_ProgramEntryChosenByPrecedence (P69 fold 3e, the review of fold 3d's X2)
+    //   — WARNING. A program defines entries of TWO NAMES the format realizes
+    //   (`main` beside `wmain` on pe64), and the format's `entryPrecedence`
+    //   ranks one above the rest: the election takes it and names the others,
+    //   as link.exe (LNK4067, "ambiguous entry point; selected
+    //   'mainCRTStartup'"), lld-link and MinGW-w64's GNU ld each take `main`
+    //   (✔MEASURED, exit 11). Two candidates of ONE rank stay the error
+    //   K_ProgramEntryAmbiguous. Suppressible: the build proceeds with the
+    //   meaning the references give it.
+    K_ProgramEntryChosenByPrecedence = 0x8031,
+    // K_PointerWidthNotTheWritersClass (P69 fold 3e, the review of fold 3d's
+    //   X9) — ERROR. An object or image writer writes ONE class (ELF64, Mach-O
+    //   64, PE32+), whose address -- every slot, rebase site and data pointer it
+    //   writes -- is that class's word, and the document's data model states a
+    //   pointer of another width. Refused at the writer's entry, naming the
+    //   width, the writer and the format, rather than writing slots of the
+    //   wrong width. UNSUPPRESSABLE in effect: nothing is written.
+    K_PointerWidthNotTheWritersClass = 0x8032,
+    // K-NEXT-SLOT: 0x8033 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

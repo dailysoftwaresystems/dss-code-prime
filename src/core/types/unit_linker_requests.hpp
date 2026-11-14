@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/types/entry_shape.hpp"       // EntryMaterialization (the verbs a runtime startup calls an entry with)
 #include "core/types/enum_name_table.hpp"   // EnumNameTable (the two closed sets a directive row states)
 
 #include <cstdint>
@@ -83,10 +84,16 @@ struct UnitSubsystemRequest {
 // the option's precedence, and dropped from a member the archive search pulls
 // like any entry -- and the image link refuses it by name only where it would
 // stand (P69 send-back 5, review-xa4 NIT 7).
+// `verbs`: for a runtime startup, the materialization verbs it calls an entry
+// with (the vocabulary's `runtimeStartups` row). The request that STANDS among
+// the units named to the link restricts the program's entry election to them
+// (`entryElectionScope`, P69 fold 3e), as link.exe and lld-link start `wmain`
+// beside `main` under `/ENTRY:wmainCRTStartup` (✔MEASURED 2026-11-05).
 struct UnitEntryRequest {
-    std::string symbol;
-    bool        runtimeStartup = false;
-    std::string unsupported{};
+    std::string                       symbol;
+    bool                              runtimeStartup = false;
+    std::string                       unsupported{};
+    std::vector<EntryMaterialization> verbs{};
     friend bool operator==(UnitEntryRequest const&, UnitEntryRequest const&) = default;
 };
 struct UnitSectionAttributeRequest { SectionAttributeRequest request; };

@@ -1,0 +1,4 @@
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kMachO64AddressBytes,
+                                                           "macho::encode", reporter)) {
+        return {};
+    }

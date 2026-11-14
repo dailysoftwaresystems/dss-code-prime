@@ -1,0 +1,1 @@
+    bool const everyTreeAssembled = substrate::runEveryUnit(std::min<std::size_t>(trees.size(), 1), [&](std::size_t ti) {

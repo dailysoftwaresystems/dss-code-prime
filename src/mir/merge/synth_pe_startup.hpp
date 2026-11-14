@@ -179,6 +179,29 @@ realizeEntryShape(Mir&                              mir,
                   std::string_view                  formatName,
                   DiagnosticReporter&               reporter);
 
+// ── THE SAME, FOR AN ENTRY WHOSE SIGNATURE IS NONE OF ITS NAME'S ROWS (P69 fold
+//    3e, lane `xa`, class C's N3) ─────────────────────────────────────────────
+//
+// The entry is `userEntrySymbol`, a function of `mir` the semantic tier stamped
+// with the RICHEST row of its name the format realizes because its own signature is
+// none of them (`SymbolRecord::entryCalledWithTheVerbsSignature`; warned there,
+// S_EntryShapeNotDeclared). The init, where the verb × the mechanism needs one, calls
+// it with the VERB's signature -- the row's parameter shapes and `int` -- never its
+// own, as every reference's startup calls any `main` and as an object's entry, which
+// carries no prototype, is called (`realizeForeignEntryShape`). ✔MEASURED before
+// (lane `xa`): `int main(int, double)` and `int main(int, char **, int)` are linked
+// and run by gcc 13.3 (-Wmain) and cl 19.44; DSS refused both.
+[[nodiscard]] DSS_EXPORT bool
+realizeEntryShapeWithTheVerbsSignature(Mir&                              mir,
+                                       TypeInterner&                     interner,
+                                       std::optional<SymbolId>&          userEntrySymbol,
+                                       std::vector<ExternImport>&        externImports,
+                                       EntryMaterialization              verb,
+                                       std::optional<ProcessArgs> const& processArgs,
+                                       CSymbolDecorationScheme           scheme,
+                                       std::string_view                  formatName,
+                                       DiagnosticReporter&               reporter);
+
 // ── THE SAME MATERIALIZATION FOR AN ENTRY ANOTHER INPUT DEFINES (P69 fold 3d,
 //    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────────
 //
