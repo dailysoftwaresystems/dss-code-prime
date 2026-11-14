@@ -497,6 +497,72 @@ TEST(TypeLayout, MemberAlignasRaisesStructAlignAndSize) {
     EXPECT_EQ(ln.size, 4u);
 }
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): EVERY LAYOUT STATES ITS MEMBERS'
+// ALIGNMENT BESIDE ITS OWN — the alignment before the composite's own request
+// (`aligned(N)` on its definition) and before an alias's type-level alignment, which
+// AAPCS64 places an argument by. ✔MEASURED (lane `cs`, probes f14 and f14r; aarch64
+// gcc 13.3.0 and clang 18.1.3): `struct __attribute__((aligned(16))) { long a, b; }`
+// is passed as an 8-aligned composite, `struct { _Alignas(16) long a; long b; }` as a
+// 16-aligned one. The cells: the composite's own request (align 16, members 8); a
+// member's request (both 16); none (equal); a union with its own request; an alias
+// raising a struct (members unchanged); a struct whose member is a requesting struct
+// (the member's whole alignment counts — it is the member's alignment, as gcc's
+// DECL_ALIGN is).
+//
+// RED-ON-DISABLE: drop `layoutOne`'s second reading and `membersAlign` equals `align`
+// for the requesting composite, its cell and the union's failing; drop the
+// `membersAlign = align` line and every cell reads 1.
+TEST(TypeLayout, ALayoutStatesItsMembersAlignmentBesideItsOwn) {
+    auto ti = makeInterner(1);
+    TypeId const i64 = ti.primitive(TypeKind::I64);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2>        const twoLongs{i64, i64};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 0> const noAligns{};
+
+    TypeId const own = ti.forwardComposite(TypeKind::Struct, "Own16", 1);
+    ti.completeComposite(own, twoLongs, /*packed=*/false, noWidths, noOffs, noAligns,
+                         /*explicitAlign=*/16);
+    StructLayout const lo = layoutOf(own, ti);
+    EXPECT_EQ(lo.align.bytes(), 16u) << "C 6.7.5: the request raises the composite";
+    EXPECT_EQ(lo.membersAlign.bytes(), 8u) << "its members are two 8-aligned longs";
+    EXPECT_EQ(lo.size, 16u);
+
+    std::array<std::uint32_t, 2> const firstAt16{16, 0};
+    TypeId const member = ti.structType("Member16", twoLongs, noWidths, noOffs, firstAt16);
+    StructLayout const lm = layoutOf(member, ti);
+    EXPECT_EQ(lm.align.bytes(), 16u);
+    EXPECT_EQ(lm.membersAlign.bytes(), 16u) << "a member's request is the member's alignment";
+
+    TypeId const plain = ti.structType("Plain", twoLongs);
+    StructLayout const lp = layoutOf(plain, ti);
+    EXPECT_EQ(lp.membersAlign.bytes(), lp.align.bytes());
+    EXPECT_EQ(lp.membersAlign.bytes(), 8u);
+
+    std::array<TypeId, 2> const intAndLong{i32, i64};
+    TypeId const un = ti.forwardComposite(TypeKind::Union, "OwnU32", 2);
+    ti.completeComposite(un, intAndLong, /*packed=*/false, noWidths, noOffs, noAligns,
+                         /*explicitAlign=*/32);
+    StructLayout const lu = layoutOf(un, ti);
+    EXPECT_EQ(lu.align.bytes(), 32u);
+    EXPECT_EQ(lu.membersAlign.bytes(), 8u);
+
+    TypeId const alias = ti.typeAligned(plain, 32);
+    StructLayout const la = layoutOf(alias, ti);
+    EXPECT_EQ(la.align.bytes(), 32u) << "the alias's type-level alignment is its answer";
+    EXPECT_EQ(la.membersAlign.bytes(), 8u) << "an alias adds no member";
+
+    std::array<TypeId, 2> const nestsOwn{i64, own};
+    TypeId const outer = ti.structType("NestsOwn16", nestsOwn);
+    StructLayout const ln = layoutOf(outer, ti);
+    EXPECT_EQ(ln.membersAlign.bytes(), 16u) << "a member's own request is that member's alignment";
+
+    TypeId const i128 = ti.primitive(TypeKind::I128);
+    StructLayout const ls = layoutOf(i128, ti);
+    EXPECT_EQ(ls.membersAlign.bytes(), ls.align.bytes()) << "a scalar's are its own";
+}
+
 // D-CSUBSET-MEMBER-ALIGNAS: the override uses MAX semantics — it can only RAISE, never
 // LOWER. `alignas(2)` on an `int` (natural align 4) is a no-op: the effective align
 // stays 4. RED-ON-DISABLE: if the override replaced (rather than max'd) the natural

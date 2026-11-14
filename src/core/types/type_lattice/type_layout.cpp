@@ -80,10 +80,19 @@ namespace {
 // Returns nullopt when the stored value is not a representable alignment — an
 // upstream bug (`completeComposite` rejects it at the sink) — so layout fails LOUD
 // rather than silently mis-aligning, mirroring the member-alignas `fromBytes` reject.
+//
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): `Ignored` seeds 1 whatever the
+// composite requests, so the fold ends at its MEMBERS' alignment — the one AAPCS64
+// places an argument by (`StructLayout::membersAlign`, which `layoutOne` computes
+// this way). Every other caller honours the request.
+enum class CompositeRequest : std::uint8_t { Honoured, Ignored };
+
 [[nodiscard]] std::optional<Alignment>
-compositeSeedAlign(TypeInterner const& interner, TypeId id) noexcept {
+compositeSeedAlign(TypeInterner const& interner, TypeId id,
+                   CompositeRequest request) noexcept {
     std::uint32_t const req = interner.explicitCompositeAlign(id);
-    if (req == 0) return Alignment::of<1>();   // no request → the unchanged path
+    if (req == 0 || request == CompositeRequest::Ignored)
+        return Alignment::of<1>();   // no request → the unchanged path
     return Alignment::fromBytes(req);
 }
 
@@ -946,10 +955,12 @@ namespace {
 // THROUGH the skin to the material type; the alignment itself is applied by
 // `layoutOne`, the thin wrapper just below this function. Nothing in this body reads
 // it, and nothing in this body should.
+// `request` is `CompositeRequest::Ignored` only for `layoutOne`'s second reading of a
+// composite that requests an alignment (`StructLayout::membersAlign`).
 [[nodiscard]] std::optional<StructLayout>
 layoutOneMaterial(TypeId id, TypeInterner const& interner,
                   AggregateLayoutParams params, DataModel dm,
-                  LayoutMemo const& memo) {
+                  LayoutMemo const& memo, CompositeRequest request) {
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
@@ -1043,7 +1054,7 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // packers, which each end with `out.align.alignUp(...)`. Field OFFSETS
             // are unaffected: they are placed from the per-FIELD `effectiveAlign`,
             // never from `out.align`.
-            auto const seed = compositeSeedAlign(interner, id);
+            auto const seed = compositeSeedAlign(interner, id, request);
             if (!seed) return std::nullopt;   // unrepresentable stored request
             out.align = *seed;
             out.fieldOffsets.reserve(fields.size());
@@ -1238,7 +1249,7 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // `out.align.alignUp(maxSize)` then grows the union's size to match.
             // clang: `union U { char a; int b; } __attribute__((aligned(32)));`
             // is sizeof 32 / _Alignof 32 (MEASURED).
-            auto const seed = compositeSeedAlign(interner, id);
+            auto const seed = compositeSeedAlign(interner, id, request);
             if (!seed) return std::nullopt;   // unrepresentable stored request
             out.align = *seed;
             out.fieldOffsets.assign(fields.size(), 0);  // every variant at offset 0
@@ -1467,9 +1478,22 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
 [[nodiscard]] std::optional<StructLayout>
 layoutOne(TypeId id, TypeInterner const& interner,
           AggregateLayoutParams params, DataModel dm, LayoutMemo const& memo) {
-    auto out = layoutOneMaterial(id, interner, params, dm, memo);
+    auto out = layoutOneMaterial(id, interner, params, dm, memo, CompositeRequest::Honoured);
+    if (!out.has_value()) return out;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the members' alignment, before
+    // the composite's own request (`StructLayout::membersAlign`). A composite that
+    // requests one is read a second time with the request ignored — the same body, so
+    // the members' fold cannot be spelled twice; its children come from `memo`, so the
+    // second reading lays out nothing below this level. The type-level alignment below
+    // never reaches it.
+    out->membersAlign = out->align;
+    if (interner.explicitCompositeAlign(id) != 0) {
+        auto const bare = layoutOneMaterial(id, interner, params, dm, memo, CompositeRequest::Ignored);
+        if (!bare.has_value()) return std::nullopt;
+        out->membersAlign = bare->align;
+    }
     std::uint32_t const want = interner.typeAlignOverride(id);
-    if (!out.has_value() || want == 0) return out;
+    if (want == 0) return out;
     auto const a = Alignment::fromBytes(want);
     // Unrepresentable (0 / non-power-of-two / over max) ⇒ FAIL LOUD, exactly as the
     // member-`alignas` fold does. The semantic tier validates the request long before

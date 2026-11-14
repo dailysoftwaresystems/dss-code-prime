@@ -21,7 +21,9 @@
 // where a convention passes a MEMORY-class aggregate by its bytes -- `aggregateMemoryArgument: stack` (sysv_amd64,
 // sysv_amd64_darwin). Under `callerCopy` (ms_x64, aapcs64, apple_arm64) the argument is a pointer to a copy the
 // caller places as a local, which the over-aligned-local frame already aligns, so those conventions are pinned
-// UNTOUCHED (no row, no realignment). A SCALAR stacked past 16 does not exist in C on these conventions: the widest
+// UNTOUCHED (no row, no realignment); the composite they DO stack by its bytes, an HFA past the FP registers, is
+// placed on its alignment capped at the stack's own 16 (`stackArgPacking`), so it too realigns nothing -- pinned
+// beside them (P69 fold f26c2, F7). A SCALAR stacked past 16 does not exist in C on these conventions: the widest
 // scalar alignment (`long double`, `__int128`) is 16, the stack's own. No DSS target is 32-bit x86, so cl's 32-bit
 // cell is not a DSS cell. The arms: (A) the row and the sequence over hand-built MIR -- the pin main asked for in
 // ledger 497, a function with NO over-aligned local passing a 64-aligned aggregate on the stack, and its control at
@@ -57,7 +59,9 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
 #include "program/program.hpp"
+#include "repo_root.hpp"   // configRoot: the shipped arm64 document the active-convention cell edits
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"   // shippedFormatNames
 
 #include <gtest/gtest.h>
 
@@ -327,18 +331,39 @@ struct ImageSection {
     return std::nullopt;
 }
 
-// The executables DSS links itself for a convention that passes a MEMORY-class aggregate by its bytes (each
-// convention read off the target below, never assumed), and where each container keeps its code and its unwind
-// table.
+// The executables DSS links itself for a convention that passes a MEMORY-class aggregate by its bytes: every
+// EXECUTABLE format document (`isExecFlavor`) whose C convention's `aggregate.memoryArgument` is `stack`, read
+// off the shipped documents, never a hand list (P69 fold f26c2, review-csf26c F5: a format or a convention
+// added later is covered the day it lands). ✔READ at f26c2: two -- elf64-x86_64-linux-exec (sysv_amd64) and
+// macho64-x86_64-darwin-exec (sysv_amd64_darwin); pe64's ms_x64 and both arm64 conventions pass such an
+// aggregate by pointer.
 struct ImageArm {
-    char const* spec;
-    char const* convention;
-    bool        macho;
+    std::string      spec;         // `<target>:<format document>`
+    std::string      target;       // the format's `targetArch`
+    std::string      convention;   // its `cCallingConvention`
+    ObjectFormatKind kind = ObjectFormatKind::Unknown;
 };
-constexpr ImageArm kImageArms[] = {
-    {"x86_64:elf64-x86_64-linux-exec", "sysv_amd64", false},
-    {"x86_64:macho64-x86_64-darwin-exec", "sysv_amd64_darwin", true},
-};
+[[nodiscard]] std::vector<ImageArm> imageArms() {
+    std::vector<ImageArm> out;
+    for (std::string const& name : test_support::shippedFormatNames()) {
+        auto format = ObjectFormatSchema::loadShipped(name);
+        EXPECT_TRUE(format.has_value()) << "object format '" << name << "' does not load";
+        if (!format.has_value() || !(*format)->isExecFlavor()) continue;
+        if ((*format)->cCallingConvention().declaresNoConvention()) continue;
+        std::string const targetName{(*format)->targetArch()};
+        auto target = TargetSchema::loadShipped(targetName);
+        EXPECT_TRUE(target.has_value()) << name << " names target '" << targetName << "', which does not load";
+        if (!target.has_value()) continue;
+        std::string const& convention = (*format)->cCallingConvention().convention;
+        TargetCallingConvention const* cc = nullptr;
+        for (std::uint16_t ci = 0; ci < (*target)->callingConventionCount(); ++ci)
+            if ((*target)->callingConvention(ci)->name == convention) cc = (*target)->callingConvention(ci);
+        EXPECT_NE(cc, nullptr) << name << " names convention '" << convention << "', which its target does not declare";
+        if (cc == nullptr || cc->aggregate.memoryArgument != AggregateMemoryArgument::Stack) continue;
+        out.push_back(ImageArm{targetName + ":" + name, targetName, convention, (*format)->kind()});
+    }
+    return out;
+}
 
 // A caller passing a 64-aligned aggregate on the stack, through a VOLATILE function pointer so that no pipeline
 // inlines the call away: at release the caller may itself be inlined into `main`, which then realigns instead.
@@ -402,6 +427,44 @@ TEST(StackedArgumentRealignment, AFunctionWithNoOverAlignedLocalPassingA64Aligne
             EXPECT_TRUE(d.realignMasks.empty()) << "an argument the stack already aligns costs no realignment";
         }
     }
+}
+
+// (A') A CARRIER NO CALL CONSUMES REALIGNS NOTHING (P69 fold f26c2, review-csf26c F11). The same 64-aligned carrier
+// as (A), read by a Load where (A) passes it to a call -- the shape the release pipeline leaves when it inlines a
+// callee that receives its aggregate on the stack (the spliced copy reads the caller's carrier as an address): no
+// call places it, so the function gets no row and no realignment. (A) is the control: the same carrier, passed.
+//
+// RED-ON-DISABLE: count every carrier an instruction reads (not only a call's) and this function gets (A)'s row.
+TEST(StackedArgumentRealignment, ACarrierNoCallConsumesRealignsNothing) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const* cc = (*target)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    TypeId const ptr = in.pointer(i64);
+    TypeId const sig = in.fnSig(std::vector<TypeId>{ptr}, i64, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{1});
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    MirInstId const p = mb.addArg(0, ptr);
+    std::array<MirInstId, 1> const carrierOps{p};
+    MirInstId const carrier = mb.addInst(MirOpcode::ByValueStackArg, carrierOps, ptr,
+                                         64u | (std::uint32_t{kByValueStackArgExhaustNone}
+                                                << kByValueStackArgExhaustShift),
+                                         MirInstFlags::None, 64u);
+    std::array<MirInstId, 1> const loadOps{carrier};
+    MirInstId const v = mb.addInst(MirOpcode::Load, loadOps, i64);
+    mb.addReturn(v);
+    Mir const m = std::move(mb).finish();
+    DiagnosticReporter rep;
+    MirToLirResult const r = lowerToLir(m, **target, in, rep, std::vector<ExternImport>{},
+                                        ExternCallDispatch::DirectPlt);
+    ASSERT_TRUE(r.ok) << inventory(rep);
+    Descents const d = descentsOf(r.lir, **target, 0, cc->stackPointer->ordinal);
+    EXPECT_TRUE(r.funcLocalAlignments.empty()) << "no call places the carrier: no row";
+    EXPECT_TRUE(d.realignMasks.empty()) << "no call places the carrier: no realignment";
 }
 
 // ── (B) THROUGH THE PIPELINE: THE FRAME THE REALIGNMENT RUNS ON ─────────────────────────────────────────────────────
@@ -558,6 +621,95 @@ TEST(StackedArgumentRealignment, ACallerCopyConventionNeverRealignsForAnAggregat
     EXPECT_GE(callerCopyConventions, 3u) << "ms_x64, aapcs64 and apple_arm64 are caller-copy conventions";
 }
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F7): A CALLER-COPY CONVENTION STILL STACKS AN HFA BY ITS BYTES once
+// the FP registers are spent, and places it on its alignment CAPPED at 16 (`stackArgPacking.maxAggregateAlignment`;
+// AAPCS64 reads its members' alignment, Apple arm64 its element's) -- never past the stack's own, so its caller
+// realigns nothing. ✔MEASURED (lane `cs`, probe f14, -O1 asm): `struct { _Alignas(32) double a, b, c, d; }` after
+// eight doubles and one stacked double is at +16 under aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 and at +8 under
+// Apple clang 21, and neither caller realigns its frame; DSS's caller took the frame-pointer frame and realigned to
+// 32 (`sub sp, sp, x14`) on both conventions, the realignment asking the carrier's own alignment raw. THE UNIVERSE:
+// every arm64 convention (both cap), the carrier's stated alignment its own (32 / 8), the row and the realignment
+// absent; and the cap is the ACTIVE convention's -- under a document where Apple's row places a composite by its
+// type up to 32, its caller realigns to 32 and AAPCS64's nothing (the lowering read the target's first convention
+// for every convention fact). RED-ON-DISABLE: ask the own alignment again in `functionStackedArgAlignment` -> the
+// aapcs64 row says 32; read the first convention again -> the edited Apple cell realigns nothing.
+TEST(StackedArgumentRealignment, AStackedHfaOverAlignedPastItsConventionsCapRealignsNothing) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    std::string regs, vals;
+    for (int i = 0; i < 8; ++i) {
+        regs += "double r" + std::to_string(i) + ", ";
+        vals += std::to_string(i) + ".0, ";
+    }
+    std::string const src = "struct HA { _Alignas(32) double a; double b; double c; double d; };\n"
+                            "long take(" + regs + "double s, struct HA h);\n"
+                            "long f(struct HA *p) { return take(" + vals + "8.0, *p); }\n";
+    std::size_t conventions = 0;
+    for (std::uint16_t ci = 0; ci < (*target)->callingConventionCount(); ++ci) {
+        auto const* cc = (*target)->callingConvention(ci);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->stackPointer.has_value());
+        SCOPED_TRACE(cc->name);
+        ++conventions;
+        EXPECT_EQ(cc->stackArgPacking.aggregateAlignment(256u, 1u), cc->stackAlignment)
+            << "the cap is the stack's own alignment, so no stacked composite needs a realignment";
+        auto const lowered = test_support::lowerCToLir(src, "arm64", ci);
+        ASSERT_TRUE(lowered.lir.ok);
+        // The carrier is there, stating its convention's own alignment of the HFA.
+        Mir const& m = lowered.mir.mir;
+        std::vector<std::uint32_t> carriers;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const mf = m.funcAt(fi);
+            for (std::uint32_t b = 0; b < m.funcBlockCount(mf); ++b) {
+                MirBlockId const blk = m.funcBlockAt(mf, b);
+                for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                    MirInstId const id = m.blockInstAt(blk, i);
+                    if (m.instOpcode(id) == MirOpcode::ByValueStackArg) carriers.push_back(m.instPayload2(id));
+                }
+            }
+        }
+        std::uint32_t const own =
+            cc->stackArgPacking.homogeneousAggregateAlignmentOf == HomogeneousAggregateAlignmentSource::Element ? 8u
+                                                                                                                 : 32u;
+        EXPECT_EQ(carriers, (std::vector<std::uint32_t>{own})) << "one stacked HFA, stating its own alignment";
+        for (FuncLocalAlignment const& row : lowered.lir.funcLocalAlignments)
+            EXPECT_EQ(row.stackedArgAlignBytes, 0u) << "placed at 16 or finer: nothing past the stack's alignment";
+        Descents const d = descentsOf(lowered.lir.lir, **target, 0, cc->stackPointer->ordinal);
+        EXPECT_TRUE(d.realignMasks.empty()) << "the caller of a capped carrier never realigns";
+    }
+    EXPECT_GE(conventions, 2u) << "aapcs64 and apple_arm64";
+
+    // THE CAP IS THE ACTIVE CONVENTION'S. Under a configuration no shipped document states -- Apple's row placing
+    // a composite by its TYPE's alignment up to 32 -- the Apple caller realigns to 32 and the AAPCS64 caller, whose
+    // row is unchanged, still realigns nothing. The lowering read the target's FIRST convention for every
+    // convention fact, so both answered AAPCS64's.
+    std::ifstream in(dss::test::configRoot() / "targets" / "arm64.target.json", std::ios::binary);
+    ASSERT_TRUE(in.is_open());
+    std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    std::string const apple = R"("maxAggregateAlignment": 16, "homogeneousAggregateAlignmentOf": "element"})";
+    auto const at = text.find(apple);
+    ASSERT_NE(at, std::string::npos) << "apple_arm64's stackArgPacking row is not the one this cell edits";
+    ASSERT_EQ(text.find(apple, at + 1), std::string::npos);
+    text.replace(at, apple.size(), R"("maxAggregateAlignment": 32})");
+    auto edited = TargetSchema::loadFromText(text, "<arm64, apple_arm64 capped at 32>");
+    ASSERT_TRUE(edited.has_value());
+    for (std::uint16_t ci = 0; ci < (*edited)->callingConventionCount(); ++ci) {
+        auto const* cc = (*edited)->callingConvention(ci);
+        ASSERT_NE(cc, nullptr);
+        ASSERT_TRUE(cc->stackPointer.has_value());
+        SCOPED_TRACE(cc->name + std::string{" under the edited document"});
+        std::uint32_t const want = cc->stackArgPacking.aggregateAlignment(32u, 1u) > cc->stackAlignment ? 32u : 0u;
+        auto const lowered = test_support::lowerCToLir(src, *edited, ci);
+        ASSERT_TRUE(lowered.lir.ok);
+        std::uint32_t widest = 0;
+        for (FuncLocalAlignment const& row : lowered.lir.funcLocalAlignments)
+            widest = std::max(widest, row.stackedArgAlignBytes);
+        EXPECT_EQ(widest, want) << "the realignment is the convention's own placement";
+        Descents const d = descentsOf(lowered.lir.lir, **edited, 0, cc->stackPointer->ordinal);
+        EXPECT_EQ(d.realignMasks.size(), want == 0u ? 0u : 1u);
+    }
+}
+
 // ── (E) WHAT DSS'S OWN LINKED IMAGE SAYS OF THE FRAME (main's ledger 510) ───────────────────────────────────────────
 //
 // The frame as an unwinder reads it: the executable DSS compiles AND links itself, for each format whose convention
@@ -570,15 +722,25 @@ TEST(StackedArgumentRealignment, ACallerCopyConventionNeverRealignsForAnAggregat
 // and ends on the entry rule; no other function's CFA leaves SP. This pins that reading. (A DSS RELOCATABLE object on
 // Mach-O carries no unwind table yet, so the native witness prints its walk there; the image is DSS's own link.)
 TEST(StackedArgumentRealignment, ARealignedCallersLinkedImageDescribesItsFrameOffTheFramePointer) {
-    auto target = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
+    std::vector<ImageArm> const arms = imageArms();
+    // FLOOR, ✔READ at f26c2: two (above). A floor, not an equality: a format added later is one more arm.
+    EXPECT_GE(arms.size(), 2u) << "the executable formats whose convention stacks a MEMORY aggregate";
     test_support::ScratchDir scratch{test_support::Location::Temp, "lir-stacked-argument-realignment-image"};
     fs::path const src = scratch.path() / "realigned.c";
     {
         std::ofstream out(src, std::ios::binary);
         out << kImageSource;
     }
-    for (ImageArm const& arm : kImageArms) {
+    for (ImageArm const& arm : arms) {
+        SCOPED_TRACE(arm.spec);
+        // The two moves the rules follow are x86-64's (kCaptureFpFromSp, kRestoreSpFromFp), and the containers
+        // this test reads are ELF and Mach-O: an arm on another target or container is stated here first.
+        ASSERT_EQ(arm.target, "x86_64") << "state this target's frame-pointer capture and restore moves";
+        bool const macho = arm.kind == ObjectFormatKind::MachO;
+        ASSERT_TRUE(macho || arm.kind == ObjectFormatKind::Elf)
+            << "state where a " << objectFormatKindName(arm.kind) << " image keeps its code and unwind table";
+        auto target = TargetSchema::loadShipped(arm.target);
+        ASSERT_TRUE(target.has_value());
         TargetCallingConvention const* cc = nullptr;
         for (std::uint16_t ci = 0; ci < (*target)->callingConventionCount(); ++ci)
             if ((*target)->callingConvention(ci)->name == arm.convention) cc = (*target)->callingConvention(ci);
@@ -590,8 +752,8 @@ TEST(StackedArgumentRealignment, ARealignedCallersLinkedImageDescribesItsFrameOf
         CfiRegRef const fp = CfiRegRef::physical(cc->framePointer->ordinal);
         for (auto const& [label, config] :
              {std::pair{"debug", CompileConfig::Debug}, std::pair{"release", CompileConfig::Release}}) {
-            SCOPED_TRACE(std::string{arm.spec} + ", " + label);
-            fs::path const out = scratch.path() / (std::string{arm.convention} + "-" + label);
+            SCOPED_TRACE(label);
+            fs::path const out = scratch.path() / (arm.convention + "-" + label);
             fs::create_directories(out);
             DiagnosticReporter rep;
             Program prog;
@@ -606,8 +768,8 @@ TEST(StackedArgumentRealignment, ARealignedCallersLinkedImageDescribesItsFrameOf
                 if (e.is_regular_file() && e.path().stem() == "realigned") image = readBytes(e.path());
             ASSERT_FALSE(image.empty()) << "DSS links the image itself";
             auto const unwind =
-                arm.macho ? machoSection(image, "__TEXT", "__eh_frame") : elfSection(image, ".eh_frame");
-            auto const code = arm.macho ? machoSection(image, "__TEXT", "__text") : elfSection(image, ".text");
+                macho ? machoSection(image, "__TEXT", "__eh_frame") : elfSection(image, ".eh_frame");
+            auto const code = macho ? machoSection(image, "__TEXT", "__text") : elfSection(image, ".text");
             ASSERT_TRUE(unwind.has_value()) << "the image carries its unwind table";
             ASSERT_TRUE(code.has_value());
             ASSERT_LE(unwind->fileOff + unwind->size, image.size());

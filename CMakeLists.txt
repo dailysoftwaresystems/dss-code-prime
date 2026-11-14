@@ -565,6 +565,14 @@ endfunction()
 #       self-test flag -- called right after that `add_test`, in the same directory.
 #       `harness/repo_guard_label_check` refuses an entry whose command line asks a program for
 #       its self-test and carries no `self-test` label, so a bare entry left unlabelled is a red.
+#   dss_label_repo_guard(<test>...)
+#       THE ONE WAY an entry gets `repo-guard`: an entry whose verdict reads the REPOSITORY'S
+#       STATE (the rule is stated in the label's own block, near the end of this file), called
+#       right after its registration, in the same directory. It refuses a name this directory
+#       registered no entry for and an entry that carries `self-test`, and records the name for
+#       the sum the checker reads. A name says nothing: until 2026-11-13 a scan gave the label
+#       to every entry whose name ended in `guard`, and skipped a compiler test and a corpus
+#       example on every indirect leg.
 # A second script entry costs one call of each and a table of its arms in its test.
 function(dss_declare_script_selftest id)
     cmake_parse_arguments(PARSE_ARGV 1 _dss_ss "" "ARGC;WORKING_DIRECTORY" "COMMAND;SCRIPTS")
@@ -698,6 +706,24 @@ function(dss_label_self_test)
                 "-- the label is given right after the `add_test` that registers the entry.")
         endif()
         set_property(TEST "${_dss_test}" APPEND PROPERTY LABELS "self-test")
+    endforeach()
+endfunction()
+
+function(dss_label_repo_guard)
+    foreach(_dss_test IN LISTS ARGN)
+        if(NOT TEST "${_dss_test}")
+            message(FATAL_ERROR
+                "dss_label_repo_guard(${_dss_test}): no ctest entry of that name is registered in this directory "
+                "-- the label is declared right after the registration of the entry.")
+        endif()
+        get_test_property("${_dss_test}" LABELS _dss_labels)
+        if("self-test" IN_LIST _dss_labels)
+            message(FATAL_ERROR
+                "dss_label_repo_guard(${_dss_test}): the entry carries `self-test` -- its verdict reads its own "
+                "fixtures, which can depend on the host, so every leg runs it and it never carries `repo-guard`.")
+        endif()
+        set_property(TEST "${_dss_test}" APPEND PROPERTY LABELS "repo-guard")
+        set_property(GLOBAL APPEND PROPERTY DSS_REPO_GUARD_DECLARED "${_dss_test}")
     endforeach()
 endfunction()
 
@@ -1094,11 +1120,13 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(anchor_registry_guard)
     add_test(
         NAME line_endings_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(line_endings_guard)
     # `conflict_markers_guard`: no text file of the tree -- tracked, or untracked and not ignored -- holds a line
     # that is a merge-conflict marker git writes (2026-10-15: a checkpoint was committed with one, and nothing
     # refused it). Its verdict is the repository's state, the same bytes on every leg. Its self-test is the test
@@ -1108,6 +1136,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-conflict-markers/check-conflict-markers.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(conflict_markers_guard)
     # `arms_registry_guard`: what the mutation arms registry promises that `dssharness check-mutations` does not
     # check itself holds of the tree -- every A and M row's before-text stands exactly once in its site, each
     # area's section is in order, the arms of one runner on one leg state one case count -- then the same
@@ -1118,6 +1147,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-arms-registry/check-arms-registry.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(arms_registry_guard)
 
     # ── The sqlite harness driver checks its own logic (2026-09-21, lane mig, part 4) ──
     # `harness/sqlite_driver_selftest` runs `build_and_test.py --self-test`: the driver's Step 0
@@ -1127,8 +1157,8 @@ if(DSS_BUILD_TESTS)
     # ★ NEW. The shell drivers ran their suites only at their own Step 0, hours away from any
     # gate, and the helpers' self-tests ran nowhere; when those twins collapsed into one Python
     # driver, its checks became cheap enough for every gate run.
-    # ★ NOT `repo-guard`, ON PURPOSE -- hence no `guard` suffix for the label scan below to
-    # match. What these programs do depends on the HOST: how its processes are enumerated,
+    # ★ NOT `repo-guard`, ON PURPOSE -- no `dss_label_repo_guard` declares them. What these programs
+    # do depends on the HOST: how its processes are enumerated,
     # whether the POSIX half runs in this process or inside WSL. So every leg runs them, rather
     # than only the host the tree happened to be checked on.
     add_test(
@@ -1309,6 +1339,7 @@ if(DSS_BUILD_TESTS)
     # tree it was configured from, including work not committed yet. The default reads
     # HEAD, which would pass a working tree citing an id nobody has added.
     dss_add_harness_guard(anchor_citations_guard check-anchor-citations --current-tree)
+    dss_label_repo_guard(anchor_citations_guard)
 
     # ── Root litter, now asked of the tool ────────────────────────────────────
     # A RETARGET of the entry, not a rename: same name, same subject, same verdict.
@@ -1336,6 +1367,7 @@ if(DSS_BUILD_TESTS)
     # refused earlier, for having no harness configuration (exit 11) — so this
     # paragraph records an OPEN question rather than a covered one.
     dss_add_harness_guard(root_litter_guard check-root-litter)
+    dss_label_repo_guard(root_litter_guard)
 
     # Action-index guard (born 2026-08-19 as the script index, when this repository had
     # eighteen scripts and no index of any kind).
@@ -1379,6 +1411,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-scripts-index/check-scripts-index.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(scripts_index_guard)
 
     # D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES — the
     # ANTI-REGRESSION DEVICE, and the reason that row can be closed rather than
@@ -1397,6 +1430,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-lsp-coordinates/check-lsp-coordinates.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(lsp_coordinate_ownership_guard)
 
     # ⓘ `carriage_paths_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT.
     # It refused a carriage script whose hard-coded repository directory name
@@ -1432,6 +1466,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-enum-name-table-guards/check-enum-name-table-guards.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(enum_name_table_guard)
 
     # ⓘ `shell_portability_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-21, lane mig,
     # part 4). It refused bash-3.2-fatal shapes in this repository's `.sh` programs. No `.sh`
@@ -1466,6 +1501,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-plan-citations/check-plan-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(plan_citations_guard)
 
     # Wall-clock-literal guard (2026-08-23 — a new wall-clock literal in a test was
     # unguarded).
@@ -1494,6 +1530,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-wall-clock-in-tests/check-wall-clock-in-tests.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(wall_clock_in_tests_guard)
 
     # Diagnostic-code allocation gate (2026-08-23 — the allocator had no ctest
     # entry).
@@ -1511,6 +1548,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(diagnostic_codes_guard)
 
     # ── THE REST OF THE GUARDS NOTHING MECHANICAL RAN ───────────────────────
     #
@@ -1537,6 +1575,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-no-abort-in-tests/check-no-abort-in-tests.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(no_abort_in_tests_guard)
     # ★ THE EMITTED-ANCHOR-ID RATCHET. An anchor id inside a C++ string literal
     # under src/ is operator OUTPUT, and the row it names can close while the
     # text keeps telling the operator "a known deferral, wait for it". The id is
@@ -1550,6 +1589,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-emitted-anchor-ids/check-emitted-anchor-ids.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(emitted_anchor_ids_guard)
     # ⚠ THESE TWO RAN ZERO SELF-TEST ARMS UNTIL 2026-08-24 (cycle P29,
     # independent step-10 audit), AND THE ENTRIES BELOW ARE UNCHANGED — the
     # repair was in the SCRIPTS, which is the whole lesson. Both carried a
@@ -1568,11 +1608,13 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-path-identity/check-path-identity.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(path_identity_guard)
     add_test(
         NAME retyped_closed_sets_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-retyped-closed-sets/check-retyped-closed-sets.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(retyped_closed_sets_guard)
 
     # ── `check-doc-census` — registered 2026-09-04 (P59) to close unchecked drift in
     # the docs' status claims; that closing work asked for "the
@@ -1599,6 +1641,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-doc-census/check-doc-census.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(doc_census_guard)
     # ★ And its self-test, for the reason the two entries below carry: a
     # self-test behind a flag nobody types is not a test. Every arm is a
     # REFUSAL plus a CONTROL that must stay green, and each was proven able to
@@ -1761,6 +1804,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(wrapped_anchor_ids_guard)
 
     # Ninja dependency-record probe, SELF-TEST arm (2026-08-23 — it exited ZERO on
     # a directory that does not exist).
@@ -1786,9 +1830,9 @@ if(DSS_BUILD_TESTS)
     # the test binary tests/harness/CMakeLists.txt registers under the same name, which runs
     # the program's `--self-test` by the command line declared beside the test directories
     # above (THE NINJA DEPENDENCY-RECORD CHECK'S SELF-TEST) and holds one case per arm of it.
-    # ⓘ Registered in a test directory it is not among the entries the label scan near the
-    # end of this file reads, so it carries no `repo-guard` label and runs on EVERY leg: it
-    # proves a program's rules on the host's own paths, which every leg has its own of.
+    # ⓘ No `dss_label_repo_guard` declares it, so it carries no `repo-guard` label and runs on
+    # EVERY leg: it proves a program's rules on the host's own paths, which every leg has its
+    # own of.
 
     # ── THE PROBE FORM, ENFORCED: IS THIS BUILD DIRECTORY FRESH ENOUGH TO BE
     #    BELIEVED? (P62 lane `ax` — ninja recorded ZERO header deps under
@@ -1890,6 +1934,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-export-macro-placement/check-export-macro-placement.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(export_macro_placement_guard)
 
     # Guard-output-encoding ratchet (2026-08-23 — nothing ratcheted a new guard into
     # reconfiguring its streams).
@@ -1933,6 +1978,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-guard-output-encoding/check-guard-output-encoding.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(guard_output_encoding_guard)
 
     # Stale-refusal-citation ratchet (2026-08-24 — a claim true when typed and false
     # when the commit landed).
@@ -2009,6 +2055,7 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    dss_label_repo_guard(stale_refusal_citations_guard)
 
     # ⓘ `repo_tree_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-21, lane mig, part 4).
     # `repo-tree.ps1`, the PowerShell owner of "which tree am I standing in?", and its bash sibling
@@ -2031,15 +2078,14 @@ endif()
 # entries before anyone noticed -- the same rot `.harness-config/runner/actions/check-doc-census/` now refuses for
 # every corpus figure `examples/README.md` states.
 #
-# ⚠ THE SCAN IS OVER TESTS THAT ACTUALLY EXIST, not a hand-kept list. `set_tests_properties`
-# on a name some host-conditional branch did not define is a hard CMake error, so a hand-kept list
-# would have to track every branch -- the drift shape this repo has been bitten by
-# repeatedly. The count is printed so `ctest -N -L repo-guard` can be CHECKED against it
-# rather than trusted.
-#
-# ★ An unlabelled new guard is NOT skipped anywhere -- it simply runs on every leg. The
-# failure direction of this mechanism is "too much testing", the only direction a gate may
-# fail in.
+# ★ THE LABEL IS DECLARED, NEVER INFERRED (2026-11-13): `dss_label_repo_guard(<test>)`, right after the registration
+# of an entry whose verdict reads the repository's state, in the directory that registers it, is the ONE way an entry
+# gets `repo-guard`. Until 2026-11-13 a scan here gave it to every entry whose NAME ended in `guard`, and a name says
+# nothing of what a verdict reads: the scan skipped `lir/test_lir_fixture_vacuity_guard` (a compiler test) and the
+# corpus example `struct_big_neighbor_guard` (in both runners) on every indirect leg (MEASURED, P69 ledger 584). The
+# declaration is beside the registration, inside whatever branch registers the entry, so no hand-kept list has to
+# track a host-conditional branch. An entry left undeclared is not skipped anywhere: it runs on every leg, so the
+# failure direction stays "too much testing", the only direction a gate may fail in.
 #
 # ★★ THE RULE OF THE LABEL, STATED ONCE, HERE (2026-10-15): `repo-guard` is for an entry whose
 # verdict reads the REPOSITORY'S STATE -- the same bytes on every leg, so an indirect leg learns
@@ -2047,50 +2093,21 @@ endif()
 # the program's own fixtures, and that CAN depend on the host -- case, path separators, path
 # spelling, what the host's git does -- which is exactly what an indirect leg is there to show. So
 # every leg runs a self-test, the indirect ones included. AN ENTRY SELF-TESTS WHEN IT CARRIES THE
-# `self-test` LABEL -- the one predicate, read by this scan and by the checker alike, and given by
-# the helpers that register a self-test entry (`dss_use_script_selftest` for a test binary that
+# `self-test` LABEL -- the one predicate, read by `dss_label_repo_guard` and by the checker alike, and
+# given by the helpers that register a self-test entry (`dss_use_script_selftest` for a test binary that
 # drives a program's self-test one case per arm, `dss_label_self_test` for an entry registered bare;
-# both stated where they are defined). A name says nothing, and neither does a property of this
-# file's own. A guard run with no flag checks the tree, even when it proves its own refusals after,
-# and keeps the label.
-# ★ THE CHECKER HOLDS BOTH SIDES (`harness/repo_guard_label_check`, `check-repo-guard-label`): it reads
-# what ctest will run -- every entry's labels and command line -- and refuses an entry carrying both
-# labels, wherever and however `repo-guard` was given, and an entry whose command line asks a program
-# for its self-test (a `--self-test` or `--selftest` word) and carries no `self-test` label. A test
-# binary's command line shows no flag; its label comes from the helper it cannot build without.
-# ★ EVERY DIRECTORY'S TESTS, NOT THE TOP DIRECTORY'S ALONE: a guard registered in a subdirectory (tests/program,
-# tests/core, tests/lir) is labelled by this one rule, where until 2026-10-28 the scan read only the entries this
-# file registered and a subdirectory's guard needed its label set by hand beside it -- or silently had none. A test's
-# properties are read and set in the directory that registered it (CMake 4.0, the minimum above). The directories
-# are walked as a work list, never by recursion.
-set(_dss_dirs "${CMAKE_CURRENT_SOURCE_DIR}")
-set(_dss_guard_tests "")
-set(_dss_self_tests "")
-while(_dss_dirs)
-    list(POP_FRONT _dss_dirs _dss_dir)
-    get_property(_dss_subdirs DIRECTORY "${_dss_dir}" PROPERTY SUBDIRECTORIES)
-    list(APPEND _dss_dirs ${_dss_subdirs})
-    get_property(_dss_dir_tests DIRECTORY "${_dss_dir}" PROPERTY TESTS)
-    foreach(_t IN LISTS _dss_dir_tests)
-        if(_t MATCHES "guard$")
-            get_test_property(${_t} LABELS DIRECTORY "${_dss_dir}" _dss_labels)
-            if("self-test" IN_LIST _dss_labels)
-                list(APPEND _dss_self_tests "${_t}")
-            else()
-                set_property(TEST ${_t} DIRECTORY "${_dss_dir}" APPEND PROPERTY LABELS "repo-guard")
-                list(APPEND _dss_guard_tests "${_t}")
-            endif()
-        endif()
-    endforeach()
-endwhile()
-if(_dss_self_tests)
-    list(LENGTH _dss_self_tests _dss_self_count)
-    message(STATUS "repo-guard label NOT applied to ${_dss_self_count} self-test(s) whose name ends in guard: ${_dss_self_tests}")
-endif()
-if(_dss_guard_tests)
-    list(LENGTH _dss_guard_tests _dss_guard_count)
-    message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s): ${_dss_guard_tests}")
-endif()
+# both stated where they are defined). A name says nothing, for either label. A guard run with no flag
+# checks the tree, even when it proves its own refusals after, and is declared.
+# ★ THE CHECKER HOLDS EVERY SIDE (`harness/repo_guard_label_check`, `check-repo-guard-label`): it reads
+# what ctest will run -- every entry's labels and command line -- and the names the declarations wrote
+# (`<build>/repo-guard-declared.txt`), and refuses an entry carrying both labels; an entry whose command
+# line asks a program for its self-test (a `--self-test` or `--selftest` word) and carries no `self-test`
+# label; an entry carrying `repo-guard` that no declaration names; and a declaration ctest does not
+# honour. A test binary's command line shows no flag; its label comes from the helper it cannot build
+# without.
+# ★ THE SUM -- the count and the names, printed at configure time (`repo-guard label applied to N test(s)`,
+# the figure to read) and written for the checker -- is taken after the last block that declares a guard,
+# below.
 
 # ── The install set ──
 # Kept whole in its own module rather than interleaved here: it owns what a
@@ -2106,11 +2123,12 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssInstall.cmake")
 #
 # ⚠ APPENDED AT THE END on purpose: this file is shared by concurrent lanes, and
 #   an append is the one edit that cannot collide with a sibling's.
-# ⚠ THE LABEL IS SET BY HAND, and that is not a style choice: the `repo-guard`
-#   scan above runs BEFORE this point, so a test registered here is invisible to
-#   it. An unlabelled guard is not skipped anywhere — it simply runs on every
-#   leg — so the failure direction is "too much testing", but the indirect legs
-#   would be paying for a tree they cannot learn anything new about.
+# ⚠ A LABEL IS DECLARED beside the registration (`dss_label_repo_guard`, or
+#   `dss_label_self_test`), as everywhere: the sum of the `repo-guard` declarations
+#   is taken after the last block that declares one. An undeclared guard is not
+#   skipped anywhere — it simply runs on every leg — so the failure direction is
+#   "too much testing", but the indirect legs would be paying for a tree they cannot
+#   learn anything new about.
 if(DSS_BUILD_TESTS)
     # ── line_endings_watchdog_guard ───────────────────────────────────────
     # Proves the bound on `check-line-endings`: 90 s, the budget P64 set. A probe that genuinely
@@ -2198,11 +2216,20 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-pkg-pipeline/check-pkg-pipeline.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # The label the scan above could no longer apply, applied by name — same
-    # reasoning as the P63 block: an unlabelled guard is not skipped anywhere, it
-    # simply runs on every leg, so the failure direction is "too much testing".
-    set_tests_properties(pkg_pipeline_modes_guard PROPERTIES LABELS "repo-guard")
-    message(STATUS "repo-guard label applied to 1 additional test (pkg_pipeline_modes_guard)")
+    # It reads the tree's pipeline files: the repository's state, declared (the rule is stated in the label's block).
+    dss_label_repo_guard(pkg_pipeline_modes_guard)
+endif()
+
+# ── `repo-guard`: THE SUM of every declaration (the rule is stated in the label's own block, above) ──
+# Taken after the last block that declares a guard: printed (`repo-guard label applied to N test(s)`, the figure to
+# read; `ctest -N -L repo-guard` checks it) and written as `repo-guard-declared.txt` in the build directory, which
+# `harness/repo_guard_label_check` reads -- an entry carrying the label that no declaration names is refused there.
+if(DSS_BUILD_TESTS)
+    get_property(_dss_guard_tests GLOBAL PROPERTY DSS_REPO_GUARD_DECLARED)
+    list(LENGTH _dss_guard_tests _dss_guard_count)
+    list(JOIN _dss_guard_tests "\n" _dss_guard_lines)
+    file(WRITE "${CMAKE_BINARY_DIR}/repo-guard-declared.txt" "${_dss_guard_lines}\n")
+    message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s): ${_dss_guard_tests}")
 endif()
 
 # ── The host compiler stamp, wired to every PCH that lists it (see `dss_host_compiler_stamp`) ──

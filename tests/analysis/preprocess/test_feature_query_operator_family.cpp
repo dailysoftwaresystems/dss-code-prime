@@ -874,8 +874,14 @@ TEST(FeatureQueryOperators, TheBuiltinAnswerFollowsTheDeclaredTruthSet) {
 //
 // Table-driven over the SHIPPED rows, never a hand list: a row added tomorrow
 // under either verb is asked here without anyone remembering to. Each name is
-// asked in its reserved spelling (`__name__`), which is an identifier whatever
-// the plain word is; the named cells below ask the plain words real headers use.
+// asked in BOTH spellings a header writes -- the reserved one (`__name__`), which
+// is an identifier whatever the plain word is, and the plain word itself -- and
+// each answer must be its row's. ★ P69 (lane `cs`, fold f26c2; main's feature-query
+// item): the plain words were a hand list of seven refused names and four
+// controls, and it went stale the day f26c gave `mode` a row that honours it
+// (`machineMode`): the list still called it refused, and macos-arm64-debug read
+// the one red of checkpoint 41's suite here. Derived from the rows, a name moves
+// between the two answers with its row.
 //
 // RED-ON-DISABLE: drop the `attributeEffectAdvertisesItsNames` line of
 // `languageDeclaresAttribute` and every row of the two verbs answers 1.
@@ -890,6 +896,8 @@ TEST(FeatureQueryOperators, AnAttributeThatIsRefusedByNameIsNotAdvertised) {
     };
     std::size_t refusing = 0;
     std::size_t advertising = 0;
+    bool askedUnsupported = false;
+    bool askedConvention = false;
     for (auto const& row : cSchema()->semantics().attributeEffects) {
         // ★ P69 (lane `cs`, fold f26b): `pp` runs with no object format in scope, where
         // a row gated to some formats is no vocabulary (its answer per format is
@@ -900,25 +908,18 @@ TEST(FeatureQueryOperators, AnAttributeThatIsRefusedByNameIsNotAdvertised) {
             // A qualified name (`q(name)`) is not an identifier: no program can ask
             // the operator about it, so it has no answer to pin.
             if (n.find('(') != std::string::npos) continue;
-            EXPECT_EQ(answers("__" + n + "__"), advertised) << n;
+            EXPECT_EQ(answers("__" + n + "__"), advertised) << n << " (the reserved spelling)";
+            EXPECT_EQ(answers(n), advertised) << n << " (the plain word)";
             ++(advertised ? advertising : refusing);
+            askedUnsupported = askedUnsupported || row.effect == AttributeEffect::Unsupported;
+            askedConvention = askedConvention || row.effect == AttributeEffect::CallingConvention;
         }
     }
-    EXPECT_GE(refusing, 10u)
-        << "the shipped table carries three `unsupported` words and seven "
-           "calling-convention words; a count below that means the loop above "
-           "asked nothing of one of the two verbs";
+    EXPECT_TRUE(askedUnsupported) << "the loop asked no name of an `unsupported` row";
+    EXPECT_TRUE(askedConvention) << "the loop asked no name of a `callingConvention` row";
+    EXPECT_GT(refusing, 0u);
     EXPECT_GT(advertising, 20u);
-
-    for (char const* n : {"vector_size", "mode", "naked", "ms_abi", "sysv_abi",
-                          "vectorcall", "aarch64_vector_pcs"}) {
-        EXPECT_FALSE(answers(n)) << n;
-    }
-    // CONTROLS: a name the compiler honours is still advertised, and a name
-    // nothing declares still answers 0.
-    for (char const* n : {"aligned", "noinline", "deprecated", "selectany"}) {
-        EXPECT_TRUE(answers(n)) << n;
-    }
+    // CONTROL: a name nothing declares still answers 0.
     EXPECT_FALSE(answers(std::string{kAbsentAttribute}));
 }
 

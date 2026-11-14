@@ -1,0 +1,2 @@
+                std::array<MirInstId, 2> offStore{fitSum, offPtr};
+                mir.addInst(MirOpcode::Store, offStore);

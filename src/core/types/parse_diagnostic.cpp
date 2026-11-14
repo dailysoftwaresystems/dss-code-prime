@@ -205,6 +205,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_ImplicitFunctionDeclaration";
         case DiagnosticCode::S_ImplicitDeclarationConflicts:
             return "S_ImplicitDeclarationConflicts";
+        case DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne:
+            return "S_PrototypeIncompatibleWithADeclarationWithoutOne";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:

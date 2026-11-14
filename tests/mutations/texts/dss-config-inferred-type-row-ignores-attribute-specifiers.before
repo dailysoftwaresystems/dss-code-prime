@@ -1,1 +1,1 @@
-        "linkageSpecifierIgnoredRules": [ "stdAttr", "alignasSpec" ] }
+        "linkageTablesFrom": "topLevelDecl",

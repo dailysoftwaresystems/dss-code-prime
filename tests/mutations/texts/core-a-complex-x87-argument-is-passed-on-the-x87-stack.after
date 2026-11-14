@@ -1,0 +1,2 @@
+        if (position != AggregatePosition::Argument) {
+            out.kind = AbiPassing::Kind::Memory;

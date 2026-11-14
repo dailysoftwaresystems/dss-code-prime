@@ -1,0 +1,1 @@
+struct { _Alignas(16) double a; } (x0, x1)

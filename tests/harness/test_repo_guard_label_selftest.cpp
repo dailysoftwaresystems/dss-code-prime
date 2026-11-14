@@ -38,10 +38,16 @@ namespace {
       "a tree check keeps the label, a word that only begins like a flag is none, the program's own path is not read, and a self-test without the label passes (the control)") \
     X(AListingThatIsNoListingTooShortWithoutTheLabelOrWithoutASelfTestIsRefusedNeverJudged,                            \
       "a listing that is no listing, too short, without the label or without a self-test is refused, never judged")    \
+    X(AnEntryCarryingRepoGuardThatNoDeclarationNamesIsRefusedWhateverItsName,                                          \
+      "an entry carrying repo-guard that no declaration names is refused, whatever its name")                          \
+    X(ADeclaredNameThatCtestListsWithoutRepoGuardOrDoesNotListIsRefused,                                               \
+      "a declared name that ctest lists without repo-guard, or does not list, is refused")                             \
     X(TheBuildSListingIsReadThroughCtestAndJudgedALabelledSelfTestIsAFailExit1NamingIt,                                \
       "the build's listing is read through ctest and judged: a labelled self-test is a FAIL (exit 1) naming it")       \
     X(CtestFailingOrAListingThatIsNotJsonCannotBeJudgedExit2NeverAPass,                                                \
       "ctest failing, or a listing that is not JSON, cannot be judged (exit 2), never a pass")                         \
+    X(ABuildWithNoDeclarationsFileCannotBeJudgedExit2NeverAPass,                                                       \
+      "a build with no declarations file cannot be judged (exit 2), never a pass")                                     \
     X(ABuildWhoseSelfTestsCarryNoLabelIsOkExit0AndSaysWhatItCountedTheControl,                                         \
       "a build whose self-tests carry no label is OK (exit 0) and says what it counted (the control)")
 

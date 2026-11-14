@@ -1838,7 +1838,7 @@ TEST(TargetSchema, ACallingConventionRowDerivesFromAnotherAndStatesOnlyWhatDiffe
 // bytes (0 or a power of two) OR the keyword `own` — the argument's own alignment, uncapped — and nothing else: a
 // misspelt keyword, another string, a negative or a non-power-of-two number is refused naming BOTH forms. SysV
 // AMD64 states `own` for an aggregate (gcc and clang begin a stacked aggregate of alignment 32/64/256 at it) and
-// 16 for a scalar; Win64 and AAPCS64 state no aggregate cap.
+// 16 for a scalar; Win64 states no aggregate cap (AAPCS64's and Apple arm64's are the next test's).
 TEST(TargetSchema, AStackedAlignmentCapIsANumberOrOwnAndNothingElse) {
     using Cap = ::dss::StackArgPackingRules::AlignmentCap;
     auto const doc = [](std::string const& sap) {
@@ -1898,6 +1898,111 @@ TEST(TargetSchema, AStackedAlignmentCapIsANumberOrOwnAndNothingElse) {
     ASSERT_NE(ms, nullptr);
     EXPECT_EQ(ms->stackArgPacking.maxAggregateAlignment.kind, Cap::Kind::Bytes);
     EXPECT_EQ(ms->stackArgPacking.maxAggregateAlignment.bytes, 0u);
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): WHICH ALIGNMENT OF A BY-VALUE AGGREGATE IS ITS OWN, AND
+// FROM WHICH ALIGNMENT AN ARGUMENT BEGINS AT AN EVEN GENERAL REGISTER, ARE THE CONVENTION'S TO STATE. Three
+// answers measured (lane `cs`, probes f14 and f14r): SysV and Apple arm64 place a composite by its TYPE's
+// alignment, AAPCS64 by its MEMBERS' (before the composite's own `aligned(N)`); Apple places an HFA by its
+// ELEMENT's; AAPCS64 alone begins a 16-aligned argument at an even register (C.8). `aggregateOwnAlignment` is the
+// one owner of the choice; a name the vocabulary does not hold, or an even-pair alignment that is not 0 or a
+// power of two, is refused by name — never read as the default.
+//
+// RED-ON-DISABLE: drop either `readSource` line of the reader and the shipped AAPCS64 (Apple) row reads the
+// type's alignment (the aggregate's), its own cells failing; drop `evenGprPairAlignment`'s read and AAPCS64
+// states 0.
+TEST(TargetSchema, AnAggregatesOwnAlignmentAndTheEvenRegisterPairAreTheConventionsToState) {
+    auto const doc = [](std::string const& sap, std::string const& extra) {
+        return std::string(
+                   R"({"dssTargetVersion":1,"target":{"name":"X"},
+                "opcodes":[{"mnemonic":"invalid","result":"none"}],
+                "registers":[{"name":"rax","class":"gpr","widthBytes":8},
+                             {"name":"rsp","class":"gpr","widthBytes":8}],
+                "callingConventions":[
+                  {"name":"c","argGprs":["rax"],"stackPointer":"rsp","stackAlignment":16,)")
+               + extra + R"("stackArgPacking":)" + sap + "}]}";
+    };
+    using Src  = ::dss::AggregateAlignmentSource;
+    using HSrc = ::dss::HomogeneousAggregateAlignmentSource;
+    struct Read {
+        char const*   sap;
+        char const*   extra;
+        Src           of;
+        HSrc          hfa;
+        std::uint16_t evenPair;
+    };
+    for (Read const& c :
+         {Read{R"({"aggregateAlignmentOf":"members"})", "", Src::Members, HSrc::Aggregate, 0},
+          Read{R"({"homogeneousAggregateAlignmentOf":"element"})", R"("evenGprPairAlignment":16,)", Src::Type,
+               HSrc::Element, 16},
+          Read{R"({"aggregateAlignmentOf":"type","homogeneousAggregateAlignmentOf":"aggregate"})",
+               R"("evenGprPairAlignment":0,)", Src::Type, HSrc::Aggregate, 0},
+          Read{R"({})", "", Src::Type, HSrc::Aggregate, 0}}) {
+        auto r = TargetSchema::loadFromText(doc(c.sap, c.extra));
+        std::string refused;
+        if (!r.has_value())
+            for (auto const& d : r.error()) refused += " | " + d.path + ": " + d.message;
+        ASSERT_TRUE(r.has_value()) << c.sap << c.extra << refused;
+        auto const& cc = (*r)->callingConventions()[0];
+        EXPECT_EQ(cc.stackArgPacking.aggregateAlignmentOf, c.of) << c.sap;
+        EXPECT_EQ(cc.stackArgPacking.homogeneousAggregateAlignmentOf, c.hfa) << c.sap;
+        EXPECT_EQ(cc.evenGprPairAlignment, c.evenPair) << c.extra;
+    }
+    struct Bad {
+        char const* sap;
+        char const* extra;
+        char const* says;
+    };
+    for (Bad const& b : {Bad{R"({"aggregateAlignmentOf":"Members"})", "", "accepted: 'type' / 'members'"},
+                         Bad{R"({"aggregateAlignmentOf":16})", "", "accepted: 'type' / 'members'"},
+                         Bad{R"({"homogeneousAggregateAlignmentOf":"elements"})", "",
+                             "accepted: 'aggregate' / 'element'"},
+                         Bad{R"({})", R"("evenGprPairAlignment":24,)", "power of two"},
+                         Bad{R"({})", R"("evenGprPairAlignment":-16,)", "must fit in"},
+                         Bad{R"({})", R"("evenGprPairAlignment":"16",)", "non-negative"}}) {
+        auto r = TargetSchema::loadFromText(doc(b.sap, b.extra));
+        ASSERT_FALSE(r.has_value()) << b.sap << b.extra;
+        bool named = false;
+        for (auto const& d : r.error())
+            named = named || (d.code == DiagnosticCode::C_MalformedJson
+                              && d.message.find(b.says) != std::string::npos);
+        EXPECT_TRUE(named) << b.sap << b.extra << ": refused saying " << b.says;
+    }
+
+    // The shipped conventions, and the one answer each gives the measured shapes (probe f14): an
+    // `aligned(16)` composite of two longs {type 16, members 8}, a member `_Alignas(16)` one {16, 16}, and an
+    // HFA of four doubles over-aligned to 32 {32, 32, element 8}.
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    struct Shipped {
+        ::dss::TargetCallingConvention const* cc;
+        char const*                           name;
+        std::uint16_t                  cap;
+        std::uint16_t                  evenPair;
+        std::uint32_t                  attr, member, hfa;   // aggregateOwnAlignment of the three shapes
+    };
+    auto const* aapcs64 = (*arm)->callingConventionByName("aapcs64");
+    auto const* apple   = (*arm)->callingConventionByName("apple_arm64");
+    auto const* sysv    = (*x86)->callingConventionByName("sysv_amd64");
+    ASSERT_NE(aapcs64, nullptr);
+    ASSERT_NE(apple, nullptr);
+    ASSERT_NE(sysv, nullptr);
+    for (Shipped const& s : {Shipped{aapcs64, "aapcs64", 16, 16, 8, 16, 32},
+                             Shipped{apple, "apple_arm64", 16, 0, 16, 16, 8}}) {
+        EXPECT_EQ(s.cc->stackArgPacking.maxAggregateAlignment.kind,
+                  ::dss::StackArgPackingRules::AlignmentCap::Kind::Bytes) << s.name;
+        EXPECT_EQ(s.cc->stackArgPacking.maxAggregateAlignment.bytes, s.cap) << s.name;
+        EXPECT_EQ(s.cc->evenGprPairAlignment, s.evenPair) << s.name;
+        EXPECT_EQ(s.cc->stackArgPacking.aggregateOwnAlignment({16, 8, 0}), s.attr) << s.name;
+        EXPECT_EQ(s.cc->stackArgPacking.aggregateOwnAlignment({16, 16, 0}), s.member) << s.name;
+        EXPECT_EQ(s.cc->stackArgPacking.aggregateOwnAlignment({32, 32, 8}), s.hfa) << s.name;
+    }
+    // CONTROL: SysV places every one by its type's alignment and pairs no register.
+    EXPECT_EQ(sysv->evenGprPairAlignment, 0u);
+    EXPECT_EQ(sysv->stackArgPacking.aggregateOwnAlignment({16, 8, 0}), 16u);
+    EXPECT_EQ(sysv->stackArgPacking.aggregateOwnAlignment({32, 32, 8}), 32u);
 }
 
 // ─── cycle 2b — JSON loader edge cases ────────────────────────────────────

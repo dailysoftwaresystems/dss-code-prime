@@ -24,9 +24,17 @@ A name says nothing. Two refusals follow:
 An entry that checks the tree -- a guard run with no flag, even one that proves its own refusals after -- keeps
 `repo-guard`: its verdict is the repository's.
 
-FAIL LOUD: ctest failing, a listing that is not ctest's JSON, a listing with fewer than FLOOR entries, or one in
-which no entry carries `repo-guard` or none carries `self-test` (the rule would judge nothing) is a refusal to
-judge -- never a pass.
+THE LABEL IS DECLARED, NEVER INFERRED (2026-11-13): `repo-guard` is given by `dss_label_repo_guard` alone, right after
+the registration of an entry whose verdict reads the repository's state, and the configure writes every name it was
+given to as `<build>/repo-guard-declared.txt`. A name says nothing for this label either: until 2026-11-13 a scan gave
+it to every entry whose name ended in `guard`, so a compiler test (`lir/test_lir_fixture_vacuity_guard`) and a corpus
+example (`struct_big_neighbor_guard`, in both runners) were skipped on every indirect leg. Two more refusals follow:
+  * an entry carrying `repo-guard` that the declarations do not name -- the label given by hand, or by a name;
+  * a declared name that ctest does not list with the label -- a declaration nothing honours.
+
+FAIL LOUD: ctest failing, a listing that is not ctest's JSON, a listing with fewer than FLOOR entries, one in which
+no entry carries `repo-guard` or none carries `self-test` (the rule would judge nothing), or a build with no
+declarations file is a refusal to judge -- never a pass.
 
 usage:
   check-repo-guard-label.py --build-dir <dir> --ctest <ctest>    judge a configured build (ctest entry
@@ -56,9 +64,11 @@ SELF_TEST_FLAG = re.compile(r"^--(?:self-test|selftest)(?:-[a-z0-9]+(?:-[a-z0-9]
                             re.IGNORECASE | re.DOTALL)
 FLOOR = 50
 TOOL = "check-repo-guard-label"
+# What `dss_label_repo_guard` was given, written by the configure into the build directory (root CMakeLists.txt).
+DECLARED_FILE = "repo-guard-declared.txt"
 SELFTEST_MARKER = TOOL + " self-test: "
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 9
+EXPECTED_ARMS = 12
 
 
 class CannotJudge(Exception):
@@ -84,8 +94,9 @@ def asked_flag(entry):
     return next((w for w in command[1:] if isinstance(w, str) and SELF_TEST_FLAG.match(w)), None)
 
 
-def judge(listing):
-    """-> (refusals, counts). CannotJudge when the listing cannot say anything."""
+def judge(listing, declared):
+    """-> (refusals, counts). CannotJudge when the listing cannot say anything. `declared` is every name
+    `dss_label_repo_guard` gave the label to (the configure's DECLARED_FILE)."""
     if not isinstance(listing, dict) or not isinstance(listing.get("tests"), list):
         raise CannotJudge("the listing is not ctest's JSON (no `tests` list)")
     tests = listing["tests"]
@@ -104,7 +115,26 @@ def judge(listing):
                  "label -- that label is what says an entry self-tests" % (t.get("name"), asked_flag(t),
                                                                           SELF_TEST_LABEL)
                  for t in tests if not is_self_test(t) and asked_flag(t)]
+    declared = set(declared)
+    refusals += ["%s: it carries `%s`, and no `dss_label_repo_guard` declared it -- the label was given by hand or "
+                 "by a name, and only a declaration says an entry's verdict reads the repository's state"
+                 % (t.get("name"), LABEL) for t in labelled if t.get("name") not in declared]
+    listed = dict((t.get("name"), t) for t in tests)
+    refusals += ["%s: `dss_label_repo_guard` declared it, and ctest %s" % (
+                     name, "lists it without `%s`" % LABEL if name in listed else "does not list it")
+                 for name in sorted(declared) if name not in listed or LABEL not in labels_of(listed[name])]
     return refusals, (len(tests), len(labelled), len(selftests))
+
+
+def read_declared(build_dir):
+    """Every name the configure's `dss_label_repo_guard` calls declared. CannotJudge when the build has no file."""
+    path = os.path.join(build_dir, DECLARED_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError as exc:
+        raise CannotJudge("the build has no %s, which the configure writes from every `dss_label_repo_guard` call "
+                          "(%s)" % (DECLARED_FILE, exc))
 
 
 def read_listing(build_dir, ctest, run=subprocess.run):
@@ -122,11 +152,11 @@ def read_listing(build_dir, ctest, run=subprocess.run):
         raise CannotJudge("ctest's listing is not JSON (%s)" % exc)
 
 
-def verify(build_dir, ctest, run=subprocess.run, out=None):
+def verify(build_dir, ctest, run=subprocess.run, out=None, declared_of=read_declared):
     """Judge a configured build: 0 OK, 1 refused, 2 cannot judge. Prints its verdict to `out`."""
     out = out or sys.stdout
     try:
-        refusals, (total, labelled, selftests) = judge(read_listing(build_dir, ctest, run))
+        refusals, (total, labelled, selftests) = judge(read_listing(build_dir, ctest, run), declared_of(build_dir))
     except CannotJudge as exc:
         out.write("%s: CANNOT JUDGE -- %s\n" % (TOOL, exc))
         return 2
@@ -135,12 +165,15 @@ def verify(build_dir, ctest, run=subprocess.run, out=None):
         for r in refusals:
             out.write("    %s\n" % r)
         out.write("  An entry carrying both labels: take `%s` off where it is registered. An entry whose command "
-                  "line asks for a self-test: give it `%s` (`dss_label_self_test`, right after its `add_test`). The "
-                  "rule is stated in the root CMakeLists.txt, in the block that gives `%s`.\n"
+                  "line asks for a self-test: give it `%s` (`dss_label_self_test`, right after its `add_test`). An "
+                  "entry carrying `%s` undeclared: declare it with `dss_label_repo_guard` right after its registration "
+                  "if its verdict reads the repository's state, else take the label off. The rule is stated in the "
+                  "root CMakeLists.txt, in the block that sums the declarations.\n"
                   % (LABEL, SELF_TEST_LABEL, LABEL))
         return 1
-    out.write("%s: OK -- %d entries, %d carry `%s`, %d carry `%s`, none both, and every command line that asks for a "
-              "self-test carries `%s`\n" % (TOOL, total, labelled, LABEL, selftests, SELF_TEST_LABEL, SELF_TEST_LABEL))
+    out.write("%s: OK -- %d entries, %d carry `%s`, each declared, %d carry `%s`, none both, and every command line "
+              "that asks for a self-test carries `%s`\n" % (TOOL, total, labelled, LABEL, selftests, SELF_TEST_LABEL,
+                                                           SELF_TEST_LABEL))
     return 0
 
 
@@ -156,6 +189,13 @@ def _listing(*extra, filler=FLOOR):
     tests.append(_entry("harness/redact_selftest", ["bin/dss_harness_redact_selftest"], [SELF_TEST_LABEL]))
     tests.append(_entry("harness/x_check", ["python", "x.py", "--self-test"], [SELF_TEST_LABEL]))
     return {"kind": "ctestInfo", "tests": tests + list(extra)}
+
+
+def _declared_of(listing):
+    """The declarations a consistent build writes for `listing`: every name it labels."""
+    if not isinstance(listing, dict) or not isinstance(listing.get("tests"), list):
+        return []
+    return [t.get("name") for t in listing["tests"] if isinstance(t, dict) and LABEL in labels_of(t)]
 
 
 class _Ran:
@@ -174,23 +214,23 @@ def self_test():
         else:
             print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, (detail or "no detail").replace("\n", " ")[:600]))
 
-    def refused(listing, name):
+    def refused(listing, name, declared=None):
         try:
-            refusals, _counts = judge(listing)
+            refusals, _counts = judge(listing, _declared_of(listing) if declared is None else declared)
         except CannotJudge as exc:
             return False, "cannot judge: %s" % exc
         return any(r.startswith(name + ":") for r in refusals), "refusals=%r" % (refusals,)
 
     def kept(listing):
         try:
-            refusals, _counts = judge(listing)
+            refusals, _counts = judge(listing, _declared_of(listing))
         except CannotJudge as exc:
             return False, "cannot judge: %s" % exc
         return not refusals, "refusals=%r" % (refusals,)
 
     def cannot(listing):
         try:
-            judge(listing)
+            judge(listing, _declared_of(listing))
         except CannotJudge as exc:
             return True, str(exc)
         return False, "judged"
@@ -219,10 +259,26 @@ def self_test():
             cannot({"tests": [t for t in _listing()["tests"] if not is_self_test(t)]})]
     arm("a listing that is no listing, too short, without the label or without a self-test is refused, never judged",
         all(ok for ok, _ in said), "%r" % ([d for _, d in said],))
+    listing = _listing(_entry("lir/test_lir_fixture_vacuity_guard", ["bin/dss_lir_test_lir_fixture_vacuity_guard"],
+                              [LABEL]))
+    arm("an entry carrying repo-guard that no declaration names is refused, whatever its name",
+        *refused(listing, "lir/test_lir_fixture_vacuity_guard",
+                 [n for n in _declared_of(listing) if n != "lir/test_lir_fixture_vacuity_guard"]))
+    listing = _listing(_entry("core/test_x_guard", ["bin/dss_core_test_x_guard"]))
+    declared = _declared_of(listing) + ["core/test_x_guard", "gone_guard"]
+    said = [refused(listing, "core/test_x_guard", declared), refused(listing, "gone_guard", declared)]
+    arm("a declared name that ctest lists without repo-guard, or does not list, is refused",
+        all(ok for ok, _ in said), "%r" % ([d for _, d in said],))
 
-    def verify_with(result):
+    def verify_with(result, declared_of=None):
         buf = io.StringIO()
-        rc = verify("build-dir", "ctest", run=lambda *a, **k: result, out=buf)
+        if declared_of is None:
+            try:
+                listed = json.loads(result.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                listed = None
+            declared_of = lambda _build_dir: _declared_of(listed)
+        rc = verify("build-dir", "ctest", run=lambda *a, **k: result, out=buf, declared_of=declared_of)
         return rc, buf.getvalue()
 
     bad = _listing(_entry("anchors_selftest_guard", ["python", "anchors.py", "--self-test"], [LABEL, SELF_TEST_LABEL]))
@@ -233,6 +289,11 @@ def self_test():
                verify_with(_Ran(0, b"not json"))]
     arm("ctest failing, or a listing that is not JSON, cannot be judged (exit 2), never a pass",
         all(rc == 2 and "CANNOT JUDGE" in s for rc, s in results), "%r" % (results,))
+    def no_file(build_dir):
+        return read_declared(os.path.join(build_dir, "no-such-build-directory"))
+    rc, said = verify_with(_Ran(0, json.dumps(_listing()).encode("utf-8")), no_file)
+    arm("a build with no declarations file cannot be judged (exit 2), never a pass",
+        rc == 2 and "CANNOT JUDGE" in said and DECLARED_FILE in said, "exit %d: %s" % (rc, said[:300]))
     rc, said = verify_with(_Ran(0, json.dumps(_listing()).encode("utf-8")))
     arm("a build whose self-tests carry no label is OK (exit 0) and says what it counted (the control)",
         rc == 0 and ("%d entries" % (FLOOR + 3)) in said, "exit %d: %s" % (rc, said[:300]))

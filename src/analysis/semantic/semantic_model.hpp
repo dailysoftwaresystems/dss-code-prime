@@ -328,6 +328,15 @@ struct DSS_EXPORT SymbolRecord {
     // promotions, not variadic — is completed at that call. The CST→HIR lowering emits it as an
     // external function bound to no library (`SemanticModel::implicitDeclarations`). Default false.
     bool            isImplicitDeclaration = false;
+    // ★ P69 (lane `cs`, fold f26c2): TRUE iff this function's OWN declaration gives it no
+    // prototype — a declaration that is not a definition, whose declarator's parameter list is
+    // EMPTY, where the language says so (`parameters.emptyListDeclaresNoPrototype`; for C,
+    // `int f();`). A call that sees no prototype of the function (`callHasNoPrototypeAt`: this
+    // record, or an implicit declaration, and no prototype of the merge written before the call)
+    // passes each argument after the default argument promotions and is typed by them (C
+    // 6.5.2.2p6); a prototype of the merge is the composite (C 6.2.7p3), the type the record
+    // takes. Set after Pass 1.5, before the redeclaration sweep. Default false.
+    bool            declaresNoPrototype = false;
     // D-CSUBSET-EXTERN-DEFINITION-MERGE: TRUE iff this symbol was minted from a
     // NON-DEFINING declaration — a declaration that announces a symbol whose
     // storage/body lives elsewhere (an `extern` declaration in C). Set by Pass 1

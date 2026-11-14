@@ -1,0 +1,2 @@
+                auto const operands = mir.instOperands(call);
+                for (std::size_t k = 0; k < operands.size(); ++k) {

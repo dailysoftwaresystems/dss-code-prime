@@ -26,6 +26,7 @@
 #include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "lowered_lir_fixture.hpp"
+#include "shipped_read_pairs.hpp"   // shippedConventionPairs
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
@@ -1571,9 +1572,11 @@ TEST(LirCallconv, VlaLeafFunctionWatermarkCarriesNoBias) {
 // runs after the frame-pointer capture and off the frame base, and every va-area lea is
 // the frame base's. The property under test is WHERE the leas address -- off the frame
 // pointer, and the incoming one (the overflow area / Win64 home space) at or past the
-// fixed frame's top -- on all three conventions that declare a va_list: sysv_amd64's
-// register-save area, ms_x64's home space, aapcs64's dual cursor. A lea left SP-relative
-// would read the save area through a stack pointer the VLA moved.
+// fixed frame's top -- on every convention a shipped format names that declares a va_list
+// (read off the documents; P69 fold f26c2, review-csf26c F5, five: sysv_amd64's
+// register-save area, sysv_amd64_darwin's (derived), ms_x64's home space, aapcs64's dual
+// cursor, apple_arm64's overflow-base pointer). A lea left SP-relative would read the save
+// area through a stack pointer the VLA moved.
 [[nodiscard]] std::vector<std::pair<std::uint16_t, std::int64_t>>
 leaBasesAndOffsets(Lir const& lir, TargetSchema const& schema, std::uint32_t funcIndex) {
     std::vector<std::pair<std::uint16_t, std::int64_t>> out;
@@ -1595,9 +1598,21 @@ leaBasesAndOffsets(Lir const& lir, TargetSchema const& schema, std::uint32_t fun
 }
 
 TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
-    struct Arm { char const* target; std::uint16_t cc; };
-    for (Arm const arm : {Arm{"x86_64", 0}, Arm{"x86_64", 1}, Arm{"arm64", 0}}) {
-        SCOPED_TRACE(std::string{arm.target} + " cc " + std::to_string(arm.cc));
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F5): EVERY convention a shipped format names that declares a
+    // va_list (`test_support::shippedConventionPairs`; a row that takes its `vaListLayout` through `derivesFrom`
+    // included), never a hand list, so a convention added later is covered the day it lands. The refusal this pin
+    // replaced was deleted for every convention, and the hand list read three of the five. ✔READ at f26c2: five --
+    // sysv_amd64's register-save area, sysv_amd64_darwin's (derived), ms_x64's home space, aapcs64's dual cursor,
+    // apple_arm64's overflow-base pointer (its own `va_start` arm: the overflow area's lea is its whole va_list).
+    std::size_t conventions = 0;
+    for (test_support::ShippedConventionPair const& pair : test_support::shippedConventionPairs()) {
+        auto target = TargetSchema::loadShipped(pair.arch);
+        ASSERT_TRUE(target.has_value()) << pair.label();
+        TargetCallingConvention const* row = (*target)->callingConvention(pair.conventionIndex);
+        ASSERT_NE(row, nullptr) << pair.label();
+        if (!row->vaListLayout.has_value()) continue;
+        ++conventions;
+        SCOPED_TRACE(pair.label());
         auto bundle = lowerThroughRewrite(
             "int f(int n, ...) {\n"
             "  int a[n];\n"
@@ -1607,7 +1622,7 @@ TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
             "  va_end(ap);\n"
             "  return a[0];\n"
             "}\n",
-            arm.cc, arm.target);
+            pair.conventionIndex, pair.arch);
         ASSERT_TRUE(bundle.lowered.lir.ok);
         ASSERT_TRUE(bundle.rewritten.ok);
         DiagnosticReporter ccRep;
@@ -1621,7 +1636,7 @@ TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
             EXPECT_NE(d.code, DiagnosticCode::L_VlaNonLeafFrameUnsupported)
                 << "the va-arm of the non-leaf VLA gate must be gone, not re-worded";
         ASSERT_EQ(result.perFunc.size(), 1u);
-        auto const* cc = bundle.lowered.target->callingConvention(arm.cc);
+        auto const* cc = bundle.lowered.target->callingConvention(pair.conventionIndex);
         ASSERT_NE(cc, nullptr);
         ASSERT_TRUE(cc->framePointer.has_value());
         ASSERT_TRUE(cc->stackPointer.has_value());
@@ -1640,6 +1655,8 @@ TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
             << "the incoming va area (the overflow area, or the Win64 home space) is addressed off the "
                "frame pointer at or past the fixed frame's top";
     }
+    // FLOOR, ✔READ at f26c2: five (above). A floor, not an equality: a convention added later is one more cell.
+    EXPECT_GE(conventions, 5u) << "every convention a shipped format names that declares a va_list";
 }
 
 // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that is a SEH PARENT (guards a

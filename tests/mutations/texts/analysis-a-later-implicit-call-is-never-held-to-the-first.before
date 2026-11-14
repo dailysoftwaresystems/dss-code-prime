@@ -1,3 +1,0 @@
-    if (!same) {
-        ParseDiagnostic d;
-        d.code     = DiagnosticCode::S_ImplicitDeclarationConflicts;

@@ -222,6 +222,20 @@ struct DSS_EXPORT MirLoweringConfig {
     // Default (all `Slot`) reproduces the previous arithmetic byte-for-byte.
     StackArgPackingRules stackArgPacking{};
 
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the two further facts of where
+    // ONE by-value argument goes, read where its operands are formed:
+    //   * `evenGprPairAlignment` — the alignment from which an argument in general
+    //     registers begins at an even one (AAPCS64 C.8; `TargetCallingConvention`
+    //     states it), honoured by the caller with a padding operand in the skipped
+    //     register and by the callee and `va_arg` by skipping it;
+    //   * `variadicArgsAlwaysStack` — every argument through `...` is stacked (Apple
+    //     arm64), so a by-value aggregate there rides the stacked carrier, whose
+    //     placement honours its alignment, rather than register pieces each placed in
+    //     its own slot.
+    // 0 / false (omitted) reproduce the previous lowering.
+    std::uint32_t      evenGprPairAlignment       = 0;
+    bool               variadicArgsAlwaysStack    = false;
+
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the active CC's `__va_list_tag` layout +
     // register-save-area geometry, threaded from the resolved `TargetCallingConvention`
     // (mirrors `aggregateClassification`). ENGAGED ⇒ HIR→MIR lowers va_start (4 field
@@ -278,6 +292,16 @@ class GrammarSchema;
 // constraint OFF and no const object's value folding: the fourth time a fixture read a
 // default the product never does (TF-C78, TF-C81, TF-C92).
 [[nodiscard]] DSS_EXPORT MirLoweringConfig languageMirLoweringConfig(GrammarSchema const& language);
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the CALLING CONVENTION's part of the
+// policy, likewise assembled in ONE place — `compile_pipeline.cpp` and every fixture that
+// lowers under a named convention call it, so a fact the convention row gains reaches every
+// lowering with one edit here. ✔READ at f26c2: the copy had six homes (the pipeline, the
+// shared LIR fixture and four fixtures of `test_mir_lowering_c`), each listing the fields by
+// hand, and the two this fold added (`evenGprPairAlignment`, `variadicArgsAlwaysStack`)
+// reached only the pipeline — every fixture lowered AAPCS64 with no even register pair and
+// Apple's variadic aggregates in registers.
+DSS_EXPORT void takeCallingConvention(MirLoweringConfig& cfg, TargetCallingConvention const& cc);
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool
 // that owns the decoded values for HIR `Literal` nodes (ML2 copies the

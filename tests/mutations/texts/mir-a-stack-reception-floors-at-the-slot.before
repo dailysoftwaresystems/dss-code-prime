@@ -1,2 +1,2 @@
-            config.stackArgPacking.aggregateAlignment(layout->align.bytes(),
+            config.stackArgPacking.aggregateAlignment(argumentOwnAlignment(aggTy, *layout),
                                                       stackSlotBytes()));

@@ -1,0 +1,1 @@
+                    if (sRec.declaresNoPrototype != aRec.declaresNoPrototype

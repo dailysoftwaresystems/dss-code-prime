@@ -68,6 +68,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -666,6 +667,22 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
         {"preserve_most", {F, F, F, F, F}},
         {"preserve_all", {F, F, F, F, F}},
         {"aarch64_vector_pcs", {U, U, U, F, F}}};
+    // ★ P69 (lane `cs`, fold f26c2; main's feature-query item): the matrix's names ARE the table's -- every name a
+    // `callingConvention` row states is asked below and nothing else is, so a row added tomorrow is red here until
+    // its five answers (each a measurement of the references) are written into `kNames`.
+    {
+        auto const schema = loadShippedSchema("c");
+        ASSERT_NE(schema, nullptr);
+        std::vector<std::string> table;
+        for (auto const& row : schema->semantics().attributeEffects)
+            if (row.effect == AttributeEffect::CallingConvention)
+                for (std::string const& n : row.names) table.push_back(n);
+        std::vector<std::string> asked;
+        for (Name const& n : kNames) asked.emplace_back(n.name);
+        std::sort(table.begin(), table.end());
+        std::sort(asked.begin(), asked.end());
+        EXPECT_EQ(asked, table) << "the matrix asks exactly the table's calling-convention names";
+    }
     std::size_t seen[3] = {0, 0, 0};
     for (std::size_t p = 0; p < 5; ++p) {
         auto const target = TargetSchema::loadShipped(kPairs[p].target);

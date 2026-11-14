@@ -1941,12 +1941,14 @@ struct Lowerer {
     // NO `linkageSpecifiers`, so each takes the early return above the loop and
     // never reached it. The filter is what keeps that an INVARIANT rather than a
     // coincidence a future linkage-bearing row would silently break.
+    // `forAttributeTables` (P69 fold f26c2, F9): located for `attributeLinkageOf`,
+    // whose tables are another row's, so the row's own empty table gates nothing.
     [[nodiscard]] std::vector<NodeId>
-    linkagePrefixRoots(NodeId node, DeclarationRule const& decl) {
+    linkagePrefixRoots(NodeId node, DeclarationRule const& decl, bool forAttributeTables = false) {
         std::vector<NodeId> roots;
         // A row with NO `linkageSpecifiers` facet folds nothing at all (typedefDecl
         // — deliberately, this cycle), so do not even locate the prefix for it.
-        if (decl.linkageSpecifiers.empty()) return roots;
+        if (decl.linkageSpecifiers.empty() && !forAttributeTables) return roots;
         if (NodeId const pfx = specifierPrefixChild(tree(), node, decl); pfx.valid())
             roots.push_back(pfx);
         // ★ P69 round 4 (lane `cs`): the attribute runs written INSIDE the head —
@@ -1984,9 +1986,10 @@ struct Lowerer {
     // DROPPED the weak binding (wrong linkage at link time, no diagnostic). The run
     // was consumed only by the init-detection skip, so `linkageFrom` never saw it.
     [[nodiscard]] std::vector<NodeId>
-    declaratorAttrRoots(DeclarationRule const& decl, NodeId declaratorNode) {
+    declaratorAttrRoots(DeclarationRule const& decl, NodeId declaratorNode,
+                        bool forAttributeTables = false) {   // as `linkagePrefixRoots`'s
         std::vector<NodeId> roots;
-        if (decl.linkageSpecifiers.empty() || !declaratorNode.valid()) return roots;
+        if ((decl.linkageSpecifiers.empty() && !forAttributeTables) || !declaratorNode.valid()) return roots;
         if (!sem.declarators.has_value()) return roots;
         DeclaratorConfig const& dc = *sem.declarators;
         if (tree().kind(declaratorNode) != NodeKind::Internal) return roots;
@@ -2066,6 +2069,42 @@ struct Lowerer {
         return linkageFrom(roots, decl, /*staticStorageOut=*/nullptr, base);
     }
 
+    // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): THE ATTRIBUTE SPECIFIERS OF ONE BLOCK-SCOPE DECLARATOR,
+    // READ BY ITS LINKAGE. A row that skips its attribute specifiers in its own fold (c's block-scope rows: an
+    // attribute gives an object declared in a block no linkage) names, by `attributeLinkageTablesFrom`, the row
+    // whose tables read them; this folds the declarator's -- the prefix's attribute specifiers (`attrSpecRule`
+    // subtrees, which the row's own fold skips) and its own name-adjacent and trailing ones -- with those tables,
+    // seeded by the row's own prefix fold (`seed`: a `static` there is the residue a binding then conflicts with).
+    // The names those tables do not key are passed over in silence: this row's attribute NAMES are the semantic
+    // tier's to judge (`linkageTierJudgesAttributeNames` gives them to it for a row that skips `attrSpec`), so one
+    // typo is never reported twice. The caller decides what the answer is: a declarator WITH linkage (a function
+    // declared in a block, C 6.2.2p5) merges it into its entity; one WITHOUT refuses a binding in it. nullopt: the
+    // row names no such tables (or the language has no attribute-specifier rule).
+    [[nodiscard]] std::optional<LinkageAttr>
+    attributeLinkageOf(NodeId node, DeclarationRule const& decl, NodeId declaratorNode, LinkageAttr seed) {
+        if (!decl.attributeLinkageRow.has_value() || !sem.attrSpecRule.valid()) return std::nullopt;
+        DeclarationRule const& tables = sem.declarations[*decl.attributeLinkageRow];
+        std::vector<NodeId> roots;
+        {   // the prefix's attribute specifiers, in source order -- an explicit stack, no recursion
+            std::vector<NodeId> const prefix = linkagePrefixRoots(node, decl, /*forAttributeTables=*/true);
+            std::vector<NodeId> stack;
+            for (auto it = prefix.rbegin(); it != prefix.rend(); ++it)
+                if (it->valid()) stack.push_back(*it);
+            while (!stack.empty()) {
+                NodeId const n = stack.back();
+                stack.pop_back();
+                if (isToken(n)) continue;
+                if (tree().rule(n).v == sem.attrSpecRule.v) { roots.push_back(n); continue; }
+                auto const kids = visible(n);
+                for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(*it);
+            }
+        }
+        for (NodeId r : declaratorAttrRoots(decl, declaratorNode, /*forAttributeTables=*/true)) roots.push_back(r);
+        if (roots.empty()) return seed;
+        return linkageFrom(roots, tables, /*staticStorageOut=*/nullptr, seed, /*nonDefiningOut=*/nullptr,
+                           /*attributeNamesAreAnotherTiers=*/true);
+    }
+
     // `seed` is the linkage ALREADY folded from an earlier-in-source root set —
     // the shared declaration prefix, when this call is folding one declarator's
     // trailing run on top of it. Seeding rather than merging afterwards is what
@@ -2079,7 +2118,10 @@ struct Lowerer {
                                           DeclarationRule const& decl,
                                           bool* staticStorageOut = nullptr,
                                           LinkageAttr seed = {},
-                                          bool* nonDefiningOut = nullptr) {
+                                          bool* nonDefiningOut = nullptr,
+                                          // F9 (fold f26c2): `attributeLinkageOf`'s reading -- a name the
+                                          // tables do not key is the semantic tier's, passed over in silence.
+                                          bool attributeNamesAreAnotherTiers = false) {
         LinkageAttr attr = seed;
         if (roots.empty() || decl.linkageSpecifiers.empty()) return attr;
         // Collect every root's tokens in SOURCE order (the composite-key
@@ -2746,13 +2788,14 @@ struct Lowerer {
                 // typo protection this gate exists for survives as a diagnostic;
                 // a program that wants the old refusal has `--warnings-as-errors`,
                 // and the code stays suppressible, as it already was.
-                emitHAt(DiagnosticCode::H_UnknownLinkageSpecifier,
-                        decl.unknownStrictAttributeIsError
-                            ? DiagnosticSeverity::Error
-                            : DiagnosticSeverity::Warning,
-                        n,
-                        std::format("'{}' is not a recognized linkage specifier",
-                                    reported));
+                if (!attributeNamesAreAnotherTiers)
+                    emitHAt(DiagnosticCode::H_UnknownLinkageSpecifier,
+                            decl.unknownStrictAttributeIsError
+                                ? DiagnosticSeverity::Error
+                                : DiagnosticSeverity::Warning,
+                            n,
+                            std::format("'{}' is not a recognized linkage specifier",
+                                        reported));
             }
         }
         return attr;
@@ -7264,178 +7307,25 @@ struct Lowerer {
         // language declares the block; FC3 c1). Falls back to the
         // type-attribute-or-then.
         TypeId common = commonArithType(thenE.type, elseE.type);
-        // C 6.5.15p6: a conditional with ONE arm a pointer and the OTHER an
-        // integer-literal null-pointer-constant has the POINTER type. The semantic
-        // tier (combineTernary) already admitted this (and vetoed value!=0), so
-        // gate STRUCTURALLY here — `HirKind::Literal` + integer type — exactly like
-        // the line-447 null-ptr coerce pattern (do NOT re-check value==0; the
-        // literal-pool lookup is host-STL-sensitive). The pointer `common` then
-        // drives the EXISTING coerce calls below: the literal-0 arm hits the
-        // null-ptr coerce arm (line 465) → `Cast(0 → Ptr)`; the pointer arm is a
-        // no-op. Handles BOTH arm orders.
-        if (!common.valid()
-            && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
-            auto const isIntLiteralArm = [&](E const& arm) -> bool {
-                if (builder.kind(arm.id) != HirKind::Literal) return false;
-                TypeKind const k = interner.kind(arm.type);
-                return k == TypeKind::I8  || k == TypeKind::I16
-                    || k == TypeKind::I32 || k == TypeKind::I64
-                    || k == TypeKind::I128
-                    || k == TypeKind::U8  || k == TypeKind::U16
-                    || k == TypeKind::U32 || k == TypeKind::U64
-                    || k == TypeKind::U128;
-            };
-            if (thenE.type.valid()
-                && interner.kind(thenE.type) == TypeKind::Ptr
-                && isIntLiteralArm(elseE)) {
-                common = thenE.type;
-            } else if (elseE.type.valid()
-                && interner.kind(elseE.type) == TypeKind::Ptr
-                && isIntLiteralArm(thenE)) {
-                common = elseE.type;
-            } else if (thenE.type.valid()
-                && interner.kind(thenE.type) == TypeKind::FnSig
-                && isIntLiteralArm(elseE)) {
-                // c56 (D-CSUBSET-TERNARY-NULL-FUNCTION-POINTER): the fn-pointer
-                // sibling — a function designator (FnSig) arm opposite a literal-0
-                // decays to Ptr<FnSig> (mirrors the semantic combineTernary). The
-                // designator arm then hits the FnSig→Ptr Bitcast coerce arm; the
-                // literal-0 the null-ptr Cast arm below. Handles BOTH arm orders.
-                common = interner.pointer(thenE.type);
-            } else if (elseE.type.valid()
-                && interner.kind(elseE.type) == TypeKind::FnSig
-                && isIntLiteralArm(thenE)) {
-                common = interner.pointer(elseE.type);
-            } else if (thenE.type.valid()
-                && interner.kind(thenE.type) == TypeKind::Array
-                && isIntLiteralArm(elseE)) {
-                // c66 (D-CSUBSET-TERNARY-NULL-STRING-LITERAL): the ARRAY/string-
-                // literal sibling — `cond ? "%s" : 0` (sqlite's
-                // `sParse.zErrMsg ? "%s" : 0`). The string-literal Array arm
-                // opposite a literal-0 decays to Ptr<elem> (C 6.3.2.1p3 +
-                // 6.5.15p6). `common`=Ptr<elem> drives the coerce: the Array arm
-                // hits the Array→Ptr decay Cast (→ a GlobalAddr to the rodata
-                // string), the literal-0 the null-ptr Cast. Without this the
-                // ternary types Array → the aggregate lowering materializes the
-                // literal-0 arm as a string → H0009. The c64 array arm below needs
-                // BOTH arms to be arrays, so it misses `array : 0`.
-                auto const e = interner.operands(thenE.type);
-                if (!e.empty()) common = interner.pointer(e[0]);
-            } else if (elseE.type.valid()
-                && interner.kind(elseE.type) == TypeKind::Array
-                && isIntLiteralArm(thenE)) {
-                auto const e = interner.operands(elseE.type);
-                if (!e.empty()) common = interner.pointer(e[0]);
-            }
-        }
-        // c64 (D-CSUBSET-TERNARY-ARRAY-DECAY): the array-decay sibling of the
-        // null-ptr / fn-designator arms above. An ARRAY arm of a conditional
-        // decays to Ptr<elem> (C 6.3.2.1p3 + 6.5.15) — `cond ? "a" : "bb"` (two
-        // string literals) yields `char*`, not an aggregate. Setting `common` to
-        // the common pointer type drives the coerce calls below: each Array arm
-        // hits coerce's Array→Ptr decay arm (the sameElem Cast) so makeTernary
-        // carries Ptr<char> and BOTH arm nodes are pointer-typed — else the
-        // ternary types aggregate and trips the aggregate-valued-control-expr
-        // guard in hir_to_mir (no aggregate-width SSA value). Mirrors the semantic
-        // combineTernary. Conservative: BOTH arms must decay to the SAME pointer
-        // type; genuine struct/union arms (no decay) keep the aggregate
-        // by-address lowering.
+        // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F2): A CONDITIONAL'S POINTER TYPE HAS ONE HOME, the
+        // semantic typer's `combineTernary` (C 6.5.15p6, and p3's null pointer constant; the array and
+        // function-designator decays; the composite of compatible pointees; `void *` beside an object pointer;
+        // `void *` for an incompatible pair, and for a pair whose pointees differ in a qualifier only the arms'
+        // spines show; `nullptr` -- each meaning fork measured and decided there), whose answer Pass 2 RECORDS for
+        // every conditional whose arms it typed (`conditionalTypeFor`, the record the lowering's constant
+        // evaluator reads too). The lowering converts both arms to that type and decides none: the coerce calls
+        // below take each arm there by the conversion its kind needs (a literal 0 to a null pointer, an array or a
+        // function designator decayed, a pointer bitcast). ✔READ at f26c2: this lowering held a mirror of six of
+        // those arms, each commented "the EXACT mirror of the semantic arm", and the analyzer had already reached
+        // past them once -- the pointee qualifier these TypeIds do not carry -- so a mirror could only fall behind
+        // its original (review-csf26c F2: a qualifier merge added to one would type one way and convert another).
+        // ✔MEASURED (run f26c2-a): the node-type door (`semTypeAt`) is NOT this record -- the analyzer writes no
+        // conditional's type there -- and read from it, every pointer conditional kept arms of their own types,
+        // down to the runtime's own stdio.c, whose two string literals of different lengths then lowered as an
+        // aggregate. The arithmetic balance above is the UAC engine's, the one both tiers ask.
         if (!common.valid()) {
-            auto const decayArray = [&](TypeId t) -> TypeId {
-                if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
-                auto const elems = interner.operands(t);
-                return elems.empty() ? t : interner.pointer(elems[0]);
-            };
-            TypeId const thenD = decayArray(thenE.type);
-            TypeId const elseD = decayArray(elseE.type);
-            if (thenD.valid() && thenD == elseD
-                && interner.kind(thenD) == TypeKind::Ptr
-                && (interner.kind(thenE.type) == TypeKind::Array
-                    || interner.kind(elseE.type) == TypeKind::Array)) {
-                common = thenD;
-            }
-            // P48 (D-CSUBSET-TERNARY-ARRAY-ARM-INCOMPATIBLE part 2) C 6.5.15p6:
-            // object-pointer beside `void *` → the conditional is `void *`. The
-            // EXACT mirror of the semantic `combineTernary` arm; setting `common`
-            // to the void pointer drives the existing coerce calls below, where
-            // an Array arm hits coerce's `toVoidPtr` decay Cast (already gated on
-            // the same `implicitToVoidPtr` flag) and a pointer arm the Ptr→Ptr
-            // bitcast. Without it the conditional typed as the ARRAY and the
-            // aggregate lowering refused `c ? "%s" : (void *)0` — a construct all
-            // four references compile with no diagnostic (✔MEASURED 2026-09-01).
-            if (!common.valid() && sem.pointerConversions.implicitToVoidPtr) {
-                auto const pointeeKind = [&](TypeId t) {
-                    return (t.valid() && interner.kind(t) == TypeKind::Ptr
-                            && !interner.operands(t).empty())
-                        ? interner.kind(interner.operands(t)[0])
-                        : TypeKind::Count_;
-                };
-                auto const isVoidPtr = [&](TypeId t) {
-                    return pointeeKind(t) == TypeKind::Void;
-                };
-                auto const isObjectPtr = [&](TypeId t) {
-                    TypeKind const pk = pointeeKind(t);
-                    return pk != TypeKind::Count_ && pk != TypeKind::Void
-                        && pk != TypeKind::FnSig;
-                };
-                if (isVoidPtr(thenD) && isObjectPtr(elseD))      common = thenD;
-                else if (isVoidPtr(elseD) && isObjectPtr(thenD)) common = elseD;
-            }
-            // ★★ P69 (lane `cs`, fold f26c — D-C-A-POINTER-TO-AN-ARRAY-OF-UNKNOWN-SIZE-IS-WARNED-INCOMPATIBLE,
-            // item (3)): two arms that are pointers to COMPATIBLE types (after an array
-            // or a function designator decays) are converted to a pointer to their COMPOSITE (C 6.2.7p3,
-            // 6.5.15p6) — the EXACT mirror of the semantic `combineTernary` arm, where the meaning split
-            // (gcc, clang and mingw-w64 gcc the composite; cl the first arm) is measured and decided.
-            // Without it the conditional carried the stamped composite over arms of their own types.
-            if (!common.valid()) {
-                auto const decayToPointer = [&](TypeId t) -> TypeId {
-                    if (t.valid() && interner.kind(t) == TypeKind::FnSig) return interner.pointer(t);
-                    return decayArray(t);
-                };
-                TypeId const thenP = decayToPointer(thenE.type);
-                TypeId const elseP = decayToPointer(elseE.type);
-                if (thenP.valid() && elseP.valid() && thenP != elseP
-                    && interner.kind(thenP) == TypeKind::Ptr && interner.kind(elseP) == TypeKind::Ptr) {
-                    TypeId const composite =
-                        compositeType(interner, thenP, elseP, ArraysCompared::BelowAPointer);
-                    if (composite.valid()) common = composite;
-                }
-            }
-            // ★★ P68 round 9 (lane `cs`): two arms contributing pointers to
-            // INCOMPATIBLE types have type `void *` — the EXACT mirror of the semantic
-            // `combineTernary` arm, where the meaning fork (gcc/clang `void *`, MSVC the
-            // second operand's type) is measured and decided. Setting `common` drives
-            // the coerce calls below: an object-pointer arm takes the Ptr→void* arm, an
-            // array arm the `toVoidPtr` decay, a function designator or function
-            // pointer the `allowVoidPtrFnConvert` arm. Before this the conditional
-            // typed as its THEN arm and the else arm reached `makeTernary` uncoerced
-            // (D-CSUBSET-INCOMPATIBLE-ELEMENT-ARRAY-TERNARY: `c ? "ab" : intArr` became
-            // a type-confused aggregate copy of the first arm).
-            if (!common.valid()
-                && sem.pointerConversions.incompatiblePointerConvertsDiagnosed) {
-                TypeId const thenP = contributedPointee(interner, thenE.type);
-                TypeId const elseP = contributedPointee(interner, elseE.type);
-                if (thenP.valid() && elseP.valid()
-                    && !pointerPairingAdmitted(interner, thenP, elseP,
-                                               /*voidPairingAdmitted=*/true,
-                                               sem.pointerConversions)) {
-                    common = interner.pointer(interner.primitive(TypeKind::Void));
-                }
-                // ★ P69 (lane `cs`, D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST):
-                // the same `void *` for a pair these TypeIds DO admit — `c ? &f_plain :
-                // &f_const` over `int (char *)` / `int (const char *)` — because the
-                // qualifier that keeps the two pointees apart is one the interner does not
-                // carry. The semantic tier reads it off the arms' spines and STAMPS the
-                // conditional `void *` (pass2Post's SE4b); that stamp is the authority,
-                // and both arms convert to it exactly as the pair above does.
-                if (!common.valid() && thenP.valid() && elseP.valid()) {
-                    TypeId const stamped = semTypeAt(node);
-                    if (stamped.valid() && interner.kind(stamped) == TypeKind::Ptr
-                        && !interner.operands(stamped).empty()
-                        && interner.kind(interner.operands(stamped)[0]) == TypeKind::Void)
-                        common = stamped;
-                }
-            }
+            TypeId const typed = reprOf(model.conditionalTypeFor(node));
+            if (typed.valid() && interner.kind(typed) == TypeKind::Ptr) common = typed;
         }
         if (common.valid()) {
             thenE = coerce(thenE, common);
@@ -15106,6 +14996,19 @@ struct Lowerer {
                         linkageFrom(linkagePrefixRoots(node, *decl), *decl),
                         *decl, d);
                 };
+                // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): A BLOCK PROTOTYPE HAS LINKAGE (C
+                // 6.2.2p5: it is the `extern` declaration), so its attribute specifiers are its linkage's --
+                // read with the tables its row names (`attributeLinkageOf`) and merged into the entity it names
+                // BEFORE the absorbed skip, as a block `extern`'s are (a later definition carries them). The
+                // import below records the merged answer. ✔MEASURED (lane `cs` probes wb, wb4): `int hook(void)
+                // __attribute__((weak));` in a block runs as a null weak reference on gcc 13.3.0, clang 18.1.3
+                // and mingw-w64 gcc with no definition, through a typedef-named head too; DSS dropped `weak` in
+                // silence and the link refused `hook`.
+                std::optional<LinkageAttr> blockLinkage;
+                if (!asGlobal) {
+                    if (std::optional<LinkageAttr> const read = attributeLinkageOf(node, *decl, d, staticLinkage))
+                        blockLinkage = mergeDeclaratorLinkage(d, dc, *read);
+                }
                 // P69 (lane `cs`): a prototype whose name an `alias` makes the
                 // second name of a definition — the alias row, with this
                 // declaration's linkage. The reference the prototype is (the import
@@ -15130,6 +15033,7 @@ struct Lowerer {
                         continue;   // shim (or refusal) — never an import row.
                     HirNodeId const ef = track(
                         builder.makeExternFunction(reprOf(pr->type), sym.v, {}), d);
+                    if (blockLinkage.has_value()) recordLinkage(ef, *blockLinkage);   // F9, above
                     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a bare-prototype
                     // cross-TU reference carries the
                     // prototype's own asm label (set below), so a labelled
@@ -15225,6 +15129,28 @@ struct Lowerer {
                         "accumulator (outside a module tree walk)"), d);
                 }
                 continue;
+            }
+            // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): AN OBJECT DECLARED IN A BLOCK WITHOUT `extern`
+            // HAS NO LINKAGE (C 6.2.2p6), so its attribute specifiers may give it no BINDING. Read with the
+            // tables its row names (`attributeLinkageOf`) and seeded by its own prefix: a `static` object's
+            // `weak` is the binding conflict that fold already refuses; an automatic one's binding is refused
+            // here. ✔MEASURED (lane `cs` probes wb3, wb4): `weak` on an automatic or a `static` object, through
+            // a plain or a typedef-named head, a for-init declaration and a C23 inferred one, is refused by
+            // gcc 13.3.0, clang 18.1.3, mingw-w64 gcc and Apple clang ("weak declaration of 'x' must be
+            // public"); cl's own text for `selectany` states the rule ("can only be applied to data items with
+            // external linkage"). DSS built them in silence. A visibility there changes nothing (gcc warns it
+            // ignored, clang is silent) and is passed over.
+            if (!asGlobal) {
+                if (std::optional<LinkageAttr> const read = attributeLinkageOf(node, *decl, d, staticLinkage);
+                    read.has_value() && read->binding != staticLinkage.binding) {
+                    auto const* rec = model.recordFor(sym);
+                    emitH(DiagnosticCode::H_UnknownLinkageSpecifier, d,
+                          std::format("'{}' is declared in a block without 'extern', so it has no linkage "
+                                      "(C 6.2.2p6), and an attribute gives it a '{}' binding, which only a "
+                                      "name with external linkage can have",
+                                      rec != nullptr ? rec->name : std::string{},
+                                      symbolBindingName(read->binding)));
+                }
             }
             TypeId type = InvalidType;
             if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);

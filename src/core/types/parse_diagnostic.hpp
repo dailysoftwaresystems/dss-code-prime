@@ -2794,6 +2794,15 @@ enum class DiagnosticCode : std::uint16_t {
     // types for 'f'") and cl (C2371) refuse it; cl takes a later `int f(char)` and
     // `int f(int, ...)`, which gcc refuses, so only the result is held to it. An ERROR.
     S_ImplicitDeclarationConflicts        = 0xE09F,
+    // P69 (lane `cs`, fold f26c2): a declaration of a function WITHOUT A PROTOTYPE (`int f();`)
+    // and a PROTOTYPE of it that C 6.7.6.3p15 does not make compatible with it -- a parameter
+    // that is not its own default argument promotion (`char`, `short`, `float`), or a `...`.
+    // ✔MEASURED (lane `cs` probe np3, each program RUN): cl 19.51 builds every such pair, at
+    // its default standard and /std:clatest, silent, and the prototype is the function's type
+    // from there on; gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and Apple clang refuse
+    // them ("conflicting types"). One working reference makes the pair accepted; a WARNING,
+    // suppressible, names what two of the three refuse.
+    S_PrototypeIncompatibleWithADeclarationWithoutOne = 0xE0A0,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

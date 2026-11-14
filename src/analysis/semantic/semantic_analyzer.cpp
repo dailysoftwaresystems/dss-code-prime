@@ -3082,6 +3082,80 @@ paramRowSpine(SchemaIndexes const& idx, Tree const& tree, NodeId row,
                                 pPrefixQuals, &typedefs);
 }
 
+// The declarator a record's OWN declaration wrote, among its row's (a row may declare
+// several), or an invalid NodeId for a row this walk cannot read. Shared by the function
+// qualification harvest below and the reading of a declaration without a prototype
+// (`functionDeclaratorWritesNoParameters`), so the two find one declarator.
+[[nodiscard]] NodeId ownDeclaratorOf(SchemaIndexes const& idx, Tree const& tree,
+                                     SymbolRecord const& rec) {
+    if (idx.cfg == nullptr || !idx.cfg->declarators.has_value()) return {};
+    SemanticConfig const& cfg = *idx.cfg;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (!rec.declRuleNode.valid()) return {};
+    auto const declIt = idx.declByRule.find(tree.rule(rec.declRuleNode).v);
+    if (declIt == idx.declByRule.end()) return {};
+    auto const& decl = cfg.declarations[declIt->second];
+    if (!decl.isDeclaratorMode()) return {};
+    auto const kids = declRoleChildren(tree, rec.declRuleNode, decl);
+    auto const carrier = decl.declaratorListChild.has_value()
+                             ? decl.declaratorListChild
+                             : decl.declaratorChild;
+    if (!carrier.has_value() || *carrier >= kids.size()) return {};
+    std::vector<NodeId> declarators;
+    collectDeclarators(TreeDeclaratorView{tree}, kids[*carrier], dc, declarators);
+    for (NodeId d : declarators) {
+        if (declaratorNameNode(tree, d, dc).v == rec.declNode.v) return d;
+    }
+    return declarators.size() == 1 ? declarators.front() : NodeId{};
+}
+
+// ★ P69 (lane `cs`, fold f26c2): whether a function's own declarator `dNode` writes an EMPTY
+// parameter list — its function suffix holds no parameter list, or one with no parameter row
+// and no `...` (`int f();`, not `int f(void);`). The suffix and the list are found by the roles
+// `functionParamsListNode` reads, so the two agree on which list is the signature's; a
+// declarator with no function suffix of its own (a function declared through a typedef) writes
+// none, and is no such declaration.
+[[nodiscard]] bool functionDeclaratorWritesNoParameters(SchemaIndexes const& idx,
+                                                        Tree const& tree, NodeId dNode) {
+    if (idx.cfg == nullptr || !idx.cfg->declarators.has_value()) return false;
+    SemanticConfig const& cfg = *idx.cfg;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return false;
+    NodeId inner = dNode;
+    if (isDeclaratorSlotWrapper(tree.rule(dNode), dc)) {
+        inner = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
+    }
+    if (!inner.valid() || tree.kind(inner) != NodeKind::Internal
+        || tree.rule(inner) != dc.declaratorRule) {
+        return false;
+    }
+    for (NodeId c : visibleChildren(tree, inner)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const cr = tree.rule(c);
+        if (cr != dc.directRule
+            && !(dc.directAbstractRule.has_value() && cr == *dc.directAbstractRule))
+            continue;
+        for (NodeId sfx : visibleChildren(tree, c)) {
+            if (tree.kind(sfx) != NodeKind::Internal || !isFnSuffixRule(tree.rule(sfx), dc))
+                continue;
+            if (!dc.fnSuffixParamsRule.has_value()) return true;
+            for (NodeId pl : visibleChildren(tree, sfx)) {
+                if (tree.kind(pl) != NodeKind::Internal
+                    || tree.rule(pl) != *dc.fnSuffixParamsRule)
+                    continue;
+                std::vector<NodeId> rows;
+                collectParamRowNodes(idx, cfg, tree, pl, rows);
+                if (!rows.empty()) return false;
+                return !(dc.variadicMarker.has_value()
+                         && subtreeContainsToken(tree, pl, *dc.variadicMarker, &idx.declByRule));
+            }
+            return true;   // a function suffix with no parameter list at all
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] std::optional<DeclaredQualification>
 harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
                              Tree const& tree, SymbolRecord const& rec,
@@ -3108,17 +3182,7 @@ harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
                                                   cfg.typeofValueRule};
 
     // This symbol's own declarator among the row's (a row may declare several).
-    auto const carrier = decl.declaratorListChild.has_value()
-                             ? decl.declaratorListChild
-                             : decl.declaratorChild;
-    if (!carrier.has_value() || *carrier >= kids.size()) return std::nullopt;
-    std::vector<NodeId> declarators;
-    collectDeclarators(TreeDeclaratorView{tree}, kids[*carrier], dc, declarators);
-    NodeId mine{};
-    for (NodeId d : declarators) {
-        if (declaratorNameNode(tree, d, dc).v == rec.declNode.v) { mine = d; break; }
-    }
-    if (!mine.valid() && declarators.size() == 1) mine = declarators.front();
+    NodeId const mine = ownDeclaratorOf(idx, tree, rec);
     if (!mine.valid()) return std::nullopt;
 
     DeclaredQualification q;
@@ -13782,8 +13846,9 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
 //     is held. The call is then checked against that declaration's parameters.
 //   * Where the unit declares NO function of the name, the declaration is MINTED (`isImplicitDeclaration`):
 //     bound in the call's innermost block from the call on, one entity for every call of the unit
-//     (`EngineState::implicitDeclarationOf`), its type completed at the first call
-//     (`completeImplicitDeclaration`); the CST→HIR lowering emits it as an external function no library binds.
+//     (`EngineState::implicitDeclarationOf`), its type completed at the first call, and every call typed by its
+//     own promoted arguments (`typeOfACallWithoutAPrototype`, the home of a function declared without a
+//     prototype); the CST→HIR lowering emits it as an external function no library binds.
 //   * Where the unit declares no function of the name and the platform's C library does, the library's
 //     function is the one called; a name of a builtin family is declared by no call (below).
 // Returns the declaration the call takes, or InvalidSymbol where the name is bound, but not to a function (an
@@ -13889,31 +13954,52 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
     return later;
 }
 
-// The type of an implicitly declared function (`implicitlyDeclaredCallee`), completed at a CALL of it: the
-// implicit result and, as its parameters, the call's arguments after the default argument promotions (C
-// 6.5.2.2p6: an array or a function decays to a pointer, `float` becomes `double`, an integer narrower than
-// `int` is promoted), not variadic — so the call passes each promoted argument as a non-variadic call does
-// (on arm64 Darwin a variadic call passes its arguments on the stack, where a non-variadic definition does not
-// read them). The FIRST call completes it; a later call whose promoted arguments differ in number or in
-// representation is refused (S_ImplicitDeclarationConflicts): at most one of two such calls can match the
-// definition, and a call that does not is undefined (C 6.5.2.2p6) — the union over what WORKS, as F1's
-// incompatible-object pair was decided. Returns the function type, or InvalidType where an argument has none.
-[[nodiscard]] TypeId completeImplicitDeclaration(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                                                 SymbolId sym, NodeId nameNode,
-                                                 std::span<NodeId const> args, ScopeId scope,
-                                                 CallRule const& call) {
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F6; main's ledger 554): A FUNCTION DECLARED WITHOUT A PROTOTYPE —
+// ONE HOME. C90 6.3.2.2's implicit declaration (`extern int name();`, `implicitlyDeclaredCallee`) and a declaration
+// whose parameter list is empty where the language says it declares none (`int f();`,
+// `parameters.emptyListDeclaresNoPrototype`; `SymbolRecord::declaresNoPrototype`) are one kind of declaration, and a
+// call that sees no prototype of the function (`callHasNoPrototypeAt`) is typed here: its own arguments after the
+// default argument promotions (C 6.5.2.2p6: an array or a function decays to a pointer, `float` becomes `double`, an
+// integer narrower than `int` is promoted) and the function's result, NOT variadic — so the call passes each promoted
+// argument as a non-variadic call does (on arm64 Darwin a variadic call passes its arguments on the stack, where a
+// non-variadic definition does not read them). EACH CALL IS TYPED BY ITS OWN ARGUMENTS, and none is refused for
+// differing from another: a call that does not match the definition is undefined only when it is EXECUTED.
+// ✔MEASURED (lane `cs` probe ic2, each program built and RUN): two calls of a function the unit declares nowhere,
+// with different promoted arguments, the mismatched one guarded, build and run on gcc 13.3.0, mingw-w64 gcc 13.2.0,
+// cl 19.51 and clang 18.1.3 at -std=c89; the same pair through `int f();` (probe np2) builds and runs on gcc 13.3.0
+// and clang 18.1.3 at their default standard, on mingw-w64 gcc and Apple clang, and on cl at every standard. Before
+// f26c2 this compiler typed the implicit declaration a PROTOTYPE of the first call's arguments and refused a later
+// call with others (S_ImplicitDeclarationConflicts), and read `int f();` as `int f(void)`.
+// The implicit declaration's own record takes the FIRST call's type (the function the module imports); every call's
+// callee is stamped its own. A K&R definition (an identifier list, C17 6.9.1) is the third declaration of this kind
+// and reads the same home.
+
+// C 6.5.2.2p6's default argument promotions of one argument's type, as a call through a function type without a
+// prototype — and the `...` of one with — performs them; C 6.7.6.3p15 asks the same promotion of a prototype's
+// parameter beside a declaration without one (`isItsOwnDefaultPromotion`).
+[[nodiscard]] TypeId defaultArgumentPromotion(EngineState& s, SemanticConfig const& cfg, TypeId t) {
     auto& in = s.lattice.interner();
+    if (!t.valid()) return t;
+    t = arrayToPointerDecay(in, t);
+    if (in.kind(t) == TypeKind::FnSig) return in.pointer(t);
+    if (in.kind(t) == TypeKind::F32) return in.primitive(TypeKind::F64);
     std::optional<ResolvedArithmeticRules> const& arith = s.arithRulesFor(cfg);
+    return arith.has_value() ? integerPromotedType(in, t, *arith) : t;
+}
+
+// The type of ONE call that sees no prototype of its callee: its arguments after the default argument promotions,
+// the function's result, not variadic. An implicit declaration not yet typed is completed by its first call, with
+// the result its call rule states. Returns InvalidType where an argument has no type (its own diagnostic said it).
+[[nodiscard]] TypeId typeOfACallWithoutAPrototype(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                                                  SymbolId sym, std::span<NodeId const> args, ScopeId scope,
+                                                  CallRule const& call) {
+    auto& in = s.lattice.interner();
     std::vector<TypeId> promoted;
     promoted.reserve(args.size());
     for (NodeId const a : args) {
-        TypeId t = subtreeType(s, tree, a, scope);
+        TypeId const t = subtreeType(s, tree, a, scope);
         if (!t.valid()) return InvalidType;
-        t = arrayToPointerDecay(in, t);
-        if (in.kind(t) == TypeKind::FnSig) t = in.pointer(t);
-        if (in.kind(t) == TypeKind::F32) t = in.primitive(TypeKind::F64);
-        else if (arith.has_value()) t = integerPromotedType(in, t, *arith);
-        promoted.push_back(t);
+        promoted.push_back(defaultArgumentPromotion(s, cfg, t));
     }
     SymbolRecord& rec = s.symbols.at(sym);
     if (!rec.type.valid()) {
@@ -13922,25 +14008,40 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
         rec.type = in.fnSig(promoted, resultIt->second, CallConv::CcSysV, /*isVariadic=*/false);
         return rec.type;
     }
-    auto const params = in.fnParams(rec.type);
-    bool same = params.size() == promoted.size();
-    for (std::size_t i = 0; same && i < promoted.size(); ++i)
-        same = in.sameRepresentation(params[i], promoted[i]);
-    if (!same) {
-        ParseDiagnostic d;
-        d.code     = DiagnosticCode::S_ImplicitDeclarationConflicts;
-        d.severity = DiagnosticSeverity::Error;
-        d.buffer   = tree.source().id();
-        d.span     = tree.span(nameNode);
-        d.actual   = std::format("conflicting calls of '{}': the unit declares it nowhere, an earlier call "
-                                 "declared it implicitly with {} promoted argument(s), and this call passes "
-                                 "{} that do not match them — at most one of the two can match its "
-                                 "definition", rec.name, params.size(), promoted.size());
-        d.related.push_back(RelatedLocation{tree.source().id(), tree.span(rec.declNode),
-                                            "the call that declared it"});
-        s.reporter.report(std::move(d));
+    if (in.kind(rec.type) != TypeKind::FnSig) return InvalidType;
+    return in.fnSig(promoted, in.fnResult(rec.type), CallConv::CcSysV, /*isVariadic=*/false);
+}
+
+// Whether a call at `at` sees NO PROTOTYPE of the function `sym` names: the function's merge (`sym` and every record
+// it was merged with) holds a declaration without one — an implicit declaration, or one whose own declarator wrote
+// an empty list (`declaresNoPrototype`) — and no prototype of the merge is visible at the call: one of another tree,
+// or one of this tree written before the call (C 6.2.1p7: a declaration's scope begins after its declarator). A
+// prototype written after the call is not seen there (`int f(); ... f(2.5) ... int f(int x) {...}` passes a
+// `double`, as gcc and clang pass it); one written before is the composite every later call is checked against.
+[[nodiscard]] bool callHasNoPrototypeAt(EngineState const& s, Tree const& tree, SymbolId sym, NodeId at) {
+    if (!sym.valid()) return false;
+    std::vector<SymbolId> group{sym};
+    for (std::size_t i = 0; i < group.size(); ++i) {
+        auto const it = s.redeclarationPartners.find(group[i].v);
+        if (it == s.redeclarationPartners.end()) continue;
+        for (SymbolId const p : it->second)
+            if (std::find_if(group.begin(), group.end(),
+                             [&](SymbolId g) { return g.v == p.v; }) == group.end())
+                group.push_back(p);
     }
-    return rec.type;
+    std::uint32_t const where = at.valid() ? streamRank(s, tree, at) : 0u;
+    bool withoutOne = false;
+    for (SymbolId const r : group) {
+        SymbolRecord const& rec = s.symbols.at(r);
+        if (rec.kind != DeclarationKind::Function) continue;
+        bool const none = rec.isImplicitDeclaration || rec.declaresNoPrototype;
+        withoutOne = withoutOne || none;
+        if (none) continue;
+        bool const visible = rec.tree.v != tree.id().v || !at.valid() || !rec.declNode.valid()
+                          || streamRank(s, tree, rec.declNode) <= where;
+        if (visible) return false;   // a prototype is in scope at the call
+    }
+    return withoutOne;
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -25296,10 +25397,22 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                       pointerValueSpine(s, cfg, tree, arms[2], elseT, here))) {
                         // P69 (lane `cs`): the pairing only the arms' spines see
                         // ("A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES
-                        // NOT") — `subtreeType` typed it `void *`; the node is
-                        // STAMPED so the HIR `combineTernary`, whose TypeIds cannot see
-                        // the qualifier, converts both arms to that type.
-                        s.nodeToType.set(node, in.pointer(in.primitive(TypeKind::Void)));
+                        // NOT") — `subtreeType` typed it `void *`, and that type is
+                        // the conditional's record above (`conditionalTypes`), which
+                        // the HIR `combineTernary`, whose TypeIds cannot see the
+                        // qualifier, converts both arms to. It is ALSO stamped on the
+                        // node-type door, for this tier's own later readers of the
+                        // node: the call typer asks the callee's door first, and
+                        // ✔MEASURED (fold f26c2, run f26c2-b, the stamp removed):
+                        // `(c ? &f_plain : &f_const)(p)` then called a `void *` in
+                        // silence (GenericQualifierAxis
+                        // .AConditionalOverAQualifierApartPairIsAVoidPointer red). The
+                        // stamp is written FROM the record (which this branch always
+                        // has: it is reached only with both arms typed), so the two
+                        // cannot differ.
+                        if (TypeId const* const recorded = s.conditionalTypes.tryGet(node);
+                            recorded != nullptr && recorded->valid())
+                            s.nodeToType.set(node, *recorded);
                         reportDiagnosedClass(s, tree, node,
                                              DiagnosedConversion::IncompatiblePointer,
                                              DiagnosedConversionSite::Conditional);
@@ -27861,6 +27974,24 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 s.reporter.report(std::move(d));
                 return;
             }
+            // P69 (lane `cs`, fold f26c2, F6): a parenthesized designator of a function the
+            // call sees no prototype of (`(f)(42)` after `int f();`) is typed by the call's own
+            // promoted arguments, as the bare name is below, on every wrapper up to the callee.
+            if (callHasNoPrototypeAt(s, tree, sym, cur)) {
+                std::vector<NodeId> argNodes;
+                if (call.argsChild < kids.size())
+                    gatherArgExpressions(tree, kids[call.argsChild], argNodes);
+                TypeId const own =
+                    typeOfACallWithoutAPrototype(s, cfg, tree, sym, argNodes, scope, call);
+                if (!own.valid()) return;   // an argument with no type: its own diagnostic said it
+                for (NodeId n = cur; n.valid() && n.v != node.v; n = tree.parent(n)) {
+                    s.nodeToType.set(n, own);
+                    if (n.v == calleeNode.v) break;
+                }
+                checkCallAgainstSig(s, cfg, tree, node, kids, call, own,
+                                    /*variadicBuiltin=*/false, scope);
+                return;
+            }
             // The name's type AT THIS USE (`typeVisibleAt`): a callee whose later
             // declaration completes what its result points to is still the type written
             // before the call here.
@@ -27925,23 +28056,25 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     if (!calleeSym.valid()) {
         if (SymbolId const* bound = s.nodeToSymbol.tryGet(resolved.node)) calleeSym = *bound;
     }
-    // …and a function the call declared implicitly takes its type from this call's arguments
-    // the first time, and holds every later call to it (`completeImplicitDeclaration`).
-    if (calleeSym.valid() && s.symbols.at(calleeSym).isImplicitDeclaration) {
+    // …and a call that sees NO PROTOTYPE of the function (`callHasNoPrototypeAt`: an implicit
+    // declaration, or `int f();`, and no prototype written before the call) is typed by its
+    // OWN arguments after the default argument promotions (`typeOfACallWithoutAPrototype`),
+    // every call its own (P69 fold f26c2, F6).
+    TypeId ownCallType = InvalidType;
+    if (callHasNoPrototypeAt(s, tree, calleeSym, resolved.node)) {
         std::vector<NodeId> argNodes;
         if (call.argsChild < kids.size()) gatherArgExpressions(tree, kids[call.argsChild], argNodes);
-        TypeId const fnTy = completeImplicitDeclaration(s, cfg, tree, calleeSym, resolved.node,
-                                                        argNodes, scope, call);
-        if (!fnTy.valid()) return;   // an argument with no type: its own diagnostic said it
-        // The reference arm ran before this call completed the type, so it stamped nothing:
-        // the type goes on the name and on every wrapper up to the callee (the reference node
-        // the lowering reads — the callee names solely an identifier, C90 6.3.2.2, so the
-        // chain holds only single-child wrappers).
+        ownCallType = typeOfACallWithoutAPrototype(s, cfg, tree, calleeSym, argNodes, scope, call);
+        if (!ownCallType.valid()) return;   // an argument with no type: its own diagnostic said it
+        // The reference arm stamped the declaration's type (or, for an implicit declaration
+        // its first call completes, nothing): the call's own type goes on the name and on every
+        // wrapper up to the callee (the reference node the lowering reads — the callee names
+        // solely an identifier, so the chain holds only single-child wrappers).
         std::vector<NodeId> chain;
         for (NodeId n = resolved.node; n.valid() && n.v != node.v; n = tree.parent(n)) {
             chain.push_back(n);
             if (n.v == calleeNode.v) {
-                for (NodeId const c : chain) s.nodeToType.set(c, fnTy);
+                for (NodeId const c : chain) s.nodeToType.set(c, ownCallType);
                 break;
             }
         }
@@ -27997,7 +28130,10 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // there asks the size of one. The record's own type is the merge's composite, the
     // type the object has after its last declaration; the call read it, and the result
     // the call was typed with was the completed array's.
-    TypeId const fnTy = typeVisibleAt(s, tree, calleeSym, resolved.node);
+    // A call that sees no prototype is checked against its OWN type (above): its arguments
+    // converted to their promotions, which is what such a call passes.
+    TypeId const fnTy = ownCallType.valid() ? ownCallType
+                                            : typeVisibleAt(s, tree, calleeSym, resolved.node);
 
     if (!fnTy.valid() || s.lattice.interner().kind(fnTy) != TypeKind::FnSig) {
         // D-CSUBSET-FNPTR-INDIRECT-CALL (closed FC4 c2): a bare-
@@ -28986,7 +29122,8 @@ subtreeType(EngineState& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
         // does not. The consequence is deliberate: `(c ? &a : &b)->x` is refused as gcc
         // and clang refuse it, where MSVC's reading (which DSS used to give by typing
         // the conditional as its THEN arm) accepted it. The HIR `combineTernary`
-        // realizes the same type, and pass2Post's SE4b reports the pairing.
+        // converts both arms to this type (Pass 2's record of it, `conditionalTypes`),
+        // and pass2Post's SE4b reports the pairing.
         if (sem.pointerConversions.incompatiblePointerConvertsDiagnosed) {
             TypeId const thenP = contributedPointee(interner, thenT);
             TypeId const elseP = contributedPointee(interner, elseT);
@@ -29004,7 +29141,8 @@ subtreeType(EngineState& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
             // 13.3.0 and clang 18.1.3 type every one `void *` with "pointer type
             // mismatch", MSVC 19.51 an arm's type — the fork decided above. Read off the
             // arms' spines ("A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES
-            // NOT"); the HIR `combineTernary` realizes the stamp, SE4b reports it.
+            // NOT"); the HIR `combineTernary` converts both arms to it (Pass 2's record,
+            // `conditionalTypes`), SE4b reports it.
             if (pointeesCanDivergeInAQualifier(interner, thenT, elseT)) {
                 if (pointeeSpinesDiverge(
                         pointerValueSpine(s, sem, tree, thenN, thenT, scope),
@@ -32865,6 +33003,38 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     s.pragmaPack = nullptr;   // no tree is active outside the per-tree walk
     s.pragmaNoOptimize = nullptr;
 
+    // ★ P69 (lane `cs`, fold f26c2 — F6): WHICH DECLARATIONS GIVE THEIR FUNCTION NO PROTOTYPE
+    // (`SymbolRecord::declaresNoPrototype`), read once every function's type is resolved and
+    // before the sweep below composes a merge: a declaration that is not a definition
+    // (`isProtoDeclaration`), typed a function of no parameters, whose own declarator writes an
+    // EMPTY list (`functionDeclaratorWritesNoParameters` — `()`, not `(void)`), where the
+    // language says such a list declares no prototype (`parameters.emptyListDeclaresNoPrototype`).
+    // Every record of the name is read, an absorbed one included: a call written before a later
+    // prototype sees only the declarations written before it (`callHasNoPrototypeAt`).
+    {
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeOf;
+        for (auto const& tree : trees) treeOf[tree.id().v] = &tree;
+        auto& in = s.lattice.interner();
+        // Symbol ids are dense and minted from 1; the store only grows.
+        for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
+            SymbolRecord& rec = s.symbols.at(SymbolId{sv});
+            if (rec.kind != DeclarationKind::Function || !rec.isProtoDeclaration
+                || rec.isImplicitDeclaration || !rec.type.valid()
+                || in.kind(rec.type) != TypeKind::FnSig || !in.fnParams(rec.type).empty()
+                || in.fnIsVariadic(rec.type))
+                continue;
+            auto const treeIt = treeOf.find(rec.tree.v);
+            if (treeIt == treeOf.end()) continue;
+            Tree const& tree = *treeIt->second;
+            auto const idxIt = s.schemaIndexes.find(tree.schema().schemaId().v);
+            if (idxIt == s.schemaIndexes.end() || idxIt->second.cfg == nullptr
+                || !idxIt->second.cfg->parameters.emptyListDeclaresNoPrototype)
+                continue;
+            rec.declaresNoPrototype = functionDeclaratorWritesNoParameters(
+                idxIt->second, tree, ownDeclaratorOf(idxIt->second, tree, rec));
+        }
+    }
+
     // D-CSUBSET-FN-PROTOTYPE: function-redeclaration COMPATIBILITY sweep. Pass 1
     // merged each (proto/def) pair into `mergedFnDecls` {survivor, absorbed};
     // now that Pass 1.5 has resolved both records' FnSig types, compare them.
@@ -33266,6 +33436,63 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         aQual = harvestFunctionQualification(
                             in, aIdxIt->second, *aTreeIt2->second, aRec, aRec.type,
                             typedefs);
+                    // ★ P69 (lane `cs`, fold f26c2 — F6): A DECLARATION WITHOUT A PROTOTYPE BESIDE
+                    // A PROTOTYPE of the function (`int f();` and `int f(int)`, either order) is
+                    // one function, whose type is the prototype (C 6.2.7p3's composite) — the
+                    // type every call that sees the prototype is checked against
+                    // (`callHasNoPrototypeAt`). C 6.7.6.3p15 makes the pair compatible where the
+                    // prototype ends in no `...` and no parameter of it changes under the default
+                    // argument promotions. ✔MEASURED (lane `cs` probe np3, each program RUN): cl
+                    // 19.51 builds every pair, those p15 refuses too (`char`, `short`, `float`,
+                    // `...`; either order), at its default standard and /std:clatest, silent, the
+                    // prototype the function's type after it; gcc 13.3.0, clang 18.1.3, mingw-w64
+                    // gcc 13.2.0 and Apple clang refuse those and build the compatible ones. One
+                    // working reference makes the pair accepted; the incompatible one is warned
+                    // (S_PrototypeIncompatibleWithADeclarationWithoutOne). The results are held
+                    // to each other as any redeclaration's are (the oracle below).
+                    if (sRec.declaresNoPrototype != aRec.declaresNoPrototype
+                        && in.fnResult(sRec.type).v == in.fnResult(aRec.type).v) {
+                        SymbolRecord const& proto = sRec.declaresNoPrototype ? aRec : sRec;
+                        SemanticConfig const* pCfg =
+                            aIdxIt != s.schemaIndexes.end() ? aIdxIt->second.cfg : nullptr;
+                        bool fits = !in.fnIsVariadic(proto.type);
+                        // A copy: the promotion interns (a pointer, `double`), which would move the
+                        // storage a span of the parameters points into.
+                        auto const protoParams = in.fnParams(proto.type);
+                        std::vector<TypeId> const params(protoParams.begin(), protoParams.end());
+                        for (TypeId const p : params) {
+                            if (!fits || pCfg == nullptr) break;
+                            fits = defaultArgumentPromotion(s, *pCfg, p).v == p.v;
+                        }
+                        if (!fits && aTreeIt2 != treeById.end()) {
+                            Tree const&     aTree2 = *aTreeIt2->second;
+                            ParseDiagnostic w;
+                            w.code     = DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne;
+                            w.severity = DiagnosticSeverity::Warning;
+                            w.buffer   = aTree2.source().id();
+                            w.span     = aTree2.span(aRec.declNode);
+                            w.actual   = std::format(
+                                "'{}' — a prototype whose parameters are not each their own default "
+                                "argument promotion, or that ends in `...`, is not compatible with a "
+                                "declaration of it without a prototype (C 6.7.6.3p15): taken, as cl "
+                                "takes it, with the prototype as its type; gcc and clang refuse it",
+                                aRec.name);
+                            if (sTreeIt2 != treeById.end()) {
+                                Tree const& sTree2 = *sTreeIt2->second;
+                                w.related.push_back(RelatedLocation{
+                                    sTree2.source().id(), sTree2.span(sRec.declNode),
+                                    "the other declaration"});
+                            }
+                            s.reporter.report(std::move(w));
+                        }
+                        if (sRec.declaresNoPrototype) {
+                            SymbolRecord& survivorRec = s.symbols.at(survivor);
+                            survivorRec.type = aRec.type;
+                            if (survivorRec.declNode.valid())
+                                s.nodeToType.set(survivorRec.declNode, aRec.type);
+                        }
+                        continue;
+                    }
                     DeclaredFunction const survivorDecl{
                         sRec.type, sQual.has_value() ? &*sQual : nullptr};
                     DeclaredFunction const absorbedDecl{

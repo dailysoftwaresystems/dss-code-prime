@@ -1,2 +1,2 @@
-            if (config.aggregate.memoryArgument != AggregateMemoryArgument::Stack) {
+            if (config.aggregate.memoryArgument == AggregateMemoryArgument::Stack && false) {
                 if (!appendByValueStackArg(operands, argNode, argTy))

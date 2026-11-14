@@ -4664,7 +4664,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 30> kCallConvKeys{
+                static constexpr std::array<std::string_view, 31> kCallConvKeys{
                     "name",
                     // P69 (lane `cs`, fold f26c, main's ledger 454): the row this one derives
                     // from (above), and what an X87UP eightbyte not preceded by X87 becomes.
@@ -4691,6 +4691,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     // aggregate argument travels (`stack` / `callerCopy`).
                     "aggregateMemoryArgument",
                     "stackArgPacking",
+                    // P69 (lane `cs`, fold f26c2): the alignment from which an argument in
+                    // general registers begins at an even one (AAPCS64 C.8).
+                    "evenGprPairAlignment",
                     "linkRegister", "stackPointer", "framePointer",
                     // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
                     // WHEN the frame pointer leaves the allocatable pool. A key
@@ -4889,6 +4892,21 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
                 readBoundedInt(c, coll, ccPath, "callPushBytes",
                                cc.callPushBytes);
+                // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the alignment from
+                // which an argument in general registers begins at an even one (AAPCS64
+                // C.8). An ALIGNMENT, so 0 (never) or a power of two: a typo'd 24 would
+                // pair no argument the references pair, in silence.
+                readBoundedInt(c, coll, ccPath, "evenGprPairAlignment",
+                               cc.evenGprPairAlignment);
+                if (std::uint16_t const a = cc.evenGprPairAlignment; a != 0 && (a & (a - 1)) != 0) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/evenGprPairAlignment", ccPath),
+                              std::format("'evenGprPairAlignment' ({}) must be 0 (no "
+                                          "argument begins at an even register) or a "
+                                          "power of two, the alignment from which one does",
+                                          a));
+                    cc.evenGprPairAlignment = 0;
+                }
                 // D-WIN64-LARGE-FRAME-STACK-PROBE: OS stack guard-page
                 // size + probe step. Optional (default 0 = no probing —
                 // Linux/macOS/arm64). ms_x64 declares 4096. Validated
@@ -5049,14 +5067,21 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "optional keys 'namedScalars' / "
                                   "'namedAggregates' / 'variadic' / "
                                   "'maxScalarAlignment' / "
-                                  "'maxAggregateAlignment'");
+                                  "'maxAggregateAlignment' / "
+                                  "'aggregateAlignmentOf' / "
+                                  "'homogeneousAggregateAlignmentOf'");
                     } else {
                         auto const& sap = c.at("stackArgPacking");
-                        static constexpr std::array<std::string_view, 5>
+                        static constexpr std::array<std::string_view, 7>
                             kStackArgPackingKeys{"namedScalars",
                                                  "namedAggregates", "variadic",
                                                  "maxScalarAlignment",
-                                                 "maxAggregateAlignment"};
+                                                 "maxAggregateAlignment",
+                                                 // P69 (lane `cs`, fold f26c2):
+                                                 // which alignment of an
+                                                 // aggregate is its own here.
+                                                 "aggregateAlignmentOf",
+                                                 "homogeneousAggregateAlignmentOf"};
                         DSS_CHECK_KEY_VOCABULARY(kStackArgPackingKeys);
                         rejectUnknownKeys(sap, kStackArgPackingKeys, sapPath,
                                           "a stack-arg-packing row", coll);
@@ -5150,6 +5175,39 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 cc.stackArgPacking.maxScalarAlignment);
                         readCap("maxAggregateAlignment",
                                 cc.stackArgPacking.maxAggregateAlignment);
+                        // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): which
+                        // alignment of a by-value aggregate the caps clamp
+                        // (`StackArgPackingRules::aggregateOwnAlignment`). A name its
+                        // table does not hold is refused naming the accepted ones —
+                        // never read as the default, which would place the aggregate
+                        // where the convention's references do not read it.
+                        auto readSource = [&](char const* key, auto const& table,
+                                              auto& out) {
+                            if (!sap.contains(key)) return;
+                            auto const& v = sap.at(key);
+                            std::string const path = std::format("{}/{}", sapPath, key);
+                            std::string const accepted =
+                                detail::renderAllowedList(allNames(table), " / ");
+                            if (!v.is_string()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          std::format("'{}' must be a name string — "
+                                                      "accepted: {}", key, accepted));
+                                return;
+                            }
+                            std::string const s = v.get<std::string>();
+                            if (auto const e = table.fromName(s); e.has_value()) {
+                                out = *e;
+                                return;
+                            }
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("unknown '{}' value '{}' — accepted: {}",
+                                                  key, s, accepted));
+                        };
+                        readSource("aggregateAlignmentOf", kAggregateAlignmentSourceTable,
+                                   cc.stackArgPacking.aggregateAlignmentOf);
+                        readSource("homogeneousAggregateAlignmentOf",
+                                   kHomogeneousAggregateAlignmentSourceTable,
+                                   cc.stackArgPacking.homogeneousAggregateAlignmentOf);
                         // ⚠ ONE BUILDABLE VALUE ON THE AGGREGATE AXIS, AND THE
                         // OTHER IS REFUSED RATHER THAN APPROXIMATED. ✔MEASURED:
                         // both shipped ABIs slot-round the SIZE of a stacked

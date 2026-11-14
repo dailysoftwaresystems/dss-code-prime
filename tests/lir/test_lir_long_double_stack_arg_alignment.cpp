@@ -162,27 +162,48 @@ TEST(LongDoubleStackArgAlignment, TheReservationIncludesThePad) {
 
 // ── (C) THE TWO ABIS DIVERGE ────────────────────────────────────────────────
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): this pinned the AAPCS64 cell the
+// wrong way round. It read "+8 for `struct __attribute__((aligned(16))){long x,y;}`" as
+// "AAPCS64 clamps a composite's alignment to the slot", and it put EVERY composite at
+// +8. AAPCS64 places a composite by its MEMBERS' alignment, capped at 16, so the
+// attribute drops out and a member-aligned composite goes to +16. ✔MEASURED (lane `cs`,
+// probe f14; -O1 asm, callee and caller, each after one stacked `long`; aarch64-linux-
+// gnu-gcc 13.3.0 and clang 18.1.3 agreeing; Apple clang 21 for apple_arm64):
+//                                   SysV   AAPCS64   Apple arm64
+//   struct aligned(16){long a, b}    +16     +8        +16      (type 16, members 8)
+//   struct {_Alignas(16) long a; b}  +16     +16       +16      (type 16, members 16)
+//   HFA {_Alignas(32) double a..d}   (MEMORY) +16      +8       (type 32, members 32, element 8)
+// The OWN alignment is the convention's choice (`aggregateOwnAlignment`, which the MIR
+// carrier states), and the CURSOR then caps it. Three conventions, one datum, three
+// answers — so neither half can be a constant.
 TEST(LongDoubleStackArgAlignment, TheAggregateCapDiffersBetweenSysvAndAapcs64) {
     auto const x86 = loadCc("x86_64", "sysv_amd64");
     auto const arm = loadCc("arm64", "aapcs64");
+    auto const apple = loadCc("arm64", "apple_arm64");
     ASSERT_NE(x86.cc, nullptr);
     ASSERT_NE(arm.cc, nullptr);
+    ASSERT_NE(apple.cc, nullptr);
 
-    // ✔MEASURED, the SAME source compiled for both targets: `struct
-    // __attribute__((aligned(16))){long x,y;}` after one stacked 8-byte argument
-    // reads at incoming +16 on x86_64 SysV and at incoming +8 on AAPCS64, where a
-    // COMPOSITE's alignment is clamped to the slot. Two ABIs, one datum, two
-    // answers — so the rule cannot be a constant in the cursor.
-    StackArgCursor onX86{*x86.cc, kSlot};
-    (void)onX86.placeNamedScalar(kSlot);
-    EXPECT_EQ(onX86.placeNamedAggregate(/*aggBytes=*/16, /*aggAlign=*/16), 16u)
-        << "SysV honours a 16-byte aggregate alignment";
-
-    StackArgCursor onArm{*arm.cc, kSlot};
-    (void)onArm.placeNamedScalar(kSlot);
-    EXPECT_EQ(onArm.placeNamedAggregate(/*aggBytes=*/16, /*aggAlign=*/16), 8u)
-        << "AAPCS64 clamps a COMPOSITE's alignment to the slot — this arm is what "
-           "proves the rule is read from the config and not hardcoded";
+    struct Cell {
+        char const*         what;
+        AggregateAlignments alignments;
+        std::uint32_t       bytes;
+        std::uint32_t       sysv, aapcs64, appleArm64;   // after one stacked slot
+    };
+    for (Cell const c : {Cell{"the composite's own aligned(16)", {16, 8, 0}, 16, 16, 8, 16},
+                         Cell{"a member _Alignas(16)", {16, 16, 0}, 16, 16, 16, 16},
+                         Cell{"an HFA over-aligned to 32", {32, 32, 8}, 32, 32, 16, 8},
+                         Cell{"the 8-aligned control", {8, 8, 0}, 16, 8, 8, 8}}) {
+        auto const placed = [&](TargetCallingConvention const& cc) {
+            StackArgCursor cur{cc, kSlot};
+            (void)cur.placeNamedScalar(kSlot);
+            return cur.placeNamedAggregate(
+                c.bytes, cc.stackArgPacking.aggregateOwnAlignment(c.alignments));
+        };
+        EXPECT_EQ(placed(*x86.cc), c.sysv) << c.what << " -- SysV";
+        EXPECT_EQ(placed(*arm.cc), c.aapcs64) << c.what << " -- AAPCS64";
+        EXPECT_EQ(placed(*apple.cc), c.appleArm64) << c.what << " -- Apple arm64";
+    }
 
     // The SCALAR axis, however, agrees: AAPCS64 rounds the NSAA up to a
     // FUNDAMENTAL type's own alignment, so a binary128 `long double` gets +16.
@@ -197,8 +218,8 @@ TEST(LongDoubleStackArgAlignment, TheAggregateCapDiffersBetweenSysvAndAapcs64) {
 // gcc 13.3.0 and clang 18.1.3, RUN; probe sa after one and two stacked eightbytes): alignment 8, 16, 32, 64 and
 // 256 begin at +8/+16/+32/+64/+256 after one stacked eightbyte and +16/+16/+32/+64/+256 after two. The
 // convention states it as `own` (StackArgPackingRules::AlignmentCap); it stated 16, and a DSS caller put a
-// 32-aligned aggregate 16 bytes before where a gcc or clang callee reads it. CONTROLS: AAPCS64 clamps a
-// composite at the slot (measured), Win64 declares no cap.
+// 32-aligned aggregate 16 bytes before where a gcc or clang callee reads it. CONTROLS: AAPCS64 caps a
+// composite's own alignment at 16 (fold f26c2, probe f14), Win64 declares no cap.
 TEST(LongDoubleStackArgAlignment, SysVBeginsAStackedAggregateOnItsOwnAlignmentUncapped) {
     auto const x86 = loadCc("x86_64", "sysv_amd64");
     auto const arm = loadCc("arm64", "aapcs64");
@@ -224,10 +245,12 @@ TEST(LongDoubleStackArgAlignment, SysVBeginsAStackedAggregateOnItsOwnAlignmentUn
         (void)two.placeNamedScalar(kSlot);
         EXPECT_EQ(two.placeNamedAggregate(/*aggBytes=*/c.align < 32 ? 32 : c.align, c.align), c.afterTwo)
             << "SysV, alignment " << c.align << " after two stacked eightbytes";
+        // ★ P69 (fold f26c2 — review-csf26c F14): AAPCS64 caps an own alignment at 16
+        // (it was read as a cap at the slot; probe f14).
         StackArgCursor onArm{*arm.cc, kSlot};
         (void)onArm.placeNamedScalar(kSlot);
-        EXPECT_EQ(onArm.placeNamedAggregate(/*aggBytes=*/16, c.align), 8u)
-            << "AAPCS64 clamps a composite at the slot, alignment " << c.align;
+        EXPECT_EQ(onArm.placeNamedAggregate(/*aggBytes=*/16, c.align), c.align <= 8 ? 8u : 16u)
+            << "AAPCS64 caps a composite's own alignment at 16, alignment " << c.align;
         StackArgCursor onWin{*win.cc, kSlot};
         (void)onWin.placeNamedScalar(kSlot);
         EXPECT_EQ(onWin.placeNamedAggregate(/*aggBytes=*/8, c.align), kSlot)

@@ -194,13 +194,10 @@ dss_add_test(NAME core/substrate/test_directory_tree    SOURCES substrate/test_d
 # how a link is read, in src/ outside src/core/substrate/ or in integrated_tests/ (the guard's header states
 # the class, the forms it refuses and why).
 dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_queries_guard.cpp)
-# ★ `repo-guard`, SET BY HAND, beside its registration: the label scan of the top-level CMakeLists reads the
-# top directory's entries, and this one is registered here. What it judges is the SOURCE TREE, the same
-# bytes on every leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for
-# (stated where the top-level CMakeLists gives the label). The mutation sweep starts the binary itself
-# and asks no label.
-set_property(TEST core/test_filesystem_queries_guard APPEND PROPERTY LABELS "repo-guard")
-message(STATUS "repo-guard label applied to 1 additional test (core/test_filesystem_queries_guard), registered in tests/core")
+# `repo-guard`, DECLARED beside its registration: what it judges is the SOURCE TREE, the same bytes on every
+# leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for (stated where the
+# top-level CMakeLists sums the declarations). The mutation sweep starts the binary itself and asks no label.
+dss_label_repo_guard(core/test_filesystem_queries_guard)
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

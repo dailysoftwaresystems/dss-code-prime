@@ -1,1 +1,1 @@
-                        /*payload2=*/layout->align.bytes());
+                        /*payload2=*/argumentOwnAlignment(aggTy, *layout));

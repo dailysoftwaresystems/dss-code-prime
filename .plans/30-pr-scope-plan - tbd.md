@@ -11,14 +11,14 @@
 > The decisions in §4 are the orchestrator's, under the operator's order of 2026-09-21 (*"you do everything"*),
 > and each one is veto-able.
 
-## 0. Where we are (MEASURED 2026-11-13, checkpoint 42 = fold H6b on `1111dbb2`)
+## 0. Where we are (MEASURED 2026-11-13, checkpoint 43 = fold f26c2 on `3da11836`)
 
-**687 open rows.**
+**688 open rows.**
 
 | band | OPEN | DISCLOSED | GATED | total |
 |---|---|---|---|---|
 | P0 | 2 | 25 | — | 27 |
-| P1 | 44 | 51 | 1 | 96 |
+| P1 | 44 | 52 | 1 | 97 |
 | P2 | 140 | 57 | 21 | 218 |
 | P3 | 221 | 7 | 103 | 331 |
 | P4 | 8 | — | 3 | 11 |
@@ -28,8 +28,8 @@
 
 | PR | rows | what |
 |---|---|---|
-| **PR #59** (current) | 102 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 33 of the 102 carry FIX FOLDED in their trigger or closing (a match at checkpoint 42, `scope/count_pr59_fix_folded.py`) and close when their arms pass and their review findings are answered; the round-close sweep's group holds two more fixed rows |
-| **the next PR** | 468 | every remaining actionable row, in three rounds; plus full debug information (§3) |
+| **PR #59** (current) | 104 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 33 of the 104 carry FIX FOLDED in their trigger or closing (a match at checkpoint 43, `scope/count_pr59_fix_folded.py`) and close when their arms pass and their review findings are answered; the round-close sweep's group holds two more fixed rows |
+| **the next PR** | 467 | every remaining actionable row, in three rounds; plus full debug information (§3) |
 | **the capability PR** | 21 | plan 28's boot half, plan 09.5's tier skeleton with its C harmlessness proof, plan 16's codesign |
 | **the wasm32 PR** | 1 | plan 18, the first ILP32 target |
 | **the C++ PR** | 2 | the second source language and the second embedding language |
@@ -40,7 +40,7 @@
   - weeks 33–36: 161, 147, 197, 127;
   - weeks 37–41: 40, 44, 163, 54, 32;
   - week 43 so far: 13.
-- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 95 opened (3 created, 92 disclosed): counted −25, REAL net +67** (2026-11-13, at checkpoint 42). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
+- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 96 opened (3 created, 93 disclosed): counted −25, REAL net +68** (2026-11-13, at checkpoint 43). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
 - (read 2026-10-22) **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
 
 ## 1. PR #59 — the exit scope
@@ -56,13 +56,13 @@ The merge is the operator's.
 
 ### 1.1 Folds, in order
 
-`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c` ✔ (checkpoint 40: its code; its rows stay open on the review's send-back) `→ H6` ✔ (checkpoint 41: its code; the review sent it back) `→ H6b` ✔ (checkpoint 42: the walk-up class's home audit and the several-unit verb) `→ f26c2 → 3e → L2b2 → f26d → 3f → 3g → 3h → L2b3 (wherever ready, before H7) → H7`, then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
+`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c` ✔ (checkpoint 40: its code; its rows stay open on the review's send-back) `→ H6` ✔ (checkpoint 41: its code; the review sent it back) `→ H6b` ✔ (checkpoint 42: the walk-up class's home audit and the several-unit verb) `→ f26c2` ✔ (checkpoint 43: the answer to f26c's review, the convention's argument alignment, the padding as a class) `→ 3e → L2b2 → f26d → 3f → 3g → 3h → L2b4 → L2b3 → H6c → H6d → H7` (L2b4, L2b3 and H6c wherever ready, before H7; H6c after 3e; H6d after 3e, L2b2 and H6c), then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
 
 | lane | rows (§8 A.1) | what it is |
 |---|---|---|
-| `lm` | 35 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement, the try/except and `#if` truth P0s; L2a2 and L2b1 folded (checkpoints 36, 37); L2b2: every asker on the binder sketch's homes, the type-name reader with the finish() oracle retired, the variadic surface's names exactly where the references' headers make them visible, the va_list record recognized by identity, a type name in a value position refused, and L2b's own rows |
-| `cs` | 26 | f26c FOLDED (checkpoint 40: the stacked-argument realignment, the SysV memory class, the order-aware lookup, the implicit declaration, `mode`, the conditional's composite), its rows open until their arms pass and the review's 15 findings are answered; f26c2: that answer (COMPLEX_X87 first, every arm's red set, the aapcs64 stacked slot); f26d: the shipped `<windows.h>` constants and declarations P0 first, then the P1–P3 rows |
-| `xa` | 31 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; 3d FOLDED (checkpoint 39); 3e: the review of 3d's answer — ONE entry election over every route and grammar (an archive member, a `.s`, no `--language`, `/ENTRY`), the audited X8 and X9 plans — and the `strtol` half of the client-import P0; 3f on: the chained unwind, the home audits, the relocatable objects' unwind tables, shared-library initializers, the non-alloc carry, each fold at a measured boundary |
+| `lm` | 37 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement, the try/except and `#if` truth P0s; L2a2 and L2b1 folded (checkpoints 36, 37); L2b2: every asker on the binder sketch's homes, the type-name reader with the finish() oracle retired, the variadic surface's names exactly where the references' headers make them visible, the va_list record recognized by identity, a type name in a value position refused, and L2b's own rows |
+| `cs` | 25 | f26c FOLDED (checkpoint 40: the stacked-argument realignment, the SysV memory class, the order-aware lookup, the implicit declaration, `mode`, the conditional's composite); f26c2 FOLDED (checkpoint 43: the answer to its review — COMPLEX_X87, every arm's red set, the alignment an arm64 convention reads of an argument, the AAPCS64 even pair and its padding closed as a class, a call without a prototype, the linkage tables of every declaration row), its rows open until their arms pass; f26d: the wide `_BitInt`'s alignment as a target fact FIRST (ledger 587), then the shipped `<windows.h>` constants and declarations P0, then the P1–P3 rows |
+| `xa` | 32 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; 3d FOLDED (checkpoint 39); 3e: the review of 3d's answer — ONE entry election over every route and grammar (an archive member, a `.s`, no `--language`, `/ENTRY`), the audited X8 and X9 plans — and the `strtol` half of the client-import P0; 3f on: the chained unwind, the home audits, the relocatable objects' unwind tables, shared-library initializers, the non-alloc carry, each fold at a measured boundary |
 | `hm` | 8 | the PE platform runtime, FOLDED (H5, checkpoint 38); H6 FOLDED (checkpoint 41: every Win32 file and process call at any length, one Win32 root parse, the import bound, the file URI); H6b FOLDED (checkpoint 42: the walk-up class's HOME AUDIT, every Win32 call on a path taking its reference spelling once by use, one path-spelling home, the several-unit verb `runEveryUnit`, the profile report's block), its rows open until its arms pass; H7: the file URI carries `\?\` and `\.\` as the client's codec does (ledger 562), then the compiler-support routines reference objects call, format-wide if the ELF and Mach-O census says so |
 | first lane to free | 2 | the shipped-constants P0, and the SysV memory-class ABI P0 |
 | round-close sweep | 2 | fixed rows whose arms have not been read |
@@ -210,20 +210,18 @@ Each fold is a pushed checkpoint. Each round ends with the 8-run gate, the arm s
 
 ## 8. Every open row, placed
 
-Generated from the production registry at plan 30's measurement: 687 rows, each placed once.
+Generated from the production registry at plan 30's measurement: 688 rows, each placed once.
 A row closed since then still resolves (the done registry), and the next refresh drops it.
 
 ### A.1 PR #59 (current)
 
-#### cs (f26c2, f26d) — 26
+#### cs (f26c2, f26d) — 25
 
 - [[D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE]] (P0)
 - [[D-C-AN-ATTRIBUTE-AFTER-A-REFERRED-TAG-NAMES-ANOTHER-TAG-AND-ONE-IN-A-TYPE-NAME-IS-REFUSED]] (P0)
 - [[D-C-PE-DECLSPEC-IS-ERASED-SO-ALIGN-AND-THREAD-STORAGE-ARE-SILENTLY-DROPPED]] (P0)
 - [[D-C-WEAK-ON-AN-INFERRED-TYPE-OBJECT-IS-SILENTLY-DROPPED]] (P0)
-- [[D-FFI-SHIPPED-CONSTANTS-TYPED-OTHERWISE-THAN-THE-REAL-HEADERS]] (P0)
 - [[D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME]] (P0)
-- [[D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE]] (P0)
 - [[D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET]] (P0)
 - [[D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION]] (P1)
 - [[D-C-A-CALLING-CONVENTION-ATTRIBUTE-NAMING-ANOTHER-CONVENTION-IS-REFUSED-NOT-EMITTED]] (P1)
@@ -237,6 +235,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-CSUBSET-ATTRIBUTE-TYPE-POSITION]] (P1)
 - [[D-LIR-GUARDED-RANGE-DOES-NOT-COVER-BLOCKS-THE-LOWERING-CREATES]] (P1)
 - [[D-LK-FOREIGN-OBJECT-THREAD-LOCAL-DEFINITION-REFUSED-AT-READ]] (P1)
+- [[D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64]] (P1)
 - [[D-C-A-MEMBER-WITH-A-RUNTIME-BOUND-IS-READ-AS-A-FLEXIBLE-MEMBER]] (P2)
 - [[D-C-AN-ARRAY-OF-UNKNOWN-SIZE-IS-REFUSED-WHERE-IT-IS-NO-OBJECT]] (P2)
 - [[D-CSUBSET-COMPOSITE-ALIGNED-HIR-TEXT]] (P2)
@@ -255,7 +254,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-AUDIT-P68-ROUND-12-MINOR-FINDINGS]] (P3)
 - [[D-AUDIT-P68-ROUND-13-MINOR-FINDINGS]] (P3)
 
-#### lm (L2b2, L2b3) — 35
+#### lm (L2b2, L2b3) — 37
 
 - [[D-C-A-BIT-FIELD-NARROWER-THAN-INT-IS-NOT-PROMOTED-TO-INT]] (P0)
 - [[D-C-A-DECLARATORS-NAME-IS-BOUND-AT-THE-END-OF-ITS-DECLARATION]] (P0)
@@ -266,8 +265,10 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-C-GENERIC-SELECTION-BEFORE-THE-EXPRESSION-PASS-SELECTS-DEFAULT]] (P0)
 - [[D-CE-UNSIGNED-UNARY-RESULT-NOT-REDUCED-TO-ITS-TYPE]] (P0)
 - [[D-CSUBSET-CONST-REF-DECLARED-NARROWING]] (P0)
+- [[D-FFI-SHIPPED-CONSTANTS-TYPED-OTHERWISE-THAN-THE-REAL-HEADERS]] (P0)
 - [[D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER]] (P0)
 - [[D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER]] (P0)
+- [[D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE]] (P0)
 - [[D-MIR-TRY-HANDLER-SHARED-FILTER-VALUE-ABORTS-IN-RELEASE]] (P0)
 - [[D-PP-IF-TRUTH-RESULT-IS-AN-INT-NOT-INTMAX]] (P0)
 - [[D-C-A-CONSTANT-EXPRESSION-POSITION-ACCEPTS-A-BARE-COMMA-AND-REFUSES-A-PARENTHESISED-ONE]] (P1)
@@ -298,7 +299,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY]] (P2)
 - [[D-PLAN00-D14-FC4-DECLARATOR-SUBSTRATE-SCOPE-DESIGN-CHOSEN]] (P3)
 
-#### xa (3e, 3f, 3g, 3h) — 31
+#### xa (3e, 3f, 3g, 3h) — 32
 
 - [[D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE]] (P0)
 - [[D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN]] (P0)
@@ -324,6 +325,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION]] (P2)
 - [[D-LK-COFF-FOREIGN-UNWIND-DROP]] (P2)
 - [[D-LK-FOREIGN-NON-ALLOC-SECTIONS-ARE-NOT-CARRIED]] (P2)
+- [[D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC]] (P2)
 - [[D-LK-PE-DLL-EXPORTS-AN-OVERRIDABLE-WEAK-NAME]] (P2)
 - [[D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE]] (P2)
 - [[D-LK-SHARED-LIBRARY-RUNS-NO-STATIC-INITIALIZERS]] (P2)
@@ -476,7 +478,7 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-SEMANTIC-MAYBE-UNINITIALIZED-WARN]] (P2)
 - [[D-TOKENIZER-FORMFEED-SCHEMA-CURSOR-DESYNC]] (P2)
 
-#### R2, lane B — 52
+#### R2, lane B — 51
 
 - [[D-AS-REWRITE-CALL-HOISTED-ABOVE-ARG-CAPTURE]] (P2)
 - [[D-AS4-ARM64-INDEXED-LEA-SCALE]] (P2)
@@ -513,7 +515,6 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-LK-MACHO-MISSING-CONST-SECTION-RETURNS-EMPTY-SILENTLY]] (P2)
 - [[D-LK-MACHO-MULTI-ITEM-SECTION-PADDING]] (P2)
 - [[D-LK-MACHO-STACK-RESERVE-LC-MAIN]] (P2)
-- [[D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC]] (P2)
 - [[D-LK-STATIC-LINK-PCREL-MULTIATOM-DATA]] (P2)
 - [[D-LK1-MACHO-RODATA-DATAITEM-RELOC]] (P2)
 - [[D-LK2-DLL-DLLMAIN-ENTRY]] (P2)

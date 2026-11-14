@@ -9650,14 +9650,26 @@ TEST(SemanticAnalyzerC, ACallBeforeAnyDeclarationDeclaresItsCalleeImplicitly) {
         ASSERT_EQ(in.fnParams(rec.type).size(), c.params) << c.src;
         EXPECT_EQ(in.kind(in.fnParams(rec.type)[0]), c.first) << c.src;
     }
-    // A later call whose promoted arguments differ from the first's: at most one can match the
-    // definition, so the second is refused by name.
+    // A LATER CALL WHOSE PROMOTED ARGUMENTS DIFFER FROM THE FIRST'S is taken (P69 fold f26c2, review-
+    // csf26c F6): the implicit declaration gives no prototype, so each call passes its own promoted
+    // arguments and is undefined only when it is EXECUTED against a definition it does not match.
+    // ✔MEASURED (lane `cs` probe ic2, each built and RUN, the mismatched call guarded): gcc 13.3.0,
+    // mingw-w64 gcc 13.2.0, cl 19.51 and clang 18.1.3 at -std=c89. The declaration keeps the first
+    // call's type; it was refused (S_ImplicitDeclarationConflicts) before f26c2.
     for (char const* src : {"int b(void) { return g(40) + g(1.0); }\n",
                             "int b(void) { return g(40) + g(1, 2); }\n"}) {
         auto model = analyzeShipped("c", {src});
-        EXPECT_TRUE(model.hasErrors()) << src;
-        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitDeclarationConflicts), 1u)
+        EXPECT_FALSE(model.hasErrors()) << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitDeclarationConflicts), 0u)
             << src;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitFunctionDeclaration), 1u)
+            << src;
+        auto const implicit = model.implicitDeclarations();
+        ASSERT_EQ(implicit.size(), 1u) << src;
+        auto const& in = model.lattice().interner();
+        auto const& rec = model.symbols()[implicit[0].v];
+        ASSERT_EQ(in.fnParams(rec.type).size(), 1u) << src << ": the first call's type";
+        EXPECT_EQ(in.kind(in.fnParams(rec.type)[0]), TypeKind::I32) << src;
     }
     // CONTROLS: a use that is no call declares nothing; a later OBJECT of the name is no function.
     for (char const* src : {"int (*b(void))(int) { return &g; }\n",
@@ -9665,6 +9677,82 @@ TEST(SemanticAnalyzerC, ACallBeforeAnyDeclarationDeclaresItsCalleeImplicitly) {
         auto model = analyzeShipped("c", {src});
         EXPECT_TRUE(model.hasErrors()) << src;
         EXPECT_TRUE(model.implicitDeclarations().empty()) << src;
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F6; main's ledger 554): A DECLARATION WITH AN EMPTY PARAMETER LIST
+// GIVES ITS FUNCTION NO PROTOTYPE (`int f();`, a declaration that is not a definition), the implicit declaration's
+// home: a call that sees no prototype passes its own promoted arguments (C 6.5.2.2p6), and a prototype of it is its
+// type from there on (C 6.2.7p3). ✔MEASURED (lane `cs` probe np2, each built and RUN, the mismatched call guarded):
+// `int f();`, calls whose promoted arguments differ, then `int f(int x)` -- gcc 13.3.0 and clang 18.1.3 at their
+// default standard, mingw-w64 gcc 13.2.0, Apple clang and cl 19.51 at its default standard and /std:clatest run it
+// (only -std=c2x refuses: C23 reads `()` as `(void)`); DSS refused it as an incompatible redeclaration. Probe np3: a
+// prototype C 6.7.6.3p15 does not make compatible with `int f();` (`char`, `short`, `float`, `...`; either order) --
+// cl builds and runs every one, silent; gcc, clang, mingw-w64 gcc and Apple clang refuse them ("conflicting types"),
+// and build the compatible ones (`long`, `double`). Taken, as cl takes it, and warned
+// (S_PrototypeIncompatibleWithADeclarationWithoutOne).
+// CONTROLS: `(void)` declares a prototype of no parameters, and a DEFINITION's empty list stays one (C23's reading;
+// an identifier list -- K&R -- is a definition of its own kind).
+//
+// RED-ON-DISABLE: drop the C document's `emptyListDeclaresNoPrototype` (or the predicate that reads it) and every
+// call of the accepted cells passes too many arguments; drop the p15 arm and the pairs are incompatible
+// redeclarations.
+TEST(SemanticAnalyzerC, ADeclarationWithAnEmptyParameterListGivesItsFunctionNoPrototype) {
+    auto const warnedIncompatible = [](SemanticModel const& m) {
+        return countCode(m.diagnostics(), DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne);
+    };
+    struct Cell {
+        char const* what;
+        char const* src;
+        std::size_t warned;   // S_PrototypeIncompatibleWithADeclarationWithoutOne
+    };
+    for (Cell const c : {
+             Cell{"np2 cell 1: calls whose promoted arguments differ, then the definition",
+                  "int f();\nint main(int c, char **v) { (void)v; if (c > 5) return f(2.5); return f(42) - 40; }\n"
+                  "int f(int x) { return x; }\n",
+                  0},
+             Cell{"np2 cell 2: one call, then the definition",
+                  "int f();\nint main(void) { return f(42) - 40; }\nint f(int x) { return x; }\n", 0},
+             Cell{"another unit defines it: three calls, three types",
+                  "int f();\nint g(void) { return f(1) + f(2.5) + f(1, 2); }\n", 0},
+             Cell{"a block-scope declaration", "int g(void) { int f(); return f(42); }\n", 0},
+             Cell{"a parenthesized designator", "int f();\nint g(void) { return (f)(42); }\n", 0},
+             Cell{"a prototype written before the call is its type",
+                  "int f();\nint f(int);\nint g(void) { return f(2.5); }\n", 0},
+             Cell{"np3 cell 6: then `int f(long x)` (compatible)",
+                  "int f();\nint f(long x) { return (int)x; }\nint main(void) { return f(2); }\n", 0},
+             Cell{"np3 cell 7: then `int f(double x)` (compatible)",
+                  "int f();\nint f(double x) { return (int)x; }\nint main(void) { return f(2.0); }\n", 0},
+             Cell{"np3 cell 1: then `int f(char c)`",
+                  "int f();\nint f(char c) { return c; }\nint main(void) { return f(2); }\n", 1},
+             Cell{"np3 cell 2: then `int f(float x)`",
+                  "int f();\nint f(float x) { return (int)x; }\nint main(void) { return f(2.0); }\n", 1},
+             Cell{"np3 cell 3: then `int f(int a, ...)`",
+                  "int f();\nint f(int a, ...) { return a; }\nint main(void) { return f(2); }\n", 1},
+             Cell{"np3 cell 4: `int f(char c);` first",
+                  "int f(char c);\nint f();\nint f(char c) { return c; }\nint main(void) { return f(2); }\n", 1},
+             Cell{"np3 cell 5: then `int f(short s)`",
+                  "int f();\nint f(short s) { return s; }\nint main(void) { return f(2); }\n", 1},
+         }) {
+        SCOPED_TRACE(c.what);
+        auto model = analyzeShipped("c", {c.src});
+        std::string said;
+        for (auto const& d : model.diagnostics().all()) said += std::string(d.actual) + "\n";
+        EXPECT_FALSE(model.hasErrors()) << said;
+        EXPECT_EQ(warnedIncompatible(model), c.warned) << said;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration), 0u) << said;
+        bool none = false;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            none = none || (model.symbols()[i].name == "f" && model.symbols()[i].declaresNoPrototype);
+        EXPECT_TRUE(none) << "a record of `f` declares no prototype";
+    }
+    // CONTROLS: `(void)`, and a definition's empty list, declare a prototype of no parameters.
+    for (char const* src : {"int f(void);\nint g(void) { return f(42); }\n",
+                            "int f() { return 0; }\nint g(void) { return f(42); }\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(model.hasErrors()) << src << ": a prototype of no parameters takes no argument";
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            EXPECT_FALSE(model.symbols()[i].declaresNoPrototype) << src;
     }
 }
 

@@ -1038,6 +1038,54 @@ naturalScalarAlignment(std::uint32_t sizeBytes,
     return (cap != 0 && size > cap) ? cap : size;
 }
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): WHICH alignment of a by-value
+// aggregate a calling convention places it by — the OWN alignment the caps below then
+// clamp. Two questions, measured to have different answers, so two keys:
+//   * `aggregateAlignmentOf` — the TYPE's alignment, its own whole-composite request
+//     included (SysV; Apple arm64), or its MEMBERS' alignment before that request
+//     (AAPCS64: "the natural alignment of a composite type is the maximum of each of
+//     the member alignments of the 'top-level' members ... before any alignment
+//     adjustment of the entire composite is applied" — `StructLayout::membersAlign`);
+//   * `homogeneousAggregateAlignmentOf` — whether a homogeneous floating-point
+//     aggregate (the classifier's HFA, `AbiPassing::homogeneousElementBytes`) is
+//     placed by that alignment (AAPCS64) or by its ELEMENT's (Apple arm64).
+// ✔MEASURED (lane `cs`, probe f14; -O1 asm, callee and caller, named and through `...`,
+// each after one stacked scalar): aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 put
+// `struct { _Alignas(16) long a; long b; }` and `struct { __int128 v; }` at +16 and
+// `struct __attribute__((aligned(16))) { long a, b; }` at +8; Apple clang 21 puts all
+// three at +16; an HFA `struct { _Alignas(32) double a, b, c, d; }` sits at +16 on
+// Linux and at +8 on Apple.
+enum class AggregateAlignmentSource : std::uint8_t {
+    Type    = 0,  // the type's alignment (C 6.7.5: its members', raised by its own request)
+    Members = 1,  // its members' alignment, before its own request
+};
+inline constexpr EnumNameTable<AggregateAlignmentSource, 2> kAggregateAlignmentSourceTable{{{
+    { AggregateAlignmentSource::Type,    "type"    },
+    { AggregateAlignmentSource::Members, "members" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kAggregateAlignmentSourceTable);
+
+enum class HomogeneousAggregateAlignmentSource : std::uint8_t {
+    Aggregate = 0,  // as any other aggregate (`aggregateAlignmentOf`)
+    Element   = 1,  // its element's alignment
+};
+inline constexpr EnumNameTable<HomogeneousAggregateAlignmentSource, 2>
+    kHomogeneousAggregateAlignmentSourceTable{{{
+        { HomogeneousAggregateAlignmentSource::Aggregate, "aggregate" },
+        { HomogeneousAggregateAlignmentSource::Element,   "element"   },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kHomogeneousAggregateAlignmentSourceTable);
+
+// The alignments of one by-value aggregate the convention may place it by — the
+// layout's two (`StructLayout::align`, `membersAlign`) and, for an HFA, its element's
+// (0 when it is not one). The single owner of the choice is
+// `StackArgPackingRules::aggregateOwnAlignment`.
+struct AggregateAlignments {
+    std::uint32_t type               = 0;
+    std::uint32_t members            = 0;
+    std::uint32_t homogeneousElement = 0;
+};
+
 // The three measured PACKING axes plus the two measured ALIGNMENT CAPS, declared
 // per calling convention. An OMITTED `stackArgPacking` object (and an omitted key
 // inside it) means `Slot` / cap 0, so every pre-existing CC is byte-unchanged by
@@ -1060,11 +1108,18 @@ naturalScalarAlignment(std::uint32_t sizeBytes,
 //   x86_64 SysV   `struct aligned(16){long x,y;}`    → +16
 //   x86_64 SysV   `struct aligned(32){long x,y;}`    → +32           ⇒ cap ≥ 32
 //   AAPCS64       binary128 `long double`            → +16           ⇒ scalar cap 16
-//   AAPCS64       `struct aligned(16){long x,y;}`    → +8            ⇒ aggregate cap 8
+//   AAPCS64       `struct aligned(16){long x,y;}`    → +8
 // ★ The last two rows are why this is CONFIG and not a constant: the two ABIs
 // give the SAME 16-byte-aligned aggregate DIFFERENT answers, and the third and
 // fourth rows are why it cannot be derived from the datum's SIZE — two 16-byte
 // aggregates with different alignments land at different offsets.
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the AAPCS64 row's +8 was read as
+// "aggregate cap 8", and that was the wrong reading. The cap is 16, and the attribute
+// drops out because AAPCS64 places a composite by its MEMBERS' alignment
+// (`aggregateAlignmentOf`). ✔MEASURED (probe f14): `struct { _Alignas(16) long a;
+// long b; }` and `struct { __int128 v; }` go to +16 on gcc 13.3.0 and clang 18.1.3
+// for aarch64. Under the old reading DSS put both at +8, where neither callee reads
+// them.
 struct StackArgPackingRules {
     StackArgPacking namedScalars    = StackArgPacking::Slot;
     StackArgPacking namedAggregates = StackArgPacking::Slot;
@@ -1108,6 +1163,32 @@ struct StackArgPackingRules {
     };
     AlignmentCap maxScalarAlignment{};
     AlignmentCap maxAggregateAlignment{};
+    // ★ P69 (lane `cs`, fold f26c2): which alignment of a by-value aggregate is its OWN
+    // here (`AggregateAlignmentSource`, above). Omitted ⇒ the type's, as before.
+    AggregateAlignmentSource            aggregateAlignmentOf = AggregateAlignmentSource::Type;
+    HomogeneousAggregateAlignmentSource homogeneousAggregateAlignmentOf =
+        HomogeneousAggregateAlignmentSource::Aggregate;
+
+    // THE ONE ANSWER to "what is this aggregate's own alignment under this convention",
+    // the `ownAlign` every tier then hands `aggregateAlignment` — the caller's carrier
+    // states it, the callee's incoming cursor, `va_arg` and the frame's realignment read
+    // it, and the register-pair rule (`TargetCallingConvention::evenGprPairAlignment`)
+    // compares it. 0 in a field it reads ⇒ unstated ⇒ the slot, as `honoured` floors it.
+    [[nodiscard]] constexpr std::uint32_t
+    aggregateOwnAlignment(AggregateAlignments a) const noexcept {
+        switch (homogeneousAggregateAlignmentOf) {
+            case HomogeneousAggregateAlignmentSource::Element:
+                if (a.homogeneousElement != 0) return a.homogeneousElement;
+                break;
+            case HomogeneousAggregateAlignmentSource::Aggregate:
+                break;
+        }
+        switch (aggregateAlignmentOf) {
+            case AggregateAlignmentSource::Members: return a.members;
+            case AggregateAlignmentSource::Type:    break;
+        }
+        return a.type;
+    }
 
     [[nodiscard]] constexpr std::uint32_t
     scalarAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
@@ -1397,9 +1478,28 @@ struct DSS_EXPORT TargetCallingConvention {
     // ⇒ the classic flat slot stride. `sysv_amd64` declares
     // `maxScalarAlignment`/`maxAggregateAlignment` so a stacked `long double`
     // (and a long-double-leaf aggregate) lands on the 16-byte boundary the x87
-    // ABI requires; `aapcs64` declares the scalar cap only, because a 16-byte
-    // aggregate is measurably NOT over-aligned there.
+    // ABI requires. ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): `aapcs64`
+    // declared the scalar cap only, on the reading that a 16-byte aggregate is not
+    // over-aligned there. That reading took a composite's OWN `aligned(16)` for its
+    // alignment, which AAPCS64 does not; it now declares the aggregate cap too, with
+    // the members as the aggregate's alignment (`StackArgPackingRules::
+    // aggregateAlignmentOf`).
     StackArgPackingRules stackArgPacking{};
+
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14, its register half): the
+    // alignment from which an argument passed in GENERAL registers begins at an
+    // EVEN-numbered one — AAPCS64 C.8, "If the argument has an alignment of 16 then
+    // the NGRN is rounded up to the next even number". 0 = never (omitted). The
+    // argument's alignment is the one `stackArgPacking` places it by on the stack
+    // (`aggregateOwnAlignment`), so the register and the stack placement of one
+    // argument read one fact. Today it bites on a by-value aggregate and a 128-bit
+    // integer, the only arguments that take two general registers. ✔MEASURED (lane
+    // `cs`, probe f14r, one `long` in x0 first): aarch64-linux-gnu-gcc 13.3.0 and clang
+    // 18.1.3 take x2:x3 for `__int128`, `struct { __int128 v; }` and `struct {
+    // _Alignas(16) long a; long b; }`, named and through `...` (va_arg rounds
+    // `__gr_offs` up to 16), and x1:x2 for `struct __attribute__((aligned(16))) { long
+    // a, b; }`; Apple clang 21 takes x1:x2 for all of them, so `apple_arm64` states 0.
+    std::uint16_t evenGprPairAlignment = 0;
 
     // The convention's BY-VALUE AGGREGATE RULES as ONE value (`AggregateConventionRules`, aggregate_layout.hpp,
     // where each field's meaning is stated): the FC7 classification strategy and register-size bound

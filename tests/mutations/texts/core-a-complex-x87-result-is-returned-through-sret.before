@@ -1,0 +1,1 @@
+    if (in.kind(aggTy) == TypeKind::Complex && in.kind(in.complexElement(aggTy)) == TypeKind::F80) {

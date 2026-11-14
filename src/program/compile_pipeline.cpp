@@ -942,31 +942,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the
     // sret mechanism follows the CC's indirect-result register (absent ⇒ hidden
     // first INTEGER arg, SysV/Win64; present ⇒ x8, AAPCS64 — C3).
-    if (auto const* cc = target.callingConvention(callingConventionIndex)) {
-        // The convention's by-value aggregate rules, WHOLE (`AggregateConventionRules`: the FC7 strategy and
-        // register-size bound, the stack-exhaust policy of D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS,
-        // the MEMORY-class argument carrier of D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET
-        // and the X87UP rule) -- one assignment, so a key the row gains reaches the classifier with no
-        // second edit here (P69 lane `cs`, fold f26c, main's ledger 455).
-        mirCfg.aggregate = cc->aggregate;
-        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-        mirCfg.argSlotAligned           = cc->slotAligned;
-        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register
-        // pool counts (the agnostic source for the all-or-nothing fit check on
-        // every call); the stack-exhaust policy rides in `aggregate` above.
-        mirCfg.argGprCount              =
-            static_cast<std::uint32_t>(cc->argGprs.size());
-        mirCfg.argFprCount              =
-            static_cast<std::uint32_t>(cc->argFprs.size());
-        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
-        // packing rules — HIR→MIR needs them for `va_start`'s overflow base, which
-        // is the byte span of the named params that overflowed onto the incoming
-        // stack and therefore depends on how those params are packed.
-        mirCfg.stackArgPacking          = cc->stackArgPacking;
-        // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
-        // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
-        mirCfg.vaListLayout             = cc->vaListLayout;
-    }
+    // The convention's facts are assembled by their ONE home (`takeCallingConvention`, beside
+    // `languageMirLoweringConfig`), which every fixture lowering under a named convention calls too.
+    if (auto const* cc = target.callingConvention(callingConventionIndex))
+        takeCallingConvention(mirCfg, *cc);
     phase.emplace(substrate::CompilePhase::LowerMir);
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
@@ -1530,7 +1509,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           // the assembly dialect's `symbolParts`.
                           assemblyFormatKind,
                           // P69 fold 3d: the names the image will define.
-                          std::move(imageDefinedNames));
+                          std::move(imageDefinedNames),
+                          // P69 fold f26c2: the convention HIR→MIR lowered under.
+                          callingConventionIndex);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }

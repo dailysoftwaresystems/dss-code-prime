@@ -8588,12 +8588,21 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
     EXPECT_FALSE(aligned->alignRepeatTakesLast);
     EXPECT_TRUE(aligned->leadingDecoratesDefinitionOf.empty());
 
-    for (char const* name : {"naked", "__declspec(allocate)"}) {
-        AttributeSemanticsRow const* const row = rowNamed(name);
-        ASSERT_NE(row, nullptr) << name;
-        EXPECT_EQ(row->effect, AttributeEffect::Unsupported) << name;
-        EXPECT_FALSE(row->reason.empty()) << name;
+    // ★ P69 (lane `cs`, fold f26c2; main's feature-query item): EVERY `unsupported` row states the reason it is
+    // refused, in both spellings -- derived from the table, so a row added under the verb tomorrow is asked here
+    // without anyone remembering to (this was a hand list of two names, the shape that left `mode` called refused
+    // in a sibling binary after f26c gave it a row that honours it).
+    std::size_t unsupportedPlain = 0;
+    std::size_t unsupportedQualified = 0;
+    for (auto const& row : sem.attributeEffects) {
+        if (row.effect != AttributeEffect::Unsupported) continue;
+        for (auto const& n : row.names) {
+            EXPECT_FALSE(row.reason.empty()) << n << " is refused by name, and says why";
+            ++(n.find('(') == std::string::npos ? unsupportedPlain : unsupportedQualified);
+        }
     }
+    EXPECT_GT(unsupportedPlain, 0u) << "the loop asked no plain `unsupported` name";
+    EXPECT_GT(unsupportedQualified, 0u) << "the loop asked no qualified `unsupported` name";
     for (char const* name : {"__declspec(dllimport)", "__declspec(dllexport)",
                              "__declspec(restrict)", "__declspec(noalias)",
                              "__declspec(thread)"}) {
@@ -9969,4 +9978,146 @@ TEST(GrammarSchema, DeclaratorsScopeBeginsAfterDeclaratorIsABoolean) {
     ASSERT_TRUE(r.has_value());
     ASSERT_TRUE((*r)->semantics().declarators.has_value());
     EXPECT_FALSE((*r)->semantics().declarators->scopeBeginsAfterDeclarator);
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9; main's ledgers 540, 551, 552): A DECLARATION ROW TAKES ANOTHER
+// ROW'S LINKAGE TABLES BY `linkageTablesFrom`, stating only what differs. The shipped document's two inferred-type rows
+// take them -- `autoInferredVarDecl` from `varDecl`, `autoInferredTopLevelDecl` from `topLevelDecl` -- each stating
+// the storage-class entries C23 6.7.2p4 makes differ where the type is inferred. So every entry of the named row is
+// the taking row's too, each one it does not state equal effect for effect, the ones it states DIFFERENT (an equal
+// one is refused), and every ignored list is the named row's -- read off the LOADED rules, whatever the named row
+// says today. Then the refusals, each by name at the key's path, each on a copy of the shipped document with one
+// thing changed: a value that is not a string, a rule no other row has, a named row that states no table, a named
+// row that itself takes them, an own entry and an own list equal to what they replace. CONTROL: an own list that
+// differs replaces the named row's whole, and the document loads.
+//
+// RED-ON-DISABLE: drop the merge (the row reads only the tables it states) and the inferred rows lose every taken
+// entry and every ignored list; drop the restatement refusal and its cell loads clean.
+TEST(GrammarSchema, ARowTakesAnotherRowsLinkageTablesAndStatesOnlyWhatDiffers) {
+    std::string const text = shippedCTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    auto const shipped = GrammarSchema::loadFromText(text);
+    ASSERT_TRUE(shipped.has_value()) << errorDiags(shipped.error());
+    auto const rowOf = [](GrammarSchema const& s, std::string_view rule) -> DeclarationRule const* {
+        RuleId const id = s.rules().find(rule);
+        if (!id.valid()) return nullptr;
+        for (auto const& d : s.semantics().declarations)
+            if (d.rule.v == id.v) return &d;
+        return nullptr;
+    };
+    struct Pair {
+        char const* taker;
+        char const* from;
+    };
+    constexpr Pair kPairs[2] = {{"autoInferredVarDecl", "varDecl"}, {"autoInferredTopLevelDecl", "topLevelDecl"}};
+    std::size_t keys = 0;
+    for (std::size_t at = text.find("\"linkageTablesFrom\":"); at != std::string::npos;
+         at = text.find("\"linkageTablesFrom\":", at + 1))
+        ++keys;
+    EXPECT_EQ(keys, std::size(kPairs)) << "the shipped document's takers are exactly the pairs asked below";
+    for (Pair const& p : kPairs) {
+        SCOPED_TRACE(std::string{p.taker} + " takes " + p.from);
+        DeclarationRule const* const taker = rowOf(**shipped, p.taker);
+        DeclarationRule const* const from  = rowOf(**shipped, p.from);
+        ASSERT_NE(taker, nullptr);
+        ASSERT_NE(from, nullptr);
+        std::size_t differing = 0;
+        for (auto const& [spec, effect] : from->linkageSpecifiers) {
+            auto const it = taker->linkageSpecifiers.find(spec);
+            ASSERT_NE(it, taker->linkageSpecifiers.end()) << spec << " is taken";
+            bool const same = it->second.binding == effect.binding && it->second.visibility == effect.visibility
+                           && it->second.staticStorage == effect.staticStorage
+                           && it->second.threadStorage == effect.threadStorage
+                           && it->second.nonDefining == effect.nonDefining && it->second.imported == effect.imported
+                           && it->second.exclusiveGroup == effect.exclusiveGroup
+                           && it->second.compatibleWith == effect.compatibleWith;
+            if (!same) ++differing;
+        }
+        EXPECT_GT(differing, 0u) << "the row states the storage-class entries that differ where the type is inferred";
+        EXPECT_GT(taker->linkageSpecifiers.size(), differing) << "and takes every other entry";
+        ASSERT_TRUE(taker->linkageSpecifiers.contains("auto")) << "`auto` is an entry of the inferred row";
+        EXPECT_EQ(taker->linkageSpecifierIgnoredKinds.size(), from->linkageSpecifierIgnoredKinds.size());
+        for (std::size_t k = 0; k < from->linkageSpecifierIgnoredKinds.size()
+                                && k < taker->linkageSpecifierIgnoredKinds.size(); ++k)
+            EXPECT_EQ(taker->linkageSpecifierIgnoredKinds[k].v, from->linkageSpecifierIgnoredKinds[k].v);
+        EXPECT_EQ(taker->linkageSpecifierIgnoredRules.size(), from->linkageSpecifierIgnoredRules.size());
+        for (std::size_t k = 0; k < from->linkageSpecifierIgnoredRules.size()
+                                && k < taker->linkageSpecifierIgnoredRules.size(); ++k)
+            EXPECT_EQ(taker->linkageSpecifierIgnoredRules[k].v, from->linkageSpecifierIgnoredRules[k].v);
+        EXPECT_EQ(taker->linkageSpecifierIgnoredNames, from->linkageSpecifierIgnoredNames);
+    }
+
+    // THE REFUSALS. `edited` replaces the first `needle` after `anchor` in a copy of the shipped text.
+    auto const edited = [&](std::string_view anchor, std::string_view needle, std::string_view repl) {
+        std::string t = text;
+        auto const a = t.find(anchor);
+        auto const n = a == std::string::npos ? a : t.find(needle, a);
+        if (n == std::string::npos) {
+            ADD_FAILURE() << "no " << needle << " after " << anchor;
+            return std::string{};
+        }
+        t.replace(n, needle.size(), repl);
+        return t;
+    };
+    auto const refusedWith = [&](std::string const& doc, std::string_view says) {
+        auto const r = GrammarSchema::loadFromText(doc);
+        ASSERT_FALSE(r.has_value()) << says << ": refused";
+        bool said = false;
+        for (auto const& d : r.error())
+            said = said || (d.message.find(says) != std::string::npos
+                            && d.path.find("/linkageTablesFrom") != std::string::npos);
+        EXPECT_TRUE(said) << says << " -- " << errorDiags(r.error());
+    };
+    constexpr std::string_view kVarTaker = "\"rule\": \"autoInferredVarDecl\"";
+    constexpr std::string_view kVarKey = "\"linkageTablesFrom\": \"varDecl\"";
+    refusedWith(edited(kVarTaker, kVarKey, "\"linkageTablesFrom\": 7"), "must be a string");
+    refusedWith(edited(kVarTaker, kVarKey, "\"linkageTablesFrom\": \"noSuchRule\""), "is the rule of no other row");
+    refusedWith(edited(kVarTaker, kVarKey, "\"linkageTablesFrom\": \"identVarDecl\""), "states no linkage table");
+    refusedWith(edited("\"rule\": \"varDecl\"", "\"kind\": \"variable\",",
+                       "\"kind\": \"variable\", \"linkageTablesFrom\": \"topLevelDecl\","),
+                "itself takes its linkage tables");
+    refusedWith(edited(kVarTaker, "\"linkageSpecifiers\": {",
+                       "\"linkageSpecifiers\": { \"thread_local\": { \"threadStorage\": true },"),
+                "restates the 'thread_local' entry");
+    refusedWith(edited(kVarTaker, kVarKey,
+                       std::string{kVarKey} + ", \"linkageSpecifierIgnoredRules\": [\"attrSpec\", \"stdAttr\", "
+                                              "\"alignasSpec\"]"),
+                "restates the list");
+    // CONTROL: an own list that DIFFERS replaces the named row's whole, and the document loads.
+    {
+        std::string const doc = edited(kVarTaker, kVarKey,
+                                       std::string{kVarKey} + ", \"linkageSpecifierIgnoredRules\": [\"attrSpec\", "
+                                                              "\"stdAttr\"]");
+        auto const r = GrammarSchema::loadFromText(doc);
+        ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+        DeclarationRule const* const t = rowOf(**r, "autoInferredVarDecl");
+        ASSERT_NE(t, nullptr);
+        EXPECT_EQ(t->linkageSpecifierIgnoredRules.size(), 2u) << "the own list replaces the named row's whole";
+    }
+
+    // ★★ (F9's second key) `attributeLinkageTablesFrom`: the shipped block rows name externDecl, resolved to its
+    // index; a name no row has, and a row that states no table, are refused by name.
+    {
+        DeclarationRule const* const v = rowOf(**shipped, "varDecl");
+        DeclarationRule const* const x = rowOf(**shipped, "externDecl");
+        ASSERT_NE(v, nullptr);
+        ASSERT_NE(x, nullptr);
+        ASSERT_TRUE(v->attributeLinkageRow.has_value()) << "varDecl's attribute specifiers are read by a row's tables";
+        EXPECT_EQ(&(*shipped)->semantics().declarations[*v->attributeLinkageRow], x) << "externDecl's";
+        constexpr std::string_view kKey = "\"attributeLinkageTablesFrom\": \"externDecl\"";
+        for (auto const& [repl, says] :
+             {std::pair<std::string_view, std::string_view>{"\"attributeLinkageTablesFrom\": \"noSuchRule\"",
+                                                            "which 0 other rows"},
+              std::pair<std::string_view, std::string_view>{"\"attributeLinkageTablesFrom\": \"identVarDecl\"",
+                                                            "states no 'linkageSpecifiers' table"}}) {
+            std::string const doc = edited("\"rule\": \"varDecl\"", kKey, repl);
+            auto const r = GrammarSchema::loadFromText(doc);
+            ASSERT_FALSE(r.has_value()) << says << ": refused";
+            bool said = false;
+            for (auto const& d : r.error())
+                said = said || (d.message.find(says) != std::string::npos
+                                && d.message.find("attributeLinkageTablesFrom") != std::string::npos);
+            EXPECT_TRUE(said) << says << " -- " << errorDiags(r.error());
+        }
+    }
 }

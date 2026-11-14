@@ -1,0 +1,1 @@
+                if (std::uint16_t const a = cc.evenGprPairAlignment; false && a != 0 && (a & (a - 1)) != 0) {

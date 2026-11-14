@@ -106,8 +106,10 @@ struct LeafField {
     // element FLOAT kind. WITHOUT this arm the bare-Complex default below emits ONE
     // zero-size NON-float leaf → the eightbyte mis-classes INTEGER (a silent 2-GPR
     // by-value pass, ABI-divergent at FFI). double _Complex → 2 SSE eightbytes /
-    // 2-double HFA; a long-double-complex leaf (F80/F128) then trips
-    // hasLongDoubleClassLeaf and the aggregate refuses classification — automatic.
+    // 2-double HFA. A long-double complex: on SysV the BARE type is COMPLEX_X87,
+    // answered by `classifyAggregate` before any leaf is collected, and an aggregate
+    // holding one is MEMORY by size; on AAPCS64 a binary128 complex is a two-piece
+    // HFA and an F80 one refuses (`hasF80Leaf`).
     if (k == TypeKind::Complex) {
         TypeId const elem = in.complexElement(ty);
         auto const elemLay = computeLayout(elem, in, lp, dm);
@@ -195,7 +197,19 @@ classifyAggregate(AggregateConventionRules const& rules,
         // HFA element homogeneity: every leaf is the SAME float kind. The member
         // COUNT is size/elem (NOT the leaf count) so a union of N floats — whose
         // members overlap to one element — is a 1-member HFA, while a struct/array
-        // of N packs to N. count must be 1..4 and divide the size evenly.
+        // of N packs to N. count must be 1..4 and divide the size evenly, AND THE
+        // ELEMENTS MUST TILE THE COMPOSITE: a leaf at every multiple of the element
+        // below the size.
+        // ★ P69 (lane `cs`, fold f26c2 — F14's neighbour, the HFA this arm states):
+        // a composite of one floating type WITH PADDING is no HFA. ✔MEASURED (probe hp,
+        // -O1 asm, both sides): aarch64 gcc 13.3.0, clang 18.1.3 and Apple clang pass
+        // `struct { _Alignas(16) double a; }` in x0/x1, `struct { float a;
+        // _Alignas(8) float b; }` and `struct { _Alignas(16) float a; float b; }` in
+        // general registers, and `struct { double a; _Alignas(16) double b; }` (32
+        // bytes) by reference -- clang's rule, `size == members * element`. This arm
+        // counted size/elem alone, so it put each in d0.. as 2 or 4 elements, a slot
+        // the reference never reads. (`struct { _Alignas(32) double a, b, c, d; }`
+        // tiles its 32 bytes and stays a four-double HFA, as all three put it.)
         bool allSameFp = !leaves.empty() && isFloatKind(leaves.front().kind);
         if (allSameFp)
             for (LeafField const& f : leaves)
@@ -204,16 +218,20 @@ classifyAggregate(AggregateConventionRules const& rules,
             std::uint64_t const elem =
                 scalarByteSize(leaves.front().kind, dm).value_or(0);
             if (elem == 0) return std::nullopt;   // un-sized FP leaf → fail loud
-            if (size % elem == 0) {
-                std::uint64_t const count = size / elem;
-                if (count >= 1 && count <= 4) {
-                    AbiPassing hout;
-                    hout.kind = AbiPassing::Kind::InRegisters;
-                    for (std::uint64_t i = 0; i < count; ++i)
-                        hout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr,
-                            i * elem, static_cast<std::uint32_t>(elem)});
-                    return hout;
-                }
+            std::uint64_t const count = size % elem == 0 ? size / elem : 0;
+            bool tiles = count >= 1 && count <= 4;
+            for (std::uint64_t i = 0; tiles && i < count; ++i)
+                tiles = std::any_of(leaves.begin(), leaves.end(), [&](LeafField const& f) {
+                    return f.offset == i * elem;
+                });
+            if (tiles) {
+                AbiPassing hout;
+                hout.kind = AbiPassing::Kind::InRegisters;
+                hout.homogeneousElementBytes = static_cast<std::uint32_t>(elem);
+                for (std::uint64_t i = 0; i < count; ++i)
+                    hout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr,
+                        i * elem, static_cast<std::uint32_t>(elem)});
+                return hout;
             }
         }
         // Non-HFA: ≤16B → ceil(size/8) GPR pieces (1 or 2); >16B / empty → by ref.
@@ -234,6 +252,29 @@ classifyAggregate(AggregateConventionRules const& rules,
 
     // SysVEightbyte (the only other implemented strategy).
     AbiPassing out;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): COMPLEX_X87, psABI 3.2.3's class of the bare complex type
+    // whose element is the x87 `long double`. Asked BEFORE the size rule below, which answered MEMORY for its 32
+    // bytes in both positions: "If the class is COMPLEX_X87, the real part of the value is returned in %st0 and
+    // the imaginary part in %st1" -- so a RESULT is the two x87 values (X87, two pieces, %st0 first), and an
+    // ARGUMENT is MEMORY ("If the class is X87, X87UP or COMPLEX_X87, it is passed in memory"). The class is the
+    // TYPE's: an aggregate holding one is classed by its eightbytes, and at 32 bytes is MEMORY by size below.
+    // ✔MEASURED 2026-11-05 (probe cx, -O1 and -O0 asm): gcc 13.3.0 and clang 18.1.3 on Linux and Apple clang
+    // 21.0.0 for x86_64 return it in %st0 (real) / %st1 (imaginary), with no hidden pointer, pass it as 32 bytes on
+    // the stack (16-aligned), read it through `...` from the overflow area, and return a struct holding one through
+    // the hidden pointer.
+    if (in.kind(aggTy) == TypeKind::Complex && in.kind(in.complexElement(aggTy)) == TypeKind::F80) {
+        if (position == AggregatePosition::Argument) {
+            out.kind = AbiPassing::Kind::Memory;
+            return out;
+        }
+        auto const elemLay = computeLayout(in.complexElement(aggTy), in, lp, dm);
+        if (!elemLay.has_value() || elemLay->size == 0) return std::nullopt;   // un-sizeable → fail loud
+        auto const w = static_cast<std::uint32_t>(elemLay->size);
+        out.kind = AbiPassing::Kind::X87;
+        out.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, 0, w});               // the real part, %st0
+        out.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, elemLay->size, w});   // the imaginary part, %st1
+        return out;
+    }
     // SysV §3.2.3: an aggregate larger than two eightbytes (> maxRegBytes) — or
     // empty — goes in MEMORY (an argument by the convention's carrier — its bytes on
     // the stack under SysV; a result through sret).
@@ -297,8 +338,13 @@ classifyAggregate(AggregateConventionRules const& rules,
         bool memory = binary128
             || std::find(cls.begin(), cls.end(), EightbyteClass::Memory) != cls.end();
         if (!memory && n == 2 && cls[0] == EightbyteClass::X87 && cls[1] == EightbyteClass::X87Up) {
-            out.kind = position == AggregatePosition::Result ? AbiPassing::Kind::X87
-                                                             : AbiPassing::Kind::Memory;
+            if (position == AggregatePosition::Result) {
+                // One x87 value, at offset 0, in %st0 (f26c2: an X87 result states its pieces, as COMPLEX_X87's).
+                out.kind = AbiPassing::Kind::X87;
+                out.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, 0, static_cast<std::uint32_t>(size)});
+            } else {
+                out.kind = AbiPassing::Kind::Memory;
+            }
             return out;
         }
         for (std::size_t e = 0; e < n && !memory; ++e) {

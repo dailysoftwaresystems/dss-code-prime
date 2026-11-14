@@ -13670,9 +13670,11 @@ TEST(HirLoweringC, AnAttributeMayLeadABlockScopeExternDeclaration) {
 // typed it too. The example examples/c/a_conditional_of_compatible_pointers_has_their_composite_type RUNS the
 // same three cells on the four exec targets.
 //
-// RED-ON-DISABLE: drop the HIR `combineTernary`'s composite arm and each ternary keeps the stamped composite
-// over arms of their own types (the arms' type assertion reds); drop the semantic arm and the size reads the
-// first arm's incomplete array (warned) and the ternary is typed it.
+// RED-ON-DISABLE: drop the HIR `combineTernary`'s read of the type the analyzer records for the conditional
+// (`conditionalTypeFor`; since fold f26c2 the lowering decides no pointer type of its own) and the ternary takes its
+// then arm's type over arms of their own types -- ✔MEASURED red (run f26c2-a, where the read asked the node-type
+// door, which holds no conditional's type); drop the semantic arm and the size reads the first arm's incomplete
+// array (warned) and the ternary is typed it.
 TEST(HirLoweringC, AConditionalOfPointersToCompatibleTypesHasTheirCompositeType) {
     struct Cell {
         char const* what;
@@ -13739,6 +13741,93 @@ TEST(HirLoweringC, AConditionalOfPointersToCompatibleTypesHasTheirCompositeType)
     }
 }
 
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F2): EVERY CONDITIONAL OF POINTERS IS LOWERED AT THE TYPE THE
+// ANALYZER GAVE IT, both arms converted to it. C 6.5.15p6 has ONE home, the semantic `combineTernary`, whose answer
+// Pass 2 records for the conditional (`conditionalTypeFor`); the lowering decides none of it (it held a mirror of six
+// of the analyzer's arms, which could only fall behind the original). THE UNIVERSE: every pointer result the analyzer decides -- a pointer beside a null
+// pointer constant (both orders), a function designator and a string literal beside one, two string literals of
+// different lengths, `void *` beside an object pointer, two compatible pointees' composite, an incompatible pair's
+// `void *`, `nullptr` beside a pointer, and two function pointers whose pointees differ in a qualifier only the
+// analyzer sees -- each with the pointee the analyzer's answer has.
+//
+// RED-ON-DISABLE: drop the record's read in the HIR `combineTernary` and the arms keep their own types (the arm
+// assertions red) or the conditional takes its then arm's type -- ✔MEASURED red on every cell but the qualifier
+// one (run f26c2-a, where the read asked the node-type door, which held only that cell's `void *`).
+TEST(HirLoweringC, EveryConditionalOfPointersIsLoweredAtTheTypeTheAnalyzerGaveIt) {
+    enum class Pointee { Int, Char, Void, Function, IntArrayOfThree };
+    struct Cell {
+        char const* what;
+        char const* src;
+        Pointee     pointee;
+    };
+    for (Cell const c : {
+             Cell{"a pointer, then a null pointer constant",
+                  "int g(int c, int *p) { int *q = c ? p : 0; return q != 0; }\n", Pointee::Int},
+             Cell{"a null pointer constant, then a pointer",
+                  "int g(int c, int *p) { int *q = c ? 0 : p; return q != 0; }\n", Pointee::Int},
+             Cell{"a function designator beside a null pointer constant",
+                  "int h(void);\nint g(int c) { int (*f)(void) = c ? h : 0; return f != 0; }\n", Pointee::Function},
+             Cell{"a string literal beside a null pointer constant",
+                  "int g(int c) { char const *s = c ? \"%s\" : 0; return s != 0; }\n", Pointee::Char},
+             Cell{"two string literals of different lengths",
+                  "int g(int c) { char const *s = c ? \"a\" : \"bb\"; return s[0]; }\n", Pointee::Char},
+             Cell{"`void *` beside an object pointer",
+                  "int g(int c, int *p, void *v) { void *r = c ? p : v; return r != 0; }\n", Pointee::Void},
+             Cell{"two compatible pointees' composite",
+                  "static int store[3];\n"
+                  "int g(int c) { int (*pu)[] = (int (*)[])store; int (*p3)[3] = &store;\n"
+                  "  return (*(c ? pu : p3))[0]; }\n",
+                  Pointee::IntArrayOfThree},
+             Cell{"an incompatible pair",
+                  "int g(int c, int *p, double *d) { void *r = c ? p : d; return r != 0; }\n", Pointee::Void},
+             Cell{"`nullptr` beside a pointer",
+                  "int g(int c, int *p) { int *q = c ? p : nullptr; return q != 0; }\n", Pointee::Int},
+             Cell{"two function pointers whose pointees differ in a qualifier",
+                  "int fp(char *s);\nint fc(const char *s);\n"
+                  "int g(int c) { return (c ? &fp : &fc) != 0; }\n",
+                  Pointee::Void},
+         }) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        auto const pointeeIs = [&](TypeId t) {
+            if (!t.valid() || in.kind(t) != TypeKind::Ptr || in.operands(t).empty()) return false;
+            TypeId const p = in.operands(t)[0];
+            TypeKind const k = in.kind(p);
+            switch (c.pointee) {
+                case Pointee::Int: return k == TypeKind::I32;
+                case Pointee::Char: return k == TypeKind::Char;   // C's plain `char` is the lattice's own core
+                case Pointee::Void: return k == TypeKind::Void;
+                case Pointee::Function: return k == TypeKind::FnSig;
+                case Pointee::IntArrayOfThree:
+                    return k == TypeKind::Array && !in.isIncompleteArray(p) && !in.scalars(p).empty()
+                        && in.scalars(p)[0] == 3;
+            }
+            return false;
+        };
+        std::size_t pointerTernaries = 0;
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Ternary) continue;
+            TypeId const t = res->hir.typeId(n);
+            if (!t.valid() || in.kind(t) != TypeKind::Ptr) continue;
+            ++pointerTernaries;
+            EXPECT_TRUE(pointeeIs(t)) << "the conditional is typed the analyzer's answer";
+            auto const kids = res->hir.children(n);
+            ASSERT_EQ(kids.size(), 3u);
+            EXPECT_EQ(res->hir.typeId(kids[1]).v, t.v) << "the then arm is converted to it";
+            EXPECT_EQ(res->hir.typeId(kids[2]).v, t.v) << "the else arm is converted to it";
+        }
+        EXPECT_GE(pointerTernaries, 1u) << "the cell's conditional is a pointer";
+    }
+}
+
 // ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION): A FUNCTION A
 // CALL DECLARED IMPLICITLY — the unit declares it nowhere — LOWERS TO ONE ExternFunction BOUND TO NO LIBRARY, not
 // eager, as an unabsorbed bare prototype does (c86), so the link binds it to the unit that defines it; its
@@ -13788,4 +13877,242 @@ TEST(HirLoweringC, AFunctionACallDeclaredImplicitlyIsAnExternNoLibraryBinds) {
     auto res2 = lowerToHir(later, r2);
     ASSERT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
     for (auto const& e : res2->externDecls) EXPECT_NE(e.canonicalName, "f") << "f is the unit's own";
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F6; main's ledger 554): EACH CALL OF A FUNCTION DECLARED WITHOUT A
+// PROTOTYPE IS LOWERED AT ITS OWN TYPE — its arguments after the default argument promotions, not variadic — and the
+// function is ONE import of the module, whichever declaration gave it no prototype: the implicit declaration of a
+// call (C90 6.3.2.2), or `int f();`. ✔MEASURED (lane `cs` probes ic2 and np2, each built and RUN, the mismatched
+// calls guarded): gcc 13.3.0, mingw-w64 gcc 13.2.0 and cl 19.51 pass each call its own promoted arguments. The
+// example examples/c/two_units_implicit_function_declaration RUNS both declarations' calls.
+//
+// RED-ON-DISABLE: type every call of such a function by its declaration (drop `typeOfACallWithoutAPrototype`'s own
+// type) and the later calls are refused, or lowered at the first call's parameters.
+TEST(HirLoweringC, EachCallOfAFunctionDeclaredWithoutAPrototypeIsLoweredAtItsOwnType) {
+    for (char const* src : {"int b(void) { return g(40) + g(1.0) + g(1, 2); }\n",
+                            "int g();\nint b(void) { return g(40) + g(1.0) + g(1, 2); }\n"}) {
+        SCOPED_TRACE(src);
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        std::vector<std::vector<TypeKind>> calls;
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Call) continue;
+            auto const kids = res->hir.children(n);
+            ASSERT_GE(kids.size(), 1u);
+            TypeId sig = res->hir.typeId(kids[0]);
+            if (sig.valid() && in.kind(sig) == TypeKind::Ptr && !in.operands(sig).empty()) sig = in.operands(sig)[0];
+            ASSERT_TRUE(sig.valid() && in.kind(sig) == TypeKind::FnSig) << "a call's callee is typed a function";
+            EXPECT_FALSE(in.fnIsVariadic(sig)) << "a call without a prototype is no variadic call";
+            EXPECT_EQ(in.kind(in.fnResult(sig)), TypeKind::I32);
+            std::vector<TypeKind> params;
+            for (TypeId const p : in.fnParams(sig)) params.push_back(in.kind(p));
+            ASSERT_EQ(params.size() + 1, kids.size()) << "one argument per parameter of the call's own type";
+            for (std::size_t a = 0; a < params.size(); ++a)
+                EXPECT_EQ(in.kind(res->hir.typeId(kids[a + 1])), params[a]) << "the argument is converted to it";
+            calls.push_back(std::move(params));
+        }
+        std::sort(calls.begin(), calls.end());
+        std::vector<std::vector<TypeKind>> want{{TypeKind::I32}, {TypeKind::I32, TypeKind::I32}, {TypeKind::F64}};
+        std::sort(want.begin(), want.end());
+        EXPECT_EQ(calls, want) << "each call at its own promoted arguments";
+        std::size_t imports = 0;
+        for (auto const& e : res->externDecls)
+            if (e.canonicalName == "g") ++imports;
+        EXPECT_EQ(imports, 1u) << "three calls, one import";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F6; main's ledger 554): A CALL SEES ONLY A PROTOTYPE WRITTEN BEFORE IT
+// (C 6.2.1p7: a declaration's scope begins after its declarator). `int f();` declares `f` without one, so a call
+// written before the prototype `int f(int x);` passes its own promoted argument -- a `double` for `f(2.5)` -- and a
+// call written after it is converted to the prototype's `int`. ✔MEASURED (lane `cs` probe np2: `int f();`, guarded
+// calls whose arguments mismatch, then `int f(int)`): gcc 13.3.0 and clang 18.1.3 at their default standard,
+// mingw-w64 gcc 13.2.0, cl 19.51 and Apple clang build and RUN it. CONTROL: the prototype written first, both calls
+// convert to `int`.
+//
+// RED-ON-DISABLE: take every prototype of the function as visible at every call (drop the rank test of
+// `callHasNoPrototypeAt`) and the first call converts 2.5 to `int`.
+TEST(HirLoweringC, ACallSeesOnlyAPrototypeWrittenBeforeIt) {
+    struct Cell {
+        char const*           what;
+        char const*           src;
+        std::vector<TypeKind> firstCall;   // the argument kinds of the call in `a`
+    };
+    std::vector<Cell> const cells{
+        {"the prototype after the first call",
+         "int f();\nint a(void) { return f(2.5); }\nint f(int x);\nint b(void) { return f(3); }\n",
+         {TypeKind::F64}},
+        {"CONTROL: the prototype before both calls",
+         "int f();\nint f(int x);\nint a(void) { return f(2.5); }\nint b(void) { return f(3); }\n",
+         {TypeKind::I32}},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        std::vector<std::vector<TypeKind>> calls;   // in source order: the call in `a`, then the call in `b`
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Call) continue;
+            auto const kids = res->hir.children(n);
+            ASSERT_EQ(kids.size(), 2u) << "one argument";
+            calls.push_back({in.kind(res->hir.typeId(kids[1]))});
+        }
+        ASSERT_EQ(calls.size(), 2u);
+        EXPECT_EQ(calls[0], c.firstCall) << "the call before the prototype passes its own promoted argument";
+        EXPECT_EQ(calls[1], std::vector<TypeKind>{TypeKind::I32}) << "a call after the prototype is converted to it";
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9, the class's universe): A LINKAGE ATTRIBUTE ON A BLOCK-SCOPE
+// DECLARATION IS READ BY THE DECLARATOR'S LINKAGE, NOT BY ITS ROW. A function declared in a block has linkage (C
+// 6.2.2p5: it is the `extern` declaration) through every row that can declare one -- a plain head (`varDecl`) and a
+// typedef-named head (`identVarDecl`) -- so its `weak` and `visibility` are its import's (and, with a definition later,
+// the definition's); and a typedef-headed one makes the import a plain one makes. An object declared in a block
+// without `extern` has none (C 6.2.2p6) through every row that declares one -- a plain head, a typedef-named head, a
+// for-init declaration, a C23 inferred object, `static` or not -- so `weak` there is refused. ✔MEASURED (lane `cs`
+// probes wb, wb3, wb4; gcc 13.3.0 and clang 18.1.3 on Linux, mingw-w64 gcc 13.2.0, Apple clang): the block prototype
+// cells run (a null weak reference without a definition, the definition with one), `.hidden` on gcc and clang; every
+// no-linkage `weak` cell is refused ("weak declaration of 'x' must be public"). CONTROLS: a parameter's `weak` is
+// passed over (gcc warns it ignored, runs), a visibility on a local changes nothing (clang silent), an unknown
+// attribute name on a block prototype is said ONCE (the semantic tier's S_UnknownAttribute, never also the linkage
+// tier's), and a block prototype without attributes keeps the default linkage.
+//
+// RED-ON-DISABLE: drop the block prototype's attribute reading and its import is strong; drop the binding refusal and
+// every no-linkage cell lowers; drop `identVarDecl`'s `prototypeSynthesizesExtern` and the typedef-headed cells make
+// no import.
+TEST(HirLoweringC, ALinkageAttributeOnABlockDeclarationIsReadByItsDeclaratorsLinkage) {
+    auto const importOf = [](CstToHirResult const& res, std::string_view name) -> HirNodeId {
+        for (auto const& e : res.externDecls)
+            if (e.canonicalName == name) return e.node;
+        return HirNodeId{};
+    };
+    struct Linked {
+        char const*                     what;
+        char const*                     src;
+        std::optional<SymbolBinding>    binding;      // of `hook`'s import (or definition, when `defined`)
+        std::optional<SymbolVisibility> visibility;
+        bool                            defined;
+    };
+    std::vector<Linked> const linked{
+        {"a trailing `weak` on a block prototype, no definition",
+         "int main(void) { int hook(void) __attribute__((weak)); return hook ? hook() : 42; }\n",
+         SymbolBinding::Weak, std::nullopt, false},
+        {"a leading `weak` on a block prototype, no definition",
+         "int main(void) { __attribute__((weak)) int hook(void); return hook ? hook() : 42; }\n",
+         SymbolBinding::Weak, std::nullopt, false},
+        {"`visibility(\"hidden\")` on a block prototype, no definition",
+         "int use(void) { int hook(void) __attribute__((visibility(\"hidden\"))); return hook(); }\n",
+         std::nullopt, SymbolVisibility::Hidden, false},
+        {"a typedef-headed block prototype with `weak`, no definition",
+         "typedef int T;\nint main(void) { T hook(void) __attribute__((weak)); return hook ? hook() : 42; }\n",
+         SymbolBinding::Weak, std::nullopt, false},
+        {"a typedef-headed block prototype, no attribute, no definition (it makes an import at all)",
+         "typedef int T;\nint main(void) { T hook(void); return hook(); }\n",
+         std::nullopt, std::nullopt, false},
+        {"`weak` on a block prototype, the definition later: the definition is weak",
+         "int main(void) { int hook(void) __attribute__((weak)); return hook ? hook() : 42; }\n"
+         "int hook(void) { return 7; }\n",
+         SymbolBinding::Weak, std::nullopt, true},
+        {"CONTROL: a block prototype with no attribute keeps the default linkage",
+         "int main(void) { int hook(void); return hook(); }\n",
+         std::nullopt, std::nullopt, false},
+    };
+    for (Linked const& c : linked) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+        HirNodeId const n = c.defined ? functionNamed(res->hir, model, "hook") : importOf(*res, "hook");
+        ASSERT_TRUE(n.valid()) << (c.defined ? "the definition" : "the block prototype's import") << " of hook";
+        std::optional<SymbolBinding> const binding =
+            res->linkageMap.has(n) ? std::optional{res->linkageMap.get(n).binding} : std::nullopt;
+        std::optional<SymbolVisibility> const visibility =
+            res->linkageMap.has(n) ? std::optional{res->linkageMap.get(n).visibility} : std::nullopt;
+        if (c.binding.has_value()) {
+            EXPECT_EQ(binding, c.binding) << "the block declaration's attribute is its linkage";
+        } else {
+            EXPECT_TRUE(!binding.has_value() || *binding == SymbolBinding::Global) << "no binding was written";
+        }
+        if (c.visibility.has_value()) {
+            EXPECT_EQ(visibility, c.visibility) << "the block declaration's visibility is its import's";
+        }
+    }
+
+    struct Refused {
+        char const* what;
+        char const* src;
+    };
+    std::vector<Refused> const refused{
+        {"`weak` on an automatic object", "int main(void) { __attribute__((weak)) int x = 41; return x + 1; }\n"},
+        {"`weak` on a static local", "int main(void) { static __attribute__((weak)) int x = 41; return x + 1; }\n"},
+        {"`weak` on an automatic object through a typedef head",
+         "typedef int T;\nint main(void) { T x __attribute__((weak)) = 41; return x + 1; }\n"},
+        {"`weak` on a for-init object",
+         "int main(void) { int s = 0; for (int i __attribute__((weak)) = 0; i < 42; ++i) s++; return s; }\n"},
+        {"`weak` on an inferred automatic object", "int main(void) { auto x __attribute__((weak)) = 41; return x + 1; }\n"},
+        {"`weak` on an inferred static object",
+         "int main(void) { static auto x __attribute__((weak)) = 41; return x + 1; }\n"},
+    };
+    for (Refused const& c : refused) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << "a binding on a declaration with no linkage is refused";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u) << "said once, by name";
+    }
+
+    struct Passed {
+        char const* what;
+        char const* src;
+    };
+    std::vector<Passed> const passed{
+        {"CONTROL: `weak` on a parameter is passed over",
+         "static int f(int x __attribute__((weak))) { return x + 1; }\nint main(void) { return f(41); }\n"},
+        {"CONTROL: a visibility on a local changes nothing",
+         "int main(void) { __attribute__((visibility(\"hidden\"))) int x = 41; return x + 1; }\n"},
+        {"CONTROL: an alignment on a local is no linkage",
+         "int main(void) { __attribute__((aligned(16))) int x = 41; return x + 1; }\n"},
+    };
+    for (Passed const& c : passed) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    }
+    // CONTROL: an unknown attribute name on a block prototype is the semantic tier's, said once.
+    {
+        SemanticModel model =
+            analyzeC("int main(void) { int hook(void) __attribute__((frobnicate_xyz)); return hook(); }\n");
+        ASSERT_FALSE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << "never also the linkage tier's";
+    }
 }

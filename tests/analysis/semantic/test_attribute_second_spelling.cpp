@@ -699,7 +699,9 @@ TEST(AttributeSecondSpelling, AThreadRequestYieldsToADeclarationThatDoesNotMakeI
 TEST(AttributeSecondSpelling, WithoutTheRowsAnswerADisagreeingThreadRequestIsRefused) {
     auto const firm = shippedCWith(
         R"J("__declspec(thread)": { "threadStorage": true, "yieldsOnMismatch": true })J",
-        R"J("__declspec(thread)": { "threadStorage": true })J", 5);
+        // Three rows state the key since fold f26c2 (varDecl, topLevelDecl, externDecl): the two C23 inferred rows
+        // take it from varDecl and topLevelDecl (`linkageTablesFrom`), so the edit reaches them through those.
+        R"J("__declspec(thread)": { "threadStorage": true })J", 3);
     ASSERT_NE(firm, nullptr);
     for (char const* src : {"extern __declspec(thread) int e;\nint e = 1;\n",
                             "int e = 1;\nextern __declspec(thread) int e;\n"}) {
@@ -1122,6 +1124,16 @@ TEST(AttributeSecondSpelling, AnImportIsRefusedWhereNoOtherImageCanHoldTheDefini
                   "__declspec(dllimport) int x;\n__declspec(dllimport) int x;\n", ""},
              Case{"CONTROL: a file-scope `extern`, then a block import",
                   "extern int x;\nint g(void) { __declspec(dllimport) int x; return x; }\n", ""},
+             // An import is no variable of its block, so an UNUSED one that nothing at file scope absorbs is
+             // not warned unused (the honoured import's own exemption -- an absorbed one is passed over by the
+             // unused sweep on the absorption). ✔MEASURED (lane `cs`, probe ui; each built and RUN): cl 19.51
+             // /W4 is silent on it as on a plain block `extern`, and warns C4101 on an automatic object;
+             // mingw-w64 gcc 13.2.0 -Wall warns all three "unused variable". cl's reading is taken: a split in
+             // warning quality, not in meaning.
+             Case{"CONTROL: an unused block import, nothing at file scope",
+                  "int g(void) { __declspec(dllimport) int x; return 0; }\n", ""},
+             Case{"CONTROL: an unused block import by the GNU spelling, nothing at file scope",
+                  "int g(void) { __attribute__((dllimport)) int x; return 0; }\n", ""},
          }) {
         SCOPED_TRACE(c.what);
         auto m = analyzePe({c.src});

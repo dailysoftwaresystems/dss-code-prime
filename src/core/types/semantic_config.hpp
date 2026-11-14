@@ -1350,11 +1350,24 @@ struct DSS_EXPORT DeclarationRule {
     //       symbol — ld's behavior).
     // false ⇒ the pre-c86 shape: an unabsorbed proto emits nothing and a call to
     // it fails loud at HIR→MIR (H0009 Ref to unbound symbol). Per-declaration
-    // opt-in (c's `topLevelDecl` + `varDecl`), source-agnostic — the
+    // opt-in (c's `topLevelDecl`, `varDecl` and, since P69 fold f26c2, the
+    // typedef-headed block row `identVarDecl`), source-agnostic — the
     // engine reads only this flag, never a rule name. Internal-linkage (`static`)
     // and weak protos never synthesize (their reference must NOT bind another
     // TU's public symbol); they keep the loud H0009. Default false.
     bool            prototypeSynthesizesExtern = false;
+    // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): the row whose linkage
+    // tables this row's ATTRIBUTE SPECIFIERS are folded with (config key
+    // `attributeLinkageTablesFrom`, the rule's name; its index into `declarations`
+    // is resolved once every row is read). A row that skips its attribute
+    // specifiers in its own fold — c's block-scope rows, where an attribute gives
+    // an object no linkage — still owes them a reading PER DECLARATOR: one WITH
+    // linkage (a function declared in a block, C 6.2.2p5) takes its binding and
+    // visibility from them as the `extern` declaration it is, and one WITHOUT may
+    // take no binding from them at all. No index = this row's attribute specifiers
+    // reach no linkage fold.
+    std::string                  attributeLinkageRuleName;
+    std::optional<std::uint32_t> attributeLinkageRow;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears
@@ -3496,9 +3509,21 @@ struct DSS_EXPORT LiteralTypeMapping {
 // is not a qualification the rule removes (C 6.2.5p27), and a `void` parameter keeps
 // its skin (see `normalizeSoleVoidParams`). Default false ⇒ a function type carries
 // its parameters' declared types exactly.
+//
+// `emptyListDeclaresNoPrototype` (P69, lane `cs`, fold f26c2) — a function declarator
+// with an EMPTY parameter list on a declaration that is not a definition (`int f();`)
+// declares the function WITHOUT A PROTOTYPE: a call through it passes each argument after
+// the default argument promotions and is typed by them (C 6.5.2.2p6), and a later
+// prototype of it is its composite (C 6.2.7p3). C23 reads `()` as `(void)`; every
+// reference builds the program the older reading allows -- gcc and clang at their default
+// standard, cl at every one (✔MEASURED, lane `cs` probe np2). The home is the analyzer's
+// "a function declared without a prototype" (`callHasNoPrototypeAt`), which the implicit
+// declaration of C90 6.3.2.2 (`extern int name();`) shares. Default false ⇒ `()` declares
+// a prototype of no parameters.
 struct DSS_EXPORT ParametersConfig {
     bool soleVoidMeansEmpty = false;
     bool unqualifiedParameterTypes = false;
+    bool emptyListDeclaresNoPrototype = false;
 };
 
 // ── inline-asm P1 (`semantics.inlineAsm`, D-CSUBSET-INLINE-ASM +

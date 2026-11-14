@@ -1,0 +1,1 @@
+                if (SymbolId const s = hir.varDeclSymbol(n); s.valid() && false) mir.keepSymbolIdsClearOf(s);

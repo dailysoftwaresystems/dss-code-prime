@@ -29,6 +29,7 @@
 #include "link/object_format_schema.hpp"       // ObjectFormatSchema (the shipped format's declared kind)
 #include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
 #include "shipped_schema_or_throw.hpp"          // shippedSchemaOrThrow — a load failure THROWS
+#include "shipped_read_pairs.hpp"               // shippedConventionPairs — every convention a format names
 
 #include <gtest/gtest.h>
 
@@ -298,21 +299,8 @@ struct Lowered {
         // compile_pipeline.cpp. `targetName`/`ccName` default to x86_64/sysv_amd64
         // (the C1/C1c pins); the AAPCS64 x8-sret pins pass "arm64"/"aapcs64" so
         // `aggregateSretViaHiddenArg` resolves false (indirectResultRegister = x8).
-        if (auto const* cc = t->callingConventionByName(ccName)) {
-            mirCfg.aggregate = cc->aggregate;   // the convention's aggregate rules, whole
-            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-            mirCfg.argSlotAligned            = cc->slotAligned;
-            mirCfg.argGprCount               =
-                static_cast<std::uint32_t>(cc->argGprs.size());
-            mirCfg.argFprCount               =
-                static_cast<std::uint32_t>(cc->argFprs.size());
-            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: threaded as
-            // part of adding the field (see the fixture note in tests/lir).
-            mirCfg.stackArgPacking           = cc->stackArgPacking;
-            // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the CC's va_list layout so
-            // va_start/va_arg lower (or fail loud when the CC omits it).
-            mirCfg.vaListLayout              = cc->vaListLayout;
-        }
+        // The convention's facts, through the one assembly the pipeline calls.
+        if (auto const* cc = t->callingConventionByName(ccName)) takeCallingConvention(mirCfg, *cc);
     }
     if (adjustConfig) adjustConfig(mirCfg);
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
@@ -1125,15 +1113,8 @@ namespace {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
-        if (auto const* cc = t->callingConventionByName("sysv_amd64")) {
-            mirCfg.aggregate = cc->aggregate;   // the convention's aggregate rules, whole
-            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-            mirCfg.argSlotAligned            = cc->slotAligned;
-            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
-            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
-            mirCfg.stackArgPacking = cc->stackArgPacking;
-            mirCfg.vaListLayout = cc->vaListLayout;
-        }
+        if (auto const* cc = t->callingConventionByName("sysv_amd64"))
+            takeCallingConvention(mirCfg, *cc);   // the one assembly the pipeline calls
     }
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
@@ -1213,15 +1194,8 @@ namespace {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
-        if (auto const* cc = t->callingConventionByName("sysv_amd64")) {
-            mirCfg.aggregate = cc->aggregate;   // the convention's aggregate rules, whole
-            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-            mirCfg.argSlotAligned            = cc->slotAligned;
-            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
-            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
-            mirCfg.stackArgPacking = cc->stackArgPacking;
-            mirCfg.vaListLayout = cc->vaListLayout;
-        }
+        if (auto const* cc = t->callingConventionByName("sysv_amd64"))
+            takeCallingConvention(mirCfg, *cc);   // the one assembly the pipeline calls
     }
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
@@ -8930,6 +8904,295 @@ TEST(MirLoweringC, AnOverAlignedMemoryAggregateCarrierStatesItsOwnAlignment) {
     EXPECT_EQ(m.instPayload2(ops[1]), 32u);
 }
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): WHERE AN ARM64 CONVENTION PUTS A COMPOSITE
+// OF ALIGNMENT 16, ONE FACT READ BY EVERY PLACEMENT OF IT. AAPCS64 takes a composite's NATURAL
+// alignment — its members', before the composite's own adjustment (C.8, C.14) — and begins one
+// of alignment 16 in general registers at an EVEN one (C.8); Apple arm64 takes the TYPE's
+// alignment (an HFA its element's) and pairs nothing, and stacks every argument through `...`.
+// ✔MEASURED (lane `cs`, probes f14 and f14r, -O1 asm of a callee, a caller, a `va_arg` callee
+// and a variadic caller; aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 agreeing, Apple clang 21):
+//   the argument                                        after one stacked     after one long
+//                                                       scalar                in x0
+//                                                       AAPCS64   Apple       AAPCS64   Apple
+//   struct { __int128 v; }                              +16       +16         x2:x3     x1:x2
+//   struct { _Alignas(16) long a; long b; }             +16       +16         x2:x3     x1:x2
+//   struct __attribute__((aligned(16))) { long a, b; }  +8        +16         x1:x2     x1:x2
+//   struct { long a; long b; }                          +8        +8          x1:x2     x1:x2
+//   struct { _Alignas(32) double a, b, c, d; }          +16       +8          (an HFA)
+//   struct { double a; double b; }                      +8        +8          (an HFA)
+//   __int128                                                                  x2:x3     x1:x2
+//   union { __int128 v; long l; }    (probes f14s/f14t) +16       +16         x2:x3     x1:x2
+//   struct { __int128 a[1]; }        (probe f14s)                             x2:x3     x1:x2
+// DSS put every one at +8 and in x1:x2. THE UNIVERSE: the eight composites × the two conventions
+// × every placement — the caller's carrier states the convention's own alignment of the
+// argument (the cap of 16 is LIR's, pinned in test_lir_long_double_stack_arg_alignment), the
+// callee receives it at the offset the references read, an even pair takes a padding operand
+// at the call and a padding `Arg` in the callee (the skipped register received, so the callee's
+// ordinals have no gap and every module verifies), behind a double too (where the verifier's
+// bound, an ordinal below the Arg count, would pass a gap), the inliner splices each register's
+// `Arg` to its own operand, AAPCS64's `va_arg` rounds `__gr_offs` for the pair and fits the last
+// registers exactly, and Apple's `...` stacks the composite.
+// RED-ON-DISABLE: read the type's alignment for AAPCS64 (`aggregateAlignmentOf`) → the
+// `aligned(16)` cells say 16; drop `evenGprPairAlignment`'s padding → the pair cells lose an
+// operand and their callee's ordinals; skip the register with no `Arg` → the ordinals gap and the
+// verifier refuses the module (I_ArgIndexOutOfRange), and behind a double the ordinals alone say
+// so; splice an inlined `Arg` by its ordinal → a half is the padding constant; restore the strict
+// fit → `ICmpSlt`.
+namespace {
+struct Arm64Shape {
+    char const*   what;
+    char const*   decl;          // declares `struct X`
+    char const*   last;          // an expression reading the parameter `x`
+    bool          fp;            // an HFA: the FP registers are the ones to exhaust
+    std::uint32_t aapcsOwn, appleOwn;         // the alignment the caller's carrier states
+    std::uint32_t aapcsOffset, appleOffset;   // where it is received after one stacked scalar
+    bool          aapcsEvenPair;              // AAPCS64 C.8 (Apple pairs nothing)
+    char const*   key = "struct";             // the composite's keyword: `struct X` or `union X`
+};
+constexpr Arm64Shape kArm64Shapes[] = {
+    {"struct { __int128 v; }", "struct X { __int128 v; };", "(long)x.v", false, 16, 16, 16, 16, true},
+    {"struct { _Alignas(16) long a; long b; }", "struct X { _Alignas(16) long a; long b; };", "x.b", false,
+     16, 16, 16, 16, true},
+    // The class closure's two composite shapes beyond f14r's (✔MEASURED, probes f14s/f14t: aarch64 gcc 13.3.0 and
+    // clang 18.1.3 put each in x2:x3 after one long, and clang at +16 after one stacked scalar; Apple clang 21 at
+    // x1:x2 and +16): a union whose widest member is 16-aligned, and a 16-aligned array member.
+    {"union { __int128 v; long l; }", "union X { __int128 v; long l; };", "(long)x.v", false, 16, 16, 16, 16, true,
+     "union"},
+    {"struct { __int128 a[1]; }", "struct X { __int128 a[1]; };", "(long)x.a[0]", false, 16, 16, 16, 16, true},
+    {"struct __attribute__((aligned(16))) { long a; long b; }",
+     "struct __attribute__((aligned(16))) X { long a; long b; };", "x.b", false, 8, 16, 8, 16, false},
+    {"struct { long a; long b; }", "struct X { long a; long b; };", "x.b", false, 8, 8, 8, 8, false},
+    {"struct { _Alignas(32) double a, b, c, d; }",
+     "struct X { _Alignas(32) double a; double b; double c; double d; };", "(long)x.d", true, 32, 8, 16, 8,
+     false},
+    {"struct { double a; double b; }", "struct X { double a; double b; };", "(long)x.b", true, 8, 8, 8, 8,
+     false},
+};
+[[nodiscard]] std::string arm64ShapeSource(Arm64Shape const& s) {
+    std::string const S = s.fp ? "double" : "long";
+    std::string regs, vals;
+    for (int i = 0; i < 8; ++i) {
+        regs += S + " r" + std::to_string(i) + ", ";
+        vals += std::to_string(i) + (s.fp ? ".0, " : "L, ");
+    }
+    std::string const last = s.last;
+    std::string const X = std::string{s.key} + " X";
+    return "#include <stdarg.h>\n" + std::string{s.decl} + "\n"
+         // every register of the class taken, one scalar stacked, then the composite
+         + "long callee(" + regs + S + " s, " + X + " x) { return " + last + " + (long)s; }\n"
+         + "long caller(" + X + " *p) { return callee(" + vals + "(" + S + ")8, *p); }\n"
+         // one long in x0 first, so the composite begins at an odd general register
+         + "long paired(long a, " + X + " x) { return " + last + " + a; }\n"
+         + "long pairCaller(" + X + " *p) { return paired(1, *p); }\n"
+         // the same pair behind a double: its FP register is ordinal 0 of its own class, so the
+         // general registers' ordinals are the ones the pair's padding keeps dense
+         + "long mixed(double d, long a, " + X + " x) { return " + last + " + a + (long)d; }\n"
+         + "long mixedCaller(" + X + " *p) { return mixed(2.0, 1, *p); }\n"
+         // the same composite through `...`, read with va_arg and passed by a variadic caller
+         + "long viaVaArg(int n, ...) {\n"
+           "  va_list ap;\n"
+           "  va_start(ap, n);\n"
+           "  " + X + " x = va_arg(ap, " + X + ");\n"
+           "  va_end(ap);\n"
+           "  return " + last + " + n;\n"
+           "}\n"
+         + "long viaEllipsis(" + X + " *p) { return viaVaArg(1, *p); }\n";
+}
+[[nodiscard]] bool isConstZero(Mir const& m, MirInstId id) {
+    if (m.instOpcode(id) != MirOpcode::Const) return false;
+    auto const& lit = m.literalValue(m.constLiteralIndex(id));
+    return std::holds_alternative<std::int64_t>(lit.value) && std::get<std::int64_t>(lit.value) == 0;
+}
+// The INLINED column of the pair's universe: the inliner over the module, then each named caller holds no
+// call, and no spliced register is the padding operand -- the callee received the halves into its slot by
+// Stores, so a Store of a constant means an `Arg` was mapped to the wrong operand (the padding, the only
+// constant among the operands that reach a Store). The module verifies after the splice.
+void expectThePairsCallersInlineEachRegisterAtItsOperand(Lowered& L, std::initializer_list<char const*> callers) {
+    auto targetR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(targetR.has_value());
+    Mir& m = L.mir.mir;
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"even-pair-inline-only", {opt::PassId::Inlining}};
+    auto const result = opt::optimize(m, **targetR, L.model.lattice().interner(), pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    for (char const* name : callers) {
+        SCOPED_TRACE(std::string{"inlined into "} + name);
+        auto const insts = instsOfNamed(L, name);
+        ASSERT_FALSE(insts.empty());
+        std::size_t calls = 0, constantsStored = 0;
+        for (MirInstId const id : insts) {
+            if (m.instOpcode(id) == MirOpcode::Call) ++calls;
+            if (m.instOpcode(id) == MirOpcode::Store
+                && m.instOpcode(m.instOperands(id)[0]) == MirOpcode::Const)
+                ++constantsStored;
+        }
+        EXPECT_EQ(calls, 0u) << "the even-pair callee is inlined";
+        EXPECT_EQ(constantsStored, 0u) << "no spliced register is the padding operand";
+    }
+    DiagnosticReporter verifyReporter;
+    MirVerifier v{m, &L.model.lattice().interner()};
+    EXPECT_TRUE(v.verify(verifyReporter))
+        << "the inlined module verifies: " << (verifyReporter.all().empty() ? "" : verifyReporter.all()[0].actual);
+}
+} // namespace
+
+TEST(MirLoweringC, AnArm64CompositeIsPlacedByTheAlignmentItsConventionReads) {
+    struct Convention {
+        char const* cc;
+        bool        apple;
+    };
+    for (Convention const cv : {Convention{"aapcs64", false}, Convention{"apple_arm64", true}}) {
+        for (Arm64Shape const& s : kArm64Shapes) {
+            SCOPED_TRACE(std::string{cv.cc} + ": " + s.what);
+            auto L = lowerC(arm64ShapeSource(s), "arm64", cv.cc);
+            ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+            Mir const& m = L.mir.mir;
+            TypeInterner const& in = L.model.lattice().interner();
+            std::uint32_t const own = cv.apple ? s.appleOwn : s.aapcsOwn;
+            bool const evenPair = !cv.apple && s.aapcsEvenPair;
+            {
+                // Every module this placement lowers verifies: a callee's `Arg` ordinals have no gap
+                // (✔MEASURED, run f26c2-f: an even pair's skipped register with no `Arg` was refused
+                // I_ArgIndexOutOfRange when the native witness compiled its AAPCS64 callees).
+                DiagnosticReporter verifyReporter;
+                MirVerifier v{m, &in};
+                EXPECT_TRUE(v.verify(verifyReporter))
+                    << "every lowered module verifies: "
+                    << (verifyReporter.all().empty() ? "" : verifyReporter.all()[0].actual);
+            }
+
+            // The stacked composite: the caller's carrier, and where the callee reads it.
+            {
+                MirInstId const call = firstOfOp(m, instsOfNamed(L, "caller"), MirOpcode::Call);
+                ASSERT_TRUE(call.valid());
+                auto const ops = m.instOperands(call);
+                ASSERT_EQ(ops.size(), 11u) << "[callee, eight registers, the scalar, the composite]";
+                ASSERT_EQ(m.instOpcode(ops[10]), MirOpcode::ByValueStackArg);
+                EXPECT_EQ(m.instPayload2(ops[10]), own) << "the carrier states the convention's own alignment";
+                std::vector<std::uint32_t> recv;
+                for (MirInstId const id : instsOfNamed(L, "callee"))
+                    if (m.instOpcode(id) == MirOpcode::RecvByValueStackParam) recv.push_back(m.instPayload(id));
+                EXPECT_EQ(recv, (std::vector<std::uint32_t>{cv.apple ? s.appleOffset : s.aapcsOffset}))
+                    << "the scalar at +0 (an Arg), the composite where the references read it";
+            }
+            if (!s.fp) {
+                // The register pair after one long in x0.
+                MirInstId const call = firstOfOp(m, instsOfNamed(L, "pairCaller"), MirOpcode::Call);
+                ASSERT_TRUE(call.valid());
+                auto const ops = m.instOperands(call);
+                ASSERT_EQ(ops.size(), evenPair ? 5u : 4u)
+                    << "[callee, a, " << (evenPair ? "the padding operand, " : "") << "the two halves]";
+                if (evenPair) EXPECT_TRUE(isConstZero(m, ops[2])) << "x1 holds the padding operand";
+                std::vector<std::uint32_t> ordinals, positions;
+                std::vector<TypeKind> kinds;
+                for (MirInstId const id : instsOfNamed(L, "paired")) {
+                    if (m.instOpcode(id) != MirOpcode::Arg) continue;
+                    ordinals.push_back(m.tryArgIndex(id).value_or(99u));
+                    positions.push_back(m.tryArgPosition(id).value_or(99u));
+                    kinds.push_back(in.kind(m.instType(id)));
+                }
+                // An even pair receives x1 too, as the padding `Arg` the caller's padding operand fills.
+                auto const want = evenPair ? std::vector<std::uint32_t>{0u, 1u, 2u, 3u}
+                                           : std::vector<std::uint32_t>{0u, 1u, 2u};
+                EXPECT_EQ(ordinals, want) << "the general registers the callee reads";
+                EXPECT_EQ(positions, want) << "the call operands those registers are";
+                if (evenPair && kinds.size() == 4u) EXPECT_EQ(kinds[1], TypeKind::I64) << "the padding Arg is x1's eightbyte";
+
+                // Behind a double: the verifier's bound (an ordinal below the function's Arg count) is met
+                // by a gap here, the FP Arg making the count, so the ordinals themselves are asserted.
+                std::vector<std::uint32_t> gpr, fpr, mixedPositions;
+                for (MirInstId const id : instsOfNamed(L, "mixed")) {
+                    if (m.instOpcode(id) != MirOpcode::Arg) continue;
+                    TypeKind const k = in.kind(m.instType(id));
+                    (k == TypeKind::F64 ? fpr : gpr).push_back(m.tryArgIndex(id).value_or(99u));
+                    mixedPositions.push_back(m.tryArgPosition(id).value_or(99u));
+                }
+                EXPECT_EQ(fpr, (std::vector<std::uint32_t>{0u})) << "d is the first FP register";
+                EXPECT_EQ(gpr, want) << "behind a double, the general registers stay dense: a, "
+                                     << (evenPair ? "the padding, " : "") << "the two halves";
+                EXPECT_EQ(mixedPositions, evenPair ? (std::vector<std::uint32_t>{0u, 1u, 2u, 3u, 4u})
+                                                   : (std::vector<std::uint32_t>{0u, 1u, 2u, 3u}))
+                    << "each Arg is the call operand at its position";
+            }
+            // Through `...`: Apple stacks the composite on its carrier; AAPCS64 passes it in
+            // registers, its `va_arg` fitting the last ones exactly, and rounding `__gr_offs`
+            // for an even pair with the consumed cursor stored before the branch.
+            {
+                MirInstId const call = firstOfOp(m, instsOfNamed(L, "viaEllipsis"), MirOpcode::Call);
+                ASSERT_TRUE(call.valid());
+                auto const ops = m.instOperands(call);
+                if (cv.apple) {
+                    ASSERT_EQ(ops.size(), 3u) << "[callee, n, the composite's carrier]";
+                    ASSERT_EQ(m.instOpcode(ops[2]), MirOpcode::ByValueStackArg);
+                    EXPECT_EQ(m.instPayload2(ops[2]), own);
+                } else {
+                    for (std::size_t i = 1; i < ops.size(); ++i)
+                        EXPECT_NE(m.instOpcode(ops[i]), MirOpcode::ByValueStackArg) << "operand " << i;
+                }
+                std::size_t pairRounds = 0, stackRounds = 0, fits = 0, storedFirst = 0;
+                MirFuncId const f = funcIdOfNamed(L, "viaVaArg");
+                ASSERT_TRUE(f.valid());
+                for (std::uint32_t b = 0; b < m.funcBlockCount(f); ++b) {
+                    MirBlockId const blk = m.funcBlockAt(f, b);
+                    std::vector<MirInstId> stored;
+                    for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                        MirInstId const id = m.blockInstAt(blk, i);
+                        MirOpcode const op = m.instOpcode(id);
+                        if (op == MirOpcode::And && in.kind(m.instType(id)) == TypeKind::I32) ++pairRounds;
+                        if (op == MirOpcode::And && in.kind(m.instType(id)) == TypeKind::I64) ++stackRounds;
+                        if (op == MirOpcode::Store) stored.push_back(m.instOperands(id)[0]);
+                        if (op == MirOpcode::ICmpSle) {
+                            ++fits;
+                            MirInstId const consumed = m.instOperands(id)[0];
+                            for (MirInstId const v : stored)
+                                if (v == consumed) ++storedFirst;
+                        }
+                    }
+                }
+                // The stacked bytes begin on the alignment the caller's carrier placed them by,
+                // capped at 16: AAPCS64's overflow arm, Apple's one walk.
+                EXPECT_EQ(stackRounds, std::min(own, 16u) > 8u ? 1u : 0u) << "the stacked bytes' rounding";
+                if (!cv.apple) {
+                    EXPECT_EQ(pairRounds, evenPair ? 1u : 0u) << "`(__gr_offs + 15) & -16` for an even pair only";
+                    EXPECT_EQ(fits, 1u) << "the fit test is `offs + n*8 <= 0`";
+                    EXPECT_EQ(storedFirst, 1u) << "the consumed cursor is stored before the branch";
+                }
+            }
+            // Last, as it rewrites the module: the inlined column.
+            if (!s.fp) expectThePairsCallersInlineEachRegisterAtItsOperand(L, {"pairCaller", "mixedCaller"});
+        }
+    }
+    // A scalar `__int128` is the pair's own case (C.8 names it): x2:x3 under AAPCS64, x1:x2 on Apple.
+    for (Convention const cv : {Convention{"aapcs64", false}, Convention{"apple_arm64", true}}) {
+        SCOPED_TRACE(std::string{cv.cc} + ": __int128");
+        auto L = lowerC("long paired(long a, __int128 v) { return (long)v + a; }\n"
+                        "long pairCaller(__int128 *p) { return paired(1, *p); }\n",
+                        "arm64", cv.cc);
+        ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+        Mir const& m = L.mir.mir;
+        {
+            DiagnosticReporter verifyReporter;
+            MirVerifier v{m, &L.model.lattice().interner()};
+            EXPECT_TRUE(v.verify(verifyReporter))
+                << "every lowered module verifies: "
+                << (verifyReporter.all().empty() ? "" : verifyReporter.all()[0].actual);
+        }
+        MirInstId const call = firstOfOp(m, instsOfNamed(L, "pairCaller"), MirOpcode::Call);
+        ASSERT_TRUE(call.valid());
+        auto const ops = m.instOperands(call);
+        ASSERT_EQ(ops.size(), cv.apple ? 4u : 5u);
+        if (!cv.apple) EXPECT_TRUE(isConstZero(m, ops[2]));
+        std::vector<std::uint32_t> ordinals;
+        for (MirInstId const id : instsOfNamed(L, "paired"))
+            if (m.instOpcode(id) == MirOpcode::Arg) ordinals.push_back(m.tryArgIndex(id).value_or(99u));
+        EXPECT_EQ(ordinals, cv.apple ? (std::vector<std::uint32_t>{0u, 1u, 2u})
+                                     : (std::vector<std::uint32_t>{0u, 1u, 2u, 3u}))
+            << "the general registers the callee reads";
+        expectThePairsCallersInlineEachRegisterAtItsOperand(L, {"pairCaller"});
+    }
+}
+
 // ★ P69 (lane `cs`, fold f26c): EVERY TYPED FRAME SLOT STATES ITS TYPE'S ALIGNMENT — one home,
 // hir_to_mir's `frameSlotAlignment`, asked by a named local, a VLA and every anonymous temp
 // (C 6.2.8 / 6.7.5: an object has the alignment its type states). An anonymous temp stated
@@ -9040,6 +9303,127 @@ TEST(MirLoweringC, AnX87OnlyStructIsPassedOnTheStackAndReturnedAsAnF80) {
         }
     }
     EXPECT_EQ(f80Calls, 2u) << "both calls of mk come back as an F80 (st0), not through sret";
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): `long double _Complex` is psABI 3.2.3's
+// COMPLEX_X87. RETURNED as two x87 values — the callee's Return carries the real part
+// (operand 0, %st0) and the imaginary part (operand 1, %st1), with no sret pointer; the
+// caller's Call is typed F80 (the real part) and is followed DIRECTLY by an F80
+// `ReturnPiece` of x87 stack ordinal 1 (the imaginary part), even where the result is
+// dropped. PASSED in memory: a 16-aligned stack carrier, received from the stack.
+// ✔MEASURED (probe cx): gcc 13.3.0, clang 18.1.3 and Apple clang 21.0.0 for x86_64.
+TEST(MirLoweringC, AComplexLongDoubleIsReturnedAsTwoX87ValuesAndPassedOnTheStack) {
+    auto L = lowerC(
+        "typedef _Complex long double cld;\n"
+        "cld mk(long double a, long double b) { cld z; long double *p = (long double *)&z;\n"
+        "    p[0] = a; p[1] = b; return z; }\n"
+        "long double get(cld z) { return ((long double *)&z)[1]; }\n"
+        "long double use(void) { cld z = mk(1.0L, 2.0L); mk(3.0L, 4.0L);\n"
+        "    return get(z) + ((long double *)&z)[0]; }\n",
+        "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::X87_80);
+    ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    // mk: no sret pointer; its Return carries two F80s, the real part first.
+    auto const mk = instsOfNamed(L, "mk");
+    for (MirInstId const id : mk)
+        EXPECT_NE(m.instOpcode(id), MirOpcode::Arg) << "mk takes no sret pointer (its two F80s are stacked)";
+    MirInstId const ret = firstOfOp(m, mk, MirOpcode::Return);
+    ASSERT_TRUE(ret.valid());
+    auto const rops = m.instOperands(ret);
+    ASSERT_EQ(rops.size(), 2u) << "a COMPLEX_X87 result returns its two x87 values";
+    for (MirInstId const r : rops)
+        EXPECT_EQ(interner.kind(m.instType(r)), TypeKind::F80);
+    // get: the complex parameter is received from the stack.
+    EXPECT_TRUE(firstOfOp(m, instsOfNamed(L, "get"), MirOpcode::RecvByValueStackParam).valid())
+        << "a COMPLEX_X87 argument is passed in memory (its bytes on the stack)";
+    // use: each call of mk is typed F80, with no sret operand, and its imaginary part is
+    // the F80 ReturnPiece of ordinal 1 that follows it directly; the call of get passes a
+    // 16-aligned carrier.
+    auto const use = instsOfNamed(L, "use");
+    std::size_t pairCalls = 0;
+    for (std::size_t i = 0; i < use.size(); ++i) {
+        MirInstId const id = use[i];
+        if (m.instOpcode(id) != MirOpcode::Call) continue;
+        auto const ops = m.instOperands(id);
+        ASSERT_TRUE(m.instType(id).valid());
+        EXPECT_EQ(interner.kind(m.instType(id)), TypeKind::F80) << "mk's real part and get's long double";
+        if (ops.size() == 2u) {
+            // get(cld): [callee, the carrier]; its one long double needs no second piece.
+            EXPECT_EQ(m.instOpcode(ops[1]), MirOpcode::ByValueStackArg);
+            EXPECT_EQ(m.instPayload2(ops[1]), 16u) << "the complex's own alignment";
+            if (i + 1 < use.size())
+                EXPECT_NE(m.instOpcode(use[i + 1]), MirOpcode::ReturnPiece) << "an X87 scalar result is one value";
+            continue;
+        }
+        ++pairCalls;
+        EXPECT_EQ(ops.size(), 3u) << "mk(a, b): [callee, a, b] -- no sret operand";
+        ASSERT_LT(i + 1, use.size());
+        MirInstId const piece = use[i + 1];
+        ASSERT_EQ(m.instOpcode(piece), MirOpcode::ReturnPiece) << "the imaginary part is read right after the call";
+        EXPECT_EQ(m.instOperands(piece)[0].v, id.v);
+        EXPECT_EQ(m.returnPieceOrdinal(piece), 1u) << "x87 stack ordinal 1, %st1";
+        EXPECT_EQ(interner.kind(m.instType(piece)), TypeKind::F80);
+    }
+    EXPECT_EQ(pairCalls, 2u) << "both calls of mk -- the one whose result is dropped too -- read both x87 values";
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3, its variadic cell): `va_arg(ap, T)` of a
+// COMPLEX T, and a complex passed through `...`, lower on EVERY convention a shipped format
+// names (shippedConventionPairs, never a hand list), for each complex the pair has: float,
+// double, and long double where the pair's `long double` format is declared. Before f26c2
+// every one was REFUSED ("a va_arg reached lowerLvalueAddress that is neither a struct/union
+// nor a native scalar", naming a `_BitInt` the source does not have — probe cva, MEASURED on
+// pe64 and ELF x86_64): the VaArg address arm routed only Struct and Union to
+// lowerVaArgAggregate, which reads nothing a complex lacks (the classifier's answer and the
+// layout). gcc, clang and Apple clang read it (probe cx, cells 7-8). Under SysV a
+// `long double _Complex` is MEMORY as an argument (COMPLEX_X87): its 32 bytes are read from
+// the overflow area alone, so the cursor steps by 32.
+TEST(MirLoweringC, AComplexVaArgLowersOnEveryConventionAShippedFormatNames) {
+    struct Element { char const* spelling; bool longDouble; };
+    std::size_t conventions = 0;
+    for (test_support::ShippedConventionPair const& pair : test_support::shippedConventionPairs()) {
+        SCOPED_TRACE(pair.label());
+        auto const target = requireShippedTarget(pair.arch);
+        auto const* cc = target->callingConvention(pair.conventionIndex);
+        ASSERT_NE(cc, nullptr);
+        if (!cc->vaListLayout.has_value()) continue;
+        ++conventions;
+        LongDoubleFormat const ldf = pair.facts.longDoubleFormat;
+        for (Element const e : {Element{"float", false}, Element{"double", false}, Element{"long double", true}}) {
+            if (e.longDouble && ldf == LongDoubleFormat::None) continue;
+            SCOPED_TRACE(e.spelling);
+            std::string const t = e.spelling;
+            auto L = lowerC(
+                "#include <stdarg.h>\n"
+                "typedef " + t + " _Complex C;\n"
+                "long long take(int n, ...) {\n"
+                "  va_list ap;\n"
+                "  va_start(ap, n);\n"
+                "  C z = va_arg(ap, C);\n"
+                "  long long k = va_arg(ap, long long);\n"
+                "  va_end(ap);\n"
+                "  " + t + " *p = (" + t + " *)&z;\n"
+                "  return n + (long long)p[0] - (long long)p[1] + k;\n"
+                "}\n"
+                "long long use(void) {\n"
+                "  C z; " + t + " *p = (" + t + " *)&z; p[0] = 14; p[1] = 4;\n"
+                "  return take(30, z, 2LL);\n"
+                "}\n",
+                pair.arch, pair.convention, pair.facts.dataModel, ldf, pair.formatDoc);
+            ASSERT_TRUE(L.mir.ok) << "va_arg of a " << t << " _Complex, and the complex through `...`: "
+                                  << firstMirError(L.mirReporter);
+            // SysV's COMPLEX_X87 argument: overflow area only, a 32-byte step.
+            if (e.longDouble && ldf == LongDoubleFormat::X87_80
+                && cc->vaListLayout->strategy == VaListStrategy::SysVRegisterSave) {
+                Mir const& m = L.mir.mir;
+                std::uint32_t const fi = funcWithVaStart(m);
+                EXPECT_TRUE(funcHasConstInt(m, fi, 32))
+                    << "a COMPLEX_X87 va_arg steps overflow_arg_area by its 32 bytes";
+            }
+        }
+    }
+    EXPECT_GE(conventions, 5u) << "every shipped C convention declares a va_list (READ at f26c2: five)";
 }
 
 // The controls: Win64 and AAPCS64 pass a MEMORY-class aggregate as a POINTER to a
@@ -9538,7 +9922,10 @@ TEST(MirLoweringC, Aapcs64VaStartInitsNegativeGrOffs) {
 // A struct va_arg under AAPCS64 now GATHERS via the dual-cursor diamond. `struct Pt`
 // (8B, non-HFA) is a 1-GPR InRegisters aggregate → it reads the GR save block. The
 // inverted pin asserts the gather's structural signature (NOT a bare ok flip): the
-// SIGNED atomic-fit (ICmpSlt, NOT the SysV ICmpUlt), the SXTW (SExt, hazard H1), and
+// SIGNED atomic-fit on the consumed cursor (ICmpSle, NOT the SysV ICmpUlt -- AAPCS64
+// §B.4's `if (ap.__gr_offs > 0) goto on_stack`, so an aggregate that fills exactly the
+// registers left is read from them; P69 fold f26c2 retired the strict ICmpSlt this pin
+// held, which read that aggregate from the stack), the SXTW (SExt, hazard H1), and
 // the H2 wrong-class guard (reads __gr_offs@24, NEVER __vr_offs@28). RED-ON-DISABLE:
 // reverting the lowerVaArgAggregate Aapcs64DualCursor arm to fail-loud flips ok false.
 TEST(MirLoweringC, Aapcs64VaArgStructGathersViaDualCursor) {
@@ -9558,8 +9945,8 @@ TEST(MirLoweringC, Aapcs64VaArgStructGathersViaDualCursor) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     std::uint32_t const fi = funcWithVaStart(m);   // `sum` (the variadic callee)
-    EXPECT_TRUE(hasMirOpcode(m, fi, MirOpcode::ICmpSlt))
-        << "the AAPCS64 struct gather uses the SIGNED atomic-fit (negative cursor < 0)";
+    EXPECT_TRUE(hasMirOpcode(m, fi, MirOpcode::ICmpSle))
+        << "the AAPCS64 struct gather uses the SIGNED atomic-fit (the consumed cursor <= 0)";
     EXPECT_EQ(countOpcodeAllBlocks(m, fi, MirOpcode::ICmpUlt), 0u)
         << "AAPCS64 does NOT use the SysV unsigned-vs-limit compare (a fall-through to "
            "the SysV gather would emit ICmpUlt)";
@@ -15553,15 +15940,8 @@ constexpr char const* kSetjmpRoundTripSrc =
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
-        if (auto const* cc = t->callingConventionByName("sysv_amd64")) {
-            mirCfg.aggregate = cc->aggregate;   // the convention's aggregate rules, whole
-            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-            mirCfg.argSlotAligned            = cc->slotAligned;
-            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
-            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
-            mirCfg.stackArgPacking = cc->stackArgPacking;
-            mirCfg.vaListLayout = cc->vaListLayout;
-        }
+        if (auto const* cc = t->callingConventionByName("sysv_amd64"))
+            takeCallingConvention(mirCfg, *cc);   // the one assembly the pipeline calls
     }
     // The real pipeline's FFI-synthesis stage (compile_pipeline step 2.5) populates a
     // per-extern FfiMetadata (mangledName + importLibrary) BETWEEN HIR and MIR; the
@@ -18947,4 +19327,47 @@ TEST(MirLoweringC, AVariableLengthOperandTheLoweringCannotSizeStaysRefusedByName
         EXPECT_TRUE(named) << "still refused, by name ('" << c.says << "'): " << c.src;
         EXPECT_FALSE(L.hir->ok && L.mir.ok) << "never a lowered program: " << c.src;
     }
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F10): AN ID THE MODULE MINTS IS NO SYMBOL THE UNIT'S BODIES DECLARE.
+// CST→HIR mints its temporaries (`freshSymbol`) from the name table's end, and the module minted its own objects --
+// here a string literal's global -- from that same number; the static-initializer environment keys every initialized
+// VarDecl's symbol, a temporary's included, in the maps it keys the minted objects in, by bare number. The unit: a
+// compound assignment through a pointer member (a temporary holding the member's address, initialized) and a string
+// literal (a global the module mints). CONTROL: the body does declare a temporary past the table's end, and the
+// module does mint a global -- else the disjointness below would hold vacuously.
+//
+// RED-ON-DISABLE: drop the VarDecl arm of `keepSymbolIdEndClearOfUnitSymbols` and the literal's global takes the
+// temporary's number.
+TEST(MirLoweringC, AnIdTheModuleMintsIsNoSymbolTheUnitsBodiesDeclare) {
+    auto L = lowerC("struct S { int a; };\n"
+                    "char const *f(struct S *p) { p->a += 1; return \"x\"; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok) << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const tableEnd = static_cast<std::uint32_t>(L.model.symbols().size());
+    Hir const& h = L.hir->hir;
+    std::uint32_t const tag = h.id().v;
+    std::set<std::uint32_t> bodySymbols;
+    bool aTemporary = false;
+    for (std::uint32_t i = 1; i < h.nodeCount(); ++i) {
+        HirNodeId const n{i, tag};
+        SymbolId s{};
+        if (h.kind(n) == HirKind::VarDecl) s = h.varDeclSymbol(n);
+        else if (h.kind(n) == HirKind::ReadModifyWrite) s = h.rmwOldValueSymbol(n);
+        if (!s.valid()) continue;
+        bodySymbols.insert(s.v);
+        aTemporary = aTemporary || s.v >= tableEnd;
+    }
+    ASSERT_TRUE(aTemporary) << "CONTROL: the body declares a temporary past the name table's end";
+    Mir const& m = L.mir.mir;
+    std::size_t minted = 0;
+    for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        SymbolId const s = m.globalSymbol(m.globalAt(gi));
+        if (s.v < tableEnd) continue;   // a record of the table: not minted here
+        ++minted;
+        EXPECT_EQ(bodySymbols.count(s.v), 0u) << "a minted id is no symbol the unit's bodies declare: " << s.v;
+    }
+    EXPECT_GE(minted, 1u) << "CONTROL: the string literal is a global the module mints";
 }

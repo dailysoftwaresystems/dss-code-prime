@@ -1,1 +1,2 @@
-            out.kind = position != AggregatePosition::Result ? AbiPassing::Kind::X87
+            if (position != AggregatePosition::Result) {
+                // One x87 value, at offset 0, in %st0

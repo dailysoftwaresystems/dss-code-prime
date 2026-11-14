@@ -1,1 +1,1 @@
-        mirCfg.aggregate = cc->aggregate;
+    cfg.aggregate                 = cc.aggregate;

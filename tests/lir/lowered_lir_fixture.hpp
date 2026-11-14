@@ -284,22 +284,12 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     if (auto const* cc = target->callingConvention(mirCcIndex)) {
         mirCfg.aggregateLayout           = target->aggregateLayout();
         mirCfg.aggregateLayoutLoaded     = target->aggregateLayoutLoaded();
-        mirCfg.aggregate = cc->aggregate;   // the convention's aggregate rules, whole
-        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-        mirCfg.argSlotAligned            = cc->slotAligned;
-        mirCfg.argGprCount               =
-            static_cast<std::uint32_t>(cc->argGprs.size());
-        mirCfg.argFprCount               =
-            static_cast<std::uint32_t>(cc->argFprs.size());
-        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
-        // packing rules decide `va_start`'s overflow base for a callee whose named
-        // params overflow the arg registers. ⚠ THREADED HERE AS PART OF ADDING THE
-        // FIELD, not as a follow-up — the docblock below records this fixture
-        // silently reading a default THREE times (TF-C78 / TF-C81 / TF-C92) and
-        // every test concluding the feature was absent. A default here would make
-        // the Apple `va_start` pin PASS against slot packing.
-        mirCfg.stackArgPacking           = cc->stackArgPacking;
-        mirCfg.vaListLayout              = cc->vaListLayout;
+        // The convention's facts, through the ONE assembly `compile_pipeline.cpp` calls
+        // (`takeCallingConvention`). ⚠ P69 fold f26c2: this fixture listed the fields by
+        // hand and missed the two that fold added (the even register pair, Apple's stacked
+        // variadic arguments) — the miss the docblock below records three times one map
+        // over (TF-C78 / TF-C81 / TF-C92), closed for the convention at its one home.
+        takeCallingConvention(mirCfg, *cc);
     }
     // D-CSUBSET-VLA (C1b): thread the captured VLA size-expr map so a `int a[n]`
     // source lowers its runtime-operand Alloca through THIS fixture too (else the
@@ -382,9 +372,19 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
                                     // records hitting three times.
                                     &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
+    // The LIR lowering reads the SAME convention the MIR config took (`mirCcIndex`), as
+    // `compile_pipeline.cpp` passes it — the format facts between stay their defaults.
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),
-                                    lirReporter);
+                                    lirReporter,
+                                    /*externImports=*/{}, /*externCallDispatch=*/std::nullopt,
+                                    /*dataImportBinding=*/std::nullopt, /*tlsAccess=*/std::nullopt,
+                                    /*sehScopes=*/{}, /*wideFloatSoftcallLibrary=*/std::nullopt,
+                                    /*externAddrBinding=*/std::nullopt, /*charIsUnsigned=*/std::nullopt,
+                                    /*atomicsRuntime=*/std::nullopt, /*indirectSlotBindings=*/{},
+                                    /*preemptibleDefinitionBindings=*/{}, /*definedSymbolNames=*/{},
+                                    /*assemblyFormatKind=*/std::nullopt, /*imageDefinedNames=*/{},
+                                    mirCcIndex);
     LoweredLir out{std::move(model), std::move(hir), std::move(hirReporter),
                    std::move(mir), std::move(mirReporter), std::move(target),
                    std::move(lirReporter), std::move(lir)};

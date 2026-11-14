@@ -1,0 +1,1 @@
+            if (typed.valid() && interner.kind(typed) == TypeKind::Ptr) common = typed;

@@ -6145,6 +6145,137 @@ TEST(MirToLir, F80ReturnOperandLowersToFld80BeforeBareRet) {
         << "a long-double return leaves the value in st0 — the ret has no reg operand";
 }
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): psABI 3.2.3's COMPLEX_X87 — a
+// `long double _Complex` result is TWO x87 values, the real part in %st0 and the
+// imaginary in %st1 (probe cx: gcc 13.3.0, clang 18.1.3 and Apple clang 21.0.0 for
+// x86_64). At MIR the callee returns them as operands 0 (real) and 1 (imaginary), and
+// the caller reads operand 1 as an F80 `ReturnPiece` of x87 stack ordinal 1.
+namespace {
+// cld f(long double re, long double im) — Return [re, im]. `recvs` gets the two F80
+// parameters' homes, in parameter order.
+[[nodiscard]] GuardProbe lowerX87PairReturnProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80 = interner.primitive(::dss::TypeKind::F80);
+    std::array<::dss::TypeId, 2> params{f80, f80};
+    auto const sig = interner.fnSig(params, interner.complex(f80), ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const re = mb.addArg(0, f80);
+    ::dss::MirInstId const im = mb.addArg(1, f80);
+    std::array<::dss::MirInstId, 2> rets{re, im};
+    mb.addReturnMulti(rets);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// void f(void) { g(); } where g returns a `long double _Complex`: the Call is typed F80
+// (piece 0, %st0) and an F80 ReturnPiece of ordinal 1 reads %st1 -- or, with `between`,
+// a constant is placed between the call and its piece.
+[[nodiscard]] GuardProbe lowerX87PairCallProbe(bool between) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80   = interner.primitive(::dss::TypeKind::F80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    auto const ptrT  = interner.pointer(voidT);
+    auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
+    std::array<::dss::MirInstId, 1> callOps{callee};
+    ::dss::MirInstId const call = mb.addInst(::dss::MirOpcode::Call, callOps, f80);
+    if (between) {
+        ::dss::MirLiteralValue lv;
+        lv.value = std::int64_t{7};
+        lv.core  = ::dss::TypeKind::I64;
+        (void)mb.addConst(lv, interner.primitive(::dss::TypeKind::I64));
+    }
+    (void)mb.addReturnPiece(call, 1, ::dss::TargetRegClass::FPR, f80);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+} // namespace
+
+TEST(MirToLir, AnX87PairReturnPushesTheImaginaryPartFirstSoTheRealPartIsInSt0) {
+    auto probe = lowerX87PairReturnProbe();
+    ASSERT_TRUE(probe.ok) << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const fldOp  = (*target)->opcodeByMnemonic("fld_m80");
+    auto const recvOp = (*target)->opcodeByMnemonic("recv_by_value_stack_param");
+    auto const retOp  = (*target)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(fldOp.has_value() && recvOp.has_value() && retOp.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::vector<LirReg> homes;   // the parameters' homes, in parameter order
+    std::vector<LirReg> pushed;  // the fld_m80 addresses, in order
+    std::optional<std::uint32_t> retIdx;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const in = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(in) == *recvOp) homes.push_back(lir.instResult(in));
+        if (lir.instOpcode(in) == *retOp && !retIdx.has_value()) retIdx = i;
+        if (lir.instOpcode(in) == *fldOp && !retIdx.has_value()) {
+            auto const ops = lir.instOperands(in);
+            ASSERT_FALSE(ops.empty());
+            ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+            pushed.push_back(ops[0].reg);
+        }
+    }
+    ASSERT_TRUE(retIdx.has_value());
+    ASSERT_EQ(homes.size(), 2u) << "re and im, each received from the stack";
+    ASSERT_EQ(pushed.size(), 2u) << "both x87 values are pushed before the ret";
+    EXPECT_EQ(pushed[0], homes[1]) << "the IMAGINARY part (operand 1) is pushed first, so it ends in %st1";
+    EXPECT_EQ(pushed[1], homes[0]) << "the REAL part (operand 0) is pushed last, so it is %st0 at the ret";
+}
+
+TEST(MirToLir, AnX87ResultPieceIsPoppedRightAfterTheCallsOwnCapture) {
+    auto probe = lowerX87PairCallProbe(/*between=*/false);
+    ASSERT_TRUE(probe.ok) << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const fstpOp = (*target)->opcodeByMnemonic("fstp_m80");
+    auto const fldOp  = (*target)->opcodeByMnemonic("fld_m80");
+    ASSERT_TRUE(callOp.has_value() && fstpOp.has_value() && fldOp.has_value());
+    Lir const& lir = probe.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::optional<std::uint32_t> callIdx;
+    std::vector<std::uint32_t> x87After;   // every x87 instruction after the call, in order
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const op = lir.instOpcode(lir.blockInstAt(bb, i));
+        if (op == *callOp && !callIdx.has_value()) { callIdx = i; continue; }
+        if (callIdx.has_value() && (op == *fstpOp || op == *fldOp)) x87After.push_back(i);
+    }
+    ASSERT_TRUE(callIdx.has_value());
+    ASSERT_EQ(x87After.size(), 2u) << "the call's two x87 values are both popped, and nothing else touches the stack";
+    EXPECT_EQ(x87After[0], *callIdx + 1) << "%st0 (the real part) is popped right after the call";
+    for (std::uint32_t const i : x87After)
+        EXPECT_EQ(lir.instOpcode(lir.blockInstAt(bb, i)), *fstpOp) << "each x87 value is POPPED (fstp_m80)";
+}
+
+TEST(MirToLir, AnX87ResultPieceThatDoesNotFollowItsCallIsRefusedByName) {
+    auto probe = lowerX87PairCallProbe(/*between=*/true);
+    EXPECT_FALSE(probe.ok) << "a piece that does not follow its call would pop another value";
+    bool named = false;
+    for (auto const& d : probe.rep.all())
+        if (d.actual.find("does not follow the call") != std::string::npos) named = true;
+    EXPECT_TRUE(named) << "the refusal names the x87 piece's place: "
+                       << (probe.rep.all().empty() ? "" : probe.rep.all()[0].actual);
+}
+
 // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: INVERTED from the LD-1 x87-review WALL.
 // An F80 phi — a `long double` crossing a control-flow JOIN (`cond ? a : b`) —
 // now LOWERS, to a MEMORY-HOME merge. The memory-resident F80 model makes an F80

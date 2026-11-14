@@ -2964,11 +2964,21 @@ def _st_pure(t):
                 and theirs.startswith("/home/a-wsl-account/.cache/dsscp/sqlite-consumers/")
                 and theirs == consumer_checkout("windows", win_out, env) and other != theirs,
                 (theirs, other))
+        # The relative spelling is taken from inside the scratch, so it exists wherever the scratch lies: a Windows
+        # path has no relative spelling from another volume's directory (os.path.relpath raises), and the scratch
+        # and the process's directory are on two volumes whenever TEMP and the checkout are.
+        here = os.getcwd()
+        os.chdir(tmp)
+        try:
+            relative = os.path.relpath(win_out)
+            relative_key = consumer_key(relative)
+        finally:
+            os.chdir(here)
         t.check("...keyed by the tree, not by its spelling: a relative spelling of the same tree keys the same, and "
                 "XDG_CACHE_HOME moves the cache root",
-                consumer_key(os.path.relpath(win_out)) == consumer_key(win_out)
+                not os.path.isabs(relative) and relative_key == consumer_key(win_out)
                 and consumer_checkout("windows", win_out, dict(env, XDG_CACHE_HOME="/x/cache")).startswith(
-                    "/x/cache/dsscp/sqlite-consumers/"), consumer_key(win_out))
+                    "/x/cache/dsscp/sqlite-consumers/"), (relative, consumer_key(win_out)))
         died, msg, _ = _dies(consumer_checkout, "windows", win_out, None)
         died2, msg2, _ = _dies(consumer_checkout, "windows", win_out, {"XDG_CACHE_HOME": "", "HOME": ""})
         t.check("a Windows consumer placed WITHOUT the POSIX side's environment is refused (this process's own names "

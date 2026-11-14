@@ -865,6 +865,33 @@ round's close; each checkpoint's commit message says what was and was not run on
   (ledger 561). DssHarness 0.6.19's `check-anchor-arms` is now a step of the round's close (`anchors.historyForms`
   declares X8's one history spelling; ledger 564). Balance unchanged: 687 open against 620 at `71648598`. Fold order
   now: f26c2 → 3e → L2b2 → f26d → 3f → 3g → 3h → L2b3 (wherever ready, before H7) → H7.
+  ✔READ after the push: checkpoint 42's five-leg suite reads 2935/2936 on macos-arm64-debug, linux-x86_64-debug and
+  linux-arm64-debug and 2934/2936 on both Windows legs. Every red is known: the `mode` red (cs's f26c2), and on
+  Windows `harness/sqlite_driver_selftest`, ours since the move (the self-test took a relative path across volumes,
+  TEMP on C: and the checkout on D:), fixed in checkpoint 43. H6b's Mac examples are read (565's risk discharged).
+  The Mac sweep of its arms: 13 passed, 18 violated by one defect (a case compiled only on Windows), 1 survived (the
+  archive withheld at two sites); both are hm's in H6c (ledger 576).
+- **Checkpoint 43 (2026-11-13) = the front-end and convention lane's fold f26c2**, the answer to f26c's review
+  (F1–F15): COMPLEX_X87 (result st0/st1, argument MEMORY, the complex `va_arg` neighbour); every arm's red set; the
+  alignment an arm64 convention reads of an argument (members, type, HFA element), the AAPCS64 even GPR pair, Apple's
+  stacked `...` and three AAPCS64 `va_arg` neighbours, through ONE asker (`takeCallingConvention`, six hand copies → one;
+  `convention_`, ten `callingConvention(0)` reads → the active one); a conditional's type decided once by the analyzer; a
+  call that sees no prototype passes its own promoted arguments, one home (`typeOfACallWithoutAPrototype`); every
+  declaration row's linkage tables (`linkageTablesFrom`, `attributeLinkageTablesFrom`); the module's minted ids kept
+  past every unit symbol. THE PADDING AS A CLASS: an AAPCS64 even-pair callee left the padded register with no `Arg`,
+  so its ordinals gapped and the verifier refused the module (found on linux-arm64-debug only); the callee now
+  receives it, and by data no other convention row (five read) or tier (every `Arg` producer and consumer) skips a
+  register. The closure found the wide `_BitInt`'s alignment (AAPCS64 Table 3: 16; DSS 8 everywhere): ONE new 🔵
+  DISCLOSED row, D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64, f26d's FIRST item (ledger 587). 54 new
+  arms, unswept. ✔MEASURED by the lane (its scope, 27 binaries whole + 10 examples × both runners): macos-arm64-debug
+  40, linux-x86_64-debug 40, linux-arm64-debug 40 (GNU 13.3.0, the native witness's GNU arm read), windows-x86_64-debug
+  and windows-x86_64-release 40/41 before the lane's own registry-order fix (re-read OK). The padding hunk's Windows
+  reading is owed to the post-fold suite. Also in this checkpoint, main's own: `repo-guard` is DECLARED
+  (`dss_label_repo_guard`), never inferred from a name; the name scan had skipped `lir/test_lir_fixture_vacuity_guard`
+  and the corpus example `struct_big_neighbor_guard` on every indirect leg, and the checker now refuses an undeclared
+  label (ledger 584); the sqlite self-test's cross-volume relative path (ledger 582); plan 30's PR #59 set keeps a row
+  until it closes (ledger 589). Balance: 688 open against 620 at `71648598` (+1, the disclosed row). Fold order now:
+  3e → L2b2 → f26d → 3f → 3g → 3h → L2b4 → L2b3 → H6c → H6d → H7 (L2b4, L2b3 and H6c wherever ready, before H7).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

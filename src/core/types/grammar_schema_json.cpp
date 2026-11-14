@@ -10122,9 +10122,101 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "/semantics/declarations",
                               "'semantics.declarations' must be an array");
                 } else {
+                    // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9; main's ledgers 540, 551, 552): A ROW MAY
+                    // TAKE ANOTHER ROW'S LINKAGE TABLES. `linkageTablesFrom` names the `rule` of another row of this
+                    // array whose four linkage tables (`kLinkageTableKeys`) the row takes, and the row states only
+                    // what differs -- a calling convention's `derivesFrom` is the reference form: an own
+                    // `linkageSpecifiers` entry replaces or adds that one key whole, an own ignored list replaces that
+                    // list whole, and a table the named row does not state is the row's own. One statement of the
+                    // block-scope tables (`varDecl`'s) is then what `autoInferredVarDecl` reads, beside the
+                    // storage-class entries C23 6.7.2p4 makes differ there, where the two rows used to hold two copies
+                    // of every other entry and list. The merge is made HERE, on the document, so the merged row is read
+                    // by the one row reader below with every check it makes of a written row.
+                    // Refused by name, and the row not read: a value that is not a string; a rule no other row has, or
+                    // that two rows have (the row taken from must be one); a named row that states none of the four
+                    // tables; a named row that itself takes them (one level, so a reader of the document finds every
+                    // entry one row away); an own entry or list EQUAL to the one it replaces -- a restatement is a
+                    // second home of one fact, the duplicate this key exists to remove.
+                    static constexpr std::array<std::string_view, 4> kLinkageTableKeys{
+                        "linkageSpecifiers", "linkageSpecifierIgnoredKinds",
+                        "linkageSpecifierIgnoredRules", "linkageSpecifierIgnoredNames"};
+                    std::vector<std::optional<json>> takenTables(arr.size());
+                    std::vector<char> tablesRefused(arr.size(), 0);
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        json const& own = arr[i];
+                        if (!own.is_object() || !own.contains("linkageTablesFrom")) continue;
+                        std::string refusal;
+                        std::optional<std::size_t> from;
+                        json const& named = own.at("linkageTablesFrom");
+                        if (!named.is_string()) {
+                            refusal = "'linkageTablesFrom' must be a string naming the rule of another row of "
+                                      "'declarations'";
+                        } else {
+                            std::string const rule = named.get<std::string>();
+                            std::size_t rows = 0;
+                            for (std::size_t r = 0; r < arr.size(); ++r) {
+                                if (r == i || !arr[r].is_object() || !arr[r].contains("rule")) continue;
+                                json const& rr = arr[r].at("rule");
+                                if (rr.is_string() && rr.get<std::string>() == rule) { ++rows; from = r; }
+                            }
+                            if (rows == 0) {
+                                refusal = std::format("'linkageTablesFrom' names '{}', which is the rule of no other "
+                                                      "row of 'declarations'", rule);
+                            } else if (rows > 1) {
+                                refusal = std::format("'linkageTablesFrom' names '{}', which {} rows of "
+                                                      "'declarations' have: the row whose tables are taken must be "
+                                                      "one", rule, rows);
+                            } else if (arr[*from].contains("linkageTablesFrom")) {
+                                refusal = std::format("'linkageTablesFrom' names '{}', which itself takes its linkage "
+                                                      "tables from another row: a row takes them from a row that "
+                                                      "states them (one level)", rule);
+                            } else if (std::none_of(kLinkageTableKeys.begin(), kLinkageTableKeys.end(),
+                                                    [&](std::string_view k) {
+                                                        return arr[*from].contains(std::string{k});
+                                                    })) {
+                                refusal = std::format("'linkageTablesFrom' names '{}', which states no linkage "
+                                                      "table", rule);
+                            }
+                        }
+                        json taken = own;
+                        taken.erase("linkageTablesFrom");
+                        for (std::string_view const keyView : kLinkageTableKeys) {
+                            if (!refusal.empty()) break;
+                            std::string const key{keyView};
+                            json const& base = arr[*from];
+                            if (!base.contains(key)) continue;            // the row's own, or none
+                            if (!own.contains(key)) { taken[key] = base.at(key); continue; }
+                            if (key == "linkageSpecifiers" && own.at(key).is_object() && base.at(key).is_object()) {
+                                json merged = base.at(key);
+                                for (auto const& [spec, effect] : own.at(key).items()) {
+                                    if (merged.contains(spec) && merged.at(spec) == effect) {
+                                        refusal = std::format("'linkageSpecifiers' restates the '{}' entry it takes "
+                                                              "from '{}': a row states only what differs",
+                                                              spec, named.get<std::string>());
+                                        break;
+                                    }
+                                    merged[spec] = effect;
+                                }
+                                taken[key] = std::move(merged);
+                            } else if (own.at(key) == base.at(key)) {
+                                refusal = std::format("'{}' restates the list it takes from '{}': a row states only "
+                                                      "what differs", key, named.get<std::string>());
+                            }
+                            // Otherwise the own value stands whole -- and a value of the wrong shape is
+                            // refused by the reader below, exactly as a written one is.
+                        }
+                        if (refusal.empty()) {
+                            takenTables[i] = std::move(taken);
+                        } else {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format("/semantics/declarations/{}/linkageTablesFrom", i), refusal);
+                            tablesRefused[i] = 1;
+                        }
+                    }
                     for (std::size_t i = 0; i < arr.size(); ++i) {
                         const auto path = std::format("/semantics/declarations/{}", i);
-                        json const& entry = arr[i];
+                        if (tablesRefused[i] != 0) continue;   // refused by name above; the row is not read
+                        json const& entry = takenTables[i].has_value() ? *takenTables[i] : arr[i];
                         if (!entry.is_object()) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics, path,
                                       "each 'declarations' entry must be an object");
@@ -10138,7 +10230,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // no-op the facet. Listed in reader order; the nested
                         // `gatedMarkers` entries carry their own closed-key
                         // check further down.
-                        static constexpr std::array<std::string_view, 41>
+                        static constexpr std::array<std::string_view, 42>
                             kDeclarationRowKeys{
                                 // the shape anchor + visible-child indices
                                 "rule", "name", "type", "init", "body",
@@ -10167,6 +10259,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 "linkageSpecifierIgnoredKinds",
                                 "linkageSpecifierIgnoredNames",
                                 "linkageSpecifierIgnoredRules",
+                                // (P69 fold f26c2) the row whose tables read
+                                // this row's attribute specifiers per declarator
+                                "attributeLinkageTablesFrom",
                                 // attribute surface (TF-C73)
                                 "declarationAttrSlotRules",
                                 "unknownStrictAttributeIsError",
@@ -11366,6 +11461,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): optional
+                        // `attributeLinkageTablesFrom`, the RULE of the row whose linkage
+                        // tables this row's attribute specifiers are folded with, per
+                        // declarator (`DeclarationRule::attributeLinkageRow`). Read as a
+                        // name here; resolved, and refused by name, once every row is
+                        // read (below the loop).
+                        if (entry.contains("attributeLinkageTablesFrom")) {
+                            if (!entry.at("attributeLinkageTablesFrom").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/attributeLinkageTablesFrom",
+                                          "'attributeLinkageTablesFrom' must be a string naming the "
+                                          "rule of another row of 'declarations'");
+                            } else {
+                                rule.attributeLinkageRuleName =
+                                    entry.at("attributeLinkageTablesFrom").get<std::string>();
+                            }
+                        }
+
                         // FC4 c1 stage 2a: optional `requireNamedDeclarators`
                         // flag (default false). Declarator-mode named
                         // positions (locals/globals/typedefs) declare true so
@@ -12212,6 +12325,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
 
                         cfg.declarations.push_back(std::move(rule));
+                    }
+                    // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): each
+                    // `attributeLinkageTablesFrom` resolved to the ONE other row of that
+                    // rule, which must state a `linkageSpecifiers` table (else the
+                    // specifiers would be folded with nothing, a key with no effect).
+                    // Refused by name; the row then reads no attribute specifier.
+                    for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
+                        DeclarationRule& row = cfg.declarations[i];
+                        if (row.attributeLinkageRuleName.empty()) continue;
+                        std::size_t rows = 0;
+                        std::size_t at = 0;
+                        for (std::size_t j = 0; j < cfg.declarations.size(); ++j) {
+                            if (j == i || cfg.declarations[j].ruleName != row.attributeLinkageRuleName) continue;
+                            ++rows;
+                            at = j;
+                        }
+                        std::string refusal;
+                        if (rows != 1) {
+                            refusal = std::format("names '{}', which {} other rows of 'declarations' have: the "
+                                                  "row whose tables read the attribute specifiers must be one",
+                                                  row.attributeLinkageRuleName, rows);
+                        } else if (cfg.declarations[at].linkageSpecifiers.empty()) {
+                            refusal = std::format("names '{}', which states no 'linkageSpecifiers' table",
+                                                  row.attributeLinkageRuleName);
+                        }
+                        if (!refusal.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/declarations",
+                                      std::format("the '{}' row's 'attributeLinkageTablesFrom' {}",
+                                                  row.ruleName, refusal));
+                            continue;
+                        }
+                        row.attributeLinkageRow = static_cast<std::uint32_t>(at);
                     }
                 }
             }
@@ -13650,9 +13795,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'parameters' must be an object");
                 } else {
                     // DERIVED FROM THE PARSE ARMS below: the block reads exactly
-                    // these two keys.
-                    static constexpr std::array<std::string_view, 2>
-                        kParametersKeys{"soleVoidMeansEmpty", "unqualifiedParameterTypes"};
+                    // these three keys.
+                    static constexpr std::array<std::string_view, 3>
+                        kParametersKeys{"soleVoidMeansEmpty", "unqualifiedParameterTypes",
+                                        "emptyListDeclaresNoPrototype"};
                     DSS_CHECK_KEY_VOCABULARY(kParametersKeys);
                     (void)checkKeysAgainst(
                         pj, kParametersKeys, "/semantics/parameters",
@@ -13672,6 +13818,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("soleVoidMeansEmpty", cfg.parameters.soleVoidMeansEmpty);
                     readBool("unqualifiedParameterTypes",
                              cfg.parameters.unqualifiedParameterTypes);
+                    readBool("emptyListDeclaresNoPrototype",
+                             cfg.parameters.emptyListDeclaresNoPrototype);
                 }
             }
 

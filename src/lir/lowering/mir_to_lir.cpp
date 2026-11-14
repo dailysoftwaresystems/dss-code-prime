@@ -828,6 +828,11 @@ wideFloatCmpPlan(MirOpcode op) noexcept {
 struct Lowerer {
     Mir const&          mir;
     TargetSchema const& target;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F7): the ACTIVE calling convention
+    // (`lowerToLir`'s `callingConventionIndex`), the one source of every convention fact
+    // this lowering reads; null when the target declares none, which each reader refuses
+    // by name. Declared after `target`, which initializes it.
+    TargetCallingConvention const* convention_;
     TypeInterner const& interner;
     DiagnosticReporter& reporter;
     LirBuilder          lir;
@@ -955,6 +960,11 @@ struct Lowerer {
     std::uint32_t                   stackedArgAlign_ = 0;
     bool                            stackRealignPending_ = false;
     std::unordered_map<std::uint32_t, std::uint32_t> stackedArgAlignByFunc_;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): the MIR instruction lowered
+    // just before the current one IN ITS BLOCK (invalid at a block's head). An x87
+    // result piece pops the x87 stack, so it must follow its call -- or the piece
+    // before it -- directly (`lowerF80ReturnPiece` asks this, fail-loud).
+    MirInstId                       precedingMirInst_ = InvalidMirInst;
     // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL x D-WIN64-SEH-FUNCLETS: for the SEH
     // filter funclet currently being lowered, the MIR function whose frame its
     // `RecoverParentFrameSlot` ops read. Set per function from the scope records
@@ -1528,8 +1538,10 @@ struct Lowerer {
             std::vector<SymbolBinding> preemptibleDefinitionBindings,
             std::span<DefinedSymbolName const> definedSymbolNames,
             std::optional<ObjectFormatKind> assemblyFormatKind,
-            std::span<std::string const> imageDefinedNames)
-        : mir(m), target(t), interner(i), reporter(r), lir(t),
+            std::span<std::string const> imageDefinedNames,
+            std::uint16_t callingConventionIndex)
+        : mir(m), target(t), convention_(t.callingConvention(callingConventionIndex)),
+          interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
@@ -3811,6 +3823,13 @@ struct Lowerer {
         // does not state rather than a file it reads from.
         if (interner.kind(mir.instType(id)) == TypeKind::F128) {
             lowerF128ReturnPiece(id);
+            return;
+        }
+        // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): an x87 piece — the
+        // imaginary part of a COMPLEX_X87 result, x87 stack ordinal 1 — is POPPED
+        // off the x87 stack into a home of its own (`lowerF80ReturnPiece`).
+        if (interner.kind(mir.instType(id)) == TypeKind::F80) {
+            lowerF80ReturnPiece(id);
             return;
         }
         // Plan 29 §4.4.5: the piece's register class is the one the PRODUCER
@@ -7058,19 +7077,25 @@ struct Lowerer {
     // then bind the alloca value to `base` so every `a[i]` address use reads it. The
     // callconv pass reserves the frame pointer for the function (the `sub_sp_reg`
     // presence is its "has-VLA" signal) so the fixed frame survives this runtime SP
-    // move; the callconv LEAF gate fails loud on a VLA function that also calls /
-    // uses va_start (D-CSUBSET-VLA-NONLEAF-CALL-FRAME).
+    // move. A VLA function may call and may use `va_start` (the outgoing-args area
+    // travels with SP; the va-area leas and the variadic spill are the frame
+    // pointer's — the LEAF gate this comment used to cite is gone, its call half and,
+    // at fold f26c, its `va_start` half). What still refuses the moved frame is
+    // `L_VlaNonLeafFrameUnsupported`'s two remaining reasons: the frame-base verifier
+    // (a fixed-frame reference left SP-relative under the moved SP) and a SEH
+    // `__try` parent, whose funclets' establisher frame is unwitnessed for a
+    // frame-register parent.
     void lowerVlaAlloca(MirInstId id) {
         auto const subOp  = opcode(MnemonicSlot::SubSpReg);
         auto const copyOp = opcode(MnemonicSlot::SpCopy);
         auto const addOp  = opcode(MnemonicSlot::Add);
         auto const andOp  = opcode(MnemonicSlot::And);
-        // The stack + frame pointer are cc fields, but TARGET-uniform (the same
-        // physical register across every cc of a target — rsp/sp, rbp/x29), so cc
-        // index 0 is the canonical source at MIR->LIR (pre-abi-resolution). A target
+        // The stack + frame pointer are cc fields (TARGET-uniform in every shipped
+        // document — rsp/sp, rbp/x29 — and read off the ACTIVE convention, the one
+        // source of this lowering's convention facts, `convention_`). A target
         // missing any part of the substrate (either op, no stackPointer, or no
         // framePointer) cannot build the dynamic frame — fail loud, never miscompile.
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         if (!subOp.has_value() || !copyOp.has_value() || !addOp.has_value()
             || !andOp.has_value() || cc == nullptr
             || !cc->stackPointer.has_value() || !cc->framePointer.has_value()) {
@@ -7236,24 +7261,52 @@ struct Lowerer {
     }
 
     // ★ P69 (lane `cs`, fold f26c, main's ledger 495): the widest alignment a
-    // stacked by-value carrier of `mf`'s calls states -- the SAME answer each
-    // carrier's `ByValueStackAgg` marker states (`byValueCarrierAlignment`), so the
-    // frame realigns to exactly what the outgoing cursor places by. 0 when `mf`
-    // passes nothing on the stack by value.
+    // stacked by-value carrier of `mf`'s calls is PLACED by, so the frame realigns
+    // to exactly what the outgoing cursor places by. 0 when `mf` passes nothing on
+    // the stack by value.
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F7): "placed by" is the carrier's
+    // own alignment (`byValueCarrierAlignment`, what its `ByValueStackAgg` marker
+    // states) as the CONVENTION honours it — `stackArgPacking.aggregateAlignment`,
+    // the cap `StackArgCursor::placeNamedAggregate` applies to the same marker. This
+    // took the own alignment raw, which is the placed one only where the cap is
+    // `own`: under AAPCS64 and Apple arm64 a 32-aligned HFA that is placed on a
+    // 16-aligned (8-aligned) slot moved its caller onto the dynamic frame-pointer
+    // frame to realign to 32 for nothing (✔MEASURED, lane `cs` probe f14: DSS's
+    // caller of `struct { _Alignas(32) double a, b, c, d; }` after eight doubles
+    // emitted `sub sp, sp, x14` on both conventions). The cap is asked with no slot
+    // floor: the question here is only whether the placement exceeds the stack's own
+    // alignment, which a slot-aligned placement never needs a realignment for.
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F11): the carriers a CALL consumes
+    // (a `Call`'s operands 1.., operand 0 being its callee; the opcode the caller's
+    // lowering hands a carrier to), never every `ByValueStackArg` of the
+    // function. The reason to realign is a call that places the carrier's bytes; after
+    // the release pipeline inlines a callee that receives its aggregate on the stack,
+    // the spliced copy reads the caller's carrier as a plain address
+    // (src/opt/passes/inlining.cpp maps the callee's reception to it) and no call is
+    // left to place it — counting it pinned a frame pointer and an entry realignment
+    // for a call that no longer exists.
     [[nodiscard]] std::uint32_t functionStackedArgAlignment(MirFuncId mf) const {
+        auto const* cc = convention_;
         std::uint32_t widest = 0;
         std::uint32_t const bc = mir.funcBlockCount(mf);
         for (std::uint32_t bi = 0; bi < bc; ++bi) {
             MirBlockId const mb = mir.funcBlockAt(mf, bi);
             std::uint32_t const n = mir.blockInstCount(mb);
             for (std::uint32_t i = 0; i < n; ++i) {
-                MirInstId const id = mir.blockInstAt(mb, i);
-                if (mir.instOpcode(id) != MirOpcode::ByValueStackArg) continue;
-                widest = std::max(widest,
-                                  byValueCarrierAlignment(
-                                      mir.instType(id),
-                                      mir.instPayload(id) & kByValueStackArgSizeMask,
-                                      mir.instPayload2(id)));
+                MirInstId const call = mir.blockInstAt(mb, i);
+                if (mir.instOpcode(call) != MirOpcode::Call) continue;
+                auto const operands = mir.instOperands(call);
+                for (std::size_t k = 1; k < operands.size(); ++k) {
+                    MirInstId const id = operands[k];
+                    if (mir.instOpcode(id) != MirOpcode::ByValueStackArg) continue;
+                    std::uint32_t const own = byValueCarrierAlignment(
+                        mir.instType(id), mir.instPayload(id) & kByValueStackArgSizeMask,
+                        mir.instPayload2(id));
+                    widest = std::max(widest,
+                                      cc != nullptr
+                                          ? cc->stackArgPacking.aggregateAlignment(own, /*slotBytes=*/1u)
+                                          : own);
+                }
             }
         }
         return widest;
@@ -7280,7 +7333,7 @@ struct Lowerer {
         auto const subOp  = opcode(MnemonicSlot::SubSpReg);
         auto const copyOp = opcode(MnemonicSlot::SpCopy);
         auto const andOp  = opcode(MnemonicSlot::And);
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         if (!subOp.has_value() || !copyOp.has_value() || !andOp.has_value() || cc == nullptr
             || !cc->stackPointer.has_value() || !cc->framePointer.has_value()) {
             ParseDiagnostic d;
@@ -7320,7 +7373,7 @@ struct Lowerer {
     // dropped save would strand its StackRestore, silently leaking the stack.
     void lowerStackSave(MirInstId id) {
         auto const copyOp = opcode(MnemonicSlot::SpCopy);
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         if (!copyOp.has_value() || cc == nullptr || !cc->stackPointer.has_value()) {
             reportVlaDynamicAlloca(id);
             poisonValue(id);
@@ -7341,7 +7394,7 @@ struct Lowerer {
     // leave the descended SP unreclaimed → the very stack leak C5 exists to fix).
     void lowerStackRestore(MirInstId id) {
         auto const restoreOp = opcode(MnemonicSlot::SpRestore);
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         auto const ops0 = mir.instOperands(id);
         if (!restoreOp.has_value() || cc == nullptr
             || !cc->stackPointer.has_value() || ops0.empty()) {
@@ -7420,12 +7473,12 @@ struct Lowerer {
 
     // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: the cc's stack alignment — the
     // bound a STATIC frame offset can promise, because the post-prologue stack
-    // pointer is congruent to 0 modulo exactly this and nothing finer. cc index 0
-    // is the canonical source at MIR→LIR (pre-abi-resolution): the stack alignment
-    // is TARGET-uniform, which is the same reason `lowerVlaAlloca` reads it there.
+    // pointer is congruent to 0 modulo exactly this and nothing finer. Read off the
+    // ACTIVE convention (`convention_`), as `lowerVlaAlloca` reads the stack pointer:
+    // a convention fact has one source in this lowering.
     // The 16 fallback covers only a schema that declares no stack alignment at all.
     [[nodiscard]] std::uint32_t ccStackAlignment() const {
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         return (cc != nullptr && cc->stackAlignment > 0)
             ? static_cast<std::uint32_t>(cc->stackAlignment) : 16u;
     }
@@ -8618,7 +8671,7 @@ struct Lowerer {
     // exist, so nothing of the function's can be live in v{k} to be clobbered,
     // and the incoming-argument value is consumed here and never read again.
     void lowerF128Arg(MirInstId id) {
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         std::uint32_t const ord = mir.argIndex(id);
         if (cc == nullptr) {
             reportUnsupported(MirOpcode::Arg, id,
@@ -8700,7 +8753,7 @@ struct Lowerer {
     // double` in q0:q1 and run a caller that reads both halves to 42 at -O0 and
     // -O2.
     void lowerF128ReturnPiece(MirInstId id) {
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
         std::uint32_t const ord = mir.returnPieceOrdinal(id);
         if (cc == nullptr || ord >= cc->returnFprs.size()) {
             reportUnsupported(MirOpcode::ReturnPiece, id,
@@ -8746,6 +8799,61 @@ struct Lowerer {
         // in the register.
         emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
                  kLirInstFlagWidth128);
+        allocaSlotIndex_.emplace(id.v, *slotIndex);
+    }
+
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): an x87 result piece of a
+    // call, k >= 1 — the imaginary part of a `long double _Complex` returned in
+    // %st0 (real) / %st1 (imaginary), psABI 3.2.3's COMPLEX_X87. Piece 0 is the
+    // call's own F80 result, popped by `lowerCall`'s `fstp_m80` right after the
+    // call; this piece is the value then on top, popped by its own `fstp_m80` into
+    // a fresh 16-byte home, and the value IS that home (the memory-resident F80
+    // model). The ORDINAL is the x87 stack position, so the pops must run in
+    // ordinal order with nothing between them that touches the x87 stack: MIR
+    // keeps every piece adjacent to its call (the call is its operand) in ordinal
+    // order, and nothing this lowering emits between them (a frame-slot address)
+    // is an x87 instruction. Every piece is popped even when its value is unused
+    // — `ReturnPiece` is side-effecting, so no pass drops it — and so a caller
+    // leaves the x87 stack as it found it, as gcc and clang do (probe cx cell 11:
+    // `fstp %st(0)` twice for a discarded result).
+    void lowerF80ReturnPiece(MirInstId id) {
+        auto const ops = mir.instOperands(id);
+        if (ops.empty() || interner.kind(mir.instType(ops[0])) != TypeKind::F80) {
+            reportUnsupported(MirOpcode::ReturnPiece, id,
+                "an x87 `long double` result piece belongs to a call whose own result "
+                "is not the first x87 value, so the x87 stack position it would pop "
+                "is not the one it names");
+            poisonValue(id);
+            return;
+        }
+        // The pop takes whatever is on top: the piece must come right after its
+        // call (ordinal 1) or right after the piece of the ordinal before it.
+        std::uint32_t const ord = mir.returnPieceOrdinal(id);
+        MirInstId const prev = precedingMirInst_;
+        bool const inOrder =
+            ord >= 1 && prev.valid()
+            && (ord == 1 ? prev.v == ops[0].v
+                         : mir.instOpcode(prev) == MirOpcode::ReturnPiece
+                               && !mir.instOperands(prev).empty()
+                               && mir.instOperands(prev)[0].v == ops[0].v
+                               && mir.returnPieceOrdinal(prev) + 1 == ord);
+        if (!inOrder) {
+            reportUnsupported(MirOpcode::ReturnPiece, id,
+                std::format("x87 result piece {} of call {} does not follow the call, "
+                            "or the piece before it, directly: the x87 value it would "
+                            "pop is not the one it names", ord, ops[0].v));
+            poisonValue(id);
+            return;
+        }
+        auto const slotIndex =
+            emitF80ScratchSlot(kF80StorageBytes, "MIR F80 result piece home");
+        if (!slotIndex.has_value()) { poisonValue(id); return; }
+        std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
+        if (!homeAddr.has_value()) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FstpM80, *homeAddr, "MIR F80 result piece")) {
+            poisonValue(id);
+            return;
+        }
         allocaSlotIndex_.emplace(id.v, *slotIndex);
     }
 
@@ -11049,7 +11157,7 @@ struct Lowerer {
         // register as written, which keeps any value live across them out of
         // those registers (the same mechanism a pinned asm operand uses).
 
-        auto const* cc = target.callingConvention(0);
+        auto const* cc = convention_;
 
         // Reserve the long-double RESULT home BEFORE marshalling/the call (the
         // LD-2 softcall order): the home-address vreg is a GPR live across the
@@ -15193,6 +15301,13 @@ struct Lowerer {
         // used to index a separate `returnVrs` pool declared over the same
         // physical file — [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]].
         std::uint32_t fprRet = 0;
+        // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): the x87 values of the
+        // return, in OPERAND order = x87 return-stack order (operand 0 is %st0). The
+        // stack is LIFO, so they are pushed after the loop, LAST operand first: a
+        // COMPLEX_X87 result (`long double _Complex`) pushes its imaginary part, then
+        // its real part, and returns real in %st0, imaginary in %st1 -- as gcc, clang
+        // and Apple clang do (probe cx). One x87 value is unchanged.
+        std::vector<LirReg> x87Homes;
         for (MirInstId const operand : operands) {
             TypeKind const opk = interner.kind(mir.instType(operand));
             // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a `long double` RETURN
@@ -15203,13 +15318,12 @@ struct Lowerer {
             // `ret` leaves the value in st0/v0 exactly as the ABI requires. This
             // UN-WALLS the former FC17.9(e) F80/F128 Return-operand boundary gate.
             if (opk == TypeKind::F80) {
-                // SysV x87: fld_m80 [home] pushes the F80 onto st0 BEFORE the
-                // GPR-only epilogue lir_callconv inserts ahead of the `ret`
-                // (st0 survives it — the x87 stack is invisible to regalloc).
+                // SysV x87: fld_m80 [home] pushes the F80 onto the x87 stack BEFORE
+                // the GPR-only epilogue lir_callconv inserts ahead of the `ret`
+                // (the x87 stack survives it — it is invisible to regalloc).
                 std::optional<LirReg> const home = regForValue(operand);
                 if (!home.has_value()) return false;
-                if (!emitX87MemOp(MnemonicSlot::FldM80, *home,
-                                  "MIR F80 Return operand")) return false;
+                x87Homes.push_back(*home);
                 continue;
             }
             if (opk == TypeKind::F128) {
@@ -15233,7 +15347,7 @@ struct Lowerer {
                 // trade is in our favour: the allocator now SEES this physical
                 // ordinal, where before it was invisible because it lived in a
                 // second register class the free lists never carried.
-                auto const* cc = target.callingConvention(0);
+                auto const* cc = convention_;
                 if (cc == nullptr || fprRet >= cc->returnFprs.size()) {
                     reportUnsupported(MirOpcode::Return, id,
                         cc == nullptr
@@ -15288,6 +15402,8 @@ struct Lowerer {
             if (!v.has_value()) return false;
             ops.push_back(LirOperand::makeReg(*v));
         }
+        for (auto it = x87Homes.rbegin(); it != x87Homes.rend(); ++it)
+            if (!emitX87MemOp(MnemonicSlot::FldM80, *it, "MIR F80 Return operand")) return false;
         emitReturn(*opcode(MnemonicSlot::Ret), ops);
         return true;
     }
@@ -16190,8 +16306,10 @@ struct Lowerer {
                 reporter.report(std::move(d));
             }
             if (op != MirOpcode::Phi) sawNonPhi = true;
+            precedingMirInst_ = i > 0 ? mir.blockInstAt(mb, i - 1) : InvalidMirInst;
             lowerInst(inst);
         }
+        precedingMirInst_ = InvalidMirInst;
         // An entry block that only receives its parameters realigns before its jump.
         if (stackRealignPending_) emitPendingStackRealign();
         // Then the terminator (which is also responsible for PLACING the
@@ -16991,7 +17109,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                               preemptibleDefinitionBindings,
                           std::vector<DefinedSymbolName> definedSymbolNames,
                           std::optional<ObjectFormatKind> assemblyFormatKind,
-                          std::vector<std::string> imageDefinedNames) {
+                          std::vector<std::string> imageDefinedNames,
+                          std::uint16_t callingConventionIndex) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -17034,7 +17153,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
               std::move(atomicsRuntime), std::move(indirectSlotBindings),
               std::move(preemptibleDefinitionBindings), definedSymbolNames,
-              assemblyFormatKind, imageDefinedNames};
+              assemblyFormatKind, imageDefinedNames, callingConventionIndex};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

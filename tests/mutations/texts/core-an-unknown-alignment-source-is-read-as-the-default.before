@@ -1,0 +1,3 @@
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("unknown '{}' value '{}' — accepted: {}",
+                                                  key, s, accepted));

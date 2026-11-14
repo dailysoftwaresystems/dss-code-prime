@@ -60,6 +60,20 @@ struct StructLayout {
     // `unitBytes == 0`. A zero-width bit-field is a packing break only — it gets a
     // `fieldOffsets` slot (so indices stay parallel) with `unitBytes == 0`.
     std::vector<BitFieldPlacement> bitFields;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the alignment the type's
+    // MEMBERS give it, BEFORE its own whole-composite request (`aligned(N)` on a
+    // struct/union definition, C 6.7.5's raise) and before an alias's type-level
+    // alignment. AAPCS64 reads THIS one where it places an argument: "the natural
+    // alignment of a composite type is the maximum of each of the member alignments
+    // of the 'top-level' members of the composite type i.e. before any alignment
+    // adjustment of the entire composite is applied" — and so does nothing else, so
+    // every other reader asks `align`. Equal to `align` for every type with neither
+    // request. Set by the engine for every layout it computes (`layoutOne`).
+    // ✔MEASURED (lane `cs`, probes f14 and f14r): aarch64 gcc 13.3.0 and clang 18.1.3
+    // put `struct { _Alignas(16) long a; long b; }` on a 16-aligned stack slot and an
+    // even register pair, and `struct __attribute__((aligned(16))) { long a, b; }` on
+    // neither.
+    Alignment                  membersAlign{};
 };
 
 // Side-table keyed by TypeId — the per-CU memoized layout table FC7 reads.

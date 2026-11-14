@@ -19,6 +19,12 @@
 // `long long` as a result and as an argument (MEMORY under psABI, %rax + %xmm0 on Apple's x86_64: its X87UP
 // eightbyte is SSE there, main's ledger 454). CONTROLS the row measured right
 // before the fold: a MEMORY-class result through the hidden pointer, and a MEMORY-class struct through `...`.
+// And a COMPLEX of each element as a result, an argument and through `...` on every arm whose reference has
+// `_Complex` (fold f26c2, review-csf26c F3): under SysV the `long double` one is psABI 3.2.3's COMPLEX_X87 --
+// returned in st0/st1, passed in MEMORY -- with its 16-aligned stacked cell, the struct holding one (MEMORY by
+// size) and a dropped result's x87 stack balance. And a COMPOSITE OF ALIGNMENT 16 stacked, in a register pair and
+// through `...` on every GNU arm (fold f26c2, review-csf26c F14): where AAPCS64 and Apple arm64 read different
+// alignments of one composite, AAPCS64's even register pair, and its `va_arg`'s exact fit and spill.
 //
 // ARMS: Linux x86_64 with gcc and with clang, GNU ld (SysV, ELF); Apple's ld `-arch x86_64` (SysV, Mach-O, under
 // Rosetta through the repo's one cross-arch gate); the AAPCS64 controls, Linux aarch64 and Apple `-arch arm64`,
@@ -268,27 +274,243 @@ constexpr int kWalkCheck      = kAllChecks + 1;
 // its own alignment, so this is the one that makes the rounding, and the row that carries the alignment from
 // MIR->LIR to the frame layout, load-bearing at run time.
 constexpr int kTailCheck      = kAllChecks + 2;
-constexpr int kReportedChecks = kAllChecks + 3;
 constexpr Aligned kTailShape{64, 8};
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): A COMPLEX CROSSES THE BOUNDARY AS ITS CONVENTION SAYS. Checks
+// 30.. are three per complex element -- the RESULT (make_cxE), an ARGUMENT after a register argument (take_cxE),
+// and through `...` (take_cxE_var: the caller's variadic carrier and the callee's `va_arg`) -- on every arm whose
+// reference has `_Complex` (all but cl), for `float` and `double`, and for `long double` where the reference's
+// `long double` is DSS's own (not the Win64 arm: mingw-w64 gcc's is the x87 one, DSS's pe64 one MSVC's `double`).
+// Under SysV the `long double` cells are psABI 3.2.3's COMPLEX_X87: the result in st0 (the real part) and st1 (the
+// imaginary), the argument MEMORY (✔MEASURED, probe cx: gcc 13.3.0, clang 18.1.3, Apple clang 21.0.0 x86_64 --
+// before f26c2 DSS returned it through a hidden pointer and refused every complex `va_arg`). Each value is read
+// through a pointer to its element (C 6.2.5p13: a complex is an array of two), so no unit needs <complex.h>.
+struct ComplexElement {
+    char const* type;   // the element type
+    char const* tag;    // the shapes' suffix
+};
+constexpr ComplexElement kComplexElements[] = {{"float", "f"}, {"double", "d"}, {"long double", "l"}};
+constexpr int kComplexElementCount = static_cast<int>(sizeof kComplexElements / sizeof kComplexElements[0]);
+constexpr int kComplexChecksBegin  = kTailCheck + 1;
+constexpr int kComplexChecksPerElement = 3;
+// The SysV group's COMPLEX_X87 cells beyond the three (the x87 arms): 39 a `long double _Complex` after one
+// stacked eightbyte (16-aligned, an 8-byte pad, probe cx c12); 40 and 41 a struct holding one, as a result and as
+// an argument (MEMORY by size, controls); 42 a `long double _Complex` result DROPPED sixteen times, then x87
+// arithmetic -- the caller pops both values and the callee pushes exactly two, or the eight-deep x87 stack
+// overflows and the arithmetic reads NaN.
+constexpr int kComplexX87ChecksBegin = kComplexChecksBegin + kComplexChecksPerElement * kComplexElementCount;
+constexpr int kComplexX87Checks      = 4;
+
+// The complex elements a unit carries: none (cl has no `_Complex`), float and double, or all three.
+[[nodiscard]] std::string complexShapes(int elements) {
+    std::string s;
+    for (int e = 0; e < elements; ++e)
+        s += std::string{"typedef "} + kComplexElements[e].type + " _Complex CX" + kComplexElements[e].tag + ";\n";
+    return s;
+}
+
+// make_cxE(re, im) builds re + im*i; take_cxE(k, z) and take_cxE_var(n, z, k) answer k + re - im and
+// n + re - im + k: 42 for the caller's values, and not 42 when the halves swap.
+[[nodiscard]] std::string complexCallees(int elements) {
+    std::string s;
+    for (int e = 0; e < elements; ++e) {
+        std::string const t = kComplexElements[e].type;
+        std::string const c = std::string{"CX"} + kComplexElements[e].tag;
+        std::string const f = std::string{"_cx"} + kComplexElements[e].tag;
+        std::string const halves = t + " *p = (" + t + " *)&z; ";
+        s += c + " make" + f + "(long long re, long long im) { " + c + " z; " + halves + "p[0] = (" + t
+           + ")re; p[1] = (" + t + ")im; return z; }\n";
+        s += "long long take" + f + "(long long k, " + c + " z) { " + halves
+           + "return k + (long long)p[0] - (long long)p[1]; }\n";
+        s += "long long take" + f + "_var(int n, ...) {\n    va_list ap;\n    va_start(ap, n);\n    " + c
+           + " z = va_arg(ap, " + c + ");\n    long long k = va_arg(ap, long long);\n    va_end(ap);\n    " + halves
+           + "return n + (long long)p[0] - (long long)p[1] + k;\n}\n";
+    }
+    return s;
+}
+
+[[nodiscard]] std::string complexDecls(int elements) {
+    std::string s;
+    for (int e = 0; e < elements; ++e) {
+        std::string const c = std::string{"CX"} + kComplexElements[e].tag;
+        std::string const f = std::string{"_cx"} + kComplexElements[e].tag;
+        s += c + " make" + f + "(long long re, long long im);\n";
+        s += "long long take" + f + "(long long k, " + c + " z);\n";
+        s += "long long take" + f + "_var(int n, ...);\n";
+    }
+    return s;
+}
+
+// Checks 30.. of the caller: each argument is built in the caller, so a wrong result does not redden the argument's
+// check too. An element the unit leaves out keeps its three bits, unset.
+[[nodiscard]] std::string complexChecks(int elements) {
+    std::string s;
+    for (int e = 0; e < elements; ++e) {
+        std::string const t = kComplexElements[e].type;
+        std::string const c = std::string{"CX"} + kComplexElements[e].tag;
+        std::string const f = std::string{"_cx"} + kComplexElements[e].tag;
+        int const bit = kComplexChecksBegin + kComplexChecksPerElement * e;
+        s += "    { " + c + " z = make" + f + "(40, 2); " + t + " *p = (" + t + " *)&z;\n"
+             "      if ((long long)p[0] != 40 || (long long)p[1] != 2) bad |= 1LL << " + std::to_string(bit) + "; }\n";
+        s += "    { " + c + " z; " + t + " *p = (" + t + " *)&z; p[0] = 40; p[1] = 2;\n"
+             "      if (take" + f + "(4, z) != 42) bad |= 1LL << " + std::to_string(bit + 1) + "; }\n";
+        s += "    { " + c + " z; " + t + " *p = (" + t + " *)&z; p[0] = 14; p[1] = 4;\n"
+             "      if (take" + f + "_var(30, z, 2LL) != 42) bad |= 1LL << " + std::to_string(bit + 2) + "; }\n";
+    }
+    return s;
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): A COMPOSITE OF ALIGNMENT 16 CROSSES THE BOUNDARY WHERE ITS
+// CONVENTION PUTS IT -- stacked, in a register pair, and through `...`. AAPCS64 reads a composite's NATURAL alignment
+// (its members', before the composite's own adjustment) and begins one of 16 at an EVEN general register (C.8);
+// Apple arm64 reads the TYPE's (an HFA its element's), pairs nothing, and stacks every argument through `...`.
+// ✔MEASURED (lane `cs`, probes f14 and f14r, -O1 asm; aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 agreeing,
+// Apple clang 21): `struct { __int128 v; }` and `struct { _Alignas(16) long a; long b; }` at +16 after one stacked
+// scalar and in x2:x3 after one long; `struct __attribute__((aligned(16))) { long a, b; }` at +8 and in x1:x2 under
+// AAPCS64, at +16 on Apple; `struct { _Alignas(32) double a, b, c, d; }` at +16 under AAPCS64, at +8 on Apple; and
+// AAPCS64 §B.4's `va_arg` fits an aggregate into exactly its last registers and spends the rest when one does not
+// fit. DSS put every one at +8 and in x1:x2, read an exact fit from the stack and a scalar after a spilled
+// aggregate from a save slot. Checks 43.. (on every GNU arm: the shapes are GNU C, and SysV and Win64 pass them
+// as they always did, so there they are controls): the six composites stacked after one stacked scalar
+// (`take_pX_stk`), the five integer ones and a scalar `__int128` after one long (`take_pX_pair`), the five
+// integer ones through `...` (`take_pX_var`), an exact fit (`take_fit_var`) and a spill (`take_spill_var`).
+// VALUES only: the placement of these parameter objects is the stacked-alignment universe's question (6-15). The
+// 32-aligned HFA is not passed through `...`: Apple clang 21's `va_arg` rounds it to 32 where its own caller
+// placed it at 8 (probe f14, side 3 against side 4), so no pairing of Apple's agrees with itself there.
+struct PairShape {
+    char const* tag;    // the shapes' suffix: struct PX and take_pX_*
+    char const* decl;   // its declaration
+    char const* lo;     // the low and high words of `x`, as `long long`
+    char const* hi;
+    char const* set;    // a statement giving `x` the low word 4 and the high word 1
+    bool        fp;     // an HFA: the double registers are the ones to spend
+    bool        pair;   // passed after one long, and through `...`
+    char const* key = "struct";   // its keyword
+};
+// The last two are the class closure's (main, after run f26c2-f): a union whose widest member is 16-aligned and a
+// 16-aligned array member. ✔MEASURED (probes f14s and f14t, -O1 asm): aarch64 gcc 13.3.0 and clang 18.1.3 put each
+// in x2:x3 after one long, clang the union at +16 after one stacked scalar; Apple clang 21 at x1:x2 and +16.
+constexpr PairShape kPairShapes[] = {
+    {"i", "struct PI { __int128 v; };\n", "(long long)x.v", "(long long)(x.v >> 64)",
+     "x.v = ((__int128)1 << 64) | 4;", false, true},
+    {"a", "struct PA { _Alignas(16) long long a; long long b; };\n", "x.a", "x.b", "x.a = 4; x.b = 1;", false,
+     true},
+    {"t", "struct __attribute__((aligned(16))) PT { long long a; long long b; };\n", "x.a", "x.b",
+     "x.a = 4; x.b = 1;", false, true},
+    {"h", "struct PH { _Alignas(32) double a; double b; double c; double d; };\n", "(long long)x.a",
+     "(long long)x.d", "x.a = 4.0; x.b = 0.0; x.c = 0.0; x.d = 1.0;", true, false},
+    {"u", "union PU { __int128 v; long long l; };\n", "(long long)x.v", "(long long)(x.v >> 64)",
+     "x.v = ((__int128)1 << 64) | 4;", false, true, "union"},
+    {"r", "struct PR { __int128 a[1]; };\n", "(long long)x.a[0]", "(long long)(x.a[0] >> 64)",
+     "x.a[0] = ((__int128)1 << 64) | 4;", false, true},
+};
+[[nodiscard]] constexpr int pairedShapeCount() {
+    int n = 0;
+    for (auto const& p : kPairShapes) n += p.pair ? 1 : 0;
+    return n;
+}
+constexpr int kPairChecksBegin = kComplexX87ChecksBegin + kComplexX87Checks;
+constexpr int kPairStackedChecks = static_cast<int>(sizeof kPairShapes / sizeof kPairShapes[0]);
+constexpr int kPairRegisterChecks = pairedShapeCount() + 1;   // the integer composites and the scalar __int128
+constexpr int kPairVariadicChecks = pairedShapeCount();       // the integer composites
+constexpr int kPairChecks = kPairStackedChecks + kPairRegisterChecks + kPairVariadicChecks + 2;
+constexpr int kReportedChecks = kPairChecksBegin + kPairChecks;
+
+[[nodiscard]] std::string upperTag(char const* tag) {
+    std::string s = "P";
+    s += static_cast<char>(tag[0] - 'a' + 'A');
+    return s;
+}
+
+[[nodiscard]] std::string pairShapes() {
+    std::string s;
+    for (PairShape const& p : kPairShapes) s += p.decl;
+    return s + "struct PL { long long a; long long b; };\n";
+}
+
+// Each answers 42 when every argument arrived, the halves in order: the scalars' sum, plus lo + 2 * hi (4 + 2).
+[[nodiscard]] std::string pairSignatures(bool definitions) {
+    std::string s;
+    auto const head = [&](std::string const& sig, std::string const& body) {
+        s += sig + (definitions ? " {\n" + body + "}\n" : std::string{";\n"});
+    };
+    for (PairShape const& p : kPairShapes) {
+        std::string const T = upperTag(p.tag);
+        std::string const K = std::string{p.key} + " ";
+        std::string const S = p.fp ? "double" : "long long";
+        std::string const sum = std::string{"(long long)("} + "r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7 + s)";
+        std::string const halves = std::string{p.lo} + " + 2 * " + p.hi;
+        // eight registers of the class spent, one scalar stacked (0..8: 36), then the composite
+        head("long long take_p" + std::string{p.tag} + "_stk(" + S + " r0, " + S + " r1, " + S + " r2, " + S + " r3, "
+                 + S + " r4, " + S + " r5, " + S + " r6, " + S + " r7, " + S + " s, " + K + T + " x)",
+             "    return " + sum + " + " + halves + ";\n");
+        if (!p.pair) continue;
+        head("long long take_p" + std::string{p.tag} + "_pair(long long k, " + K + T + " x)",
+             "    return k + " + halves + ";\n");
+        head("long long take_p" + std::string{p.tag} + "_var(int n, ...)",
+             "    va_list ap;\n    va_start(ap, n);\n    " + K + T + " x = va_arg(ap, " + K + T + ");\n"
+             "    long long k = va_arg(ap, long long);\n    va_end(ap);\n    return n + " + halves + " + k;\n");
+    }
+    head("long long take_i128_pair(long long k, __int128 v)",
+         "    return k + (long long)v + 2 * (long long)(v >> 64);\n");
+    // n in the first register, five more, then a two-register aggregate in exactly the last two
+    head("long long take_fit_var(int n, ...)",
+         "    va_list ap;\n    va_start(ap, n);\n    long long t = 0;\n"
+         "    for (int i = 0; i < 5; ++i) t += va_arg(ap, long long);\n"
+         "    struct PL x = va_arg(ap, struct PL);\n    va_end(ap);\n    return n + t + x.a + 2 * x.b;\n");
+    // n and six more, so the aggregate fits no longer, and a scalar after it
+    head("long long take_spill_var(int n, ...)",
+         "    va_list ap;\n    va_start(ap, n);\n    long long t = 0;\n"
+         "    for (int i = 0; i < 6; ++i) t += va_arg(ap, long long);\n"
+         "    struct PL x = va_arg(ap, struct PL);\n    long long k = va_arg(ap, long long);\n    va_end(ap);\n"
+         "    return n + t + x.a + 2 * x.b + k;\n");
+    return s;
+}
+
+[[nodiscard]] std::string pairChecks() {
+    std::string s;
+    int bit = kPairChecksBegin;
+    auto const check = [&](std::string const& setup, std::string const& call) {
+        s += "    { " + setup + "\n      if (" + call + " != 42) bad |= 1LL << " + std::to_string(bit++) + "; }\n";
+    };
+    for (PairShape const& p : kPairShapes) {
+        std::string const T = upperTag(p.tag);
+        std::string const v = p.fp ? ".0" : "";
+        std::string args;
+        for (int i = 0; i < 9; ++i) args += std::to_string(i) + v + ", ";
+        check(std::string{p.key} + " " + T + " x; " + p.set, "take_p" + std::string{p.tag} + "_stk(" + args + "x)");
+    }
+    for (PairShape const& p : kPairShapes)
+        if (p.pair)
+            check(std::string{p.key} + " " + upperTag(p.tag) + " x; " + p.set, "take_p" + std::string{p.tag} + "_pair(36, x)");
+    check("__int128 v = ((__int128)1 << 64) | 4;", "take_i128_pair(36, v)");
+    for (PairShape const& p : kPairShapes)
+        if (p.pair)
+            check(std::string{p.key} + " " + upperTag(p.tag) + " x; " + p.set, "take_p" + std::string{p.tag} + "_var(30, x, 6LL)");
+    check("struct PL x = { 5, 1 };", "take_fit_var(20, 1LL, 2LL, 3LL, 4LL, 5LL, x)");
+    check("struct PL x = { 4, 1 };", "take_spill_var(10, 1LL, 2LL, 3LL, 4LL, 5LL, 6LL, x, 5LL)");
+    return s;
+}
+
 struct CallerVariant {
-    char const* tag;     // the driver's line for it
-    char const* head;    // the function's head, through the declarations of `bad` and `misplaced`
-    char const* frame;   // its own frame's check, made after every other
+    char const* tag;       // the driver's line for it
+    char const* head;      // the function's head, through the declarations of `bad` and `misplaced`
+    char const* frame;     // its own frame's check, made after every other
+    char const* tailCall;  // check 29's call: the tail function of this frame kind (`tailFunctions`)
 };
 constexpr CallerVariant kPlainCaller{
-    "plain", "int run_caller(long *bad_out, long *misplaced_out) {\n    long bad = 0;\n    long misplaced = 0;\n",
-    ""};
+    "plain", "int run_caller(long long *bad_out, long long *misplaced_out) {\n    long long bad = 0;\n    long long misplaced = 0;\n",
+    "", "tail_plain_at()"};
 constexpr CallerVariant kVlaCaller{
     "vla",
-    "int run_caller_vla(int n, long *bad_out, long *misplaced_out) {\n    long bad = 0;\n    long misplaced = 0;\n"
+    "int run_caller_vla(int n, long long *bad_out, long long *misplaced_out) {\n    long long bad = 0;\n    long long misplaced = 0;\n"
     "    volatile char frame[n];\n    frame[0] = 27;\n    frame[n - 1] = 28;\n",
-    "    if (frame[0] != 27 || frame[n - 1] != 28) bad |= 1L << 27;\n"};
+    "    if (frame[0] != 27 || frame[n - 1] != 28) bad |= 1LL << 27;\n", "tail_vla_at(n)"};
 constexpr CallerVariant kVaCaller{
     "va",
-    "int run_caller_va(long *bad_out, long *misplaced_out, ...) {\n    long bad = 0;\n    long misplaced = 0;\n"
+    "int run_caller_va(long long *bad_out, long long *misplaced_out, ...) {\n    long long bad = 0;\n    long long misplaced = 0;\n"
     "    va_list ap;\n    va_start(ap, misplaced_out);\n    int const k = va_arg(ap, int);\n    va_end(ap);\n",
-    "    if (k != 27) bad |= 1L << 27;\n"};
+    "    if (k != 27) bad |= 1LL << 27;\n", "tail_va_at(1, 27)"};
 
 // The callers a unit defines: the VLA one only where the reference has VLAs (GNU).
 [[nodiscard]] std::vector<CallerVariant> callerVariants(bool gnu) {
@@ -309,10 +531,33 @@ constexpr CallerVariant kVaCaller{
     return "long long take_al64_tail(long long a, long long b, long long c, long long d, long long e, long long f, "
            "struct AL64 s, long long k);\n";
 }
-[[nodiscard]] std::string tailCheck(Alignments const& refused) {
+// ★ P69 (lane `cs`, fold f26c2 — the checkpoint 40 sweep's survivor of the arm that drops the row's stacked-
+// argument alignment on its way to the frame): CHECK 29 IS MADE BY A FUNCTION WHOSE ONLY CALL IT IS, one per caller
+// frame kind -- a fixed frame, a VLA's (GNU), a variadic one's -- reached through a VOLATILE pointer so that no
+// pipeline inlines it back into the caller. A function's outgoing area is the widest of its calls'
+// (`computeMaxOutgoingStackArgs`, READ), and made among the caller's other checks the tail sat in a frame whose area
+// was take_al256_even's 512 bytes -- already a multiple of 64 -- so the rounding check 29 exists for was never
+// reached: the mutation survived. Here the area is the tail's own 72, a multiple of 64 only once rounded. Each
+// returns what the callee returned (42 placed, 1042 misplaced), or 0 when its own frame lost its bytes.
+[[nodiscard]] std::string tailFunctions(Alignments const& refused, bool gnu) {
     if (!taken(kTailShape, refused)) return {};
-    return "    { struct AL64 x = {0}; x.v = 10; x.w[6] = 4;\n"
-           "      PLACED(take_al64_tail(1, 2, 3, 4, 5, 6, x, 7), 29); }\n";
+    std::string const call =
+        "    long long r;\n"
+        "    { struct AL64 x = {0}; x.v = 10; x.w[6] = 4; r = take_al64_tail(1, 2, 3, 4, 5, 6, x, 7); }\n";
+    std::string s = "static long long tail_plain(void) {\n" + call + "    return r;\n}\n"
+                    "static long long (*volatile tail_plain_at)(void) = tail_plain;\n";
+    if (gnu)
+        s += "static long long tail_vla(int n) {\n    volatile char frame[n];\n    frame[0] = 27;\n"
+             "    frame[n - 1] = 28;\n" + call + "    return frame[0] == 27 && frame[n - 1] == 28 ? r : 0;\n}\n"
+             "static long long (*volatile tail_vla_at)(int) = tail_vla;\n";
+    s += "static long long tail_va(int n, ...) {\n    va_list ap;\n    va_start(ap, n);\n"
+         "    int const k = va_arg(ap, int);\n    va_end(ap);\n" + call + "    return n == 1 && k == 27 ? r : 0;\n}\n"
+         "static long long (*volatile tail_va_at)(int, ...) = tail_va;\n";
+    return s;
+}
+[[nodiscard]] std::string tailCheck(Alignments const& refused, CallerVariant const& v) {
+    if (!taken(kTailShape, refused)) return {};
+    return std::string{"    PLACED("} + v.tailCall + ", 29);\n";
 }
 
 // The walk's callee (in the callee unit) and the driver's walker it calls.
@@ -320,12 +565,41 @@ constexpr char const* kWalkCallee =
     "long long unwound(void);\n"
     "long long walk_below(long long k) { return k + unwound(); }\n";
 constexpr char const* kWalkDecl = "long long walk_below(long long k);\n";
-constexpr char const* kWalkCheckText = "    if (walk_below(42) != 42) bad |= 1L << 28;\n";
+constexpr char const* kWalkCheckText = "    if (walk_below(42) != 42) bad |= 1LL << 28;\n";
 
 constexpr char const* kX87Shapes =
     "struct LD { long double x; };\n"
     "struct A16 { long double x; long long y; };\n"
-    "union ULI { long double a; long long i; };\n";
+    "union ULI { long double a; long long i; };\n"
+    "struct SCLD { long double _Complex z; };\n";
+
+// The COMPLEX_X87 cells beyond the three (39-42): take_cld_after_seven answers 1..7 (28) + re - im, plus 1000 when
+// `&z` is not 16-aligned; make_scld / take_scld are make_cxl / take_cxl for the struct holding one.
+[[nodiscard]] std::string complexX87Callees() {
+    return "long long take_cld_after_seven(long long a, long long b, long long c, long long d, long long e, "
+           "long long f, long long g, long double _Complex z) { " + placementTerm("z", 16)
+         + "long double *p = (long double *)&z; return misplaced + a + b + c + d + e + f + g + (long long)p[0] - "
+           "(long long)p[1]; }\n"
+           "struct SCLD make_scld(long long re, long long im) { struct SCLD s; long double *p = (long double *)&s.z; "
+           "p[0] = (long double)re; p[1] = (long double)im; return s; }\n"
+           "long long take_scld(long long k, struct SCLD s) { " + placementTerm("s", 16)
+         + "long double *p = (long double *)&s.z; return misplaced + k + (long long)p[0] - (long long)p[1]; }\n";
+}
+constexpr char const* kComplexX87Decls =
+    "long long take_cld_after_seven(long long a, long long b, long long c, long long d, long long e, long long f,\n"
+    "                               long long g, long double _Complex z);\n"
+    "struct SCLD make_scld(long long re, long long im);\n"
+    "long long take_scld(long long k, struct SCLD s);\n";
+constexpr char const* kComplexX87CallerChecks =
+    "    { long double _Complex z; long double *p = (long double *)&z; p[0] = 16; p[1] = 2;\n"
+    "      PLACED(take_cld_after_seven(1, 2, 3, 4, 5, 6, 7, z), 39); }\n"
+    "    { struct SCLD s = make_scld(40, 2); long double *p = (long double *)&s.z;\n"
+    "      if ((long long)p[0] != 40 || (long long)p[1] != 2) bad |= 1LL << 40; }\n"
+    "    { struct SCLD s; long double *p = (long double *)&s.z; p[0] = 40; p[1] = 2;\n"
+    "      PLACED(take_scld(4, s), 41); }\n"
+    "    { long double acc = 0.0L;\n"
+    "      for (int i = 0; i < 16; ++i) { (void)make_cxl(i, i); acc += (long double)i; }\n"
+    "      if ((long long)acc != 120) bad |= 1LL << 42; }\n";
 
 constexpr char const* kCalleeBody =
     "long long take_big(struct Big s, long long k) { return s.a + s.b + s.c + k; }\n"
@@ -376,43 +650,43 @@ constexpr char const* kX87CallerDecls =
 // value that did not arrive.
 constexpr char const* kPlacedMacro =
     "#define PLACED(call, bit) do { long long const r_ = (call); \\\n"
-    "    if (r_ == 1042) misplaced |= 1L << (bit); else if (r_ != 42) bad |= 1L << (bit); } while (0)\n";
+    "    if (r_ == 1042) misplaced |= 1LL << (bit); else if (r_ != 42) bad |= 1LL << (bit); } while (0)\n";
 
 // The checks every caller makes first (0-5).
 constexpr char const* kCommonCallerChecks =
     "    struct Big b = { 1, 2, 3 };\n"
     "    struct Big c = { 10, 20, 32 };\n"
-    "    if (take_big(b, 36) != 42) bad |= 1L << 0;\n"
-    "    if (take_after_six(1, 2, 3, 4, 5, 6, b, 15) != 42) bad |= 1L << 1;\n"
-    "    if (take_two(c, b) != 13) bad |= 1L << 2;\n"
-    "    if (write_param(b) != 102 || b.a != 1) bad |= 1L << 3;\n"
+    "    if (take_big(b, 36) != 42) bad |= 1LL << 0;\n"
+    "    if (take_after_six(1, 2, 3, 4, 5, 6, b, 15) != 42) bad |= 1LL << 1;\n"
+    "    if (take_two(c, b) != 13) bad |= 1LL << 2;\n"
+    "    if (write_param(b) != 102 || b.a != 1) bad |= 1LL << 3;\n"
     "    struct Big r = make_big(14);\n"
-    "    if (r.a + r.b + r.c != 42) bad |= 1L << 4;\n"
-    "    if (take_var(30, b, 6LL) != 42) bad |= 1L << 5;\n";
+    "    if (r.a + r.b + r.c != 42) bad |= 1LL << 4;\n"
+    "    if (take_var(30, b, 6LL) != 42) bad |= 1LL << 5;\n";
 
 constexpr char const* kX87CallerChecks =
     "    struct LD l;\n"
     "    l.x = 40.0L;\n"
-    "    if (take_ld(l, 2) != 42) bad |= 1L << 16;\n"
+    "    if (take_ld(l, 2) != 42) bad |= 1LL << 16;\n"
     "    struct LD m = make_ld(42);\n"
-    "    if ((long long)m.x != 42) bad |= 1L << 17;\n"
+    "    if ((long long)m.x != 42) bad |= 1LL << 17;\n"
     "    struct A16 a;\n"
     "    a.x = 2.0L;\n"
     "    a.y = 33;\n"
-    "    if (take_a16_after_seven(1, 2, 3, 4, 5, 6, 7, a) != 42) bad |= 1L << 18;\n"
+    "    if (take_a16_after_seven(1, 2, 3, 4, 5, 6, 7, a) != 42) bad |= 1LL << 18;\n"
     "    union ULI um = make_uli(42);\n"
-    "    if ((long long)um.a != 42) bad |= 1L << 25;\n"
+    "    if ((long long)um.a != 42) bad |= 1LL << 25;\n"
     "    union ULI ua;\n"
     "    ua.a = 40.0L;\n"
-    "    if (take_uli(ua, 2) != 42) bad |= 1L << 26;\n";
+    "    if (take_uli(ua, 2) != 42) bad |= 1LL << 26;\n";
 
 [[nodiscard]] std::string callerTail() {
     return "    *bad_out = bad;\n"
            "    *misplaced_out = misplaced;\n"
            "    for (int i = 0; i < " + std::to_string(kReportedChecks) + "; ++i)\n"
-           "        if (bad & (1L << i)) return 100 + i;\n"
+           "        if (bad & (1LL << i)) return 100 + i;\n"
            "    for (int i = 0; i < " + std::to_string(kReportedChecks) + "; ++i)\n"
-           "        if (misplaced & (1L << i)) return 200 + i;\n"
+           "        if (misplaced & (1LL << i)) return 200 + i;\n"
            "    return 42;\n"
            "}\n";
 }
@@ -425,9 +699,9 @@ constexpr char const* kX87CallerChecks =
     std::string s = walk ? "#define _GNU_SOURCE 1\n" : "";
     s += "#include <stdio.h>\n";
     if (walk) s += "#include <dlfcn.h>\n#include <unwind.h>\n";
-    s += "int run_caller(long *bad_out, long *misplaced_out);\n"
-         "int run_caller_va(long *bad_out, long *misplaced_out, ...);\n";
-    if (gnu) s += "int run_caller_vla(int n, long *bad_out, long *misplaced_out);\n";
+    s += "int run_caller(long long *bad_out, long long *misplaced_out);\n"
+         "int run_caller_va(long long *bad_out, long long *misplaced_out, ...);\n";
+    if (gnu) s += "int run_caller_vla(int n, long long *bad_out, long long *misplaced_out);\n";
     s += "static void *caller_under_test;\n";
     if (walk)
         s += "int main(void);\n"
@@ -454,12 +728,12 @@ constexpr char const* kX87CallerChecks =
              "    return w.caller && w.top ? 0 : 1;\n"
              "}\n";
     s += "static int first = 42;\n"
-         "static void report(char const *tag, int rc, long bad, long misplaced) {\n"
-         "    printf(\"%s bad=%lx misplaced=%lx\\n\", tag, (unsigned long)bad, (unsigned long)misplaced);\n"
+         "static void report(char const *tag, int rc, long long bad, long long misplaced) {\n"
+         "    printf(\"%s bad=%llx misplaced=%llx\\n\", tag, (unsigned long long)bad, (unsigned long long)misplaced);\n"
          "    if (first == 42) first = rc;\n"
          "}\n"
          "int main(void) {\n"
-         "    long bad = -1, misplaced = -1;\n"
+         "    long long bad = -1, misplaced = -1;\n"
          "    caller_under_test = (void *)&run_caller;\n"
          "    int rc = run_caller(&bad, &misplaced);\n"
          "    report(\"plain\", rc, bad, misplaced);\n";
@@ -493,33 +767,58 @@ constexpr char const* kChecks =
     "`long double` and `long long` as a result and as an argument: MEMORY under psABI, %rax + %xmm0 on Apple's x86_64), "
     "27 the caller's own frame (its VLA's bytes, or its first variadic argument), 28 an unwind walk from a callee "
     "below the caller, through it, to `main` (SysV arms), 29 take_al64_tail (a 64-aligned aggregate with a stacked "
-    "eightbyte after it: the caller's outgoing area is a multiple of 64 only once rounded); every check is made by "
-    "each caller the driver names";
+    "eightbyte after it, made by a function of the caller's frame kind whose only call it is: that function's "
+    "outgoing area, 72 bytes, is a multiple of 64 only once rounded), "
+    "30-38 three per complex element, float, double and long double in that order -- make_cxE (the RESULT), "
+    "take_cxE (an ARGUMENT after a register argument), take_cxE_var (through `...`, read by va_arg); `long double` "
+    "where the reference's is DSS's (not Win64; under SysV it is COMPLEX_X87: the result in st0/st1, the argument "
+    "MEMORY) -- 39 take_cld_after_seven (a `long double _Complex` after one stacked eightbyte, 16-aligned), "
+    "40 make_scld and 41 take_scld (a struct holding one: MEMORY by size), 42 a `long double _Complex` result "
+    "dropped sixteen times, then x87 arithmetic (each side keeps the x87 stack balanced) (39-42: SysV arms); "
+    "43-61 on the GNU arms, a composite of alignment 16 where its convention puts it -- 43-48 take_pX_stk for "
+    "struct { __int128 v; }, struct { _Alignas(16) long long a, b; }, struct __attribute__((aligned(16))) "
+    "{ long long a, b; }, struct { _Alignas(32) double a, b, c, d; }, union { __int128 v; long long l; } and "
+    "struct { __int128 a[1]; } after one stacked scalar, 49-54 take_pX_pair for the five integer ones and a scalar "
+    "__int128 after one long (AAPCS64's even register pair), 55-59 take_pX_var for the five integer ones through "
+    "`...`, 60 take_fit_var (an aggregate in exactly the last two registers, read by va_arg) and 61 take_spill_var "
+    "(an aggregate that no longer fits spends the registers left: the scalar after it is read from the stack); "
+    "every check is made by each caller the driver names";
 
 static_assert(kCommonChecks == 16, "the SysV group's checks begin at 16");
 static_assert(kAllChecks == 27, "the shapes' checks are 0-26");
 static_assert(kFrameCheck == 27 && kWalkCheck == 28 && kTailCheck == 29,
               "the frame's, the walk's and the tail's bits are spelled 27, 28 and 29 above");
-static_assert(kReportedChecks <= 31, "every check is one bit of a `long`");
+static_assert(kComplexChecksBegin == 30 && kComplexX87ChecksBegin == 39 && kPairChecksBegin == 43,
+              "the complex checks are spelled 30-38 and the COMPLEX_X87 ones 39-42 above");
+static_assert(kPairChecks == 19 && kReportedChecks == 62, "the composites of alignment 16 are spelled 43-61 above");
+static_assert(kReportedChecks <= 63, "every check is one bit of a `long long`");
 
 // `x87`: the SysV group; `gnu`: the over-aligned scalar typedefs, whose attribute is GNU's; `refused`: the
-// stacked-alignment shapes the unit leaves out.
+// stacked-alignment shapes the unit leaves out; `complexElements`: how many of kComplexElements the unit carries
+// (0: the reference has no `_Complex`; 2: float and double; 3: and long double). The SysV group needs all three.
 // `walk`: the unwind walk (check 28), on the SysV arms.
-[[nodiscard]] std::string calleeSource(bool x87, bool gnu, bool walk, Alignments const& refused) {
+[[nodiscard]] std::string calleeSource(bool x87, bool gnu, bool walk, int complexElements, Alignments const& refused) {
     return std::string{kShapes} + alignedShapes(refused) + (x87 ? kX87Shapes : "") + (gnu ? scalarShapes() : "")
-         + kCalleeBody + alignedCallees(refused) + tailCallee(refused) + (x87 ? kX87CalleeBody : "")
-         + (gnu ? scalarCallees() : "") + (walk ? kWalkCallee : "");
+         + (gnu ? pairShapes() : "") + complexShapes(complexElements) + kCalleeBody + alignedCallees(refused)
+         + tailCallee(refused) + (x87 ? std::string{kX87CalleeBody} + complexX87Callees() : std::string{})
+         + (gnu ? scalarCallees() + pairSignatures(/*definitions=*/true) : "") + complexCallees(complexElements)
+         + (walk ? kWalkCallee : "");
 }
 
-[[nodiscard]] std::string callerSource(bool x87, bool gnu, bool walk, Alignments const& refused) {
-    std::string const checks = std::string{kCommonCallerChecks} + alignedChecks(refused) + tailCheck(refused)
-                             + (x87 ? kX87CallerChecks : "") + (gnu ? scalarChecks() : "")
+[[nodiscard]] std::string callerSource(bool x87, bool gnu, bool walk, int complexElements, Alignments const& refused) {
+    std::string const checks = std::string{kCommonCallerChecks} + alignedChecks(refused)
+                             + (x87 ? std::string{kX87CallerChecks} + kComplexX87CallerChecks : std::string{})
+                             + (gnu ? scalarChecks() + pairChecks() : "") + complexChecks(complexElements)
                              + (walk ? kWalkCheckText : "");
     std::string s = std::string{kShapes} + alignedShapes(refused) + (x87 ? kX87Shapes : "")
-                  + (gnu ? scalarShapes() : "") + kCallerDecls + alignedDecls(refused) + tailDecl(refused)
-                  + (x87 ? kX87CallerDecls : "") + (gnu ? scalarDecls() : "") + (walk ? kWalkDecl : "")
-                  + kPlacedMacro;
-    for (CallerVariant const& v : callerVariants(gnu)) s += std::string{v.head} + checks + v.frame + callerTail();
+                  + (gnu ? scalarShapes() + pairShapes() : "") + complexShapes(complexElements) + kCallerDecls
+                  + alignedDecls(refused) + tailDecl(refused)
+                  + (x87 ? std::string{kX87CallerDecls} + kComplexX87Decls : std::string{})
+                  + (gnu ? scalarDecls() + pairSignatures(/*definitions=*/false) : "")
+                  + complexDecls(complexElements) + (walk ? kWalkDecl : "") + kPlacedMacro
+                  + tailFunctions(refused, gnu);
+    for (CallerVariant const& v : callerVariants(gnu))
+        s += std::string{v.head} + checks + tailCheck(refused, v) + v.frame + callerTail();
     return s;
 }
 
@@ -582,24 +881,35 @@ struct NativeArm {
     // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS; main's ledger 510): the unwind walk (check 28) of every
     // pairing holding a DSS object is PRINTED, naming that row, never asserted; the control's walk is asserted.
     bool walkWaitsOnObjectUnwind = false;
+    // The reference's `long double` is DSS's own for this target (the `long double _Complex` cells, 36-38). False
+    // on Win64's gcc arm: mingw-w64 gcc's `long double` is the x87 80-bit one, DSS's pe64 one MSVC's `double`
+    // (the format's `longDoubleFormat`) -- two types, so no call of one can be read against the other.
+    bool longDoubleIsDss = true;
 };
+
+// The complex elements of an arm's units: none where the reference has no `_Complex` (cl), else float and double,
+// and `long double` where the reference's `long double` is DSS's.
+[[nodiscard]] int complexElementsOf(NativeArm const& arm) {
+    if (arm.msvc) return 0;
+    return arm.longDoubleIsDss ? kComplexElementCount : kComplexElementCount - 1;
+}
 
 // The checks whose object a pointer convention's CALLER places: the stacked-alignment aggregates (6-15, and the
 // tail shape, 29).
-constexpr unsigned long kCallerPlacedChecks =
-    (((1UL << 16) - 1UL) & ~((1UL << 6) - 1UL)) | (1UL << kTailCheck);
+constexpr unsigned long long kCallerPlacedChecks =
+    (((1ULL << 16) - 1ULL) & ~((1ULL << 6) - 1ULL)) | (1ULL << kTailCheck);
 // The checks whose object the CALLEE places: an over-aligned scalar's `&v` (19-24) is the callee's own home -- it
 // arrives as the scalar it is and the callee copies it where its address can be taken (probe sa). ✔MEASURED, run
 // f26c-s22 on linux-arm64-debug: gcc 13.3.0 aarch64's own callee misplaces the 32- and 64-aligned homes in the
 // control (mask 0x1e00000) and the 64-aligned one under a DSS caller (0x800000).
-constexpr unsigned long kCalleeHomeChecks = ((1UL << 25) - 1UL) & ~((1UL << kScalarChecksBegin) - 1UL);
-constexpr unsigned long kEveryCheck       = (1UL << kReportedChecks) - 1UL;
+constexpr unsigned long long kCalleeHomeChecks = ((1ULL << 25) - 1ULL) & ~((1ULL << kScalarChecksBegin) - 1ULL);
+constexpr unsigned long long kEveryCheck       = (1ULL << kReportedChecks) - 1ULL;
 
 // The two masks the driver prints for the caller `tag` (`<tag> bad=<hex> misplaced=<hex>`, one line), or nullopt
 // when it printed no such line.
 struct CheckMasks {
-    unsigned long bad;
-    unsigned long misplaced;
+    unsigned long long bad;
+    unsigned long long misplaced;
 };
 [[nodiscard]] std::optional<CheckMasks> masksOf(std::string const& out, std::string const& tag) {
     std::string const lead = tag + " bad=";
@@ -612,8 +922,8 @@ struct CheckMasks {
         auto const m = line.find(" misplaced=");
         if (m == std::string::npos) return std::nullopt;
         try {
-            return CheckMasks{std::stoul(line.substr(lead.size()), nullptr, 16),
-                              std::stoul(line.substr(m + 11), nullptr, 16)};
+            return CheckMasks{std::stoull(line.substr(lead.size()), nullptr, 16),
+                              std::stoull(line.substr(m + 11), nullptr, 16)};
         } catch (std::exception const&) {
             return std::nullopt;
         }
@@ -653,7 +963,7 @@ struct CheckMasks {
              {{256, "error C2719: 's': formal parameter with requested alignment of 256 won't be aligned"}},
              /*callerCopy=*/true},
             {"Win64 control, mingw-w64 gcc + GNU ld", "x86_64:pe64-x86_64-windows", "gcc", "", false, false, {},
-             /*callerCopy=*/true}};
+             /*callerCopy=*/true, /*walkWaitsOnObjectUnwind=*/false, /*longDoubleIsDss=*/false}};
 #else
     return {};
 #endif
@@ -730,11 +1040,14 @@ TEST(SysVMemoryClassReferenceLinkNative, EveryPairingOfDssAndTheHostsCompilerAgr
         // The unwind walk where the realignment happens: the SysV arms -- asserted where every object carries an
         // unwind table, printed in a pairing holding a DSS object where the arm's objects do not (`waitsWalk`).
         bool const walk = arm.x87;
-        unsigned long const waitsWalk = walk && arm.walkWaitsOnObjectUnwind ? 1UL << kWalkCheck : 0UL;
-        std::string const calleeAll = calleeSource(arm.x87, gnu, walk, {});
-        std::string const callerAll = callerSource(arm.x87, gnu, walk, {});
-        std::string const calleeTaken = calleeSource(arm.x87, gnu, walk, refusedAlignments);
-        std::string const callerTaken = callerSource(arm.x87, gnu, walk, refusedAlignments);
+        unsigned long long const waitsWalk = walk && arm.walkWaitsOnObjectUnwind ? 1ULL << kWalkCheck : 0ULL;
+        int const complexElements = complexElementsOf(arm);
+        ASSERT_TRUE(!arm.x87 || complexElements == kComplexElementCount)
+            << "the SysV group's COMPLEX_X87 cells read make_cxl (check 42)";
+        std::string const calleeAll = calleeSource(arm.x87, gnu, walk, complexElements, {});
+        std::string const callerAll = callerSource(arm.x87, gnu, walk, complexElements, {});
+        std::string const calleeTaken = calleeSource(arm.x87, gnu, walk, complexElements, refusedAlignments);
+        std::string const callerTaken = callerSource(arm.x87, gnu, walk, complexElements, refusedAlignments);
         // DSS's objects at BOTH build configurations: the release pipeline reaches the same call boundary after
         // the optimizer, and the frame it realigns is the one MIR->LIR builds after it.
         struct DssObjects {
@@ -828,24 +1141,24 @@ TEST(SysVMemoryClassReferenceLinkNative, EveryPairingOfDssAndTheHostsCompilerAgr
             std::string   tag;
             fs::path      caller;
             fs::path      callee;
-            unsigned long referencePlaced;
+            unsigned long long referencePlaced;
             // The walk's bit when this pairing holds a DSS object on an arm whose objects carry no unwind table:
             // its failure is printed, never asserted.
-            unsigned long walkPrinted;
+            unsigned long long walkPrinted;
         };
         std::vector<Pairing> pairings;
         for (DssObjects const& o : dssObjects) {
             std::string const at = std::string{" ("} + o.config + ")";
             std::string const tagAt = std::string{"-"} + o.config;
             pairings.push_back({"DSS caller, DSS callee, every shape" + at, "dd" + tagAt, o.callerAll, o.calleeAll,
-                                0UL, waitsWalk});
+                                0ULL, waitsWalk});
             pairings.push_back({"reference caller, DSS callee" + at, "rd" + tagAt, refCaller, o.callee,
-                                arm.callerCopy ? kCallerPlacedChecks : 0UL, waitsWalk});
+                                arm.callerCopy ? kCallerPlacedChecks : 0ULL, waitsWalk});
             pairings.push_back({"DSS caller, reference callee" + at, "dr" + tagAt, o.caller, refCallee,
                                 kCalleeHomeChecks, waitsWalk});
         }
         pairings.push_back({"reference caller, reference callee (the control)", "rr", refCaller, refCallee,
-                            kEveryCheck, 0UL});
+                            kEveryCheck, 0ULL});
 #if defined(_WIN32)
         std::string const exeSuffix = ".exe";
 #else
@@ -877,24 +1190,24 @@ TEST(SysVMemoryClassReferenceLinkNative, EveryPairingOfDssAndTheHostsCompilerAgr
                     everyCallerClean = false;
                     continue;
                 }
-                EXPECT_EQ(masks->bad & ~pair.walkPrinted, 0UL)
+                EXPECT_EQ(masks->bad & ~pair.walkPrinted, 0ULL)
                     << arm.label << ", " << pair.label << ", the " << v.tag
                     << " caller: values did not arrive at check(s) of mask 0x" << std::hex
                     << (masks->bad & ~pair.walkPrinted) << std::dec << ", exit " << r.exitCode << " -- " << kChecks;
-                EXPECT_EQ(masks->misplaced & ~pair.referencePlaced, 0UL)
+                EXPECT_EQ(masks->misplaced & ~pair.referencePlaced, 0ULL)
                     << arm.label << ", " << pair.label << ", the " << v.tag << " caller: a parameter object DSS "
                     << "placed is misplaced at check(s) of mask 0x" << std::hex
                     << (masks->misplaced & ~pair.referencePlaced) << std::dec << ", exit " << r.exitCode << " -- "
                     << kChecks;
-                if (masks->bad != 0UL || masks->misplaced != 0UL) everyCallerClean = false;
+                if (masks->bad != 0ULL || masks->misplaced != 0ULL) everyCallerClean = false;
                 std::cout << "[native-arm] " << arm.label << ", " << pair.label << ", the " << v.tag
                           << " caller: bad 0x" << std::hex << masks->bad << ", misplaced 0x" << masks->misplaced
                           << std::dec
-                          << ((masks->misplaced & pair.referencePlaced) != 0UL
+                          << ((masks->misplaced & pair.referencePlaced) != 0ULL
                                   ? " (the reference's own placement, not asserted)"
                                   : "")
-                          << (pair.walkPrinted == 0UL ? ""
-                              : (masks->bad & pair.walkPrinted) != 0UL
+                          << (pair.walkPrinted == 0ULL ? ""
+                              : (masks->bad & pair.walkPrinted) != 0ULL
                                   ? " (the walk, check 28, FAILED: it waits on "
                                     "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS -- printed, not asserted)"
                                   : " (the walk, check 28, PASSED: the row it waited on, "

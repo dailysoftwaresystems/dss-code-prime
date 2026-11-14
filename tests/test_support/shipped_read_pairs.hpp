@@ -47,7 +47,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -160,6 +162,101 @@ struct Enumeration {
     EXPECT_GE(e.realPairs, 22u) << "the real-pair enumeration collapsed";
     EXPECT_GE(e.distinct.size(), 5u) << "the distinct-read enumeration collapsed";
     return e.distinct;
+}
+
+// ══ EVERY C CALLING CONVENTION A SHIPPED FORMAT NAMES ═══════════════════════
+// (P69, lane `cs`, fold f26c2.) A convention is per FORMAT (`cCallingConvention`
+// names a row of the paired target's `callingConventions[]`), so a test that means
+// "on every convention" walks the real pairs and keeps one per (target,
+// convention) -- its first format document by name -- with the pair's own type
+// facts (the data model, the `long double` format). Never a hand list: a format
+// or a convention row added later is covered the day it lands. The facts are NOT
+// collapsed (unlike `shippedReadPairs`): two conventions with equal facts are two
+// entries. ✔READ at f26c2 over the 24 format documents: five conventions --
+// sysv_amd64 (ELF x86_64), sysv_amd64_darwin (Mach-O x86_64), ms_x64 (pe64),
+// aapcs64 (ELF arm64), apple_arm64 (Mach-O arm64); spirv and wasm32 name `none`.
+struct ShippedConventionPair {
+    std::string         arch;               // the shipped target's name
+    std::string         convention;         // the format's `cCallingConvention`
+    std::uint16_t       conventionIndex = 0;   // its row in the target's callingConventions[]
+    std::string         formatDoc;          // the first format document (by name) naming it
+    ObjectFormatKind    kind = ObjectFormatKind::Unknown;
+    PredefinedTypeFacts facts;              // predefinedTypeFactsFor(target, format)
+
+    [[nodiscard]] std::string label() const { return arch + ":" + formatDoc + " (" + convention + ")"; }
+};
+
+namespace shipped_read_pairs_detail {
+
+struct ConventionEnumeration {
+    std::vector<ShippedConventionPair> pairs;
+    std::string                        failure;   // empty ⇔ every document loaded and every name resolved
+};
+
+[[nodiscard]] inline ConventionEnumeration enumerateConventions() {
+    ConventionEnumeration out;
+    std::vector<std::shared_ptr<TargetSchema>> targets;
+    for (std::string const& name : stems("targets", ".target.json")) {
+        auto r = TargetSchema::loadShipped(name);
+        if (!r.has_value()) {
+            out.failure += "target '" + name + "' does not load; ";
+            continue;
+        }
+        targets.push_back(*r);
+    }
+    for (std::string const& name : stems("object-formats", ".format.json")) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        if (!r.has_value()) {
+            out.failure += "object format '" + name + "' does not load; ";
+            continue;
+        }
+        ObjectFormatSchema const& format = **r;
+        if (format.cCallingConvention().declaresNoConvention()) continue;
+        for (auto const& target : targets) {
+            if (format.targetArch() != target->name()) continue;   // not a real pair
+            std::string const& cc = format.cCallingConvention().convention;
+            bool const seen = std::any_of(out.pairs.begin(), out.pairs.end(), [&](ShippedConventionPair const& p) {
+                return p.arch == target->name() && p.convention == cc;
+            });
+            if (seen) continue;
+            std::optional<std::uint16_t> index;
+            for (std::uint16_t i = 0; i < target->callingConventionCount(); ++i)
+                if (target->callingConvention(i)->name == cc) index = i;
+            if (!index.has_value()) {
+                out.failure += "format '" + name + "' names convention '" + cc + "', which target '"
+                             + std::string{target->name()} + "' does not declare; ";
+                continue;
+            }
+            ShippedConventionPair pair;
+            pair.arch            = std::string{target->name()};
+            pair.convention      = cc;
+            pair.conventionIndex = *index;
+            pair.formatDoc       = std::string{format.name()};
+            pair.kind            = format.kind();
+            pair.facts           = predefinedTypeFactsFor(*target, format);
+            out.pairs.push_back(std::move(pair));
+        }
+    }
+    return out;
+}
+
+}  // namespace shipped_read_pairs_detail
+
+// Every (target, convention) a shipped format names. The checks run on EVERY call,
+// so each consuming test fails on its own when the enumeration collapses.
+[[nodiscard]] inline std::vector<ShippedConventionPair> const& shippedConventionPairs() {
+    static shipped_read_pairs_detail::ConventionEnumeration const e =
+        shipped_read_pairs_detail::enumerateConventions();
+    EXPECT_TRUE(e.failure.empty()) << "the shipped convention pairs do not all resolve: " << e.failure;
+    // FLOOR, ✔READ at f26c2: five conventions (see above).
+    EXPECT_GE(e.pairs.size(), 5u) << "the convention enumeration collapsed";
+    return e.pairs;
+}
+
+// Every shipped format document's name, in name order -- the `object-formats` directory read, never a hand
+// list. For a test that walks a property of the formats themselves (an executable's container, say).
+[[nodiscard]] inline std::vector<std::string> shippedFormatNames() {
+    return shipped_read_pairs_detail::stems("object-formats", ".format.json");
 }
 
 // The one read for (arch, format kind), or nullptr with a test failure naming it.
