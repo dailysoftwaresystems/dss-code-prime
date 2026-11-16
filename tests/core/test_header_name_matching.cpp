@@ -288,8 +288,17 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root
         using dss::core::WalkStep;
         // The substrate's walk (`dss::core::walkTree`): an explicit work stack, and it never descends
         // a link, on every build.
+        // ★ EACH ENTRY'S TEXT, AS THIS SWEEP SPELLS IT (P69 H6c): the root it named, then each LISTED name down
+        // to the entry (`at.filename()`, text to match) -- the walk hands out a value, and the sweep judges
+        // names, never a path. The walk yields a directory's entries before its next sibling, so the names by
+        // depth are the entry's own.
+        std::vector<fs::path> listedNames;
         auto const walk = dss::core::walkTree(root, [&](dss::core::TreeEntry const& entry) {
-            std::string const inTree = treeRel(entry.path);
+            listedNames.resize(entry.depth);
+            listedNames.push_back(entry.at.filename());
+            fs::path entryText = root;
+            for (fs::path const& name : listedNames) entryText /= name;
+            std::string const inTree = treeRel(entryText);
             auto const        names = dss::test_support::tree_ignores_detail::splitNames(inTree);
             // ★ A SYMBOLIC LINK IS NO DIRECTORY AND IS NEVER DESCENDED: git records a link as a file,
             // so a `build/` rule does not take one (✔MEASURED, git 2.55), and a clone holds the link
@@ -308,7 +317,7 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root
             if (!inTree.empty() && !ignores.decide(names, false).empty()) return WalkStep::Continue;   // never cloned
             // LEXICALLY relative to the swept root, never through `fs::relative`, which resolves a
             // symbolic link to what it points at and would report the target, not the link.
-            fs::path const    relPath = frame(entry.path).lexically_relative(frame(root));
+            fs::path const    relPath = frame(entryText).lexically_relative(frame(root));
             std::string const rel     = narrowUtf8OrEmpty(relPath);
             if (rel.empty()) {
                 // Distinguish the two reasons rather than folding them: no relative path is a
@@ -1422,7 +1431,8 @@ TEST(TreeIgnoresGrammar, LiveEveryScenarioIsAnsweredAsGitCheckIgnoreAnswersIt) {
     fs::create_directories(target);
     auto const& withheld = dss::gitRepositoryLocalVariables();
     {
-        auto const init = dss::substrate::spawnAndWaitRedirectStdout({narrowUtf8OrEmpty(*gitExe), "init", "-q"}, repo,
+        // The image is the resolved git, a value; argv[0] its rendering (as git_acquire.cpp hands it, H6c).
+        auto const init = dss::substrate::spawnAndWaitRedirectStdout(*gitExe, {gitExe->spelling().display(), "init", "-q"}, repo,
                                                                      scratch.path() / "init.out", withheld);
         ASSERT_TRUE(init.spawned && init.exitCode == 0) << init.diagnostic;
     }
@@ -1468,12 +1478,12 @@ TEST(TreeIgnoresGrammar, LiveEveryScenarioIsAnsweredAsGitCheckIgnoreAnswersIt) {
     // is; the pattern is written as it stands and may hold a tab, so the LAST tab ends it.
     std::map<std::string, std::map<std::string, std::string>> said;   // setting -> path -> pattern ("" none)
     for (std::string const fold : {"false", "true"}) {
-        std::vector<std::string> argv{narrowUtf8OrEmpty(*gitExe), "-c", "core.ignorecase=" + fold, "-c",
+        std::vector<std::string> argv{gitExe->spelling().display(), "-c", "core.ignorecase=" + fold, "-c",
                                       "core.excludesFile=" + narrowUtf8OrEmpty(scratch.path() / "no-excludes-file"),
                                       "-c", "core.quotePath=true", "check-ignore", "--no-index", "-v", "-n", "--"};
         for (auto const& a : asked) argv.push_back(a.asAsked);
         fs::path const out = scratch.path() / ("check-ignore-" + fold + ".out");
-        auto const     r = dss::substrate::spawnAndWaitRedirectStdout(argv, repo, out, withheld);
+        auto const     r = dss::substrate::spawnAndWaitRedirectStdout(*gitExe, argv, repo, out, withheld);
         ASSERT_TRUE(r.spawned && (r.exitCode == 0 || r.exitCode == 1)) << r.diagnostic << " exit " << r.exitCode;
         std::ifstream     in(out, std::ios::binary);
         std::string const bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};

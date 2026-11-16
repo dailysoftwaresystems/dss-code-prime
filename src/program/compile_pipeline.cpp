@@ -510,7 +510,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
-            std::ifstream probe(core::extendedLengthSpelling(lib.path), std::ios::binary);
+            std::ifstream probe = core::openInputStream(lib.path, std::ios::binary);
             if (!probe) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -3432,7 +3432,7 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
 }  // namespace
 
 bool isArArchiveFile(std::filesystem::path const& path) {
-    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
+    std::ifstream in = core::openInputStream(path, std::ios::binary);
     if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
     std::uint8_t buf[8] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
@@ -3445,7 +3445,7 @@ bool isArArchiveFile(std::filesystem::path const& path) {
 
 bool isRelocatableObjectFile(std::filesystem::path const& path,
                              ObjectFormatSchema const&    format) {
-    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
+    std::ifstream in = core::openInputStream(path, std::ios::binary);
     if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
 
     // A HEADER PREFIX, never the file. Every field the backends inspect lives in
@@ -4036,7 +4036,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // after it. Nothing is pulled from any archive when one failed.
     bool const everyArchiveParsed = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {
         std::filesystem::path const& archivePath = archivePaths[a];
-        std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
+        std::ifstream in = core::openInputStream(archivePath, std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -4714,7 +4714,7 @@ pullEntryArchiveMembers(std::span<EntryLinkName const>         names,
         if (archives[ai].has_value()) return &*archives[ai];
         if (unreadable[ai]) return nullptr;   // reported when it was first asked
         unreadable[ai] = true;   // until the read below succeeds
-        std::ifstream in(core::extendedLengthSpelling(archivePaths[ai]), std::ios::binary);
+        std::ifstream in = core::openInputStream(archivePaths[ai], std::ios::binary);
         if (!in) {
             report(reporter, DiagnosticCode::F_FileOpenFailed, DiagnosticSeverity::Error,
                    std::format("static-link: failed to open archive '{}' for reading.",
@@ -4790,7 +4790,7 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     // parse, or a member that does not read, never stops the ones after it.
     bool const everyArchiveRead = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {
         std::filesystem::path const& archivePath = archivePaths[a];
-        std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
+        std::ifstream in = core::openInputStream(archivePath, std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -4864,7 +4864,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     // open or read never stops the objects after it.
     bool const everyObjectRead = substrate::runEveryUnit(objectPaths.size(), [&](std::size_t o) {
         std::filesystem::path const& objectPath = objectPaths[o];
-        std::ifstream in(core::extendedLengthSpelling(objectPath), std::ios::binary);
+        std::ifstream in = core::openInputStream(objectPath, std::ios::binary);
         if (!in) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;

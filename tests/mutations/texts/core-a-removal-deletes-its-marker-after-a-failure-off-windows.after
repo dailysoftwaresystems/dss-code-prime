@@ -1,1 +1,1 @@
-        std::string const name  = top.names[top.next++];
+        std::string const name = top.names[top.next++];

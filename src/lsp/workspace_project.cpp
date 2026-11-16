@@ -119,20 +119,22 @@ struct ManifestScanFailure {
                             kProjectFileSuffix) == 0;
     };
     std::error_code rootEc;
-    if (core::reachedKind(root, rootEc) == core::EntryKind::Absent && !rootEc) return std::nullopt;
+    // A CONTAINER (H6c, A2): the workspace root, walked.
+    if (core::reachedKind(root, core::Use::Container, rootEc) == core::EntryKind::Absent && !rootEc)
+        return std::nullopt;
     std::optional<ManifestScanFailure> unreadable;
     auto const walk = core::walkTree(
         root,
         [&](core::TreeEntry const& entry) {
-            if (!named(entry.path)) return core::WalkStep::Prune;
+            if (!named(entry.at.filename())) return core::WalkStep::Prune;
             if (entry.reachError) {
                 unreadable = ManifestScanFailure{
                     WorkspaceProjectErrorKind::ProjectFileLoadFailed,
-                    "project file `" + entry.path.string() + "` cannot be read: what it reaches cannot be "
+                    "project file `" + entry.at.spelling().display() + "` cannot be read: what it reaches cannot be "
                         "examined (" + entry.reachError.message() + ")"};
                 return core::WalkStep::Stop;
             }
-            if (entry.reaches == core::EntryKind::File) out.push_back(entry.path);
+            if (entry.reaches == core::EntryKind::File) out.push_back(entry.storeRoutePath);
             return core::WalkStep::Prune;
         },
         core::TreeWalkOptions{.handOutUnreadableLinks = true});
@@ -141,7 +143,7 @@ struct ManifestScanFailure {
         return ManifestScanFailure{
             WorkspaceProjectErrorKind::ProjectFileNotFound,
             "the workspace root `" + root.string() + "` could not be read: the walk stopped at `"
-                + walk.where.string() + "` (" + walk.error.message() + "), so no `"
+                + walk.where.spelling().display() + "` (" + walk.error.message() + "), so no `"
                 + std::string{kProjectFileSuffix} + "` project file in it could be found"};
     }
     return std::nullopt;
@@ -332,7 +334,12 @@ std::string fileUriFromPath(std::string_view path) {
 std::string fileUriFromPath(fs::path const& path) {
     // `core::genericSpellingU8`, NOT `generic_u8string()`: on the MinGW model the latter renders a share's root with a
     // SINGLE leading slash (✔MEASURED, the substrate's header), and the URI then named a path on the local drive.
-    const std::u8string u8 = core::genericSpellingU8(path);
+    std::u8string u8 = core::genericSpellingU8(path);
+    // A VERBATIM text keeps its `\` as a path (the substrate's generic rule, H6c A10: under `\\?\` a `/` is a
+    // character), but a URI's PATH separates its segments by `/` alone (RFC 3986), so the encoder writes the URI
+    // grammar's separator; `pathFromFileUri` puts the verbatim form back. Only a Win32-grammar host parses one.
+    if (core::rootSpelling(path).kind == core::RootSpelling::Kind::Verbatim)
+        std::replace(u8.begin(), u8.end(), char8_t{'\\'}, char8_t{'/'});
     std::string_view bytes(reinterpret_cast<char const*>(u8.data()), u8.size());
 
     std::string out = "file://";
@@ -548,7 +555,7 @@ refusal(WorkspaceProjectErrorKind kind, DiagnosticCode code, std::string detail)
                                         std::string const& entry) {
     fs::path const p{resolveManifestPathSpelling(manifestDir, entry)};
     std::error_code ec;
-    fs::path const abs = core::absoluteKeepingRoot(p, ec);
+    fs::path const abs = core::storeRouteAbsolute(p, ec);   // the include search's store route (H6d)
     return ec ? p : abs;
 }
 
@@ -612,7 +619,7 @@ WorkspaceBuildResult resolveWorkspaceBuild(
         }
         m.sources.reserve(files->size());
         for (auto const& f : *files) {
-            m.sources.push_back(core::PathIdentity::of(fs::path{f}));
+            m.sources.push_back(core::PathIdentity::of(fs::path{f}, core::Use::Leaf));   // a source FILE
         }
 
         for (auto const& spec : cfg->targets) {
@@ -698,7 +705,7 @@ DocumentBuildSelection selectDocumentConfigurations(
     // stored identities, and the document's path is reduced the same way.
     std::vector<WorkspaceBuildManifest const*> chosen;
     if (documentPath.has_value()) {
-        auto const id = core::PathIdentity::of(*documentPath);
+        auto const id = core::PathIdentity::of(*documentPath, core::Use::Leaf);   // the document, a FILE
         for (auto const& m : build.manifests) {
             if (std::find(m.sources.begin(), m.sources.end(), id)
                 != m.sources.end()) {

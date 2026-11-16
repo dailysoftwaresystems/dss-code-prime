@@ -21,7 +21,8 @@
 // program layer, so a home there could not be reached by every site of its class. Every layer reaches core.
 //
 // Pinned by tests/program/test_every_unit.cpp (both cells for each verb: every unit failing, and a valid unit before
-// an invalid one; the growing form also asks a unit a step added).
+// an invalid one; the growing form also asks a unit a step added; the netted form names a silent unit after a
+// reporting one, and no reporting one).
 
 #include <cstddef>
 #include <type_traits>
@@ -36,6 +37,27 @@ template <class Step>
     bool every = true;
     for (std::size_t i = 0; i < units; ++i) {
         if (!step(i)) every = false;
+    }
+    return every;
+}
+
+// THE NETTED FORM (P69 H6c, R4): `runEveryUnit` with the fail-loud net taken PER UNIT. A failing tier must say why;
+// a unit whose step fails having added no error to `errorCount()` -- the count of the build's reporter -- is a
+// substrate-contract violation the build would otherwise fail on with nothing said, so `onSilentFailure(i)` names
+// it, in unit order. The count is read before EACH unit's step: one snapshot for the whole step is defeated by any
+// earlier unit's error, and a silent unit after a reporting one went unnamed. A site that means the net names this
+// verb; no overload is chosen by the arguments' count.
+template <class Step, class ErrorCount, class OnSilentFailure>
+    requires std::is_invocable_r_v<bool, Step&, std::size_t> && std::is_invocable_r_v<std::size_t, ErrorCount&>
+             && std::is_invocable_v<OnSilentFailure&, std::size_t>
+[[nodiscard]] bool runEveryUnitReportingSilence(std::size_t units, Step&& step, ErrorCount&& errorCount,
+                                                OnSilentFailure&& onSilentFailure) {
+    bool every = true;
+    for (std::size_t i = 0; i < units; ++i) {
+        std::size_t const reported = errorCount();
+        if (step(i)) continue;
+        every = false;
+        if (errorCount() == reported) onSilentFailure(i);
     }
     return every;
 }

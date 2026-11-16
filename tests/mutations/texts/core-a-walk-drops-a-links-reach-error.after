@@ -1,2 +1,2 @@
-            entry.reaches = reachedKind(listed.spelled[i], entry.reachError);
+            entry.reaches = reachedKind(entry.at, Use::Leaf, entry.reachError);
             entry.reachError.clear();

@@ -1,12 +1,14 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/host_path.hpp"
 
 #include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <string>
@@ -209,6 +211,22 @@ struct RootSpelling {
 [[nodiscard]] DSS_EXPORT std::wstring normalizedSpelling(std::wstring_view native, PathGrammar grammar);
 [[nodiscard]] DSS_EXPORT std::string normalizedSpelling(std::string_view native, PathGrammar grammar);
 
+// ONE NAME OF A TYPED RELATIVE, AS THE OS'S PLAIN RULE MAKES IT BY ITS POSITION BELOW `dir` (P69 H6c, B1) -- for a
+// consumer that matches a typed name against a LISTING name by name (the header search), and so cannot compose the
+// whole value through `HostPath::operator/`, which takes this same rule (`normalizedSpelling`'s trim) over the whole
+// right side. Below a `dir` whose text is DOS, in the Win32 grammar: a MIDDLE name (one a separator follows) loses ONE
+// trailing period, the LAST every trailing period and space. ✔MEASURED, H6c u4 (cl 19.52.37029, MinGW gcc 13.2.0, both
+// Windows legs): both open `dir\config.h` for `#include "config.h."` (`"sub./x.h"` and `"x.h "` alike) with that twin
+// there, and NOTHING with the literal alone; `"sub /x.h"` (a middle space, which the rule keeps) opens the literal
+// `sub `. Below a VERBATIM `dir`, and in the POSIX grammar, the name as typed: no reference reads a typed name below a
+// verbatim directory (cl and gcc open nothing below a verbatim `-I`, u4) and DSS takes the whole verbatim spelling's.
+// A name the rule makes no name of -- trimmed to nothing (a last `...`), a `.` or `..`, or a DEVICE (a last `NUL`) --
+// and a name holding a separator come back as typed (an include of a device: UNMEASURED).
+enum class NamePosition : std::uint8_t { Middle, Last };
+[[nodiscard]] DSS_EXPORT std::filesystem::path typedNameBelow(std::filesystem::path const& dir,
+                                                              std::filesystem::path const& name,
+                                                              NamePosition                 position);
+
 // Whether the DOS spelling of a tail below a Win32 volume root names the file its verbatim (`\\?\`) spelling names:
 // true unless the DOS normalization would rewrite it -- an empty component (a doubled separator), a `.` or `..`, a
 // `/`, a component ending in a dot or a space, or a last component that is a reserved device name (`NUL`, `CON`, ...).
@@ -218,98 +236,108 @@ struct RootSpelling {
 // Paths, and Namespaces"), unmeasured.
 [[nodiscard]] DSS_EXPORT bool dosSpellingNamesTheSameFile(std::wstring_view tail);
 
-// ════ THE SPELLING A FILE CALL TAKES, AT ANY LENGTH (P69 H6) ════
+// ════ THE SPELLING A FILE CALL TAKES, AT ANY LENGTH (P69 H6, H6b; H6c: the TYPED home) ════
 //
-// INVARIANT: every Win32 file call opens what the PLAIN spelling means, at any length. A plain spelling of 260
-// characters or more opens nothing on a Windows that has not opted into long paths (the registry switch, a system
-// setting, is not ours to assume), and that limit is the namespace's, not the file's: ✔MEASURED 2026-11-04
-// (probe-reference-cc runs 20261104-215014-7ba4f08f, cl 19.51 / MS STL; 20261104-215144-4893b98f, g++ 13.2 /
-// libstdc++; 20261104-215351-24246ad8, both; RtlAreLongPathsEnabled 0, a 316-character tree):
-//   * at 260 or more, a drive, forward-slash, UNC, relative AND `\\.\` spelling fails in CreateDirectoryW, CreateFileW
-//     (create and open), GetFileAttributesExW, FindFirstFileExW, MoveFileExW, DeleteFileW, RemoveDirectoryW and
-//     _wfopen (ERROR_PATH_NOT_FOUND) and in every std::filesystem operation of both libraries; GetFullPathNameW and
-//     `fs::absolute`, string operations, answer at any length;
-//   * `\\?\` and `\\?\UNC\` open in every one of those calls at any length, and in `std::ifstream`, `std::ofstream`
-//     and `_wfopen` under both libraries;
-//   * ⚠ BUT NOT IN libstdc++'s std::filesystem: `directory_iterator` over a `\\?\` or `\\?\UNC\` directory of 260 or
-//     more returns a WRONG entry count (3 for 2) with NO error, and `status`, `exists`, `file_size`,
-//     `create_directories` (EINVAL) and `remove` fail on `\\?\UNC\` at ANY length. So this spelling is handed to Win32
-//     calls, streams and the C runtime -- NEVER to a std::filesystem operation; this file's operations below are Win32
-//     on Windows for that reason.
+// INVARIANT: every host call on a path opens what the value NAMES, at any length, and no code outside
+// src/core/substrate/ makes one (the filesystem-queries guard, tests/core/test_filesystem_queries_guard.cpp). Each
+// operation below takes a `HostPath` (host_path.hpp) and fixes the USE it asks it in; the one question both uses can
+// ask -- a kind, an identity, a reached path, a stored name, a write time, a sameness -- takes the `Use` as a
+// parameter with no default.
 //
-// THE SPELLING, ONE RULE AT EVERY LENGTH, AND IT IS THE OS'S, asked in path_identity.cpp alone (P69 H6b, F4: the
-// rule's one home is this canonicalizer; integrated_tests compiles it and carries src/ on its include path, so no
-// header-only second home is owed). `p` names what its WHOLE spelling names, taken ONCE -- the LEAF reference: a
-// verbatim spelling as written, `\??\` as its `\\?\` twin (N4: ✔MEASURED 2026-11-05, every file call reads `\??\`
-// verbatim, GetFullPathNameW reads it rooted, and CreateDirectoryW takes only `\\?\` past MAX_PATH); otherwise
-// `p`'s full spelling as the OS resolves it -- GetFullPathNameW: the caller's directories for a relative
-// spelling, the separators, `.` and `..` (under `\\.\` the climb over the volume), the trim, a reserved name to its
-// device -- prefixed: `\\?\` before a drive, `\\?\UNC\` in place of a share's `\\`, `\\?\` in place of a device
-// spelling's `\\.\` (a reserved name the OS resolved, `\\.\NUL`, so becomes `\\?\NUL`: the same device). A device
-// spelling converts so because both name one NT namespace (✔MEASURED, run 20261104-215748-2946f6a6, below 260:
-// `\\.\X` and its converted `\\?\` spelling open the SAME object -- one NT name, one file id -- for a file, a trailing
-// dot, a `..`, the climb, `\\.\C:\d\NUL` (a file in both), `\\.\NUL`, `\\.\CONIN$`, an absent `\\.\COM1`, GLOBALROOT,
-// `\\.\UNC\` and `\\.\pipe\`). Kept as written: a verbatim spelling (already literal), one the OS refuses to resolve,
-// and every spelling on a POSIX host, which has no such limit.
-// ⚠ A LEAF'S SPELLING, NEVER A WALK'S: the resolution of a cut is not the cut of the resolution. GetFullPathNameW
-// trims ONE trailing period from every segment but a trailing space and a device name from the LAST alone (✔MEASURED
-// 2026-11-05 over 256 cells: kinds {drive, cwd-relative, drive-relative, rooted, share, `\\?\`, `\\.\`, `\??\`} x last
-// names {`d `, `e.`, `f\..`, `NUL`} x separators {`\`, `/`, mixed, trailing} x {short, 469 characters}, runs
-// 20261105-062441-7bd17744 / 062514-83af17c8 (cl) and 062546-4ccf610b / 062603-16841970 (g++), byte-identical). So
-// a walk never re-extends a level: every walk below takes the whole's reference once and cuts it LITERALLY.
-[[nodiscard]] DSS_EXPORT std::filesystem::path extendedLengthSpelling(std::filesystem::path const& p);
+// THE REFERENCE RULE (path_identity.cpp's `referenceSpelling`, its one home): a verbatim spelling as written; `\??\` as
+// its `\\?\` twin (N4: ✔MEASURED 2026-11-05, every file call reads `\??\` verbatim, GetFullPathNameW reads it rooted,
+// CreateDirectoryW takes only `\\?\` past MAX_PATH, CreateProcessW refuses it, 267); otherwise the OS's full spelling
+// (GetFullPathNameW) -- of `text + \` for a CONTAINER -- prefixed `\\?\`, `\\?\UNC\` for a share, `\\?\` for a device
+// path's `\\.\` (one NT namespace: ✔MEASURED, run 20261104-215748-2946f6a6). A plain spelling of 260 characters or
+// more opens nothing on a Windows that has not opted into long paths, in every Win32 call and every std::filesystem
+// operation of both libraries, where `\\?\` opens at any length (✔MEASURED 2026-11-04, runs 20261104-215014-7ba4f08f,
+// 20261104-215144-4893b98f, 20261104-215351-24246ad8) -- so a reference is handed to Win32 calls, streams and the C
+// runtime, and NEVER to a std::filesystem operation: libstdc++'s `directory_iterator` over a long `\\?\` directory
+// returns a wrong entry count with no error, and its `status`, `exists`, `file_size`, `create_directories` and
+// `remove` fail on `\\?\UNC\` at any length.
+// ⚠ A LEAF'S RESOLUTION IS NOT A WALK'S: GetFullPathNameW trims ONE trailing period from every segment that ends in a
+// single one, but every trailing period and space, and a device name, from the LAST alone (✔MEASURED over the 256
+// walk-up cells, runs 20261105-062441-7bd17744 / 062514-83af17c8 / 062546-4ccf610b / 062603-16841970, and the 270
+// listed cells of H6c, runs 20261113-212927-50669bb8 / 212941-deb1d8ec). So a walk never re-resolves a level: it cuts
+// the whole's reference LITERALLY, and a value made from a listing keeps its references fixed.
 
-// THE CONTAINER FORM of `dir` (P69 H6b, ledger 541): `dir` with a separator after it, the spelling that names the
-// directory every `dir \ name` lies in. ✔MEASURED (the universe above): resolved with no segment last, `C:\o\d \` is
-// `d ` and `C:\o\NUL\` a directory, exactly as every child composed from it means them, where `C:\o\d ` alone is
-// `C:\o\d` and `C:\o\NUL` the device. A spelling USED as a container -- a directory to make, to list, to start a
-// process in -- is asked in this form; one used as a LEAF -- an open, a kind, a removal's target -- as given. `dir`
-// itself when it already ends in a separator, is empty, or on POSIX (which resolves no name by its position).
-[[nodiscard]] DSS_EXPORT std::filesystem::path containerSpelling(std::filesystem::path const& dir);
+// THE DIRECTORY `file` IS IN -- the ONE cut (H6c, A9): the level above the last name of `file`'s LEAF reference (a
+// GIVEN value's taken now by the rule, a made value's fixed one), cut literally -- only `\` separates under `\\?\`,
+// and a volume root keeps its separator. Never the library's `parent_path()` of the text: re-resolved as a whole that
+// is another directory when its last name ends in a space or is a device name, and at `\\?\D:\a.exe` it is `\\?\D:`,
+// the volume's DEVICE (✔MEASURED, H6c u2 part 5: attributes ERR 87, open ERR 5). Its text is lossless (the DOS form
+// exactly where that names the same directory). EMPTY at a volume root (there is no level above). POSIX: the text's
+// level within its root (`parentWithinRoot`).
+[[nodiscard]] DSS_EXPORT HostPath containingDirectory(HostPath const& file);
 
-// THE DIRECTORY `file` IS IN, as every file call names it: the level above `file`'s last name in `file`'s own leaf
-// reference -- extended once and cut literally (only `\` separates under `\\?\`; a volume root keeps its separator) --
-// so the directory its write will name, whatever its last name is. Never `file.parent_path()`: re-resolved as a whole
-// that is another directory when its last name ends in a space or is a device name, and at `\\?\D:\a.exe` it is
-// `\\?\D:`, the volume's DEVICE. Windows: an extended spelling, which every substrate call takes as written (spell a
-// message from `file`); empty for a file at no level (a volume root itself). POSIX: `parentWithinRoot(file)`.
-[[nodiscard]] DSS_EXPORT std::filesystem::path containingDirectory(std::filesystem::path const& file);
-
-// The spelling a process's IMAGE takes as CreateProcessW's application name: its extended-length spelling exactly
-// where its plain one cannot start, and as given everywhere else. ✔MEASURED 2026-11-04 (probe-reference-cc runs
-// 20261104-220546-3ec56792 and 20261104-220446-62443cb7, cl 19.51): a plain application name starts up to MAX_PATH - 1
-// = 259 characters and fails from 260 (ERROR_PATH_NOT_FOUND, where CreateFileW's open fails too); `\\?\` starts at any
-// length -- but the child then reads its OWN image name verbatim (GetModuleFileNameW: `\\?\...`, at 80 characters as
-// at 322), so an image a plain spelling starts keeps the name the child reads as it was given. The length is the
-// OS's full spelling's (a relative image is resolved against the caller's directory). Every spawn of the tree takes
-// it -- the process spawner's (process_spawn.cpp) and the test harness's (tests/test_support/run_binary.hpp) alike.
-// POSIX: `p`.
-[[nodiscard]] DSS_EXPORT std::filesystem::path applicationNameSpelling(std::filesystem::path const& p);
-
-// The file-system OPERATIONS a site would otherwise ask of std::filesystem, at any length: Win32 on Windows, through
-// `extendedLengthSpelling` (see above for why never the library there), std::filesystem elsewhere. Each answers as the
-// std::filesystem call of the same name does, `ec` included.
+// The file-system OPERATIONS a site would otherwise ask of std::filesystem or of the OS, at any length: Win32 on
+// Windows through the value's reference, std::filesystem or POSIX elsewhere. Each answers as the std::filesystem call
+// of the same name does, `ec` included; the EMPTY spelling as a leaf is refused, `std::errc::invalid_argument` (H6c
+// B2: GetFullPathNameW refuses "", ERR 123, and so does a spawn in "").
 //   * `createDirectories`: every missing directory of `p`; true when it made one; a level that exists as a file is
-//     an error (ERROR_ALREADY_EXISTS on Windows, as the library's EEXIST). ★ `p` IS A CONTAINER (P69 H6b): it is
-//     walked in its container form (`containerSpelling`), so it makes the directory every `p \ name` is written into
-//     -- the library's create_directories resolves `p` as a leaf and makes ANOTHER directory for a last name ending in
-//     a space, the device for `NUL` (✔MEASURED: 50 of 224 cells made another directory, 52 none). And a level
-//     reported made is CONFIRMED a directory, opened as one: CreateDirectoryW of a device succeeds and makes nothing
-//     (✔MEASURED, `\\?\NUL`), which is refused here, never passed as made.
+//     an error (ERROR_ALREADY_EXISTS on Windows, as the library's EEXIST). `p` IS A CONTAINER (P69 H6b): it makes the
+//     directory every `p \ name` is written into -- the library's create_directories resolves `p` as a leaf and makes
+//     ANOTHER directory for a last name ending in a space, the device for `NUL` (✔MEASURED: 50 of 224 cells made
+//     another directory, 52 none). And a level reported made is CONFIRMED a directory, opened as one: CreateDirectoryW
+//     of a level below a device answers MADE and makes nothing (✔MEASURED, H6c u2 part 5: `\\?\NUL\x`, `\\.\NUL\x`,
+//     `\\?\GLOBALROOT\Device\Null\x`), which is refused here, never passed as made.
 //   * `createDirectoriesFor`: every missing directory `file` is to be written into -- `createDirectories` of
 //     `containingDirectory(file)`; false, `ec` clear, when that is no level (a volume root's file).
 //   * `removeEntry`: the file, link or EMPTY directory at `p` (a link itself, never what it reaches); false, with `ec`
 //     clear, when nothing is there; a read-only file is removed as MS STL's `remove` removes one.
 //   * `copyFile`: the file `from` reaches, copied to a NEW file `to` -- refused when `to` exists, as
 //     `fs::copy_file` under `copy_options::none`.
-// A rename has no operation here: the one rename DSS commits is the writer's (src/link/writer.cpp), by handle.
-//   * `openFileStream`: a C stream on `p`, opened as `std::fopen(p, mode)` opens it (`_wfopen` of the extended-length
-//     spelling on Windows, which takes it under both libraries); null when the open is refused, `errno` as it left it.
-[[nodiscard]] DSS_EXPORT std::FILE* openFileStream(std::filesystem::path const& p, char const* mode);
-[[nodiscard]] DSS_EXPORT bool createDirectories(std::filesystem::path const& p, std::error_code& ec);
-[[nodiscard]] DSS_EXPORT bool createDirectoriesFor(std::filesystem::path const& file, std::error_code& ec);
-[[nodiscard]] DSS_EXPORT bool removeEntry(std::filesystem::path const& p, std::error_code& ec);
-DSS_EXPORT void copyFile(std::filesystem::path const& from, std::filesystem::path const& to, std::error_code& ec);
+//   * `openFileStream`: a C stream on `p`, opened as `std::fopen(p, mode)` opens it (`_wfopen` of the reference on
+//     Windows, which takes it under both libraries); null when the open is refused, `errno` as it left it.
+//   * `openInputStream` / `openOutputStream`: a C++ stream on `p` -- the reference, which `std::ifstream` and
+//     `std::ofstream` take at any length under both libraries (✔MEASURED, the runs above); check `is_open()`.
+[[nodiscard]] DSS_EXPORT std::FILE* openFileStream(HostPath const& p, char const* mode);
+[[nodiscard]] DSS_EXPORT std::ifstream openInputStream(HostPath const& p, std::ios::openmode mode = std::ios::in);
+[[nodiscard]] DSS_EXPORT std::ofstream openOutputStream(HostPath const& p, std::ios::openmode mode = std::ios::out);
+[[nodiscard]] DSS_EXPORT bool createDirectories(HostPath const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT bool createDirectoriesFor(HostPath const& file, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT bool removeEntry(HostPath const& p, std::error_code& ec);
+DSS_EXPORT void copyFile(HostPath const& from, HostPath const& to, std::error_code& ec);
+
+#ifdef _WIN32
+// THE HANDLE CALLS a site makes on a path (H6c, A4) -- the writer's exclusive create, its holder query and its staged
+// file's open, the dependency cache's lock: CreateFileW of `p`'s LEAF reference with the caller's own access, share,
+// disposition and flags (the HANDLE as `void*`, INVALID_HANDLE_VALUE and GetLastError when refused; the caller owns
+// and closes it); GetFileAttributesW of it (INVALID_FILE_ATTRIBUTES and GetLastError when refused); and the COMMIT BY
+// HANDLE: SetFileInformationByHandle FileRenameInfoEx (POSIX semantics) or FileRenameInfo of the file behind `staged`
+// -- a handle with DELETE access -- to `target`'s LEAF reference, replacing what is there (0, or the Win32 error;
+// never 0 for a refusal). The rename's name is resolved as MoveFileExW resolves one -- forward slashes, a bare
+// relative name and a `..` land against the current directory (✔MEASURED, the writer's measurement) -- so it is
+// handed the reference, which names `target` at any length.
+[[nodiscard]] DSS_EXPORT void* openHandle(HostPath const& p, unsigned long access, unsigned long share,
+                                          unsigned long disposition, unsigned long flagsAndAttributes);
+[[nodiscard]] DSS_EXPORT unsigned long fileAttributes(HostPath const& p);
+[[nodiscard]] DSS_EXPORT unsigned long commitByHandle(void* staged, HostPath const& target, bool posixSemantics);
+#else
+// THE DESCRIPTOR CALL a site makes on a path (H6c, A4): `open(2)` of `p` with the caller's flags and mode -- the
+// writer's exclusive create, the dependency cache's lock -- the descriptor, or -1 with `errno` as `open` left it.
+[[nodiscard]] DSS_EXPORT int openDescriptor(HostPath const& p, int flags, unsigned mode);
+// `renameEntry`: `from` renamed to `to`, replacing a file there (`rename(2)`). POSIX alone: on Windows the one rename
+// DSS commits is the writer's, BY HANDLE (`commitByHandle`).
+DSS_EXPORT void renameEntry(HostPath const& from, HostPath const& to, std::error_code& ec);
+#endif
+
+// THE OS'S ANSWERS a site would otherwise ask of std::filesystem or Win32 (H6c), each an ANSWERED value: its reference
+// fixed to the answer, never resolved again, its text lossless.
+//   * `currentDirectory`: the process's working directory (GetCurrentDirectoryW; `fs::current_path` elsewhere);
+//   * `temporaryDirectory`: the directory for temporary files (GetTempPath2W where the OS has it, else GetTempPathW;
+//     `fs::temp_directory_path` elsewhere);
+//   * `runningExecutable`: the image this process runs. ★ On Windows QueryFullProcessImageNameW, NEVER
+//     GetModuleFileNameW, which names the spelling the CREATOR handed, normalized only under `\\?\`, not the image the
+//     OS opened (✔MEASURED, H6c u3 part 5, both Windows libraries: started verbatim from a listed `e.` directory the
+//     literal image runs and the module name is the TWIN's, `\\?\...\e\u3.exe`; started plain, the twin's image runs
+//     and the module name is `e.`). Its answer is a DOS text even for a literal `e.` image, so it is taken PREFIXED
+//     (`\\?\`, `\\?\UNC\` for a share) and never resolved -- resolved by the rule, it would be the twin again.
+//     ⚠ UNMEASURED, named: a child's DLL search from its application directory, INFERRED to take the same
+//     normalized name. `/proc/self/exe` on Linux, `_NSGetExecutablePath` on macOS.
+[[nodiscard]] DSS_EXPORT HostPath currentDirectory(std::error_code& ec);
+[[nodiscard]] DSS_EXPORT HostPath temporaryDirectory(std::error_code& ec);
+[[nodiscard]] DSS_EXPORT HostPath runningExecutable(std::error_code& ec);
 
 // `fs::absolute` WITHOUT letting it invent a drive for a path that already names
 // an AUTHORITY or a NAMESPACE (`rootSpelling`: a share, POSIX `//`, a device or verbatim prefix). Same invariant as
@@ -340,8 +368,8 @@ DSS_EXPORT void copyFile(std::filesystem::path const& from, std::filesystem::pat
 // `ec` follows `fs::absolute`: cleared on the preserved path (nothing can fail),
 // otherwise whatever the call reports. Callers keep their existing
 // on-failure-use-the-raw-path idiom unchanged.
-[[nodiscard]] DSS_EXPORT std::filesystem::path
-absoluteKeepingRoot(std::filesystem::path const& p, std::error_code& ec);
+// ★ H6c (A6): a VALUE resolved by `use`, answered as a value -- no exported function resolves plain text.
+[[nodiscard]] DSS_EXPORT HostPath absoluteKeepingRoot(HostPath const& p, Use use, std::error_code& ec);
 
 // `lexically_normal()` WITHOUT letting it eat the leading separator RUN — the
 // third member of this file's trio, and the reason all three are exported
@@ -365,8 +393,8 @@ absoluteKeepingRoot(std::filesystem::path const& p, std::error_code& ec);
 // absolute plain spelling (a drive, a share, a device path) is the OS's own answer, GetFullPathNameW
 // (asked in path_identity.cpp), which that normalization is pinned equal to wherever every Windows release agrees;
 // a relative, rooted or drive-relative one stays the text's, never resolved against a directory here.
-[[nodiscard]] DSS_EXPORT std::filesystem::path
-normalizeKeepingRoot(std::filesystem::path const& p);
+// ★ H6c (A6): a VALUE resolved by `use`, answered as a value -- no exported function resolves plain text.
+[[nodiscard]] DSS_EXPORT HostPath normalizeKeepingRoot(HostPath const& p, Use use);
 
 // Reduce `p` to its identity. Never throws and never returns empty: a path that
 // cannot be resolved degrades to its lexically-normal form, because a degraded
@@ -378,28 +406,26 @@ normalizeKeepingRoot(std::filesystem::path const& p);
 // computable for a path that DOES NOT EXIST YET. Output artifacts, a `path`
 // dependency resolved before anything confirmed the directory, and the cycle key
 // needed for the reject's own message are all keyed before the file is there.
-[[nodiscard]] DSS_EXPORT std::string
-canonicalIdentityKey(std::filesystem::path const& p);
+// ★ H6c (A2): the identity of `p` as `use` names it -- a directory used as a container is asked as one.
+[[nodiscard]] DSS_EXPORT std::string canonicalIdentityKey(HostPath const& p, Use use);
 
 // Same, but REPORTING the underlying resolution failure instead of
 // swallowing it. `ec` is set only by the filesystem refusing to answer (an
 // unreadable parent) -- NEVER by the path merely not existing yet, and never
 // by the short-name expansion, whose failure is the ordinary
 // does-not-exist-yet case. The returned key is usable either way.
-[[nodiscard]] DSS_EXPORT std::string
-canonicalIdentityKey(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT std::string canonicalIdentityKey(HostPath const& p, Use use, std::error_code& ec);
 
 class PathIdentity {
 public:
     // THE ONLY CONSTRUCTOR. See the header note: this is the gate.
-    [[nodiscard]] static PathIdentity of(std::filesystem::path const& p) {
-        return PathIdentity{canonicalIdentityKey(p)};
+    [[nodiscard]] static PathIdentity of(HostPath const& p, Use use) {
+        return PathIdentity{canonicalIdentityKey(p, use)};
     }
     // For callers that must FAIL LOUD on a filesystem refusal rather than
     // degrade. See `canonicalIdentityKey(p, ec)`.
-    [[nodiscard]] static PathIdentity of(std::filesystem::path const& p,
-                                         std::error_code& ec) {
-        return PathIdentity{canonicalIdentityKey(p, ec)};
+    [[nodiscard]] static PathIdentity of(HostPath const& p, Use use, std::error_code& ec) {
+        return PathIdentity{canonicalIdentityKey(p, use, ec)};
     }
 
     // Converting OUT is free — for I/O, and for a diagnostic an operator reads.
@@ -465,19 +491,19 @@ enum class EntryKind : std::uint8_t {
 // The kind of the entry AT `p` -- never of what a link there reaches. Absence is `Absent` with
 // `ec` clear; `ec` is set only when the entry cannot be examined, and the answer is then `Other`,
 // the kind nothing descends, empties or reads.
-[[nodiscard]] DSS_EXPORT EntryKind entryKind(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT EntryKind entryKind(HostPath const& p, Use use, std::error_code& ec);
 
 // The kind of what `p` REACHES, every link on the way followed: never `Link`, and `Absent` for a
 // dangling link. `ec` is set only when what it reaches cannot be examined (a link cycle, a refusal),
 // and the answer is then `Absent`: nothing usable is reached.
-[[nodiscard]] DSS_EXPORT EntryKind reachedKind(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT EntryKind reachedKind(HostPath const& p, Use use, std::error_code& ec);
 
 // Whether `p` REACHES a NAMED PIPE (a FIFO), every link on the way followed: the one `Other` a reader takes for an
 // `#embed` resource, a device staying refused there (Apple clang 21.0.0 refuses one, "device files are not yet
 // supported by '#embed' directive", and embeds a fed pipe -- ✔MEASURED 2026-10-28, macos-arm64-debug, run
 // 20261029-002044-5101633a; gcc 13.3 and clang 18.1.3 have no #embed). `false`, `ec` clear, for anything else and
 // on Windows, whose directories record no FIFO kind. `ec` is set only when what `p` reaches cannot be examined.
-[[nodiscard]] DSS_EXPORT bool reachedPipe(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT bool reachedPipe(HostPath const& p, std::error_code& ec);
 
 // The size in bytes of the regular file `p` REACHES, every link on the way followed -- or nothing,
 // when it reaches no regular file (nothing there, a dangling link, a directory, a special file). `ec`
@@ -485,7 +511,7 @@ enum class EntryKind : std::uint8_t {
 // ✔MEASURED (2026-08-29, the include-once comment of preprocessor.cpp; 2026-10-20): libstdc++ on
 // Windows sizes a file link by the LINK's own attributes -- `fs::file_size` of a symlinked file is 0 --
 // so how many bytes a path names is asked here, never of the library.
-[[nodiscard]] DSS_EXPORT std::optional<std::uintmax_t> reachedFileSize(std::filesystem::path const& p,
+[[nodiscard]] DSS_EXPORT std::optional<std::uintmax_t> reachedFileSize(HostPath const& p,
                                                                        std::error_code& ec);
 
 // The path `p` REACHES, every link on the way resolved, absolute and normal: the longest leading part
@@ -507,7 +533,7 @@ enum class EntryKind : std::uint8_t {
 // splits a verbatim spelling at `\` alone, `/` being a character there. The answer is spelled in the DOS form
 // (`C:\...`, `\\server\share\...`) exactly when that form names the same file (`dosSpellingNamesTheSameFile`), and
 // in the OS's verbatim form otherwise.
-[[nodiscard]] DSS_EXPORT std::filesystem::path reachedPath(std::filesystem::path const& p, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT HostPath reachedPath(HostPath const& p, Use use, std::error_code& ec);
 
 // The path `p` REACHES, spelled relative to the path `base` REACHES -- every link on either side resolved
 // (`reachedPath`), then compared lexically: `std::filesystem::relative`'s answer, which the standard defines
@@ -519,8 +545,10 @@ enum class EntryKind : std::uint8_t {
 // answers `relative` WITHOUT resolving a link -- `base/lnk/x.txt` from `base`, `lnk` naming a directory
 // outside it, is `lnk/x.txt` there and `../outside/x.txt` under MS STL -- so where one path lies from
 // another is asked here, never of the library.
-[[nodiscard]] DSS_EXPORT std::filesystem::path reachedRelative(std::filesystem::path const& p,
-                                                               std::filesystem::path const& base, std::error_code& ec);
+// ★ H6c (A2): `p` as `use` names it, against `base` as a CONTAINER (fixed: a base is the directory the answer is
+// spelled below). The answer is TEXT -- a relative spelling, for a label or a key.
+[[nodiscard]] DSS_EXPORT std::filesystem::path reachedRelative(HostPath const& p, Use use, HostPath const& base,
+                                                               std::error_code& ec);
 
 // The time the file `p` REACHES was last written, every link on the way followed -- or nothing, when
 // nothing is reached (nothing there, a dangling link); `ec` is set only when what it reaches cannot be
@@ -530,7 +558,7 @@ enum class EntryKind : std::uint8_t {
 // target 1825 days old) where MS STL and libc++ answer the target's -- so when a file was written is
 // asked here, never of the library.
 [[nodiscard]] DSS_EXPORT std::optional<std::filesystem::file_time_type>
-reachedWriteTime(std::filesystem::path const& p, std::error_code& ec);
+reachedWriteTime(HostPath const& p, Use use, std::error_code& ec);
 
 // Whether `a` and `b` REACH one file -- every link on the way followed, a hard link to it included: the
 // question `std::filesystem::equivalent` answers. Something absent on either side is no file: `false`,
@@ -538,7 +566,7 @@ reachedWriteTime(std::filesystem::path const& p, std::error_code& ec);
 // `false`.
 // ✔MEASURED 2026-10-21: of a DANGLING link libstdc++ on Windows answers `equivalent` with no error,
 // MS STL and libc++ with one -- so this one answer is given on every build.
-[[nodiscard]] DSS_EXPORT bool reachedSameFile(std::filesystem::path const& a, std::filesystem::path const& b,
+[[nodiscard]] DSS_EXPORT bool reachedSameFile(HostPath const& a, HostPath const& b, Use use,
                                               std::error_code& ec);
 
 // Add `add` to the permissions of the file `p` REACHES, every link on the way followed (on Windows, as
@@ -546,7 +574,7 @@ reachedWriteTime(std::filesystem::path const& p, std::error_code& ec);
 // file as it is). `ec` is set when nothing is reached or the change is refused.
 // ✔MEASURED 2026-10-21: `permissions` through a link changes the TARGET under MS STL and libc++ and the
 // LINK's own attribute under libstdc++ on Windows.
-DSS_EXPORT void addReachedPermissions(std::filesystem::path const& p, std::filesystem::perms add,
+DSS_EXPORT void addReachedPermissions(HostPath const& p, std::filesystem::perms add,
                                       std::error_code& ec);
 
 // ════ AN ENTRY'S STORED NAME AND A DIRECTORY'S CASE RULE, ASKED WITHOUT THE DIRECTORY'S LISTING ════
@@ -574,29 +602,38 @@ DSS_EXPORT void addReachedPermissions(std::filesystem::path const& p, std::files
 // Whether `a` and `b` name ONE directory entry -- the entry itself, a link there NOT followed: two spellings of one
 // name in a directory that folds case. Something absent on either side is no entry: `false`, `ec` clear. `ec` is set
 // only when either cannot be examined.
-[[nodiscard]] DSS_EXPORT bool sameEntry(std::filesystem::path const& a, std::filesystem::path const& b,
+[[nodiscard]] DSS_EXPORT bool sameEntry(HostPath const& a, HostPath const& b, Use use,
                                         std::error_code& ec);
 
 // The name the entry AT `p` -- its last component, a link there NOT followed -- is STORED under in its directory, asked
 // of the entry and never of a listing (the table above). Nothing, `ec` clear, when nothing is there and on a host that
 // has no such question (Linux). `ec` is set when the entry cannot be examined.
 [[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path::string_type>
-storedEntryName(std::filesystem::path const& p, std::error_code& ec);
+storedEntryName(HostPath const& p, Use use, std::error_code& ec);
 
 // Whether the directory `dir` reaches folds the case of the names it is asked for -- its own rule, asked of the
 // directory and never of an entry in it (the table above). Nothing, `ec` clear, on a host that has no such question
 // (Linux). `ec` is set when the directory cannot be examined.
-[[nodiscard]] DSS_EXPORT std::optional<bool> directoryFoldsCase(std::filesystem::path const& dir, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT std::optional<bool> directoryFoldsCase(HostPath const& dir, std::error_code& ec);
 
 // One entry a walk yields.
+// ★ H6c (R1, A1): the entry is a LISTED VALUE -- its references fixed to the listing, literally, never re-resolved --
+// and its names below the root a MATCHING KEY that composes only through `HostPath::operator/`. A walk's entry
+// handed out as plain text (`root / name`) named a listed `e.` as `e` the moment any call re-resolved it (the review
+// of H6b, R1); its `storeRoutePath` is that text, kept for the STORE ROUTE alone (the block at the end of this
+// header).
 struct TreeEntry {
-    std::filesystem::path path;     // the walked root joined with the entry's names, as listed
-    EntryKind             kind;     // the entry itself (`Absent`: it went away while it was listed)
-    EntryKind             reaches;  // `kind`, except a Link: what it reaches (`reachedKind`; `Absent` if dangling)
-    std::size_t           depth;    // 0 for an entry directly under the root
+    HostPath       at;          // the entry, as listed
+    ListedRelative relative;    // its names below the walked root, as listed
+    EntryKind      kind;        // the entry itself (`Absent`: it went away while it was listed)
+    EntryKind      reaches;     // `kind`, except a Link: what it reaches (`Absent` if dangling)
+    std::size_t    depth;       // 0 for an entry directly under the root
     // A Link whose reach could not be examined (a loop, a refusal): why. `reaches` is then `Absent`.
     // Such an entry reaches a visitor only when the options hand it out; by default it ENDS the walk.
-    std::error_code       reachError{};
+    std::error_code reachError{};
+    // THE STORE ROUTE'S TEXT FORM (the block at the end of this header): the walked root's text, then each listed
+    // name -- the entry's text exactly as before H6c. Fenced to its pinned sites; H6d deletes it.
+    std::filesystem::path storeRoutePath{};
 };
 
 // What a walk does after the visitor has seen an entry: go on (descending it if it is a Directory),
@@ -612,11 +649,24 @@ struct TreeWalkOptions {
     bool handOutUnreadableLinks = false;
 };
 
+// What the walk found at its ROOT (H6c, A2 and N10): the walk reports it, so no caller asks the kind of what it walks
+// first -- and in a host-neutral word, never an OS error code (ENOENT against ERROR_PATH_NOT_FOUND / ERROR_DIRECTORY).
+enum class WalkRoot : std::uint8_t {
+    Listed,          // a directory, listed
+    Absent,          // nothing is there (`error` set: no_such_file_or_directory)
+    NotADirectory,   // something that is no directory (`error` set: not_a_directory)
+    Unreadable,      // a directory the walk could not list, or a root it could not examine (`error`: the OS's)
+};
+
 struct TreeWalk {
-    std::error_code       error;    // set: the walk ended there and did NOT read the whole tree
-    std::filesystem::path where;    // the directory it could not list (the root itself when that failed),
-                                    // or the link whose reach it could not examine
-    bool                  stopped = false;   // the visitor ended it
+    std::error_code error;    // set: the walk ended there and did NOT read the whole tree
+    HostPath        where;    // the directory it could not list (the root itself when that failed),
+                              // or the link whose reach it could not examine
+    bool            stopped = false;   // the visitor ended it
+    WalkRoot        root    = WalkRoot::Listed;
+    // THE STORE ROUTE'S TEXT FORM of `where` (the block at the end of this header): its text exactly as before H6c.
+    // Fenced to its pinned sites; H6d deletes it.
+    std::filesystem::path storeRouteWhere{};
 };
 
 // EVERY entry under `root` (the root itself is not yielded), each directory's entries before the
@@ -625,21 +675,22 @@ struct TreeWalk {
 // tree costs memory, never call stack. The first directory it cannot list ends the walk (`error`,
 // `where`), and so does a link whose reach it cannot examine unless the options hand it out; the
 // order within a directory is the filesystem's.
-// ★ ITS LISTINGS NAME THE DIRECTORIES THE ENTRIES ARE IN (P69 H6b, F3): `root` is a CONTAINER, listed by its container
-// reference (`containerSpelling`, resolved once), and a listed directory by its parent's verbatim spelling extended
-// literally with its name; a link's reach is asked by that spelling too -- never `entry.path` re-resolved, which
-// names ANOTHER entry for a name ending in a space or a period, or a device name (✔MEASURED, the walk-up universe:
-// the step extended then listed reached another directory in 38 cells and was refused in 36). Each entry is still
-// NAMED from `root` as given, `root / name / ...`.
-[[nodiscard]] DSS_EXPORT TreeWalk walkTree(std::filesystem::path const&                  root,
+// ★ ITS LISTINGS NAME THE DIRECTORIES THE ENTRIES ARE IN (P69 H6b, F3; H6c): `root` is a CONTAINER, listed by its
+// container reference, and a listed directory by its parent's reference extended literally with its name; a link's
+// reach is asked by that reference too -- never a text re-resolved, which names ANOTHER entry for a name ending in a
+// space or a period, or a device name (✔MEASURED, the walk-up universe: the step extended then listed reached another
+// directory in 38 cells and was refused in 36). Each entry is a LISTED value (`TreeEntry::at`).
+// ★ IT REPORTS ITS ROOT (H6c, A2): an absent root, or one that is no directory, ends the walk with `error`, `where`
+// and `root` set -- no caller asks the kind of what it walks before it walks it.
+[[nodiscard]] DSS_EXPORT TreeWalk walkTree(HostPath const&                               root,
                                            std::function<WalkStep(TreeEntry const&)> const& visit,
                                            TreeWalkOptions                               options = {});
 
 // What a removal could not remove.
 struct TreeRemoval {
-    std::size_t           failures = 0;   // entries STILL THERE after their one attempt
-    std::filesystem::path firstPath;      // the first of them
-    std::error_code       firstError;     // and why
+    std::size_t     failures = 0;   // entries STILL THERE after their one attempt
+    HostPath        firstPath;      // the first of them -- a LISTED value below the target (H6c), or the target
+    std::error_code firstError;     // and why
 };
 
 // Remove `target` -- one entry, or a whole tree -- and NEVER anything a link reaches: a link (to a
@@ -678,13 +729,49 @@ struct TreeRemoval {
 struct RemovalOptions {
     std::filesystem::path lastEntry;
 };
-[[nodiscard]] DSS_EXPORT TreeRemoval removeTree(std::filesystem::path const& target, RemovalOptions const& options = {});
+[[nodiscard]] DSS_EXPORT TreeRemoval removeTree(HostPath const& target, RemovalOptions const& options = {});
 
-// THE TEST SEAM of `removeTree`: called with each entry's path after its directory was listed and
-// before the entry is opened -- the window a swap would use. Empty (the default) in every build; a test
+// ════ THE STORE ROUTE'S TEXT FORMS (P69 H6c, ledger 579; fenced by ledger 580): H6d DELETES EVERY ONE ════
+//
+// H6c gave every operation a value and a use. The STORES a made value flows into -- the config root, a glob's
+// matches into a project's sources, the input resolver's list, the include search's header lists, the descriptor
+// lists, and a build's output and staging directories (`Program::setOutputDir`, the default `<cwd>/target` and the
+// runtime staging area under the temporary directory) -- still keep it as TEXT, and moving them is H6d's ("a made
+// value never crosses to text"). Until then a
+// store site reads its text through ONE of these forms -- each the text the store route read before H6c, so H6c
+// changes nothing the store route does -- and no other site does: the filesystem-queries guard pins the exact set
+// of sites that use one (the two members `TreeEntry::storeRoutePath` and `TreeWalk::storeRouteWhere` too), by file,
+// form and count, and a use outside that set, or a count other than its pinned one, is red. They are an ESCAPE from
+// the value, named so one search finds every use; none of them is a home operation, and a non-store site states its
+// value and its use.
+//
+// `normalizeKeepingRoot`'s text form before H6c: on a Windows host an absolute plain spelling (a drive, a share, a
+// device) is the OS's own answer (GetFullPathNameW); every other spelling, and every POSIX one, the text's own
+// normalization under the host's grammar.
+[[nodiscard]] DSS_EXPORT std::filesystem::path storeRouteNormalized(std::filesystem::path const& p);
+// `absoluteKeepingRoot`'s text form before H6c: a share, an authority, a device or a verbatim spelling as it is (it
+// names no location on the current drive); any other made absolute by the library.
+[[nodiscard]] DSS_EXPORT std::filesystem::path storeRouteAbsolute(std::filesystem::path const& p, std::error_code& ec);
+// The text of `reachedPath(p, Use::Leaf, ec)`, `p` GIVEN.
+[[nodiscard]] DSS_EXPORT std::filesystem::path storeRouteReachedPath(std::filesystem::path const& p,
+                                                                     std::error_code&             ec);
+// The text of `currentDirectory(ec)`.
+[[nodiscard]] DSS_EXPORT std::filesystem::path storeRouteCurrentDirectory(std::error_code& ec);
+// The text of `runningExecutable(ec)`.
+[[nodiscard]] DSS_EXPORT std::filesystem::path storeRouteRunningExecutable(std::error_code& ec);
+// The text of `temporaryDirectory(ec)`.
+[[nodiscard]] DSS_EXPORT std::filesystem::path storeRouteTemporaryDirectory(std::error_code& ec);
+
+// THE TEST SEAM of `removeTree`: called with each entry's TEXT (its listed value's, H6c) after its directory was
+// listed and before the entry is opened -- the window a swap would use. Empty (the default) in every build; a test
 // sets it to make the race deterministic, and clears it.
 namespace substrate_testing {
 DSS_EXPORT void setRemoveTreeEntryHook(std::function<void(std::filesystem::path const&)> hook);
+// THE REFERENCE RULE'S ANSWER for `value` asked by `use` (P69 H6c): what every host call on it is handed -- for the
+// rule's own table pin (tests/core/test_path_identity.cpp). A seam for the substrate's TESTS alone: invariant (3)
+// of host_path.hpp holds for every product caller, because the filesystem-queries guard refuses any use of
+// `substrate_testing` in src/ outside src/core/substrate/ (family (f), with its control).
+[[nodiscard]] DSS_EXPORT std::filesystem::path::string_type referenceForTest(HostPath const& value, Use use);
 }  // namespace substrate_testing
 
 }  // namespace dss::core

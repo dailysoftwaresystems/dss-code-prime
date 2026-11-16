@@ -81,11 +81,10 @@ public:
     acquire(fs::path const& file, std::function<void()> const& onContention) {
         AcquisitionLock lock;
 #ifdef _WIN32
-        lock.handle_ = ::CreateFileW(
-            core::extendedLengthSpelling(file).c_str(), GENERIC_READ | GENERIC_WRITE,   // at any length
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,  // not inheritable
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        // Through the home (`core::openHandle`, H6c A4): the file's LEAF reference, at any length; not inheritable.
+        lock.handle_ = static_cast<HANDLE>(core::openHandle(
+            file, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL));
         if (lock.handle_ == INVALID_HANDLE_VALUE) {
             return std::unexpected("the lock file '" + core::genericSpelling(file)
                                    + "' could not be opened (Windows error "
@@ -112,7 +111,7 @@ public:
             }
         }
 #else
-        lock.fd_ = ::open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+        lock.fd_ = core::openDescriptor(file, O_RDWR | O_CREAT | O_CLOEXEC, 0666);   // through the home (A4)
         if (lock.fd_ < 0) {
             return std::unexpected("the lock file '" + core::genericSpelling(file)
                                    + "' could not be opened: " + std::strerror(errno));
@@ -382,12 +381,12 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
     // directory, an external partial delete — and deleting it would destroy
     // something we did not create; it is refused, as it always was (the
     // staging design's landing rename refused it too).
-    bool const markedOurs = core::reachedKind(marker, ec) != core::EntryKind::Absent && !ec;
+    bool const markedOurs = core::reachedKind(marker, core::Use::Leaf, ec) != core::EntryKind::Absent && !ec;
     ec.clear();
     // An ENTRY at the checkout path -- a link there included, never what it
     // reaches -- asked of the substrate, which asks the OS where the library
     // cannot tell a link (the substrate's header).
-    if (core::entryKind(checkoutDir, ec) != core::EntryKind::Absent && !ec) {
+    if (core::entryKind(checkoutDir, core::Use::Leaf, ec) != core::EntryKind::Absent && !ec) {   // removeTree's target
         if (!markedOurs) {
             out.detail = "'" + core::genericSpelling(checkoutDir)
                        + "' exists but is not a usable checkout, and no '"
@@ -407,7 +406,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
                          "at '"
                        + core::genericSpelling(checkoutDir)
                        + "' could not be removed: '"
-                       + core::genericSpelling(removal.firstPath) + "': "
+                       + removal.firstPath.spelling().generic() + "': "
                        + removal.firstError.message();
             return out;
         }
@@ -528,9 +527,10 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     // the working tree is complete) — the marker is the only thing that knows.
     bool        hasCheckout = false;
     std::string headCommit;
-    bool const  markedIncomplete = core::reachedKind(marker, ec) != core::EntryKind::Absent && !ec;
+    bool const  markedIncomplete = core::reachedKind(marker, core::Use::Leaf, ec) != core::EntryKind::Absent && !ec;
     ec.clear();
-    if (!markedIncomplete && core::reachedKind(checkoutDir, ec) == core::EntryKind::Directory && !ec) {
+    if (!markedIncomplete && core::reachedKind(checkoutDir, core::Use::Container, ec) == core::EntryKind::Directory
+        && !ec) {   // the directory git runs in: a container
         GitCommandResult const head = git_->revParse(checkoutDir, "HEAD");
         hasCheckout                 = head.ok;
         headCommit                  = head.output;

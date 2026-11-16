@@ -407,7 +407,7 @@ using ::dss::test_support::writtenAt;
 // throwing form answers one of those two questions by aborting the run.
 [[nodiscard]] FsAnswer fileExists(fs::path const& p) {
     std::error_code ec;
-    bool const present = reachesSomething(p, ec);
+    bool const present = reachesSomething(p, dss::core::Use::Leaf, ec);
     if (ec) {
         return {false,
                 "cannot stat '" + p.generic_string() + "': " + ec.message()};
@@ -716,11 +716,11 @@ struct ExampleManifest {
 // still see them.
 [[nodiscard]] bool
 parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
-                             std::filesystem::path const& path,
+                             dss::core::HostPath const& path,
                              std::vector<ExpectedDiagnostic>& out) {
     if (!arr.is_array() || arr.empty()) {
         std::cerr << "  '" << keyName << "' must be a non-empty array in "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     for (auto const& d : arr) {
@@ -730,7 +730,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             || !d.contains("col")  || !d.at("col").is_number_unsigned()) {
             std::cerr << "  each " << keyName << " entry needs string 'code'"
                          " + unsigned 'line' + unsigned 'col' in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         ExpectedDiagnostic ed;
@@ -741,7 +741,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         if (d.contains("positioned")) {
             if (!d.at("positioned").is_boolean()) {
                 std::cerr << "  " << keyName << " 'positioned' must be a "
-                             "boolean in " << path.generic_string() << "\n";
+                             "boolean in " << path.spelling().generic() << "\n";
                 return false;
             }
             ed.positioned = d.at("positioned").get<bool>();
@@ -765,7 +765,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                       << "' — the runner reads code / line / col /"
                          " positioned (plus $comment keys). An expectation"
                          " the runner does not read is an assertion that"
-                         " never fires: " << path.generic_string() << "\n";
+                         " never fires: " << path.spelling().generic() << "\n";
             return false;
         }
         out.push_back(std::move(ed));
@@ -782,7 +782,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
 // shape (every c171 example unchanged). Returns false (after a loud std::cerr)
 // on any malformed field.
 [[nodiscard]] bool parseDependsOnEntry(nlohmann::json const& d,
-                                       fs::path const&       path,
+                                       dss::core::HostPath const& path,
                                        DependsOnArtifact&    out) {
     out.spec     = d.value("spec", "");
     out.artifact = d.value("artifact", "");
@@ -794,7 +794,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
     }
     if (out.sources.empty() || out.spec.empty() || out.artifact.empty()) {
         std::cerr << "  'dependsOn' entry needs non-empty 'sources', 'spec', "
-                     "and 'artifact' in " << path.generic_string() << "\n";
+                     "and 'artifact' in " << path.spelling().generic() << "\n";
         return false;
     }
     // The per-dependency escalation lever. STRICTLY TYPED — a JSON `"true"` or
@@ -807,7 +807,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         if (!d.at("mustDifferFromBaseline").is_boolean()) {
             std::cerr << "  'dependsOn' entry '" << out.artifact
                       << "' key 'mustDifferFromBaseline' must be a boolean in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         out.mustDifferFromBaseline =
@@ -838,7 +838,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                      " / dependsOn / mustDifferFromBaseline (plus $comment"
                      " keys). An expectation the runner does not read is an"
                      " assertion that never fires: "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     // Nested `dependsOn`: this entry's OWN prerequisites (built first, resolved
@@ -847,7 +847,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
     if (d.contains("dependsOn")) {
         if (!d.at("dependsOn").is_array()) {
             std::cerr << "  'dependsOn' entry 'dependsOn' must be an array in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         for (auto const& nested : d.at("dependsOn")) {
@@ -900,11 +900,11 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
 }
 
 [[nodiscard]] bool parsePrebuiltLibraryEntry(nlohmann::json const& p,
-                                             fs::path const&       path,
+                                             dss::core::HostPath const& path,
                                              PrebuiltLibrary&      out) {
     if (!p.is_object()) {
         std::cerr << "  'prebuiltLibraries' entries must be objects in "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     // ★ THE CLOSED PER-ENTRY KEY SET RUNS FIRST, and the order is a MEASURED
@@ -919,7 +919,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << "' — the runner reads path / containerWitness (plus"
                      " $comment keys). An expectation the runner does not read"
                      " is an assertion that never fires: "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     out.path             = p.value("path", "");
@@ -928,13 +928,13 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         std::cerr << "  'prebuiltLibraries' entry needs non-empty 'path'"
                      " (repo-root-relative) and 'containerWitness' (an ASCII"
                      " token that must appear in the file's bytes) in "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     if (std::string const why = prebuiltLibraryPathRefusal(out.path);
         !why.empty()) {
         std::cerr << "  'prebuiltLibraries' 'path' " << why << " (got '"
-                  << out.path << "') in " << path.generic_string() << "\n";
+                  << out.path << "') in " << path.spelling().generic() << "\n";
         return false;
     }
     return true;
@@ -963,7 +963,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
 //       have been compared against (manifest-level AND every per-target
 //       override) — a declared "difference" that is not one.
 [[nodiscard]] bool validateOptimizationObservable(ExampleManifest const& m,
-                                                  fs::path const&        path) {
+                                                  dss::core::HostPath const& path) {
     bool anyDiffering = false;
     for (auto const& arm : m.optimizedPipelines) {
         if (!arm.exitCode.has_value()) continue;
@@ -974,7 +974,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " produce the baseline's exit code; declaring a"
                          " different one is legal ONLY where a named standard"
                          " clause makes both results conforming: "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         if (*arm.exitCode == m.exitCode) {  // R3, manifest-level
@@ -984,7 +984,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " declared difference that is not one. Drop the key: an"
                          " arm with no 'exitCode' is already required to match"
                          " the baseline, and that is the stronger assertion: "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         for (auto const& t : m.targets) {  // R3, per-target overrides
@@ -995,7 +995,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                           << ", which EQUALS target '" << t.spec
                           << "'s exitCode override — so on that target the arm"
                              " asserts no difference at all while claiming an"
-                             " exemption: " << path.generic_string() << "\n";
+                             " exemption: " << path.spelling().generic() << "\n";
                 return false;
             }
         }
@@ -1007,22 +1007,24 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << "\") but no optimizedPipelines arm declares a differing"
                      " 'exitCode'. An exemption that exempts nothing weakens the"
                      " corpus-wide count of examples allowed to diverge; remove"
-                     " it: " << path.generic_string() << "\n";
+                     " it: " << path.spelling().generic() << "\n";
         return false;
     }
     return true;
 }
 
-[[nodiscard]] bool readManifest(fs::path const& path, ExampleManifest& out) {
-    std::ifstream in(path);
+// ★ THE MANIFEST IS A VALUE (P69 H6c): a GIVEN spelling, or a walked entry's listed value -- opened through the
+// home, never as a listed value's text handed to the library.
+[[nodiscard]] bool readManifest(dss::core::HostPath const& path, ExampleManifest& out) {
+    std::ifstream in = dss::core::openInputStream(path);
     if (!in) {
-        std::cerr << "  cannot open " << path.generic_string() << "\n";
+        std::cerr << "  cannot open " << path.spelling().generic() << "\n";
         return false;
     }
     nlohmann::json j;
     try { in >> j; }
     catch (std::exception const& e) {
-        std::cerr << "  JSON parse failed for " << path.generic_string()
+        std::cerr << "  JSON parse failed for " << path.spelling().generic()
                   << ": " << e.what() << "\n";
         return false;
     }
@@ -1044,7 +1046,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             || j.at("project").get<std::string>().empty()) {
             std::cerr << "  'project' must be a NON-EMPTY string naming a "
                          ".dss-project.json relative to the example dir, in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         if (hasSource || hasSources) {
@@ -1054,7 +1056,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          ".dss-project.json's own 'sources' (which a "
                          "preBuildScripts hook may GENERATE), so the "
                          "expected.json list would be silently ignored — delete "
-                         "one: " << path.generic_string() << "\n";
+                         "one: " << path.spelling().generic() << "\n";
             return false;
         }
         out.project = j.at("project").get<std::string>();
@@ -1063,19 +1065,19 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         std::cerr << "  manifest declares BOTH 'source' and 'sources' — one "
                      "names a single CU, the other a multi-CU list, and "
                      "honoring either would silently discard the other. Delete "
-                     "one: " << path.generic_string() << "\n";
+                     "one: " << path.spelling().generic() << "\n";
         return false;
     }
     if (hasSources) {
         if (!j.at("sources").is_array() || j.at("sources").empty()) {
             std::cerr << "  'sources' must be a non-empty array of file names in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         for (auto const& s : j.at("sources")) {
             if (!s.is_string()) {
                 std::cerr << "  'sources' entries must be strings in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             out.sources.push_back(s.get<std::string>());
@@ -1085,7 +1087,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         auto single = j.value("source", std::string{});
         if (!j.at("source").is_string() || single.empty()) {
             std::cerr << "  'source' must be a non-empty string in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         out.sources = {std::move(single)};
@@ -1095,7 +1097,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         // inputs live in the other file.
         std::cerr << "  manifest requires 'source' (single CU), 'sources' "
                      "(multi-CU), or 'project' (a .dss-project.json build): "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     // V2-4 Part C: expect-error diagnostics (parsed first — their presence
@@ -1125,7 +1127,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                      "'expectWarnings'. The first asserts the compile was "
                      "REJECTED and never runs the artifact; the second asserts "
                      "it SUCCEEDED and still reported: "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     // `forbidDiagnostics` — the absence assertion: a non-empty array of
@@ -1143,7 +1145,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         auto const& arr = j.at("forbidDiagnostics");
         if (!arr.is_array() || arr.empty()) {
             std::cerr << "  'forbidDiagnostics' must be a non-empty array of"
-                         " diagnostic-code names in " << path.generic_string() << "\n";
+                         " diagnostic-code names in " << path.spelling().generic() << "\n";
             return false;
         }
         for (auto const& e : arr) {
@@ -1151,14 +1153,14 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 std::cerr << "  each 'forbidDiagnostics' entry must be a string —"
                              " a diagnostic-code NAME (an absence has no"
                              " position, so there is no {code, line, col} form) in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             std::string name = e.get<std::string>();
             if (std::find(out.forbidDiagnostics.begin(), out.forbidDiagnostics.end(),
                           name) != out.forbidDiagnostics.end()) {
                 std::cerr << "  'forbidDiagnostics' names '" << name
-                          << "' twice in " << path.generic_string() << "\n";
+                          << "' twice in " << path.spelling().generic() << "\n";
                 return false;
             }
             out.forbidDiagnostics.push_back(std::move(name));
@@ -1171,7 +1173,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         std::cerr << "  manifest declares BOTH 'expectDiagnostics' and"
                      " 'forbidDiagnostics'. The first already asserts the"
                      " refused compile's diagnostics; the second could assert"
-                     " nothing there: " << path.generic_string() << "\n";
+                     " nothing there: " << path.spelling().generic() << "\n";
         return false;
     }
     // A code cannot be both REQUIRED and FORBIDDEN.
@@ -1181,7 +1183,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             std::cerr << "  manifest names '" << e.code << "' in BOTH"
                          " 'expectWarnings' (it must be emitted) and"
                          " 'forbidDiagnostics' (it must not): "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
     }
@@ -1198,20 +1200,20 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                      "unambiguous; a project build has no such source. "
                      "Implement the project-mode diagnostic path in BOTH "
                      "runners before declaring this pair: "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     if (j.contains("exitCode")) {
         if (!j.at("exitCode").is_number_integer()) {
             std::cerr << "  'exitCode' must be an integer in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         out.exitCode = j.at("exitCode").get<std::int64_t>();
     } else if (out.expectDiagnostics.empty()) {
         std::cerr << "  missing integer 'exitCode' (required unless"
                      " 'expectDiagnostics' is present) in "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     // The manifest-level stdout pin. Same shape and same rules as the in-process
@@ -1219,14 +1221,14 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
     if (j.contains("expectedStdout")) {
         if (!j.at("expectedStdout").is_string()) {
             std::cerr << "  'expectedStdout' must be a string in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         out.expectedStdout = j.at("expectedStdout").get<std::string>();
     }
     if (!j.contains("targets") || !j.at("targets").is_array()) {
         std::cerr << "  missing 'targets' array in "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     for (auto const& t : j.at("targets")) {
@@ -1254,7 +1256,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " runpaths (plus $comment keys). An expectation the"
                          " runner does not read is an assertion that never"
                          " fires: "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         if (t.contains("runOn") && t.at("runOn").is_array()) {
@@ -1266,7 +1268,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         if (t.contains("exitCode")) {
             if (!t.at("exitCode").is_number_integer()) {
                 std::cerr << "  target 'exitCode' must be an integer in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
@@ -1275,7 +1277,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         if (t.contains("expectedStdout")) {
             if (!t.at("expectedStdout").is_string()) {
                 std::cerr << "  target 'expectedStdout' must be a string in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             et.expectedStdoutOverride = t.at("expectedStdout").get<std::string>();
@@ -1285,7 +1287,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         if (t.contains("dependsOn")) {
             if (!t.at("dependsOn").is_array()) {
                 std::cerr << "  target 'dependsOn' must be an array in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             for (auto const& d : t.at("dependsOn")) {
@@ -1304,7 +1306,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 std::cerr << "  target 'prebuiltLibraries' must be a NON-EMPTY"
                              " array — an empty one declares a capability the"
                              " build then never exercises: "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             for (auto const& p : t.at("prebuiltLibraries")) {
@@ -1326,7 +1328,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                              " naming an environment variable"
                              " ([A-Za-z_][A-Za-z0-9_]*) — a name the host"
                              " cannot set is one the child never sees: "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             et.loaderSearchPathVariable = v.get<std::string>();
@@ -1353,7 +1355,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                              " non-empty strings — an empty array declares a"
                              " request the build never makes, and an empty"
                              " entry is one this runner cannot pass: "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
         }
@@ -1384,7 +1386,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                   << t.loaderSearchPathVariable << "') but " << why
                   << " — the variable would be set for no spawn, or to no"
                      " directory, and the declaration would assert nothing: "
-                  << path.generic_string() << "\n";
+                  << path.spelling().generic() << "\n";
         return false;
     }
     // ── THE TWO KEYS A REFUSAL ARM CANNOT HONOUR, REFUSED BY NAME ───────────
@@ -1410,7 +1412,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " artifact, so there is no baseline image for an"
                          " optimized arm to differ from — the arm would be"
                          " parsed and then silently dropped: "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         for (auto const& t : out.targets) {
@@ -1421,7 +1423,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                           << "' declares 'runpaths' beside 'expectDiagnostics'."
                              " A refusal arm links no image, so the runpaths"
                              " would be parsed and then silently dropped: "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             if (t.dependsOn.empty()) continue;
@@ -1432,7 +1434,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " Declare a library input a refusal needs as"
                          " 'prebuiltLibraries', which the refusal arm resolves"
                          " and threads into --resolve-library: "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
     }
@@ -1442,7 +1444,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
     if (j.contains("optimizedPipelines")) {
         if (!j.at("optimizedPipelines").is_array()) {
             std::cerr << "  'optimizedPipelines' must be an array in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         for (auto const& arm : j.at("optimizedPipelines")) {
@@ -1451,7 +1453,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 std::cerr << "  each optimizedPipelines entry needs string"
                              " 'label' + exactly one of 'passes' /"
                              " 'shippedPipeline' in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             OptimizedArm oa;
@@ -1459,14 +1461,14 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             if (arm.contains("passes")) {
                 if (!arm.at("passes").is_array()) {
                     std::cerr << "  optimizedPipelines 'passes' must be an array"
-                                 " in " << path.generic_string() << "\n";
+                                 " in " << path.spelling().generic() << "\n";
                     return false;
                 }
                 oa.hasPasses = true;
                 for (auto const& p : arm.at("passes")) {
                     if (!p.is_string()) {
                         std::cerr << "  optimizedPipelines.passes entries must be"
-                                     " strings in " << path.generic_string()
+                                     " strings in " << path.spelling().generic()
                                   << "\n";
                         return false;
                     }
@@ -1480,7 +1482,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                                  " a NON-EMPTY string naming a shipped pipeline"
                                  " config (it is threaded verbatim into the CLI's"
                                  " --config=<name>) in "
-                              << path.generic_string() << "\n";
+                              << path.spelling().generic() << "\n";
                     return false;
                 }
                 oa.shippedPipeline =
@@ -1497,13 +1499,13 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                           << "' must declare EXACTLY ONE OF 'passes' or"
                              " 'shippedPipeline' (got "
                           << (oa.hasPasses ? "both" : "neither") << ") in "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             if (arm.contains("exitCode")) {
                 if (!arm.at("exitCode").is_number_integer()) {
                     std::cerr << "  optimizedPipelines 'exitCode' must be an"
-                                 " integer in " << path.generic_string() << "\n";
+                                 " integer in " << path.spelling().generic() << "\n";
                     return false;
                 }
                 oa.exitCode = arm.at("exitCode").get<std::int64_t>();
@@ -1512,7 +1514,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 if (!arm.at("mustDifferFromBaseline").is_boolean()) {
                     std::cerr << "  optimizedPipelines arm '" << oa.label
                               << "' key 'mustDifferFromBaseline' must be a"
-                                 " boolean in " << path.generic_string() << "\n";
+                                 " boolean in " << path.spelling().generic() << "\n";
                     return false;
                 }
                 oa.mustDifferFromBaseline =
@@ -1534,7 +1536,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                              " shippedPipeline / exitCode (plus $comment keys)."
                              " An expectation the runner does not read is an"
                              " assertion that never fires: "
-                          << path.generic_string() << "\n";
+                          << path.spelling().generic() << "\n";
                 return false;
             }
             out.optimizedPipelines.push_back(std::move(oa));
@@ -1550,7 +1552,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                          " non-empty string 'clause' naming the standard clause"
                          " that makes the optimized arm's different result"
                          " conforming (e.g. \"C99 6.7.4p7\") in "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
         out.optimizationObservable =
@@ -1598,7 +1600,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                      " expectDiagnostics / expectWarnings / forbidDiagnostics"
                      " (plus $comment keys)."
                      " An expectation the runner does not read is an assertion"
-                     " that never fires: " << path.generic_string() << "\n";
+                     " that never fires: " << path.spelling().generic() << "\n";
         return false;
     }
     // ★ SINGLE-SOURCE ONLY WHERE POSITIONS ARE ASSERTED — the same rule the
@@ -1614,7 +1616,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                       << " sources — one buffer, so a span offset maps to"
                          " exactly one file. Declare every code"
                          " `positioned:false` to use two or more sources: "
-                      << path.generic_string() << "\n";
+                      << path.spelling().generic() << "\n";
             return false;
         }
     }
@@ -1742,7 +1744,7 @@ struct ProjectFacts {
     if (argv0.find('/') != std::string::npos
         || argv0.find('\\') != std::string::npos) {
         std::error_code ec;
-        bool const there = reachesSomething(fs::path{argv0}, ec);
+        bool const there = reachesSomething(fs::path{argv0}, dss::core::Use::Leaf, ec);
         return there && !ec;
     }
     return !findOnPath(argv0).empty();
@@ -1842,7 +1844,7 @@ resolvePrebuiltLibraryCli(PrebuiltLibrary const& lib,
     std::string    why;
     std::string    bytes;
     std::error_code ec;
-    if (bool const regular = reachesKind(resolved, dss::core::EntryKind::File, ec); !regular || ec) {
+    if (bool const regular = reachesKind(resolved, dss::core::Use::Leaf, dss::core::EntryKind::File, ec); !regular || ec) {
         // ⚠ The "never a skip" clause is on BOTH sub-branches, not just the
         // clean-absence one: a missing path is no regular file with no error,
         // one that cannot be examined carries its error, and both are the
@@ -3425,15 +3427,15 @@ void runErrorExampleViaCli(std::string const& compiler,
         // leftovers there, so it FAILS this check, naming where it stopped --
         // never a pass over the part it read.
         auto const walk = dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
-            if (entry.reaches == dss::core::EntryKind::File && entry.path.filename() != cliLog.filename())
-                leftovers.push_back(entry.path.generic_string());
+            if (entry.reaches == dss::core::EntryKind::File && entry.at.filename() != cliLog.filename())
+                leftovers.push_back(entry.at.spelling().generic());
             return dss::core::WalkStep::Continue;
         });
         check(exampleName + ": CLI writes NO artifact for a rejected build",
               leftovers.empty() && !walk.error,
               walk.error
                   ? "the walk of " + outDir.generic_string() + " stopped at "
-                        + walk.where.generic_string() + ": " + walk.error.message()
+                        + walk.where.spelling().generic() + ": " + walk.error.message()
                         + " — the directory was not read whole, so no leftover "
                           "was ruled out"
                   : std::to_string(leftovers.size()) + " file(s) under "
@@ -3504,7 +3506,7 @@ void runAllExamples(std::string const& compiler,
     // per-example failures, or one bad symlink would black out the whole
     // corpus. Both severities are counted, so RC is 1 in every case.
     std::error_code rootEc;
-    bool const rootIsDir = reachesKind(examplesRoot, dss::core::EntryKind::Directory, rootEc);
+    bool const rootIsDir = reachesKind(examplesRoot, dss::core::Use::Container, dss::core::EntryKind::Directory, rootEc);
     if (rootEc) {
         std::cerr << "[ERROR] cannot stat examples root "
                   << examplesRoot.generic_string() << ": " << rootEc.message()
@@ -3544,7 +3546,7 @@ void runAllExamples(std::string const& compiler,
         // yes-or-no, and the library's cached answer on a MinGW build is the
         // link's own.
         std::error_code langKindEc;
-        bool const langIsDir = reachesKind(langIt->path(), dss::core::EntryKind::Directory, langKindEc);
+        bool const langIsDir = reachesKind(langIt->path(), dss::core::Use::Container, dss::core::EntryKind::Directory, langKindEc);
         if (langKindEc) {
             std::cerr << "[ERROR] cannot stat corpus entry "
                       << langPath.generic_string() << ": "
@@ -3568,7 +3570,7 @@ void runAllExamples(std::string const& compiler,
             if (nameEc) break;  // reported after this inner loop
             auto const namePath = nameIt->path();
             std::error_code nameKindEc;
-            bool const nameIsDir = reachesKind(nameIt->path(), dss::core::EntryKind::Directory, nameKindEc);
+            bool const nameIsDir = reachesKind(nameIt->path(), dss::core::Use::Container, dss::core::EntryKind::Directory, nameKindEc);
             if (nameKindEc) {
                 std::cerr << "[ERROR] cannot stat corpus entry "
                           << namePath.generic_string() << ": "
@@ -3585,7 +3587,7 @@ void runAllExamples(std::string const& compiler,
             // print a green Results line, which is the failure mode this
             // defect is named for.
             std::error_code mpEc;
-            bool const haveManifest = reachesSomething(mp, mpEc);
+            bool const haveManifest = reachesSomething(mp, dss::core::Use::Leaf, mpEc);
             if (mpEc) {
                 std::cerr << "[ERROR] cannot stat manifest "
                           << mp.generic_string() << ": " << mpEc.message()
@@ -3945,7 +3947,7 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
     // The substrate's walk: it never descends a link on any build.
     {
         auto const walk = dss::core::walkTree(examplesRoot, [&](dss::core::TreeEntry const& entry) {
-            if (entry.path.filename() == "expected.json") ++population;
+            if (entry.at.filename() == "expected.json") ++population;
             return dss::core::WalkStep::Continue;
         });
         ec = walk.error;
@@ -3967,7 +3969,7 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
     // could not be read". ★ A fail-loud message that names the wrong subsystem is
     // not fail-loud: it sends the reader to the one place the defect is not.
     std::size_t unreadableCells = 0;
-    if (reachesKind(g_cellDir, dss::core::EntryKind::Directory, ec)) {
+    if (reachesKind(g_cellDir, dss::core::Use::Container, dss::core::EntryKind::Directory, ec)) {
         for (fs::directory_iterator it(g_cellDir, ec), end; it != end && !ec;
              it.increment(ec)) {
             if (it->path().extension() != ".cell") continue;
@@ -5735,17 +5737,18 @@ void runRunnerVocabularyPin() {
 // coverage_boundary.hpp) forbid a LOSS of coverage, never a gain. Teaching this
 // runner to compile every declared spec would leave every clause green.
 [[nodiscard]] bool selectCoverageBoundarySubject(fs::path const& examplesRoot,
-                                                 fs::path&    subjectDir,
+                                                 dss::core::HostPath& subjectDir,
                                                  std::string& subjectId,
                                                  ExampleManifest& subject) {
     // The subject is DERIVED FROM THE CORPUS, never named in CMake or here. An
     // example renamed or retired moves the selection automatically, which is the
     // one property a hand-picked id cannot have — and the property that stops
     // this entry from silently becoming a pin on a file that no longer exists.
-    std::vector<fs::path> manifests;
+    // Each a LISTED value (H6c): opened and handed on as itself, never as its text re-resolved.
+    std::vector<dss::core::HostPath> manifests;
     // The substrate's walk: it never descends a link on any build.
     auto const walk = dss::core::walkTree(examplesRoot, [&](dss::core::TreeEntry const& entry) {
-        if (entry.path.filename() == "expected.json") manifests.push_back(entry.path);
+        if (entry.at.filename() == "expected.json") manifests.push_back(entry.at);
         return dss::core::WalkStep::Continue;
     });
     std::error_code const ec = walk.error;
@@ -5755,7 +5758,10 @@ void runRunnerVocabularyPin() {
                   + ec.message());
         return false;
     }
-    std::sort(manifests.begin(), manifests.end());  // deterministic subject
+    std::sort(manifests.begin(), manifests.end(),   // deterministic subject: by the names, as the text sorts
+              [](dss::core::HostPath const& a, dss::core::HostPath const& b) {
+                  return a.spelling().generic() < b.spelling().generic();
+              });
 
     auto const host = currentHostOs();
     std::size_t consideredParsed = 0;
@@ -5821,8 +5827,8 @@ void runRunnerVocabularyPin() {
         }
         if (!bindable || !excludedForeignArch) continue;
 
-        subjectDir = mp.parent_path();
-        subjectId  = subjectDir.parent_path().filename().generic_string() + "/"
+        subjectDir = dss::core::containingDirectory(mp);
+        subjectId  = dss::core::containingDirectory(subjectDir).filename().generic_string() + "/"
                    + subjectDir.filename().generic_string();
         subject    = std::move(m);
         return true;
@@ -5847,7 +5853,7 @@ void runRunnerVocabularyPin() {
     return false;
 }
 
-void runCoverageBoundaryJudge(fs::path const& subjectDir,
+void runCoverageBoundaryJudge(dss::core::HostPath const& subjectDir,
                               std::string const& subjectId,
                               ExampleManifest const& subject,
                               fs::path const& outputBase) {
@@ -5905,7 +5911,7 @@ void runCoverageBoundaryJudge(fs::path const& subjectDir,
     // below rather than a small one.
     auto const siblingLog = outputBase / "coverage-boundary-sibling.log";
     std::string const cmd = quote(g_siblingRunner.string()) + " "
-        + quote(subjectDir.string())
+        + quote(subjectDir.spelling().display())   // a spawn ARGUMENT: the value's rendering (absolute: the corpus root's)
         + " --gtest_filter=Examples.RunFromManifest > "
         + quote(siblingLog.string()) + " 2>&1";
     // ── WHERE THE SIBLING IS RUN FROM ───────────────────────────────────────
@@ -6321,7 +6327,7 @@ struct ScratchRemoval {
 // be there.
 [[nodiscard]] bool scratchEntryIsGone(fs::path const& p) {
     std::error_code ec;
-    return dss::core::entryKind(p, ec) == dss::core::EntryKind::Absent && !ec;
+    return dss::core::entryKind(p, dss::core::Use::Leaf, ec) == dss::core::EntryKind::Absent && !ec;
 }
 
 void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
@@ -6345,7 +6351,7 @@ void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
     ScratchRemoval out;
     out.failures = removal.failures;
     if (removal.failures != 0) {
-        out.first = "'" + removal.firstPath.generic_string() + "': "
+        out.first = "'" + removal.firstPath.spelling().generic() + "': "
                   + removal.firstError.message();
     }
     return out;
@@ -6394,7 +6400,7 @@ void releaseRemovalClaim(fs::path const& claim) {
     ScratchRemoval out;
     out.failures = removal.failures;
     if (removal.failures != 0) {
-        out.first = "'" + removal.firstPath.generic_string() + "': " + removal.firstError.message();
+        out.first = "'" + removal.firstPath.spelling().generic() + "': " + removal.firstError.message();
     }
     return out;
 }
@@ -6409,7 +6415,7 @@ void sweepStaleRemovalClaims(fs::path const& base, fs::file_time_type now) {
     fs::directory_iterator it(base / kReclaimDirName, ec);
     for (fs::directory_iterator const end; !ec && it != end; it.increment(ec)) {
         std::error_code tec;
-        auto const stamp = writtenAt(it->path(), tec);
+        auto const stamp = writtenAt(it->path(), dss::core::Use::Container, tec);
         if (!tec && now - stamp >= kRunningStaleAfter) stale.push_back(it->path());
     }
     for (auto const& claim : stale) releaseRemovalClaim(claim);
@@ -6437,14 +6443,14 @@ enum class Reclaim : std::uint8_t {
     bool const stillSelected = [&] {
         std::error_code sec;
         auto const running = root / kRunningName;
-        bool const sentinel = reachesSomething(running, sec);
+        bool const sentinel = reachesSomething(running, dss::core::Use::Leaf, sec);
         if (sec) return false;  // could not even ask: treat as LIVE
         if (sentinel) {
-            auto const stamp = writtenAt(running, sec);
+            auto const stamp = writtenAt(running, dss::core::Use::Leaf, sec);
             if (sec || now - stamp < kRunningStaleAfter) return false;
         }
-        if (!reachesSomething(root / kRunInfoName, sec) || sec) return false;
-        auto const mtime = writtenAt(root, sec);
+        if (!reachesSomething(root / kRunInfoName, dss::core::Use::Leaf, sec) || sec) return false;
+        auto const mtime = writtenAt(root, dss::core::Use::Container, sec);
         return !sec && mtime == scannedMtime;
     }();
     Reclaim outcome = Reclaim::NotOurs;
@@ -6521,24 +6527,24 @@ std::size_t pruneKeptRoots(fs::path const& base, fs::path const& mine) {
         // What the entry REACHES, asked of the substrate with the error kept
         // apart, as the corpus walk above asks it.
         std::error_code dec;
-        if (p == mine || !reachesKind(p, dss::core::EntryKind::Directory, dec) || dec) continue;
+        if (p == mine || !reachesKind(p, dss::core::Use::Container, dss::core::EntryKind::Directory, dec) || dec) continue;
         // Only ever remove a directory this runner demonstrably created.
         std::error_code iec;
-        if (!reachesSomething(p / kRunInfoName, iec) || iec) continue;
+        if (!reachesSomething(p / kRunInfoName, dss::core::Use::Leaf, iec) || iec) continue;
         // A sentinel we cannot READ counts as LIVE. The uncertainty is
         // asymmetric: keeping a dead root costs a little temp space, while
         // deleting a live one is the fixed-temp-path collision between two
         // concurrent runs over again.
         std::error_code rec;
         auto const running = p / kRunningName;
-        bool const sentinel = reachesSomething(running, rec);
+        bool const sentinel = reachesSomething(running, dss::core::Use::Leaf, rec);
         if (rec) continue;  // could not even ask
         if (sentinel) {
-            auto const stamp = writtenAt(running, rec);
+            auto const stamp = writtenAt(running, dss::core::Use::Leaf, rec);
             if (rec || now - stamp < kRunningStaleAfter) continue;  // maybe LIVE
         }
         std::error_code mec;
-        auto const mtime = writtenAt(p, mec);
+        auto const mtime = writtenAt(p, dss::core::Use::Container, mec);
         if (mec) continue;  // vanished under us — a sibling cleaning up
         prunable.emplace_back(mtime, p);
     }
@@ -6630,12 +6636,12 @@ void reportLegacyDebris(fs::path const& base) {
     // `temp_directory_path()` throws — unwanted on a best-effort path.
     auto const legacy = base.parent_path() / kLegacyBaseName;
     std::error_code lec;
-    auto const legacyStamp = writtenAt(legacy, lec);
+    auto const legacyStamp = writtenAt(legacy, dss::core::Use::Container, lec);
     if (lec) return;  // absent (the normal case), or unreadable — say nothing
 
     auto const marker = base / kLegacyNotedName;
     std::error_code mec;
-    auto const noted = writtenAt(marker, mec);
+    auto const noted = writtenAt(marker, dss::core::Use::Leaf, mec);
     bool const saidBefore = !mec;
     if (saidBefore && noted >= legacyStamp) {
         return;  // already said, and nothing has touched the tree since
@@ -6784,7 +6790,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         }
         std::ofstream((root / kRunInfoName).string())
             << "planted by the concurrent scratch-removal pin\n";
-        if (!reachesSomething(root / kRunInfoName, ec)) {
+        if (!reachesSomething(root / kRunInfoName, dss::core::Use::Leaf, ec)) {
             return "cannot plant '" + (root / kRunInfoName).generic_string()
                  + "'";
         }
@@ -6803,7 +6809,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         });
         if (walk.error && unwalked.empty()) {
             unwalked = "the walk of '" + root.generic_string() + "' stopped at '"
-                     + walk.where.generic_string() + "': " + walk.error.message();
+                     + walk.where.spelling().generic() + "': " + walk.error.message();
         }
         return n;
     };
@@ -6843,7 +6849,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         for (fs::directory_iterator it(base, ec), end; !ec && it != end;
              it.increment(ec)) {
             std::error_code iec;
-            if (!reachesSomething(it->path() / kRunInfoName, iec)) continue;
+            if (!reachesSomething(it->path() / kRunInfoName, dss::core::Use::Leaf, iec)) continue;
             ++left;
             if (filesUnder(it->path()) != kPlantedFiles) ++broken;
         }
@@ -6869,7 +6875,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
         planted = plant(root);
         if (!planted.empty()) break;
         std::error_code mec;
-        auto const selectedMtime = writtenAt(root, mec);
+        auto const selectedMtime = writtenAt(root, dss::core::Use::Container, mec);
         auto const now = fs::file_time_type::clock::now();
         std::vector<int> removed(static_cast<std::size_t>(kDeleters), 0);
         std::vector<int> warned(static_cast<std::size_t>(kDeleters), 0);
@@ -6942,7 +6948,7 @@ void runConcurrentScratchRemovalPin(fs::path const& scratch) {
             auto const early      = reclaimKeptRoot(root, olderScan, now);
             auto const earlyFiles = filesUnder(root);
             std::ofstream((root / kRunningName).string());
-            auto const currentScan = writtenAt(root, mec);
+            auto const currentScan = writtenAt(root, dss::core::Use::Container, mec);
             auto const live        = reclaimKeptRoot(root, currentScan, now);
             auto const liveFiles   = filesUnder(root);
             if (mec || early != Reclaim::NotOurs || earlyFiles != kPlantedFiles
@@ -7026,19 +7032,19 @@ void runLinkedKeptRootPin(fs::path const& scratch) {
         check(what + ": the link was planted", !made, made ? made.message() : std::string{});
         if (made) continue;
         std::error_code tec;
-        auto const      scanned = writtenAt(link, tec);
+        auto const      scanned = writtenAt(link, dss::core::Use::Container, tec);
         check(what + ": its write time was read through it", !tec, tec ? tec.message() : std::string{});
         if (tec) continue;
         auto const  outcome = reclaimKeptRoot(link, scanned, fs::file_time_type::clock::now());
         std::string lost;
         for (fs::path const& kept : {target / kRunInfoName, target / "keep.txt", target / "sub" / "inner.txt"}) {
             std::error_code kec;
-            if (!reachesSomething(kept, kec) || kec) lost += " " + kept.lexically_relative(scratch).generic_string();
+            if (!reachesSomething(kept, dss::core::Use::Leaf, kec) || kec) lost += " " + kept.lexically_relative(scratch).generic_string();
         }
         check(what + ": the prune's removal left what the link reaches whole", lost.empty(),
               "removed through the link:" + lost);
         std::error_code lec;
-        bool const      linkGone = dss::core::entryKind(link, lec) == dss::core::EntryKind::Absent && !lec;
+        bool const      linkGone = dss::core::entryKind(link, dss::core::Use::Leaf, lec) == dss::core::EntryKind::Absent && !lec;
         check(what + ": the link itself was removed", outcome == Reclaim::Removed && linkGone,
               linkGone ? "the reclaim did not report a removal" : "the link is still there");
     }
@@ -7185,7 +7191,7 @@ int main(int argc, char* argv[]) {
     // sibling against code no ctest entry executes, and could report a boundary
     // the suite does not actually have.
     bool const wantCoverageBoundary = g_only.kind == OnlyKind::CoverageBoundary;
-    fs::path        boundarySubjectDir;
+    dss::core::HostPath boundarySubjectDir;
     std::string     boundarySubjectId;
     ExampleManifest boundarySubject;
     if (wantCoverageBoundary) {

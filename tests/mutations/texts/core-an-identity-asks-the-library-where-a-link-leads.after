@@ -1,1 +1,1 @@
-    fs::path const c = fs::weakly_canonical(p, canonEc);
+    HostPath const c = fs::weakly_canonical(fs::path{HostPathAccess::reference(p, use)}, canonEc);

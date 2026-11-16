@@ -62,8 +62,8 @@ void emitGuaranteed(DiagnosticReporter& rep, DiagnosticCode code,
 // strictly better than an exception out of a resolver, and the only thing it
 // costs is that two exotic spellings of one directory might read as two nodes
 // (which produces a duplicate build, never a wrong one).
-[[nodiscard]] fs::path canonicalize(fs::path const& p) {
-    return core::PathIdentity::of(p).path();
+[[nodiscard]] fs::path canonicalize(fs::path const& p, core::Use use) {
+    return core::PathIdentity::of(p, use).path();
 }
 
 // The de-dup key for a source path. Same rule `expandAndDedupProjectSources`
@@ -73,7 +73,7 @@ void emitGuaranteed(DiagnosticReporter& rep, DiagnosticCode code,
 // than an exotic edge — and its consequence is a duplicate CU and a
 // duplicate-symbol link error no diagnostic can tie back to a manifest.
 [[nodiscard]] core::PathIdentity sourceKey(std::string const& spelling) {
-    return core::PathIdentity::of(fs::path{spelling});
+    return core::PathIdentity::of(fs::path{spelling}, core::Use::Leaf);   // a source: a FILE
 }
 
 // A manifest's `includes`, each resolved against THAT manifest's directory
@@ -341,9 +341,9 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
         // which keeps a `//host/share` authority rooted (`isRootedPath`, not
         // `is_absolute()`: ✔MEASURED 2026-08-28, the bare test glued the
         // consumer's DRIVE in front of another machine's authority).
-        dir = canonicalize(resolveManifestPath(parent.dir, raw));
+        dir = canonicalize(resolveManifestPath(parent.dir, raw), core::Use::Container);
         std::error_code ec;
-        if (core::reachedKind(dir, ec) != core::EntryKind::Directory) {
+        if (core::reachedKind(dir, core::Use::Container, ec) != core::EntryKind::Directory) {
             emitDriverError(
                 rep_, DiagnosticCode::D_FileNotFound,
                 "project 'dependsOn': path dependency '" + spelling
@@ -358,12 +358,12 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
     } else {
         // A git entry: the checkout `DependencyCache::acquire` produced.
         spelling = entry.git.value_or(std::string{});
-        dir      = canonicalize(fs::path{*acquiredCheckout});
+        dir      = canonicalize(fs::path{*acquiredCheckout}, core::Use::Container);
     }
 
     fs::path const manifest = dir / std::string{kDependencyManifestName};
     std::error_code ec;
-    if (core::reachedKind(manifest, ec) != core::EntryKind::File) {
+    if (core::reachedKind(manifest, core::Use::Leaf, ec) != core::EntryKind::File) {
         emitGuaranteed(
             rep_, DiagnosticCode::D_DependencyManifestNotFound,
             "project 'dependsOn': '" + spelling + "' (declared by '"
@@ -378,7 +378,7 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
             + core::genericSpelling(manifest) + "'.");
         return std::nullopt;
     }
-    return canonicalize(manifest);
+    return canonicalize(manifest, core::Use::Leaf);
 }
 
 // The output/cache NAME a dependency's artifacts are filed under (U-9), derived
@@ -1006,7 +1006,7 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
     std::vector<BuiltArtifact>   incoming;
     std::set<core::PathIdentity> seen;
     auto const add = [&](BuiltArtifact const& a) {
-        if (seen.insert(core::PathIdentity::of(a.path)).second) {
+        if (seen.insert(core::PathIdentity::of(a.path, core::Use::Leaf)).second) {
             incoming.push_back(a);
         }
     };
@@ -1101,7 +1101,7 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
 
 std::optional<DependencyResolution> Resolver::run(ProjectConfig const& rootConfig) {
     Node root;
-    root.manifestPath = canonicalize(req_.rootManifestPath);
+    root.manifestPath = canonicalize(req_.rootManifestPath, core::Use::Leaf);
     root.dir          = root.manifestPath.parent_path();
     root.config       = rootConfig;
     // The root's own `outputName` is never used (its artifacts are not filed

@@ -1,1 +1,1 @@
-    return p;
+    if (dos != reference) return dos;

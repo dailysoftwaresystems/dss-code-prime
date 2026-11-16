@@ -1,1 +1,1 @@
-            return fs::path{dosSpellingOf(resolved)};
+            return HostPathAccess::answered(resolved);

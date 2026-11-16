@@ -70,6 +70,40 @@ TEST(EveryUnit, EveryUnitSucceedingSucceedsTheControl) {
     EXPECT_TRUE(dss::substrate::runEveryUnit(0, [](std::size_t) { return false; })) << "no unit asked is no unit failed";
 }
 
+// THE NETTED FORM (P69 H6c, R4): a unit that fails having reported nothing is named, the count read before EACH unit
+// -- a silent unit AFTER a reporting one, which one snapshot for the whole step leaves unnamed.
+TEST(EveryUnit, ASilentUnitAfterAReportingOneIsNamed) {
+    std::size_t              errors = 0;
+    std::vector<std::size_t> asked, silent;
+    bool const every = dss::substrate::runEveryUnitReportingSilence(
+        3,
+        [&](std::size_t i) {
+            asked.push_back(i);
+            if (i == 0) ++errors;   // unit 0 fails and says why; unit 1 fails and says nothing; unit 2 succeeds
+            return i == 2;
+        },
+        [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); });
+    EXPECT_FALSE(every) << "two failed units were taken for success";
+    EXPECT_EQ(asked, (std::vector<std::size_t>{0, 1, 2})) << "a failed unit stopped the units after it";
+    EXPECT_EQ(silent, std::vector<std::size_t>{1}) << "the silent unit after a reporting one was not named";
+}
+
+// The control: every failing unit reports, so none is named -- and a unit that succeeds is never named.
+TEST(EveryUnit, AUnitThatReportsIsNeverNamedSilent) {
+    std::size_t              errors = 0;
+    std::vector<std::size_t> silent;
+    bool const every = dss::substrate::runEveryUnitReportingSilence(
+        3,
+        [&](std::size_t i) {
+            if (i == 1) return true;
+            ++errors;
+            return false;
+        },
+        [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); });
+    EXPECT_FALSE(every);
+    EXPECT_TRUE(silent.empty()) << "a unit that reported its failure was named silent";
+}
+
 // THE INPUT-LANGUAGE CLAIM (program.cpp `resolveGrammarForTarget`): with no `--language`, the language the target
 // declares must claim every input, and EVERY input it does not claim is named before the build fails -- two inputs of
 // extensions no shipped language claims, two D_UnknownFileExtension, each naming its own file.

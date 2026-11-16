@@ -74,7 +74,7 @@ drainStreamChecked(std::istream& in, std::string const& shown, std::uintmax_t ma
 
 // `readFileChecked` with or without a bound: `maxBytes` absent, a regular file alone is read (the one-argument form).
 [[nodiscard]] std::expected<std::string, FileReadError>
-readChecked(fs::path const& path, std::optional<std::uintmax_t> maxBytes) {
+readChecked(HostPath const& path, std::optional<std::uintmax_t> maxBytes) {
     // ONE spelling of a path in a diagnostic, on every host. (Several call
     // sites already rendered it this way and their wording is asserted by
     // tests.)
@@ -86,12 +86,12 @@ readChecked(fs::path const& path, std::optional<std::uintmax_t> maxBytes) {
     // the four errors below are the only thing an operator sees when one of them
     // cannot be read. The two spellings are byte-identical for every path with a
     // leading separator run below 2, so no asserted wording moves.
-    std::string const shown = genericSpelling(path);
+    std::string const shown = path.spelling().generic();
 
     // The OS's reason for a refused open is read from `errno` the open left -- it is cleared first, so a stale one
     // is never reported: gcc and clang name it ("Permission denied"), and so does this.
     errno = 0;
-    std::ifstream in(extendedLengthSpelling(path), std::ios::binary);
+    std::ifstream in = openInputStream(path, std::ios::binary);   // the value's LEAF reference, at any length
     if (!in) {
         int const why = errno;
         return std::unexpected(FileReadError{
@@ -107,7 +107,7 @@ readChecked(fs::path const& path, std::optional<std::uintmax_t> maxBytes) {
     // which without this check would surface as an empty file. A STREAM -- a
     // device, a named pipe: `Other` -- is read only where the caller bounds it.
     std::error_code       ec;
-    EntryKind const       kind   = reachedKind(path, ec);
+    EntryKind const       kind   = reachedKind(path, Use::Leaf, ec);
     bool const            stream = kind == EntryKind::Other && maxBytes.has_value();
     if (kind != EntryKind::File && !stream) {
         return std::unexpected(FileReadError{
@@ -227,12 +227,12 @@ readStreamChecked(std::istream& in, std::string_view label,
 }
 
 std::expected<std::string, FileReadError>
-readFileChecked(fs::path const& path) {
+readFileChecked(HostPath const& path) {
     return readChecked(path, std::nullopt);
 }
 
 std::expected<std::string, FileReadError>
-readFileChecked(fs::path const& path, std::uintmax_t maxBytes) {
+readFileChecked(HostPath const& path, std::uintmax_t maxBytes) {
     return readChecked(path, maxBytes);
 }
 

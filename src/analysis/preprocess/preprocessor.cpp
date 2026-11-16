@@ -1567,7 +1567,7 @@ preScanIncludeFile(fs::path const& path,
         return nullptr;   // caller emits the unreadable-include diagnostic
     }
     auto buf = SourceBuffer::fromString(*std::move(text), path.string());
-    PreScanKey key{core::PathIdentity::of(path),
+    PreScanKey key{core::PathIdentity::of(path, core::Use::Leaf),
                    crypto::sha256OfText(buf->text())};
     {
         std::lock_guard<std::mutex> lk{preScanMemoMutex()};
@@ -1694,7 +1694,7 @@ public:
         std::size_t& from = checkedUpTo_[canon];
         for (std::size_t k = from; k < files_.size(); ++k) {
             std::error_code ec;
-            if (core::reachedSameFile(p, files_[k], ec) && !ec) {
+            if (core::reachedSameFile(p, files_[k], core::Use::Leaf, ec) && !ec) {
                 from = files_.size();
                 spellings_.insert(canon);   // memoise: hash hit from now on
                 return true;
@@ -3514,7 +3514,7 @@ struct SynthBuilder {
                     // delimiter in the output; for the COMPUTED form, past the last
                     // operand token. Both are already in `angleDirEnd`.
                     const ByteOffset dirEnd = angleDirEnd;
-                    auto const canon = core::PathIdentity::of(angleRes.path);
+                    auto const canon = core::PathIdentity::of(angleRes.path, core::Use::Leaf);
                     // TF-C87: the buffer is loaded BEFORE the stack test now,
                     // because the re-entry decision reads the header's own text.
                     // Order-independent in practice: a header already ON the stack
@@ -3772,7 +3772,7 @@ struct SynthBuilder {
                 copiedUpTo = dirEnd;
                 continue;
             }
-            auto const canon = core::PathIdentity::of(*resolved);
+            auto const canon = core::PathIdentity::of(*resolved, core::Use::Leaf);
             // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
             // the header's own text) — see the angle arm's note. Routed through
             // the shared per-file pre-scan for the same reason it is there.
@@ -6285,7 +6285,7 @@ private:
                                                         std::uint64_t maxBytes,
                                                         bool pipe = false) {
         if (pipe) {
-            std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
+            std::ifstream in = core::openInputStream(path, std::ios::binary);
             if (!in) return std::nullopt;
             std::string out(static_cast<std::size_t>(maxBytes), '\0');
             in.read(out.data(), static_cast<std::streamsize>(maxBytes));
@@ -6313,7 +6313,7 @@ private:
         // The BOUNDED arm keeps the same short-read detector: `gcount()` must
         // deliver exactly the bytes asked for, or the read failed and the
         // caller refuses LOUD rather than embedding a shorter resource.
-        std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
+        std::ifstream in = core::openInputStream(path, std::ios::binary);
         if (!in) return std::nullopt;
         std::string out(static_cast<std::size_t>(maxBytes), '\0');
         in.read(out.data(), static_cast<std::streamsize>(maxBytes));
@@ -10548,7 +10548,7 @@ PreprocessResult preprocessRun(
 
     std::vector<core::PathIdentity> includeStack;
     includeStack.push_back(
-        core::PathIdentity::of(fs::path{mainSource->name()}));
+        core::PathIdentity::of(fs::path{mainSource->name()}, core::Use::Leaf));
     // D-PP-PRAGMA-RECOGNIZED-SEMANTICS: the TU's include-once set. Its lifetime
     // is EXACTLY this translation unit — a fresh set per `preprocess()` call, so
     // one TU's `#pragma once` can never suppress another TU's include. The main

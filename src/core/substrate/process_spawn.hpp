@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/host_path.hpp"
 
 // `dss::substrate::buildWindowsCommandLine` USED TO BE DECLARED HERE and is
 // still part of this facility's surface — including this header still gets it,
@@ -183,8 +184,15 @@ namespace dss::substrate {
 // shim, which is a strictly worse diagnostic than the real one).
 // On POSIX there is no extension probing and a candidate must additionally
 // pass `access(X_OK)`.
-[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
+// The answer is a VALUE (P69 H6c): the image a spawn is handed as its `image`.
+[[nodiscard]] DSS_EXPORT std::optional<core::HostPath>
 resolveExecutableOnPath(std::string const& command);
+
+// A program SPELLED as text by its caller's input -- a manifest's `run[0]`, UTF-8 as every argv element is -- as a
+// path: `nullopt` when the bytes are not UTF-8 (on Windows; a POSIX path is bytes). The narrow `std::filesystem::path`
+// constructor is NOT this on Windows: MS STL reads the bytes in the ACTIVE CODE PAGE, libstdc++ as UTF-8.
+[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
+programPathFromUtf8(std::string const& utf8);
 
 // `buildWindowsCommandLine` / `tryBuildWindowsCommandLine` / `decodeUtf8ToWide`
 // are declared in `core/substrate/windows_command_line.hpp`, included above —
@@ -258,16 +266,37 @@ struct SpawnResult {
 // everything: the variable the caller named is precisely the one the child
 // must not see.
 
-// Spawn `argv[0]` DIRECTLY (see the NO SHELL note above), passing `argv` as
-// the child's argument vector, and BLOCK until it exits.
+// Spawn the program `image` DIRECTLY (see the NO SHELL note above), passing
+// `argv` as the child's argument vector, and BLOCK until it exits.
+//
+//   * ★ THE IMAGE IS A VALUE (P69 H6c), never a spelling re-read from argv: a
+//     BARE NAME (a text with no directory component, `git`) is searched on PATH
+//     exactly as `resolveExecutableOnPath` searches (the current directory is
+//     never searched); any other value is the file itself, a LEAF -- a GIVEN
+//     relative one resolved against the CALLER's directory, a listed one by its
+//     fixed reference -- probed with the PATHEXT rule on Windows. It is handed to
+//     CreateProcessW in its DOS form exactly where that names the same file and
+//     is under MAX_PATH, the verbatim reference otherwise (✔MEASURED, H6c u3
+//     part 4: a plain spelling through a listed `e.` directory starts the TWIN's
+//     image or nothing; the verbatim one starts the literal image). `argv[0]` is
+//     the CHILD's own first argument, handed as written.
 //
 //   * stdio is INHERITED — the child writes to the compiler's own stdout and
 //     stderr, and reads the compiler's stdin. A build script's output is the
 //     user's output and belongs on the user's terminal, interleaved live
 //     rather than buffered and replayed.
 //   * `cwd` empty (the default) = inherit the caller's current directory.
-//     Otherwise the child starts in `cwd`; the PARENT's current directory is
-//     never changed. That is what makes the function safe to call from a
+//     Otherwise the child starts in `cwd` -- a CONTAINER (P69 H6c, A2/A3/A12):
+//     its reference taken ONCE; an absent one, or one that is no directory,
+//     refused BY NAME before anything starts; handed as its DOS container
+//     spelling WITH its separator wherever that form exists (the verbatim one
+//     with its separator otherwise), its length checked on THAT form (258 with
+//     the separator: ✔MEASURED, H6c u3 part 4, every form); and on Windows a
+//     directory any segment of whose reference ends in ONE period is REFUSED by
+//     name: CreateProcessW removes that period in every spelling, `\\?\`
+//     included (✔MEASURED, H6c u3 parts 2-3: the child starts in the trimmed
+//     twin, or nothing starts), so no spelling DSS hands starts a process
+//     there. The PARENT's current directory is never changed. That is what makes the function safe to call from a
 //     thread at all — a `chdir` here would be process-global and would move
 //     every other thread's idea of "here" with it. Stated as the property it
 //     is, not as a description of where the call happens: today no caller is
@@ -298,8 +327,9 @@ struct SpawnResult {
 // other failure on this path is reportable and one abort in the middle of
 // them would be a surprise.
 [[nodiscard]] DSS_EXPORT SpawnResult
-spawnAndWaitInherit(std::vector<std::string> const& argv,
-                    std::filesystem::path const&    cwd               = {},
+spawnAndWaitInherit(core::HostPath const&           image,
+                    std::vector<std::string> const& argv,
+                    core::HostPath const&           cwd               = {},
                     std::vector<std::string> const& withheldVariables = {});
 
 // The same spawn, with the child's STDOUT going to `stdoutFile` instead of the
@@ -358,10 +388,32 @@ spawnAndWaitInherit(std::vector<std::string> const& argv,
 // quietly meaning "inherit" — that sentinel is internal, and a caller that
 // reached this entry point wanted output it could read.
 [[nodiscard]] DSS_EXPORT SpawnResult
-spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
-                           std::filesystem::path const&    cwd,
-                           std::filesystem::path const&    stdoutFile,
+spawnAndWaitRedirectStdout(core::HostPath const&           image,
+                           std::vector<std::string> const& argv,
+                           core::HostPath const&           cwd,
+                           core::HostPath const&           stdoutFile,
                            std::vector<std::string> const& withheldVariables = {});
+
+#if defined(_WIN32)
+// ── THE ONE IMAGE START A TEST HARNESS MAKES (Windows; P69 H6c) ─────────────────────────────────────────────
+//
+// The test harness's runner (tests/test_support/run_binary.hpp) starts the images DSS emits with its own stdio
+// plumbing (a pipe drained while it waits, the null device), its own wait and its own timeout -- arms this
+// facility leaves out on purpose (the note at the top). What it does NOT keep is its own spelling of the image: a
+// caller's text handed to CreateProcessW starts the image the OS's plain rule makes of it -- a listed `e.`'s
+// TWIN, or nothing past MAX_PATH -- so the image is a VALUE, and the form handed is the spawn's own (its DOS form
+// exactly where that names the same file and is under MAX_PATH, the verbatim reference otherwise, at any length).
+//
+// `commandLine` is the child's whole command line (`tryBuildWindowsCommandLine`). `startupInfo` is the caller's
+// STARTUPINFOW and `processInformation` receives the PROCESS_INFORMATION, both as `void*` so this header stays free
+// of <windows.h>. The child inherits the caller's inheritable handles, and starts in this process's current
+// directory with its environment. Answers 0 when the process was created, else the GetLastError of the refusal;
+// an empty image is refused, ERROR_INVALID_PARAMETER, and nothing is asked of the OS.
+[[nodiscard]] DSS_EXPORT unsigned long startImageInheriting(core::HostPath const& image,
+                                                            std::wstring const&   commandLine,
+                                                            void*                 startupInfo,
+                                                            void*                 processInformation);
+#endif
 
 // ── The exec-status handshake, decided as a value (POSIX only) ─────────────
 //

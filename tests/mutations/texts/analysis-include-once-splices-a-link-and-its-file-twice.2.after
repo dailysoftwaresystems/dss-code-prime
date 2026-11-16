@@ -1,1 +1,1 @@
-    fs::path const c = fs::absolute(p, canonEc).lexically_normal();
+    HostPath const c = normalizeKeepingRoot(absoluteKeepingRoot(p, use, canonEc), use);

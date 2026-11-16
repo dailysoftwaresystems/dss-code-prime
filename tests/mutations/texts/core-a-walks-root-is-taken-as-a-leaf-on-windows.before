@@ -1,1 +1,1 @@
-    fs::path const spelledRoot{referenceSpelling(root.native(), Use::Container)};
+    auto const     rootReference = HostPathAccess::reference(root, Use::Container);

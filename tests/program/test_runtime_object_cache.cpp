@@ -1094,7 +1094,7 @@ TEST(RuntimeObjectCacheStore, LookupMissesBeforeStoreAndHitsAfter) {
 // What the artifact path REACHES, for a message: a file, nothing, or something else.
 [[nodiscard]] static std::string reachedAt(fs::path const& p) {
     std::error_code       ec;
-    dss::core::EntryKind const k = dss::core::reachedKind(p, ec);
+    dss::core::EntryKind const k = dss::core::reachedKind(p, dss::core::Use::Leaf, ec);   // an artifact FILE
     if (ec) return "an error: " + ec.message();
     return k == dss::core::EntryKind::File ? "a file" : k == dss::core::EntryKind::Absent ? "nothing" : "something else";
 }
@@ -2200,13 +2200,13 @@ namespace {
     if (dss::test_support::makeSymbolicLink(missingTarget, link, dss::test_support::LinkTo::File)) return false;
     std::error_code kec;
     std::error_code rec;
-    return dss::core::entryKind(link, kec) == dss::core::EntryKind::Link && !kec
-        && dss::core::reachedKind(link, rec) == dss::core::EntryKind::Absent && !rec;
+    return dss::core::entryKind(link, dss::core::Use::Leaf, kec) == dss::core::EntryKind::Link && !kec
+        && dss::core::reachedKind(link, dss::core::Use::Leaf, rec) == dss::core::EntryKind::Absent && !rec;
 }
 
 [[nodiscard]] bool isLinkEntry(fs::path const& p) {
     std::error_code ec;
-    return dss::core::entryKind(p, ec) == dss::core::EntryKind::Link && !ec;
+    return dss::core::entryKind(p, dss::core::Use::Leaf, ec) == dss::core::EntryKind::Link && !ec;
 }
 
 } // namespace

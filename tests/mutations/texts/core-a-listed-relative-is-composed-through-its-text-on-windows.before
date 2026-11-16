@@ -1,0 +1,2 @@
+HostPath HostPath::operator/(ListedRelative const& listed) const {
+    if (listed.names_.empty()) return *this;

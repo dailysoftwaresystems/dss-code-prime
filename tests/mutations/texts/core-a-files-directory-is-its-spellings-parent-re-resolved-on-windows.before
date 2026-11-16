@@ -1,1 +1,1 @@
-    return fs::path{levelAbove(referenceSpelling(file.native(), Use::Leaf))};
+    return HostPathAccess::made(fs::path{dosSpellingOf(above)}, above, above, HostPath::Origin::Composed);

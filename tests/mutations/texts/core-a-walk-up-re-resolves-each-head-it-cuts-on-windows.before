@@ -1,1 +1,1 @@
-    std::wstring const      w    = referenceSpelling(whole.native(), Use::Leaf);
+    auto const w = callSpelling(p, use, ec);

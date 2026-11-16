@@ -67,6 +67,7 @@
 // documents at length.
 
 #include "core/substrate/process_spawn.hpp"
+#include "spawn_image.hpp"   // the image argv[0] names (H6c)
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -296,7 +297,7 @@ void runNest(int baseDepth, int diagCodes) {
         "--gtest_also_run_disabled_tests",
         std::string{kBaseDepthFlag} + std::to_string(baseDepth),
     };
-    const auto rc = dss::substrate::spawnAndWaitRedirectStdout(argv, {}, out);
+    const auto rc = dss::test_support::spawnArgvRedirectStdout(argv, {}, out);
     if (!rc.spawned) { why = "spawn failed: " + rc.diagnostic; return 0; }
     if (rc.exitCode != 0) {
         why = "child exited " + std::to_string(rc.exitCode);

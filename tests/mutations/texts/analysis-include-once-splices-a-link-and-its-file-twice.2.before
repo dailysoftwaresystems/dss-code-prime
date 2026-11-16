@@ -1,1 +1,1 @@
-    fs::path const c = reachedPath(p, canonEc);
+    HostPath const c = reachedPath(p, use, canonEc);

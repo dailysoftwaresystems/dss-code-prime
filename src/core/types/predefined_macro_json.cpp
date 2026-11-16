@@ -121,15 +121,15 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
     // whole tree cannot say the tree agrees, and an empty answer would say it.
     std::vector<fs::path> files;
     auto const walk = core::walkTree(fs::path{configRootDir}, [&](core::TreeEntry const& entry) {
-        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-            files.push_back(entry.path);
+        if (entry.reaches == core::EntryKind::File && entry.at.extension() == ".json")
+            files.push_back(entry.storeRoutePath);
         return core::WalkStep::Continue;
     });
     if (walk.error) {
         out.push_back(std::format("the config tree '{}' could not be read whole: the walk stopped at '{}' ({}), so "
                                   "no document beyond it was compared",
                                   core::genericSpelling(fs::path{configRootDir}),
-                                  core::genericSpelling(walk.where), walk.error.message()));
+                                  walk.where.spelling().generic(), walk.error.message()));
     }
     // Deterministic on every host: a directory iteration order is the
     // filesystem's, and "which document is FIRST" decides which one the message
@@ -138,7 +138,7 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
     std::sort(files.begin(), files.end());
 
     for (fs::path const& f : files) {
-        std::ifstream in(core::extendedLengthSpelling(f), std::ios::binary);
+        std::ifstream in = core::openInputStream(f, std::ios::binary);   // at any length (the home)
         if (!in) continue;
         // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`).
         // `operator>>` into a `json` is `json::parse` under another spelling —

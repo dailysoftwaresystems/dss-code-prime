@@ -82,7 +82,8 @@ canonicalizeLikeTheProduct(std::filesystem::path const& p) {
     // `make_preferred` for the same reason `PathIdentity::path()` does it:
     // this value becomes a DIRECTORY that tests hand to `cmd.exe`, and a
     // forward-slashed Windows path is fine for every API except the shell.
-    return std::filesystem::path{dss::core::canonicalIdentityKey(p)}
+    // A DIRECTORY's key (P69 H6c, A2): the directory tests write into -- a CONTAINER.
+    return std::filesystem::path{dss::core::canonicalIdentityKey(p, dss::core::Use::Container)}
         .make_preferred();
 }
 
@@ -217,8 +218,7 @@ public:
             // named as unrenderable rather than not at all.
             std::string first;
             try {
-                auto const u8 = dss::core::genericSpellingU8(removal.firstPath);
-                first.assign(reinterpret_cast<char const*>(u8.data()), u8.size());
+                first = removal.firstPath.spelling().generic();   // the value's rendering, UTF-8 (H6c)
             } catch (...) {
                 first = "<a name with no UTF-8 spelling>";
             }

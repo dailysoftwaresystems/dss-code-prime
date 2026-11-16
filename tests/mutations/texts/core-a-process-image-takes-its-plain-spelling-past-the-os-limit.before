@@ -1,1 +1,1 @@
-    return full.size() >= std::size_t{MAX_PATH} ? extendedLengthSpelling(p) : p;
+    if (dos != reference && dos.size() < std::size_t{MAX_PATH}) return dos;

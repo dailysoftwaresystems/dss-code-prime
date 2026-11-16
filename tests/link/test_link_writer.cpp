@@ -17,6 +17,7 @@
 //     accepts any path the caller gives it.
 
 #include "asm/asm.hpp"
+#include "core/substrate/path_identity.hpp"   // the cell below reads back through `\\?\` (H6c)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -358,4 +359,53 @@ TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
     EXPECT_EQ(hdr[1], 'E');
     EXPECT_EQ(hdr[2], 'L');
     EXPECT_EQ(hdr[3], 'F');
+}
+
+// ── P69 H6c (plan section 6 #23, #24, #4): AN IMAGE BELOW A DIRECTORY THE PLAIN RULE WOULD TRIM AS A LEAF ──────
+//
+// `S\d \a.bin` names the image in the directory `d ` (a MIDDLE name keeps its trailing space), so the write asks
+// that directory as the level of the image's own leaf reference (#23), stages its sibling there (`withSuffix`, #4)
+// and commits by the target's leaf reference (#24) -- with the trimmed twin `d` absent, and present: the bytes land
+// in `d `, nothing is left beside them, and the twin stays empty. Read back through `\\?\`, the one spelling with no
+// second reading.
+TEST(LinkWriter, AnImageBelowADirectoryEndingInASpaceIsWrittenThere) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "POSIX resolves no name by its position: `d ` is its bytes in every use";
+#else
+    auto const namesIn = [](std::wstring const& dir) {
+        std::vector<std::string> names;
+        static_cast<void>(core::walkTree(fs::path{dir}, [&](core::TreeEntry const& e) {
+            names.push_back(e.at.filename().string());
+            return core::WalkStep::Prune;
+        }));
+        return names;
+    };
+    for (bool const twin : {false, true}) {
+        SCOPED_TRACE(twin ? "the twin `d` present" : "the twin `d` absent");
+        ScratchDir         scratch{Location::Temp, twin ? "link-writer-space-twin" : "link-writer-space"};
+        std::wstring const S       = scratch.path().native();
+        std::wstring const literal = L"\\\\?\\" + S + L"\\d ";
+        std::wstring const twinDir = L"\\\\?\\" + S + L"\\d";
+        std::error_code    ec;
+        static_cast<void>(core::createDirectories(fs::path{literal}, ec));
+        ASSERT_FALSE(ec) << ec.message();
+        if (twin) {
+            static_cast<void>(core::createDirectories(fs::path{twinDir}, ec));
+            ASSERT_FALSE(ec) << ec.message();
+        }
+        auto const         image = makeImage({0xD5, 0x20, 0x0A});
+        DiagnosticReporter rep;
+        bool const         wrote = linker::writeImage(image, fs::path{S + L"\\d \\a.bin"}, rep);
+        std::string        said;
+        for (auto const& d : rep.all()) said += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+        ASSERT_TRUE(wrote) << "the image below `d ` was refused:" << said;
+        EXPECT_EQ(rep.errorCount(), 0u) << said;
+        std::ifstream             in = core::openInputStream(fs::path{literal + L"\\a.bin"}, std::ios::binary);
+        std::vector<std::uint8_t> read{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        EXPECT_EQ(read, image.bytes) << "the image is not in `d `";
+        EXPECT_EQ(namesIn(literal), std::vector<std::string>{"a.bin"})
+            << "`d ` holds something besides the image (a staging sibling left), or not the image";
+        if (twin) EXPECT_TRUE(namesIn(twinDir).empty()) << "the twin `d` received a file";
+    }
+#endif
 }

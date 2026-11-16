@@ -1741,7 +1741,7 @@ readProjectFacts(fs::path const& projectPath) {
     if (argv0.find('/') != std::string::npos
         || argv0.find('\\') != std::string::npos) {
         std::error_code ec;
-        bool const there = reachesSomething(fs::path{argv0}, ec);
+        bool const there = reachesSomething(fs::path{argv0}, dss::core::Use::Leaf, ec);
         return there && !ec;
     }
     return !findOnPath(argv0).empty();
@@ -2133,7 +2133,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
     }
     auto const resolved = root / lib.path;
     std::error_code ec;
-    if (!reachesKind(resolved, dss::core::EntryKind::File, ec) || ec) {
+    if (!reachesKind(resolved, dss::core::Use::Leaf, dss::core::EntryKind::File, ec) || ec) {
         ADD_FAILURE() << "prebuiltLibraries: '" << lib.path
                       << "' declared by " << exampleDir.generic_string()
                       << " is not a regular file at "
@@ -2261,7 +2261,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
     for (auto const& s : dep.sources) {
         auto const      sp = scratchPath / s;
         std::error_code spEc;
-        if (!reachesSomething(sp, spEc) || spEc) {
+        if (!reachesSomething(sp, dss::core::Use::Leaf, spEc) || spEc) {
             ADD_FAILURE() << "dependsOn source '" << s
                           << "' not found in example dir "
                           << exampleDir.generic_string() << (spEc ? " (" + spEc.message() + ")" : std::string{});
@@ -2318,7 +2318,7 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
     }
     auto const depArtifact = outDir / dep.artifact;
     std::error_code depArtifactEc;
-    if (!reachesSomething(depArtifact, depArtifactEc) || depArtifactEc) {
+    if (!reachesSomething(depArtifact, dss::core::Use::Leaf, depArtifactEc) || depArtifactEc) {
         ADD_FAILURE() << "dependsOn artifact missing at "
                       << depArtifact.generic_string() << " (spec=" << dep.spec
                       << ")" << (depArtifactEc ? " (" + depArtifactEc.message() + ")" : std::string{});
@@ -2453,7 +2453,7 @@ compileAndRunArm(fs::path const& exampleDir,
     for (auto const& s : m.sources) {
         auto const      sp = scratch.path() / s;
         std::error_code spEc;
-        if (!reachesSomething(sp, spEc) || spEc) {
+        if (!reachesSomething(sp, dss::core::Use::Leaf, spEc) || spEc) {
             ADD_FAILURE() << "manifest source '" << s
                           << "' not found in example dir "
                           << exampleDir.generic_string() << (spEc ? " (" + spEc.message() + ")" : std::string{});
@@ -2481,7 +2481,7 @@ compileAndRunArm(fs::path const& exampleDir,
     if (m.project.has_value()) {
         projectPath = scratch.path() / *m.project;
         std::error_code projectEc;
-        if (!reachesSomething(projectPath, projectEc) || projectEc) {
+        if (!reachesSomething(projectPath, dss::core::Use::Leaf, projectEc) || projectEc) {
             ADD_FAILURE() << "manifest 'project' file '" << *m.project
                           << "' not found in example dir "
                           << exampleDir.generic_string() << (projectEc ? " (" + projectEc.message() + ")" : std::string{})
@@ -2784,7 +2784,7 @@ compileAndRunArm(fs::path const& exampleDir,
         ? outDir / specFormatName(t.spec) / t.artifact
         : outDir / t.artifact;
     std::error_code artifactEc;
-    if (!reachesSomething(artifactPath, artifactEc) || artifactEc) {
+    if (!reachesSomething(artifactPath, dss::core::Use::Leaf, artifactEc) || artifactEc) {
         ADD_FAILURE() << "artifact missing at " << artifactPath.generic_string()
                       << " (arm=" << armLabel << ")" << (artifactEc ? " (" + artifactEc.message() + ")" : std::string{});
         armResult.verdict = ArmVerdict::Poisoned;
@@ -3488,17 +3488,18 @@ void runErrorTarget(fs::path const&        exampleDir,
     // there: it FAILS the case, naming where it stopped. An output directory the
     // refused build never made holds nothing, and is no walk to fail.
     std::error_code    outKindEc;
-    bool const         outDirMade = dss::core::entryKind(outDir, outKindEc) != dss::core::EntryKind::Absent
+    bool const         outDirMade = dss::core::entryKind(outDir, dss::core::Use::Container, outKindEc)
+                                    != dss::core::EntryKind::Absent
                                  || outKindEc;
     dss::core::TreeWalk walk;
     if (outDirMade) {
         walk = dss::core::walkTree(outDir, [&](dss::core::TreeEntry const& entry) {
-            if (entry.reaches == dss::core::EntryKind::File) leftovers.push_back(entry.path.generic_string());
+            if (entry.reaches == dss::core::EntryKind::File) leftovers.push_back(entry.at.spelling().generic());
             return dss::core::WalkStep::Continue;
         });
     }
     EXPECT_FALSE(walk.error) << "expect-error example " << exampleDir.generic_string() << ": the walk of "
-                             << outDir.generic_string() << " stopped at " << walk.where.generic_string() << ": "
+                             << outDir.generic_string() << " stopped at " << walk.where.spelling().generic() << ": "
                              << walk.error.message() << " -- no leftover artifact was ruled out there";
     EXPECT_TRUE(leftovers.empty())
         << "expect-error example " << exampleDir.generic_string()
@@ -3613,7 +3614,7 @@ void runErrorTarget(fs::path const&        exampleDir,
                " so this check refuses rather than assumes";
     }
     std::error_code markerEc;
-    if (!reachesKind(cwd / "src" / "dss-config", dss::core::EntryKind::Directory, markerEc) || markerEc) {
+    if (!reachesKind(cwd / "src" / "dss-config", dss::core::Use::Container, dss::core::EntryKind::Directory, markerEc) || markerEc) {
         return {};  // not a checkout root — isolated per build tree
     }
     return "this corpus entry's working directory IS a repository checkout root"
@@ -3648,11 +3649,11 @@ TEST(Examples, RunFromManifest) {
         << "examples_runner needs the example directory as argv[1]";
     fs::path const exampleDir = argv0Dir[1];
     std::error_code exampleDirEc;
-    ASSERT_TRUE(reachesKind(exampleDir, dss::core::EntryKind::Directory, exampleDirEc))
+    ASSERT_TRUE(reachesKind(exampleDir, dss::core::Use::Container, dss::core::EntryKind::Directory, exampleDirEc))
         << "argv[1] is not a directory: " << exampleDir.generic_string() << (exampleDirEc ? " (" + exampleDirEc.message() + ")" : std::string{});
     auto const      manifestPath = exampleDir / "expected.json";
     std::error_code manifestEc;
-    ASSERT_TRUE(reachesSomething(manifestPath, manifestEc) && !manifestEc)
+    ASSERT_TRUE(reachesSomething(manifestPath, dss::core::Use::Leaf, manifestEc) && !manifestEc)
         << "expected.json missing in " << exampleDir.generic_string() << (manifestEc ? " (" + manifestEc.message() + ")" : std::string{});
     auto const m = readManifest(manifestPath);
     ASSERT_FALSE(m.targets.empty()) << "manifest declared no targets";
@@ -3871,7 +3872,7 @@ TEST(ExamplesCorpusLint, EveryArmAgreesWithItsSiblingsOnTheEmulator) {
         << "the corpus lint entry needs the examples ROOT as argv[1]";
     fs::path const corpusRoot = argv[1];
     std::error_code corpusRootEc;
-    ASSERT_TRUE(reachesKind(corpusRoot, dss::core::EntryKind::Directory, corpusRootEc))
+    ASSERT_TRUE(reachesKind(corpusRoot, dss::core::Use::Container, dss::core::EntryKind::Directory, corpusRootEc))
         << "argv[1] is not a directory: " << corpusRoot.generic_string() << (corpusRootEc ? " (" + corpusRootEc.message() + ")" : std::string{});
 
     std::vector<::dss::test_support::DeclaredArm> arms;
@@ -3880,19 +3881,19 @@ TEST(ExamplesCorpusLint, EveryArmAgreesWithItsSiblingsOnTheEmulator) {
         // What each entry REACHES, asked of the substrate with the error kept apart, as the CLI runner's walk
         // asks it: an entry nobody could examine is reported, never taken for "not an example".
         std::error_code langEc;
-        bool const      langIsDir = reachesKind(langEntry.path(), dss::core::EntryKind::Directory, langEc);
+        bool const      langIsDir = reachesKind(langEntry.path(), dss::core::Use::Container, dss::core::EntryKind::Directory, langEc);
         EXPECT_FALSE(langEc) << "cannot examine corpus entry " << langEntry.path().generic_string() << ": "
                              << langEc.message();
         if (!langIsDir) continue;
         for (auto const& nameEntry : fs::directory_iterator(langEntry.path())) {
             std::error_code nameEc;
-            bool const      nameIsDir = reachesKind(nameEntry.path(), dss::core::EntryKind::Directory, nameEc);
+            bool const      nameIsDir = reachesKind(nameEntry.path(), dss::core::Use::Container, dss::core::EntryKind::Directory, nameEc);
             EXPECT_FALSE(nameEc) << "cannot examine corpus entry " << nameEntry.path().generic_string() << ": "
                                  << nameEc.message();
             if (!nameIsDir) continue;
             auto const      mp = nameEntry.path() / "expected.json";
             std::error_code mpEc;
-            bool const      manifest = reachesSomething(mp, mpEc);
+            bool const      manifest = reachesSomething(mp, dss::core::Use::Leaf, mpEc);
             EXPECT_FALSE(mpEc) << "cannot examine " << mp.generic_string() << ": " << mpEc.message();
             if (!manifest || mpEc) continue;
             ++manifestCount;
@@ -4917,7 +4918,7 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
         << "the corpus lint entry needs the examples ROOT as argv[1]";
     fs::path const corpusRoot = argv[1];
     std::error_code corpusRootEc;
-    ASSERT_TRUE(reachesKind(corpusRoot, dss::core::EntryKind::Directory, corpusRootEc))
+    ASSERT_TRUE(reachesKind(corpusRoot, dss::core::Use::Container, dss::core::EntryKind::Directory, corpusRootEc))
         << "argv[1] is not a directory: " << corpusRoot.generic_string() << (corpusRootEc ? " (" + corpusRootEc.message() + ")" : std::string{});
 
     // The COMPLETE set of examples licensed to have an optimized arm whose exit
@@ -4932,19 +4933,19 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
         // What each entry REACHES, asked of the substrate with the error kept apart, as the CLI runner's walk
         // asks it: an entry nobody could examine is reported, never taken for "not an example".
         std::error_code langEc;
-        bool const      langIsDir = reachesKind(langEntry.path(), dss::core::EntryKind::Directory, langEc);
+        bool const      langIsDir = reachesKind(langEntry.path(), dss::core::Use::Container, dss::core::EntryKind::Directory, langEc);
         EXPECT_FALSE(langEc) << "cannot examine corpus entry " << langEntry.path().generic_string() << ": "
                              << langEc.message();
         if (!langIsDir) continue;
         for (auto const& nameEntry : fs::directory_iterator(langEntry.path())) {
             std::error_code nameEc;
-            bool const      nameIsDir = reachesKind(nameEntry.path(), dss::core::EntryKind::Directory, nameEc);
+            bool const      nameIsDir = reachesKind(nameEntry.path(), dss::core::Use::Container, dss::core::EntryKind::Directory, nameEc);
             EXPECT_FALSE(nameEc) << "cannot examine corpus entry " << nameEntry.path().generic_string() << ": "
                                  << nameEc.message();
             if (!nameIsDir) continue;
             auto const      mp = nameEntry.path() / "expected.json";
             std::error_code mpEc;
-            bool const      manifest = reachesSomething(mp, mpEc);
+            bool const      manifest = reachesSomething(mp, dss::core::Use::Leaf, mpEc);
             EXPECT_FALSE(mpEc) << "cannot examine " << mp.generic_string() << ": " << mpEc.message();
             if (!manifest || mpEc) continue;
             ++manifestCount;

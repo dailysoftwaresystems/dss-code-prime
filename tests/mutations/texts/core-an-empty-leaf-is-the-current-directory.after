@@ -1,0 +1,1 @@
+    if (reference.empty()) reference = HostPathAccess::reference(p, Use::Container);

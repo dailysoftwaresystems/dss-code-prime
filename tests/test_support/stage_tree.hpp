@@ -107,21 +107,19 @@ namespace fs = std::filesystem;
     // A walk error ENDS the staging, named, before anything is reported done.
     std::string failure;
     auto const  walk = dss::core::walkTree(srcDir, [&](dss::core::TreeEntry const& entry) {
-        fs::path const& from = entry.path;
-        // LEXICALLY relative, not `fs::relative`: the latter runs both paths
-        // through `weakly_canonical`, which touches the filesystem and RESOLVES
-        // SYMLINKS — so a repo reached through a symlinked path would have its
-        // subpaths rewritten against the resolved tree. The walk guarantees
-        // `from` is literally `srcDir` plus components, so the lexical answer is
-        // the exact one, needs no syscall, and cannot fail for an I/O reason.
-        fs::path const rel = from.lexically_relative(srcDir);
+        // ★ EACH ENTRY IS A LISTED VALUE (P69 H6c, A1): copied FROM itself, and TO the staged tree composed
+        // with its names below the walked root as LISTED (`relative`, literally) -- never its text re-resolved,
+        // which names another entry for a name ending in a space or a period. Its names are the walk's own
+        // answer, so there is nothing to compute lexically and nothing that can fall outside the tree.
+        dss::core::HostPath const& from = entry.at;
+        auto const&                rel  = entry.relative;
         if (rel.empty()) {
-            failure = "cannot express '" + from.generic_string()
+            failure = "cannot express '" + from.spelling().generic()
                     + "' relative to '" + srcDir.generic_string()
                     + "': the walk yielded an entry outside the tree it is walking";
             return dss::core::WalkStep::Stop;
         }
-        fs::path const  to = dstDir / rel;
+        dss::core::HostPath const to = dss::core::HostPath{dstDir} / rel;
         std::error_code ec;
 
         if (entry.kind == dss::core::EntryKind::Directory) {
@@ -134,7 +132,7 @@ namespace fs = std::filesystem;
             static_cast<void>(dss::core::createDirectories(to, ec));
             if (ec) {
                 failure = "cannot create the staged directory '"
-                        + to.generic_string() + "': " + ec.message();
+                        + to.spelling().generic() + "': " + ec.message();
                 return dss::core::WalkStep::Stop;
             }
             return dss::core::WalkStep::Continue;
@@ -142,7 +140,7 @@ namespace fs = std::filesystem;
         if (entry.kind == dss::core::EntryKind::Link
             && entry.reaches == dss::core::EntryKind::Directory) {
             failure = "refusing to stage the SYMLINKED directory '"
-                    + from.generic_string()
+                    + from.spelling().generic()
                     + "': the walk deliberately does not descend through a"
                       " symlink (a cycle would never terminate), so staging"
                       " it would create an EMPTY directory here and drop"
@@ -150,23 +148,26 @@ namespace fs = std::filesystem;
             return dss::core::WalkStep::Stop;
         }
         if (entry.reaches != dss::core::EntryKind::File) {
-            failure = "refusing to silently skip '" + from.generic_string()
+            failure = "refusing to silently skip '" + from.spelling().generic()
                     + "': it is neither a directory nor a regular file, and a"
                       " dropped input is the confusing missing-file error this"
                       " staging exists to prevent";
             return dss::core::WalkStep::Stop;
         }
-        if (rel.generic_string() == "expected.json") return dss::core::WalkStep::Continue;
+        if (rel.generic() == "expected.json") return dss::core::WalkStep::Continue;   // the listed key
 
         static_cast<void>(dss::core::createDirectoriesFor(to, ec));   // the directory `to`'s copy names (A3)
         if (ec) {
             failure = "cannot create the staged directory '"
-                    + to.parent_path().generic_string() + "': " + ec.message();
+                    + dss::core::containingDirectory(to).spelling().generic() + "': " + ec.message();
             return dss::core::WalkStep::Stop;
         }
-        fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+        // Through the home, value to value (H6c): a staged file a previous run left is replaced, as the
+        // library's `overwrite_existing` replaced it -- removed first, then copied to a NEW file.
+        static_cast<void>(dss::core::removeEntry(to, ec));
+        if (!ec) dss::core::copyFile(from, to, ec);
         if (ec) {
-            failure = "cannot stage '" + rel.generic_string() + "' into '"
+            failure = "cannot stage '" + rel.generic() + "' into '"
                     + dstDir.generic_string() + "': " + ec.message();
             return dss::core::WalkStep::Stop;
         }
@@ -176,8 +177,9 @@ namespace fs = std::filesystem;
     if (walk.error) {
         return "cannot walk the example directory '" + srcDir.generic_string()
              + "': " + walk.error.message()
-             + (walk.where == srcDir ? std::string{}
-                                     : " (at '" + walk.where.generic_string() + "')");
+             + (walk.root != dss::core::WalkRoot::Listed   // the walk's own report of its root (H6c, A2)
+                    ? std::string{}
+                    : " (at '" + walk.where.spelling().generic() + "')");
     }
     return {};
 }
@@ -230,7 +232,7 @@ namespace fs = std::filesystem;
     // libstdc++'s `remove_all` on Windows would follow.
     if (auto const cleared = dss::core::removeTree(sandbox); cleared.failures != 0) {
         return "self-test sandbox '" + sandbox.generic_string()
-             + "' could not be cleared: '" + cleared.firstPath.generic_string()
+             + "' could not be cleared: '" + cleared.firstPath.spelling().generic()
              + "': " + cleared.firstError.message();
     }
 

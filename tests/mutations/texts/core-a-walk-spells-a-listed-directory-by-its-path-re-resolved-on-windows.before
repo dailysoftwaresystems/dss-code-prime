@@ -1,1 +1,1 @@
-        spelledOut.push_back(fs::path{base + std::wstring{name}});
+        out.push_back(TreeEntry{HostPathAccess::listed(text, at, name), std::move(names), kind, kind, depth});

@@ -60,7 +60,7 @@ constexpr char const* kMainSource = "int dss_long_path_value(void);\nint main(vo
 
 // `text` written to `file` -- through the extended-length spelling, as DSS writes.
 [[nodiscard]] bool writeText(fs::path const& file, char const* text) {
-    std::ofstream out{dss::core::extendedLengthSpelling(file), std::ios::binary};
+    std::ofstream out = dss::core::openOutputStream(file, std::ios::binary);
     out << text;
     return out.good();
 }
@@ -68,8 +68,9 @@ constexpr char const* kMainSource = "int dss_long_path_value(void);\nint main(vo
 // The one regular file DSS left in `dir` (listed by the substrate, which lists at any length), or empty.
 [[nodiscard]] fs::path onlyFileIn(fs::path const& dir) {
     std::vector<fs::path> files;
-    auto const walk = dss::core::walkTree(dir, [&files](dss::core::TreeEntry const& e) {
-        if (e.kind == dss::core::EntryKind::File) files.push_back(e.path);
+    auto const walk = dss::core::walkTree(dir, [&files, &dir](dss::core::TreeEntry const& e) {
+        // The test's own spelling of a file DSS named: the directory it named and the listed NAME (H6c).
+        if (e.kind == dss::core::EntryKind::File) files.push_back(dir / e.at.filename());
         return dss::core::WalkStep::Prune;
     });
     return !walk.error && files.size() == 1 ? files.front() : fs::path{};
@@ -120,14 +121,15 @@ TEST(ArtifactAtAnyLength, AnObjectIsWrittenReadBackAndLinkedIntoAnImageThatRuns)
         if (cell.atLeast != 0) EXPECT_GE(image.native().size(), 300u) << "the image's own path is not past the limit";
 
         // (3) THE IMAGE'S BYTES read back.
-        std::ifstream in{dss::core::extendedLengthSpelling(image), std::ios::binary};
+        std::ifstream in = dss::core::openInputStream(image, std::ios::binary);   // at any length (the home)
         std::string const head{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
         ASSERT_GE(head.size(), 2u) << "the image was not read back";
         EXPECT_EQ(head.substr(0, 2), "MZ");
 
         // (4) THE IMAGE STARTED there -- by the process spawner, and by the test harness's own CreateProcessW
         // (tests/test_support/run_binary.hpp), which takes the same rule from its one home.
-        auto const run = dss::substrate::spawnAndWaitInherit({image.string()});
+        // The image ITSELF, a value (H6c): its narrow text is the ANSI code page's under MSVC.
+        auto const run = dss::substrate::spawnAndWaitInherit(image, {image.string()});
         ASSERT_TRUE(run.spawned) << run.diagnostic;
         EXPECT_EQ(run.exitCode, 42);
         auto const harnessRun = dss::test_support::runBinary(image);
@@ -158,12 +160,12 @@ TEST(ArtifactAtAnyLength, ACurrentDirectoryPastTheOsLimitIsRefusedNamingIt) {
     fs::path const image = onlyFileIn(shallow / "exe");
     ASSERT_FALSE(image.empty());
 
-    auto const control = dss::substrate::spawnAndWaitInherit({image.string()}, shallow);
+    auto const control = dss::substrate::spawnAndWaitInherit(image, {image.string()}, shallow);
     ASSERT_TRUE(control.spawned) << "the control's current directory, below the limit, was refused: "
                                  << control.diagnostic;
     EXPECT_EQ(control.exitCode, 42);
 
-    auto const refused = dss::substrate::spawnAndWaitInherit({image.string()}, deep);
+    auto const refused = dss::substrate::spawnAndWaitInherit(image, {image.string()}, deep);
     EXPECT_FALSE(refused.spawned) << "a current directory past the OS's limit started a process";
     EXPECT_NE(refused.diagnostic.find("Windows starts no process in a current directory longer than 258"),
               std::string::npos)

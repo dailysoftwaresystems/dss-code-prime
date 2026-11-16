@@ -43,7 +43,8 @@ bool InputResolver::resolveDirectory(
         std::vector<std::string>&      out,
         DiagnosticReporter&            reporter) {
     std::error_code       ec;
-    core::EntryKind const root = core::reachedKind(directoryPath, ec);
+    // A CONTAINER (H6c, A2): the directory the inputs are listed from.
+    core::EntryKind const root = core::reachedKind(directoryPath, core::Use::Container, ec);
     // What the directory REACHES cannot be examined (a looping link, a refusal): that is no
     // absence, and saying "does not exist" would send the reader after the wrong cause.
     if (ec) {
@@ -82,22 +83,22 @@ bool InputResolver::resolveDirectory(
         if (entry.kind == core::EntryKind::Directory)
             return mode == Mode::Recursive ? core::WalkStep::Continue : core::WalkStep::Prune;
         if (entry.reachError) {
-            if (!extensionMatches(entry.path, fileExtensions)) return core::WalkStep::Continue;
+            if (!extensionMatches(entry.at.filename(), fileExtensions)) return core::WalkStep::Continue;
             unreadable = entry;
             return core::WalkStep::Stop;
         }
         if (entry.reaches != core::EntryKind::File) return core::WalkStep::Continue;
-        if (extensionMatches(entry.path, fileExtensions)) {
+        if (extensionMatches(entry.at.filename(), fileExtensions)) {
             // Not a message — the INPUT LIST the compiler goes on to open.
             // The walk joins `directoryPath` with each name, so every entry
             // inherits that path's root, authority included.
-            matched.push_back(core::genericSpelling(entry.path));
+            matched.push_back(core::genericSpelling(entry.storeRoutePath));
         }
         return core::WalkStep::Continue;
     }, core::TreeWalkOptions{.handOutUnreadableLinks = true});
     if (unreadable) {
         emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-             "InputResolver: '" + core::genericSpelling(unreadable->path)
+             "InputResolver: '" + unreadable->at.spelling().generic()
              + "' is named like an input of '" + core::genericSpelling(directoryPath)
              + "', and what it reaches cannot be examined: " + unreadable->reachError.message());
         return false;
@@ -106,13 +107,13 @@ bool InputResolver::resolveDirectory(
         // The directory itself, or one under it: the two remediations differ, so
         // the two messages do.
         emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-             walk.where == directoryPath
+             walk.root != core::WalkRoot::Listed   // the walk's own report of its root (H6c, A2)
                  ? "InputResolver: failed to open directory '"
                        + core::genericSpelling(directoryPath) + "': " + walk.error.message()
                  : "InputResolver: directory-scan interrupted after "
                    "partial enumeration of '"
                        + core::genericSpelling(directoryPath) + "' (at '"
-                       + core::genericSpelling(walk.where) + "'): " + walk.error.message());
+                       + walk.where.spelling().generic() + "'): " + walk.error.message());
         return false;
     }
 
@@ -150,7 +151,7 @@ bool InputResolver::validateFiles(
         // What the path REACHES, asked of the substrate (a dangling link reaches nothing, on every
         // build); a clean absence is the missing-file arm, as `status` reported it with ENOENT.
         std::error_code       ec;
-        core::EntryKind const reached = core::reachedKind(path, ec);
+        core::EntryKind const reached = core::reachedKind(path, core::Use::Leaf, ec);   // an input FILE
         if (!ec && reached == core::EntryKind::Absent)
             ec = std::make_error_code(std::errc::no_such_file_or_directory);
         bool const isRegular = reached == core::EntryKind::File;
@@ -226,7 +227,8 @@ bool InputResolver::checkSearchDirectoriesUsable(
         if (!ec) continue;                     // enumerable — nothing to say
 
         std::error_code       existsEc;
-        core::EntryKind const reached = core::reachedKind(dir, existsEc);
+        // A CONTAINER (H6c, A2): an include directory, searched below.
+        core::EntryKind const reached = core::reachedKind(dir, core::Use::Container, existsEc);
         bool const            present = reached != core::EntryKind::Absent;
         std::error_code const dirEc   = existsEc;
         bool const            isDir   = reached == core::EntryKind::Directory;

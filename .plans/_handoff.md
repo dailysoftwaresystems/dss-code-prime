@@ -917,6 +917,26 @@ round's close; each checkpoint's commit message says what was and was not run on
     its writer.
   - Balance: 689 open against 620 at `71648598`. The one created since checkpoint 43 is the reopened row of known
     defect (13).
+  - Its review (review-xa3e.log) SENT IT BACK, though no finding is a blocker or a major. Five are design failures
+    and F4 is the third send-back on the every-unit class. 3f opens with the answer: a home audit per class, read by
+    an independent design audit, all five amended (ledgers 606, 609).
+- **Checkpoint 45 (2026-11-14) = the host-path lane's fold H6c**, folded ahead of L2b2 and f26d because it was ready:
+  - Every NON-STORE operation on a host path, at every site of src/, takes its reading from one typed value,
+    `dss::core::HostPath`. Its reference is reachable only through the substrate's access header and taken ONCE, by
+    its use (Leaf / Container).
+  - The guard refuses every other route outside the substrate. The store routes are FENCED (28 uses, 8 forms), not
+    closed: they are H6d's, under the new 🔵 DISCLOSED row D-CORE-A-STORED-HOST-PATH-IS-RE-READ-FROM-ITS-TEXT
+    (HEAD's debt), whose site list H6d re-derives BY DATA.
+  - A several-unit step names every unit that failed silently (`runEveryUnitReportingSilence`), at three sites, the
+    third found by data.
+  - The assembly archive's early return is kept: it is packaging's precondition, measured.
+  - `compile_pipeline.cpp` was settled in the main tree as checkpoint 44's copy with H6c's seven `openInputStream`
+    lines.
+  - 36 new arms, unswept.
+  - ✔MEASURED by the lane: 28–29 binaries whole, passed on macos-arm64-debug, linux-x86_64-debug,
+    windows-x86_64-debug and windows-x86_64-release (MSVC 19.52). The pre-fold repo-guard on the lane's tree passed.
+  - Balance: 690 open against 620 at `71648598`. Fold order now: L2b2 → f26d → f26e (a convention an attribute names
+    is EMITTED, ledger 607) → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

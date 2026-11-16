@@ -327,13 +327,13 @@ void reportArtifactWritten(std::string const& targetSpec,
     // this line reported `C:\host\share\…` for an artifact written to
     // `\\host\share\…` — a diagnostic naming a file that is not there, which is
     // worse than losing the absolute guarantee it was written to protect.
-    fs::path abs = core::absoluteKeepingRoot(outPath, ec);
+    core::HostPath abs = core::absoluteKeepingRoot(outPath, core::Use::Leaf, ec);   // the artifact: a FILE
     // Not a silent fallback: `outPath` IS the path the writer committed to, so
     // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
     // only when the process has no usable cwd to resolve against.
     if (ec) abs = outPath;
     std::cerr << "dsscp: artifact " << targetSpec << ' '
-              << artifactPathForReport(core::normalizeKeepingRoot(abs))
+              << core::normalizeKeepingRoot(abs, core::Use::Leaf).spelling().generic()
               << '\n';
 }
 
@@ -694,7 +694,11 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
                  ? (*outputDir / formatName)
                  : *outputDir;
     }
-    return fs::current_path() / "target" / formatName;
+    // The home's answer (H6c), as the text the output route keeps until H6d types it.
+    std::error_code ec;
+    fs::path const  cwd = core::storeRouteCurrentDirectory(ec);
+    if (ec) throw fs::filesystem_error("the current directory could not be read", ec);
+    return cwd / "target" / formatName;
 }
 
 // D-AP2-OUTPUT-ROUTING (`output` field): do two output-dir BASES name the same
@@ -719,10 +723,12 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
 [[nodiscard]] bool sameOutputBase(fs::path const& a, fs::path const& b) {
     std::error_code ecA;
     std::error_code ecB;
-    fs::path const absA = core::absoluteKeepingRoot(a, ecA);
-    fs::path const absB = core::absoluteKeepingRoot(b, ecB);
+    // VALUES (H6c): two output-dir BASES, each a DIRECTORY (Container), compared by their normal forms' text.
+    core::HostPath const absA = core::absoluteKeepingRoot(a, core::Use::Container, ecA);
+    core::HostPath const absB = core::absoluteKeepingRoot(b, core::Use::Container, ecB);
     if (ecA || ecB) return false;
-    return core::normalizeKeepingRoot(absA) == core::normalizeKeepingRoot(absB);
+    return core::normalizeKeepingRoot(absA, core::Use::Container).spelling().display()
+           == core::normalizeKeepingRoot(absB, core::Use::Container).spelling().display();
 }
 
 // Compile one resolved (CU, target, format) triple to one artifact.
@@ -1188,10 +1194,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // does to one side it does to the other; and it drops a `.` component as
     // `lexically_normal()` does, so the `--output .` repair described above is
     // untouched.
-    auto const containmentBasis =
-        core::normalizeKeepingRoot(outDir / "dss-containment-probe")
-            .parent_path();
-    if (core::normalizeKeepingRoot(outPath).parent_path() != containmentBasis) {
+    // VALUES (H6c): the directory each FILE is in -- the one cut, `containingDirectory` -- compared by text.
+    std::string const containmentBasis =
+        core::containingDirectory(core::normalizeKeepingRoot(outDir / "dss-containment-probe", core::Use::Leaf))
+            .spelling().display();
+    if (core::containingDirectory(core::normalizeKeepingRoot(outPath, core::Use::Leaf)).spelling().display()
+        != containmentBasis) {
         emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
                    "artifact name '" + artifactName.value_or(sourceStem)
                    + "' resolves outside the output directory '"
@@ -1732,6 +1740,17 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // driver never exits 1 with ZERO output. A no-op on the happy path and on
     // every genuine (already-reported) failure. Mirrors the optimizer's
     // X_OptReturnFalseWithoutDiagnostic belt-and-suspenders guard.
+    // ★ A SEVERAL-UNIT STEP NAMES EACH SILENT UNIT ITSELF (P69 H6c, R4): `substrate::runEveryUnitReportingSilence`
+    // asks the count before EACH unit and calls this for a unit that failed having said nothing -- one snapshot
+    // for the whole build let an earlier unit's error hide a later unit's silence.
+    auto const emitSilentUnit = [&](char const* where, std::size_t unit) {
+        std::string_view const name = unit < cus.size() ? cus[unit].primarySourceName() : std::string_view{};
+        emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                   std::string{"internal: "} + where + " of unit " + std::to_string(unit)
+                       + (name.empty() ? std::string{} : " ('" + std::string{name} + "')")
+                       + " returned a null module without reporting any diagnostic — substrate-contract "
+                         "violation: a failing tier must say why.");
+    };
     auto const errorsBeforeCuBuild = reporter.errorCount();
     auto const emitNullNoDiagnostic = [&](char const* where) {
         if (reporter.errorCount() == errorsBeforeCuBuild) {
@@ -1942,20 +1961,26 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             if ((*formatR)->isStaticArchive()) {
                 std::vector<AssembledModule> units;
                 units.reserve(cus.size());
-                // EVERY unit is assembled and reports its own errors before the build fails (`runEveryUnit`, the one
-                // home: P69 H6b, the review of H6's N1), and nothing is packaged when any unit failed. The fail-loud
-                // net stays, and fires only when nothing was reported at all.
-                bool const everyUnitAssembled = substrate::runEveryUnit(cus.size(), [&](std::size_t i) {
-                    auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
-                                                reporter, perCuOpts);
-                    if (!unit) {
-                        emitNullNoDiagnostic("the assembly unit build "
-                                             "(assembleAsmUnit)");
-                        return false;
-                    }
-                    units.push_back(std::move(*unit));
-                    return true;
-                });
+                // EVERY unit is assembled and reports its own errors before the build fails (the one home: P69 H6b,
+                // the review of H6's N1), and a unit that fails having said nothing is named, per unit (its netted
+                // form, H6c R4).
+                bool const everyUnitAssembled = substrate::runEveryUnitReportingSilence(
+                    cus.size(),
+                    [&](std::size_t i) {
+                        auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
+                                                    reporter, perCuOpts);
+                        if (!unit) return false;
+                        units.push_back(std::move(*unit));
+                        return true;
+                    },
+                    [&] { return reporter.errorCount(); },
+                    [&](std::size_t i) { emitSilentUnit("the assembly unit build (assembleAsmUnit)", i); });
+                // PACKAGING'S PRECONDITION, NOT A SECOND COPY OF THE WRITER'S DECISION (P69 H6c, ledger 576 (2)):
+                // the step names member i after unit i's source (`packageUnitsAsStaticArchive`), so it takes EVERY
+                // unit's module or none -- packaging the units that assembled would name a member after another
+                // unit's source. A build any unit failed hands the writer nothing, so there is no archive for
+                // `link::writeBytes` to withhold (no K_ArtifactWithheldAfterError);
+                // ArchivePackaging.EveryUnitsErrorsAreReportedAndABuildAnyUnitFailedWritesNoArchive asserts it.
                 if (!everyUnitAssembled) return std::nullopt;
                 if (analysisOnly) return std::nullopt;
                 return packageUnitsAsStaticArchive(std::move(units));
@@ -2115,14 +2140,16 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // failing build surfaces every CU's errors deterministically (not just the first-to-
         // fail's — an improvement the parallel model makes free: every CU is always built). The verb is
         // `runEveryUnit`, the one home every several-unit step takes (P69 H6b).
-        bool const allBuilt = substrate::runEveryUnit(cus.size(), [&](std::size_t i) {
-            copyDiagnostics(cuScratch[i], reporter);
-            return cuMirSlots[i].has_value();
-        });
-        if (!allBuilt) {
-            emitNullNoDiagnostic("a per-CU build (buildCuMir)");
-            return std::nullopt;  // ≥1 front-half tier failure — all diagnostics reported
-        }
+        // Each unit that failed having said nothing is named (the netted form, H6c R4).
+        bool const allBuilt = substrate::runEveryUnitReportingSilence(
+            cus.size(),
+            [&](std::size_t i) {
+                copyDiagnostics(cuScratch[i], reporter);
+                return cuMirSlots[i].has_value();
+            },
+            [&] { return reporter.errorCount(); },
+            [&](std::size_t i) { emitSilentUnit("a per-CU build (buildCuMir)", i); });
+        if (!allBuilt) return std::nullopt;  // ≥1 front-half tier failure — every unit's diagnostics reported
     }
 
     // ── D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: THE MEASURE-ONLY STOP ──
@@ -2169,8 +2196,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // EVERY member is built and reports its own errors before the build
         // fails (`runEveryUnit`, the several-unit class's one home: P69 H6b, the
         // review of H6's N1; this loop is site (a) of the orchestrator's ledger
-        // 550, fold 3e), and nothing is packaged when any member failed.
-        bool const everyMemberBuilt = substrate::runEveryUnit(cuMirs.size(), [&](std::size_t i) {
+        // 550, fold 3e), and nothing is packaged when any member failed. A member
+        // that failed having said nothing is named, per unit (the netted form, H6c
+        // R4): the single-unit route names a silent `lowerCuMirToAssembly` null, and
+        // this loop failed the build on one with nothing said.
+        bool const everyMemberBuilt = substrate::runEveryUnitReportingSilence(cuMirs.size(), [&](std::size_t i) {
             // P10: a static-archive member is the FINAL module of its own
             // artifact (nothing downstream merges it — the foreign linker
             // pulls members whole), so it gets the PROGRAM-stage schedule
@@ -2211,7 +2241,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             if (!mod) return false;  // back-half tier failure already reported
             units.push_back(std::move(*mod));
             return true;
-        });
+        },
+            [&] { return reporter.errorCount(); },
+            [&](std::size_t i) {
+                emitSilentUnit("a static-archive member's build (shims, optimizeModule, lowerCuMirToAssembly)", i);
+            });
         if (!everyMemberBuilt) return std::nullopt;
         // The members are packaged by the one step every unit enters (`packageUnitsAsStaticArchive`,
         // above the `encode` route): the archive-wide visibility, the names, the input archives and objects.
@@ -3298,7 +3332,7 @@ class LanguageBlockExtensionReader {
 // failure, so a broken sibling document never became a claimant then and does
 // not now.
 [[nodiscard]] std::vector<std::string> declaredFileExtensionsOf(fs::path const& doc) {
-    std::ifstream in{core::extendedLengthSpelling(doc), std::ios::binary};
+    std::ifstream in = core::openInputStream(doc, std::ios::binary);
     if (!in) return {};
     LanguageBlockExtensionReader reader;
     // The return value is DELIBERATELY ignored: `false` means either "we aborted
@@ -3660,8 +3694,8 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
     std::vector<fs::path> descriptors;
     auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
         if (entry.reaches == core::EntryKind::File
-            && asciiLowerCopy(entry.path.extension().generic_string()) == ".json")
-            descriptors.push_back(entry.path);
+            && asciiLowerCopy(entry.at.extension().generic_string()) == ".json")
+            descriptors.push_back(entry.storeRoutePath);   // the descriptor store's text (H6d makes it a value)
         return core::WalkStep::Continue;
     });
     if (walk.error) {
@@ -3669,7 +3703,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
                    "shipped-source realization: the descriptor corpus at '"
                    + core::genericSpelling(descriptorDir)
                    + "' could not be walked (stopped at '"
-                   + core::genericSpelling(walk.where) + "': " + walk.error.message()
+                   + walk.where.spelling().generic() + "': " + walk.error.message()
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
                      "cache keys on their CONTENT (the unit includes their "
@@ -3681,7 +3715,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
             dss::ffi::readShippedSourcesForFormat(descriptor, formatKey);
         if (declared.empty()) continue;
         std::error_code relEc;
-        fs::path const rel = core::reachedRelative(descriptor, configRoot, relEc);
+        fs::path const rel = core::reachedRelative(descriptor, core::Use::Leaf, configRoot, relEc);
         // A descriptor outside the config root cannot be spelled
         // config-root-relatively, and the key document's whole point is that it
         // is portable between an installed tree and a source tree — so the
@@ -3723,7 +3757,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
 // stored artifact host-dependent under a key that says it is not.
 [[nodiscard]] std::optional<std::vector<std::uint8_t>>
 readWholeBinaryFile(fs::path const& path) {
-    std::ifstream in(core::extendedLengthSpelling(path), std::ios::binary);
+    std::ifstream in = core::openInputStream(path, std::ios::binary);
     if (!in) return std::nullopt;
     std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                     std::istreambuf_iterator<char>()};
@@ -3849,7 +3883,7 @@ public:
     [[nodiscard]] fs::path const& dir() {
         if (!dir_.empty()) return dir_;
         std::error_code    ec;
-        fs::path const     base = fs::temp_directory_path(ec);
+        fs::path const     base = core::storeRouteTemporaryDirectory(ec);   // the home's answer, the staging route's text (H6d)
         if (ec) {   // still empty ⇒ the caller reports the failure
             failure_ = "the system temporary directory is unknown (" + ec.message() + ")";
             return dir_;
@@ -3922,7 +3956,7 @@ void appendSchemaDocuments(
         std::string{label}, std::move(path), std::string{digest}});
     for (auto const& dep : referenced) {
         std::error_code relEc;
-        fs::path const  rel = core::reachedRelative(fs::path{dep.path}, configRoot, relEc);
+        fs::path const  rel = core::reachedRelative(fs::path{dep.path}, core::Use::Leaf, configRoot, relEc);
         out.push_back(dss::runtime::LoadedConfigDocument{
             std::string{label} + "-ref",
             (relEc || rel.empty()) ? dep.path : rel.generic_string(),
@@ -4291,7 +4325,7 @@ buildDependencyArtifactKey(
                                      / (std::string{buildFormat.name()}
                                         + ".format.json");
             std::error_code relEc;
-            fs::path const  rel = core::reachedRelative(formatDoc, configRoot, relEc);
+            fs::path const  rel = core::reachedRelative(formatDoc, core::Use::Leaf, configRoot, relEc);
             std::string const spelling =
                 (relEc || rel.empty()) ? core::genericSpelling(formatDoc)
                                        : rel.generic_string();
@@ -4533,7 +4567,8 @@ buildDependencyArtifactKey(
             stagingRoot / fs::path{claim.source}.stem();
         std::error_code mkEc;
         static_cast<void>(core::createDirectories(unitDir, mkEc));   // at any length
-        if (std::error_code dirEc; mkEc && core::reachedKind(unitDir, dirEc) != core::EntryKind::Directory) {
+        if (std::error_code dirEc;
+            mkEc && core::reachedKind(unitDir, core::Use::Container, dirEc) != core::EntryKind::Directory) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: could not create the "
                        "staging directory '" + core::genericSpelling(unitDir)
@@ -6587,7 +6622,7 @@ int Program::compileProject(
     if (!resolved->mergedSources.empty()) {
         std::set<core::PathIdentity> seen;
         auto const key = [](std::string const& s) {
-            return core::PathIdentity::of(fs::path{s});
+            return core::PathIdentity::of(fs::path{s}, core::Use::Leaf);   // a source: a FILE
         };
         for (auto const& s : expandedSources) seen.insert(key(s));
         expandedSources.reserve(expandedSources.size()
@@ -6741,7 +6776,7 @@ void applyIncludeDirs(UnitBuilder& builder,
         // local drive with no error, so the search dir named a directory that
         // cannot exist and the header missed 0/30 for BOTH slash spellings while
         // the acceptance check, which saw the ORIGINAL string, stayed silent.
-        fs::path const abs = core::absoluteKeepingRoot(fs::path{d}, ec);
+        fs::path const abs = core::storeRouteAbsolute(fs::path{d}, ec);   // the header lists' text (H6d)
         builder.addIncludeDir(ec ? fs::path{d} : abs);
         ec.clear();
     }
@@ -7131,7 +7166,7 @@ int Program::emitHirText(
     // compared byte-for-byte by its consumers (and by this repo's goldens), so a
     // host-dependent line ending would make the same compiler produce two
     // different files for one input.
-    std::ofstream o{core::extendedLengthSpelling(fs::path{path}), std::ios::binary | std::ios::trunc};
+    std::ofstream o = core::openOutputStream(fs::path{path}, std::ios::binary | std::ios::trunc);
     if (!o) {
         err << "error: --emit-hir: could not open '" << path
             << "' for writing.\n";

@@ -300,18 +300,15 @@ namespace detail {
 // `_open_osfhandle` succeeds, so the failure paths below must not also
 // `CloseHandle` — that would be a double close.
 [[nodiscard]] std::FILE*
-createExclusiveBinary(std::filesystem::path const& p) {
+createExclusiveBinary(core::HostPath const& p) {
 #ifdef _WIN32
-    // At any length: the extended-length spelling (`core::extendedLengthSpelling`; a plain one of 260 or more opens
-    // nothing on a Windows that has not opted into long paths).
-    HANDLE const h = ::CreateFileW(
-        core::extendedLengthSpelling(p).c_str(),
+    // Through the home (`core::openHandle`, H6c A4): the value's LEAF reference, at any length; not inheritable.
+    HANDLE const h = static_cast<HANDLE>(core::openHandle(
+        p,
         GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,                                    // bInheritHandle = FALSE
         CREATE_NEW,                                 // the exclusive claim
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-        nullptr);
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT));
     if (h == INVALID_HANDLE_VALUE) { return nullptr; }
     int const fd =
         ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), _O_WRONLY | _O_BINARY);
@@ -328,13 +325,13 @@ createExclusiveBinary(std::filesystem::path const& p) {
 #else
     // 0666 & umask — the same permissions `fopen` would have created, so
     // `writeImage`'s load-bearing re-apply (D-OUTPUT-EXEC-BIT) is unaffected.
-    int const fd =
-        ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    int const fd = core::openDescriptor(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);   // through the home (A4)
     if (fd < 0) { return nullptr; }
     std::FILE* const f = ::fdopen(fd, "wb");
     if (!f) {
         ::close(fd);
-        ::unlink(p.c_str());
+        std::error_code removed;
+        static_cast<void>(core::removeEntry(p, removed));
     }
     return f;
 #endif
@@ -396,6 +393,9 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
     }
 }
 
+// A VALUE's name (H6c): its rendering, which never throws (a name no encoding accepts is rendered losslessly).
+[[nodiscard]] std::string pathForDiag(core::HostPath const& p) { return p.spelling().generic(); }
+
 // Delete the staging temp on a failure path and return a note to APPEND to
 // the caller's primary diagnostic. Returns an empty string on success.
 //
@@ -407,7 +407,7 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 // the leak. Never returns a "success" indication that would let the caller
 // report the write as clean.
 [[nodiscard]] std::string
-removeTempNote(std::filesystem::path const& tempPath) {
+removeTempNote(core::HostPath const& tempPath) {
     std::error_code ec;
     static_cast<void>(core::removeEntry(tempPath, ec));   // at any length (`core::removeEntry`)
     if (!ec) {
@@ -502,21 +502,6 @@ namespace {
 
 #ifdef _WIN32
 
-// `FileRenameInfoEx` (Windows 10 RS1) is SPELLED BY VALUE because MinGW-w64's
-// FILE_INFO_BY_HANDLE_CLASS ends before it at every version: ✔MEASURED
-// 2026-10-28, MinGW-w64 13.2 at _WIN32_WINNT 0x0601, 0x0A00 and 0x0A00 with
-// NTDDI_VERSION RS5 (probe-reference-cc run 20261028-215651-aa544959). The
-// Windows SDK's headers declare it (MSVC 19.51, run 20261028-215632-ef25bfcc),
-// and there the value is the header's, by the assert. Everything else the
-// rename hands over is the headers' own on both toolchains at the version the
-// build declares (the top-level CMakeLists): FILE_RENAME_INFO with its RS1
-// `Flags` member (the union with the classic class's `ReplaceIfExists`) and the
-// FILE_RENAME_FLAG_* flags (runs 20261028-220157-d478c33e and
-// 20261028-220208-b3938c42).
-constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
-#ifndef __MINGW32__
-static_assert(FileRenameInfoEx == kFileRenameInfoEx);
-#endif
 
 // The Win32 error BY NUMBER first: the text is localized (this workstation's is
 // Portuguese) and the number is what a report can be searched on — the same
@@ -526,39 +511,6 @@ static_assert(FileRenameInfoEx == kFileRenameInfoEx);
          + std::system_category().message(static_cast<int>(error)) + ")";
 }
 
-// Rename the file behind `staged` — a handle with DELETE access — to `target`,
-// replacing whatever is there. `posix` selects `FileRenameInfoEx` with POSIX
-// semantics, else the classic `FileRenameInfo`, the replace `MoveFileExW`
-// performs. ✔MEASURED: the name is resolved the way `MoveFileExW` resolves it —
-// forward slashes, a bare relative name and a `..` component all land against
-// the current directory — so `target` is handed over in its extended-length
-// spelling (`core::extendedLengthSpelling`: that same resolution, then `\\?\`),
-// which names it at any length where a plain one of 260 or more names nothing.
-[[nodiscard]] DWORD renameByHandle(HANDLE                       staged,
-                                   std::filesystem::path const& target,
-                                   bool                         posix) {
-    std::wstring const  name  = core::extendedLengthSpelling(target).native();
-    std::size_t const   bytes =
-        offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(WCHAR);
-    // `std::uint64_t` storage so the HANDLE member is aligned whatever the size.
-    std::vector<std::uint64_t> storage(
-        (bytes + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t), 0);
-    auto* const info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-    // The classic class reads byte 0 as `ReplaceIfExists`, so TRUE lands there.
-    info->Flags = posix ? DWORD{FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS}
-                        : DWORD{TRUE};
-    info->RootDirectory  = nullptr;
-    info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(WCHAR));
-    std::memcpy(info->FileName, name.c_str(), (name.size() + 1) * sizeof(WCHAR));
-    if (::SetFileInformationByHandle(staged,
-                                     posix ? kFileRenameInfoEx : FileRenameInfo,
-                                     info, static_cast<DWORD>(bytes))) {
-        return ERROR_SUCCESS;
-    }
-    DWORD const error = ::GetLastError();
-    // A failed call must never read as a success, whatever the slot holds.
-    return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error;
-}
 
 // The answers that mean the VOLUME (or an OS older than the class) cannot
 // rename with POSIX semantics — so the classic replace is the one to make. The
@@ -587,12 +539,12 @@ enum class RefusalKind : std::uint8_t {
 // file (classic disposition, a holder still open) answers 5 here and to both
 // replaces, and is gone once its last handle closes — and is NOT held when
 // nothing is at the name at all: then the 5 came from elsewhere (an ACL).
-[[nodiscard]] RefusalKind classifyRefusal(DWORD                        error,
-                                          bool                         onStaged,
-                                          std::filesystem::path const& target) {
+[[nodiscard]] RefusalKind classifyRefusal(DWORD                 error,
+                                          bool                  onStaged,
+                                          core::HostPath const& target) {
     if (error == ERROR_SHARING_VIOLATION) return RefusalKind::Holder;
     if (error != ERROR_ACCESS_DENIED || onStaged) return RefusalKind::Other;
-    DWORD const attributes = ::GetFileAttributesW(core::extendedLengthSpelling(target).c_str());
+    DWORD const attributes = core::fileAttributes(target);   // through the home (A4)
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         DWORD const why = ::GetLastError();
         return (why == ERROR_FILE_NOT_FOUND || why == ERROR_PATH_NOT_FOUND)
@@ -650,7 +602,7 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
     return pathForDiag(std::filesystem::path{image}) + " " + id;
 }
 
-[[nodiscard]] std::string describeHolders(std::filesystem::path const& file) {
+[[nodiscard]] std::string describeHolders(core::HostPath const& file) {
     auto const query = reinterpret_cast<NtQueryInformationFileFn>(
         reinterpret_cast<void (*)()>(::GetProcAddress(
             ::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
@@ -658,11 +610,9 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
         return "the holders could not be listed (ntdll exports no "
                "NtQueryInformationFile)";
     }
-    HANDLE const handle = ::CreateFileW(
-        core::extendedLengthSpelling(file).c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-        nullptr);
+    HANDLE const handle = static_cast<HANDLE>(core::openHandle(   // through the home (A4)
+        file, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS));
     if (handle == INVALID_HANDLE_VALUE) {
         return "the holders could not be listed (" + windowsError(::GetLastError()) + ")";
     }
@@ -703,8 +653,8 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
                                          bool                         posix,
                                          std::uint32_t                holderRefusals,
                                          std::chrono::milliseconds    waited,
-                                         std::filesystem::path const& staged,
-                                         std::filesystem::path const& target) {
+                                         core::HostPath const&        staged,
+                                         core::HostPath const&        target) {
     std::string text = windowsError(error);
     if (onStaged) {
         text += " opening the staged file '" + pathForDiag(staged) + "' for the rename";
@@ -743,8 +693,8 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
 
 namespace detail {
 
-CommitOutcome commitReplacing(std::filesystem::path const& staged,
-                              std::filesystem::path const& target,
+CommitOutcome commitReplacing(core::HostPath const& staged,
+                              core::HostPath const& target,
                               CommitPatience const&        patience) {
     CommitOutcome outcome;
 #ifdef _WIN32
@@ -761,20 +711,20 @@ CommitOutcome commitReplacing(std::filesystem::path const& staged,
         // FILE_FLAG_OPEN_REPARSE_POINT renames the ENTRY, as `MoveFileExW`
         // does, never a link's target.
         if (handle == INVALID_HANDLE_VALUE) {
-            handle = ::CreateFileW(core::extendedLengthSpelling(staged).c_str(), DELETE | SYNCHRONIZE,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                   nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
-                                   nullptr);
+            handle = static_cast<HANDLE>(core::openHandle(staged, DELETE | SYNCHRONIZE,   // through the home (A4)
+                                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                          OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT));
         }
         if (handle == INVALID_HANDLE_VALUE) {
             error    = ::GetLastError();
             onStaged = true;
         } else {
             onStaged = false;
-            error    = renameByHandle(handle, target, posix);
+            // The commit BY HANDLE, at the home (`core::commitByHandle`, A4): the target's LEAF reference.
+            error    = static_cast<DWORD>(core::commitByHandle(handle, target, posix));
             if (posix && posixRenameUnavailable(error)) {
                 posix = false;
-                error = renameByHandle(handle, target, false);
+                error = static_cast<DWORD>(core::commitByHandle(handle, target, false));
             }
             if (error == ERROR_SUCCESS) {
                 ::CloseHandle(handle);
@@ -806,7 +756,7 @@ CommitOutcome commitReplacing(std::filesystem::path const& staged,
     // there is no holder to wait for and `patience` is never asked.
     (void)patience;
     std::error_code ec;
-    std::filesystem::rename(staged, target, ec);
+    core::renameEntry(staged, target, ec);   // through the home (A4)
     if (!ec) {
         outcome.committed = true;
         return outcome;
@@ -820,8 +770,8 @@ CommitOutcome commitReplacing(std::filesystem::path const& staged,
 #endif
 }
 
-CommitOutcome commitReplacing(std::filesystem::path const& staged,
-                              std::filesystem::path const& target) {
+CommitOutcome commitReplacing(core::HostPath const& staged,
+                              core::HostPath const& target) {
     // The cap runs from the FIRST refusal, so it measures the holder and never
     // the attempt before it.
     std::optional<std::chrono::steady_clock::time_point> deadline;
@@ -1018,9 +968,9 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     // re-resolved: that is another directory for a last name ending in a space or a device name, and at
     // `\\?\D:\a.exe` the volume's DEVICE. `parent` stays the caller's spelling, for the message.
     auto const parent = path.parent_path();
-    if (std::filesystem::path const level = core::containingDirectory(path); !parent.empty() && !level.empty()) {
+    if (core::HostPath const level = core::containingDirectory(path); !parent.empty() && !level.empty()) {
         std::error_code ec;
-        bool const exists = core::reachedKind(level, ec) != core::EntryKind::Absent;
+        bool const exists = core::reachedKind(level, core::Use::Container, ec) != core::EntryKind::Absent;
         if (ec) {
             emit(reporter, DiagnosticCode::K_ImageWriteParentMissing,
                  std::string{"link::writeBytes: failed to stat "
@@ -1124,8 +1074,8 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     static std::atomic<std::uint64_t> tempCounter{0};
     auto const                        seed = processSeed();
 
-    std::filesystem::path tempPath;
-    StagedFile            out;
+    core::HostPath tempPath;
+    StagedFile     out;
     for (std::uint32_t attempt = 0;; ++attempt) {
         if (attempt >= detail::kMaxClaimAttempts) {
             emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
@@ -1138,13 +1088,12 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
                        "it could clean up. Delete them and re-run.");
             return false;
         }
-        // Sibling by construction: the target path plus an ASCII suffix.
-        // `operator+=` concatenates in the path's NATIVE encoding, so this
-        // never narrows a wide path (the MSVC throw hazard `pathForDiag`
-        // documents) and never touches the directory portion.
-        auto candidate = path;
-        candidate += ".dsstmp-" + std::to_string(seed) + "-"
-                   + std::to_string(tempCounter.fetch_add(1));
+        // Sibling by construction: the target plus an ASCII suffix -- `withSuffix` (H6c, A1): the target's LEAF
+        // reference's last name extended LITERALLY, so the sibling lies in the directory the target's own write
+        // names (a target in a listed `d ` stages in `d `, never its twin), in the NATIVE encoding.
+        core::HostPath candidate = core::HostPath{path}.withSuffix(
+            std::filesystem::path{".dsstmp-" + std::to_string(seed) + "-"
+                                  + std::to_string(tempCounter.fetch_add(1))}.native());
 
         if (std::FILE* claimed = detail::createExclusiveBinary(candidate)) {
             // Take ownership FIRST: the path assignment below allocates, and
@@ -1204,7 +1153,7 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         // only for an entry it cannot examine, so a real error is never routed
         // into the retry loop.
         std::error_code eec;
-        if (core::entryKind(candidate, eec) != core::EntryKind::Absent && !eec) {
+        if (core::entryKind(candidate, core::Use::Leaf, eec) != core::EntryKind::Absent && !eec) {
             continue;
         }
         emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,

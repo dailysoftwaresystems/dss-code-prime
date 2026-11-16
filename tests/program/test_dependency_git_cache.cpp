@@ -494,10 +494,11 @@ TEST(SystemGitRunnerIsolation, AnInvalidCheckoutNeverResolvesToTheEnclosingRepos
     fs::path const project = scratch.path() / "consumer";
     fs::create_directories(project);
     auto const run = [&](std::vector<std::string> args) {
-        std::vector<std::string> argv{gitExe->string(), "-c", "user.name=dss-test",
+        // The image is the resolved git, a value; argv[0] its rendering (as git_acquire.cpp hands it, H6c).
+        std::vector<std::string> argv{gitExe->spelling().display(), "-c", "user.name=dss-test",
                                       "-c", "user.email=dss-test@example.invalid"};
         argv.insert(argv.end(), args.begin(), args.end());
-        return dss::substrate::spawnAndWaitInherit(argv, project);
+        return dss::substrate::spawnAndWaitInherit(*gitExe, argv, project);
     };
     ASSERT_EQ(run({"init", "--quiet"}).exitCode, 0);
     writeFile(project / "tracked.txt", "committed\n");
@@ -557,10 +558,10 @@ TEST(SystemGitRunnerIsolation, GitsOwnRepositoryVariablesNeverReachTheDependency
     }
     ScratchDir scratch{Location::Temp, "dep-git-environment"};
     auto const gitIn = [&](fs::path const& dir, std::vector<std::string> args) {
-        std::vector<std::string> argv{gitExe->string(), "-c", "user.name=dss-test",
+        std::vector<std::string> argv{gitExe->spelling().display(), "-c", "user.name=dss-test",
                                       "-c", "user.email=dss-test@example.invalid"};
         argv.insert(argv.end(), args.begin(), args.end());
-        return dss::substrate::spawnAndWaitInherit(argv, dir);
+        return dss::substrate::spawnAndWaitInherit(*gitExe, argv, dir);
     };
 
     // The dependency's upstream: one commit.
@@ -628,7 +629,7 @@ TEST(SystemGitRunnerIsolation, TheWithheldListCoversEverythingTheInstalledGitCal
     ScratchDir     scratch{Location::Temp, "dep-git-local-env"};
     fs::path const out = scratch.path() / "local-env-vars.txt";
     auto const     r   = dss::substrate::spawnAndWaitRedirectStdout(
-        {gitExe->string(), "rev-parse", "--local-env-vars"}, scratch.path(), out);
+        *gitExe, {gitExe->spelling().display(), "rev-parse", "--local-env-vars"}, scratch.path(), out);
     ASSERT_TRUE(r.spawned && r.exitCode == 0) << r.diagnostic;
 
     auto const&              ours = dss::gitRepositoryLocalVariables();

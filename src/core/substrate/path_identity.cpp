@@ -1,11 +1,18 @@
 #include "core/substrate/path_identity.hpp"
 
+#include "core/substrate/host_path_access.hpp"
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <iterator>
 #include <optional>
+#include <ostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -29,7 +36,8 @@
     #include <sys/stat.h>
     #include <unistd.h>
     #ifdef __APPLE__
-        #include <sys/attr.h>   // getattrlist: an entry's stored name, asked of the entry (storedEntryName)
+        #include <mach-o/dyld.h>   // _NSGetExecutablePath: the running image (runningExecutable)
+        #include <sys/attr.h>      // getattrlist: an entry's stored name, asked of the entry (storedEntryName)
     #endif
 #endif
 
@@ -104,7 +112,7 @@ template <class C>
     // 062546-4ccf610b / 062603-16841970, g++; byte-identical): CreateFileW opens `\??\<d>\d \x.txt` literally, refuses
     // a `..` and a `/` under it as `\\?\` does, CreateDirectoryW makes `d ` through it -- while GetFullPathNameW reads
     // it as rooted (`C:\??\...`), which names nothing. Its `\\?\` twin opens the same object in all 32 cells, and is
-    // what a call takes (`extendedLengthSpelling`): CreateDirectoryW refuses `\??\` past MAX_PATH (206). `/??/` is no
+    // what a call takes (`referenceSpelling`): CreateDirectoryW refuses `\??\` past MAX_PATH (206). `/??/` is no
     // prefix at all (every call refuses it, 123), so it stays rooted, as GetFullPathNameW reads it.
     if (s.size() >= 4 && s[0] == C('\\') && s[1] == C('?') && s[2] == C('?') && s[3] == C('\\')) {
         std::size_t const first = segmentEnd(s, 4, grammar, true);
@@ -336,8 +344,8 @@ template <class C>
 // segment the last (`C:\o\d \` keeps `d `, `C:\o\NUL\` is a directory). So resolution does NOT compose: the
 // resolution of a cut is not the cut of the resolution; every walk below takes the whole's spelling ONCE and cuts it.
 // These live HERE, inside the one canonicalizer, and nowhere else (check-path-identity refuses the call elsewhere):
-// integrated_tests compiles this file and carries src/ on its include path, and the test harness's spawn
-// (tests/test_support/run_binary.hpp) takes `applicationNameSpelling`, so no consumer needs a second home.
+// integrated_tests compiles this file and carries src/ on its include path, and the test harness spawns through the
+// substrate's own spawn (tests/test_support/run_binary.hpp, H6c), so no consumer needs a second home.
 
 // GetFullPathNameW of `plain`, or EMPTY when the OS refuses it (an empty spelling, one holding a NUL).
 [[nodiscard]] std::wstring osFullPath(std::wstring const& plain) {
@@ -351,38 +359,67 @@ template <class C>
     return out;
 }
 
-// How a spelling is USED, which decides what it names (P69 H6b, ledger 541): a LEAF names the object the whole
-// spelling names (an open, a kind, a removal's target); a CONTAINER names the directory every `container \ name`
-// composed from it lies in (a directory to make, to list, to start a process in) -- its CONTAINER FORM, the spelling
-// with a separator after it, which GetFullPathNameW resolves with no segment last: GetFullPathNameW(dir + `\` + name)
-// is GetFullPathNameW(dir + `\`) + name for every listed name. ✔MEASURED (the universe above): a plain step `<d>\d `
-// is made, opened and listed as `<d>\d` -- ANOTHER directory -- while `<d>\d \` is `d `; a NUL step is the device.
-enum class Use : std::uint8_t { Leaf, Container };
+// How a spelling is USED (`Use`, host_path.hpp; P69 H6b, ledger 541): a LEAF names the object the whole spelling names
+// (an open, a kind, a removal's target); a CONTAINER names the directory every `container \ name` composed from it
+// lies in (a directory to make, to list, to start a process in) -- its CONTAINER FORM, the spelling with a separator
+// after it, which GetFullPathNameW resolves with no segment last: GetFullPathNameW(dir + `\` + name) is
+// GetFullPathNameW(dir + `\`) + name for every listed name. ✔MEASURED (the universe above): a plain step `<d>\d ` is
+// made, opened and listed as `<d>\d` -- ANOTHER directory -- while `<d>\d \` is `d `; a NUL step is the device.
+
+// THE `\\?\` FORM OF A FULL SPELLING THE OS ANSWERED (GetFullPathNameW's, GetCurrentDirectoryW's, GetTempPathW's,
+// QueryFullProcessImageNameW's): `\\?\` before a drive, `\\?\UNC\` in place of a share's `\\`, `\\?\` in place of a
+// device's `\\.\` (one NT namespace: ✔MEASURED, run 20261104-215748-2946f6a6, one NT name and one file id each), a
+// verbatim answer as it is -- PREFIXED, never resolved again; EMPTY for an answer of no such form.
+[[nodiscard]] std::wstring verbatimOf(std::wstring const& full) {
+    if (full.size() >= 4 && full[0] == L'\\' && full[1] == L'\\' && full[2] == L'?' && full[3] == L'\\') return full;
+    if (full.size() >= 4 && full[0] == L'\\' && full[1] == L'\\' && full[2] == L'.' && full[3] == L'\\')
+        return L"\\\\?\\" + full.substr(4);
+    if (full.size() >= 3 && full[0] == L'\\' && full[1] == L'\\') return L"\\\\?\\UNC\\" + full.substr(2);
+    if (full.size() >= 3 && full[1] == L':' && full[2] == L'\\') return L"\\\\?\\" + full;
+    return {};
+}
+
+// `\??\` as its `\\?\` twin, anything else as it is (N4: one NT namespace; `\\?\` is what CreateDirectoryW takes past
+// MAX_PATH, and the one CreateProcessW takes at all -- it refuses `\??\`, 267).
+[[nodiscard]] std::wstring twinOf(std::wstring const& text) {
+    if (text.size() >= 4 && text[0] == L'\\' && text[1] == L'?' && text[2] == L'?' && text[3] == L'\\')
+        return L"\\\\?\\" + text.substr(4);
+    return text;
+}
+
+// A reference without the separators after its last name -- but its volume root's own, which IS the root: without it
+// `\\?\C:` is the volume's DEVICE (✔MEASURED, H6c u2 part 5: attributes ERR 87, open ERR 5).
+[[nodiscard]] std::wstring withoutTrailingSeparators(std::wstring reference) {
+    std::wstring_view const s   = reference;
+    std::size_t const       end = stepEnd(s, parseRoot(s, PathGrammar::Win32), PathGrammar::Win32);
+    reference.resize(end);
+    return reference;
+}
 
 // THE REFERENCE SPELLING of `plain` as `use` names it, taken ONCE: the spelling every Win32 call on it is handed, at
 // any length. A verbatim spelling as written (its letters are the NT name), `\??\` as its `\\?\` twin (N4: one NT
 // namespace, and `\\?\` is what CreateDirectoryW takes past MAX_PATH); any other the OS's full spelling of it -- of its
-// container form for a container, with that separator dropped again unless it is the volume root's -- prefixed:
-// `\\?\` before a drive, `\\?\UNC\` in place of a share's `\\`, `\\?\` in place of a device's `\\.\` (one NT
-// namespace: ✔MEASURED, run 20261104-215748-2946f6a6, one NT name and one file id each). `plain` as written when the
-// OS refuses it.
+// container form for a container -- in its `\\?\` form (`verbatimOf`). A CONTAINER reference carries no separator
+// after its last name but at a volume root (a caller that hands a directory on with its separator -- the spawn --
+// appends it). `plain` as written when the OS refuses it.
+// ★ R8 (H6c): a container whose RELATIVE PART IS EMPTY -- a bare drive-relative `X:` -- is the LEAF resolved, the
+// separator after it: `X:` + `\` is the drive's ROOT, where `X:` names the drive's own directory. ✔MEASURED, H6c u3
+// parts 6 and 7: with the process in <S> on drive X, GetFullPathNameW(`X:`) is <S> and GetFullPathNameW(`X:\`) the
+// root; FindFirstFileW(`X:*`) lists <S>, and a spawn in `X:` starts in <S>; another drive with a volume follows its
+// `=X:` variable (its root when that is unset). (The empty spelling is `.` as a container: HostPathAccess::reference.)
 [[nodiscard]] std::wstring referenceSpelling(std::wstring const& plain, Use use) {
     if (plain.empty()) return plain;
-    RootSpelling const root = parseRoot(std::wstring_view{plain}, PathGrammar::Win32);
-    if (root.kind == RootSpelling::Kind::Verbatim)
-        return plain[1] == L'?' ? L"\\\\?\\" + plain.substr(4) : plain;   // `\??\` -> its `\\?\` twin
-    bool const         container = use == Use::Container && !separatesIn(plain.back(), PathGrammar::Win32, false);
-    std::wstring const full      = osFullPath(container ? plain + L'\\' : plain);
-    std::wstring       out;
-    if (full.size() >= 4 && full[0] == L'\\' && full[1] == L'\\' && full[2] == L'?' && full[3] == L'\\') out = full;
-    else if (full.size() >= 4 && full[0] == L'\\' && full[1] == L'\\' && full[2] == L'.' && full[3] == L'\\')
-        out = L"\\\\?\\" + full.substr(4);
-    else if (full.size() >= 3 && full[0] == L'\\' && full[1] == L'\\') out = L"\\\\?\\UNC\\" + full.substr(2);
-    else if (full.size() >= 3 && full[1] == L':' && full[2] == L'\\') out = L"\\\\?\\" + full;
-    else return plain;
-    if (container && out.size() > parseRoot(std::wstring_view{out}, PathGrammar::Win32).volume && out.back() == L'\\')
-        out.pop_back();
-    return out;
+    RootSpelling const root      = parseRoot(std::wstring_view{plain}, PathGrammar::Win32);
+    bool const         container = use == Use::Container;
+    if (root.kind == RootSpelling::Kind::Verbatim) {
+        std::wstring twin = twinOf(plain);
+        return container ? withoutTrailingSeparators(std::move(twin)) : twin;
+    }
+    bool const bareDrive = root.kind == RootSpelling::Kind::DriveRelative && root.prefix == plain.size();
+    bool const appended  = container && !bareDrive && !separatesIn(plain.back(), PathGrammar::Win32, false);
+    std::wstring out     = verbatimOf(osFullPath(appended ? plain + L'\\' : plain));
+    if (out.empty()) return plain;
+    return container ? withoutTrailingSeparators(std::move(out)) : out;
 }
 
 // THE LEVEL ABOVE THE LAST NAME of a reference spelling, cut LITERALLY (only `\` separates under `\\?\`; never into
@@ -437,17 +474,15 @@ enum class Use : std::uint8_t { Leaf, Container };
 // ★ THE WALK STOPS AT THE VOLUME ROOT `rootSpelling` parses (P69 H6), as `reachedPath`'s does: the library's
 // `parent_path()` steps from `\\?\C:\x` onto `\\?\C:` -- the volume's device -- and splits a verbatim spelling at a `/`
 // Win32 reads as a character.
-// ★ ITS HEADS ARE LITERAL CUTS OF THE WHOLE'S REFERENCE SPELLING, TAKEN ONCE (P69 H6b): an absolute spelling is walked
-// in its leaf reference (`referenceSpelling`, at any length) and the answer -- verbatim -- is given back in the DOS
-// form wherever that form names the same file, as `reachedPath` gives its own. A head re-resolved as a whole names
-// ANOTHER directory when its last name ends in a space or is a device name (✔MEASURED, the universe above). A
-// relative spelling is walked as written: its answer is relative, and stays so.
-[[nodiscard]] std::wstring expandShortComponents(std::wstring const& given) {
-    RootSpelling::Kind const kind = rootSpelling(std::wstring_view{given}, PathGrammar::Win32).kind;
-    bool const absolute = kind == RootSpelling::Kind::Drive || kind == RootSpelling::Kind::Share
-                       || kind == RootSpelling::Kind::Device || kind == RootSpelling::Kind::Verbatim;
-    std::wstring const in       = absolute ? referenceSpelling(given, Use::Leaf) : given;
-    auto const         answered = [&](std::wstring out) { return in == given ? out : dosSpellingOf(out); };
+// ★ ITS HEADS ARE LITERAL CUTS OF A REFERENCE, TAKEN ONCE (P69 H6b; H6c R10): it is handed a value's reference --
+// absolute for EVERY kind of spelling, since the reference rule resolves a relative, rooted or drive-relative one --
+// and the answer is given back in the DOS form wherever that form names the same file, as `reachedPath` gives its own.
+// A head re-resolved as a whole names ANOTHER directory when its last name ends in a space or is a device name
+// (✔MEASURED, the universe above); and a spelling-walk of the non-absolute kinds "as written" re-resolved each head
+// against the process's directories -- the review of H6b's R10, the class's own defect, no boundary.
+[[nodiscard]] std::wstring expandShortComponents(std::wstring const& reference) {
+    std::wstring const& in       = reference;
+    auto const          answered = [](std::wstring out) { return dosSpellingOf(out); };
     if (auto const whole = longNameOrEmpty(in); !whole.empty()) return answered(whole);
 
     std::wstring_view const s       = in;
@@ -467,7 +502,7 @@ enum class Use : std::uint8_t { Leaf, Container };
     std::size_t       tailBegin = tailEnd;
     for (bool first = true;; first = false) {
         // Ask the head -- the whole once more only when separators were trimmed from it.
-        if (headEnd == 0) return given;   // a relative spelling with nothing left to ask
+        if (headEnd == 0) return answered(in);   // a reference the OS refused to resolve: nothing left to ask
         if (!first || headEnd != in.size()) {
             if (auto const expanded = longNameOrEmpty(in.substr(0, headEnd)); !expanded.empty()) {
                 std::wstring out = expanded;
@@ -479,7 +514,7 @@ enum class Use : std::uint8_t { Leaf, Container };
             }
         }
         std::size_t const parent = parentEnd(s, headEnd, root, PathGrammar::Win32);
-        if (parent == std::wstring_view::npos) return given;   // nothing of it expands, its volume root included
+        if (parent == std::wstring_view::npos) return answered(in);   // nothing of it expands, its volume root included
         tailBegin = nameBegin(s, parent, root, PathGrammar::Win32);
         headEnd   = parent;
     }
@@ -496,7 +531,196 @@ enum class Use : std::uint8_t { Leaf, Container };
     return drive ? verbatim.substr(4) : verbatim;
 }
 
+// ════ COMPOSITION, THE ONE WAY A CHILD IS SPELLED (P69 H6c, B1: only a LISTED name composes literally) ════
+
+// A reference extended by one LISTED (or literal) name: only `\` separates under `\\?\`, and a name is never resolved.
+[[nodiscard]] std::wstring below(std::wstring const& reference, std::wstring const& name) {
+    if (reference.empty() || reference.back() == L'\\') return reference + name;
+    return reference + L'\\' + name;
+}
+
+// A text extended by a RELATIVE right side, as written: a separator between them unless the text ends in one or is a
+// bare drive (`X:` and `x` are `X:x`, the drive's own directory's `x`). Never the library's `operator/`, whose root
+// model is not the home's (`rootSpelling`'s header).
+[[nodiscard]] std::wstring composedText(std::wstring const& text, std::wstring const& right) {
+    if (text.empty()) return right;
+    RootSpelling const root      = parseRoot(std::wstring_view{text}, PathGrammar::Win32);
+    bool const         bareDrive = root.kind == RootSpelling::Kind::DriveRelative && root.prefix == text.size();
+    if (bareDrive || separatesIn(text.back(), PathGrammar::Win32, root.kind == RootSpelling::Kind::Verbatim))
+        return text + right;
+    return text + L'\\' + right;
+}
+
+// THE TEXT OF A MADE CHILD (H6c, A7 and B1) -- the parent's text extended by the literal `name` of the child whose
+// reference is `childReference`, so that the text NAMES, in this process, what the reference names: below a VERBATIM
+// text, `\` and the name (literal there too); below a DOS text, the name composed on, exactly where the name keeps its
+// meaning in a DOS spelling (`dosSpellingNamesTheSameFile`, the home's conservative rule: every reserved name and every
+// trailing period or space is unsafe); otherwise the child's own reference, verbatim. A `\??\` text is its `\\?\` twin.
+[[nodiscard]] std::wstring childText(std::wstring const& parentText, std::wstring const& childReference,
+                                     std::wstring const& name) {
+    if (parseRoot(std::wstring_view{parentText}, PathGrammar::Win32).kind == RootSpelling::Kind::Verbatim)
+        return below(twinOf(parentText), name);
+    if (!parentText.empty() && dosSpellingNamesTheSameFile(name)) return composedText(parentText, name);
+    return childReference;
+}
+
+// THE NAMES OF A TYPED RELATIVE RIGHT SIDE (B1): split at `\` and `/`, an empty name and `.` dropped, a `..` taking
+// the name before it -- and, with none before it, counted: each LEADING `..` is one cut of the left (`levelAbove`).
+struct TypedNames {
+    std::size_t               cuts = 0;
+    std::vector<std::wstring> names;
+};
+[[nodiscard]] TypedNames typedNames(std::wstring_view right) {
+    TypedNames  out;
+    std::size_t at = 0;
+    while (at <= right.size()) {
+        std::size_t end = at;
+        while (end < right.size() && right[end] != L'\\' && right[end] != L'/') ++end;
+        std::wstring_view const name = right.substr(at, end - at);
+        if (name == L"..") {
+            if (out.names.empty()) ++out.cuts;
+            else out.names.pop_back();
+        } else if (!name.empty() && name != L".") {
+            out.names.emplace_back(name);
+        }
+        at = end + 1;
+    }
+    return out;
+}
+
+// A TYPED RELATIVE right side below a MADE left, or a GIVEN verbatim one (B1; a GIVEN DOS left composes as the GIVEN
+// value of the whole text, which the reference rule resolves at each use: `composedTyped`) -- the left's CONTAINER
+// reference cut once per leading `..` (never past its volume root: `C:\..` is `C:\`), then:
+//   * below a VERBATIM text, the names LITERALLY, as the whole verbatim spelling `left \ right` names them. DECIDED:
+//     no reference reads a typed name below a verbatim directory (✔MEASURED, H6c u4: cl 19.52 and MinGW gcc 13.2 open
+//     NOTHING below a verbatim `-I`, in every state), and a verbatim text cannot name two objects by use, as a last
+//     `x.h ` would ask (leaf `x.h`, container `x.h `);
+//   * below a DOS text, the names by the OS's plain rule BY POSITION -- the home's own Win32 normalization, pinned equal
+//     to GetFullPathNameW, under the left TEXT's root kind: a middle name loses ONE trailing period, the LAST is
+//     resolved by use (a leaf loses every trailing period and space, and a last `NUL` is the device below every root
+//     but a share's and a device path's; a container keeps the middle rule), the two references fixed; the text is the
+//     left's, `\`, the right side AS TYPED, which names, in this process, what each reference names. ✔MEASURED, H6c
+//     u4: cl and gcc open `dir\config.h` for `#include "config.h."` (`sub./x.h` and `x.h ` alike) with the trimmed
+//     twin there, and NOTHING with the literal alone.
+[[nodiscard]] HostPath composedBelow(HostPath const& left, std::wstring const& right) {
+    std::wstring const leftText = twinOf(HostPathAccess::text(left).native());
+    std::wstring       base     = HostPathAccess::reference(left, Use::Container);
+    if (parseRoot(std::wstring_view{base}, PathGrammar::Win32).kind != RootSpelling::Kind::Verbatim)
+        return HostPath{fs::path{composedText(leftText, right)}};   // the OS refused the left: the whole text, GIVEN
+    TypedNames const typed = typedNames(right);
+    for (std::size_t i = 0; i < typed.cuts; ++i) {
+        std::wstring above = levelAbove(base);
+        if (above.empty()) break;   // the volume root
+        base = std::move(above);
+    }
+    RootSpelling const textRoot = parseRoot(std::wstring_view{leftText}, PathGrammar::Win32);
+    if (textRoot.kind == RootSpelling::Kind::Verbatim || leftText.empty()) {
+        std::wstring reference = base;
+        std::wstring text      = typed.cuts == 0 ? leftText : dosSpellingOf(base);
+        for (std::wstring const& name : typed.names) {
+            std::wstring const child = below(reference, name);
+            text      = childText(text, child, name);
+            reference = child;
+        }
+        return HostPathAccess::made(fs::path{text}, reference, reference, HostPath::Origin::Composed);
+    }
+    std::wstring rest;
+    for (std::wstring const& name : typed.names) {
+        if (!rest.empty()) rest += L'\\';
+        rest += name;
+    }
+    // The model root the names are normalized below: the left TEXT's kind decides what a last `NUL` is.
+    std::wstring const model = textRoot.kind == RootSpelling::Kind::Share    ? std::wstring{L"\\\\z\\z\\"}
+                             : textRoot.kind == RootSpelling::Kind::Device ? std::wstring{L"\\\\.\\Z:\\"}
+                                                                           : std::wstring{L"Z:\\"};
+    auto const referenceOf = [&](std::wstring const& normalized) {
+        if (normalized.size() >= model.size() && normalized.compare(0, model.size(), model) == 0) {
+            std::wstring tail = normalized.substr(model.size());
+            while (!tail.empty() && tail.back() == L'\\') tail.pop_back();
+            return tail.empty() ? base : below(base, tail);
+        }
+        // A last name resolved to a DEVICE (`\\.\NUL`): its `\\?\` form, one NT namespace.
+        std::wstring device = verbatimOf(normalized);
+        return device.empty() ? base : device;
+    };
+    std::wstring const leaf =
+        referenceOf(normalizeIn(std::wstring_view{model + rest}, PathGrammar::Win32));
+    std::wstring const container =
+        referenceOf(normalizeIn(std::wstring_view{rest.empty() ? model : model + rest + L'\\'}, PathGrammar::Win32));
+    return HostPathAccess::made(fs::path{composedText(leftText, right)}, leaf, container, HostPath::Origin::Composed);
+}
+
+// A TYPED RELATIVE right side (B1): below a GIVEN left whose text is not verbatim, the GIVEN value of the whole text --
+// the reference rule resolves it at each use, by the OS's own plain rule; below any other left, `composedBelow`.
+[[nodiscard]] HostPath composedTyped(HostPath const& left, std::wstring const& right) {
+    if (right.empty()) return left;
+    std::wstring const& text = HostPathAccess::text(left).native();
+    if (left.origin() == HostPath::Origin::Given
+        && parseRoot(std::wstring_view{text}, PathGrammar::Win32).kind != RootSpelling::Kind::Verbatim)
+        return HostPath{fs::path{composedText(text, right)}};
+    return composedBelow(left, right);
+}
+
+// UTF-16 as UTF-8 -- a lone surrogate (NTFS keeps one) as its own three bytes (WTF-8), so a name no encoding accepts
+// is rendered losslessly and the rendering never throws, as one on a diagnostic's path must not.
+[[nodiscard]] std::string wtf8Of(std::wstring_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        std::uint32_t c = static_cast<std::uint16_t>(s[i]);
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.size()) {
+            std::uint32_t const low = static_cast<std::uint16_t>(s[i + 1]);
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00);
+                ++i;
+            }
+        }
+        if (c < 0x80) {
+            out += static_cast<char>(c);
+        } else if (c < 0x800) {
+            out += static_cast<char>(0xC0 | (c >> 6));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out += static_cast<char>(0xE0 | (c >> 12));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (c >> 18));
+            out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
 #endif  // _WIN32
+
+// THE ONE GENERIC RULE (`genericSpelling`'s, `genericSpellingU8`'s, `PathText::generic`'s): the model's own separator
+// as `/` -- but in a VERBATIM spelling (H6c, A10): under `\\?\` a `/` is a character, not a separator, so a `/` written
+// there would name another file, and a verbatim text keeps its `\`. (The model's separator, never a literal backslash:
+// a POSIX name may contain one.)
+template <class S>
+void toGeneric(S& out, fs::path const& p) {
+    if constexpr (fs::path::preferred_separator != fs::path::value_type{'/'}) {
+        if (rootSpelling(p).kind == RootSpelling::Kind::Verbatim) return;
+        using Unit = typename S::value_type;
+        std::replace(out.begin(), out.end(), static_cast<Unit>(fs::path::preferred_separator), Unit{'/'});
+    } else {
+        static_cast<void>(out);
+        static_cast<void>(p);
+    }
+}
+
+// The spelling every host call on `p` takes for `use` (HostPathAccess::reference: the reference on Windows, the text
+// elsewhere) -- or, for the EMPTY spelling as a LEAF, none: `ec` is set to `invalid_argument` and the caller refuses
+// (H6c, B2: ✔MEASURED, u3 part 6, GetFullPathNameW refuses "" with ERROR_INVALID_NAME and so does a spawn in "";
+// both libraries' `status("")` answer not-found -- never "the current directory").
+[[nodiscard]] fs::path::string_type callSpelling(HostPath const& p, Use use, std::error_code& ec) {
+    fs::path::string_type reference = HostPathAccess::reference(p, use);
+    if (reference.empty()) ec = std::make_error_code(std::errc::invalid_argument);
+    return reference;
+}
 
 }  // namespace
 
@@ -517,6 +741,29 @@ fs::path parentWithinRoot(fs::path const& p) {
 std::wstring normalizedSpelling(std::wstring_view native, PathGrammar grammar) { return normalizeIn(native, grammar); }
 std::string normalizedSpelling(std::string_view native, PathGrammar grammar) { return normalizeIn(native, grammar); }
 
+fs::path typedNameBelow(fs::path const& dir, fs::path const& name, NamePosition position) {
+#ifdef _WIN32
+    std::wstring const& typed = name.native();
+    if (typed.empty() || typed.find_first_of(L"\\/") != std::wstring::npos) return name;
+    if (parseRoot(std::wstring_view{dir.native()}, PathGrammar::Win32).kind == RootSpelling::Kind::Verbatim) return name;
+    // The one normalization, below a model drive root: the trim is the same below every DOS root, and the one name it
+    // reads by root -- a last `NUL` -- is a device below a drive and comes back as typed here, as below a share.
+    std::wstring const model = L"Z:\\";
+    std::wstring const after = position == NamePosition::Middle ? std::wstring{L"\\z"} : std::wstring{};
+    std::wstring const normalized = normalizeIn(std::wstring_view{model + typed + after}, PathGrammar::Win32);
+    if (normalized.size() <= model.size() + after.size() || normalized.compare(0, model.size(), model) != 0
+        || normalized.compare(normalized.size() - after.size(), after.size(), after) != 0)
+        return name;
+    std::wstring trimmed = normalized.substr(model.size(), normalized.size() - model.size() - after.size());
+    if (trimmed.empty() || trimmed.find(L'\\') != std::wstring::npos) return name;
+    return fs::path{std::move(trimmed)};
+#else
+    static_cast<void>(dir);
+    static_cast<void>(position);
+    return name;
+#endif
+}
+
 bool dosSpellingNamesTheSameFile(std::wstring_view tail) {
     if (tail.find(L'/') != std::wstring_view::npos) return false;
     // A tail names the same file in both namespaces when the ONE normalization leaves it as it is (below a volume
@@ -531,32 +778,203 @@ bool dosSpellingNamesTheSameFile(std::wstring_view tail) {
     return true;
 }
 
-fs::path extendedLengthSpelling(fs::path const& p) {
+// ════ A PATH ON THIS HOST, AS A VALUE (host_path.hpp, host_path_access.hpp; P69 H6c) ════
+
+std::string PathText::display() const {
 #ifdef _WIN32
-    return fs::path{referenceSpelling(p.native(), Use::Leaf)};   // the OS's rule, at its one home (above)
+    return wtf8Of(text_.native());
 #else
-    return p;
+    return text_.native();
 #endif
 }
 
-fs::path containerSpelling(fs::path const& dir) {
+std::string PathText::generic() const {
+    std::string out = display();
+    toGeneric(out, text_);
+    return out;
+}
+
+std::ostream& operator<<(std::ostream& out, PathText const& text) { return out << text.display(); }
+
+HostPath HostPath::operator/(fs::path const& right) const {
+    if (right.empty()) return *this;
 #ifdef _WIN32
-    std::wstring const& s = dir.native();
-    if (s.empty() || separatesIn(s.back(), PathGrammar::Win32, rootSpelling(dir).kind == RootSpelling::Kind::Verbatim))
-        return dir;
-    return fs::path{s + L'\\'};
+    std::wstring const& r    = right.native();
+    RootSpelling const  root = parseRoot(std::wstring_view{r}, PathGrammar::Win32);
+    switch (root.kind) {
+        case RootSpelling::Kind::Drive:
+        case RootSpelling::Kind::Share:
+        case RootSpelling::Kind::Device:
+        case RootSpelling::Kind::Verbatim:
+        case RootSpelling::Kind::Authority:
+            return HostPath{right};   // an absolute right side IS the child, GIVEN
+        case RootSpelling::Kind::Rooted: {
+            // The left's VOLUME ROOT, the names below it by the same rule: a share keeps `\\server\share\`.
+            std::wstring const base     = HostPathAccess::reference(*this, Use::Container);
+            RootSpelling const baseRoot = parseRoot(std::wstring_view{base}, PathGrammar::Win32);
+            if (baseRoot.kind != RootSpelling::Kind::Verbatim) return HostPath{right};
+            std::wstring volume = base.substr(0, baseRoot.volume);
+            if (volume.empty() || volume.back() != L'\\') volume += L'\\';
+            return composedBelow(HostPathAccess::answered(volume), r.substr(root.prefix));
+        }
+        case RootSpelling::Kind::DriveRelative: {
+            // `D:x`: the left extended by `x` when D is the left's drive, the GIVEN `D:x` otherwise.
+            std::wstring const base      = HostPathAccess::reference(*this, Use::Container);
+            bool const         sameDrive = base.size() >= 6 && base.compare(0, 4, L"\\\\?\\") == 0 && base[5] == L':'
+                                   && asciiLower(base[4]) == asciiLower(r[0]);
+            if (!sameDrive) return HostPath{right};
+            return composedTyped(*this, r.substr(root.prefix));
+        }
+        case RootSpelling::Kind::Relative:
+            break;
+    }
+    return composedTyped(*this, r);
 #else
-    return dir;
+    if (parseRoot(std::string_view{right.native()}, PathGrammar::Posix).kind != RootSpelling::Kind::Relative)
+        return HostPath{right};
+    HostPath out{text_.empty() ? right : text_ / right};
+    out.origin_ = origin_ == Origin::Given ? Origin::Given : Origin::Composed;
+    return out;
 #endif
 }
 
-fs::path applicationNameSpelling(fs::path const& p) {
+HostPath HostPath::operator/(ListedRelative const& listed) const {
+    if (listed.names_.empty()) return *this;
 #ifdef _WIN32
-    // The OS's full spelling decides: a plain application name starts below MAX_PATH, the extended one at any length.
-    std::wstring const full = osFullPath(p.native());
-    return full.size() >= std::size_t{MAX_PATH} ? extendedLengthSpelling(p) : p;
+    std::wstring reference = HostPathAccess::reference(*this, Use::Container);
+    std::wstring text      = twinOf(text_.native());
+    for (std::wstring const& name : listed.names_) {
+        std::wstring const child = below(reference, name);
+        text      = childText(text, child, name);
+        reference = child;
+    }
+    return HostPathAccess::made(fs::path{text}, reference, reference, Origin::Composed);
 #else
-    return p;
+    fs::path text = text_;
+    for (std::string const& name : listed.names_) text = text.empty() ? fs::path{name} : text / name;
+    HostPath out{text};
+    out.origin_ = origin_ == Origin::Given ? Origin::Given : Origin::Composed;
+    return out;
+#endif
+}
+
+HostPath HostPath::withSuffix(fs::path::string_type const& suffix) const {
+#ifdef _WIN32
+    // The LEAF reference's last name, extended literally: a GIVEN value's taken now by the rule, a made value's fixed.
+    std::wstring const      leaf = HostPathAccess::reference(*this, Use::Leaf);
+    std::wstring_view const s    = leaf;
+    RootSpelling const      root = parseRoot(s, PathGrammar::Win32);
+    std::size_t const       end  = stepEnd(s, root, PathGrammar::Win32);
+    if (leaf.empty() || end <= root.volume)
+        throw std::invalid_argument{"HostPath::withSuffix: `" + spelling().display() + "` names no last name"};
+    if (root.kind != RootSpelling::Kind::Verbatim) return HostPath{fs::path{text_.native() + suffix}};   // refused
+    std::wstring const sibling = leaf.substr(0, end) + suffix;
+    // Its text: this text grown by the suffix exactly where this text's last name IS the reference's and the grown name
+    // keeps its meaning in a DOS spelling -- then the grown text names the sibling; otherwise the sibling's own.
+    std::wstring              text;
+    std::wstring const&       t     = text_.native();
+    RootSpelling const        tRoot = parseRoot(std::wstring_view{t}, PathGrammar::Win32);
+    std::size_t const         head  = parentEnd(s, end, root, PathGrammar::Win32);
+    std::wstring_view const   name  = s.substr(nameBegin(s, head, root, PathGrammar::Win32), end - nameBegin(s, head, root, PathGrammar::Win32));
+    if (tRoot.kind != RootSpelling::Kind::Verbatim) {
+        std::wstring_view const ts    = t;
+        std::size_t const       tEnd  = stepEnd(ts, tRoot, PathGrammar::Win32);
+        std::size_t const       tHead = parentEnd(ts, tEnd, tRoot, PathGrammar::Win32);
+        if (tHead != std::wstring_view::npos) {
+            std::size_t const tName = nameBegin(ts, tHead, tRoot, PathGrammar::Win32);
+            if (ts.substr(tName, tEnd - tName) == name && dosSpellingNamesTheSameFile(std::wstring{name} + suffix))
+                text = t.substr(0, tEnd) + suffix;
+        }
+    }
+    if (text.empty()) text = dosSpellingOf(sibling);
+    return HostPathAccess::made(fs::path{text}, sibling, sibling, Origin::Composed);
+#else
+    if (!text_.has_filename())
+        throw std::invalid_argument{"HostPath::withSuffix: `" + spelling().display() + "` names no last name"};
+    HostPath out{fs::path{text_.native() + suffix}};
+    out.origin_ = origin_ == Origin::Given ? Origin::Given : Origin::Composed;
+    return out;
+#endif
+}
+
+HostPathAccess::String HostPathAccess::reference(HostPath const& value, Use use) {
+#ifdef _WIN32
+    if (value.origin_ != HostPath::Origin::Given) return use == Use::Leaf ? value.leafRef_ : value.containerRef_;
+    std::wstring const& text = value.text_.native();
+    // [A8, B2] The empty spelling is `.` as a container -- and as a leaf names nothing: EMPTY, refused by every caller.
+    if (text.empty()) return use == Use::Container ? referenceSpelling(L".", Use::Container) : std::wstring{};
+    return referenceSpelling(text, use);
+#else
+    // POSIX resolves no name by its position: both uses are the text ("" is `.` as a container, nothing as a leaf).
+    if (value.text_.empty()) return use == Use::Container ? String{"."} : String{};
+    return value.text_.native();
+#endif
+}
+
+HostPath HostPathAccess::listed(fs::path const& parentText, String const& parentReference, String const& name) {
+#ifdef _WIN32
+    std::wstring const child = below(parentReference, name);
+    return made(fs::path{childText(parentText.native(), child, name)}, child, child, HostPath::Origin::Listed);
+#else
+    static_cast<void>(parentReference);
+    return made(parentText.empty() ? fs::path{name} : parentText / name, {}, {}, HostPath::Origin::Listed);
+#endif
+}
+
+void HostPathAccess::extend(ListedRelative& relative, String const& name) {
+    if (!relative.names_.empty()) relative.generic_ += '/';
+#ifdef _WIN32
+    relative.generic_ += wtf8Of(name);
+#else
+    relative.generic_ += name;
+#endif
+    relative.names_.push_back(name);
+}
+
+HostPath HostPathAccess::answered(String const& reference) {
+#ifdef _WIN32
+    std::wstring const fixed = withoutTrailingSeparators(reference);
+    return made(fs::path{dosSpellingOf(fixed)}, fixed, fixed, HostPath::Origin::Answered);
+#else
+    return made(fs::path{reference}, {}, {}, HostPath::Origin::Answered);
+#endif
+}
+
+HostPath HostPathAccess::made(fs::path text, String leafReference, String containerReference, HostPath::Origin origin) {
+    HostPath out;
+    out.text_         = std::move(text);
+    out.leafRef_      = std::move(leafReference);
+    out.containerRef_ = std::move(containerReference);
+    out.origin_       = origin;
+    return out;
+}
+
+HostPathAccess::String HostPathAccess::spawnDirectory(HostPath const& cwd) {
+#ifdef _WIN32
+    std::wstring const reference = HostPathAccess::reference(cwd, Use::Container);
+    if (reference.empty()) return reference;
+    RootSpelling const root = parseRoot(std::wstring_view{reference}, PathGrammar::Win32);
+    std::wstring       form = reference;
+    if (root.kind == RootSpelling::Kind::Verbatim) {
+        bool const drive = root.volume >= 6 && isAsciiAlpha(reference[4]) && reference[5] == L':';
+        if (root.authority) form = L"\\\\" + reference.substr(8);   // `\\?\UNC\server\share\` -> `\\server\share\`
+        else if (drive) form = reference.substr(4);
+    }
+    if (form.back() != L'\\') form += L'\\';
+    return form;
+#else
+    return HostPathAccess::reference(cwd, Use::Container);
+#endif
+}
+
+HostPathAccess::String HostPathAccess::spawnImage(HostPath const& image) {
+#ifdef _WIN32
+    std::wstring const reference = HostPathAccess::reference(image, Use::Leaf);
+    std::wstring const dos       = dosSpellingOf(reference);
+    if (dos != reference && dos.size() < std::size_t{MAX_PATH}) return dos;
+    return reference;
+#else
+    return HostPathAccess::reference(image, Use::Leaf);
 #endif
 }
 
@@ -591,28 +1009,25 @@ fs::path applicationNameSpelling(fs::path const& p) {
 // file `x.c` to the OS, and was a second key here) and climbs where the OS does not (`\\host\share\..\x` was
 // `\\host\x`), and the two Windows libraries do not even agree on where a root ends (`rootSpelling`'s header).
 //
-// ★ ON A WINDOWS HOST AN ABSOLUTE PLAIN SPELLING IS THE OS'S OWN ANSWER (P69 H6): GetFullPathNameW, through the one
-// home of that rule (`osFullPath`, above). The normalization is pinned equal to it on both Windows legs, but which
-// reserved names it resolves is the release's (this Windows 11 resolves a last `NUL` alone, older ones `CON`, `COM1`,
-// ... too), and the OS, not a model of it, says what a plain spelling means. A relative, rooted or drive-relative
-// spelling stays the text's -- the OS would resolve it against a directory, which this never does.
-fs::path normalizeKeepingRoot(fs::path const& p) {
+// ★ ON A WINDOWS HOST IT IS THE VALUE'S REFERENCE (P69 H6; H6c, A6): the OS's own answer for a GIVEN value, by the
+// reference rule at `use` (GetFullPathNameW through its one home, `osFullPath`) -- a relative, rooted or drive-relative
+// spelling resolved against the process's directories as every call on it resolves it -- and a made value's fixed
+// reference; answered as a value, its text the DOS form exactly where that names the same object. The normalization
+// above is pinned equal to the OS on both Windows legs, but which reserved names it resolves is the release's (this
+// Windows 11 resolves a last `NUL` alone, older ones `CON`, `COM1`, ... too), and the OS, not a model of it, says what a
+// plain spelling means. Elsewhere it is the text's own normalization, answered as a value.
+HostPath normalizeKeepingRoot(HostPath const& p, Use use) {
 #ifdef _WIN32
-    RootSpelling::Kind const kind = rootSpelling(p).kind;
-    if (kind == RootSpelling::Kind::Drive || kind == RootSpelling::Kind::Share || kind == RootSpelling::Kind::Device) {
-        if (std::wstring full = osFullPath(p.native()); !full.empty())
-            return fs::path{std::move(full)};
-    }
+    return HostPathAccess::answered(HostPathAccess::reference(p, use));
+#else
+    return HostPathAccess::answered(
+        normalizeIn(std::string_view{HostPathAccess::reference(p, use)}, PathGrammar::Posix));
 #endif
-    return fs::path{normalizeIn(std::basic_string_view<fs::path::value_type>{p.native()}, kHostPathGrammar)};
 }
 
 std::string genericSpelling(fs::path const& p) {
     std::string out = p.string();
-    if constexpr (fs::path::preferred_separator != fs::path::value_type{'/'}) {
-        std::replace(out.begin(), out.end(),
-                     static_cast<char>(fs::path::preferred_separator), '/');
-    }
+    toGeneric(out, p);
     return out;
 }
 
@@ -629,44 +1044,44 @@ std::u8string genericSpellingU8(fs::path const& p) {
     // `u8string()` and NOT `generic_u8string()` -- the NATIVE spelling carries
     // the leading run, and the substitution below is the same normalisation
     // without the generic-format conversion that eats it. See the header.
+    // Every path separator is ASCII, so it is ONE UTF-8 code unit and a per-unit substitution cannot land inside a
+    // multi-byte sequence.
     std::u8string out = p.u8string();
-    if constexpr (fs::path::preferred_separator != fs::path::value_type{'/'}) {
-        // Every path separator is ASCII, so it is ONE UTF-8 code unit and a
-        // per-unit substitution cannot land inside a multi-byte sequence.
-        std::replace(out.begin(), out.end(),
-                     static_cast<char8_t>(fs::path::preferred_separator),
-                     char8_t{'/'});
-    }
+    toGeneric(out, p);
     return out;
 }
 
-fs::path absoluteKeepingRoot(fs::path const& p, std::error_code& ec) {
-    // A share, POSIX `//` and a device or verbatim prefix name an AUTHORITY or a NAMESPACE, not a location on the
-    // current drive, so there is nothing here to make absolute. See the header for the measurement: `fs::absolute`
-    // does not merely fail on these, it succeeds having re-rooted the path onto the local drive.
-    switch (rootSpelling(p).kind) {
-        case RootSpelling::Kind::Share:
-        case RootSpelling::Kind::Authority:
-        case RootSpelling::Kind::Device:
-        case RootSpelling::Kind::Verbatim:
-            ec.clear();
-            return p;
-        case RootSpelling::Kind::Relative:
-        case RootSpelling::Kind::DriveRelative:
-        case RootSpelling::Kind::Rooted:
-        case RootSpelling::Kind::Drive:
-            break;
-    }
-    return fs::absolute(p, ec);
-}
-
-std::string canonicalIdentityKey(fs::path const& p) {
-    std::error_code ec;
-    return canonicalIdentityKey(p, ec);
-}
-
-std::string canonicalIdentityKey(fs::path const& p, std::error_code& ec) {
+HostPath absoluteKeepingRoot(HostPath const& p, Use use, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, use, ec);
+    if (ec) return {};   // the empty spelling as a leaf (B2)
+#ifdef _WIN32
+    // The value's reference: the OS's own absolute spelling (a GIVEN value's by the rule, a made value's fixed one),
+    // which never re-roots a share, a device or a verbatim spelling onto the local drive.
+    return HostPathAccess::answered(reference);
+#else
+    // POSIX `//` names an AUTHORITY, not a location below `/`, so there is nothing here to make absolute. See the
+    // header for the measurement: `fs::absolute` does not merely fail on such a root, it re-roots it.
+    fs::path const given{reference};
+    if (rootSpelling(given).kind == RootSpelling::Kind::Authority) return HostPathAccess::answered(reference);
+    fs::path const absolute = fs::absolute(given, ec);
+    if (ec) return {};
+    return HostPathAccess::answered(absolute.native());
+#endif
+}
+
+std::string canonicalIdentityKey(HostPath const& p, Use use) {
+    std::error_code ec;
+    return canonicalIdentityKey(p, use, ec);
+}
+
+std::string canonicalIdentityKey(HostPath const& p, Use use, std::error_code& ec) {
+    ec.clear();
+    // The empty spelling as a leaf names no file, so it has no identity (B2): refused, the key empty.
+    if (use == Use::Leaf && p.empty()) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return {};
+    }
     // The canonicalisation's OWN failure, kept separate from the `ec` this
     // function reports: the two answer different questions (see below), and
     // folding them was what let a model failure masquerade as a host refusal.
@@ -677,7 +1092,7 @@ std::string canonicalIdentityKey(fs::path const& p, std::error_code& ec) {
     // ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). On Windows `reachedPath` is the final
     // path of the opened file's handle -- what MS STL's `weakly_canonical` asks too.
     std::error_code canonEc;
-    fs::path const c = reachedPath(p, canonEc);
+    HostPath const c = reachedPath(p, use, canonEc);
     if (canonEc) {
         // ⚠ A `weakly_canonical` FAILURE IS NOT EVIDENCE THAT THE FILESYSTEM
         // REFUSED, and this overload's whole contract is that `ec` means exactly
@@ -691,9 +1106,9 @@ std::string canonicalIdentityKey(fs::path const& p, std::error_code& ec) {
         // not exist, so this arm means a genuine filesystem failure" -- reject a
         // perfectly readable source. So ASK THE FILESYSTEM DIRECTLY: if it
         // answers at all, whatever the answer, it did not refuse. (Through this file's own question, which answers at
-        // any length on Windows -- the library's `exists` does not: `extendedLengthSpelling`'s header.)
+        // any length on Windows -- the library's `exists` does not: the header's "THE SPELLING A FILE CALL TAKES".)
         std::error_code probe;
-        static_cast<void>(reachedKind(p, probe));
+        static_cast<void>(reachedKind(p, use, probe));
         ec = probe;
     }
     // ★★★ AND A SUCCESS IS NOT EVIDENCE THAT IT ANSWERED FOR THE PATH IT WAS
@@ -711,16 +1126,23 @@ std::string canonicalIdentityKey(fs::path const& p, std::error_code& ec) {
     // exposure.) A canonicalisation that took the AUTHORITY away (`rootSpelling`) changed which machine the path
     // names, so it is refused here and the lexical normalisation -- which cannot relocate anything -- is used. A
     // namespace prefix the OS resolved to its drive is no relocation: `\\?\C:\x` and `C:\x` are one file, one key.
-    bool const relocated = rootSpelling(p).authority && !rootSpelling(c).authority;
-    fs::path const r = (canonEc || relocated) ? normalizeKeepingRoot(p) : c;
+    bool const relocated =
+        rootSpelling(HostPathAccess::text(p)).authority && !rootSpelling(HostPathAccess::text(c)).authority;
 #ifdef _WIN32
     // ONE separator convention for every key in the compiler: two sites that key
     // the same file with different separators disagree about identity for a
     // reason no diagnostic can explain. `genericSpelling` and NOT
     // `generic_string()` -- see the header for what the latter deletes.
-    return genericSpelling(fs::path{expandShortComponents(r.wstring())});
+    // ★ THROUGH A REFERENCE (H6c, R10): the reached value's, or -- the lexical fallback -- `p`'s own by `use`, which
+    // the reference rule makes absolute for EVERY kind of spelling, so the expansion never walks a relative text
+    // against the process's directories; its answer is DOS exactly where that names the same file, verbatim
+    // otherwise, and a verbatim key keeps its `\` (A10).
+    std::wstring const reference = (canonEc || relocated) ? HostPathAccess::reference(p, use)
+                                                          : HostPathAccess::reference(c, use);
+    return genericSpelling(fs::path{expandShortComponents(reference)});
 #else
-    return genericSpelling(r);
+    HostPath const r = (canonEc || relocated) ? normalizeKeepingRoot(p, use) : c;
+    return genericSpelling(HostPathAccess::text(r));
 #endif
 }
 
@@ -744,15 +1166,12 @@ namespace {
     return std::error_code{static_cast<int>(e), std::system_category()};
 }
 
-// The spelling EVERY Win32 call of this file takes: what the plain spelling means, at any length
-// (`extendedLengthSpelling`; the header measures why).
-[[nodiscard]] std::wstring callSpelling(fs::path const& p) { return extendedLengthSpelling(p).native(); }
-
-// What `p` REACHES, read through a handle opened WITHOUT `FILE_FLAG_OPEN_REPARSE_POINT` -- a handle to
+// What the reference REACHES, read through a handle opened WITHOUT `FILE_FLAG_OPEN_REPARSE_POINT` -- a handle to
 // what every link on the way reaches. Nothing when nothing is reached; `ec` set only for a failure
 // that is not "nothing there".
-[[nodiscard]] std::optional<BY_HANDLE_FILE_INFORMATION> reachedInformation(fs::path const& p, std::error_code& ec) {
-    HANDLE const reached = ::CreateFileW(callSpelling(p).c_str(), FILE_READ_ATTRIBUTES,
+[[nodiscard]] std::optional<BY_HANDLE_FILE_INFORMATION> reachedInformation(std::wstring const& reference,
+                                                                           std::error_code&    ec) {
+    HANDLE const reached = ::CreateFileW(reference.c_str(), FILE_READ_ATTRIBUTES,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                          FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (reached == INVALID_HANDLE_VALUE) {
@@ -781,33 +1200,38 @@ namespace {
     return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? EntryKind::Directory : EntryKind::File;
 }
 
-// Every entry of `dir` but `.` and `..`, each classified from its own find record -- the record
-// carries the attributes AND a reparse point's tag, so no entry costs a second call.
-// ★ THE DIRECTORY IS LISTED BY ITS VERBATIM SPELLING `spelledDir` (P69 H6b, F3): the walk's root's container reference,
-// or a listed directory's literal extension `\name` of its parent's -- never `dir` re-resolved, which lists ANOTHER
-// directory when a name ends in a space or a period or is a device name (✔MEASURED, the universe above: the
-// extended step's `\*` listed `d` for `d `, and refused a NUL directory). Each entry is named from `dir` as given, and
-// its own verbatim spelling (`spelledDir \ name`) goes to `spelledOut`, in the same order.
-void listEntries(fs::path const& dir, fs::path const& spelledDir, std::size_t depth, std::vector<TreeEntry>& out,
-                 std::vector<fs::path>& spelledOut, std::error_code& ec) {
+// Every entry of `dir` but `.` and `..`, each classified from its own find record -- the record carries the
+// attributes AND a reparse point's tag, so no entry costs a second call.
+// ★ THE DIRECTORY IS LISTED BY ITS CONTAINER REFERENCE (P69 H6b, F3; H6c): the walk's root's, taken once by the rule,
+// or a listed directory's, fixed -- never a text re-resolved, which lists ANOTHER directory when a name ends in a space
+// or a period or is a device name (✔MEASURED, the universe above: the extended step's `\*` listed `d` for `d `, and
+// refused a NUL directory). Each entry is a LISTED value (`HostPathAccess::listed`): its reference the listing's
+// literal extension `\name`, and its names below the walked root `relative` and the name.
+// `storeText` is the directory's STORE-ROUTE text (`TreeEntry::storeRoutePath`, the header's last block): each
+// entry's is it
+// and the entry's name, exactly as before H6c.
+void listEntries(HostPath const& dir, fs::path const& storeText, ListedRelative const& relative, std::size_t depth,
+                 std::vector<TreeEntry>& out, std::error_code& ec) {
     ec.clear();
-    std::wstring const& at     = spelledDir.native();
-    std::wstring const  base   = !at.empty() && at.back() == L'\\' ? at : at + L'\\';
-    std::wstring const pattern = base + L'*';
-    WIN32_FIND_DATAW found{};
-    HANDLE const     search = ::FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &found, FindExSearchNameMatch,
-                                                 nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    std::wstring const at      = HostPathAccess::reference(dir, Use::Container);
+    std::wstring const pattern = below(at, L"*");
+    fs::path const&    text    = HostPathAccess::text(dir);
+    WIN32_FIND_DATAW   found{};
+    HANDLE const search = ::FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &found, FindExSearchNameMatch, nullptr,
+                                             FIND_FIRST_EX_LARGE_FETCH);
     if (search == INVALID_HANDLE_VALUE) {
         ec = winError(::GetLastError());
         return;
     }
     do {
-        std::wstring_view const name{found.cFileName};
+        std::wstring const name{found.cFileName};
         if (name == L"." || name == L"..") continue;
         DWORD const     tag  = (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ? found.dwReserved0 : 0;
         EntryKind const kind = kindOfAttributes(found.dwFileAttributes, tag);
-        out.push_back(TreeEntry{dir / fs::path{std::wstring{name}}, kind, kind, depth});
-        spelledOut.push_back(fs::path{base + std::wstring{name}});
+        ListedRelative  names = relative;
+        HostPathAccess::extend(names, name);
+        out.push_back(TreeEntry{HostPathAccess::listed(text, at, name), std::move(names), kind, kind, depth});
+        out.back().storeRoutePath = storeText / fs::path{name};
     } while (::FindNextFileW(search, &found));
     DWORD const last = ::GetLastError();
     ::FindClose(search);
@@ -1018,8 +1442,8 @@ template <class Clock>
 
 // A handle to what `p` REACHES (every link on the way followed), or none: nothing reached is no handle
 // with `ec` clear.
-[[nodiscard]] Handle reachedHandle(fs::path const& p, DWORD access, std::error_code& ec) {
-    HANDLE const reached = ::CreateFileW(callSpelling(p).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+[[nodiscard]] Handle reachedHandle(std::wstring const& reference, DWORD access, std::error_code& ec) {
+    HANDLE const reached = ::CreateFileW(reference.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                          nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (reached == INVALID_HANDLE_VALUE) {
         DWORD const e = ::GetLastError();
@@ -1031,8 +1455,8 @@ template <class Clock>
 
 // A handle to the entry AT `p` itself -- a link there is NOT followed -- or none: nothing there is no handle with
 // `ec` clear.
-[[nodiscard]] Handle entryHandle(fs::path const& p, DWORD access, std::error_code& ec) {
-    HANDLE const entry = ::CreateFileW(callSpelling(p).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+[[nodiscard]] Handle entryHandle(std::wstring const& reference, DWORD access, std::error_code& ec) {
+    HANDLE const entry = ::CreateFileW(reference.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                                        nullptr);
     if (entry == INVALID_HANDLE_VALUE) {
@@ -1074,6 +1498,19 @@ constexpr auto kFileCaseSensitiveInfo = static_cast<FILE_INFO_BY_HANDLE_CLASS>(2
 static_assert(FileCaseSensitiveInfo == kFileCaseSensitiveInfo);
 #endif
 
+// `FileRenameInfoEx` (Windows 10 RS1) is SPELLED BY VALUE because MinGW-w64's FILE_INFO_BY_HANDLE_CLASS ends before it
+// at every version: ✔MEASURED 2026-10-28, MinGW-w64 13.2 at _WIN32_WINNT 0x0601, 0x0A00 and 0x0A00 with NTDDI_VERSION
+// RS5 (probe-reference-cc run 20261028-215651-aa544959). The Windows SDK's headers declare it (MSVC 19.51, run
+// 20261028-215632-ef25bfcc), and there the value is the header's, by the assert. Everything else the rename hands over
+// is the headers' own on both toolchains at the version the build declares (the top-level CMakeLists):
+// FILE_RENAME_INFO with its RS1 `Flags` member (the union with the classic class's `ReplaceIfExists`) and the
+// FILE_RENAME_FLAG_* flags (runs 20261028-220157-d478c33e and 20261028-220208-b3938c42). (Moved here with the
+// writer's commit by handle, H6c A4.)
+constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+#ifndef __MINGW32__
+static_assert(FileRenameInfoEx == kFileRenameInfoEx);
+#endif
+
 #else
 
 [[nodiscard]] EntryKind kindOfStatus(fs::file_type type) {
@@ -1090,11 +1527,14 @@ static_assert(FileCaseSensitiveInfo == kFileCaseSensitiveInfo);
 // where the platform records one). The `ec` test comes BEFORE the end test: a failed increment may
 // leave the iterator equal to the end, and a loop that asked "finished?" first would read a listing
 // error as a complete listing.
-// POSIX resolves no name by its position: an entry's spelling is its path, and `spelledDir` is `dir`.
-void listEntries(fs::path const& dir, fs::path const& /*spelledDir*/, std::size_t depth, std::vector<TreeEntry>& out,
-                 std::vector<fs::path>& spelledOut, std::error_code& ec) {
+// POSIX resolves no name by its position: an entry's text is its directory's text and its name (H6c: a LISTED value).
+// `storeText`: as the Windows listing's.
+void listEntries(HostPath const& dir, fs::path const& storeText, ListedRelative const& relative, std::size_t depth,
+                 std::vector<TreeEntry>& out, std::error_code& ec) {
     ec.clear();
-    fs::directory_iterator       it{dir, ec};
+    fs::path const               listedDir{HostPathAccess::reference(dir, Use::Container)};
+    fs::path const&              text = HostPathAccess::text(dir);
+    fs::directory_iterator       it{listedDir, ec};
     fs::directory_iterator const end;
     while (true) {
         if (ec) return;
@@ -1106,9 +1546,12 @@ void listEntries(fs::path const& dir, fs::path const& /*spelledDir*/, std::size_
             ec = kec;
             return;
         }
-        EntryKind const kind = kindOfStatus(type);
-        out.push_back(TreeEntry{it->path(), kind, kind, depth});
-        spelledOut.push_back(it->path());
+        EntryKind const             kind  = kindOfStatus(type);
+        fs::path::string_type const name  = it->path().filename().native();
+        ListedRelative              names = relative;
+        HostPathAccess::extend(names, name);
+        out.push_back(TreeEntry{HostPathAccess::listed(text, {}, name), std::move(names), kind, kind, depth});
+        out.back().storeRoutePath = storeText / fs::path{name};
         it.increment(ec);
     }
 }
@@ -1191,24 +1634,46 @@ constexpr int kOpenDirectoryOnly = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEX
 
 // ════ THE OPERATIONS A SITE WOULD ASK OF std::filesystem, AT ANY LENGTH (the header states why Win32 on Windows) ════
 
-std::FILE* openFileStream(fs::path const& p, char const* mode) {
+std::FILE* openFileStream(HostPath const& p, char const* mode) {
+    std::error_code refused;
+    auto const      reference = callSpelling(p, Use::Leaf, refused);
+    if (refused) {
+        errno = EINVAL;   // the empty spelling as a leaf (B2)
+        return nullptr;
+    }
 #ifdef _WIN32
     std::wstring wideMode;
     for (char const* m = mode; *m != '\0'; ++m) wideMode += static_cast<wchar_t>(static_cast<unsigned char>(*m));
-    return ::_wfopen(callSpelling(p).c_str(), wideMode.c_str());
+    return ::_wfopen(reference.c_str(), wideMode.c_str());
 #else
-    return std::fopen(p.c_str(), mode);
+    return std::fopen(reference.c_str(), mode);
 #endif
 }
 
-bool createDirectories(fs::path const& p, std::error_code& ec) {
+std::ifstream openInputStream(HostPath const& p, std::ios::openmode mode) {
+    std::ifstream   in;
+    std::error_code refused;
+    auto const      reference = callSpelling(p, Use::Leaf, refused);
+    if (!refused) in.open(fs::path{reference}, mode);
+    return in;
+}
+
+std::ofstream openOutputStream(HostPath const& p, std::ios::openmode mode) {
+    std::ofstream   out;
+    std::error_code refused;
+    auto const      reference = callSpelling(p, Use::Leaf, refused);
+    if (!refused) out.open(fs::path{reference}, mode);
+    return out;
+}
+
+bool createDirectories(HostPath const& p, std::error_code& ec) {
     ec.clear();
 #ifdef _WIN32
     // ★ `p` IS A CONTAINER (P69 H6b, ledger 541): the directory every `p \ name` lies in, so it is walked in its
     // CONTAINER reference -- `p` with a separator after it, resolved ONCE -- whose levels are literal cuts. Resolved as a
     // leaf, `C:\o\d ` made `C:\o\d` while every file written below it went into `d `, and `C:\o\NUL` was the device
     // (✔MEASURED, the universe above: 50 of 224 parents made ANOTHER directory, 52 were refused or made nothing).
-    std::wstring const      spelled = referenceSpelling(p.native(), Use::Container);
+    std::wstring const      spelled = HostPathAccess::reference(p, Use::Container);
     std::wstring_view const s       = spelled;
     RootSpelling const      root    = rootSpelling(s, PathGrammar::Win32);
     // Every level below the volume root, shortest first: a directory there is passed, a missing one made. A spelling
@@ -1236,7 +1701,7 @@ bool createDirectories(fs::path const& p, std::error_code& ec) {
                     // alone proves no directory. Confirmed by opening it as one, the question the device refuses
                     // (✔MEASURED: CreateFileW of `\\?\NUL` with backup semantics, ERROR_INVALID_PARAMETER).
                     std::error_code confirmEc;
-                    auto const      info = reachedInformation(fs::path{level}, confirmEc);
+                    auto const      info = reachedInformation(level, confirmEc);
                     if (!info || (info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
                         ec = confirmEc ? confirmEc : winError(ERROR_DIRECTORY);
                         return made;
@@ -1252,35 +1717,53 @@ bool createDirectories(fs::path const& p, std::error_code& ec) {
     }
     return made;
 #else
-    return fs::create_directories(p, ec);
+    return fs::create_directories(fs::path{HostPathAccess::reference(p, Use::Container)}, ec);
 #endif
 }
 
-fs::path containingDirectory(fs::path const& file) {
+HostPath containingDirectory(HostPath const& file) {
 #ifdef _WIN32
-    // The level above the file's last name in the FILE's own leaf reference, cut literally: the directory the file's
-    // write will name, whatever its last name is. Never `file.parent_path()` -- re-resolved as a whole it is
-    // another directory for a name ending in a space or a device name, and at `\\?\D:\a.exe` it is `\\?\D:`, the
-    // volume's DEVICE (the review of H6's F2).
-    return fs::path{levelAbove(referenceSpelling(file.native(), Use::Leaf))};
+    // The level above the file's last name in the FILE's own LEAF reference, cut literally (a GIVEN value's taken now
+    // by the rule, a made value's fixed one): the directory the file's write will name, whatever its last name is.
+    // Never the library's `parent_path()` of the text -- re-resolved as a whole it is another directory for a name
+    // ending in a space or a device name, and at `\\?\D:\a.exe` it is `\\?\D:`, the volume's DEVICE (the review of
+    // H6's F2). A MADE value, its text lossless.
+    std::wstring const leaf = HostPathAccess::reference(file, Use::Leaf);
+    if (parseRoot(std::wstring_view{leaf}, PathGrammar::Win32).kind != RootSpelling::Kind::Verbatim) {
+        if (leaf.empty()) return {};   // the empty spelling as a leaf names nothing (B2)
+        return HostPath{parentWithinRoot(HostPathAccess::text(file))};   // the OS refused it: the text's own level
+    }
+    std::wstring const above = levelAbove(leaf);
+    if (above.empty()) return {};   // a volume root has no level above it
+    return HostPathAccess::made(fs::path{dosSpellingOf(above)}, above, above, HostPath::Origin::Composed);
 #else
-    return parentWithinRoot(file);
+    fs::path const above = parentWithinRoot(HostPathAccess::text(file));
+    if (above.empty()) return {};
+    return HostPathAccess::made(above, {}, {},
+                                file.origin() == HostPath::Origin::Given ? HostPath::Origin::Given
+                                                                         : HostPath::Origin::Composed);
 #endif
 }
 
-bool createDirectoriesFor(fs::path const& file, std::error_code& ec) {
+bool createDirectoriesFor(HostPath const& file, std::error_code& ec) {
     ec.clear();
-    fs::path const dir = containingDirectory(file);
+    if (file.empty()) {   // the empty spelling as a leaf names no file to write (B2)
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return false;
+    }
+    HostPath const dir = containingDirectory(file);
     if (dir.empty()) return false;   // a volume root's file, or a relative last name: its directory exists
     return createDirectories(dir, ec);
 }
 
-bool removeEntry(fs::path const& p, std::error_code& ec) {
+bool removeEntry(HostPath const& p, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, Use::Leaf, ec);
+    if (ec) return false;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
     // The entry itself (a link is opened as the link), deleted through its handle -- the removal `removeTree` makes of
     // each entry, POSIX semantics where the OS has them and a read-only file deleted as MS STL's `remove` deletes one.
-    Handle const entry = entryHandle(p, kRemovalAccess, ec);
+    Handle const entry = entryHandle(reference, kRemovalAccess, ec);
     if (!entry) return false;   // nothing there (`ec` clear), or the open's refusal (`ec` set)
     if (DWORD const e = deleteThrough(entry.get()); e != ERROR_SUCCESS) {
         ec = winError(e);
@@ -1288,25 +1771,225 @@ bool removeEntry(fs::path const& p, std::error_code& ec) {
     }
     return true;
 #else
-    return fs::remove(p, ec);
+    return fs::remove(fs::path{reference}, ec);
 #endif
 }
 
-void copyFile(fs::path const& from, fs::path const& to, std::error_code& ec) {
+void copyFile(HostPath const& from, HostPath const& to, std::error_code& ec) {
+    ec.clear();
+    auto const source = callSpelling(from, Use::Leaf, ec);
+    if (ec) return;
+    auto const target = callSpelling(to, Use::Leaf, ec);
+    if (ec) return;
+#ifdef _WIN32
+    if (!::CopyFileW(source.c_str(), target.c_str(), /*bFailIfExists=*/TRUE)) ec = winError(::GetLastError());
+#else
+    static_cast<void>(fs::copy_file(fs::path{source}, fs::path{target}, fs::copy_options::none, ec));
+#endif
+}
+
+#ifdef _WIN32
+
+void* openHandle(HostPath const& p, unsigned long access, unsigned long share, unsigned long disposition,
+                 unsigned long flagsAndAttributes) {
+    std::error_code    refused;
+    std::wstring const reference = callSpelling(p, Use::Leaf, refused);
+    if (refused) {
+        ::SetLastError(ERROR_INVALID_PARAMETER);   // the empty spelling as a leaf (B2)
+        return INVALID_HANDLE_VALUE;
+    }
+    return ::CreateFileW(reference.c_str(), access, share, nullptr, disposition, flagsAndAttributes, nullptr);
+}
+
+unsigned long fileAttributes(HostPath const& p) {
+    std::error_code    refused;
+    std::wstring const reference = callSpelling(p, Use::Leaf, refused);
+    if (refused) {
+        ::SetLastError(ERROR_INVALID_PARAMETER);   // the empty spelling as a leaf (B2)
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    return ::GetFileAttributesW(reference.c_str());
+}
+
+// THE COMMIT BY HANDLE (moved here from the writer, H6c A4). ✔MEASURED (the writer's): the name a rename by handle is
+// handed is resolved the way `MoveFileExW` resolves it -- forward slashes, a bare relative name and a `..` component
+// all land against the current directory -- so `target` is handed over as its LEAF reference, which names it at any
+// length where a plain spelling of 260 or more names nothing.
+unsigned long commitByHandle(void* staged, HostPath const& target, bool posixSemantics) {
+    std::error_code    refused;
+    std::wstring const name = callSpelling(target, Use::Leaf, refused);
+    if (refused) return ERROR_INVALID_PARAMETER;   // the empty spelling as a leaf (B2)
+    std::size_t const bytes = offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(WCHAR);
+    // `std::uint64_t` storage so the HANDLE member is aligned whatever the size.
+    std::vector<std::uint64_t> storage((bytes + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t), 0);
+    auto* const                info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+    // The classic class reads byte 0 as `ReplaceIfExists`, so TRUE lands there.
+    info->Flags = posixSemantics ? DWORD{FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS}
+                                 : DWORD{TRUE};
+    info->RootDirectory  = nullptr;
+    info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(WCHAR));
+    std::memcpy(info->FileName, name.c_str(), (name.size() + 1) * sizeof(WCHAR));
+    if (::SetFileInformationByHandle(static_cast<HANDLE>(staged), posixSemantics ? kFileRenameInfoEx : FileRenameInfo,
+                                     info, static_cast<DWORD>(bytes)))
+        return ERROR_SUCCESS;
+    DWORD const error = ::GetLastError();
+    // A failed call must never read as a success, whatever the slot holds.
+    return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error;
+}
+
+#else
+
+int openDescriptor(HostPath const& p, int flags, unsigned mode) {
+    std::error_code refused;
+    auto const      reference = callSpelling(p, Use::Leaf, refused);
+    if (refused) {
+        errno = EINVAL;   // the empty spelling as a leaf (B2)
+        return -1;
+    }
+    return ::open(reference.c_str(), flags, static_cast<mode_t>(mode));
+}
+
+void renameEntry(HostPath const& from, HostPath const& to, std::error_code& ec) {
+    ec.clear();
+    auto const source = callSpelling(from, Use::Leaf, ec);
+    if (ec) return;
+    auto const target = callSpelling(to, Use::Leaf, ec);
+    if (ec) return;
+    fs::rename(fs::path{source}, fs::path{target}, ec);
+}
+
+#endif
+
+HostPath currentDirectory(std::error_code& ec) {
     ec.clear();
 #ifdef _WIN32
-    if (!::CopyFileW(callSpelling(from).c_str(), callSpelling(to).c_str(), /*bFailIfExists=*/TRUE))
-        ec = winError(::GetLastError());
+    // GetCurrentDirectoryW's answer, PREFIXED (`verbatimOf`) and never resolved again. A buffer too small is answered
+    // with the size it needs, its terminator included; one that fits with the length written, without it.
+    for (DWORD size = MAX_PATH;;) {
+        std::wstring answer(size, L'\0');
+        DWORD const  n = ::GetCurrentDirectoryW(size, answer.data());
+        if (n == 0) {
+            ec = winError(::GetLastError());
+            return {};
+        }
+        if (n < size) {
+            answer.resize(n);
+            std::wstring const reference = verbatimOf(answer);
+            if (reference.empty()) {
+                ec = winError(ERROR_BAD_PATHNAME);
+                return {};
+            }
+            return HostPathAccess::answered(reference);
+        }
+        size = n;
+    }
 #else
-    static_cast<void>(fs::copy_file(from, to, fs::copy_options::none, ec));
+    fs::path const here = fs::current_path(ec);
+    if (ec) return {};
+    return HostPathAccess::answered(here.native());
 #endif
 }
 
-EntryKind entryKind(fs::path const& p, std::error_code& ec) {
+HostPath temporaryDirectory(std::error_code& ec) {
     ec.clear();
+#ifdef _WIN32
+    // GetTempPath2W where the OS has it (DOCUMENTED, Microsoft: an application should call it instead of
+    // GetTempPathW), GetTempPathW otherwise; the answer PREFIXED and never resolved again -- and, as the library's
+    // `temp_directory_path` ([fs.op.temp.dir.path]), an error unless it is a directory.
+    using TempPath = DWORD(WINAPI*)(DWORD, LPWSTR);
+    static TempPath const tempPath2 = [] {
+        HMODULE const kernel = ::GetModuleHandleW(L"kernel32.dll");
+        return kernel == nullptr ? TempPath{nullptr}
+                                 : reinterpret_cast<TempPath>(
+                                       reinterpret_cast<void*>(::GetProcAddress(kernel, "GetTempPath2W")));
+    }();
+    TempPath const ask = tempPath2 != nullptr ? tempPath2 : &::GetTempPathW;
+    for (DWORD size = MAX_PATH + 1;;) {
+        std::wstring answer(size, L'\0');
+        DWORD const  n = ask(size, answer.data());
+        if (n == 0) {
+            ec = winError(::GetLastError());
+            return {};
+        }
+        if (n < size) {
+            answer.resize(n);
+            std::wstring const reference = verbatimOf(answer);
+            if (reference.empty()) {
+                ec = winError(ERROR_BAD_PATHNAME);
+                return {};
+            }
+            HostPath const  value = HostPathAccess::answered(reference);
+            std::error_code kindEc;
+            EntryKind const kind = reachedKind(value, Use::Container, kindEc);
+            if (kindEc) {
+                ec = kindEc;
+                return {};
+            }
+            if (kind != EntryKind::Directory) {
+                ec = std::make_error_code(std::errc::not_a_directory);
+                return {};
+            }
+            return value;
+        }
+        size = n;
+    }
+#else
+    fs::path const temporary = fs::temp_directory_path(ec);
+    if (ec) return {};
+    return HostPathAccess::answered(temporary.native());
+#endif
+}
+
+HostPath runningExecutable(std::error_code& ec) {
+    ec.clear();
+#if defined(_WIN32)
+    // ★ QueryFullProcessImageNameW, NEVER GetModuleFileNameW (the header measures why), PREFIXED and never resolved:
+    // resolved by the rule, a literal `e.` image's name would be its TWIN's again.
+    std::wstring answer(32768, L'\0');   // the longest Win32 path, its terminator included
+    DWORD        size = static_cast<DWORD>(answer.size());
+    if (!::QueryFullProcessImageNameW(::GetCurrentProcess(), 0, answer.data(), &size)) {
+        ec = winError(::GetLastError());
+        return {};
+    }
+    answer.resize(size);
+    std::wstring const reference = verbatimOf(answer);
+    if (reference.empty()) {
+        ec = winError(ERROR_BAD_PATHNAME);
+        return {};
+    }
+    return HostPathAccess::answered(reference);
+#elif defined(__APPLE__)
+    // `_NSGetExecutablePath` REPORTS the required size through the same out-parameter when it fails, so one retry
+    // always suffices.
+    std::uint32_t size = 0;
+    ::_NSGetExecutablePath(nullptr, &size);   // size := required, rc != 0
+    if (size == 0) {
+        ec = std::make_error_code(std::errc::io_error);
+        return {};
+    }
+    std::string answer(size, '\0');
+    if (::_NSGetExecutablePath(answer.data(), &size) != 0) {
+        ec = std::make_error_code(std::errc::io_error);
+        return {};
+    }
+    answer.resize(std::char_traits<char>::length(answer.c_str()));
+    return HostPathAccess::answered(answer);
+#else
+    // Linux (and the BSDs that provide it): `/proc/self/exe` is a link the kernel keeps to the running image; where
+    // it leads is asked of `reachedPath`, as every link question is.
+    HostPath const image = reachedPath(HostPath{"/proc/self/exe"}, Use::Leaf, ec);
+    if (ec) return {};
+    return image;
+#endif
+}
+
+EntryKind entryKind(HostPath const& p, Use use, std::error_code& ec) {
+    ec.clear();
+    auto const reference = callSpelling(p, use, ec);
+    if (ec) return EntryKind::Other;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    std::wstring const spelled = callSpelling(p);
+    std::wstring const&       spelled = reference;
     if (!::GetFileAttributesExW(spelled.c_str(), GetFileExInfoStandard, &data)) {
         DWORD const e = ::GetLastError();
         if (winNotFound(e)) return EntryKind::Absent;
@@ -1334,7 +2017,7 @@ EntryKind entryKind(fs::path const& p, std::error_code& ec) {
     }
     return kindOfAttributes(info.FileAttributes, info.ReparseTag);
 #else
-    auto const type = fs::symlink_status(p, ec).type();
+    auto const type = fs::symlink_status(fs::path{reference}, ec).type();
     if (type == fs::file_type::not_found) {
         ec.clear();
         return EntryKind::Absent;
@@ -1343,14 +2026,16 @@ EntryKind entryKind(fs::path const& p, std::error_code& ec) {
 #endif
 }
 
-EntryKind reachedKind(fs::path const& p, std::error_code& ec) {
+EntryKind reachedKind(HostPath const& p, Use use, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, use, ec);
+    if (ec) return EntryKind::Absent;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    auto const info = reachedInformation(p, ec);
+    auto const info = reachedInformation(reference, ec);
     if (!info) return EntryKind::Absent;
     return (info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? EntryKind::Directory : EntryKind::File;
 #else
-    auto const type = fs::status(p, ec).type();
+    auto const type = fs::status(fs::path{reference}, ec).type();
     if (type == fs::file_type::not_found) {
         ec.clear();
         return EntryKind::Absent;
@@ -1362,13 +2047,15 @@ EntryKind reachedKind(fs::path const& p, std::error_code& ec) {
 #endif
 }
 
-bool reachedPipe(fs::path const& p, std::error_code& ec) {
+bool reachedPipe(HostPath const& p, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, Use::Leaf, ec);
+    if (ec) return false;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    static_cast<void>(p);
+    static_cast<void>(reference);
     return false;
 #else
-    auto const type = fs::status(p, ec).type();
+    auto const type = fs::status(fs::path{reference}, ec).type();
     if (type == fs::file_type::not_found) {
         ec.clear();
         return false;
@@ -1377,32 +2064,36 @@ bool reachedPipe(fs::path const& p, std::error_code& ec) {
 #endif
 }
 
-std::optional<std::uintmax_t> reachedFileSize(fs::path const& p, std::error_code& ec) {
+std::optional<std::uintmax_t> reachedFileSize(HostPath const& p, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, Use::Leaf, ec);
+    if (ec) return std::nullopt;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    auto const info = reachedInformation(p, ec);
+    auto const info = reachedInformation(reference, ec);
     if (!info || (info->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return std::nullopt;
     return (std::uintmax_t{info->nFileSizeHigh} << 32) | info->nFileSizeLow;
 #else
-    auto const reached = fs::status(p, ec).type();
+    fs::path const at{reference};
+    auto const     reached = fs::status(at, ec).type();
     if (reached == fs::file_type::not_found) {
         ec.clear();
         return std::nullopt;
     }
     if (ec || reached != fs::file_type::regular) return std::nullopt;
-    auto const size = fs::file_size(p, ec);
+    auto const size = fs::file_size(at, ec);
     if (ec) return std::nullopt;
     return size;
 #endif
 }
 
-fs::path reachedPath(fs::path const& p, std::error_code& ec) {
+HostPath reachedPath(HostPath const& p, Use use, std::error_code& ec) {
     ec.clear();
+    // The value's reference for `use`: absolute and normal by the OS's own rule (a GIVEN value's) or fixed (a made
+    // one's) -- never an authority re-rooted onto the local drive (the header measures what `fs::absolute` and
+    // `lexically_normal` do to a multi-separator root).
+    auto const w = callSpelling(p, use, ec);
+    if (ec) return {};   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    // Absolute and normal WITHOUT re-rooting an authority onto the local drive (the header measures
-    // what `fs::absolute` and `lexically_normal` do to a multi-separator root).
-    fs::path const whole = normalizeKeepingRoot(absoluteKeepingRoot(p, ec));
-    if (ec) return {};
     // The longest leading part that exists, resolved by the OS; what follows it is appended as written.
     // ★ THE WALK STOPS AT THE VOLUME ROOT, WITH ITS SEPARATOR (P69 H6): `rootSpelling` parses where it ends, for every
     // Win32 spelling. The library's parent of `\\?\Volume{G}\x`, `\\?\C:\x` or `\\?\GLOBALROOT\Device\HarddiskVolumeN\x`
@@ -1414,7 +2105,6 @@ fs::path reachedPath(fs::path const& p, std::error_code& ec) {
     // head re-extended as a whole names ANOTHER directory when its last name ends in a space or is a device name
     // (✔MEASURED over the walk-up universe: 48 of 224 heads reached another object, 52 were refused, where the one
     // cut reached the whole's own level in every cell but a share's NUL directory, which the server refuses).
-    std::wstring const      w    = referenceSpelling(whole.native(), Use::Leaf);
     std::wstring_view const s    = w;
     RootSpelling const      root = rootSpelling(s, PathGrammar::Win32);
     std::size_t             headEnd   = stepEnd(s, root, PathGrammar::Win32);   // a trailing separator names nothing
@@ -1463,7 +2153,7 @@ fs::path reachedPath(fs::path const& p, std::error_code& ec) {
                 if (resolved.back() != L'\\') resolved += L'\\';
                 resolved.append(w, restBegin, restEnd - restBegin);
             }
-            return fs::path{dosSpellingOf(resolved)};
+            return HostPathAccess::answered(resolved);
         }
         DWORD const e = ::GetLastError();
         if (!winNotFound(e)) {
@@ -1471,20 +2161,27 @@ fs::path reachedPath(fs::path const& p, std::error_code& ec) {
             return {};
         }
         std::size_t const parent = parentEnd(s, headEnd, root, PathGrammar::Win32);
-        if (parent == std::wstring_view::npos) return whole;   // nothing of it exists, its volume root included
+        if (parent == std::wstring_view::npos) return HostPathAccess::answered(w);   // nothing of it exists
         restBegin = nameBegin(s, parent, root, PathGrammar::Win32);
         headEnd   = parent;
     }
 #else
-    return fs::weakly_canonical(p, ec);
+    fs::path const resolved = fs::weakly_canonical(fs::path{w}, ec);
+    if (ec) return {};
+    return HostPathAccess::answered(resolved.native());
 #endif
 }
 
-fs::path reachedRelative(fs::path const& p, fs::path const& base, std::error_code& ec) {
-    fs::path const to = reachedPath(p, ec);
+fs::path reachedRelative(HostPath const& p, Use use, HostPath const& base, std::error_code& ec) {
+    // Both REACHED, each an answered value whose reference is fixed, and compared by those references -- one form for
+    // both on Windows (`\\?\`), whatever DOS or verbatim text each has. The base is a CONTAINER (H6c, A2): the
+    // directory the answer is spelled below.
+    HostPath const toValue = reachedPath(p, use, ec);
     if (ec) return {};
-    fs::path const from = reachedPath(base, ec);
+    HostPath const fromValue = reachedPath(base, Use::Container, ec);
     if (ec) return {};
+    fs::path const to{HostPathAccess::reference(toValue, use)};
+    fs::path const from{HostPathAccess::reference(fromValue, Use::Container)};
     // Another root is decided by `rootSpelling`, never by the library's `root_name()` (MinGW's is empty for every
     // share): the two volume roots, spelled with one separator and, on Win32, in one ASCII case, must be one.
     RootSpelling const toRoot   = rootSpelling(to);
@@ -1503,10 +2200,12 @@ fs::path reachedRelative(fs::path const& p, fs::path const& base, std::error_cod
         fs::path{from.native().substr(fromRoot.volume)});
 }
 
-std::optional<fs::file_time_type> reachedWriteTime(fs::path const& p, std::error_code& ec) {
+std::optional<fs::file_time_type> reachedWriteTime(HostPath const& p, Use use, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, use, ec);
+    if (ec) return std::nullopt;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    Handle const reached = reachedHandle(p, FILE_READ_ATTRIBUTES, ec);
+    Handle const reached = reachedHandle(reference, FILE_READ_ATTRIBUTES, ec);
     if (!reached) return std::nullopt;
     FILETIME written{};
     if (!::GetFileTime(reached.get(), nullptr, nullptr, &written)) {
@@ -1515,7 +2214,7 @@ std::optional<fs::file_time_type> reachedWriteTime(fs::path const& p, std::error
     }
     return fileTimeOf(written);
 #else
-    auto const t = fs::last_write_time(p, ec);
+    auto const t = fs::last_write_time(fs::path{reference}, ec);
     if (ec) {
         if (ec == std::errc::no_such_file_or_directory) ec.clear();
         return std::nullopt;
@@ -1524,16 +2223,22 @@ std::optional<fs::file_time_type> reachedWriteTime(fs::path const& p, std::error
 #endif
 }
 
-bool reachedSameFile(fs::path const& a, fs::path const& b, std::error_code& ec) {
+bool reachedSameFile(HostPath const& a, HostPath const& b, Use use, std::error_code& ec) {
     ec.clear();
+    auto const first = callSpelling(a, use, ec);
+    if (ec) return false;   // the empty spelling as a leaf (B2)
+    auto const second = callSpelling(b, use, ec);
+    if (ec) return false;
 #ifdef _WIN32
-    Handle const first = reachedHandle(a, FILE_READ_ATTRIBUTES, ec);
-    if (!first) return false;
-    Handle const second = reachedHandle(b, FILE_READ_ATTRIBUTES, ec);
-    if (!second) return false;
-    return sameIdentity(first, second, ec);
+    Handle const firstHandle = reachedHandle(first, FILE_READ_ATTRIBUTES, ec);
+    if (!firstHandle) return false;
+    Handle const secondHandle = reachedHandle(second, FILE_READ_ATTRIBUTES, ec);
+    if (!secondHandle) return false;
+    return sameIdentity(firstHandle, secondHandle, ec);
 #else
-    for (fs::path const* side : {&a, &b}) {
+    fs::path const firstPath{first};
+    fs::path const secondPath{second};
+    for (fs::path const* side : {&firstPath, &secondPath}) {
         auto const reached = fs::status(*side, ec).type();
         if (reached == fs::file_type::not_found) {
             ec.clear();
@@ -1541,15 +2246,17 @@ bool reachedSameFile(fs::path const& a, fs::path const& b, std::error_code& ec) 
         }
         if (ec) return false;
     }
-    bool const same = fs::equivalent(a, b, ec);
+    bool const same = fs::equivalent(firstPath, secondPath, ec);
     return !ec && same;
 #endif
 }
 
-void addReachedPermissions(fs::path const& p, fs::perms add, std::error_code& ec) {
+void addReachedPermissions(HostPath const& p, fs::perms add, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, Use::Leaf, ec);
+    if (ec) return;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    Handle const reached = reachedHandle(p, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, ec);
+    Handle const reached = reachedHandle(reference, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, ec);
     if (!reached) {
         if (!ec) ec = winError(ERROR_FILE_NOT_FOUND);
         return;
@@ -1568,37 +2275,43 @@ void addReachedPermissions(fs::path const& p, fs::perms add, std::error_code& ec
     if (!::SetFileInformationByHandle(reached.get(), FileBasicInfo, &basic, sizeof basic))
         ec = winError(::GetLastError());
 #else
-    fs::permissions(p, add, fs::perm_options::add, ec);   // follows every link (POSIX `chmod`)
+    fs::permissions(fs::path{reference}, add, fs::perm_options::add, ec);   // follows every link (POSIX `chmod`)
 #endif
 }
 
-bool sameEntry(fs::path const& a, fs::path const& b, std::error_code& ec) {
+bool sameEntry(HostPath const& a, HostPath const& b, Use use, std::error_code& ec) {
     ec.clear();
+    auto const first = callSpelling(a, use, ec);
+    if (ec) return false;   // the empty spelling as a leaf (B2)
+    auto const second = callSpelling(b, use, ec);
+    if (ec) return false;
 #ifdef _WIN32
-    Handle const first = entryHandle(a, FILE_READ_ATTRIBUTES, ec);
-    if (!first) return false;
-    Handle const second = entryHandle(b, FILE_READ_ATTRIBUTES, ec);
-    if (!second) return false;
-    return sameIdentity(first, second, ec);
+    Handle const firstHandle = entryHandle(first, FILE_READ_ATTRIBUTES, ec);
+    if (!firstHandle) return false;
+    Handle const secondHandle = entryHandle(second, FILE_READ_ATTRIBUTES, ec);
+    if (!secondHandle) return false;
+    return sameIdentity(firstHandle, secondHandle, ec);
 #else
     // `lstat`: the entry itself. Nothing there (or a component that is no directory) is no entry.
-    auto const look = [&ec](fs::path const& p, struct stat& st) {
-        if (::lstat(p.c_str(), &st) == 0) return true;
+    auto const look = [&ec](std::string const& at, struct stat& st) {
+        if (::lstat(at.c_str(), &st) == 0) return true;
         int const e = errno;
         if (e != ENOENT && e != ENOTDIR) ec = std::error_code{e, std::generic_category()};
         return false;
     };
     struct stat sa{};
     struct stat sb{};
-    if (!look(a, sa) || !look(b, sb)) return false;
+    if (!look(first, sa) || !look(second, sb)) return false;
     return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 #endif
 }
 
-std::optional<fs::path::string_type> storedEntryName(fs::path const& p, std::error_code& ec) {
+std::optional<fs::path::string_type> storedEntryName(HostPath const& p, Use use, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(p, use, ec);
+    if (ec) return std::nullopt;   // the empty spelling as a leaf (B2)
 #ifdef _WIN32
-    Handle const entry = entryHandle(p, FILE_READ_ATTRIBUTES, ec);
+    Handle const entry = entryHandle(reference, FILE_READ_ATTRIBUTES, ec);
     if (!entry) return std::nullopt;
     // By the NT volume name: only the last component is read, and a volume with no DOS name refuses its DOS
     // spelling (`reachedPath`).
@@ -1625,7 +2338,7 @@ std::optional<fs::path::string_type> storedEntryName(fs::path const& p, std::err
     request.bitmapcount = ATTR_BIT_MAP_COUNT;
     request.commonattr  = ATTR_CMN_NAME;
     alignas(4) char reply[sizeof(std::uint32_t) + sizeof(attrreference_t) + NAME_MAX * 3 + 1] = {};
-    if (::getattrlist(p.c_str(), &request, reply, sizeof reply, FSOPT_NOFOLLOW) != 0) {
+    if (::getattrlist(reference.c_str(), &request, reply, sizeof reply, FSOPT_NOFOLLOW) != 0) {
         int const e = errno;
         if (e != ENOENT && e != ENOTDIR) ec = std::error_code{e, std::generic_category()};
         return std::nullopt;
@@ -1640,15 +2353,17 @@ std::optional<fs::path::string_type> storedEntryName(fs::path const& p, std::err
     char const* const name = reply + at;
     return std::string{name, ::strnlen(name, sizeof reply - at)};
 #else
-    static_cast<void>(p);
+    static_cast<void>(reference);
     return std::nullopt;
 #endif
 }
 
-std::optional<bool> directoryFoldsCase(fs::path const& dir, std::error_code& ec) {
+std::optional<bool> directoryFoldsCase(HostPath const& dir, std::error_code& ec) {
     ec.clear();
+    auto const reference = callSpelling(dir, Use::Container, ec);
+    if (ec) return std::nullopt;
 #ifdef _WIN32
-    Handle const reached = reachedHandle(dir, FILE_READ_ATTRIBUTES, ec);
+    Handle const reached = reachedHandle(reference, FILE_READ_ATTRIBUTES, ec);
     if (!reached) {
         if (!ec) ec = winError(ERROR_PATH_NOT_FOUND);
         return std::nullopt;
@@ -1661,86 +2376,109 @@ std::optional<bool> directoryFoldsCase(fs::path const& dir, std::error_code& ec)
     return (info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR) == 0;
 #elif defined(__APPLE__)
     errno = 0;
-    long const sensitive = ::pathconf(dir.c_str(), _PC_CASE_SENSITIVE);
+    long const sensitive = ::pathconf(reference.c_str(), _PC_CASE_SENSITIVE);
     if (sensitive < 0) {
         if (errno != 0) ec = std::error_code{errno, std::generic_category()};
         return std::nullopt;
     }
     return sensitive == 0;
 #else
-    static_cast<void>(dir);
+    static_cast<void>(reference);
     return std::nullopt;
 #endif
 }
 
-TreeWalk walkTree(fs::path const& root, std::function<WalkStep(TreeEntry const&)> const& visit,
+TreeWalk walkTree(HostPath const& root, std::function<WalkStep(TreeEntry const&)> const& visit,
                   TreeWalkOptions options) {
     TreeWalk walk;
-    // One listed directory: its entries, their spellings (what every call on an entry is handed), and how many of
-    // them the walk has handed out.
+    // ★ THE ROOT IS A CONTAINER (P69 H6b, ledger 541), its reference taken ONCE: the kind asked and the listing made
+    // through the same one -- never `root` re-resolved as a leaf, whose last name the OS may trim or map.
+    auto const     rootReference = HostPathAccess::reference(root, Use::Container);
+    HostPath const listedRoot    = HostPathAccess::made(HostPathAccess::text(root), rootReference, rootReference,
+                                                        HostPath::Origin::Composed);
+    // ★ THE WALK REPORTS ITS ROOT (H6c, A2 and N10) in a host-neutral word: no caller asks the kind of what it walks.
+    {
+        std::error_code kindEc;
+        EntryKind const kind = reachedKind(listedRoot, Use::Container, kindEc);
+        if (kindEc) {
+            walk.error     = kindEc;
+            walk.where     = root;
+            walk.storeRouteWhere = HostPathAccess::text(root);
+            walk.root      = WalkRoot::Unreadable;
+            return walk;
+        }
+        if (kind == EntryKind::Absent) {
+            walk.error     = std::make_error_code(std::errc::no_such_file_or_directory);
+            walk.where     = root;
+            walk.storeRouteWhere = HostPathAccess::text(root);
+            walk.root      = WalkRoot::Absent;
+            return walk;
+        }
+        if (kind != EntryKind::Directory) {
+            walk.error     = std::make_error_code(std::errc::not_a_directory);
+            walk.where     = root;
+            walk.storeRouteWhere = HostPathAccess::text(root);
+            walk.root      = WalkRoot::NotADirectory;
+            return walk;
+        }
+    }
+    // One listed directory: its entries -- LISTED values -- and how many of them the walk has handed out.
     struct Listed {
         std::vector<TreeEntry> entries;
-        std::vector<fs::path>  spelled;
         std::size_t            next = 0;
     };
     std::vector<Listed> work;
-    // List `dir`, spelled `spelledDir`, onto the stack; false ends the walk (its error recorded).
-    auto const descend = [&](fs::path const& dir, fs::path const& spelledDir, std::size_t depth) {
+    // List `dir` onto the stack; false ends the walk (its error recorded). `storeText` is its store-route text.
+    auto const descend = [&](HostPath const& dir, HostPath const& reported, fs::path const& storeText,
+                             ListedRelative const& relative, std::size_t depth) {
         Listed          listed;
         std::error_code ec;
-        listEntries(dir, spelledDir, depth, listed.entries, listed.spelled, ec);
+        listEntries(dir, storeText, relative, depth, listed.entries, ec);
         if (ec) {
-            walk.error = ec;
-            walk.where = dir;
+            walk.error     = ec;
+            walk.where     = reported;
+            walk.storeRouteWhere = storeText;
+            if (depth == 0) walk.root = WalkRoot::Unreadable;
             return false;
         }
-        for (std::size_t i = 0; i < listed.entries.size(); ++i) {
-            TreeEntry& entry = listed.entries[i];
+        for (TreeEntry& entry : listed.entries) {
             if (entry.kind != EntryKind::Link) continue;
             // A link whose reach cannot be examined reaches nothing usable, and the walk does not know
             // what that entry is: it ends here naming the link, unless the visitor asked to answer it.
-            // Asked by the entry's own spelling: `entry.path` re-resolved is another entry for a name ending in
-            // a space or a period, or a device name (P69 H6b).
-            entry.reaches = reachedKind(listed.spelled[i], entry.reachError);
+            // Asked of the entry's own VALUE, its reference fixed to the listing: its text re-resolved is another
+            // entry for a name ending in a space or a period, or a device name (P69 H6b).
+            entry.reaches = reachedKind(entry.at, Use::Leaf, entry.reachError);
             if (entry.reachError && !options.handOutUnreadableLinks) {
-                walk.error = entry.reachError;
-                walk.where = entry.path;
+                walk.error     = entry.reachError;
+                walk.where     = entry.at;
+                walk.storeRouteWhere = entry.storeRoutePath;
                 return false;
             }
         }
         work.push_back(std::move(listed));
         return true;
     };
-    // ★ THE ROOT IS A CONTAINER (P69 H6b, ledger 541): it is listed by its container reference, the directory every
-    // `root \ name` lies in -- never by `root` re-resolved as a leaf, whose last name the OS may trim or map.
-#ifdef _WIN32
-    fs::path const spelledRoot{referenceSpelling(root.native(), Use::Container)};
-#else
-    fs::path const& spelledRoot = root;
-#endif
-    if (!descend(root, spelledRoot, 0)) return walk;
+    if (!descend(listedRoot, root, HostPathAccess::text(root), ListedRelative{}, 0)) return walk;
     while (!work.empty()) {
         Listed& top = work.back();
         if (top.next == top.entries.size()) {
             work.pop_back();
             continue;
         }
-        // COPIES: descending grows `work`, which would leave a reference into it dangling.
-        std::size_t const at      = top.next++;
-        TreeEntry const   entry   = top.entries[at];
-        fs::path const    spelled = top.spelled[at];
-        WalkStep const    step    = visit(entry);
+        // A COPY: descending grows `work`, which would leave a reference into it dangling.
+        TreeEntry const entry = top.entries[top.next++];
+        WalkStep const  step  = visit(entry);
         if (step == WalkStep::Stop) {
             walk.stopped = true;
             return walk;
         }
         if (step == WalkStep::Prune || entry.kind != EntryKind::Directory) continue;
-        if (!descend(entry.path, spelled, entry.depth + 1)) return walk;
+        if (!descend(entry.at, entry.at, entry.storeRoutePath, entry.relative, entry.depth + 1)) return walk;
     }
     return walk;
 }
 
-TreeRemoval removeTree(fs::path const& target, RemovalOptions const& options) {
+TreeRemoval removeTree(HostPath const& target, RemovalOptions const& options) {
     TreeRemoval out;
     // The options' last entry (the header): moved to the end of the TARGET's listing, and handled only
     // when every entry before it was removed -- otherwise the removal ends, leaving it and the target.
@@ -1751,41 +2489,44 @@ TreeRemoval removeTree(fs::path const& target, RemovalOptions const& options) {
         auto const at = std::find_if(names.begin(), names.end(), isLastEntry);
         if (at != names.end()) std::rotate(at, at + 1, names.end());
     };
-    // A failure on an entry that is now GONE was beaten to the outcome wanted: it is no failure.
-    // Gone-ness is asked by the entry's own SPELLING where the walk holds one (P69 H6b): `p`, a listed name composed
-    // onto its directory as given, is ANOTHER entry for a name ending in a space or a period, or a device name.
-    auto const note = [&out](fs::path const& p, std::error_code const& ec, fs::path const& spelled = {}) {
+    // A failure on an entry that is now GONE was beaten to the outcome wanted: it is no failure. Gone-ness is asked of
+    // the entry's VALUE (H6c): a listed entry's reference is fixed to the listing -- its text re-resolved is ANOTHER
+    // entry for a name ending in a space or a period, or a device name (P69 H6b).
+    auto const note = [&out](HostPath const& p, std::error_code const& ec) {
         std::error_code gec;
-        if (entryKind(spelled.empty() ? p : spelled, gec) == EntryKind::Absent && !gec) return;
+        if (entryKind(p, Use::Leaf, gec) == EntryKind::Absent && !gec) return;
         if (out.failures++ == 0) {
             out.firstPath  = p;
             out.firstError = ec;
         }
     };
+    // ★ THE EMPTY SPELLING NAMES NOTHING TO REMOVE (H6c, B2): refused by name -- never read as the current directory.
+    std::error_code refused;
+    auto const      spelledTarget = callSpelling(target, Use::Leaf, refused);
+    if (refused) {
+        note(target, refused);
+        return out;
+    }
     auto const& hook = removeTreeEntryHook();
     // An explicit work stack of OPEN directories: each is listed once, through its own handle, its
     // entries handled one by one -- each opened RELATIVE to it, never following a link, and judged by
     // what was opened -- and it is deleted once every entry of that listing has been. A directory's
     // handle stays open while its entries are handled, so every relative open names an entry of the
-    // directory that was listed, whatever its path names by then.
+    // directory that was listed, whatever its path names by then. Each entry is a LISTED value below its
+    // directory's (H6c): its reference the directory's extended literally by the listed name.
 #ifdef _WIN32
     struct Open {
         Handle                    dir;
-        fs::path                  path;
+        HostPath                  value;     // the target, or a LISTED value below it
+        std::wstring              spelled;   // its reference: the target's leaf reference, then `\name`, literally
         std::vector<std::wstring> names;
         std::size_t               next   = 0;
         bool                      listed = false;
-        std::wstring              spelled;   // its verbatim spelling: the target's leaf reference, then `\name`
-    };
-    // An entry's verbatim spelling below its directory's: a literal extension, never re-resolved.
-    auto const below = [](std::wstring const& dir, std::wstring const& name) {
-        return (!dir.empty() && dir.back() == L'\\' ? dir : dir + L'\\') + name;
     };
     // The target itself, opened as the entry it is (a link is opened as the link) -- a directory by ONE
     // opening that both lists and deletes it. An entry that refuses the listing access is opened again for
     // its deletion alone (a file this process may delete but not read, or one another process holds
     // without sharing reads); a DIRECTORY opened only so cannot be listed, and that refusal is the failure.
-    std::wstring const spelledTarget = callSpelling(target);
     auto const openTarget = [&spelledTarget](ACCESS_MASK access, DWORD& error) {
         HANDLE const h = ::CreateFileW(spelledTarget.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                        nullptr, OPEN_EXISTING,
@@ -1819,31 +2560,30 @@ TreeRemoval removeTree(fs::path const& target, RemovalOptions const& options) {
         return out;
     }
     std::vector<Open> work;
-    work.push_back(Open{std::move(root), target, {}, 0, false, spelledTarget});
+    work.push_back(Open{std::move(root), target, spelledTarget, {}, 0, false});
     while (!work.empty()) {
         Open& top = work.back();
         if (!top.listed) {
             top.listed      = true;
             DWORD listError = ERROR_SUCCESS;
             top.names       = namesThrough(top.dir.get(), listError);
-            if (listError != ERROR_SUCCESS) note(top.path, winError(listError), fs::path{top.spelled});
+            if (listError != ERROR_SUCCESS) note(top.value, winError(listError));
             if (work.size() == 1) moveLastEntryLast(top.names);   // the target's own listing
             continue;
         }
         if (top.next == top.names.size()) {
             // Every entry of its listing handled: the directory itself, through its own handle.
-            DWORD const    e       = deleteThrough(top.dir.get());
-            fs::path const path    = top.path;
-            fs::path const spelled{top.spelled};
+            DWORD const    e     = deleteThrough(top.dir.get());
+            HostPath const value = top.value;
             work.pop_back();   // closes the handle: a classic disposition deletes it now
-            if (e != ERROR_SUCCESS) note(path, winError(e), spelled);
+            if (e != ERROR_SUCCESS) note(value, winError(e));
             continue;
         }
-        std::wstring const name  = top.names[top.next++];
+        std::wstring const name = top.names[top.next++];
         if (work.size() == 1 && out.failures != 0 && isLastEntry(name)) return out;   // it stays, and the target
-        fs::path const     entry = top.path / name;
-        std::wstring const entrySpelled = below(top.spelled, name);
-        if (hook) hook(entry);
+        HostPath const     entry   = HostPathAccess::listed(HostPathAccess::text(top.value), top.spelled, name);
+        std::wstring const spelled = below(top.spelled, name);
+        if (hook) hook(HostPathAccess::text(entry));
         // A directory is opened ONCE for its listing and its deletion (a link to a directory meets that open
         // as the link, and is judged a link below); an entry that is no directory refuses it, and is opened
         // for its deletion alone.
@@ -1852,72 +2592,74 @@ TreeRemoval removeTree(fs::path const& target, RemovalOptions const& options) {
         if (!opened && openError == ERROR_DIRECTORY)
             opened = openEntryRelative(top.dir.get(), name, kRemovalAccess, FILE_NON_DIRECTORY_FILE, openError);
         if (!opened) {
-            if (!winNotFound(openError)) note(entry, winError(openError), fs::path{entrySpelled});   // gone: no failure
+            if (!winNotFound(openError)) note(entry, winError(openError));   // gone: no failure
             continue;
         }
         kindError = ERROR_SUCCESS;
         kind      = kindOfHandle(opened.get(), kindError);
         if (kindError != ERROR_SUCCESS) {
-            note(entry, winError(kindError), fs::path{entrySpelled});
+            note(entry, winError(kindError));
             continue;
         }
         if (kind == EntryKind::Directory) {
-            work.push_back(Open{std::move(opened), entry, {}, 0, false, entrySpelled});   // `top` is not used past here
+            work.push_back(Open{std::move(opened), entry, spelled, {}, 0, false});   // `top` is not used past here
             continue;
         }
         // A file, or a link -- the link itself, which is what was opened.
-        if (DWORD const e = deleteThrough(opened.get()); e != ERROR_SUCCESS) note(entry, winError(e), fs::path{entrySpelled});
+        if (DWORD const e = deleteThrough(opened.get()); e != ERROR_SUCCESS) note(entry, winError(e));
     }
 #else
     struct Open {
         Descriptor               dir;
-        fs::path                 path;
+        HostPath                 value;   // the target, or a LISTED value below it
+        std::string              name;    // its name in its directory's listing (empty for the target)
         std::vector<std::string> names;
         std::size_t              next   = 0;
         bool                     listed = false;
     };
     // The target itself: a directory opened as one, or -- refused as a link or as no directory -- the
     // entry removed as itself (`unlink` never follows a link).
-    int const first = ::open(target.c_str(), kOpenDirectoryOnly);
+    int const first = ::open(spelledTarget.c_str(), kOpenDirectoryOnly);
     if (first < 0) {
         int const e = errno;
         if (e == ENOENT) return out;
         if (e == ELOOP || e == ENOTDIR) {
-            if (::unlink(target.c_str()) != 0 && errno != ENOENT) note(target, posixError(errno));
+            if (::unlink(spelledTarget.c_str()) != 0 && errno != ENOENT) note(target, posixError(errno));
             return out;
         }
         note(target, posixError(e));
         return out;
     }
     std::vector<Open> work;
-    work.push_back(Open{Descriptor{first}, target, {}, 0, false});
+    work.push_back(Open{Descriptor{first}, target, {}, {}, 0, false});
     while (!work.empty()) {
         Open& top = work.back();
         if (!top.listed) {
             top.listed    = true;
             int listError = 0;
             top.names     = namesThrough(top.dir.get(), listError);
-            if (listError != 0) note(top.path, posixError(listError));
+            if (listError != 0) note(top.value, posixError(listError));
             if (work.size() == 1) moveLastEntryLast(top.names);   // the target's own listing
             continue;
         }
         if (top.next == top.names.size()) {
             // Every entry of its listing handled: the directory itself, relative to its parent's
-            // descriptor -- the root by its path (`rmdir` never follows a link).
-            fs::path const path = top.path;
+            // descriptor -- the root by its spelling (`rmdir` never follows a link).
+            HostPath const    value = top.value;
+            std::string const name  = top.name;
             work.pop_back();   // closes its descriptor
-            int const rc = work.empty() ? ::rmdir(path.c_str())
-                                        : ::unlinkat(work.back().dir.get(), path.filename().c_str(), AT_REMOVEDIR);
-            if (rc != 0 && errno != ENOENT) note(path, posixError(errno));
+            int const rc = work.empty() ? ::rmdir(spelledTarget.c_str())
+                                        : ::unlinkat(work.back().dir.get(), name.c_str(), AT_REMOVEDIR);
+            if (rc != 0 && errno != ENOENT) note(value, posixError(errno));
             continue;
         }
-        std::string const name  = top.names[top.next++];
+        std::string const name = top.names[top.next++];
         if (work.size() == 1 && out.failures != 0 && isLastEntry(name)) return out;   // it stays, and the target
-        fs::path const    entry = top.path / name;
-        if (hook) hook(entry);
+        HostPath const entry = HostPathAccess::listed(HostPathAccess::text(top.value), {}, name);
+        if (hook) hook(HostPathAccess::text(entry));
         int const opened = ::openat(top.dir.get(), name.c_str(), kOpenDirectoryOnly);
         if (opened >= 0) {
-            work.push_back(Open{Descriptor{opened}, entry, {}, 0, false});   // `top` is not used past here
+            work.push_back(Open{Descriptor{opened}, entry, name, {}, 0, false});   // `top` is not used past here
             continue;
         }
         int const e = errno;
@@ -1933,10 +2675,51 @@ TreeRemoval removeTree(fs::path const& target, RemovalOptions const& options) {
     return out;
 }
 
+// ════ THE STORE ROUTE'S TEXT FORMS (ledger 579; fenced by ledger 580): H6d deletes every one (the header) ════
+
+fs::path storeRouteNormalized(fs::path const& p) {
+#ifdef _WIN32
+    RootSpelling::Kind const kind = rootSpelling(p).kind;
+    if (kind == RootSpelling::Kind::Drive || kind == RootSpelling::Kind::Share || kind == RootSpelling::Kind::Device) {
+        if (std::wstring full = osFullPath(p.native()); !full.empty()) return fs::path{std::move(full)};
+    }
+#endif
+    return fs::path{normalizeIn(std::basic_string_view<fs::path::value_type>{p.native()}, kHostPathGrammar)};
+}
+
+fs::path storeRouteAbsolute(fs::path const& p, std::error_code& ec) {
+    switch (rootSpelling(p).kind) {
+        case RootSpelling::Kind::Share:
+        case RootSpelling::Kind::Authority:
+        case RootSpelling::Kind::Device:
+        case RootSpelling::Kind::Verbatim:
+            ec.clear();
+            return p;
+        case RootSpelling::Kind::Relative:
+        case RootSpelling::Kind::DriveRelative:
+        case RootSpelling::Kind::Rooted:
+        case RootSpelling::Kind::Drive:
+            break;
+    }
+    return fs::absolute(p, ec);
+}
+
+fs::path storeRouteReachedPath(fs::path const& p, std::error_code& ec) {
+    return HostPathAccess::text(reachedPath(HostPath{p}, Use::Leaf, ec));
+}
+
+fs::path storeRouteCurrentDirectory(std::error_code& ec) { return HostPathAccess::text(currentDirectory(ec)); }
+
+fs::path storeRouteRunningExecutable(std::error_code& ec) { return HostPathAccess::text(runningExecutable(ec)); }
+
+fs::path storeRouteTemporaryDirectory(std::error_code& ec) { return HostPathAccess::text(temporaryDirectory(ec)); }
+
 namespace substrate_testing {
 void setRemoveTreeEntryHook(std::function<void(fs::path const&)> hook) {
     removeTreeEntryHook() = std::move(hook);
 }
+
+fs::path::string_type referenceForTest(HostPath const& value, Use use) { return HostPathAccess::reference(value, use); }
 }  // namespace substrate_testing
 
 }  // namespace dss::core

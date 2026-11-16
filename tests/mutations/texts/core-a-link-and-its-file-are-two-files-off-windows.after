@@ -1,1 +1,1 @@
-    bool const same = a.lexically_normal() == b.lexically_normal();
+    bool const same = firstPath.lexically_normal() == secondPath.lexically_normal();

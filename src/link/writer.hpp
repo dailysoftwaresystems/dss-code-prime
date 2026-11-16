@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/host_path.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "link/linker.hpp"
 
@@ -224,7 +225,7 @@ inline constexpr std::uint32_t kMaxClaimAttempts = 1000;
 //
 // Caller owns the returned stream and must `std::fclose` it.
 [[nodiscard]] DSS_EXPORT std::FILE*
-createExclusiveBinary(std::filesystem::path const& p);
+createExclusiveBinary(core::HostPath const& p);
 
 // ── THE COMMIT: rename a staged file over its target ───────────────────────
 //
@@ -298,16 +299,16 @@ using CommitPatience = std::function<bool(std::uint32_t holderRefusals)>;
 
 // The production commit: waits up to `kCommitHolderWait` for a holder.
 [[nodiscard]] DSS_EXPORT CommitOutcome
-commitReplacing(std::filesystem::path const& staged,
-                std::filesystem::path const& target);
+commitReplacing(core::HostPath const& staged,
+                core::HostPath const& target);
 
 // The same commit with the caller's patience — the seam a test uses to release
 // its holder at the moment the commit has been refused, by handshake rather
 // than by a timer.
 [[nodiscard]] DSS_EXPORT CommitOutcome
-commitReplacing(std::filesystem::path const& staged,
-                std::filesystem::path const& target,
-                CommitPatience const&        patience);
+commitReplacing(core::HostPath const& staged,
+                core::HostPath const& target,
+                CommitPatience const& patience);
 
 } // namespace detail
 

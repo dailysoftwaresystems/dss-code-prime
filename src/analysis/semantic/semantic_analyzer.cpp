@@ -32340,7 +32340,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         for (ShippedDescriptorRef const& ref :
              cu->shippedLibDescriptors()) {
             std::filesystem::path const& descPath = ref.path;  // (ref.span/buffer: the c8 gate)
-            auto const key = core::PathIdentity::of(descPath);
+            auto const key = core::PathIdentity::of(descPath, core::Use::Leaf);
             if (!readDescriptors.insert(key).second) continue;  // already read
 
             // Read + decode against THIS CU's interner/registry/reporter. The

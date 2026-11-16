@@ -1,1 +1,1 @@
-    Handle const entry = reachedHandle(p, FILE_READ_ATTRIBUTES, ec);
+    Handle const entry = reachedHandle(reference, FILE_READ_ATTRIBUTES, ec);

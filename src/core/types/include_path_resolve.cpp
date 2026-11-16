@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -115,14 +116,14 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     HeaderSearchCache::Impl::Listing l;
     // THE SUBSTRATE'S LISTING (P69 H6): it lists at any length, and one it could not read whole hands out no name --
     // the library's `directory_iterator` miscounts a directory of 260 characters or more under MinGW's libstdc++ with
-    // no error (`core::extendedLengthSpelling`'s header). A name is all a listing answers here, so a link whose reach
+    // no error (path_identity.hpp, "THE SPELLING A FILE CALL TAKES, AT ANY LENGTH"). A name is all a listing answers here, so a link whose reach
     // cannot be examined is listed by its name like any other.
     core::TreeWalkOptions options;
     options.handOutUnreadableLinks = true;
     core::TreeWalk const walk = core::walkTree(
         dir,
         [&l](core::TreeEntry const& entry) {
-            l.names.push_back(entry.path.filename().native());
+            l.names.push_back(entry.at.filename().native());   // the listed name, to MATCH
             return core::WalkStep::Prune;
         },
         options);
@@ -131,12 +132,9 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
     // substrate's answer: nothing, or no directory). A directory -- or a `dir` whose
     // reach cannot be examined -- that could not be listed whole is a listing the
     // search cannot answer from, and it says so (`matchComponent`).
-    if (ec) {
-        std::error_code       kec;
-        core::EntryKind const there = core::reachedKind(dir, kec);
-        if (kec) l.error = kec;
-        else if (there == core::EntryKind::Directory) l.error = ec;
-    }
+    // ★ THE WALK REPORTS ITS ROOT (P69 H6c, A2): which of the three it found, asked as a CONTAINER -- the
+    // question this asked again after the walk is the walk's own answer.
+    if (ec && walk.root != core::WalkRoot::Absent && walk.root != core::WalkRoot::NotADirectory) l.error = ec;
     l.exact.reserve(l.names.size());
     for (std::size_t i = 0; i < l.names.size(); ++i) {
         l.exact.insert(l.names[i]);
@@ -194,19 +192,27 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
 // `fs::exists`: libstdc++ on Windows reads a dangling link's OWN attributes and
 // calls it `regular` (✔MEASURED 2026-10-20, path_identity.hpp), so the MinGW
 // build found the link under BOTH policies.
-[[nodiscard]] core::EntryKind reachedOnce(HeaderSearchCache& cache, fs::path const& candidate,
+//
+// `use` is the candidate's POSITION in the name searched (P69 H6c): a MIDDLE component is a directory the search
+// descends through, asked as a CONTAINER -- the OS keeps a middle name's trailing space where a last name loses
+// it, so `sub /x.h` opens the literal `sub ` -- and the LAST is the header, a LEAF. The cache keeps the two uses
+// apart (one path can be both, in two names); the tally counts the path.
+[[nodiscard]] core::EntryKind reachedOnce(HeaderSearchCache& cache, fs::path const& candidate, core::Use use,
                                           std::error_code& error) {
     HeaderSearchCache::Impl& c = cache.impl();
     std::lock_guard<std::mutex> lock{c.mutex};
-    NativeString key = cacheKeyOf(candidate);
+    NativeString const path = cacheKeyOf(candidate);
+    NativeString       key  = path;
+    key.insert(key.begin(), use == core::Use::Container ? NativeChar{'C'} : NativeChar{'L'});
     if (auto const hit = c.probes.find(key); hit != c.probes.end()) {
         error = hit->second.error;
         return hit->second.kind;
     }
     HeaderSearchCache::Impl::Probe probe;
-    probe.kind = core::reachedKind(candidate, probe.error);
+    // By its position's use (the search composes the candidate's text -- the store route, H6d).
+    probe.kind = core::reachedKind(candidate, use, probe.error);
     if (probe.error) probe.kind = core::EntryKind::Absent;
-    tallyRecord(key, /*listing=*/false);
+    tallyRecord(path, /*listing=*/false);
     error = probe.error;
     c.probes.emplace(std::move(key), probe);
     return probe.kind;
@@ -248,12 +254,12 @@ listingOf(HeaderSearchCache::Impl& c, fs::path const& dir) {
 // refused: never a guess, and never "not here". The checkpoint-34 bytes read such a listing as holding NOTHING and
 // went on: `-I u -I b` compiled b/x.h, the header of the wrong directory, in silence.
 [[nodiscard]] HeaderSearchCache::Impl::Unlisted
-decideUnlisted(fs::path const& dir, fs::path const& name, HeaderNameMatching matching, HeaderSearchCache& cache,
-               std::error_code const& listingError) {
+decideUnlisted(fs::path const& dir, fs::path const& name, core::Use use, HeaderNameMatching matching,
+               HeaderSearchCache& cache, std::error_code const& listingError) {
     bool const            caseSensitive = matching == HeaderNameMatching::CaseSensitive;
     fs::path const        candidate     = dir / name;
     std::error_code       ec;
-    core::EntryKind const reaches = reachedOnce(cache, candidate, ec);
+    core::EntryKind const reaches = reachedOnce(cache, candidate, use, ec);
     if (ec) return {HeaderSearchResult::unexaminable(candidate, ec)};
     NativeString const other   = otherAsciiCase(name.native());
     bool const         letters = other != name.native();
@@ -266,11 +272,11 @@ decideUnlisted(fs::path const& dir, fs::path const& name, HeaderNameMatching mat
     }
     if (!letters) return {HeaderSearchResult::found(candidate), reaches};
     fs::path const otherSpelling = dir / fs::path{other};
-    bool const     folds         = core::sameEntry(candidate, otherSpelling, ec);
+    bool const     folds         = core::sameEntry(candidate, otherSpelling, use, ec);
     if (ec) return {HeaderSearchResult::unexaminable(otherSpelling, ec)};
     if (!folds) {
         if (caseSensitive) return {HeaderSearchResult::found(candidate), reaches};
-        core::EntryKind const second = reachedOnce(cache, otherSpelling, ec);
+        core::EntryKind const second = reachedOnce(cache, otherSpelling, use, ec);
         if (ec) return {HeaderSearchResult::unexaminable(otherSpelling, ec)};
         if (second == core::EntryKind::Absent) return {HeaderSearchResult::unexaminable(dir, listingError)};
         std::vector<fs::path> both{candidate, otherSpelling};
@@ -278,7 +284,7 @@ decideUnlisted(fs::path const& dir, fs::path const& name, HeaderNameMatching mat
                   [](fs::path const& a, fs::path const& b) { return a.native() < b.native(); });
         return {HeaderSearchResult::ambiguous(std::move(both))};
     }
-    std::optional<NativeString> const stored = core::storedEntryName(candidate, ec);
+    std::optional<NativeString> const stored = core::storedEntryName(candidate, use, ec);
     if (ec) return {HeaderSearchResult::unexaminable(candidate, ec)};
     if (!stored) return {HeaderSearchResult::unexaminable(dir, listingError)};
     if (caseSensitive) {
@@ -290,12 +296,13 @@ decideUnlisted(fs::path const& dir, fs::path const& name, HeaderNameMatching mat
 }
 
 // `decideUnlisted`, asked once per policy and candidate per compile. `reached` is what a Found entry reaches.
-[[nodiscard]] HeaderSearchResult unlistedMatch(fs::path const& dir, fs::path const& name, HeaderNameMatching matching,
-                                               HeaderSearchCache& cache, std::error_code const& listingError,
-                                               core::EntryKind& reached) {
+[[nodiscard]] HeaderSearchResult unlistedMatch(fs::path const& dir, fs::path const& name, core::Use use,
+                                               HeaderNameMatching matching, HeaderSearchCache& cache,
+                                               std::error_code const& listingError, core::EntryKind& reached) {
     HeaderSearchCache::Impl& c   = cache.impl();
     NativeString             key = cacheKeyOf(dir / name);
     key.insert(key.begin(), matching == HeaderNameMatching::CaseSensitive ? NativeChar{'S'} : NativeChar{'I'});
+    key.insert(key.begin(), use == core::Use::Container ? NativeChar{'C'} : NativeChar{'L'});
     {
         std::lock_guard<std::mutex> lock{c.mutex};
         if (auto const hit = c.unlisted.find(key); hit != c.unlisted.end()) {
@@ -303,7 +310,7 @@ decideUnlisted(fs::path const& dir, fs::path const& name, HeaderNameMatching mat
             return hit->second.result;
         }
     }
-    HeaderSearchCache::Impl::Unlisted verdict = decideUnlisted(dir, name, matching, cache, listingError);
+    HeaderSearchCache::Impl::Unlisted verdict = decideUnlisted(dir, name, use, matching, cache, listingError);
     reached                                   = verdict.reached;
     std::lock_guard<std::mutex> lock{c.mutex};
     return c.unlisted.emplace(std::move(key), std::move(verdict)).first->second.result;
@@ -357,7 +364,7 @@ constexpr NativeChar kDotChar = NativeChar{'.'};
 // The comparisons themselves are unchanged, name for name.
 // `reached` is what a Found entry REACHES, from the search's own examination of it -- for `descend`, which decides
 // from it what the search may take.
-HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
+HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name, core::Use use,
                                   HeaderNameMatching matching,
                                   HeaderSearchCache& cache, core::EntryKind& reached) {
     reached = core::EntryKind::Absent;
@@ -369,7 +376,7 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
         // It is also where a dangling link is no header (`reachedOnce`).
         fs::path const candidate = dir / name;
         std::error_code       probeError;
-        core::EntryKind const reaches = reachedOnce(cache, candidate, probeError);
+        core::EntryKind const reaches = reachedOnce(cache, candidate, use, probeError);
         if (probeError) return HeaderSearchResult::unexaminable(candidate, probeError);
         if (reaches == core::EntryKind::Absent) return HeaderSearchResult::notFound();
         // The probe said yes — but a case-INSENSITIVE host may have FOLDED to
@@ -380,7 +387,7 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
         // is no permission to assume, and no absence either.
         std::error_code listingError;
         bool const      spelled = listsExactly(cache, dir, name.native(), listingError);
-        if (listingError) return unlistedMatch(dir, name, matching, cache, listingError, reached);
+        if (listingError) return unlistedMatch(dir, name, use, matching, cache, listingError, reached);
         if (!spelled) return HeaderSearchResult::notFound();
         reached = reaches;
         return HeaderSearchResult::found(candidate);
@@ -401,11 +408,11 @@ HeaderSearchResult matchComponent(fs::path const& dir, fs::path const& name,
     core::EntryKind       hitReaches = core::EntryKind::Absent;   // what the hit reaches, when there is one
     std::error_code       listingError;
     auto const            matches = foldMatches(cache, dir, asciiToLower(name.native()), listingError);
-    if (listingError) return unlistedMatch(dir, name, matching, cache, listingError, reached);
+    if (listingError) return unlistedMatch(dir, name, use, matching, cache, listingError, reached);
     for (NativeString const& entry : matches) {
         fs::path              hit = dir / fs::path{entry};
         std::error_code       probeError;
-        core::EntryKind const reaches = reachedOnce(cache, hit, probeError);
+        core::EntryKind const reaches = reachedOnce(cache, hit, use, probeError);
         if (probeError) return HeaderSearchResult::unexaminable(std::move(hit), probeError);
         if (reaches == core::EntryKind::Absent) continue;
         hitReaches = reaches;
@@ -454,7 +461,8 @@ HeaderSearchResult descendThrough(fs::path base, Range const& rel, Components co
     // What `base` reaches, as the search examined it: known once a component is matched (its probe's
     // answer), unknown at the start and after a `..` -- a path no probe named.
     std::optional<core::EntryKind> reaches;
-    for (fs::path const& comp : rel) {
+    for (auto at = std::begin(rel), end = std::end(rel); at != end; ++at) {
+        fs::path const& comp = *at;
         // NATIVE, not `comp.string()`: the requested name is already a path,
         // and narrowing it back would reintroduce the throw/lossy conversion
         // documented on `matchComponent` — on the REQUEST side this time.
@@ -475,8 +483,18 @@ HeaderSearchResult descendThrough(fs::path base, Range const& rel, Components co
             reaches.reset();
             continue;
         }
+        // ★ A TYPED NAME IS MATCHED AS THE OS'S PLAIN RULE MAKES IT BY ITS POSITION (P69 H6c, B1): below a DOS-text
+        // base a middle name loses one trailing period and the last every trailing period and space -- what cl and gcc
+        // open (`core::typedNameBelow`; RootedIncludeResolution.ATypedIncludeNameOpensWhatTheReferencesOpen). The bytes
+        // before matched the name AS TYPED against the listing, so `"config.h."` beside `config.h` alone was no header
+        // where both references open `config.h`. Below a verbatim base a name is its bytes.
+        // The component's probe takes its position's use too (`reachedOnce`): a middle one is a directory.
+        bool const     last  = std::next(at) == end;
+        fs::path const named = core::typedNameBelow(base, comp, last ? core::NamePosition::Last
+                                                                    : core::NamePosition::Middle);
         core::EntryKind    reached = core::EntryKind::Absent;
-        HeaderSearchResult step    = matchComponent(base, comp, matching, cache, reached);
+        HeaderSearchResult step    = matchComponent(base, named, last ? core::Use::Leaf : core::Use::Container,
+                                                    matching, cache, reached);
         if (step.status != HeaderSearchStatus::Found) return step;
         base    = std::move(step.path);
         reaches = reached;
@@ -487,7 +505,7 @@ HeaderSearchResult descendThrough(fs::path base, Range const& rel, Components co
     // and fail with the OS's reason). The checkpoint-34 bytes handed such a path back as Found, unexamined.
     if (!reaches) {
         std::error_code error;
-        reaches = reachedOnce(cache, base, error);
+        reaches = reachedOnce(cache, base, core::Use::Leaf, error);   // the name as a whole: the header
         if (error) return HeaderSearchResult::unexaminable(base, error);
         // Nothing reached -- a `..` through a FILE (`x.h/..`) -- is no header, and the search goes on.
         if (*reaches == core::EntryKind::Absent) return HeaderSearchResult::notFound();

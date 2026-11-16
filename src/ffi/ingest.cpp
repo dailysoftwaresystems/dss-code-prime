@@ -255,7 +255,7 @@ struct PeekedLibraryIdentity {
 [[nodiscard]] static PeekedLibraryIdentity
 peekLibraryIdentity(std::filesystem::path const& libraryPath) {
     PeekedLibraryIdentity out;
-    std::ifstream in(core::extendedLengthSpelling(libraryPath), std::ios::binary);
+    std::ifstream in = core::openInputStream(libraryPath, std::ios::binary);   // at any length (the home)
     if (!in) return out;
     std::uint8_t buf[kArchitectureLeadBytes] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
@@ -453,7 +453,7 @@ checkArchiveMembersMatchTargetFormat(std::filesystem::path const& archivePath,
     // the same bytes with the same reader and reports structural faults in
     // full. Reporting here as well would double-report one broken archive; the
     // contract is `peekLibraryIdentity`'s, one tier up.
-    std::ifstream in(core::extendedLengthSpelling(archivePath), std::ios::binary);
+    std::ifstream in = core::openInputStream(archivePath, std::ios::binary);   // at any length (the home)
     if (!in) return std::nullopt;
     std::vector<std::uint8_t> const bytes{
         std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
@@ -712,7 +712,8 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
                      DiagnosticReporter&          reporter) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    if (core::reachedKind(headerDir, ec) != core::EntryKind::Directory || ec) {
+    // A CONTAINER (H6c, A2): the directory the headers are listed from.
+    if (core::reachedKind(headerDir, core::Use::Container, ec) != core::EntryKind::Directory || ec) {
         return std::unexpected(HeaderReadError{
             HeaderReadErrorKind::FileOpenFailed,
             std::string{"readCHeaderDirectory: not a directory: "}
@@ -739,13 +740,13 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
     auto const walk = core::walkTree(
         headerDir,
         [&](core::TreeEntry const& entry) {
-            if (entry.path.extension() != ".h") return core::WalkStep::Prune;
+            if (entry.at.extension() != ".h") return core::WalkStep::Prune;
             if (entry.reachError) {
-                unreadable = "'" + core::genericSpelling(entry.path) + "' is named as a header but what it "
+                unreadable = "'" + entry.at.spelling().generic() + "' is named as a header but what it "
                              "reaches cannot be examined (" + entry.reachError.message() + ")";
                 return core::WalkStep::Stop;
             }
-            if (entry.reaches == core::EntryKind::File) headers.push_back(entry.path);
+            if (entry.reaches == core::EntryKind::File) headers.push_back(entry.storeRoutePath);
             return core::WalkStep::Prune;
         },
         core::TreeWalkOptions{.handOutUnreadableLinks = true});
@@ -755,7 +756,7 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
             std::string{"readCHeaderDirectory: '"} + core::genericSpelling(headerDir)
                 + "' could not be read whole: "
                 + (!unreadable.empty() ? unreadable
-                                       : "the walk stopped at '" + core::genericSpelling(walk.where) + "' ("
+                                       : "the walk stopped at '" + walk.where.spelling().generic() + "' ("
                                              + walk.error.message() + ")")
         });
     }

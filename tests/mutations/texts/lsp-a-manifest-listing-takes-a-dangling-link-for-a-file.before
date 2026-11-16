@@ -1,1 +1,1 @@
-            if (entry.reaches == core::EntryKind::File) out.push_back(entry.path);
+            if (entry.reaches == core::EntryKind::File) out.push_back(entry.storeRoutePath);

@@ -1,1 +1,1 @@
-    return file.parent_path();
+    return HostPath{HostPathAccess::text(file).parent_path()};

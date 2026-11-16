@@ -1,1 +1,1 @@
-        std::wstring const name  = top.names[top.next++];
+        std::wstring const name = top.names[top.next++];

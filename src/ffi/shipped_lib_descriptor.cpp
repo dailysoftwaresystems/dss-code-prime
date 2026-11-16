@@ -2039,7 +2039,7 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
 // existing call sites verbatim).
 [[nodiscard]] core::PathIdentity descriptorPathKey(
     std::filesystem::path const& path) {
-    return core::PathIdentity::of(path);
+    return core::PathIdentity::of(path, core::Use::Leaf);
 }
 
 // Decode a struct `fields` JSON array (non-empty, each `{name,type}`) into
@@ -5792,16 +5792,17 @@ struct CorpusIndex {
     // it never read "unknown".
     std::vector<fs::path> descriptors;
     std::error_code       rootEc;
-    if (core::reachedKind(idx.root, rootEc) == core::EntryKind::Absent && !rootEc) return idx;
+    if (core::reachedKind(idx.root, core::Use::Container, rootEc) == core::EntryKind::Absent && !rootEc) return idx;
     auto const walk = core::walkTree(idx.root, [&](core::TreeEntry const& entry) {
-        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-            descriptors.push_back(entry.path);
+        if (entry.reaches == core::EntryKind::File && entry.at.extension() == ".json")
+            descriptors.push_back(entry.storeRoutePath);   // the descriptor store's text (H6d makes it a value)
         return core::WalkStep::Continue;
     });
     if (walk.error)
-        throw fs::filesystem_error("the shipped descriptor corpus could not be walked", walk.where, walk.error);
+        throw fs::filesystem_error("the shipped descriptor corpus could not be walked", walk.storeRouteWhere,
+                                   walk.error);
     for (fs::path const& descriptor : descriptors) {
-        std::ifstream in(core::extendedLengthSpelling(descriptor), std::ios::binary);
+        std::ifstream in = core::openInputStream(descriptor, std::ios::binary);
         if (!in) continue;  // lenient: unreadable descriptor skipped
         // THE ONE CONFIG PARSE, and the reason a LENIENT scanner routes through
         // it too: `operator>>` into a `json` is `json::parse` under another
@@ -5823,7 +5824,7 @@ struct CorpusIndex {
             continue;
         }
         std::error_code relEc;
-        auto rel = core::reachedRelative(descriptor, idx.root, relEc);
+        auto rel = core::reachedRelative(descriptor, core::Use::Leaf, idx.root, relEc);
         std::string const relPath =
             // ASYMMETRIC ON PURPOSE. `rel` is a RELATIVE path — no root, so no
             // authority to lose — while the fallback arm is the ABSOLUTE entry
@@ -6547,7 +6548,7 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
                       DiagnosticReporter&          reporter) {
     std::vector<ShippedSourceClaim> claims;
     std::error_code ec;
-    auto const      kind = core::reachedKind(descriptorDir, ec);
+    auto const      kind = core::reachedKind(descriptorDir, core::Use::Container, ec);
     if (ec) {
         emitMalformed(reporter,
             "shipped-lib descriptor directory '" + core::genericSpelling(descriptorDir)
@@ -6563,14 +6564,14 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
     // reads this list as the whole of them.
     std::vector<std::filesystem::path> descriptors;
     auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
-        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-            descriptors.push_back(entry.path);
+        if (entry.reaches == core::EntryKind::File && entry.at.extension() == ".json")
+            descriptors.push_back(entry.storeRoutePath);   // the descriptor store's text (H6d makes it a value)
         return core::WalkStep::Continue;
     });
     if (walk.error) {
         emitMalformed(reporter,
             "shipped-lib descriptor directory '" + core::genericSpelling(descriptorDir)
-            + "' could not be read whole: the walk stopped at '" + core::genericSpelling(walk.where) + "' ("
+            + "' could not be read whole: the walk stopped at '" + walk.where.spelling().generic() + "' ("
             + walk.error.message() + "), so the claims of the descriptors beyond it were never read");
     }
     for (std::filesystem::path const& descriptor : descriptors) {
@@ -6629,7 +6630,7 @@ resolveShippedSource(std::string_view configRelativePath) {
     // drive, and everything below reports on `out.path`: `status()` would answer
     // `not_found` for a file that is there, and `describeShippedSourceLookup`
     // would go on to tell the reader "no file exists at" a path nobody named.
-    out.path = core::normalizeKeepingRoot(
+    out.path = core::storeRouteNormalized(   // the descriptor store's text (H6d makes it a value)
         *root / std::filesystem::path{std::string{configRelativePath}});
     // ★ `status()` RATHER THAN `is_regular_file()`, and the difference is the whole
     // repair: the predicate form answers false for "absent" and for "I could not
@@ -6641,7 +6642,7 @@ resolveShippedSource(std::string_view configRelativePath) {
     // Asked of the substrate (what the path REACHES), which every build answers alike: an error is the
     // query's own failure, `Absent` a clean absence -- a dangling link included.
     std::error_code       ec;
-    core::EntryKind const reached = core::reachedKind(out.path, ec);
+    core::EntryKind const reached = core::reachedKind(out.path, core::Use::Leaf, ec);
     if (ec) {
         out.status = ShippedSourceResolution::QueryFailed;
         out.error  = ec;
@@ -6775,7 +6776,7 @@ bool validateShippedSourceTree(
     for (auto const& c : claims) {
         auto const look = resolveShippedSource(c.source);
         if (look.resolved()) {
-            claimedPaths.insert(core::PathIdentity::of(look.path));
+            claimedPaths.insert(core::PathIdentity::of(look.path, core::Use::Leaf));
             continue;
         }
         // ⚠ THE SUBJECT IS THE CLAIM'S OWN, AND THE CONSEQUENCE CLAUSE IS
@@ -6847,7 +6848,7 @@ bool validateShippedSourceTree(
     // make this function silently ignore a stray `.txt` or `.o` sitting in the
     // AUTHORED tree, which is exactly the inert-config case R2 exists to catch.
     // The problem was the SUBJECT DIRECTORY, so the subject is what got fixed.
-    if (core::reachedKind(runtimeRootDir / "src", ec) == core::EntryKind::Directory) {
+    if (core::reachedKind(runtimeRootDir / "src", core::Use::Container, ec) == core::EntryKind::Directory) {
         // The caller handed a TIER (or a `src/`) instead of the root. Refusing is
         // the whole point: silently scanning the wrong tree is how a guard passes
         // while guarding nothing.
@@ -6869,20 +6870,20 @@ bool validateShippedSourceTree(
     auto const unread = [&](std::filesystem::path const& subject, core::TreeWalk const& walk) {
         emitMalformed(reporter,
             "shipped-source tree: '" + core::genericSpelling(subject) + "' could not be read whole: the walk "
-            "stopped at '" + core::genericSpelling(walk.where) + "' (" + walk.error.message() + "), so no file "
+            "stopped at '" + walk.where.spelling().generic() + "' (" + walk.error.message() + "), so no file "
             "beyond it was checked against its declarers");
     };
     std::vector<std::filesystem::path> tiers;
-    if (core::reachedKind(runtimeRootDir, ec) != core::EntryKind::Absent || ec) {
+    if (core::reachedKind(runtimeRootDir, core::Use::Container, ec) != core::EntryKind::Absent || ec) {
         auto const tierWalk = core::walkTree(runtimeRootDir, [&](core::TreeEntry const& entry) {
-            if (entry.reaches == core::EntryKind::Directory) tiers.push_back(entry.path);
+            if (entry.reaches == core::EntryKind::Directory) tiers.push_back(entry.storeRoutePath);
             return core::WalkStep::Prune;
         });
         if (tierWalk.error) unread(runtimeRootDir, tierWalk);
     }
     for (std::filesystem::path const& tier : tiers) {
         std::filesystem::path const authored = tier / "src";
-        auto const authoredKind = core::reachedKind(authored, ec);
+        auto const authoredKind = core::reachedKind(authored, core::Use::Container, ec);
         if (ec) {
             emitMalformed(reporter,
                 "shipped-source tree: '" + core::genericSpelling(authored) + "' cannot be examined ("
@@ -6892,12 +6893,12 @@ bool validateShippedSourceTree(
         if (authoredKind != core::EntryKind::Directory) continue;
         std::vector<std::filesystem::path> authoredFiles;
         auto const authoredWalk = core::walkTree(authored, [&](core::TreeEntry const& entry) {
-            if (entry.reaches == core::EntryKind::File) authoredFiles.push_back(entry.path);
+            if (entry.reaches == core::EntryKind::File) authoredFiles.push_back(entry.storeRoutePath);
             return core::WalkStep::Continue;
         });
         if (authoredWalk.error) unread(authored, authoredWalk);
         for (std::filesystem::path const& p : authoredFiles) {
-            if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
+            if (claimedPaths.contains(core::PathIdentity::of(p, core::Use::Leaf))) continue;
             emitMalformed(reporter,
                 "shipped-source tree: '" + core::genericSpelling(p)
                 + "' is named by NO DECLARER — neither a 'realization' map of a "
@@ -7075,14 +7076,14 @@ bool validateShippedIncludeClosure(
     // sweep that did not read the whole corpus cannot say its closures hold.
     std::vector<std::filesystem::path> descriptors;
     auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
-        if (entry.reaches == core::EntryKind::File && entry.path.extension() == ".json")
-            descriptors.push_back(entry.path);
+        if (entry.reaches == core::EntryKind::File && entry.at.extension() == ".json")
+            descriptors.push_back(entry.storeRoutePath);   // the descriptor store's text (H6d makes it a value)
         return core::WalkStep::Continue;
     });
     if (walk.error) {
         emitCorpusInvariant(reporter,
             "shipped-lib corpus sweep: '" + core::genericSpelling(descriptorDir)
-            + "' could not be read whole: the walk stopped at '" + core::genericSpelling(walk.where) + "' ("
+            + "' could not be read whole: the walk stopped at '" + walk.where.spelling().generic() + "' ("
             + walk.error.message() + "), so the descriptors beyond it were never swept");
     }
     // Deterministic order on every host (a directory iteration order is the

@@ -32,9 +32,13 @@ enable_testing()
 # (✔MEASURED 2026-10-20; src/core/substrate/path_identity.hpp states it). So the
 # substrate's one unit -- standard library and OS calls only -- is compiled here
 # beside the runner, its header reached through `src/`, and nothing else of the
-# compiler comes with it.
+# compiler comes with it. ★ AND THE SPAWN'S UNIT (P69 H6c): the harness starts an
+# image through the substrate's one image start (`startImageInheriting`, Windows),
+# whose form of the image is the spawn's own -- process_spawn.cpp, likewise standard
+# library and OS calls only, over the same home.
 add_executable(integrated_tests runner.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/substrate/path_identity.cpp)
+    ${CMAKE_SOURCE_DIR}/src/core/substrate/path_identity.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/substrate/process_spawn.cpp)
 target_link_libraries(integrated_tests
     PRIVATE
         nlohmann_json::nlohmann_json

@@ -834,8 +834,8 @@ namespace {
 [[nodiscard]] bool isDanglingLink(fs::path const& p) {
     std::error_code kec;
     std::error_code rec;
-    return dss::core::entryKind(p, kec) == dss::core::EntryKind::Link && !kec
-        && dss::core::reachedKind(p, rec) == dss::core::EntryKind::Absent && !rec;
+    return dss::core::entryKind(p, dss::core::Use::Leaf, kec) == dss::core::EntryKind::Link && !kec
+        && dss::core::reachedKind(p, dss::core::Use::Leaf, rec) == dss::core::EntryKind::Absent && !rec;
 }
 
 } // namespace
@@ -938,12 +938,12 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverDanglingSymlinkCandidates) {
     for (std::uint64_t i = 0; i < kDanglingAhead; ++i) {
         auto const& p = links[static_cast<std::size_t>(i)];
         std::error_code kec;
-        EXPECT_EQ(dss::core::entryKind(p, kec), dss::core::EntryKind::Link)
+        EXPECT_EQ(dss::core::entryKind(p, dss::core::Use::Leaf, kec), dss::core::EntryKind::Link)
             << "candidate #" << (nextSlot + i)
             << " is no longer a symlink — the writer consumed a slot it did "
                "not create";
         std::error_code rec;
-        EXPECT_EQ(dss::core::reachedKind(p, rec), dss::core::EntryKind::Absent)
+        EXPECT_EQ(dss::core::reachedKind(p, dss::core::Use::Leaf, rec), dss::core::EntryKind::Absent)
             << "candidate #" << (nextSlot + i)
             << " now resolves — the writer wrote THROUGH the link and created "
                "its target, which is the other way this misroute can go wrong";

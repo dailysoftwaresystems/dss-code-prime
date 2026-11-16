@@ -114,9 +114,9 @@ DependencyLockfile::load(fs::path const& lockPath, DiagnosticReporter& rep) {
     // PERMISSION error on an existing file does not masquerade as "no lockfile"
     // — that would be exactly the tolerant fallback U-4 forbids, arriving
     // through the filesystem instead of through the parser.
-    if (core::reachedKind(lockPath, ec) == core::EntryKind::Absent || ec) return DependencyLockfile{};
+    if (core::reachedKind(lockPath, core::Use::Leaf, ec) == core::EntryKind::Absent || ec) return DependencyLockfile{};
 
-    std::ifstream in{core::extendedLengthSpelling(lockPath), std::ios::binary};
+    std::ifstream in = core::openInputStream(lockPath, std::ios::binary);   // at any length (the home)
     if (!in) {
         emitLockfileMalformed(rep, lockPath,
                               "the file exists but could not be opened for "
@@ -310,7 +310,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         // Asked at the ENTRY (`symlink_status`), which is the question the
         // exclusive create asked; anything else is a real failure, reported now.
         std::error_code eec;
-        if (core::entryKind(candidate, eec) != core::EntryKind::Absent && !eec) continue;
+        if (core::entryKind(candidate, core::Use::Leaf, eec) != core::EntryKind::Absent && !eec) continue;
         emitLockfileWriteFailed(rep, "the scratch file '"
                                          + core::genericSpelling(candidate)
                                          + "' could not be created for writing");

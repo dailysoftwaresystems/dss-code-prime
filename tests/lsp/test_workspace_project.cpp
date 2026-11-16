@@ -1354,13 +1354,13 @@ TEST(WorkspaceBuild, AManifestIsReadTheWayTheBuildReadsIt) {
             << t.spec << ": the pair's calling convention was not resolved";
     }
     ASSERT_EQ(m.includeDirs.size(), 1u);
-    EXPECT_EQ(dss::core::PathIdentity::of(m.includeDirs[0]),
-              dss::core::PathIdentity::of(ws.path() / "inc"))
+    EXPECT_EQ(dss::core::PathIdentity::of(m.includeDirs[0], dss::core::Use::Container),   // an include DIRECTORY
+              dss::core::PathIdentity::of(ws.path() / "inc", dss::core::Use::Container))
         << "a relative `includes` entry is joined to the manifest's directory";
     EXPECT_EQ(m.defines, (std::vector<std::string>{"A=1"}));
     EXPECT_EQ(m.sources.size(), 2u) << "the `*.c` glob names both files";
     EXPECT_NE(std::find(m.sources.begin(), m.sources.end(),
-                        dss::core::PathIdentity::of(ws.path() / "util.c")),
+                        dss::core::PathIdentity::of(ws.path() / "util.c", dss::core::Use::Leaf)),   // a source FILE
               m.sources.end());
 }
 

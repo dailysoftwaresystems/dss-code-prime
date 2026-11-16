@@ -121,11 +121,13 @@ loaderSearchPathValue(std::vector<std::filesystem::path> const& resolvedLibrarie
     for (auto const& lib : resolvedLibraries) {
         // The non-throwing overload: the throwing one consults the process
         // working directory and ends a run whose cwd has been deleted.
-        std::error_code ec;
-        auto file = dss::core::absoluteKeepingRoot(lib, ec);
+        // ★ A VALUE (P69 H6c): the library as an absolute LEAF (the file itself), and its directory the level
+        // above that one reference (`containingDirectory`) -- one directory, one entry -- rendered into the
+        // variable the child is given, with the host's own separators, as a spawn's argument is.
+        std::error_code     ec;
+        dss::core::HostPath file = dss::core::absoluteKeepingRoot(lib, dss::core::Use::Leaf, ec);
         if (ec) file = lib;
-        auto dir = dss::core::parentWithinRoot(dss::core::normalizeKeepingRoot(file));
-        std::string const spelled = dir.make_preferred().string();
+        std::string const spelled = dss::core::containingDirectory(file).spelling().display();
         if (spelled.empty() || !seen.insert(spelled).second) continue;
         if (!value.empty()) value += kLoaderSearchPathListSeparator;
         value += spelled;

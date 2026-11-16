@@ -5854,7 +5854,7 @@ LinkedImage link(AssembledModule const&    module,
                  ObjectFormatSchema const& objectFormatSchema,
                  DiagnosticReporter&       reporter,
                  ImageRequest const&       request) {
-    return link(std::span<AssembledModule const>{&module, 1},
+    return dss::linker::link(std::span<AssembledModule const>{&module, 1},
                 targetSchema, objectFormatSchema, reporter, request);
 }
 

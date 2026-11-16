@@ -1,1 +1,1 @@
-    std::wstring const      w    = whole.native();
+    auto const w = HostPathAccess::text(p).native();

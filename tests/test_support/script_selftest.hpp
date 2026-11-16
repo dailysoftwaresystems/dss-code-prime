@@ -46,6 +46,7 @@
 // is in the log beside the cases it explains.
 
 #include "core/substrate/process_spawn.hpp"
+#include "spawn_image.hpp"   // the image argv[0] names, as a build script's is (H6c)
 
 #include <gtest/gtest.h>
 
@@ -167,7 +168,8 @@ inline void readScriptVerdictLine(ScriptSelfTest const& entry, std::string_view 
     }
     std::filesystem::path const            output  = entry.standardOutput;
     dss::substrate::SpawnResult const spawned =
-        dss::substrate::spawnAndWaitRedirectStdout(argv, std::filesystem::path(entry.workingDirectory), output);
+        // The image argv[0] names, as a build script's is (spawn_image.hpp, H6c).
+        dss::test_support::spawnArgvRedirectStdout(argv, std::filesystem::path(entry.workingDirectory), output);
     if (!spawned.spawned) {
         run.whyNot = "the self-test's command line could not be started: " + spawned.diagnostic;
         return run;

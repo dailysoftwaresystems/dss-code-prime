@@ -1,1 +1,1 @@
-        bool const everyMemberBuilt = substrate::runEveryUnit(cuMirs.size(), [&](std::size_t i) {
+        bool const everyMemberBuilt = substrate::runEveryUnitReportingSilence(cuMirs.size(), [&](std::size_t i) {

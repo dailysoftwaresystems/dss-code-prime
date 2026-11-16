@@ -127,8 +127,12 @@ bool runBuildScripts(std::vector<ScriptEntry> const& scripts,
         // spelled them. No join, no split, no expansion, no shell. `cwd` is the
         // child's working directory — the manifest's own directory (see the
         // header). stdio is inherited; there is no timeout.
-        substrate::SpawnResult const result =
-            substrate::spawnAndWaitInherit(argv, cwd);
+        // ★ THE IMAGE IS A VALUE (P69 H6c): the program the manifest names -- its re-based spelling above, decoded as
+        // argv is (UTF-8); a bare name stays a name, searched on PATH by the spawn. Bytes that are not UTF-8 name no
+        // image, and the spawn refuses argv[0] itself, naming why.
+        std::optional<std::filesystem::path> const program = substrate::programPathFromUtf8(argv.front());
+        substrate::SpawnResult const result = substrate::spawnAndWaitInherit(
+            program.has_value() ? core::HostPath{*program} : core::HostPath{}, argv, cwd);
 
         // ── THE FORK: was there ever a process? ─────────────────────────────
         //

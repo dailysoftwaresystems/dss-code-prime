@@ -5,8 +5,10 @@
 //   D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED — a foreign object whose frame passes a page names the stack
 //     probe: cl `__chkstk`, mingw-w64 gcc `___chkstk_ms`; DSS refused every such object undefined.
 //   D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED — cl's /GS family (`__security_cookie`,
-//     `__security_check_cookie`, `__GSHandlerCheck`, `__GSHandlerCheck_SEH`, `__report_rangecheckfailure`) and cl's
-//     `_fltused`; DSS refused every /GS object undefined.
+//     `__security_check_cookie`, `__GSHandlerCheck`, `__GSHandlerCheck_SEH`, `__report_rangecheckfailure`); DSS
+//     refused every /GS object undefined.
+//   The runtime defines cl's `_fltused` too, which DSS never refused: a cl float object names it in no relocation,
+//     so DSS's link never asks for it; cl's own link.exe does (pe_compiler_support.c states both measurements).
 //   D-LK-PE-FOREIGN-OBJECT-GCC-MAIN-HOOK-UNDEFINED — every mingw-w64 gcc `main` calls `__main`; DSS refused it.
 //   And gcc's unwinder entry points a `-fexceptions` object with a `cleanup` names, `__gcc_personality_seh0` and
 //   `_Unwind_Resume`; and gcc's stack protector (`-fstack-protector*`, gcc's /GS), `__stack_chk_guard` and
@@ -55,6 +57,7 @@
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+#include "../core/native_c_probe.hpp"   // link.exe, for the `_fltused` cell (R5)
 
 #include <gtest/gtest.h>
 
@@ -232,7 +235,7 @@ constexpr std::string_view kNoSource{};
 }
 
 [[nodiscard]] std::vector<std::uint8_t> bytesOf(fs::path const& path) {
-    std::ifstream in{dss::core::extendedLengthSpelling(path), std::ios::binary};   // at any length
+    std::ifstream in = dss::core::openInputStream(path, std::ios::binary);   // at any length (the home)
     if (!in.good()) {
         ADD_FAILURE() << "cannot open " << path.string();
         return {};
@@ -343,7 +346,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> inputs;
     if (!source.empty()) {
         auto const unit = dir / "main.c";
-        std::ofstream(dss::core::extendedLengthSpelling(unit), std::ios::binary) << source;
+        dss::core::openOutputStream(unit, std::ios::binary) << source;   // at any length (the home)
         inputs.push_back(unit.string());
     }
     if (!object.empty()) inputs.push_back(object.string());
@@ -351,7 +354,8 @@ int main(int argc, char **argv) {
     std::string const want = std::string_view{target} == kDll ? ".dll" : ".exe";
     fs::path          image;
     static_cast<void>(dss::core::walkTree(out, [&](dss::core::TreeEntry const& e) {
-        if (e.kind == dss::core::EntryKind::File && e.path.extension() == want) image = e.path;
+        // The test's own spelling of the one image DSS named: the directory it named and the listed NAME.
+        if (e.kind == dss::core::EntryKind::File && e.at.extension() == want) image = out / e.at.filename();
         return image.empty() ? dss::core::WalkStep::Prune : dss::core::WalkStep::Stop;
     }));
     return image;
@@ -607,4 +611,69 @@ TEST(PeCompilerSupportRuntimeNative, EachCensusProgramRunsAsItsReferenceDoes) {
         EXPECT_FALSE(r.timedOut);
         EXPECT_EQ(r.exitCode, 42u) << "5 = a value the program computes was wrong";
     }
+}
+
+// ── R5 (P69 H6c; the review of H6b): `_fltused`, A REFERENCE LINK'S REQUIREMENT OF THE RUNTIME ──────────────────
+//
+// cl writes `_fltused` as an undefined symbol no relocation names, so DSS's own link never asks for it
+// (pe_compiler_support.c states that measurement); cl's link.exe does. THE CONTROL, measured here: a cl /O2 float
+// object linked by link.exe with no C runtime (/NODEFAULTLIB, kernel32 alone) is refused naming `_fltused`. THE CLAIM:
+// beside the platform runtime's compiler-support unit -- compiled by DSS, as an object, from the source the shipped
+// runtime archive is built from -- link.exe names no `_fltused`, and stops at no other fatal error first (one would hide
+// the name it never reached).
+TEST(PeCompilerSupportRuntimeNative, ClsLinkFindsTheFloatMarkerInTheRuntime) {
+    if (!onWindowsX64()) GTEST_SKIP() << "link.exe runs only where the host is Windows x86_64";
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "pe-fltused"};
+    fs::path const dir = scratch.path();
+    namespace np = test_support::native_probe;
+    auto const msvc = np::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const tools = np::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(tools.ready()) << tools.describe();
+    {
+        std::ofstream out = dss::core::openOutputStream(dir / "f.c", std::ios::binary);
+        out << "double fl_scale(double x) { return x * 2.5; }\nint fl_entry(void) { return (int)fl_scale(4.0); }\n";
+    }
+    std::string const cl =
+        np::captureCmd("cd /d \"" + dir.string() + "\" && cl /nologo /c /O2 /GS- f.c", dir / "cl.txt");
+    ASSERT_EQ(np::systemUnder(tools.env, cl), 0) << np::tailOf(dir / "cl.txt", 30, "cl");
+    // The runtime's compiler-support unit, compiled by DSS to an object.
+    fs::path const  rt = dir / "rt";
+    std::error_code ec;
+    static_cast<void>(dss::core::createDirectories(rt, ec));
+    ASSERT_FALSE(ec) << ec.message();
+    DiagnosticReporter rep;
+    Program            p;
+    p.setOutputDir(rt);
+    fs::path const unit =
+        dss::test::repoRoot() / "src" / "dss-config" / "runtime" / "platform" / "src" / "pe_compiler_support.c";
+    ASSERT_EQ(p.compileFiles({unit.string()}, "c", {"x86_64:pe64-x86_64-windows"}, rep), 0) << diagnosticsOf(rep);
+    fs::path object;
+    static_cast<void>(dss::core::walkTree(rt, [&](dss::core::TreeEntry const& e) {
+        if (e.kind == dss::core::EntryKind::File) object = rt / e.at.filename();
+        return dss::core::WalkStep::Prune;
+    }));
+    ASSERT_FALSE(object.empty()) << "DSS left no object of the runtime unit";
+    auto const linkSays = [&](std::string const& inputs, std::string const& log) {
+        std::string const cmd = np::captureCmd("cd /d \"" + dir.string()
+                                                   + "\" && link /nologo /NODEFAULTLIB /ENTRY:fl_entry "
+                                                     "/SUBSYSTEM:CONSOLE /OUT:" + log + ".exe " + inputs
+                                                   + " kernel32.lib",
+                                               dir / (log + ".txt"));
+        int const     rc = np::systemUnder(tools.env, cmd);
+        std::ifstream in = dss::core::openInputStream(dir / (log + ".txt"), std::ios::binary);
+        return std::pair<int, std::string>{rc, std::string{std::istreambuf_iterator<char>{in},
+                                                           std::istreambuf_iterator<char>{}}};
+    };
+    auto const control = linkSays("f.obj", "control");
+    EXPECT_NE(control.first, 0) << "link.exe took the float object with no runtime: " << control.second;
+    EXPECT_NE(control.second.find("_fltused"), std::string::npos)
+        << "the control's refusal names no `_fltused`: " << control.second;
+    auto const with = linkSays("f.obj \"" + object.string() + "\"", "with");
+    EXPECT_EQ(with.second.find("_fltused"), std::string::npos)
+        << "link.exe still names `_fltused` beside the runtime unit: " << with.second;
+    EXPECT_TRUE(with.first == 0 || with.second.find("fatal error LNK1") == std::string::npos
+                || with.second.find("LNK1120") != std::string::npos)
+        << "link.exe stopped at another fatal error before it could name what it lacks: " << with.second;
 }

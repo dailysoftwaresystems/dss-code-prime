@@ -1,0 +1,1 @@
+        HeaderSearchResult step    = matchComponent(base, named, last ? core::Use::Leaf : core::Use::Container,

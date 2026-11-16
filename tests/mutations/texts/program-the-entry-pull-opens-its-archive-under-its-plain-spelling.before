@@ -1,1 +1,1 @@
-        std::ifstream in(core::extendedLengthSpelling(archivePaths[ai]), std::ios::binary);
+        std::ifstream in = core::openInputStream(archivePaths[ai], std::ios::binary);

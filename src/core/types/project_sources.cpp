@@ -154,7 +154,7 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
     seen.reserve(expanded.size());
     for (auto& s : expanded) {
         std::error_code kec;
-        auto const id = core::PathIdentity::of(fs::path{s}, kec);
+        auto const id = core::PathIdentity::of(fs::path{s}, core::Use::Leaf, kec);   // a source FILE
         if (kec) {
             emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                        "project sources: filesystem error resolving source path '"

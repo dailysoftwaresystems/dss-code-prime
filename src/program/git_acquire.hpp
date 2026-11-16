@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/host_path.hpp"
 
 #include <filesystem>
 #include <optional>
@@ -291,9 +292,9 @@ private:
     // or found nothing. Cached because every operation needs it and a PATH scan
     // per invocation would re-answer a question whose answer cannot change
     // mid-build.
-    [[nodiscard]] std::optional<std::filesystem::path> resolve_();
+    [[nodiscard]] std::optional<core::HostPath> resolve_();
 
-    std::optional<std::filesystem::path> gitExe_;
+    std::optional<core::HostPath> gitExe_;   // the resolved image, a VALUE (H6c)
     bool                                 resolved_ = false;
 };
 

@@ -1,1 +1,1 @@
-    long const sensitive = ::pathconf(dir.c_str(), _PC_CASE_SENSITIVE);
+    long const sensitive = ::pathconf(reference.c_str(), _PC_CASE_SENSITIVE);

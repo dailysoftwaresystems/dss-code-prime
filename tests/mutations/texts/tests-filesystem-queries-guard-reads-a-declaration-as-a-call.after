@@ -1,0 +1,1 @@
+    return false && std::isdigit(static_cast<unsigned char>(word.front())) == 0 && kExpressionKeywords.count(word) == 0;

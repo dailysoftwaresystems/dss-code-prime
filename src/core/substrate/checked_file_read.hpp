@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/host_path.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -91,7 +92,7 @@ struct DSS_EXPORT FileReadError {
 // Read `path` whole, or say precisely why not. Never returns a partial prefix. A regular file only: anything else
 // is NotARegularFile -- a STREAM has no size to bound it, so it is read only by the bounded form below.
 [[nodiscard]] DSS_EXPORT std::expected<std::string, FileReadError>
-readFileChecked(std::filesystem::path const& path);
+readFileChecked(HostPath const& path);
 
 // Read `path` whole -- a regular file, or a STREAM: a device or a named pipe, an entry that is neither a regular file
 // nor a directory -- holding at most `maxBytes`, or say precisely why not. A regular file over the bound is refused
@@ -104,7 +105,7 @@ readFileChecked(std::filesystem::path const& path);
 // `#include "/dev/null"` and a header that is a named pipe fed by a writer (gcc opens the pipe too, and waits on it):
 // a header reader passes its bound and reads them.
 [[nodiscard]] DSS_EXPORT std::expected<std::string, FileReadError>
-readFileChecked(std::filesystem::path const& path, std::uintmax_t maxBytes);
+readFileChecked(HostPath const& path, std::uintmax_t maxBytes);
 
 // The SEAM the pins drive. `expectedBytes` is the size the caller measured for
 // this exact stream; `label` names the thing being read in the diagnostic.

@@ -698,6 +698,12 @@ TEST(ArchivePackaging, EveryUnitsErrorsAreReportedAndABuildAnyUnitFailedWritesNo
             for (auto const& artifact : p.artifactPaths()) {
                 EXPECT_FALSE(artifact.has_value()) << "the failed build names an artifact: " << artifact->string();
             }
+            // PACKAGING TAKES EVERY UNIT OR NONE (P69 H6c, ledger 576 (2)): it names member i after unit i's source,
+            // so a build any unit failed packages nothing and hands the writer no archive to withhold.
+            for (auto const& diag : rep.all()) {
+                EXPECT_NE(diag.code, DiagnosticCode::K_ArtifactWithheldAfterError)
+                    << "the writer was handed an archive: packaging ran on part of the units:" << said;
+            }
             std::error_code walkEc;
             for (auto it = fs::recursive_directory_iterator{scratch.path(), walkEc};
                  !walkEc && it != fs::recursive_directory_iterator{}; it.increment(walkEc)) {

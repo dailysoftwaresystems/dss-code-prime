@@ -21,7 +21,7 @@
 
 #include "object_entry_support.hpp"
 
-#include "core/substrate/path_identity.hpp"   // extendedLengthSpelling, createDirectories: a path at any length
+#include "core/substrate/path_identity.hpp"   // openInputStream, openOutputStream, createDirectories: at any length
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -200,7 +200,8 @@ TEST(ObjectEntryNative, ArchiveMembersAndPrecedenceRunAsTheReferencesDo) {
 
 // Windows (the 260-character limit is Win32's; every other host compiles this TEST and has no such limit to pin): the
 // archive the startup's entry is pulled from is opened at any length, as every Win32 file call of a build takes its
-// path (`core::extendedLengthSpelling`; tests/program/test_artifact_at_any_length.cpp pins the object input's): an
+// path (the value's reference from the home, `core::openInputStream`; tests/program/test_artifact_at_any_length.cpp
+// pins the object input's): an
 // archive at 300 characters or more whose member alone defines `main`, beside a source of none, links and its image
 // runs to 42, as the control below 260 does. Fold 3e's entry pull (`pullEntryArchiveMembers`, new in the fold) opened
 // its archives under their plain spelling, the one call of the program tier that did.
@@ -215,7 +216,7 @@ TEST(ObjectEntryNative, AnEntrysArchiveAtAnyLengthIsPulledAndRuns) {
     fs::path const archive = buildArtifact(scratch.path() / "lib", "member_main.c", "int main(void) { return 42; }\n",
                                            "x86_64:pe64-x86_64-windows-staticlib");
     ASSERT_FALSE(archive.empty());   // reported
-    std::ifstream in{core::extendedLengthSpelling(archive), std::ios::binary};
+    std::ifstream in = core::openInputStream(archive, std::ios::binary);
     std::string const bytes{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
     ASSERT_FALSE(bytes.empty()) << "the archive DSS built was not read";
     std::size_t k = 0;
@@ -229,7 +230,7 @@ TEST(ObjectEntryNative, AnEntrysArchiveAtAnyLengthIsPulledAndRuns) {
         fs::path const placed = dir / archive.filename();
         if (cell.atLeast != 0) EXPECT_GE(placed.native().size(), 300u) << "the archive's path is not past the limit";
         {
-            std::ofstream out{core::extendedLengthSpelling(placed), std::ios::binary};
+            std::ofstream out = core::openOutputStream(placed, std::ios::binary);
             out << bytes;
             ASSERT_TRUE(out.good()) << "the archive was not placed";
         }

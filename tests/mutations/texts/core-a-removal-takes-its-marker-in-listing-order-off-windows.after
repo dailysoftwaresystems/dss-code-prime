@@ -1,1 +1,1 @@
-            if (listError != 0) note(top.path, posixError(listError));
+            if (listError != 0) note(top.value, posixError(listError));

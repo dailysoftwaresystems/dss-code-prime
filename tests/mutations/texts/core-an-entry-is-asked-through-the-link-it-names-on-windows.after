@@ -1,1 +1,1 @@
-    Handle const first = reachedHandle(a, FILE_READ_ATTRIBUTES, ec);
+    Handle const firstHandle = reachedHandle(first, FILE_READ_ATTRIBUTES, ec);

@@ -14,6 +14,9 @@
 // judges both runners, so neither can ask the library again.
 //
 // These keep the library's `error_code` contract: a size or a time of a path that reaches no file is an ERROR, named.
+// ★ THEY TAKE THE VALUE AND A STATED USE (P69 H6c, A2), with no default: a FILE asked of is a Leaf, a DIRECTORY asked
+// of as one a Container -- the two name different objects on Windows exactly where a last name ends in a period or a
+// space, or is a device name (path_identity.hpp's table), so the use is the caller's to state.
 // The header references the substrate and the standard library alone: the two runners link different sets
 // (`dss_examples_runner` links dsscp-lib; `integrated_tests` compiles the substrate's unit beside itself), and both
 // hold the substrate.
@@ -27,37 +30,38 @@
 namespace dss::test_support {
 
 // Whether `p` reaches anything; `ec` set when nobody could tell.
-[[nodiscard]] inline bool reachesSomething(std::filesystem::path const& p, std::error_code& ec) {
-    return dss::core::reachedKind(p, ec) != dss::core::EntryKind::Absent;
+[[nodiscard]] inline bool reachesSomething(dss::core::HostPath const& p, dss::core::Use use, std::error_code& ec) {
+    return dss::core::reachedKind(p, use, ec) != dss::core::EntryKind::Absent;
 }
 
 // Whether `p` reaches an entry of `kind`; false (with `ec` set) when nobody could tell.
-[[nodiscard]] inline bool reachesKind(std::filesystem::path const& p, dss::core::EntryKind kind,
+[[nodiscard]] inline bool reachesKind(dss::core::HostPath const& p, dss::core::Use use, dss::core::EntryKind kind,
                                       std::error_code& ec) {
-    return dss::core::reachedKind(p, ec) == kind && !ec;
+    return dss::core::reachedKind(p, use, ec) == kind && !ec;
 }
 
 // Why `p` has no size or time to give, when the substrate answered "nothing".
-[[nodiscard]] inline std::error_code whyNoFile(std::filesystem::path const& p) {
+[[nodiscard]] inline std::error_code whyNoFile(dss::core::HostPath const& p, dss::core::Use use) {
     std::error_code kec;
-    auto const      kind = dss::core::reachedKind(p, kec);
+    auto const      kind = dss::core::reachedKind(p, use, kec);
     if (kec) return kec;
     if (kind == dss::core::EntryKind::Absent) return std::make_error_code(std::errc::no_such_file_or_directory);
     if (kind == dss::core::EntryKind::Directory) return std::make_error_code(std::errc::is_a_directory);
     return std::make_error_code(std::errc::not_supported);
 }
 
-// The size of the regular file `p` reaches; `ec` set (and 0) when it reaches none.
-[[nodiscard]] inline std::uintmax_t reachedSize(std::filesystem::path const& p, std::error_code& ec) {
+// The size of the regular file `p` reaches -- a FILE, so a Leaf; `ec` set (and 0) when it reaches none.
+[[nodiscard]] inline std::uintmax_t reachedSize(dss::core::HostPath const& p, std::error_code& ec) {
     auto const size = dss::core::reachedFileSize(p, ec);
-    if (!size && !ec) ec = whyNoFile(p);
+    if (!size && !ec) ec = whyNoFile(p, dss::core::Use::Leaf);
     return size.value_or(0);
 }
 
-// When the file `p` reaches was last written; `ec` set when it reaches nothing.
-[[nodiscard]] inline std::filesystem::file_time_type writtenAt(std::filesystem::path const& p, std::error_code& ec) {
-    auto const when = dss::core::reachedWriteTime(p, ec);
-    if (!when && !ec) ec = whyNoFile(p);
+// When the entry `p` reaches (as `use` names it) was last written; `ec` set when it reaches nothing.
+[[nodiscard]] inline std::filesystem::file_time_type writtenAt(dss::core::HostPath const& p, dss::core::Use use,
+                                                              std::error_code& ec) {
+    auto const when = dss::core::reachedWriteTime(p, use, ec);
+    if (!when && !ec) ec = whyNoFile(p, use);
     return when.value_or(std::filesystem::file_time_type{});
 }
 

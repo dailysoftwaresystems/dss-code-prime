@@ -1,1 +1,1 @@
-        return plain;
+        std::wstring twin = plain;

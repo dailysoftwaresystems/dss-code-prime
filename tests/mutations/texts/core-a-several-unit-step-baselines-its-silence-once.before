@@ -1,0 +1,3 @@
+    bool every = true;
+    for (std::size_t i = 0; i < units; ++i) {
+        std::size_t const reported = errorCount();

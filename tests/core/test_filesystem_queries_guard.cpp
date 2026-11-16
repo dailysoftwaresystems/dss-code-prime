@@ -13,10 +13,12 @@
 // POSIX library follow the link. So one source gave two answers, and every such question in the scope below is
 // asked of the substrate (src/core/substrate/path_identity.hpp), which asks the OS on Windows.
 //
-// ★ OUTSIDE THE CLASS, MEASURED THE SAME on both Windows libraries (and not refused): `remove` and `rename` (they
-// act on the entry itself), `directory_iterator` (its listing; the questions its entries answer ARE refused, as
-// members), `create_directory` / `create_directories`, `copy_file`, `copy` with no link option, and the questions
-// that read no entry at all (`absolute`, `current_path`, `temp_directory_path`, `space`).
+// ★ OUTSIDE THE CLASS, MEASURED THE SAME on both Windows libraries (and not refused by the forms below): `remove`
+// and `rename` (they act on the entry itself), `directory_iterator` (its listing; the questions its entries answer
+// ARE refused, as members), `create_directory` / `create_directories`, `copy_file`, `copy` with no link option, and
+// the questions that read no entry at all (`absolute`, `current_path`, `temp_directory_path`, `space`). Under src/
+// they are refused all the same, by H6c's family (d) (the last paragraph of this note): each receives TEXT and
+// resolves it by the library's own use, which no value can reach.
 //
 // THE FORMS REFUSED, each naming the substrate call to ask instead:
 //   * a refused name MENTIONED through a qualifier that is `std::filesystem` -- in any spelling: `::std::filesystem`,
@@ -41,6 +43,14 @@
 // tests/examples/ (the in-process examples runner, the CLI runner's twin: the scope is the RUNNERS, not one of
 // them -- P69 fold H5, the review of H4b's F4). The scan also reads tests/test_support/, which both runners
 // include, for the aliases its headers declare. Comments and string literals are not code, and are not read.
+//
+// ★ WHICH CODE TOUCHES A HOST PATH (P69 H6c): every operation on a host path takes its reading from one home, the
+// substrate (src/core/substrate/host_path.hpp's value and path_identity.hpp's operations). Over src/ outside the
+// substrate -- the runners keep their own file operations, on names DSS chooses -- five more families are refused,
+// each keyed on the CALL and read from the code's identifiers: (a) a Win32 path call, (b) a C-runtime or POSIX path
+// call, (c) a stream constructed or opened on a path, (d) a std::filesystem HOST operation the forms above let
+// through, (f) the substrate's access header or its test seam. And THE FENCE (ledger 580): the store route's text
+// forms, which H6d deletes, are taken at the pinned sites alone.
 
 #include "core/substrate/path_identity.hpp"   // walkTree: the substrate's own walk, never through a link
 #include "repo_root.hpp"
@@ -54,10 +64,12 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -65,31 +77,32 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Each refused name and the substrate's answer to it.
+// Each refused name and the substrate's answer to it -- `use` the answer's use (H6c): core::Use::Leaf for the object
+// the whole spelling names, core::Use::Container for the directory its names lie in.
 std::map<std::string, std::string> const kAsk = {
     {"file_size", "core::reachedFileSize(p, ec)"},
-    {"is_regular_file", "core::reachedKind(p, ec) == core::EntryKind::File"},
-    {"is_directory", "core::reachedKind(p, ec) == core::EntryKind::Directory"},
-    {"exists", "core::reachedKind(p, ec) != core::EntryKind::Absent (the entry itself: core::entryKind)"},
-    {"status", "core::reachedKind(p, ec)"},
-    {"symlink_status", "core::entryKind(p, ec)"},
-    {"canonical", "core::reachedPath(p, ec), or core::PathIdentity for an identity"},
-    {"weakly_canonical", "core::reachedPath(p, ec), or core::PathIdentity for an identity"},
-    {"is_symlink", "core::entryKind(p, ec) == core::EntryKind::Link"},
-    {"is_other", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
-    {"is_fifo", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
-    {"is_socket", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
-    {"is_block_file", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
-    {"is_character_file", "core::reachedKind(p, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_regular_file", "core::reachedKind(p, use, ec) == core::EntryKind::File"},
+    {"is_directory", "core::reachedKind(p, use, ec) == core::EntryKind::Directory"},
+    {"exists", "core::reachedKind(p, use, ec) != core::EntryKind::Absent (the entry itself: core::entryKind)"},
+    {"status", "core::reachedKind(p, use, ec)"},
+    {"symlink_status", "core::entryKind(p, use, ec)"},
+    {"canonical", "core::reachedPath(p, use, ec), or core::PathIdentity::of(p, use) for an identity"},
+    {"weakly_canonical", "core::reachedPath(p, use, ec), or core::PathIdentity::of(p, use) for an identity"},
+    {"is_symlink", "core::entryKind(p, use, ec) == core::EntryKind::Link"},
+    {"is_other", "core::reachedKind(p, use, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_fifo", "core::reachedKind(p, use, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_socket", "core::reachedKind(p, use, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_block_file", "core::reachedKind(p, use, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
+    {"is_character_file", "core::reachedKind(p, use, ec) == core::EntryKind::Other (the entry itself: core::entryKind)"},
     {"is_empty", "core::reachedFileSize(p, ec) for a file, core::walkTree for a directory"},
-    {"equivalent", "core::reachedSameFile(a, b, ec)"},
-    {"last_write_time", "core::reachedWriteTime(p, ec)"},
+    {"equivalent", "core::reachedSameFile(a, b, use, ec)"},
+    {"last_write_time", "core::reachedWriteTime(p, use, ec)"},
     {"hard_link_count", "a substrate question (core:: asks none yet): add it to path_identity.hpp"},
-    {"read_symlink", "core::reachedPath(p, ec)"},
+    {"read_symlink", "core::reachedPath(p, use, ec)"},
     {"remove_all", "core::removeTree(p)"},
     {"permissions", "core::addReachedPermissions(p, perms, ec)"},
-    {"relative", "core::reachedRelative(p, base, ec)"},
-    {"proximate", "core::reachedRelative(p, base, ec), or p where that is empty"},
+    {"relative", "core::reachedRelative(p, use, base, ec)"},
+    {"proximate", "core::reachedRelative(p, use, base, ec), or p where that is empty"},
     {"recursive_directory_iterator", "core::walkTree(root, visit)"},
     {"copy_symlinks", "a copy that asks the library no link question: copy_file of what core::walkTree hands out"},
     {"skip_symlinks", "a copy that asks the library no link question: copy_file of what core::walkTree hands out"},
@@ -331,8 +344,9 @@ struct Scanner {
     return found;
 }
 
-[[nodiscard]] std::string readAll(fs::path const& p) {
-    std::ifstream in{p, std::ios::binary};
+// A source's bytes, read through the home (H6c): `p` is the walk's LISTED value, never its text re-resolved.
+[[nodiscard]] std::string readAll(dss::core::HostPath const& p) {
+    std::ifstream in = dss::core::openInputStream(p, std::ios::binary);
     return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
 }
 
@@ -348,6 +362,480 @@ struct Scanner {
     return got;
 }
 
+
+// =====================================================================================================================
+// WHICH CODE TOUCHES A HOST PATH (P69 H6c). Every family below is keyed on the CALL and read from the code's
+// identifiers -- a name, the qualifier it is written with, and what stands before it -- never from a line's shape.
+// =====================================================================================================================
+
+// (a) The Win32 calls that take a path or hand one out (A4's vocabulary, the plan's W1). A name of kWin32Stems is
+// refused bare and with its `A` or `W` suffix, a name of kWin32Names as it is, and a name that begins with one of
+// kWin32Prefixes whatever follows it. SetFileInformationByHandle is refused at every call: whether a path rides it
+// is its information class's (`FileRenameInfo`, `FileLinkInfo`), which the line that calls it need not spell.
+std::set<std::string, std::less<>> const kWin32Stems = {
+    "CopyFile",           "CopyFileEx",          "CreateDirectory",       "CreateDirectoryEx",
+    "CreateFile",         "CreateFileMapping",   "CreateHardLink",        "CreateNamedPipe",
+    "CreateProcess",      "CreateProcessAsUser", "CreateSymbolicLink",    "DeleteFile",
+    "FindFirstChangeNotification", "FindFirstFile", "FindFirstFileEx",    "GetBinaryType",
+    "GetCompressedFileSize", "GetCurrentDirectory", "GetDiskFreeSpace",   "GetDiskFreeSpaceEx",
+    "GetFileAttributes",  "GetFileAttributesEx", "GetFileVersionInfo",    "GetFileVersionInfoEx",
+    "GetFileVersionInfoSize", "GetFileVersionInfoSizeEx", "GetFinalPathNameByHandle", "GetFullPathName",
+    "GetLongPathName",    "GetModuleFileName",   "GetModuleFileNameEx",   "GetShortPathName",
+    "GetTempFileName",    "GetTempPath",         "GetTempPath2",          "GetVolumeInformation",
+    "GetVolumePathName",  "LoadImage",           "LoadLibrary",           "LoadLibraryEx",
+    "MoveFile",           "MoveFileEx",          "MoveFileWithProgress",  "PathFileExists",
+    "RemoveDirectory",    "ReplaceFile",         "SHCreateDirectory",     "SHCreateDirectoryEx",
+    "SHFileOperation",    "SHGetFolderPath",     "SHGetFolderPathAndAppend", "SHGetSpecialFolderPath",
+    "SearchPath",         "SetCurrentDirectory", "SetFileAttributes",     "ShellExecute",
+    "ShellExecuteEx"};
+std::set<std::string, std::less<>> const kWin32Names = {
+    "CopyFile2",    "CreateFile2",  "FindFirstFileNameTransactedW", "FindFirstFileNameW", "NtCreateFile",
+    "NtOpenFile",   "OpenFile",     "OpenFileById", "SHGetKnownFolderPath", "SetFileInformationByHandle",
+    "ZwCreateFile", "ZwOpenFile",   "_lcreat",      "_lopen"};
+std::vector<std::string_view> const kWin32Prefixes = {"GetPrivateProfile", "RtlDosPathNameToNtPathName",
+                                                      "WritePrivateProfile"};
+
+// (b) The C-runtime and POSIX calls that take a path (A4's vocabulary, the plan's W2), wide and narrow: a name of
+// kCrtNames as it is, and a name that begins with one of kCrtPrefixes. `open` and `creat` share their names with
+// the tree's own functions, so they are keyed apart (the plan's B3): refused when the global scope qualifies them
+// (`::open(`), or when their argument list names an `O_*` flag. Every other name is refused as W2 keys it -- `std::
+// remove` among them, which is also the algorithm's name: the tree erases with `std::erase` / `std::ranges::remove`.
+std::set<std::string, std::less<>> const kCrtNames = {
+    "_access",  "_chdir",   "_chmod",    "_fsopen",    "_fullpath", "_getcwd",   "_mkdir",     "_open",
+    "_popen",   "_rmdir",   "_sopen",    "_sopen_s",   "_unlink",   "_waccess",  "_waccess_s", "_wchdir",
+    "_wchmod",  "_wfopen",  "_wfopen_s", "_wfreopen",  "_wfreopen_s", "_wfsopen", "_wfullpath", "_wgetcwd",
+    "_wmkdir",  "_wopen",   "_wopendir", "_wpopen",    "_wremove",  "_wrename",  "_wrmdir",    "_wsopen",
+    "_wsopen_s", "_wsystem", "_wtmpnam", "_wunlink",   "access",    "chdir",     "chmod",      "creat",
+    "dlopen",   "fopen",    "freopen",   "fstatat",    "getcwd",    "link",      "lstat",      "mkdir",
+    "mkdirat",  "mkdtemp",  "open",      "openat",     "opendir",   "popen",     "posix_spawn", "posix_spawnp",
+    "readlink", "realpath", "remove",    "rename",     "rmdir",     "stat",      "stat64",     "symlink",
+    "system",   "tmpfile",  "tmpnam",    "truncate",   "unlink",    "unlinkat"};
+std::vector<std::string_view> const kCrtPrefixes = {"_findfirst", "_stat",  "_utime", "_wexec",   "_wfindfirst",
+                                                    "_wspawn",    "_wstat", "_wutime", "execl",   "execv",
+                                                    "mkostemp",   "mkstemp", "utime"};
+
+// (c) The library's file streams: constructed on a path, or opened on one, they read the path's text by the
+// library's own rule, which no value can reach.
+std::set<std::string, std::less<>> const kStreamTypes = {
+    "basic_filebuf", "basic_fstream", "basic_ifstream", "basic_ofstream", "filebuf",  "fstream",
+    "ifstream",      "ofstream",      "wfilebuf",       "wfstream",       "wifstream", "wofstream"};
+
+// (d) The std::filesystem HOST operations the link questions (kAsk) let through, each with the home's answer: every
+// library call receives TEXT and resolves it by the library's own use, which no value can reach (the plan's 5.4).
+std::map<std::string, std::string, std::less<>> const kHostOperations = {
+    {"absolute", "core::absoluteKeepingRoot(p, use, ec)"},
+    {"copy", "core::copyFile(from, to, ec), a tree's files through core::walkTree"},
+    {"copy_file", "core::copyFile(from, to, ec)"},
+    {"copy_symlink", "a substrate operation (core:: has none yet): add it to path_identity.hpp"},
+    {"create_directories", "core::createDirectories(p, ec)"},
+    {"create_directory", "core::createDirectories(p, ec)"},
+    {"create_directory_symlink", "a substrate operation (core:: has none yet): add it to path_identity.hpp"},
+    {"create_hard_link", "a substrate operation (core:: has none yet): add it to path_identity.hpp"},
+    {"create_symlink", "a substrate operation (core:: has none yet): add it to path_identity.hpp"},
+    {"current_path", "core::currentDirectory(ec)"},
+    {"directory_entry", "core::walkTree(root, visit): the entries it hands out are the substrate's"},
+    {"directory_iterator", "core::walkTree(root, visit)"},
+    {"remove", "core::removeEntry(p, ec)"},
+    {"rename", "core::renameEntry(from, to, ec)"},
+    {"resize_file", "a substrate operation (core:: has none yet): add it to path_identity.hpp"},
+    {"space", "a substrate question (core:: asks none yet): add it to path_identity.hpp"},
+    {"temp_directory_path", "core::temporaryDirectory(ec)"},
+};
+// The host operations an UNQUALIFIED call can reach by argument-dependent lookup through a path argument. `copy`,
+// `remove`, `rename` and `space` are left out of this form: they are also the algorithms' and the C library's names
+// (family (b) reads the last two) and the tree's own local functions' (a `space(c)` lambda), so only their qualified
+// mention is refused; `temp_directory_path` takes no path.
+std::set<std::string, std::less<>> const kHostOperationsByLookup = {
+    "absolute",         "copy_file",        "copy_symlink",   "create_directories", "create_directory",
+    "create_directory_symlink", "create_hard_link", "create_symlink", "current_path",   "resize_file"};
+
+// The keywords after which a name begins an expression: before any other identifier it is a declaration's name.
+std::set<std::string, std::less<>> const kExpressionKeywords = {
+    "alignof", "and",    "and_eq", "bitand", "bitor", "case", "co_await", "co_return", "co_yield", "compl", "delete",
+    "do",      "else",   "new",    "not",    "not_eq", "or",  "or_eq",    "return",    "sizeof",   "throw", "typeid",
+    "xor",     "xor_eq"};
+
+std::string const kAskHostCall =
+    "the substrate's operation on a HostPath (core::openHandle, core::openDescriptor, core::openFileStream, "
+    "core::removeEntry, core::renameEntry, core::spawnAndWait*), or a new one in src/core/substrate/";
+std::string const kAskStream = "core::openInputStream(p, mode) or core::openOutputStream(p, mode)";
+
+[[nodiscard]] bool isIdentifierChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+// The last character before `k` that is no space, or npos.
+[[nodiscard]] std::size_t lastBefore(std::string const& code, std::size_t k) {
+    while (k > 0) {
+        --k;
+        if (std::isspace(static_cast<unsigned char>(code[k])) == 0) return k;
+    }
+    return std::string::npos;
+}
+
+// The first character from `k` on that is no space (code.size() when none is).
+[[nodiscard]] std::size_t firstFrom(std::string const& code, std::size_t k) {
+    while (k < code.size() && std::isspace(static_cast<unsigned char>(code[k])) != 0) ++k;
+    return k;
+}
+
+// The identifier whose last character is at `last`, and where it begins.
+[[nodiscard]] std::pair<std::string_view, std::size_t> identifierEndingAt(std::string const& code, std::size_t last) {
+    std::size_t begin = last + 1;
+    while (begin > 0 && isIdentifierChar(code[begin - 1])) --begin;
+    return {std::string_view{code}.substr(begin, last + 1 - begin), begin};
+}
+
+// How a name is written: bare, after the global scope (`::open`), after a NAMED scope (`std::fopen`,
+// `DependencyCache::open` -- `qualifier` names it), or as a member (`in.open`, `p->open` -- `object` names what
+// stands before the `.` or `->`, empty when that is no identifier). `start` is where the written name begins.
+enum class Written { Bare, Global, Named, Member };
+struct NameContext {
+    Written          how;
+    std::string_view qualifier;
+    std::string_view object;
+    std::size_t      start;
+};
+
+[[nodiscard]] NameContext contextOf(std::string const& code, std::size_t at) {
+    std::size_t const k = lastBefore(code, at);
+    if (k != std::string::npos && k >= 1 && code[k] == ':' && code[k - 1] == ':') {
+        std::size_t const j = lastBefore(code, k - 1);
+        if (j != std::string::npos && isIdentifierChar(code[j])) {
+            auto const [qualifier, begin] = identifierEndingAt(code, j);
+            // An expression keyword is no scope: `return ::open(p)` is a call after the GLOBAL scope.
+            if (kExpressionKeywords.count(qualifier) == 0) return {Written::Named, qualifier, {}, begin};
+        }
+        return {Written::Global, {}, {}, k - 1};
+    }
+    bool const arrow = k != std::string::npos && k >= 1 && code[k] == '>' && code[k - 1] == '-';
+    if (k != std::string::npos && (code[k] == '.' || arrow)) {
+        std::size_t const o = lastBefore(code, arrow ? k - 1 : k);
+        std::string_view object;
+        if (o != std::string::npos && isIdentifierChar(code[o])) object = identifierEndingAt(code, o).first;
+        return {Written::Member, {}, object, at};
+    }
+    return {Written::Bare, {}, {}, at};
+}
+
+// Whether the name written from `start` is a DECLARATION's: an identifier that is no expression keyword stands
+// before it (`void truncate(`, `LinkedImage link(`, a declaration whose type ends the line before).
+[[nodiscard]] bool namesADeclaration(std::string const& code, std::size_t start) {
+    std::size_t const k = lastBefore(code, start);
+    if (k == std::string::npos || !isIdentifierChar(code[k])) return false;
+    std::string_view const word = identifierEndingAt(code, k).first;
+    return std::isdigit(static_cast<unsigned char>(word.front())) == 0 && kExpressionKeywords.count(word) == 0;
+}
+
+// The text between a call's parentheses when `(` follows the name ending at `end`, or nullopt when none does.
+[[nodiscard]] std::optional<std::string_view> callArguments(std::string const& code, std::size_t end) {
+    std::size_t const open = firstFrom(code, end);
+    if (open >= code.size() || code[open] != '(') return std::nullopt;
+    int depth = 0;
+    for (std::size_t k = open; k < code.size(); ++k) {
+        char const c = code[k];
+        if (c == '(' || c == '[' || c == '{') ++depth;
+        else if ((c == ')' || c == ']' || c == '}') && --depth == 0)
+            return std::string_view{code}.substr(open + 1, k - open - 1);
+    }
+    return std::string_view{code}.substr(open + 1);
+}
+
+[[nodiscard]] bool isBlank(std::string_view text) {
+    return std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; });
+}
+
+// Whether `args` names an `O_*` flag (`O_RDONLY`, `O_WRONLY | O_CREAT`): the POSIX open's own argument.
+[[nodiscard]] bool namesAnOpenFlag(std::string_view args) {
+    for (std::size_t k = args.find("O_"); k != std::string_view::npos; k = args.find("O_", k + 2)) {
+        bool const begins = k == 0 || !isIdentifierChar(args[k - 1]);
+        if (begins && k + 2 < args.size() && std::isupper(static_cast<unsigned char>(args[k + 2])) != 0) return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool beginsWithOneOf(std::string_view name, std::vector<std::string_view> const& prefixes) {
+    return std::any_of(prefixes.begin(), prefixes.end(), [&](std::string_view p) { return name.substr(0, p.size()) == p; });
+}
+
+[[nodiscard]] bool isWin32PathCall(std::string_view name) {
+    if (kWin32Names.count(name) != 0 || kWin32Stems.count(name) != 0) return true;
+    bool const suffixed = name.size() > 1 && (name.back() == 'A' || name.back() == 'W');
+    return (suffixed && kWin32Stems.count(name.substr(0, name.size() - 1)) != 0) || beginsWithOneOf(name, kWin32Prefixes);
+}
+
+[[nodiscard]] bool isCrtPathCall(std::string_view name) {
+    return kCrtNames.count(name) != 0 || beginsWithOneOf(name, kCrtPrefixes);
+}
+
+// What follows a stream type that ends at `end`: the name it declares (empty for none -- a temporary, a template
+// argument) and where the declaration goes on after it.
+struct StreamUse {
+    std::string_view declared;
+    std::size_t      next;
+};
+
+[[nodiscard]] StreamUse streamUseAfter(std::string const& code, std::size_t end) {
+    std::size_t k = firstFrom(code, end);
+    if (k < code.size() && code[k] == '<') {   // `std::basic_ifstream<char>`
+        for (int depth = 0; k < code.size(); ++k) {
+            if (code[k] == '<') ++depth;
+            else if (code[k] == '>' && --depth == 0) break;
+        }
+        k = firstFrom(code, std::min(code.size(), k + 1));
+    }
+    for (bool more = true; more;) {   // `&`, `*`, `const`, `volatile` before the declared name
+        more = false;
+        while (k < code.size() && (code[k] == '&' || code[k] == '*')) {
+            k    = firstFrom(code, k + 1);
+            more = true;
+        }
+        for (std::string_view const word : {std::string_view{"const"}, std::string_view{"volatile"}}) {
+            if (code.compare(k, word.size(), word) == 0
+                && (k + word.size() >= code.size() || !isIdentifierChar(code[k + word.size()]))) {
+                k = firstFrom(code, k + word.size());
+                more = true;
+            }
+        }
+    }
+    std::size_t e = k;
+    while (e < code.size() && isIdentifierChar(code[e])) ++e;
+    if (e == k) return {{}, k};
+    return {std::string_view{code}.substr(k, e - k), firstFrom(code, e)};
+}
+
+// Every identifier of `code` with where it begins, numbers left out.
+template <typename Visit>
+void forEachIdentifier(std::string const& code, Visit&& visit) {
+    for (std::size_t i = 0; i < code.size();) {
+        if (!isIdentifierChar(code[i])) {
+            ++i;
+            continue;
+        }
+        std::size_t e = i;
+        while (e < code.size() && isIdentifierChar(code[e])) ++e;
+        if (std::isdigit(static_cast<unsigned char>(code[i])) == 0) visit(std::string_view{code}.substr(i, e - i), i);
+        i = e;
+    }
+}
+
+// Every name the sources DECLARE with a stream type -- a variable, a parameter, a member: a member a header
+// declares is opened in its .cpp, so the names are the whole set's, as the aliases are.
+[[nodiscard]] std::set<std::string, std::less<>> streamNamesIn(std::vector<Source> const& sources) {
+    std::set<std::string, std::less<>> names;
+    for (auto const& s : sources) {
+        forEachIdentifier(s.code, [&](std::string_view name, std::size_t at) {
+            if (kStreamTypes.count(name) == 0) return;
+            NameContext const ctx = contextOf(s.code, at);
+            if (ctx.how != Written::Named || ctx.qualifier != "std") return;
+            StreamUse const use = streamUseAfter(s.code, at + name.size());
+            if (!use.declared.empty()) names.emplace(use.declared);
+        });
+    }
+    return names;
+}
+
+// One finding of a host-path family: which family, where, what was written, and what to ask instead.
+struct HostFinding {
+    char        family;
+    std::string where;
+    std::string call;
+    std::string ask;
+};
+
+// What the host-path families read from the whole set of sources: its names for std::filesystem and its streams.
+struct HostScope {
+    std::set<std::string>              aliases;
+    std::set<std::string, std::less<>> streams;
+};
+
+// The include a directive line names (`"x/y.hpp"` or `<x/y.hpp>`) from its TEXT -- code blanks a quoted name.
+[[nodiscard]] std::string includedName(std::string const& codeLine, std::string const& textLine) {
+    std::size_t const hash = firstFrom(codeLine, 0);
+    if (hash >= codeLine.size() || codeLine[hash] != '#') return {};
+    std::size_t const word = firstFrom(codeLine, hash + 1);
+    if (codeLine.compare(word, 7, "include") != 0) return {};
+    std::size_t const open = textLine.find_first_of("\"<", word + 7);
+    if (open == std::string::npos) return {};
+    std::size_t const close = textLine.find(textLine[open] == '"' ? '"' : '>', open + 1);
+    return close == std::string::npos ? std::string{} : textLine.substr(open + 1, close - open - 1);
+}
+
+// Every host-path call of families (a)-(d) and (f) in one source's code.
+[[nodiscard]] std::vector<HostFinding> hostPathCallsIn(Source const& source, HostScope const& scope) {
+    std::string const& code = source.code;
+    std::vector<std::size_t> lineStarts{0};
+    for (std::size_t k = 0; k < code.size(); ++k)
+        if (code[k] == '\n') lineStarts.push_back(k + 1);
+    auto const where = [&](std::size_t at) {
+        auto const line = std::upper_bound(lineStarts.begin(), lineStarts.end(), at) - lineStarts.begin();
+        return source.relative + ":" + std::to_string(line);
+    };
+    std::vector<HostFinding> out;
+    forEachIdentifier(code, [&](std::string_view name, std::size_t at) {
+        bool const win32 = isWin32PathCall(name);
+        bool const crt   = isCrtPathCall(name);
+        bool const named = kStreamTypes.count(name) != 0 || name == "open" || kHostOperations.count(name) != 0
+                           || name == "substrate_testing";
+        if (!win32 && !crt && !named) return;
+        NameContext const ctx   = contextOf(code, at);
+        std::size_t const end   = at + name.size();
+        auto const        args  = callArguments(code, end);
+        bool const        call  = args.has_value() && !namesADeclaration(code, ctx.start);
+        bool const        plain = ctx.how == Written::Bare || ctx.how == Written::Global;
+        bool const        isStd = ctx.how == Written::Named && ctx.qualifier == "std";
+        if (win32 && plain && call)
+            out.push_back({'a', where(at), std::string{name}, kAskHostCall});
+        bool const keyedApart = name == "open" || name == "creat";
+        if (crt && (plain || isStd) && call && (!keyedApart || ctx.how == Written::Global || namesAnOpenFlag(*args)))
+            out.push_back({'b', where(at), std::string{name}, kAskHostCall});
+        if (kStreamTypes.count(name) != 0 && isStd) {
+            StreamUse const   use = streamUseAfter(code, end);
+            std::size_t const k   = use.next;
+            bool const opens = k < code.size() && (code[k] == '(' || code[k] == '{')
+                               && firstFrom(code, k + 1) < code.size()
+                               && code[firstFrom(code, k + 1)] != (code[k] == '(' ? ')' : '}');
+            if (opens) out.push_back({'c', where(at), "std::" + std::string{name} + " on a path", kAskStream});
+        }
+        if (name == "open" && ctx.how == Written::Member && args.has_value() && scope.streams.count(ctx.object) != 0)
+            out.push_back({'c', where(at), std::string{ctx.object} + ".open", kAskStream});
+        bool const filesystem = ctx.how == Written::Named
+                                && (ctx.qualifier == "filesystem" || scope.aliases.count(std::string{ctx.qualifier}) != 0);
+        if (kHostOperations.count(name) != 0 && filesystem)
+            out.push_back({'d', where(at), std::string{name}, kHostOperations.find(name)->second});
+        else if (kHostOperationsByLookup.count(name) != 0 && ctx.how == Written::Bare && call && !isBlank(*args))
+            out.push_back({'d', where(at), std::string{name} + " (unqualified: argument-dependent lookup may reach "
+                                           "std::filesystem)", kHostOperations.find(name)->second});
+        if (name == "substrate_testing")
+            out.push_back({'f', where(at), "substrate_testing", "a test's seam: it is named under tests/ alone"});
+    });
+    auto const codeLines = linesOf(code);
+    auto const textLines = linesOf(source.text);
+    for (std::size_t n = 0; n < codeLines.size() && n < textLines.size(); ++n) {
+        std::string const name = includedName(codeLines[n], textLines[n]);
+        bool const access = name == "host_path_access.hpp"
+                            || (name.size() > 21 && name.compare(name.size() - 21, 21, "/host_path_access.hpp") == 0);
+        if (access)
+            out.push_back({'f', source.relative + ":" + std::to_string(n + 1), "#include " + name,
+                           "the substrate's operations (path_identity.hpp, process_spawn.hpp): the access header "
+                           "is the home's own"});
+    }
+    return out;
+}
+
+// Whether `relative` is a source the host-path families judge: src/ outside the substrate (H6c's ruled scope; the
+// runners keep their own file operations, on DSS-chosen names).
+[[nodiscard]] bool isJudgedForHostPaths(std::string const& relative) {
+    return isGuarded(relative) && relative.rfind("src/", 0) == 0;
+}
+
+// Every host-path finding over a set of sources: the aliases and the streams are the whole set's, the findings the
+// judged sources' alone, in the order the sources stand.
+[[nodiscard]] std::vector<HostFinding> hostPathCallsAcross(std::vector<Source> const& sources) {
+    HostScope const scope{aliasesIn(sources), streamNamesIn(sources)};
+    std::vector<HostFinding> found;
+    for (auto const& s : sources) {
+        if (!isJudgedForHostPaths(s.relative)) continue;
+        auto more = hostPathCallsIn(s, scope);
+        std::stable_sort(more.begin(), more.end(), [](HostFinding const& a, HostFinding const& b) {
+            return std::stoul(a.where.substr(a.where.rfind(':') + 1)) < std::stoul(b.where.substr(b.where.rfind(':') + 1));
+        });
+        found.insert(found.end(), more.begin(), more.end());
+    }
+    return found;
+}
+
+// `found`'s findings of `family` as `<line>=<call>` words, or `<file> line <line>=<call>` when `withFile`.
+[[nodiscard]] std::string spelledFamily(std::vector<HostFinding> const& found, char family, bool withFile) {
+    std::string got;
+    for (auto const& f : found) {
+        if (f.family != family) continue;
+        std::size_t const colon = f.where.rfind(':');
+        std::string const line  = f.where.substr(colon + 1);
+        got += " " + (withFile ? f.where.substr(0, colon) + " line " + line : line) + "=" + f.call;
+    }
+    return got;
+}
+
+// THE FENCE (ledger 580). Until H6d makes the stores' values typed, six forms (`storeRouteNormalized`,
+// `storeRouteAbsolute`, `storeRouteReachedPath`, `storeRouteCurrentDirectory`, `storeRouteRunningExecutable`,
+// `storeRouteTemporaryDirectory`) and
+// two members (`TreeEntry::storeRoutePath`, `TreeWalk::storeRouteWhere`) hand a store the TEXT it keeps today: an
+// escape, which any site could take. So every use is pinned -- by file, form and count, over every source the
+// guard reads outside the substrate -- and a use outside the pin, or a count other than its pinned one, reds. H6d
+// deletes the forms, this pin and the cases that read it.
+using StoreRoutePin = std::map<std::string, std::map<std::string, std::size_t>>;
+StoreRoutePin const kStoreRoutePin = {
+    {"src/core/types/config_path_walk.cpp",
+     {{"storeRouteAbsolute", 1}, {"storeRouteCurrentDirectory", 1}, {"storeRouteNormalized", 2}, {"storeRoutePath", 1}, {"storeRouteReachedPath", 1}, {"storeRouteRunningExecutable", 1}}},
+    {"src/core/types/glob_match.cpp",
+     {{"storeRouteNormalized", 1}, {"storeRoutePath", 3}, {"storeRouteWhere", 1}}},
+    {"src/core/types/predefined_macro_json.cpp",
+     {{"storeRoutePath", 1}}},
+    {"src/ffi/ingest.cpp",
+     {{"storeRoutePath", 1}}},
+    {"src/ffi/shipped_lib_descriptor.cpp",
+     {{"storeRouteNormalized", 1}, {"storeRoutePath", 5}, {"storeRouteWhere", 1}}},
+    {"src/lsp/workspace_project.cpp",
+     {{"storeRouteAbsolute", 1}, {"storeRoutePath", 1}}},
+    {"src/program/input_resolver.cpp",
+     {{"storeRoutePath", 1}}},
+    {"src/program/program.cpp",
+     {{"storeRouteAbsolute", 1}, {"storeRouteCurrentDirectory", 1}, {"storeRoutePath", 1}, {"storeRouteTemporaryDirectory", 1}}},
+};
+
+// Every use of a store-route form or member in `sources` outside the substrate, by file and form.
+[[nodiscard]] StoreRoutePin storeRouteUsesIn(std::vector<Source> const& sources) {
+    StoreRoutePin uses;
+    for (auto const& s : sources) {
+        if (s.relative.rfind("src/core/substrate/", 0) == 0) continue;
+        forEachIdentifier(s.code, [&](std::string_view name, std::size_t) {
+            if (name.substr(0, 10) == "storeRoute") ++uses[s.relative][std::string{name}];
+        });
+    }
+    return uses;
+}
+
+// Every way `uses` departs from `pin`: a form taken where none is pinned, or a count other than the pinned one.
+[[nodiscard]] std::vector<std::string> fenceBreaches(StoreRoutePin const& uses, StoreRoutePin const& pin) {
+    std::set<std::pair<std::string, std::string>> keys;
+    for (auto const* map : {&uses, &pin})
+        for (auto const& [file, forms] : *map)
+            for (auto const& form : forms) keys.emplace(file, form.first);
+    auto const count = [](StoreRoutePin const& map, std::string const& file, std::string const& form) -> std::size_t {
+        auto const f = map.find(file);
+        if (f == map.end()) return 0;
+        auto const n = f->second.find(form);
+        return n == f->second.end() ? 0 : n->second;
+    };
+    std::vector<std::string> breaches;
+    for (auto const& [file, form] : keys) {
+        std::size_t const taken = count(uses, file, form);
+        std::size_t const fenced = count(pin, file, form);
+        if (taken != fenced)
+            breaches.push_back(file + ": " + form + " taken " + std::to_string(taken) + " time(s), pinned "
+                               + std::to_string(fenced));
+    }
+    return breaches;
+}
+
+// The sources under `tops` (directories under the repository), read through the home: each a LISTED value.
+[[nodiscard]] std::vector<Source> sourcesUnder(fs::path const& root, std::vector<std::string> const& tops) {
+    std::vector<Source> sources;
+    for (std::string const& top : tops) {
+        auto const walk = dss::core::walkTree(root / top, [&](dss::core::TreeEntry const& entry) {
+            if (entry.kind != dss::core::EntryKind::File) return dss::core::WalkStep::Continue;
+            std::string const ext = entry.at.extension().string();
+            if (ext == ".cpp" || ext == ".hpp")
+                sources.push_back(sourceOf(top + "/" + entry.relative.generic(), readAll(entry.at)));
+            return dss::core::WalkStep::Continue;
+        });
+        EXPECT_FALSE(walk.error) << "the walk of " << top << "/ stopped at " << walk.where.spelling().generic() << ": "
+                                 << walk.error.message();
+    }
+    return sources;
+}
+
 } // namespace
 
 // THE TREE: no source in scope asks the library a question its answer to depends on how it reads a link.
@@ -357,12 +845,13 @@ TEST(FilesystemQueriesGuard, TheSourceTreeAsksTheSubstrateForEveryFilesystemQuer
     for (char const* top : {"src", "integrated_tests", "tests/examples", "tests/test_support"}) {
         auto const walk = dss::core::walkTree(root / top, [&](dss::core::TreeEntry const& entry) {
             if (entry.kind != dss::core::EntryKind::File) return dss::core::WalkStep::Continue;
-            std::string const relative = entry.path.lexically_relative(root).generic_string();
-            std::string const ext      = entry.path.extension().string();
-            if (ext == ".cpp" || ext == ".hpp") sources.push_back(sourceOf(relative, readAll(entry.path)));
+            // Each entry a LISTED value (H6c): its names below the top as listed, its extension as text to match.
+            std::string const relative = std::string{top} + "/" + entry.relative.generic();
+            std::string const ext      = entry.at.extension().string();
+            if (ext == ".cpp" || ext == ".hpp") sources.push_back(sourceOf(relative, readAll(entry.at)));
             return dss::core::WalkStep::Continue;
         });
-        ASSERT_FALSE(walk.error) << "the walk of " << top << "/ stopped at " << walk.where.generic_string() << ": "
+        ASSERT_FALSE(walk.error) << "the walk of " << top << "/ stopped at " << walk.where.spelling().generic() << ": "
                                  << walk.error.message();
     }
     std::size_t const judged =
@@ -483,4 +972,243 @@ TEST(FilesystemQueriesGuard, TheSubstrateIsTheOneDirectoryLeftOut) {
     EXPECT_FALSE(isGuarded("tests/core/test_header_name_matching.cpp"));
     EXPECT_FALSE(isGuarded("tests/test_support/stage_tree.hpp")) << "read for its aliases, not judged";
     EXPECT_TRUE(isGuarded("src/core/substrate_like/x.cpp")) << "only the substrate directory itself is left out";
+}
+
+// ════ WHICH CODE TOUCHES A HOST PATH (P69 H6c) ════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// The sources the host-path cases read, read ONCE for the binary: every top the link family reads.
+[[nodiscard]] std::vector<Source> const& treeSources() {
+    static std::vector<Source> const sources =
+        sourcesUnder(dss::test::repoRoot(), {"src", "integrated_tests", "tests/examples", "tests/test_support"});
+    return sources;
+}
+
+}  // namespace
+
+// THE TREE: no source under src/ outside the substrate touches a host path but through the home -- no Win32 path
+// call, no C-runtime or POSIX path call, no stream on a path, no std::filesystem host operation, and neither the
+// access header nor the test seam.
+TEST(FilesystemQueriesGuard, TheSourceTreeTouchesAHostPathOnlyThroughItsHome) {
+    auto const&       sources = treeSources();
+    std::size_t const judged  = static_cast<std::size_t>(std::count_if(
+        sources.begin(), sources.end(), [](Source const& s) { return isJudgedForHostPaths(s.relative); }));
+    // Not a vacuous pass: src/ holds hundreds of sources outside the substrate (517 when H6c widened the guard).
+    EXPECT_GE(judged, 400u) << "the host-path families judged only " << judged << " sources";
+    auto const  found = hostPathCallsAcross(sources);
+    std::string listed;
+    for (auto const& f : found)
+        listed += "\n  (" + std::string(1, f.family) + ") " + f.where + ": `" + f.call + "` -- ask the home: " + f.ask;
+    EXPECT_TRUE(found.empty()) << found.size() << " host path operation(s) outside src/core/substrate/:" << listed;
+}
+
+// THE TREE'S FENCE: every store-route use stands where the pin says, as many times as it says.
+TEST(FilesystemQueriesGuard, TheSourceTreeTakesTheStoreRouteOnlyAtItsPinnedSites) {
+    auto const uses = storeRouteUsesIn(treeSources());
+    EXPECT_FALSE(uses.empty()) << "no store-route use was read: the fence reads nothing";
+    std::string listed;
+    for (auto const& b : fenceBreaches(uses, kStoreRoutePin)) listed += "\n  " + b;
+    EXPECT_TRUE(listed.empty()) << "the store route is taken outside its pin (H6d types the stores; until then a "
+                                   "store site is pinned, and no other site takes the route):"
+                                << listed;
+}
+
+// (a) A WIN32 PATH CALL: bare or after the global scope, every name of the vocabulary with its suffixes and its
+// prefixes -- and not a member, a scope's own function, a longer name, a declaration, a mention, prose, the home or
+// a runner.
+TEST(FilesystemQueriesGuard, AWin32PathCallIsRefusedOutsideTheHome) {
+    std::vector<Source> const sources = {
+        sourceOf("src/a/win.cpp",
+                 "#include <windows.h>\n"
+                 "void* a(wchar_t const* p) { return ::CreateFileW(p, 0, 0, nullptr, 3, 0, nullptr); }\n"   // 2
+                 "unsigned long b(wchar_t const* p) { return GetFileAttributesW(p); }\n"                     // 3
+                 "int c(void* h, void* i) { return SetFileInformationByHandle(h, FileRenameInfo, i, 8); }\n"  // 4
+                 "int d() { return CreateProcessW(nullptr, cmd, nullptr, nullptr, 0, 0, nullptr, nullptr, &s, &i); }\n"
+                 "long e() { return RtlDosPathNameToNtPathName_U_WithStatus(p, &n, nullptr, nullptr); }\n"   // 6
+                 "int f() { return GetPrivateProfileStringW(s, k, d, b, n, p) + GetTempPath2W(n, b); }\n"     // 7
+                 "int g(Mock& m) { return m.CreateFileW(p) + Mock::DeleteFileW(p) + CreateFileWrapper(p); }\n"
+                 "int h(Mock* m) { return m->RemoveDirectoryW(p); }\n"
+                 "// ::CreateFileW(p) in a comment\n"
+                 "char const* j = \"DeleteFileW(p) in a string\";\n"
+                 "HANDLE WINAPI CreateFileW(wchar_t const* p);\n"
+                 "auto k = &::MoveFileExW;\n"
+                 "int l(wchar_t const* p) {\n"
+                 "    return CopyFileExW(p,\n"                                                               // 15
+                 "                       q, nullptr, nullptr, nullptr, 0);\n"
+                 "}\n"),
+        sourceOf("src/core/substrate/home.cpp",
+                 "void* m(wchar_t const* p) { return ::CreateFileW(p, 0, 0, nullptr, 3, 0, nullptr); }\n"),
+        sourceOf("integrated_tests/runner_like.cpp",
+                 "void* n(wchar_t const* p) { return ::CreateFileW(p, 0, 0, nullptr, 3, 0, nullptr); }\n"),
+    };
+    std::string const got = spelledFamily(hostPathCallsAcross(sources), 'a', /*withFile=*/true);
+    std::string const want =
+        " src/a/win.cpp line 2=CreateFileW src/a/win.cpp line 3=GetFileAttributesW"
+        " src/a/win.cpp line 4=SetFileInformationByHandle src/a/win.cpp line 5=CreateProcessW"
+        " src/a/win.cpp line 6=RtlDosPathNameToNtPathName_U_WithStatus src/a/win.cpp line 7=GetPrivateProfileStringW"
+        " src/a/win.cpp line 7=GetTempPath2W src/a/win.cpp line 15=CopyFileExW";
+    EXPECT_EQ(got, want);
+}
+
+// (b) A C-RUNTIME OR POSIX PATH CALL, `open` and `creat` keyed apart (B3): the global scope's or one with an `O_*`
+// flag, on one line or across two. NEGATIVE, each a form MEASURED in the tree: a member, a scope's own function,
+// a local `open(braceList, object)`, `guard = open(rule)`, `open(ctx, ...)`, the declarations `void truncate(` and
+// `LinkedImage link(` (its type on the line before too), and the tree's own `link` called qualified.
+TEST(FilesystemQueriesGuard, ACRuntimePathCallIsRefusedOutsideTheHome) {
+    std::vector<Source> const sources = {
+        sourceOf("src/b/crt.cpp",
+                 "#include <fcntl.h>\n"
+                 "int a(char const* p) { return ::open(p, O_RDONLY); }\n"                                    // 2
+                 "int b(char const* p) { return open(p, O_WRONLY | O_CREAT, 0666); }\n"                      // 3
+                 "int c(char const* p) { return ::creat(p, 0644); }\n"                                       // 4
+                 "std::FILE* d(char const* p) { return std::fopen(p, \"rb\"); }\n"                            // 5
+                 "std::FILE* e(wchar_t const* p) { return _wfopen(p, L\"rb\"); }\n"                           // 6
+                 "int f(char const* p) { return ::unlink(p) + _wstat64(w, &st); }\n"                          // 7
+                 "int g(char const* p) { return open(p,\n"                                                    // 8
+                 "                                   O_RDONLY); }\n"
+                 "void h(Cache& x) { x.open(); y->open(z); }\n"
+                 "void i() { DependencyCache::open(dir); TreeBuilder::open(kind); }\n"
+                 "void j() { auto open = [](auto&, auto&) {}; open(braceList, object); }\n"
+                 "void k() { guard = open(rule); }\n"
+                 "void l() { open(ctx, schema); }\n"
+                 "void truncate(std::size_t n) { size_ = n; }\n"
+                 "LinkedImage link(std::span<Module const> modules, Schema const& s) {\n"
+                 "    return dss::linker::link(std::span<Module const>{&m, 1}, s); }\n"
+                 "[[nodiscard]] DSS_EXPORT LinkedImage\n"
+                 "link(Module const& m);\n"
+                 "int m(char const* p) { return remove(p) + std::rename(p, q); }\n"                           // 20
+                 "void n(char const* p) { if (p) {} else unlink(p); }\n"                                      // 21
+                 "// ::open(p, O_RDONLY) in a comment\n"
+                 "struct stat st; int o(Cache& c) { return c.stat(1); }\n"),
+        sourceOf("src/core/substrate/home.cpp", "int q(char const* p) { return ::open(p, O_RDONLY); }\n"),
+    };
+    std::string const got = spelledFamily(hostPathCallsAcross(sources), 'b', /*withFile=*/false);
+    std::string const want = " 2=open 3=open 4=creat 5=fopen 6=_wfopen 7=unlink 7=_wstat64 8=open 20=remove 20=rename "
+                             "21=unlink";
+    EXPECT_EQ(got, want);
+}
+
+// (c) A STREAM ON A PATH: a stream type constructed with an argument (a variable, a temporary, a template's), or a
+// name the sources declare as a stream -- a header's member included -- opened. NEGATIVE: the home's stream taken
+// by value, the MEASURED `sv.open(rule)` and `documents_.open(uri, text)` (no stream), a stream made with no
+// argument, a string stream, prose and the home.
+TEST(FilesystemQueriesGuard, AStreamOnAPathIsOpenedOnlyByTheHome) {
+    std::vector<Source> const sources = {
+        sourceOf("src/c/log.hpp", "#pragma once\n#include <fstream>\nstruct Log { std::ofstream out_; };\n"),
+        sourceOf("src/c/streams.cpp",
+                 "#include \"log.hpp\"\n"
+                 "void a(P const& p) { std::ifstream in(p, std::ios::binary); }\n"                             // 2
+                 "void b(P const& p) { auto o = std::ofstream{p}; }\n"                                         // 3
+                 "void c(W const& w) { std::wifstream const x(w); }\n"                                         // 4
+                 "void d(P const& p) { std::fstream s; s.open(p); }\n"                                         // 5
+                 "void e(Log& l, P const& p) { l.out_.open(p, std::ios::app); }\n"                             // 6
+                 "void f(std::basic_ifstream<char>& r, P const& p) { r.open(p); }\n"                           // 7
+                 "void g(P const& p) { std::filebuf fb; fb.open(p, std::ios::in); }\n"                         // 8
+                 "void h(P const& p) { std::ifstream in = core::openInputStream(p, std::ios::binary); }\n"
+                 "void i(Builder& sv) { sv.open(rule); }\n"
+                 "void j(Store& documents_) { documents_.open(uri, text); }\n"
+                 "void k() { std::ifstream none; std::ofstream{}; std::ostringstream os(text); }\n"
+                 "// std::ifstream in(p); in a comment\n"
+                 "char const* m = \"std::ofstream o(p)\";\n"),
+        sourceOf("src/core/substrate/home.cpp",
+                 "std::ifstream openInputStream(P const& p) { return std::ifstream(p); }\n"),
+    };
+    std::string const got = spelledFamily(hostPathCallsAcross(sources), 'c', /*withFile=*/false);
+    std::string const want = " 2=std::ifstream on a path 3=std::ofstream on a path 4=std::wifstream on a path "
+                             "5=s.open 6=out_.open 7=r.open 8=fb.open";
+    EXPECT_EQ(got, want);
+}
+
+// (d) A HOST OPERATION OF std::filesystem the link family lets through: mentioned through any of its names (an alias
+// declared in a header included), or called unqualified with an argument where only argument-dependent lookup
+// tells it from the tree's own. NEGATIVE: the library's types and options that are no operation, the MEASURED local
+// `space(c)`, an algorithm's `copy`, a member, another scope's function, the home's own answer and the home.
+TEST(FilesystemQueriesGuard, AHostOperationIsAskedOfTheHome) {
+    std::vector<Source> const sources = {
+        sourceOf("src/d/ops.hpp", "#pragma once\nnamespace stdfs = std::filesystem;\nnamespace fs = stdfs;\n"),
+        sourceOf("src/d/ops.cpp",
+                 "#include \"ops.hpp\"\n"
+                 "void a(P const& p) { std::filesystem::create_directories(p); }\n"                         // 2
+                 "auto b(P const& p) { return stdfs::absolute(p); }\n"                                        // 3
+                 "void c(P const& p) { stdfs::remove(p); fs::rename(p, p); }\n"                               // 4
+                 "auto d() { return std::filesystem::current_path() / std::filesystem::temp_directory_path(); }\n"
+                 "void e(P const& p) { fs::copy_file(p, p); fs::copy(p, p); fs::resize_file(p, 0); }\n"       // 6
+                 "void f(P const& p) { for (auto const& x : fs::directory_iterator{p}) use(x); }\n"           // 7
+                 "void g(P const& p) { fs::directory_entry const e{p}; }\n"                                    // 8
+                 "auto h(P const& p) { return fs::space(p).available; }\n"                                     // 9
+                 "void i(P const& p) { create_directories(p); copy_file(p, p); }\n"                            // 10
+                 "using std::filesystem::create_symlink;\n"                                                    // 11
+                 "auto j = fs::copy_options::recursive; auto k = fs::file_status{}; fs::space_info l{};\n"
+                 "auto m(std::string const& x) { return fs::path{x} / fs::path{\"y\"}; }\n"
+                 "bool n(std::string const& s, std::size_t i) { return space(s[i]); }\n"
+                 "void o(V const& v, O out) { copy(v.begin(), v.end(), out); }\n"
+                 "void q(X& x) { x.create_directories(p); Paths::absolute(p); current_path(); }\n"
+                 "bool r(P const& p, std::error_code& ec) { return core::createDirectories(p, ec); }\n"),
+        sourceOf("src/core/substrate/home.cpp", "void s(P const& p) { std::filesystem::create_directories(p); }\n"),
+    };
+    std::string const got = spelledFamily(hostPathCallsAcross(sources), 'd', /*withFile=*/false);
+    std::string const want =
+        " 2=create_directories 3=absolute 4=remove 4=rename 5=current_path 5=temp_directory_path 6=copy_file 6=copy "
+        "6=resize_file 7=directory_iterator 8=directory_entry 9=space "
+        "10=create_directories (unqualified: argument-dependent lookup may reach std::filesystem) "
+        "10=copy_file (unqualified: argument-dependent lookup may reach std::filesystem) 11=create_symlink";
+    EXPECT_EQ(got, want);
+}
+
+// (f) THE HOME'S OWN: the access header (host_path_access.hpp), which hands out reference spellings, and the test
+// seam (`substrate_testing`), refused outside src/core/substrate/ -- in either include spelling, and in a directory
+// that only shares the substrate's prefix. NEGATIVE: the value's own header, prose, and the substrate itself.
+TEST(FilesystemQueriesGuard, TheAccessHeaderAndTheTestSeamStayInTheHome) {
+    std::vector<Source> const sources = {
+        sourceOf("src/f/user.cpp",
+                 "#include \"core/substrate/host_path_access.hpp\"\n"                                            // 1
+                 "#include <core/substrate/host_path_access.hpp>\n"                                              // 2
+                 "auto a(V const& v) { return dss::core::substrate_testing::referenceForTest(v, Use::Leaf); }\n"  // 3
+                 "#include \"core/substrate/host_path.hpp\"\n"
+                 "// #include \"core/substrate/host_path_access.hpp\" in a comment\n"
+                 "char const* s = \"substrate_testing\";\n"),
+        sourceOf("src/core/substrate/process_spawn.cpp",
+                 "#include \"core/substrate/host_path_access.hpp\"\nnamespace substrate_testing {}\n"),
+        sourceOf("src/core/substrate_like/x.cpp", "#include \"host_path_access.hpp\"\n"),                     // 1
+    };
+    std::string const got = spelledFamily(hostPathCallsAcross(sources), 'f', /*withFile=*/true);
+    std::string const want = " src/f/user.cpp line 1=#include core/substrate/host_path_access.hpp"
+                             " src/f/user.cpp line 2=#include core/substrate/host_path_access.hpp"
+                             " src/f/user.cpp line 3=substrate_testing"
+                             " src/core/substrate_like/x.cpp line 1=#include host_path_access.hpp";
+    EXPECT_EQ(got, want);
+}
+
+// THE FENCE ITSELF (ledger 580): a pinned set of uses passes; a use in a file the pin does not name, one more use
+// of a pinned form, and a pinned use that is gone each red -- and prose, the substrate's own definitions and the
+// home's other names count for nothing.
+TEST(FilesystemQueriesGuard, TheFenceRefusesEveryStoreRouteUseItDoesNotPin) {
+    StoreRoutePin const pin = {
+        {"src/store/a.cpp", {{"storeRouteNormalized", 1}, {"storeRoutePath", 1}}},
+        {"src/store/b.cpp", {{"storeRouteWhere", 1}}},
+    };
+    std::string const a = "auto x = core::storeRouteNormalized(p); auto y = e.storeRoutePath; // storeRoutePath\n";
+    std::string const b = "auto z = w.storeRouteWhere; char const* s = \"storeRouteWhere\"; auto r = core::route(p);\n";
+    std::string const home = "fs::path storeRoutePath; fs::path storeRouteNormalized(fs::path const& p);\n";
+    auto const breaches = [&](std::vector<Source> const& sources) {
+        std::string got;
+        for (auto const& line : fenceBreaches(storeRouteUsesIn(sources), pin)) got += "[" + line + "]";
+        return got;
+    };
+    EXPECT_EQ(breaches({sourceOf("src/store/a.cpp", a), sourceOf("src/store/b.cpp", b),
+                        sourceOf("src/core/substrate/path_identity.cpp", home)}),
+              "")
+        << "the pinned uses, and only they, must pass";
+    EXPECT_EQ(breaches({sourceOf("src/store/a.cpp", a), sourceOf("src/store/b.cpp", b),
+                        sourceOf("src/other/c.cpp", "auto q = e.storeRoutePath;\n")}),
+              "[src/other/c.cpp: storeRoutePath taken 1 time(s), pinned 0]")
+        << "a use in a file the pin does not name";
+    EXPECT_EQ(breaches({sourceOf("src/store/a.cpp", a + "auto again = core::storeRouteNormalized(q);\n"),
+                        sourceOf("src/store/b.cpp", b)}),
+              "[src/store/a.cpp: storeRouteNormalized taken 2 time(s), pinned 1]")
+        << "one more use of a pinned form";
+    EXPECT_EQ(breaches({sourceOf("src/store/a.cpp", a), sourceOf("src/store/b.cpp", "auto z = 1;\n")}),
+              "[src/store/b.cpp: storeRouteWhere taken 0 time(s), pinned 1]")
+        << "a pinned use that is gone: the pin is the census, and H6d lowers it with every store it types";
 }

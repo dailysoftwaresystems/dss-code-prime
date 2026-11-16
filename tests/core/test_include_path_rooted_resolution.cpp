@@ -34,8 +34,11 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <cstring>
 #include <fstream>
+#include <span>
 #include <string>
+#include <string_view>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -328,6 +331,114 @@ TEST_P(RootedIncludeResolution, ANamespaceSpelledHeaderResolvesFromItsVolumeRoot
                 << (verbatim ? "below \\\\?\\ a `..` is a name no listing holds" : "below \\\\.\\ a `..` is a step");
         }
     }
+#endif
+}
+
+// ── [B1] A TYPED #include NAME OPENS WHAT cl AND gcc OPEN (P69 H6c) ───────
+//
+// A quote include below the including file's directory, and `<config.h.>` below an `-I` given plain and given
+// VERBATIM: each case's LITERAL object (`config.h.`, a directory `sub.`, `x.h `, a directory `sub `) and its TRIMMED
+// twin (`config.h`, `sub`, `x.h`) present or absent, made so their bytes stand (through `\\?\` on Windows) -- and
+// what the search finds is the object whose MARK the found file holds, read as the preprocessor reads a header, or
+// none. The expected answers are cl's and gcc's MEASURED ones (`include_name_cells.inc`, generated from the u4 logs;
+// clang and clang-cl UNMEASURED, absent on both Windows legs): below a DOS-text directory a typed name takes the OS's
+// plain rule by position (`core::typedNameBelow`). Below a verbatim `-I` both references open NOTHING in every state;
+// DSS takes the whole verbatim spelling's, the name as typed (DECIDED: the table's `dss` column). POSIX resolves no
+// name by its position, so there each name is its bytes and the literal is found where it stands (the home's POSIX
+// rule; no reference was measured on POSIX for this table), and there is no verbatim form.
+namespace {
+struct IncludeNameCell {
+    char const* form;    // "quote", "-I plain", "-I verbatim"
+    char const* typed;   // the name between the delimiters
+    char const* lit;     // the literal object
+    char const* twin;    // its trimmed twin
+    bool        dir;     // the objects are directories, `x.h` below each
+    bool        hasLit;
+    bool        hasTwin;
+    char const* cl;      // what cl 19.52 opened: "LIT", "TWIN" or "none"
+    char const* gcc;     // what MinGW gcc 13.2 opened
+    char const* dss;     // what DSS opens
+};
+constexpr IncludeNameCell kIncludeNameCells[] = {
+#include "include_name_cells.inc"
+};
+
+// The named object below `holder`, made so that its bytes stand as written (through `\\?\` on Windows).
+[[nodiscard]] bool placeLiterally(fs::path const& holder, char const* name, bool dir, char const* mark) {
+    std::size_t const markSize = std::strlen(mark);
+#if defined(_WIN32)
+    std::wstring const at   = L"\\\\?\\" + holder.native() + L"\\" + std::wstring(name, name + std::strlen(name));
+    std::wstring const file = dir ? at + L"\\x.h" : at;
+    if (dir && !::CreateDirectoryW(at.c_str(), nullptr)) return false;
+    HANDLE const h = ::CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD      wrote = 0;
+    BOOL const ok    = ::WriteFile(h, mark, static_cast<DWORD>(markSize), &wrote, nullptr);
+    ::CloseHandle(h);
+    return ok && wrote == markSize;
+#else
+    fs::path const  at = holder / name;
+    std::error_code ec;
+    if (dir && !fs::create_directory(at, ec)) return false;
+    std::ofstream out{dir ? at / "x.h" : at, std::ios::binary};
+    out.write(mark, static_cast<std::streamsize>(markSize));
+    return static_cast<bool>(out);
+#endif
+}
+
+// Which object a found header is: the MARK it holds, read through the home, as the preprocessor reads a header.
+[[nodiscard]] std::string markOf(fs::path const& found) {
+    std::ifstream in = dss::core::openInputStream(dss::core::HostPath{found}, std::ios::binary);
+    std::string   line;
+    std::getline(in, line);
+    return line == "LIT_MARK" ? "LIT" : line == "TWIN_MARK" ? "TWIN" : "(unreadable: `" + line + "`)";
+}
+}  // namespace
+
+TEST_P(RootedIncludeResolution, ATypedIncludeNameOpensWhatTheReferencesOpen) {
+    dss::test_support::ScratchDir sd{kFixtureRoot, "typed-include-name"};
+    fs::path const scratch = sd.path();
+    ASSERT_TRUE(scratch.is_absolute()) << scratch.string();
+    std::size_t made  = 0;
+    std::size_t asked = 0;
+    for (IncludeNameCell const& c : kIncludeNameCells) {
+        std::string_view const form{c.form};
+        SCOPED_TRACE(std::string{c.form} + " `" + c.typed + "`, literal " + (c.hasLit ? "present" : "absent")
+                     + ", twin " + (c.hasTwin ? "present" : "absent"));
+#if !defined(_WIN32)
+        if (form == "-I verbatim") continue;   // no verbatim spelling on POSIX
+        std::string const expected = c.hasLit ? "LIT" : "none";
+#else
+        std::string const expected = c.dss;
+#endif
+        fs::path const cell = scratch / ("c" + std::to_string(++made));
+        ASSERT_TRUE(fs::create_directory(cell));
+        fs::path const holder = form == "quote" ? cell : cell / "inc";
+        if (form != "quote") ASSERT_TRUE(fs::create_directory(holder));
+        if (c.hasLit) ASSERT_TRUE(placeLiterally(holder, c.lit, c.dir, "LIT_MARK\n"));
+        if (c.hasTwin) ASSERT_TRUE(placeLiterally(holder, c.twin, c.dir, "TWIN_MARK\n"));
+        dss::HeaderSearchCache compile;
+        auto const             r = [&] {
+            if (form == "quote") return resolveIncludePath(c.typed, cell, {}, GetParam(), compile);
+#if defined(_WIN32)
+            fs::path const dir = form == "-I verbatim" ? fs::path{L"\\\\?\\" + holder.native()} : holder;
+#else
+            fs::path const dir = holder;
+#endif
+            return resolveIncludePath(c.typed, {}, std::span<fs::path const>{&dir, 1}, GetParam(), compile);
+        }();
+        ASSERT_TRUE(r.status == HeaderSearchStatus::Found || r.status == HeaderSearchStatus::NotFound)
+            << "the search ended neither found nor absent (status " << static_cast<int>(r.status) << ")";
+        std::string const opened = r.status == HeaderSearchStatus::Found ? markOf(r.path) : "none";
+        EXPECT_EQ(opened, expected) << "cl opened " << c.cl << ", gcc " << c.gcc
+                                    << (r.status == HeaderSearchStatus::Found ? "; DSS found `" + r.path.string() + "`"
+                                                                              : std::string{});
+        ++asked;
+    }
+#if defined(_WIN32)
+    EXPECT_EQ(asked, 22u) << "the table is 22 measured cells";
+#else
+    EXPECT_EQ(asked, 19u) << "the table's 22 cells less its 3 verbatim ones";
 #endif
 }
 

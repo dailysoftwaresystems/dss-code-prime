@@ -1,1 +1,1 @@
-    return normalizeKeepingRoot(absoluteKeepingRoot(p, ec));
+    fs::path const resolved = fs::absolute(fs::path{w}, ec).lexically_normal();

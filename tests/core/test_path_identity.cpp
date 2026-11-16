@@ -88,17 +88,17 @@ TEST(PathIdentitySubstrate, TwoSpellingsOfOneDirectoryShareOneIdentity) {
         << "the staged spelling is byte-identical to the long one, so this "
            "test would be comparing a path with itself";
 
-    EXPECT_EQ(PathIdentity::of(shortForm), PathIdentity::of(probe))
+    EXPECT_EQ(PathIdentity::of(shortForm, dss::core::Use::Container), PathIdentity::of(probe, dss::core::Use::Container))
         << "two spellings of ONE directory produced TWO identities — this is "
            "the defect the type exists to make impossible.\n  short: "
-        << PathIdentity::of(shortForm).string()
-        << "\n  long : " << PathIdentity::of(probe).string();
+        << PathIdentity::of(shortForm, dss::core::Use::Container).string()
+        << "\n  long : " << PathIdentity::of(probe, dss::core::Use::Container).string();
 
     // And the containers built on it agree, which is the form every converted
     // site actually uses.
     std::unordered_set<PathIdentity> seen;
-    EXPECT_TRUE(seen.insert(PathIdentity::of(probe)).second);
-    EXPECT_FALSE(seen.insert(PathIdentity::of(shortForm)).second)
+    EXPECT_TRUE(seen.insert(PathIdentity::of(probe, dss::core::Use::Container)).second);
+    EXPECT_FALSE(seen.insert(PathIdentity::of(shortForm, dss::core::Use::Container)).second)
         << "the set admitted a second entry for one directory";
 }
 
@@ -134,12 +134,12 @@ TEST(PathIdentitySubstrate, ShortPrefixIsExpandedEvenWhenTheTailDoesNotExist) {
     fs::path const shortTail = shortForm / "not" / "yet" / "built.o";
     ASSERT_FALSE(fs::exists(shortTail));
 
-    EXPECT_EQ(PathIdentity::of(shortTail), PathIdentity::of(longTail))
+    EXPECT_EQ(PathIdentity::of(shortTail, dss::core::Use::Leaf), PathIdentity::of(longTail, dss::core::Use::Leaf))
         << "an output path under a short-spelled directory kept its short "
            "spelling, so every not-yet-created artifact keys differently from "
            "the same artifact named the long way.\n  short-tail: "
-        << PathIdentity::of(shortTail).string()
-        << "\n  long-tail : " << PathIdentity::of(longTail).string();
+        << PathIdentity::of(shortTail, dss::core::Use::Leaf).string()
+        << "\n  long-tail : " << PathIdentity::of(longTail, dss::core::Use::Leaf).string();
 }
 
 // ── Degradation, not exceptions ────────────────────────────────────────────
@@ -147,13 +147,13 @@ TEST(PathIdentitySubstrate, AbsentPathStillYieldsAUsableIdentity) {
     fs::path const ghost = fs::temp_directory_path()
                          / "dss-no-such-dir-ever" / "x" / "y.o";
     ASSERT_FALSE(fs::exists(ghost));
-    auto const id = PathIdentity::of(ghost);
+    auto const id = PathIdentity::of(ghost, dss::core::Use::Leaf);
     EXPECT_FALSE(id.string().empty())
         << "identity must be computable BEFORE a path exists — output "
            "artifacts, `path` dependencies resolved before the directory is "
            "confirmed, and the cycle key needed for a reject's own message are "
            "all keyed while absent";
-    EXPECT_EQ(id, PathIdentity::of(ghost)) << "identity is not deterministic";
+    EXPECT_EQ(id, PathIdentity::of(ghost, dss::core::Use::Leaf)) << "identity is not deterministic";
 }
 
 TEST(PathIdentitySubstrate, DotAndDotDotAreResolved) {
@@ -164,17 +164,17 @@ TEST(PathIdentitySubstrate, DotAndDotDotAreResolved) {
     fs::create_directories(dir, ec);
     ASSERT_FALSE(ec);
 
-    EXPECT_EQ(PathIdentity::of(dir),
-              PathIdentity::of(sd.path() / "." / "sub"));
-    EXPECT_EQ(PathIdentity::of(dir),
-              PathIdentity::of(dir / ".." / "sub"));
+    EXPECT_EQ(PathIdentity::of(dir, dss::core::Use::Container),
+              PathIdentity::of(sd.path() / "." / "sub", dss::core::Use::Container));
+    EXPECT_EQ(PathIdentity::of(dir, dss::core::Use::Container),
+              PathIdentity::of(dir / ".." / "sub", dss::core::Use::Container));
 }
 
 TEST(PathIdentitySubstrate, DifferentFilesKeepDifferentIdentities) {
     dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
                                      "path-identity"};
-    EXPECT_NE(PathIdentity::of(sd.path() / "a.c"),
-              PathIdentity::of(sd.path() / "b.c"))
+    EXPECT_NE(PathIdentity::of(sd.path() / "a.c", dss::core::Use::Leaf),
+              PathIdentity::of(sd.path() / "b.c", dss::core::Use::Leaf))
         << "collapsing distinct files into one identity would silently DROP a "
            "translation unit — the opposite failure, and the worse one";
 }
@@ -188,7 +188,7 @@ TEST(PathIdentitySubstrate, DifferentFilesKeepDifferentIdentities) {
 TEST(PathIdentitySubstrate, AbsenceIsNotAnError) {
     fs::path const  ghost = fs::temp_directory_path() / "dss-absent" / "z.c";
     std::error_code ec;
-    auto const      id = PathIdentity::of(ghost, ec);
+    auto const      id = PathIdentity::of(ghost, dss::core::Use::Leaf, ec);
     EXPECT_FALSE(ec) << "a path that merely does not exist was reported as a "
                         "filesystem failure (" << ec.message()
                      << "), which would fail builds on every generated source";
@@ -223,7 +223,7 @@ TEST(PathIdentitySubstrate, AReachablePathIsNeverReportedAsAFilesystemFailure) {
     ASSERT_TRUE(fs::exists(unc)) << unc.string();
 
     std::error_code ec;
-    auto const      id = PathIdentity::of(unc, ec);
+    auto const      id = PathIdentity::of(unc, dss::core::Use::Leaf, ec);
     EXPECT_FALSE(ec) << "a path the OS opens was reported as a filesystem "
                         "refusal (" << ec.message()
                      << "), which fails the build for a source that is right "
@@ -249,10 +249,10 @@ TEST(PathIdentitySubstrate, AReachablePathIsNeverReportedAsAFilesystemFailure) {
 TEST(PathIdentitySubstrate, AMultiSeparatorRootIsNotCollapsedOntoTheLocalDrive) {
     fs::path const authority{"//dss-no-such-server/share/hdr.h"};
     fs::path const localSameName{"/dss-no-such-server/share/hdr.h"};
-    EXPECT_NE(PathIdentity::of(authority), PathIdentity::of(localSameName))
+    EXPECT_NE(PathIdentity::of(authority, dss::core::Use::Leaf), PathIdentity::of(localSameName, dss::core::Use::Leaf))
         << "a path naming another machine and a path naming the local drive "
            "root collapsed onto ONE identity ("
-        << PathIdentity::of(authority).string()
+        << PathIdentity::of(authority, dss::core::Use::Leaf).string()
         << ") — that is a wrong-content hazard, not a duplicate-work one";
 
     // ★ THE EXACT COLLISION AS MEASURED, and it needs no drive letter written
@@ -264,10 +264,10 @@ TEST(PathIdentitySubstrate, AMultiSeparatorRootIsNotCollapsedOntoTheLocalDrive) 
     //     'C:/no-such-server/share/x.h'   -> 'C:/no-such-server/share/x.h/'
     fs::path const driveQualified =
         fs::current_path().root_name() / localSameName;
-    EXPECT_NE(PathIdentity::of(authority), PathIdentity::of(driveQualified))
+    EXPECT_NE(PathIdentity::of(authority, dss::core::Use::Leaf), PathIdentity::of(driveQualified, dss::core::Use::Leaf))
         << "a path naming another machine keyed identically to a LOCAL file of "
            "the same name ("
-        << PathIdentity::of(authority).string()
+        << PathIdentity::of(authority, dss::core::Use::Leaf).string()
         << "), so every map this type keys would serve one file's contents for "
            "the other";
 }
@@ -278,10 +278,10 @@ TEST(PathIdentitySubstrate, AMultiSeparatorRootIsNotCollapsedOntoTheLocalDrive) 
 TEST(PathIdentitySubstrate, BothSpellingsOfOneRootShareOneIdentity) {
     fs::path const forward{"//dss-no-such-server/share/hdr.h"};
     fs::path const preferred = fs::path{forward}.make_preferred();
-    EXPECT_EQ(PathIdentity::of(forward), PathIdentity::of(preferred))
+    EXPECT_EQ(PathIdentity::of(forward, dss::core::Use::Leaf), PathIdentity::of(preferred, dss::core::Use::Leaf))
         << "one location spelled two ways produced two identities: '"
-        << PathIdentity::of(forward).string() << "' vs '"
-        << PathIdentity::of(preferred).string() << "'";
+        << PathIdentity::of(forward, dss::core::Use::Leaf).string() << "' vs '"
+        << PathIdentity::of(preferred, dss::core::Use::Leaf).string() << "'";
 }
 
 // ── An identity must not change when the file comes into being ────────────
@@ -299,13 +299,13 @@ TEST(PathIdentitySubstrate, CreatingTheFileDoesNotChangeItsIdentity) {
                                      "path-identity"};
     fs::path const artifact = sd.path() / "notyet.o";
     ASSERT_FALSE(fs::exists(artifact));
-    auto const before = PathIdentity::of(artifact);
+    auto const before = PathIdentity::of(artifact, dss::core::Use::Leaf);
     { std::ofstream f{artifact}; f << "x"; }
     ASSERT_TRUE(fs::exists(artifact));
-    EXPECT_EQ(before, PathIdentity::of(artifact))
+    EXPECT_EQ(before, PathIdentity::of(artifact, dss::core::Use::Leaf))
         << "the identity of one path changed when the file was created ('"
         << before.string() << "' -> '"
-        << PathIdentity::of(artifact).string()
+        << PathIdentity::of(artifact, dss::core::Use::Leaf).string()
         << "'), so anything keyed before the write and read after it holds TWO "
            "entries for one file";
 }
@@ -318,7 +318,7 @@ TEST(PathIdentitySubstrate, CreatingTheFileDoesNotChangeItsIdentity) {
 TEST(PathIdentitySubstrate, IdentityUsesOneSeparatorConvention) {
     dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
                                      "path-identity"};
-    auto const id = PathIdentity::of(sd.path() / "sub" / "leaf.c");
+    auto const id = PathIdentity::of(sd.path() / "sub" / "leaf.c", dss::core::Use::Leaf);
     EXPECT_EQ(id.string().find('\\'), std::string::npos)
         << "identity keys must use one separator convention: " << id.string();
 }
@@ -353,15 +353,16 @@ TEST(PathIdentitySubstrate, AbsoluteDoesNotRerootAMultiSeparatorPath) {
     ASSERT_GE(dss::test_support::leadingSeparatorRun(unc), 2u);
 
     std::error_code ec;
-    fs::path const got = dss::core::absoluteKeepingRoot(unc, ec);
+    // A VALUE (H6c): the directory, a CONTAINER; its text asked lexically (its rendering), its object of the home.
+    dss::core::HostPath const got = dss::core::absoluteKeepingRoot(unc, dss::core::Use::Container, ec);
     EXPECT_FALSE(ec) << "preserving a rooted path cannot fail: " << ec.message();
-    EXPECT_GE(dss::test_support::leadingSeparatorRun(got), 2u)
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(fs::path{got.spelling().display()}), 2u)
         << "the leading separator run was collapsed, so this no longer names "
-           "the machine that was asked for: " << got.string();
+           "the machine that was asked for: " << got.spelling().display();
     std::error_code existsEc;
-    EXPECT_TRUE(fs::exists(got, existsEc))
+    EXPECT_EQ(dss::core::reachedKind(got, dss::core::Use::Container, existsEc), dss::core::EntryKind::Directory)
         << "the result must still name a directory that is there: "
-        << got.string();
+        << got.spelling().display();
 }
 
 // ── [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]] ─────
@@ -427,21 +428,22 @@ TEST(PathIdentitySubstrate, GenericSpellingU8LeavesAnOrdinaryPathAlone) {
 // predicate. A relative path must also still resolve against the cwd.
 TEST(PathIdentitySubstrate, AbsoluteStillResolvesSingleSeparatorAndRelative) {
     std::error_code ec;
-    fs::path const rel = dss::core::absoluteKeepingRoot(fs::path{"some_relative_leaf"}, ec);
+    // A VALUE (H6c): a FILE's spelling (Leaf); its text asked lexically, by its rendering.
+    dss::core::HostPath const rel = dss::core::absoluteKeepingRoot(fs::path{"some_relative_leaf"}, dss::core::Use::Leaf, ec);
     EXPECT_FALSE(ec) << ec.message();
-    EXPECT_TRUE(rel.is_absolute())
+    EXPECT_TRUE(fs::path{rel.spelling().display()}.is_absolute())
         << "a relative path stopped being resolved against the cwd: "
-        << rel.string();
+        << rel.spelling().display();
 
     ec.clear();
-    fs::path const rooted = dss::core::absoluteKeepingRoot(fs::path{"/single_sep_leaf"}, ec);
+    dss::core::HostPath const rooted = dss::core::absoluteKeepingRoot(fs::path{"/single_sep_leaf"}, dss::core::Use::Leaf, ec);
     EXPECT_FALSE(ec) << ec.message();
     // On Windows this acquires the current drive; on POSIX it is already
     // absolute and comes back unchanged. Both are `is_absolute()`, and asking
     // only that keeps the arm free of a platform branch.
-    EXPECT_TRUE(rooted.is_absolute())
+    EXPECT_TRUE(fs::path{rooted.spelling().display()}.is_absolute())
         << "a single-separator root must still be made absolute — skipping it "
-           "would leave the drive undecided: " << rooted.string();
+           "would leave the drive undecided: " << rooted.spelling().display();
 }
 
 // ── THE ROOT'S ONE PARSE AND THE ONE NORMALIZATION, AS TEXT, IN BOTH GRAMMARS, ON EVERY LEG (P69 H6) ────────────────
@@ -636,8 +638,8 @@ TEST(PathIdentitySubstrate, ADosSpellingIsUsedOnlyWhereItNamesTheSameFile) {
 TEST(PathIdentitySubstrate, TheLexicalKeyOfANameWin32TrimsIsTheTrimmedNamesKey) {
     fs::path const dir = fs::temp_directory_path() / "dss-no-such-dir-ever-h6";
     ASSERT_FALSE(fs::exists(dir));
-    auto const trimmed  = PathIdentity::of(dir / "x.c");
-    auto const trailing = PathIdentity::of(fs::path{(dir / "x.c").native() + fs::path::string_type(1, '.')});
+    auto const trimmed  = PathIdentity::of(dir / "x.c", dss::core::Use::Leaf);
+    auto const trailing = PathIdentity::of(fs::path{(dir / "x.c").native() + fs::path::string_type(1, '.')}, dss::core::Use::Leaf);
     if constexpr (dss::core::kHostPathGrammar == dss::core::PathGrammar::Win32) {
         EXPECT_EQ(trailing, trimmed) << trailing.string() << " vs " << trimmed.string();
     } else {
@@ -651,7 +653,11 @@ TEST(PathIdentitySubstrate, TheLexicalKeyOfANameWin32TrimsIsTheTrimmedNamesKey) 
 // verbatim spelling and an empty one. POSIX: every spelling as given. A reserved name other than `NUL` is no row: which
 // of them the OS maps is the release's (path_identity.cpp asks the OS), and the rule follows the OS either way.
 TEST(PathIdentitySubstrate, EverySpellingTakesTheExtendedLengthSpellingThatOpensWhatItMeans) {
-    using dss::core::extendedLengthSpelling;
+    // The rule's answer for a LEAF -- what `extendedLengthSpelling` was -- read through the substrate's test seam
+    // (H6c: no exported operation hands a reference out).
+    auto const extendedLengthSpelling = [](fs::path const& p) {
+        return fs::path{dss::core::substrate_testing::referenceForTest(p, dss::core::Use::Leaf)};
+    };
 #ifdef _WIN32
     {
         struct Row { std::wstring_view spelling; std::wstring_view extended; };

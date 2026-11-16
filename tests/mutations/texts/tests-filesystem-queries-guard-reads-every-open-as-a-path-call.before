@@ -1,0 +1,1 @@
+        bool const keyedApart = name == "open" || name == "creat";

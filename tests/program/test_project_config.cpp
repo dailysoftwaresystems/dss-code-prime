@@ -4960,11 +4960,13 @@ TEST(CompileProjectOutputField, ManifestOutputRedirectsTheBaseDir) {
     // operator-facing line. Resolve the same way here rather than assuming the
     // driver did it, so the comparison is between two resolved spellings.
     std::error_code absEc;
-    auto const reported =
+    // VALUES (H6c): the artifact a FILE (Leaf), compared by their renderings.
+    std::string const reported =
         dss::core::normalizeKeepingRoot(
-            dss::core::absoluteKeepingRoot(*paths[0], absEc));
+            dss::core::absoluteKeepingRoot(*paths[0], dss::core::Use::Leaf, absEc), dss::core::Use::Leaf)
+            .spelling().display();
     EXPECT_FALSE(absEc) << "the reported artifact path must resolve";
-    EXPECT_EQ(reported, dss::core::normalizeKeepingRoot(declared))
+    EXPECT_EQ(reported, dss::core::normalizeKeepingRoot(declared, dss::core::Use::Leaf).spelling().display())
         << "and the driver's own report of what it wrote must name that path";
 }
 

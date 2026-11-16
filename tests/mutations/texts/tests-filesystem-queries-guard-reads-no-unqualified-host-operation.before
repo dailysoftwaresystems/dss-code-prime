@@ -1,0 +1,1 @@
+        else if (kHostOperationsByLookup.count(name) != 0 && ctx.how == Written::Bare && call && !isBlank(*args))

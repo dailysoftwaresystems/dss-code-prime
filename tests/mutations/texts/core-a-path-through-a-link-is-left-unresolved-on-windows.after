@@ -1,1 +1,1 @@
-            return whole;
+            return HostPathAccess::answered(w);

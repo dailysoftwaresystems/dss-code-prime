@@ -163,8 +163,9 @@ analysis/compilation_unit/compilation_unit.hpp
 analysis/compilation_unit/import_resolver.hpp
 analysis/preprocess/preprocessor.hpp
 analysis/semantic/semantic_analyzer.cpp
-core/substrate/checked_file_read.cpp
 core/substrate/checked_file_read.hpp
+core/substrate/host_path.hpp
+core/substrate/host_path_access.hpp
 core/substrate/path_identity.hpp
 core/substrate/process_spawn.hpp
 core/types/config_path_walk.hpp

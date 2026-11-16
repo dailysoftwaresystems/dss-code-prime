@@ -1,0 +1,1 @@
+    HostPath const c = reachedPath(p, Use::Leaf, canonEc);

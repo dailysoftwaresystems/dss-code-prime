@@ -11,14 +11,14 @@
 > The decisions in §4 are the orchestrator's, under the operator's order of 2026-09-21 (*"you do everything"*),
 > and each one is veto-able.
 
-## 0. Where we are (MEASURED 2026-11-14, checkpoint 44 = fold 3e on `e8beaddc`)
+## 0. Where we are (MEASURED 2026-11-14, checkpoint 45 = fold H6c on `9e98013f`)
 
-**689 open rows.**
+**690 open rows.**
 
 | band | OPEN | DISCLOSED | GATED | total |
 |---|---|---|---|---|
 | P0 | 2 | 25 | — | 27 |
-| P1 | 45 | 52 | 1 | 98 |
+| P1 | 45 | 53 | 1 | 99 |
 | P2 | 140 | 57 | 21 | 218 |
 | P3 | 221 | 7 | 103 | 331 |
 | P4 | 8 | — | 3 | 11 |
@@ -28,7 +28,7 @@
 
 | PR | rows | what |
 |---|---|---|
-| **PR #59** (current) | 105 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 40 of the 105 carry FIX FOLDED in their trigger or closing (a match at checkpoint 44, `scope/count_pr59_fix_folded.py`) and close when their arms pass and their review findings are answered; the round-close sweep's group holds two more fixed rows |
+| **PR #59** (current) | 106 | the four lanes' rows, every remaining P0, the rows ruled into folds 3d/3e, L2b, H5/H6/H7 and f26c/f26d; 40 of the 106 carry FIX FOLDED in their trigger or closing (a match at checkpoint 45, `scope/count_pr59_fix_folded.py`) and close when their arms pass and their review findings are answered; the round-close sweep's group holds two more fixed rows |
 | **the next PR** | 467 | every remaining actionable row, in three rounds; plus full debug information (§3) |
 | **the capability PR** | 21 | plan 28's boot half, plan 09.5's tier skeleton with its C harmlessness proof, plan 16's codesign |
 | **the wasm32 PR** | 1 | plan 18, the first ILP32 target |
@@ -40,7 +40,7 @@
   - weeks 33–36: 161, 147, 197, 127;
   - weeks 37–41: 40, 44, 163, 54, 32;
   - week 43 so far: 13.
-- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 97 opened (4 created, 93 disclosed): counted −24, REAL net +69** (2026-11-14, at checkpoint 44; the created one more than checkpoint 43 is the REOPENED D-C-A-BLOCK-SCOPE-FUNCTION-DECLARATION-HIDES-NOTHING-IN-ITS-BLOCK, one of its nine arms violated). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
+- Since the cycle base `71648598` (2026-09-30), `check-anchor-balance` counts **28 closed and 98 opened (4 created, 94 disclosed): counted −24, REAL net +70** (2026-11-14, at checkpoint 45; H6c's one disclosed row, D-CORE-A-STORED-HOST-PATH-IS-RE-READ-FROM-ITS-TEXT, is HEAD's debt, H6d's). The registry grew, mostly by disclosed rows: debt this round found, not debt it created. Rows born closed are not counted.
 - (read 2026-10-22) **24 open rows (8 of them P0) are already FIXED** and wait only for their mutation arms to read `passed` on main.
 
 ## 1. PR #59 — the exit scope
@@ -56,14 +56,14 @@ The merge is the operator's.
 
 ### 1.1 Folds, in order
 
-`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c` ✔ (checkpoint 40: its code; its rows stay open on the review's send-back) `→ H6` ✔ (checkpoint 41: its code; the review sent it back) `→ H6b` ✔ (checkpoint 42: the walk-up class's home audit and the several-unit verb) `→ f26c2` ✔ (checkpoint 43: the answer to f26c's review, the convention's argument alignment, the padding as a class) `→ 3e` ✔ (checkpoint 44: ONE entry election over every input kind and grammar, one address class per writer, every unit before the step fails, a foreign object's libc reference, an input section read by the format's data) `→ L2b2 → f26d → 3f → 3g → 3h → L2b4 → L2b3 → H6c → H6d → H7` (L2b4, L2b3 and H6c wherever ready, before H7; H6c after 3e; H6d after 3e, L2b2 and H6c), then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
+`L2a` ✔ (checkpoint 33) `→ H4b` ✔ (checkpoint 34, folded ahead of f26b: it was ready and depends on nothing of `cs`'s) `→ f26b` ✔ (checkpoint 35) `→ L2a2` ✔ (checkpoint 36) `→ L2b1` ✔ (checkpoint 37, folded ahead of H5, 3d and f26c: it was ready and depends on none of them) `→ H5` ✔ (checkpoint 38) `→ 3d` ✔ (checkpoint 39) `→ f26c` ✔ (checkpoint 40: its code; its rows stay open on the review's send-back) `→ H6` ✔ (checkpoint 41: its code; the review sent it back) `→ H6b` ✔ (checkpoint 42: the walk-up class's home audit and the several-unit verb) `→ f26c2` ✔ (checkpoint 43: the answer to f26c's review, the convention's argument alignment, the padding as a class) `→ 3e` ✔ (checkpoint 44: ONE entry election over every input kind and grammar, one address class per writer, every unit before the step fails, a foreign object's libc reference, an input section read by the format's data) `→ H6c` ✔ (checkpoint 45, folded ahead of L2b2 and f26d: it was ready, and the every-unit home needed it before 3f: every non-store host-path operation takes its reading from one typed value, the store routes fenced) `→ L2b2 → f26d → f26e → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7` (f26e: a calling convention named by an attribute is EMITTED, its own fold by ledger 607) (L2b4, L2b3 and H6c wherever ready, before H7; H6c after 3e; H6d after 3e, L2b2 and H6c), then the added work of §1.2 on the lanes that free first. L2a2 is lane `lm`'s answer to the review of L2a (its typedef finding goes to `cs`'s f26c, with the name-before-declaration P0).
 
 | lane | rows (§8 A.1) | what it is |
 |---|---|---|
 | `lm` | 37 | constant evaluation, VLA `sizeof`, statement expressions, try/filter MIR, HIR brace placement, the try/except and `#if` truth P0s; L2a2 and L2b1 folded (checkpoints 36, 37); L2b2: every asker on the binder sketch's homes, the type-name reader with the finish() oracle retired, the variadic surface's names exactly where the references' headers make them visible, the va_list record recognized by identity, a type name in a value position refused, and L2b's own rows |
 | `cs` | 26 | f26c FOLDED (checkpoint 40: the stacked-argument realignment, the SysV memory class, the order-aware lookup, the implicit declaration, `mode`, the conditional's composite); f26c2 FOLDED (checkpoint 43: the answer to its review — COMPLEX_X87, every arm's red set, the alignment an arm64 convention reads of an argument, the AAPCS64 even pair and its padding closed as a class, a call without a prototype, the linkage tables of every declaration row), its rows open until their arms pass; f26d: the wide `_BitInt`'s alignment as a target fact FIRST (ledger 587), then the shipped `<windows.h>` constants and declarations P0, then the P1–P3 rows |
 | `xa` | 32 | object readers and writers, COMDAT selections, unwind and handlers, initializer tables, relocatable `__eh_frame`, TLS; 3d FOLDED (checkpoint 39); 3e FOLDED (checkpoint 44: ONE entry election over every route and grammar, X9's one address class per writer, the several-unit class closed with H6b, a foreign object's libc reference in part, the Mach-O section-relative relocation and its addend record), its rows open until their arms pass; 3f on: the GUI startups, the PE alias key and the MinGW runtime body, the `__stack_chk_guard` cells, the chained unwind, the home audits, the relocatable objects' unwind tables, shared-library initializers, the non-alloc carry, each fold at a measured boundary |
-| `hm` | 8 | the PE platform runtime, FOLDED (H5, checkpoint 38); H6 FOLDED (checkpoint 41: every Win32 file and process call at any length, one Win32 root parse, the import bound, the file URI); H6b FOLDED (checkpoint 42: the walk-up class's HOME AUDIT, every Win32 call on a path taking its reference spelling once by use, one path-spelling home, the several-unit verb `runEveryUnit`, the profile report's block), its rows open until its arms pass; H7: the file URI carries `\?\` and `\.\` as the client's codec does (ledger 562), then the compiler-support routines reference objects call, format-wide if the ELF and Mach-O census says so |
+| `hm` | 9 | the PE platform runtime, FOLDED (H5, checkpoint 38); H6 FOLDED (checkpoint 41: every Win32 file and process call at any length, one Win32 root parse, the import bound, the file URI); H6b FOLDED (checkpoint 42: the walk-up class's HOME AUDIT, every Win32 call on a path taking its reference spelling once by use, one path-spelling home, the several-unit verb `runEveryUnit`, the profile report's block); H6c FOLDED (checkpoint 45: every non-store operation on a host path takes its reading from the typed value `HostPath`, its reference taken once by its use, the guard refusing every other route, the store routes FENCED; a silent unit of a several-unit step named), its rows open until its arms pass; H6d: every store route re-derived BY DATA and moved onto the typed value (D-CORE-A-STORED-HOST-PATH-IS-RE-READ-FROM-ITS-TEXT); H7: the file URI carries `\?\` and `\.\` as the client's codec does (ledger 562), then the compiler-support routines reference objects call |
 | first lane to free | 2 | the shipped-constants P0, and the SysV memory-class ABI P0 |
 | round-close sweep | 2 | fixed rows whose arms have not been read |
 
@@ -210,7 +210,7 @@ Each fold is a pushed checkpoint. Each round ends with the 8-run gate, the arm s
 
 ## 8. Every open row, placed
 
-Generated from the production registry at plan 30's measurement: 689 rows, each placed once.
+Generated from the production registry at plan 30's measurement: 690 rows, each placed once.
 A row closed since then still resolves (the done registry), and the next refresh drops it.
 
 ### A.1 PR #59 (current)
@@ -244,8 +244,9 @@ A row closed since then still resolves (the done registry), and the next refresh
 - [[D-DSSHIR-NATIVE-SIDE-TABLES-HAVE-NO-TEXT-FORM]] (P2)
 - [[D-LK3-EXEC-EXPORT-SCOPE-NOT-CONFIG-DRIVEN]] (P3)
 
-#### hm (H6b, H7) — 8
+#### hm (H6b, H7) — 9
 
+- [[D-CORE-A-STORED-HOST-PATH-IS-RE-READ-FROM-ITS-TEXT]] (P1)
 - [[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]] (P1)
 - [[D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED]] (P1)
 - [[D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED]] (P1)
