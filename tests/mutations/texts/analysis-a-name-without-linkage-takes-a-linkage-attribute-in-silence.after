@@ -1,0 +1,1 @@
+        bool const neverLinked = false && answer == AttributeTableAnswer::NoLinkage;

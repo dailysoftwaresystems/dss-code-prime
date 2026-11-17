@@ -1,0 +1,1 @@
+    { "name": "GetModuleFileNameA", "signature": "fn(ptr<void>, ptr<char>, u32) -> u32 \"unsigned long\"", "kind": "function", "linkage": "external" },

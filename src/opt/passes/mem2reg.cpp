@@ -938,7 +938,17 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     if (promoted_.empty()) return;
     allocasPromoted_ += promoted_.size();
 
-    for (std::uint32_t aid : promoted_) {
+    // Deterministic order: `promoted_` is an unordered_set, and this loop MINTS the
+    // phi markers and fixes each block's phi order (`phisByBlock_`), which the
+    // rename walk and onBlockBegin follow. Ranging over it directly made the phis,
+    // and so every value and register after them, a function of the standard
+    // library's hash-table layout: one source compiled to different code by a
+    // compiler built with MSVC's library and one built with libstdc++. Walk the
+    // allocas by their id (a pure function of the module), the rule onBlockBegin's
+    // zero materialization already keeps for `zeroTypeById_`.
+    std::vector<std::uint32_t> promotedInOrder(promoted_.begin(), promoted_.end());
+    std::sort(promotedInOrder.begin(), promotedInOrder.end());
+    for (std::uint32_t aid : promotedInOrder) {
         auto const& defs = defBlocksOf[aid];
         if (defs.empty()) {
             // Step 1 unconditionally adds the alloca's own block as a

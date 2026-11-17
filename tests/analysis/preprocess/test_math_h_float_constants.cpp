@@ -262,6 +262,10 @@ TEST(MathHFloatConstants, ATypeNoFormSpellsIsRefusedOnALiveIncludeOnly) {
     PreprocessResult const live = run("#include <fh.h>\nint probe;\n");
     std::string const errs = allErrors(*live.diagnostics);
     EXPECT_NE(errs.find("float constant 'K_HALF_H'"), std::string::npos) << errs;
+    // C's type-spelling table has no word for `f16`: the sentence says so, and never stops the compiler (the
+    // renderer once aborted here) nor prints the engine's kind name.
+    EXPECT_NE(errs.find("as its declared type (a type this language does not spell)"), std::string::npos)
+        << errs;
     std::string const synth = live.synthBuffer ? std::string{live.synthBuffer->text()} : std::string{};
     EXPECT_EQ(synth.find("#define K_HALF_H"), std::string::npos) << synth;
     PreprocessResult const dead = run("#if 0\n#include <fh.h>\n#endif\nint probe;\n");

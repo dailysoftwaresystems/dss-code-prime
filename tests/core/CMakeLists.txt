@@ -2,6 +2,8 @@
 # parallelize and pinpoint failures.
 
 dss_add_test(NAME core/test_strong_ids          SOURCES test_strong_ids.cpp)
+# The one rule of a fresh SymbolId (core/types/symbol_id_cursor.hpp): the counting cursor and the index rule.
+dss_add_test(NAME core/test_symbol_id_cursor    SOURCES test_symbol_id_cursor.cpp)
 dss_add_test(NAME core/test_source_span         SOURCES test_source_span.cpp)
 dss_add_test(NAME core/test_source_buffer       SOURCES test_source_buffer.cpp)
 dss_add_test(NAME core/test_token               SOURCES test_token.cpp)
@@ -205,6 +207,35 @@ dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_
 # leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for (stated where the
 # top-level CMakeLists sums the declarations). The mutation sweep starts the binary itself and asks no label.
 dss_label_repo_guard(core/test_filesystem_queries_guard)
+# THE SOURCE GUARD of a fresh SymbolId (P69 fold f26d, review-csf26c2 N9): no source under src/ but
+# src/core/types/symbol_id_cursor.hpp makes one from arithmetic, a counter or a size (the guard's header
+# states the forms it refuses). `repo-guard`, as the filesystem guard above: it judges the source tree.
+dss_add_test(NAME core/test_symbol_id_mints_guard    SOURCES test_symbol_id_mints_guard.cpp)
+dss_label_repo_guard(core/test_symbol_id_mints_guard)
+# P69 f26d (lane `cs`): the ONE rendering of source text inside a diagnostic
+# (core/types/diagnostic_quote.hpp) — one line, cut past the configuration's limit at a character
+# boundary with an ellipsis, a short text whole — and its repo guard: every message statement of the
+# files whose diagnostics quote source text quotes through it.
+dss_add_test(NAME core/test_diagnostic_quote       SOURCES test_diagnostic_quote.cpp)
+dss_add_test(NAME core/test_diagnostic_quote_guard SOURCES test_diagnostic_quote_guard.cpp)
+dss_label_repo_guard(core/test_diagnostic_quote_guard)
+# Its limit's configure-time read (cmake/DssConfigureTimeCount.cmake) refuses by name a missing document,
+# bytes that are not JSON, a top level that is not an object, no `quotedSourceTextLimit`, and one that is not
+# a positive whole number — each case the reader alone in script mode, with two controls (the nesting
+# limit's own refusals, core/config_nesting_limit_configure_refusals, go through the same reader).
+add_test(NAME core/diagnostic_quote_limit_configure_refusals
+         COMMAND ${CMAKE_COMMAND}
+                 -D "DSS_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                 -D "DSS_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}/diagnostic_quote_limit_refusals"
+                 -D "KEY=quotedSourceTextLimit"
+                 -D "SUBJECT=the diagnostics' quoted-source-text limit"
+                 -D "UNIT=bytes"
+                 -D "SHIPPED=src/dss-config/configure-time/diagnostics.json"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test_configure_time_count_refusals.cmake")
+# P69 f26d (lane `cs`, rulings 617 and 621): the ONE spelling of a type in a language's diagnostic —
+# the document's `semantics.typeSpelling` table loaded complete or refused, every shipped language with
+# types declaring one, a second language's own words, and the c document over every type form.
+dss_add_test(NAME core/test_type_spelling       SOURCES test_type_spelling.cpp)
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

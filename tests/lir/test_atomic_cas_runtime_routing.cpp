@@ -29,6 +29,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -51,6 +52,7 @@ namespace {
     TypeId const params[] = {i32p, i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // This hand-built module is its own table: nothing beside it names an id it
     // does not define (the under-aligned arms mint the runtime entry's import).
     mb.stateSelfContainedSymbolIds();
@@ -109,7 +111,7 @@ struct Lowered {
     Mir mir = buildCasFnMir(provableAlign, interner);
     Lowered out;
     std::vector<ExternImport> noExterns;
-    out.result = lowerToLir(mir, target, interner, out.rep, noExterns,
+    out.result = lowerToLir(mir, target, interner, out.rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                             ExternCallDispatch::DirectPlt, std::nullopt,
                             std::nullopt, {}, std::nullopt, std::nullopt,
                             std::nullopt, std::move(runtime));
@@ -242,6 +244,7 @@ constexpr std::uint32_t kGuardedPersonalityV = 500;
     TypeId const params[] = {i32p, i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // its own table, as `buildCasFnMir`'s
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry   = mb.createBlock(StructCfMarker::EntryBlock);
@@ -270,7 +273,7 @@ constexpr std::uint32_t kGuardedPersonalityV = 500;
     std::array<MirSehScope, 1> const scopes{scope};
     Lowered out;
     std::vector<ExternImport> noExterns;
-    out.result = lowerToLir(mir, target, interner, out.rep, noExterns,
+    out.result = lowerToLir(mir, target, interner, out.rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                             ExternCallDispatch::DirectPlt, std::nullopt,
                             std::nullopt, scopes, std::nullopt, std::nullopt,
                             std::nullopt, elfRuntime(true));

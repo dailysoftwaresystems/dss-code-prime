@@ -1,0 +1,1 @@
+         for (auto const& e : m.staticInitSchedule) seeHeldSymbolId(h, e.symbol);

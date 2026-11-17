@@ -11,7 +11,7 @@
 #include "link/branch_veneers.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/extern_reference_gate.hpp"  // the ONE "this module uses that extern" (gate + static pull)
-#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — the ONE taken-id scan
+#include "link/fresh_symbol_ids.hpp"   // ModuleSymbolIds / NewSpaceSymbolIds — the doors of a fresh id
 #include "link/got_slots.hpp"          // lowerGotSlotReferences — the image's GOT slots
 #include "link/pc_relative_import_address.hpp"   // bindPcRelativeImportAddressUnits
 #include "link/pointer_reloc.hpp"      // absolutePointerRelocKind — the one pointer-slot predicate
@@ -38,6 +38,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -726,6 +727,9 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
     if (!anyDrop) return true;   // rejects (if any) reported; module unchanged
     filtered = m;   // copy, then erase the unreferenced non-eager rows
+    // The null-address symbols below are minted on `filtered` through its door, opened HERE, before any row is
+    // erased: an erased row's id stays below the module's end (`link/fresh_symbol_ids.hpp`).
+    ModuleSymbolIds ids{filtered};
     // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the null-bound set is
     // matched by SYMBOL, not by re-deriving the predicate a second time. The
     // classification loop above already applied `!allowUndefinedExterns &&
@@ -771,7 +775,6 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
     WeakResolvedToNothing const answers = objectFormatSchema.weakResolvedToNothing();
     BranchSites const branchSites{targetSchema};
-    std::uint32_t maxV = maxExistingSymbolIdV(m);   // every id still named, the erased rows' included
     std::unordered_map<std::uint32_t, SymbolId> nullAddressOf;   // row id -> its null-address symbol
     std::unordered_set<std::uint32_t> stillNamed;   // rows whose own id a reference keeps
     std::set<std::pair<std::uint32_t, int>> refusedOnce;   // (row, class) already reported
@@ -797,15 +800,13 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         if (auto const it = nullAddressOf.find(rowId); it != nullAddressOf.end()) {
             return it->second;
         }
-        if (maxV == std::numeric_limits<std::uint32_t>::max()) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
-                   "linker: SymbolId space exhausted minting a null-address symbol.");
+        std::optional<SymbolId> const s = ids.take(reporter, "linker: a null-address symbol");
+        if (!s.has_value()) {
             refusedAny = true;
             return std::nullopt;
         }
-        SymbolId const s{++maxV};
-        nullAddressOf.emplace(rowId, s);
-        filtered.nullAddressSymbols.push_back(s);
+        nullAddressOf.emplace(rowId, *s);
+        filtered.nullAddressSymbols.push_back(*s);
         return s;
     };
     // One relocation of a function (`code` = its bytes) or of a data item.
@@ -1213,11 +1214,11 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
 
     withSlots = m;   // copy, then append the slots and retarget the references
-    // Fresh SymbolIds are minted PAST every id already in the module, by the
-    // one shared scan `injectEntryTrampoline` uses — a mint that only looked
-    // at `functions` would collide with a string-literal data item and
-    // surface as K_DuplicateDataSymbol in a walker, away from this site.
-    std::uint32_t maxV = maxExistingSymbolIdV(withSlots);
+    // Fresh SymbolIds come from the module's door (`link/fresh_symbol_ids.hpp`): past every id ANY holder of
+    // the module holds -- a mint that only looked at `functions` would collide with a string-literal data item
+    // and surface as K_DuplicateDataSymbol in a walker, away from this site -- and refused there by name once
+    // the space is exhausted.
+    ModuleSymbolIds ids{withSlots};
     std::unordered_map<std::uint32_t, SymbolId> slotBySymbol;
     // Deterministic order: the module's OWN import order, not a hash set's.
     // Two runs over one module must mint the same ids and emit the same
@@ -1225,15 +1226,10 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // table depend on the allocator.
     for (auto const& ext : withSlots.externImports) {
         if (!needSlot.contains(ext.symbol.v)) continue;
-        if (maxV == std::numeric_limits<std::uint32_t>::max()) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "linker: SymbolId space exhausted minting the "
-                   "object-carried data-import slot for '" + ext.mangledName
-                       + "'.");
-            return false;
-        }
-        SymbolId const slotSym{++maxV};
+        std::optional<SymbolId> const minted = ids.take(
+            reporter, std::format("linker: the object-carried data-import slot for '{}'", ext.mangledName));
+        if (!minted.has_value()) return false;
+        SymbolId const slotSym = *minted;
         slotBySymbol.emplace(ext.symbol.v, slotSym);
 
         AssembledData slot;
@@ -1654,14 +1650,20 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
         std::unordered_map<std::string, std::pair<std::string, std::uint32_t>> discardedNames;
         for (auto const& m : modules) {
             std::unordered_map<std::uint32_t, std::vector<ModuleSymbol const*>> externalNamesOf;
+            // The definitions in the unit's table order, as `namesEachCopyCarries` walks them (P69 fold f26d, the
+            // host-toolchain class): this walk reports a refusal per definition, and walking the hash map itself
+            // reported a unit's several refusals in the standard library's hash order of their ids.
+            std::vector<std::uint32_t> inOrder;
             for (auto const& s : m.symbols) {
                 if (s.binding == SymbolBinding::Local || s.name.empty()) continue;
                 auto& names = externalNamesOf[s.symbol.v];
+                if (names.empty()) inOrder.push_back(s.symbol.v);
                 bool const repeated = std::any_of(names.begin(), names.end(),
                                                   [&](ModuleSymbol const* n) { return n->name == s.name; });
                 if (!repeated) names.push_back(&s);
             }
-            for (auto const& [id, names] : externalNamesOf) {
+            for (std::uint32_t const id : inOrder) {
+                std::vector<ModuleSymbol const*> const& names = externalNamesOf.at(id);
                 if (names.size() < 2u) continue;   // one name: there is no other to take
                 LinkedSymbolKey const self{m.cuId, SymbolId{id}};
                 std::vector<LinkedSymbolKey> replacers;
@@ -2052,7 +2054,10 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // `remap` for the question because `mergedIdFor` memoizes FOLDS into it before the
     // emission walk runs, making a folded key indistinguishable from a pre-assigned one.
     std::unordered_set<LinkedSymbolKey> winningKeys;
-    std::uint32_t nextId = 1;
+    // The merged module's ids: a NEW counting space from 1, through its door (`link/fresh_symbol_ids.hpp`), which
+    // steps over a writer-reserved value -- the one id `mergedIdFor` keeps through the merge -- and, exhausted,
+    // reports the refusal once by name; the merge's caller refuses a merge that reported an error.
+    NewSpaceSymbolIds mergedIds{SymbolIdEnd{}, reporter, "linker: the merged module"};
     // ★ ONE FRESH id PER KEY, NEVER ONE PER NAME —
     // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW.
     // An alias set puts SEVERAL winning names on ONE key. Minting per name burned
@@ -2063,9 +2068,42 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // emission path (whose compound index is built from the MERGED module) then rejected
     // a legal program with K_SymbolUndefined. `try_emplace` + a conditional bump makes
     // every name of one atom share that atom's id.
-    for (auto const& [name, key] : image.resolvedGlobalDefs) {
-        auto const [it, freshKey] = remap.try_emplace(key, nextId);
-        if (freshKey) ++nextId;
+    // ★ IN A DATA ORDER (P69 fold f26d; the host-toolchain class, its site in the merge): the winners by their
+    // unit's place in the link's input, then by their definition's place in that unit (its functions, then its data
+    // items), then by name. `resolvedGlobalDefs` is a hash map, and walking it minted the merged module's ids in the
+    // standard library's hash order of the names -- a numbering that differed by the library that built DSS. Every
+    // key of the walk is a fact of the input.
+    std::unordered_map<std::uint32_t, std::size_t> inputPositionOfUnit;   // cuId -> its place in `modules`
+    std::vector<std::unordered_map<std::uint32_t, std::size_t>> definitionPositionIn(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        inputPositionOfUnit.try_emplace(modules[i].cuId.v, i);
+        std::size_t place = 0;
+        for (auto const& fn : modules[i].functions) definitionPositionIn[i].try_emplace(fn.symbol.v, place++);
+        for (auto const& di : modules[i].dataItems) definitionPositionIn[i].try_emplace(di.symbol.v, place++);
+    }
+    auto const placeOf = [&](LinkedSymbolKey const& key) {
+        auto const unit = inputPositionOfUnit.find(key.cuId.v);
+        std::size_t const u = unit == inputPositionOfUnit.end() ? modules.size() : unit->second;
+        std::size_t       d = std::numeric_limits<std::size_t>::max();
+        if (u < modules.size()) {
+            auto const at = definitionPositionIn[u].find(key.symbol.v);
+            if (at != definitionPositionIn[u].end()) d = at->second;
+        }
+        return std::tuple{u, d, key.cuId.v, key.symbol.v};
+    };
+    std::vector<std::pair<std::string const*, LinkedSymbolKey>> winnersInOrder;
+    winnersInOrder.reserve(image.resolvedGlobalDefs.size());
+    for (auto const& [name, key] : image.resolvedGlobalDefs) winnersInOrder.emplace_back(&name, key);
+    std::ranges::sort(winnersInOrder, [&](auto const& a, auto const& b) {
+        auto const pa = placeOf(a.second);
+        auto const pb = placeOf(b.second);
+        if (pa != pb) return pa < pb;
+        return *a.first < *b.first;   // the names of one definition: distinct, so the order is total
+    });
+    for (auto const& [namePtr, key] : winnersInOrder) {
+        std::string const& name = *namePtr;
+        auto const [it, freshKey] = remap.try_emplace(key, 0u);
+        if (freshKey) it->second = mergedIds.take().v;
         nameToId.emplace(name, it->second);
         winningKeys.insert(key);
     }
@@ -2170,7 +2208,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 return *folded;
             }
         }
-        std::uint32_t const id = nextId++;
+        std::uint32_t const id = mergedIds.take().v;
         remap.emplace(key, id);
         return id;
     };
@@ -2261,7 +2299,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             LinkedSymbolKey const key{modules[modIdx].cuId, sym};
             switch (supersededAs(modIdx, sym)) {
                 case Superseded::KeepsItsBytes:
-                    if (keptBytesId.try_emplace(key, nextId).second) ++nextId;
+                    if (auto const [kept, freshKept] = keptBytesId.try_emplace(key, 0u); freshKept) {
+                        kept->second = mergedIds.take().v;
+                    }
                     break;
                 case Superseded::Unanswered:
                     supersededUnanswered.insert(key);
@@ -2405,7 +2445,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             continue;
         }
         if (*readsThroughSlot) {
-            std::uint32_t const thunkSlotId = nextId++;
+            std::uint32_t const thunkSlotId = mergedIds.take().v;
             AssembledData slot;
             slot.symbol  = SymbolId{thunkSlotId};
             // A CONST pointer table the loader fills — the shared c145 chokepoint
@@ -2886,9 +2926,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         }
         slice->section = it->second;
     };
-    // The id a shadowed unit member keeps its bytes under: fresh, and the SAME
-    // counter `mergedIdFor` mints from, so it collides with nothing.
-    auto keptShadowedId = [&]() { return SymbolId{nextId++}; };
+    // The id a shadowed unit member keeps its bytes under: fresh, from the SAME
+    // door `mergedIdFor` mints from, so it collides with nothing.
+    auto keptShadowedId = [&]() { return mergedIds.take(); };
 
     for (std::size_t i = 0; i < modules.size(); ++i) {
         auto const& m = modules[i];
@@ -3550,8 +3590,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // unit's entry, its place in the link's order -- through the one mover
 // (`moveDefinitionId`, asm/asm.hpp; P69 fold 3d: the place was the statement a
 // mover of its own left behind).
-void leaveTheIdToTheName(AssembledModule& m, SymbolId id, std::string const& name) {
-    SymbolId const fresh{maxExistingSymbolIdV(m) + 1u};
+[[nodiscard]] bool leaveTheIdToTheName(AssembledModule& m, SymbolId id, std::string const& name,
+                                       DiagnosticReporter& reporter) {
+    std::optional<SymbolId> const freshId = ModuleSymbolIds{m}.take(
+        reporter, std::format("linker: the body that leaves its id to the weak name '{}'", name));
+    if (!freshId.has_value()) return false;
+    SymbolId const fresh = *freshId;
     ExternImport   ref;
     ref.symbol      = id;
     ref.mangledName = name;
@@ -3563,9 +3607,11 @@ void leaveTheIdToTheName(AssembledModule& m, SymbolId id, std::string const& nam
     }
     moveDefinitionId(m, id, fresh);
     m.externImports.push_back(std::move(ref));
+    return true;
 }
 
-void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule>& out) {
+[[nodiscard]] bool handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule>& out,
+                                          DiagnosticReporter& reporter) {
     for (auto& m : out) {
         for (std::size_t r = m.symbols.size(); r-- > 0;) {
             if (m.symbols[r].name != name || m.symbols[r].binding != SymbolBinding::Weak) continue;
@@ -3576,9 +3622,10 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             m.symbols.erase(m.symbols.begin() + static_cast<std::ptrdiff_t>(r));
             if (byRow) continue;         // referenced by row: the body keeps its identity
             if (names != 1u) continue;   // the body keeps its other name
-            leaveTheIdToTheName(m, id, name);
+            if (!leaveTheIdToTheName(m, id, name, reporter)) return false;
         }
     }
+    return true;
 }
 
 // ── ONE WEAK NAME, REFERENCED BY ROW IN ONE UNIT AND THROUGH ITS DEFINITION IN
@@ -3601,7 +3648,8 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
 // An IMAGE needs none of it — nothing re-links one, and the merge's fold is the
 // by-name resolution. Returns TRUE when no unit is restated (`out` untouched).
 [[nodiscard]] bool restateWeakNameReferencesByRow(std::span<AssembledModule const> modules,
-                                                  std::vector<AssembledModule>&     out) {
+                                                  std::vector<AssembledModule>&     out,
+                                                  DiagnosticReporter&               reporter) {
     std::unordered_set<std::string> byRow;
     for (auto const& m : modules) {
         for (auto const& s : m.symbols) {
@@ -3638,7 +3686,8 @@ void handTheNameToTheCommon(std::string const& name, std::vector<AssembledModule
             SymbolId const    id   = m.symbols[r].symbol;
             std::string const name = m.symbols[r].name;
             m.symbols[r].referencedByName = true;
-            leaveTheIdToTheName(m, id, name);
+            if (!leaveTheIdToTheName(m, id, name, reporter)) return false;   // refused by name: the caller's
+                                                                           // error count tells it from a change
         }
     }
     return false;
@@ -4171,6 +4220,9 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
         if (lost[i].empty()) continue;
         AssembledModule const& in = modules[i];
         AssembledModule&       m  = out[i];
+        // The unit's door, opened BEFORE anything of it is erased: an erased id stays below its end, and the
+        // reference rows minted below never take one (`link/fresh_symbol_ids.hpp`).
+        ModuleSymbolIds ids{m};
         auto const groupOf = [&](std::optional<InputSectionSlice> const& from) -> std::string_view {
             if (!from.has_value()) return {};
             auto const it = lost[i].find(from->section);
@@ -4320,7 +4372,6 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
         // compiled unit's alias names the definition it aliases) -- the unit's own row of the name where it has one.
         // A reference, not a weak one: where nothing defines the name or its default, it is undefined, as both
         // reference linkers leave it.
-        std::uint32_t nextId = maxExistingSymbolIdV(m) + 1u;
         for (ModuleSymbol const& ms : in.symbols) {
             auto const lostIn = lostIds.find(ms.symbol.v);
             if (lostIn == lostIds.end() || ms.name.empty() || ms.binding == SymbolBinding::Local) continue;
@@ -4354,8 +4405,11 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                 }
                 continue;
             }
+            std::optional<SymbolId> const staysId = ids.take(
+                reporter, std::format("linker: the reference row that keeps the weak name '{}'", ms.name));
+            if (!staysId.has_value()) return false;   // refused by name; the caller's error count says so
             ExternImport stays;
-            stays.symbol       = SymbolId{nextId++};
+            stays.symbol       = *staysId;
             stays.mangledName  = ms.name;
             stays.fallbackName = fallback;
             if (auto const datum = threadLocalDatum.find(ms.symbol.v); datum != threadLocalDatum.end()) {
@@ -4579,7 +4633,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
         if (!image) {
             // The final linker's to allocate: the artifact hands the common on,
             // and each weak definition it outranks gives the name up.
-            if (weakDefinitions.contains(name)) handTheNameToTheCommon(name, out);
+            if (weakDefinitions.contains(name) && !handTheNameToTheCommon(name, out, reporter)) return false;
             continue;
         }
         CommonRow        winner     = rows.front();
@@ -4767,7 +4821,7 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
     }();
 
     out = in;
-    std::uint32_t maxV = maxExistingSymbolIdV(out);
+    ModuleSymbolIds ids{out};   // the GOT slots' ids (`link/fresh_symbol_ids.hpp`)
     std::unordered_map<GotSlotKey, SymbolId, GotSlotKeyHash> slotByKey;
     std::unordered_map<std::uint32_t, TargetRelocationInfo const*> twinByKind;
     for (auto& fn : out.functions) {
@@ -4805,13 +4859,9 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
                                tri->name, key.addend, key.addend));
                     return false;
                 }
-                if (maxV == std::numeric_limits<std::uint32_t>::max()) {
-                    report(reporter, DiagnosticCode::K_SymbolUndefined,
-                           DiagnosticSeverity::Error,
-                           "linker: SymbolId space exhausted minting a GOT slot.");
-                    return false;
-                }
-                SymbolId const slotSym{++maxV};
+                std::optional<SymbolId> const minted = ids.take(reporter, "linker: a GOT slot");
+                if (!minted.has_value()) return false;
+                SymbolId const slotSym = *minted;
                 slotIt->second = slotSym;
                 AssembledData slot;
                 slot.symbol    = slotSym;
@@ -4981,9 +5031,15 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // artifact's writer read ONE statement of the name
     // (`restateWeakNameReferencesByRow`).
     std::vector<AssembledModule> weakNameBoundStorage;   // populated only when a unit is restated
-    if (!objectFormatSchema.isImageFlavor()
-        && !restateWeakNameReferencesByRow(modules, weakNameBoundStorage)) {
-        modules = std::span<AssembledModule const>{weakNameBoundStorage};
+    if (!objectFormatSchema.isImageFlavor()) {
+        std::size_t const errsBeforeRestating = reporter.errorCount();
+        if (!restateWeakNameReferencesByRow(modules, weakNameBoundStorage, reporter)) {
+            if (reporter.errorCount() != errsBeforeRestating) {
+                image.resolvedFuncCount = 0;
+                return image;
+            }
+            modules = std::span<AssembledModule const>{weakNameBoundStorage};
+        }
     }
     // N>1: cross-CU merge (LK11a resolution + LK11b pre-merge emission). Validate each
     // CU, resolve symbols, then pre-merge the resolved CUs into ONE combined module that

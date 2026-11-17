@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -14074,10 +14075,15 @@ TEST(HirLoweringC, ACallSeesOnlyAPrototypeWrittenBeforeIt) {
 // passed over (gcc warns it ignored, runs), a visibility on a local changes nothing (clang silent), an unknown
 // attribute name on a block prototype is said ONCE (the semantic tier's S_UnknownAttribute, never also the linkage
 // tier's), and a block prototype without attributes keeps the default linkage.
+// ★ P69 (fold f26d — review-csf26c2 N5): the no-linkage verdict is the semantic tier's no-linkage gate's, read from
+// the attribute's row (`refusedWithoutLinkage`): the refused cells are refused THERE, by name, once
+// (S_AttributeNotHonoured), and the controls are ignored and SAID (S_AttributeIgnoredForDeclarationKind) -- gcc and
+// mingw-w64 gcc warn both ignored (probe n5p) -- where fold f26c2 refused a binding in the lowering and passed the
+// controls in silence.
 //
-// RED-ON-DISABLE: drop the block prototype's attribute reading and its import is strong; drop the binding refusal and
-// every no-linkage cell lowers; drop `identVarDecl`'s `prototypeSynthesizesExtern` and the typedef-headed cells make
-// no import.
+// RED-ON-DISABLE: drop the block prototype's attribute reading and its import is strong; drop the no-linkage gate's
+// refusal and every no-linkage cell builds; drop `identVarDecl`'s `prototypeSynthesizesExtern` and the typedef-headed
+// cells make no import.
 TEST(HirLoweringC, ALinkageAttributeOnABlockDeclarationIsReadByItsDeclaratorsLinkage) {
     auto const importOf = [](CstToHirResult const& res, std::string_view name) -> HirNodeId {
         for (auto const& e : res.externDecls)
@@ -14158,31 +14164,31 @@ TEST(HirLoweringC, ALinkageAttributeOnABlockDeclarationIsReadByItsDeclaratorsLin
     for (Refused const& c : refused) {
         SCOPED_TRACE(c.what);
         SemanticModel model = analyzeC(c.src);
-        ASSERT_FALSE(model.hasErrors())
-            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
-        DiagnosticReporter r;
-        auto res = lowerToHir(model, r);
-        EXPECT_FALSE(res->ok) << "a binding on a declaration with no linkage is refused";
-        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u) << "said once, by name";
+        EXPECT_TRUE(model.hasErrors()) << "`weak` on an object with no linkage is refused";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u)
+            << "said once, by name, by the semantic tier's no-linkage gate";
     }
 
     struct Passed {
         char const* what;
         char const* src;
+        std::size_t ignoredSaid;   // S_AttributeIgnoredForDeclarationKind
     };
     std::vector<Passed> const passed{
-        {"CONTROL: `weak` on a parameter is passed over",
-         "static int f(int x __attribute__((weak))) { return x + 1; }\nint main(void) { return f(41); }\n"},
-        {"CONTROL: a visibility on a local changes nothing",
-         "int main(void) { __attribute__((visibility(\"hidden\"))) int x = 41; return x + 1; }\n"},
+        {"CONTROL: `weak` on a parameter is ignored and said",
+         "static int f(int x __attribute__((weak))) { return x + 1; }\nint main(void) { return f(41); }\n", 1},
+        {"CONTROL: a visibility on a local is ignored and said",
+         "int main(void) { __attribute__((visibility(\"hidden\"))) int x = 41; return x + 1; }\n", 1},
         {"CONTROL: an alignment on a local is no linkage",
-         "int main(void) { __attribute__((aligned(16))) int x = 41; return x + 1; }\n"},
+         "int main(void) { __attribute__((aligned(16))) int x = 41; return x + 1; }\n", 0},
     };
     for (Passed const& c : passed) {
         SCOPED_TRACE(c.what);
         SemanticModel model = analyzeC(c.src);
         ASSERT_FALSE(model.hasErrors())
             << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                  c.ignoredSaid);
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
         EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
@@ -14198,5 +14204,280 @@ TEST(HirLoweringC, ALinkageAttributeOnABlockDeclarationIsReadByItsDeclaratorsLin
         auto res = lowerToHir(model, r);
         ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
         EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << "never also the linkage tier's";
+    }
+}
+
+// ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5, the class's universe): EVERY DECLARATION ROW'S ATTRIBUTE
+// SPECIFIERS ARE READ BY THE ONE TABLE ITS ROW NAMES (`attributeTableOf`), IN BOTH TIERS. The row axis is the shipped
+// document's, walked: every row of `semantics.declarations` must have a C spelling in `kSpelledBy` below, keyed by
+// rule name, so a row added later FAILS this pin until its cell is written. Per row, `__attribute__((weak))` is
+// written on one of its declarators and the verdict asserted is the one its accessor answer gives:
+//   * `Own` (the row's fold reads it): the symbol is WEAK;
+//   * `Borrowed` (a block row): the object has no linkage, `weak` is refused by name, once (S_AttributeNotHonoured);
+//   * `NoLinkage` (a member, a parameter, an enumerator, a tag, a typedef name): ignored and said, the build goes on;
+//     on an EMPTY declaration (`declaresNothing`: the four typedef-named rows) nothing is declared, so no attribute
+//     is said and the declaration is said to declare nothing, once (✔MEASURED, lane `cs` probe tn5: gcc 13.3.0 and
+//     clang 18.1.3 accept each with their one empty-declaration warning and name no attribute).
+// ✔MEASURED (lane `cs` probes n5p, wb3, wb4; gcc 13.3.0, clang 18.1.3, Apple clang 21, clang-cl, mingw-w64 gcc
+// 13.2.0): weak on every file-scope and block `extern` declaration; refused on every block object, through a keyword,
+// a typedef-named head, a for-init and a C23 inferred one; warned ignored on a member, a parameter and a typedef
+// name. DSS built the typedef-headed for-init cell (`forIdentDecl`, no table) and the member and parameter cells in
+// silence before this fold.
+// The TIER, SPELLING and FORMAT axes, beside the row walk:
+//   * the semantic record's facets through a BORROWED table: `typedef int T; { T __declspec(dllimport) tx; }` on pe
+//     is an import (cl, mingw-w64 gcc and clang-cl import it, as its keyword-head twin; DSS made an automatic object);
+//     `{ __declspec(thread) int x; }` on pe is ignored and said (mingw-w64 gcc builds it, cl and clang-cl refuse it),
+//     and a block `static` one keeps its thread storage;
+//   * the C23 vendor spelling (probe n5q): `[[gnu::weak]]` and `[[__gnu__::weak]]` at the leading sequence and after
+//     the declarator are WEAK, `[[gnu::visibility("hidden")]]` HIDDEN, `[[gnu::dllimport]]` on pe an import; `[[weak]]`
+//     and `[[clang::weak]]` (no namespace, another vendor's) and `int * [[gnu::weak]] p` (the pointer type's) confer
+//     nothing;
+//   * the per-format verdict (`refusedWithoutLinkageOn`): `selectany` on a block object is refused on pe and ignored
+//     and said on ELF, where gcc 13.3.0 builds it.
+// RED-ON-DISABLE: the accessor answering the row's OWN table for the semantic tier leaves the typedef-headed import an
+// automatic object; dropping forIdentDecl's borrowed table builds its cell; dropping the token's reader builds the
+// member and parameter cells in silence; dropping the standard form's reading leaves the `[[gnu::]]` cells strong.
+namespace {
+struct RowSpelling {
+    char const*          src;       // `weak` on a declarator of the row
+    AttributeTableAnswer answer;    // what the row's accessor must answer
+    bool declaresNothing = false;   // an EMPTY declaration: `weak` on the row, which declares no entity
+};
+std::map<std::string, RowSpelling, std::less<>> const kSpelledBy{
+    {"topLevelDecl", {"int hook __attribute__((weak));\nint main(void) { return hook; }\n", AttributeTableAnswer::Own}},
+    {"autoInferredTopLevelDecl",
+     {"auto hook __attribute__((weak)) = 1;\nint main(void) { return hook; }\n", AttributeTableAnswer::Own}},
+    {"externDecl",
+     {"extern int hook __attribute__((weak));\nint main(void) { return &hook ? hook : 0; }\n", AttributeTableAnswer::Own}},
+    {"varDecl", {"int main(void) { int x __attribute__((weak)) = 1; return x; }\n", AttributeTableAnswer::Borrowed}},
+    {"identVarDecl",
+     {"typedef int T;\nint main(void) { T x __attribute__((weak)) = 1; return x; }\n", AttributeTableAnswer::Borrowed}},
+    {"forDecl",
+     {"int main(void) { int s = 0; for (int i __attribute__((weak)) = 0; i < 2; ++i) s += i; return s; }\n",
+      AttributeTableAnswer::Borrowed}},
+    {"forIdentDecl",
+     {"typedef int T;\nint main(void) { int s = 0; for (T i __attribute__((weak)) = 0; i < 2; ++i) s += i; return s; }\n",
+      AttributeTableAnswer::Borrowed}},
+    {"autoInferredVarDecl",
+     {"int main(void) { auto x __attribute__((weak)) = 1; return x; }\n", AttributeTableAnswer::Borrowed}},
+    {"autoInferredForDecl",
+     {"int main(void) { int s = 0; for (auto i __attribute__((weak)) = 0; i < 2; ++i) s += i; return s; }\n",
+      AttributeTableAnswer::Borrowed}},
+    {"param", {"static int f(int x __attribute__((weak))) { return x; }\nint main(void) { return f(1); }\n",
+               AttributeTableAnswer::NoLinkage}},
+    {"structField", {"struct S { int x __attribute__((weak)); };\nint main(void) { struct S s = {1}; return s.x; }\n",
+                     AttributeTableAnswer::NoLinkage}},
+    {"unionField", {"union U { int x __attribute__((weak)); };\nint main(void) { union U u = {1}; return u.x; }\n",
+                    AttributeTableAnswer::NoLinkage}},
+    {"typedefDecl", {"typedef int U __attribute__((weak));\nU u;\nint main(void) { return u; }\n",
+                     AttributeTableAnswer::NoLinkage}},
+    {"structSpec", {"struct __attribute__((weak)) S { int x; };\nint main(void) { struct S s = {1}; return s.x; }\n",
+                    AttributeTableAnswer::NoLinkage}},
+    {"unionSpec", {"union __attribute__((weak)) U { int x; };\nint main(void) { union U u = {1}; return u.x; }\n",
+                   AttributeTableAnswer::NoLinkage}},
+    {"enumSpec", {"enum __attribute__((weak)) E { A = 1 };\nint main(void) { return A; }\n",
+                  AttributeTableAnswer::NoLinkage}},
+    {"enumerator", {"enum E { A __attribute__((weak)) = 1 };\nint main(void) { return A; }\n",
+                    AttributeTableAnswer::NoLinkage}},
+    // the typedef-named EMPTY declarations: a bare row's only attribute position follows the typedef name
+    {"typeNameEmptyDecl", {"typedef int T;\nint main(void) { const __attribute__((weak)) T; return 0; }\n",
+                           AttributeTableAnswer::NoLinkage, true}},
+    {"typeNameEmptyForDecl",
+     {"typedef int T;\nint main(void) { for (const __attribute__((weak)) T; 0; ) { } return 0; }\n",
+      AttributeTableAnswer::NoLinkage, true}},
+    {"typeNameBareEmptyDecl", {"typedef int T;\nint main(void) { T __attribute__((weak)); return 0; }\n",
+                               AttributeTableAnswer::NoLinkage, true}},
+    {"typeNameBareEmptyForDecl",
+     {"typedef int T;\nint main(void) { for (T __attribute__((weak)); 0; ) { } return 0; }\n",
+      AttributeTableAnswer::NoLinkage, true}},
+};
+
+[[nodiscard]] HirNodeId globalOrImportNamed(CstToHirResult const& res, SemanticModel const& m, std::string_view name) {
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        HirKind const k = res.hir.kind(d);
+        if (k != HirKind::Global && k != HirKind::Function) continue;
+        SymbolId const sym = k == HirKind::Function ? res.hir.functionSymbol(d) : res.hir.globalSymbol(d);
+        auto const* rec = m.recordFor(sym);
+        if (rec != nullptr && rec->name == name) return d;
+    }
+    for (auto const& e : res.externDecls)
+        if (e.canonicalName == name) return e.node;
+    return HirNodeId{};
+}
+
+[[nodiscard]] std::optional<SymbolBinding> bindingOf(CstToHirResult const& res, HirNodeId n) {
+    if (!n.valid() || !res.linkageMap.has(n)) return std::nullopt;
+    return res.linkageMap.get(n).binding;
+}
+} // namespace
+
+TEST(HirLoweringC, EveryDeclarationRowsAttributeSpecifiersAreReadByTheTableItsRowNames) {
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    SemanticConfig const& cfg = loaded->semantics();
+    ASSERT_FALSE(cfg.declarations.empty());
+    for (DeclarationRule const& row : cfg.declarations) {
+        SCOPED_TRACE(row.ruleName);
+        auto const it = kSpelledBy.find(row.ruleName);
+        ASSERT_NE(it, kSpelledBy.end()) << "a declaration row with no C spelling in this pin: write its cell";
+        AttributeTableOfRow const reading = attributeTableOf(cfg, row);
+        EXPECT_EQ(reading.answer, it->second.answer) << "the row's accessor answer";
+        ASSERT_NE(reading.answer, AttributeTableAnswer::Unread) << "no shipped row's specifiers are read by nobody";
+        SemanticModel model = analyzeC(it->second.src);
+        switch (reading.answer) {
+            case AttributeTableAnswer::Own: {
+                ASSERT_FALSE(model.hasErrors())
+                    << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+                DiagnosticReporter r;
+                auto res = lowerToHir(model, r);
+                ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+                EXPECT_EQ(bindingOf(*res, globalOrImportNamed(*res, model, "hook")), SymbolBinding::Weak)
+                    << "the row's own table reads the attribute: the symbol is weak";
+                break;
+            }
+            case AttributeTableAnswer::Borrowed:
+                EXPECT_TRUE(model.hasErrors()) << "a block object has no linkage: `weak` is refused";
+                EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u)
+                    << "by name, once, by the no-linkage gate";
+                break;
+            case AttributeTableAnswer::NoLinkage: {
+                ASSERT_FALSE(model.hasErrors())
+                    << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+                bool const empty = it->second.declaresNothing;
+                EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                          empty ? 0u : 1u)
+                    << (empty ? "an empty declaration names no attribute" : "ignored and said, once");
+                DiagnosticReporter r;
+                auto res = lowerToHir(model, r);
+                EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+                if (empty)
+                    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+                        << "the declaration declares nothing, said once";
+                break;
+            }
+            case AttributeTableAnswer::Unread:
+                break;
+        }
+    }
+
+    // THE TIER AXIS through a borrowed table, on pe: the semantic record's `imported` and thread facets.
+    {
+        SCOPED_TRACE("a typedef-headed block `__declspec(dllimport)` object is an import");
+        SemanticModel model = analyzeCPe("typedef int T;\nint main(void) { T __declspec(dllimport) tx; return tx; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        SymbolId const tx = symbolIdNamed(model, "tx");
+        ASSERT_TRUE(tx.valid());
+        EXPECT_TRUE(model.symbols()[tx.v].isImportedDeclaration) << "read with the borrowed table";
+    }
+    {
+        SCOPED_TRACE("CONTROL: its keyword-head twin is an import too");
+        SemanticModel model = analyzeCPe("int main(void) { int __declspec(dllimport) ax; return ax; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        SymbolId const ax = symbolIdNamed(model, "ax");
+        ASSERT_TRUE(ax.valid());
+        EXPECT_TRUE(model.symbols()[ax.v].isImportedDeclaration);
+    }
+    {
+        SCOPED_TRACE("`__declspec(thread)` on an automatic object is ignored and said");
+        SemanticModel model = analyzeCPe("typedef int T;\nint main(void) { T __declspec(thread) x; x = 1; return x; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u);
+        SymbolId const x = symbolIdNamed(model, "x");
+        ASSERT_TRUE(x.valid());
+        EXPECT_FALSE(model.symbols()[x.v].isThreadLocal) << "the object keeps its automatic storage";
+    }
+    {
+        SCOPED_TRACE("CONTROL: `__declspec(thread)` on a block `static` object keeps its thread storage");
+        SemanticModel model = analyzeCPe("int main(void) { static __declspec(thread) int x; return x; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        SymbolId const x = symbolIdNamed(model, "x");
+        ASSERT_TRUE(x.valid());
+        EXPECT_TRUE(model.symbols()[x.v].isThreadLocal);
+    }
+
+    // THE SPELLING AXIS: the C23 vendor form, read for the items the GNU spelling claims.
+    struct Spelled {
+        char const*                     what;
+        char const*                     src;
+        std::optional<SymbolBinding>    binding;      // of `hook`
+        std::optional<SymbolVisibility> visibility;
+    };
+    std::vector<Spelled> const spelled{
+        {"`[[gnu::weak]]` leading", "[[gnu::weak]] int hook;\nint main(void) { return hook; }\n",
+         SymbolBinding::Weak, std::nullopt},
+        {"`[[gnu::weak]]` after the declarator", "int hook [[gnu::weak]];\nint main(void) { return hook; }\n",
+         SymbolBinding::Weak, std::nullopt},
+        {"`[[__gnu__::weak]]` leading", "[[__gnu__::weak]] int hook;\nint main(void) { return hook; }\n",
+         SymbolBinding::Weak, std::nullopt},
+        {"`[[gnu::weak]]` on a block `extern`",
+         "int main(void) { [[gnu::weak]] extern int hook; return &hook ? hook : 0; }\n", SymbolBinding::Weak,
+         std::nullopt},
+        {"`[[gnu::weak]]` on a block prototype",
+         "int main(void) { [[gnu::weak]] int hook(void); return hook ? hook() : 42; }\n", SymbolBinding::Weak,
+         std::nullopt},
+        {"`[[gnu::visibility(\"hidden\")]]` leading",
+         "[[gnu::visibility(\"hidden\")]] int hook;\nint main(void) { return hook; }\n", std::nullopt,
+         SymbolVisibility::Hidden},
+        {"CONTROL: `[[weak]]` (no namespace) confers nothing", "[[weak]] int hook;\nint main(void) { return hook; }\n",
+         std::nullopt, std::nullopt},
+        {"CONTROL: `[[clang::weak]]` (another vendor's) confers nothing",
+         "[[clang::weak]] int hook;\nint main(void) { return hook; }\n", std::nullopt, std::nullopt},
+        {"CONTROL: `[[gnu::weak]]` beside the name in a pointer is the pointer type's",
+         "int * [[gnu::weak]] hook;\nint main(void) { return hook != 0; }\n", std::nullopt, std::nullopt},
+    };
+    for (Spelled const& c : spelled) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+        HirNodeId const n = globalOrImportNamed(*res, model, "hook");
+        ASSERT_TRUE(n.valid()) << "hook";
+        std::optional<SymbolBinding> const binding = bindingOf(*res, n);
+        if (c.binding.has_value()) {
+            EXPECT_EQ(binding, c.binding) << "the claimed item is the GNU spelling's attribute";
+        } else {
+            EXPECT_TRUE(!binding.has_value() || *binding == SymbolBinding::Global) << "no binding was written";
+        }
+        std::optional<SymbolVisibility> const visibility =
+            res->linkageMap.has(n) ? std::optional{res->linkageMap.get(n).visibility} : std::nullopt;
+        if (c.visibility.has_value()) {
+            EXPECT_EQ(visibility, c.visibility);
+        } else {
+            EXPECT_TRUE(!visibility.has_value() || *visibility == SymbolVisibility::Default)
+                << "no visibility was written";
+        }
+    }
+    {
+        SCOPED_TRACE("`[[gnu::dllimport]]` on pe is an import");
+        SemanticModel model = analyzeCPe("[[gnu::dllimport]] extern int hook;\nint main(void) { return hook; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        SymbolId const hook = symbolIdNamed(model, "hook");
+        ASSERT_TRUE(hook.valid());
+        EXPECT_TRUE(model.symbols()[hook.v].isImportedDeclaration);
+    }
+
+    // THE FORMAT AXIS: `selectany` on a block object, refused where every reference of the format refuses it.
+    {
+        SCOPED_TRACE("`selectany` on a block object on pe is refused");
+        SemanticModel model = analyzeCPe("int main(void) { __attribute__((selectany)) int x = 1; return x; }\n");
+        EXPECT_TRUE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u);
+    }
+    {
+        SCOPED_TRACE("`selectany` on a block object on ELF is ignored and said (gcc 13.3.0 builds it)");
+        SemanticModel model = analyzeC("int main(void) { __attribute__((selectany)) int x = 1; return x; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     }
 }

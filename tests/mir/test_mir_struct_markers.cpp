@@ -83,6 +83,7 @@ TEST(MirPostDom, DiamondIpdomIsJoin) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock();
@@ -123,6 +124,7 @@ TEST(MirPostDom, BothArmsReturnIpdomIsVirtual) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock();
@@ -151,6 +153,7 @@ TEST(MirPostDom, LoopHeaderIpdomIsLoopExit) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -179,6 +182,7 @@ TEST(MirPostDom, MultiExitLoopHeaderIpdomIsVirtual) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -284,6 +288,7 @@ TEST(StructCfDerivation, IfNoElse) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const thenB = mb.createBlock();
@@ -307,6 +312,7 @@ TEST(StructCfDerivation, IfElseDiamond) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock();
@@ -333,6 +339,7 @@ TEST(StructCfDerivation, BothArmsReturnIfHasNoJoin) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock();
@@ -361,6 +368,7 @@ TEST(StructCfDerivation, ElseLessSealedThenDerivesIfElse) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const thenB = mb.createBlock();
@@ -383,6 +391,7 @@ TEST(StructCfDerivation, WhileShape) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -415,6 +424,7 @@ TEST(StructCfDerivation, MultiExitLoop) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -447,6 +457,7 @@ TEST(StructCfDerivation, MultiBackEdgeLoop) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -512,6 +523,7 @@ TEST(StructCfDerivation, NestedIfInLoop) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -547,6 +559,7 @@ TEST(StructCfDerivation, CompoundConditionLoopBodyHeadIsIfThen) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();  // evaluates `a`
@@ -581,6 +594,7 @@ TEST(StructCfDerivation, InfiniteLoopCondBrTreatsInvalidIpdomAsVirtual) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock();
@@ -614,6 +628,7 @@ TEST(StructCfDerivation, RederiveCorrectsStaleStampsOnFrozenMir) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = mb.addFunction(fnSig, SymbolId{1});
     // Deliberately WRONG stamps everywhere (incl. dormant values).
     MirBlockId const entry = mb.createBlock(StructCfMarker::SwitchHead);
@@ -690,6 +705,7 @@ AdversarialModule buildAdversarialModule(TypeInterner& interner) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     AdversarialModule out;
 
     // f0 — TRIVIAL: one block. Derived FIRST, so the module-wide sweep's

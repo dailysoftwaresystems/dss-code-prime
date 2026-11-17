@@ -153,6 +153,7 @@ TEST(Dce, UnusedParameterArgIsPreservedAsAbiRoot) {
     TypeId const fnSig = interner.fnSig(paramTys, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);

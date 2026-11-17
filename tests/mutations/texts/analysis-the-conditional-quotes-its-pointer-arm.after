@@ -1,0 +1,3 @@
+                                 "conditional are a pointer (`"
+                               + std::string{tree.text(thenIsThePointer ? arms[1] : arms[2])}
+                               + "`) and an integer"

@@ -17110,6 +17110,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           TargetSchema const& target,
                           TypeInterner const& interner,
                           DiagnosticReporter& reporter,
+                          std::uint16_t callingConventionIndex,
                           std::vector<ExternImport> externImports,
                           std::optional<ExternCallDispatch> externCallDispatch,
                           std::optional<DataImportBinding> dataImportBinding,
@@ -17124,8 +17125,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
                               preemptibleDefinitionBindings,
                           std::vector<DefinedSymbolName> definedSymbolNames,
                           std::optional<ObjectFormatKind> assemblyFormatKind,
-                          std::vector<std::string> imageDefinedNames,
-                          std::uint16_t callingConventionIndex) {
+                          std::vector<std::string> imageDefinedNames) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.

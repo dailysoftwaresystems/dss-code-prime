@@ -19,6 +19,9 @@ add_library(core OBJECT
     types/scope_kind.cpp
     types/parse_diagnostic.cpp
     types/diagnostic_reporter.cpp
+    # The ONE rendering of source text inside a diagnostic — one line, cut past the
+    # configuration's limit (D-DIAG-A-DIAGNOSTIC-QUOTES-ITS-OPERAND-WHOLE).
+    types/diagnostic_quote.cpp
     types/unsuppressable_codes.cpp
     types/config_path_walk.cpp
     types/header_case_diagnostic.cpp
@@ -46,6 +49,10 @@ add_library(core OBJECT
     # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor
     # reader at USE (a lattice-derived constant's `of`), P68 round 9.
     types/type_name_resolve.cpp
+    # The ONE renderer of a type as a source language spells it in a diagnostic,
+    # and the load of the language document's table it reads (P69 fold f26d).
+    types/type_spelling.cpp
+    types/type_spelling_json.cpp
     # The ONE `when` selector (decode + validate, and the match against a pair):
     # the shipped-descriptor reader at READ and the language document's builtin
     # `signature` variants at LOAD + INJECTION — P68 round 12, S2a-1 of
@@ -134,6 +141,21 @@ dss_read_config_nesting_limit(
 target_compile_definitions(core PRIVATE
     DSS_CONFIG_MAX_NESTING=${DSS_CONFIG_MAX_NESTING}
     DSS_CONFIG_MAX_NESTING_DOCUMENT="configure-time/config-documents.json")
+
+# THE DIAGNOSTICS' QUOTED-SOURCE-TEXT LIMIT (cycle P69 f26d, lane `cs`). Every diagnostic that
+# quotes source text renders it through `quotedSourceText` (core/types/diagnostic_quote.hpp), cut
+# past this many bytes. The limit is the diagnostics' own — no language, target or object format
+# states it — so it is the config tree's configure-time document, read HERE by
+# cmake/DssConfigureTimeCount.cmake, which refuses the configure by name on a missing or malformed
+# one, and compiled in. Undefined => diagnostic_quote.cpp's `#error`; no default stands in for it.
+include("${CMAKE_SOURCE_DIR}/cmake/DssConfigureTimeCount.cmake")
+dss_read_configure_time_count(
+    "${CMAKE_SOURCE_DIR}/src/dss-config/configure-time/diagnostics.json"
+    quotedSourceTextLimit
+    "the diagnostics' quoted-source-text limit"
+    "Every diagnostic that quotes source text takes its `quotedSourceTextLimit`, so the build cannot be configured without it."
+    bytes DSS_DIAGNOSTIC_QUOTE_LIMIT)
+target_compile_definitions(core PRIVATE DSS_DIAGNOSTIC_QUOTE_LIMIT=${DSS_DIAGNOSTIC_QUOTE_LIMIT})
 
 # nlohmann/json is PRIVATE: the include path is a build requirement of `core`'s
 # own sources, NOT a usage requirement re-exported to consumers.

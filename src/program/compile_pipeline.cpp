@@ -1473,7 +1473,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     phase.emplace(substrate::CompilePhase::LowerLir);
     auto const lirEntry = reporter.errorCount();
     auto lir = lowerToLir(mir, target,
-                          interner, reporter,
+                          interner, reporter, callingConventionIndex,
                           std::move(externImports),
                           externCallDispatch,
                           dataImportBinding,
@@ -1504,9 +1504,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           // the assembly dialect's `symbolParts`.
                           assemblyFormatKind,
                           // P69 fold 3d: the names the image will define.
-                          std::move(imageDefinedNames),
-                          // P69 fold f26c2: the convention HIR→MIR lowered under.
-                          callingConventionIndex);
+                          std::move(imageDefinedNames));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -2385,6 +2383,16 @@ bool buildForeignEntryStartup(ForeignEntryCandidate const&    entry,
     startup.reset();
     MirBuilder emptyModule;
     emptyModule.stateSymbolIdEnd(1);   // its name table holds no id: the space starts past 0
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): the entry shape gives this module functions
+    // that receive arguments, numbered as the convention the format names counts them
+    // (`argCountingOf`) -- a module holding an `Arg` and stating no counting is refused by the MIR
+    // verifier (✔MEASURED, run n2a: every exec link of objects alone was). A format that names no
+    // convention (a register-free machine) has no argument registers to count, and states none.
+    if (!format.cCallingConvention().declaresNoConvention()) {
+        auto const abi = ffi::resolveAbi(target, format, reporter);
+        if (!abi.has_value() || abi->cc == nullptr) return false;   // resolveAbi said why
+        emptyModule.stateArgCounting(argCountingOf(abi->cc->slotAligned));
+    }
     Mir                       mir = std::move(emptyModule).finish();
     TypeLattice               host{startupId, std::string{grammar.configName()}};
     std::optional<SymbolId>   init;
@@ -4881,8 +4889,9 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     // of the named objects TOGETHER, once all are read (P69 fold 2): only the
     // entry that stands among them is a reference — a later object's dropped
     // `/ENTRY:` requires nothing, as under link.exe.
-    if (linkFormat.isImageFlavor()) {
-        linker::requireEntryReference(std::span<AssembledModule>{objects});
+    if (linkFormat.isImageFlavor()
+        && !linker::requireEntryReference(std::span<AssembledModule>{objects}, reporter)) {
+        return std::nullopt;   // the unit's id space is exhausted, refused by name
     }
     return objects;
 }

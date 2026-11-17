@@ -1,0 +1,3 @@
+        if (plan.empty()) continue;
+        mod.externImports[plan.front().first].addressSlotSymbol = mod.externImports[plan.front().first].symbol;
+        // Every rewritten row's id from the module's door, ALL AT ONCE: a space too short for every one of them is

@@ -746,10 +746,33 @@ TEST(TypeDerivedPredefines, ATypeThePairRealizesButTheLanguageCannotSpellIsAConf
     bool named = false;
     for (auto const& c : conflicts) {
         named |= c.find("__INT64_TYPE__") != std::string::npos
-                 && c.find("lists no name for") != std::string::npos;
+                 && c.find("lists no name for") != std::string::npos
+                 // P69 fold f26d (ruling 617): the type as the language spells it — the
+                 // vocabulary tag `long` — never the engine's kind name (`I64 "long"`).
+                 && c.find("its type on this pair is 'long' under data model") != std::string::npos;
     }
-    EXPECT_TRUE(named) << "the conflict must name __INT64_TYPE__ and why";
+    EXPECT_TRUE(named) << "the conflict must name __INT64_TYPE__, its type and why"
+                       << (conflicts.empty() ? std::string{} : ": " + conflicts.front());
     EXPECT_TRUE(out.empty()) << "a merge with conflicts yields no effective list";
+
+    // ruling 621: the same document with no `semantics.typeSpelling` table names no type.
+    std::string bare = text;
+    std::string const key = "\"typeSpelling\": {";
+    ASSERT_NE(bare.find(key), std::string::npos) << "the shipped c document spells its types";
+    bare.replace(bare.find(key), key.size(), "\"$typeSpelling\": {");
+    auto noTable = GrammarSchema::loadFromText(bare, "<edited-c-without-type-spelling>");
+    ASSERT_TRUE(noTable.has_value()) << (noTable.error().empty() ? "" : noTable.error()[0].message);
+    std::vector<std::string> bareConflicts;
+    (void)realized(&elf, noTable->get(), ObjectFormatKind::Elf, &bareConflicts);
+    bool bareNamed = false;
+    for (auto const& c : bareConflicts) {
+        bareNamed |= c.find("__INT64_TYPE__") != std::string::npos
+                     && c.find("its type on this pair is the declared type under data model")
+                            != std::string::npos
+                     && c.find("I64") == std::string::npos;
+    }
+    EXPECT_TRUE(bareNamed) << "with no table the conflict names no type"
+                           << (bareConflicts.empty() ? std::string{} : ": " + bareConflicts.front());
 }
 
 TEST(TypeDerivedPredefines, AShippedTypedefOfAHeaderDssDoesNotShipIsAConflict) {

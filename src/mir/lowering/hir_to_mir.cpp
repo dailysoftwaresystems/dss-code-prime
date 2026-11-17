@@ -347,6 +347,10 @@ struct Lowerer {
     // direct calls go through `GlobalAddr(SymbolId)`, and codegen wires the
     // symbol to the MirFunc later. Hence: set, not map.
     std::unordered_set<std::uint32_t> functionSymbols;
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): the signature of every function this
+    // unit DEFINES (`collectFunctions`), by symbol — what a call is held to when it is stamped
+    // (`passesByItsDefinition`).
+    std::unordered_map<std::uint32_t, TypeId> definedFunctionSignatures_;
     // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the subset of
     // `functionSymbols` whose body is a C99 6.7.4p7 INLINE DEFINITION — populated
     // by `collectFunctions` from `inlineDefinitionMap`, i.e. COMPLETE before
@@ -10084,6 +10088,9 @@ struct Lowerer {
     // Args of the same class collide. (Threading per-class here also fixes the
     // latent mixed-class `D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA`: a scalar param now gets its per-class
     // index, not the param index.)
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): THE ONE CURSOR OF A CALL'S ARGUMENTS, advanced by the
+    // caller and the callee alike, and only through the placement step (`placeAggregate` / `placeScalar` /
+    // `placeResultPointer`). The caller kept a cursor of its own (`runGpr` / `runFpr`) until this fold.
     struct ArgOrdinalCounter {
         bool          slotAligned = false;
         std::uint32_t flat = 0, gpr = 0, fpr = 0;
@@ -10131,9 +10138,37 @@ struct Lowerer {
         std::size_t                fnParamsSize = 0;
         std::size_t                fixedOperandCount = 0;
         bool                       fixedOperandCountStamped = false;
-        std::uint32_t              runGpr = 0;
-        std::uint32_t              runFpr = 0;
+        ArgOrdinalCounter          cursor;        // the one placement cursor (`callSetup` seeds it)
         std::size_t                argIdx = 0;    // index of the NEXT arg child
+
+        // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): THE ONE BOUNDARY OF "THROUGH `...`".
+        // `argIdx` counts the Call's HIR CHILDREN and child 0 is the callee (`callSetup` starts
+        // at 1), so argument a is child a + 1: child `fnParamsSize` is the LAST FIXED argument
+        // and a child past it is passed through `...` (`fnParamsSize` is the callee type's
+        // `fixedParameterCount`, the count its own reception reads). This is the WRITER of the
+        // boundary: the fixed-operand count is stamped by `stampFixedOperandsAt` and nowhere
+        // else, every MIR placement that asks whether an argument goes through `...` asks
+        // `passesThroughEllipsis` here, and every later tier — lir_callconv, lir_wide_call_args,
+        // lir_regalloc, lir_rewrite, the inliner — asks the stamp through
+        // `call_payload::passesThroughEllipsis`, so no two sites can draw it apart. ✔MEASURED before this (the native witness's ellipsis caller, its Apple arm64
+        // arm): the by-value placement asked `i >= fnParamsSize`, one child early, so under
+        // Apple's `variadicArgsAlwaysStack` the LAST FIXED by-value argument was stacked while
+        // its callee read it from registers — a DSS caller wrong against a DSS and an Apple
+        // clang callee alike for a struct, `__int128`, an HFA and a complex, at 0, 1 and 3
+        // varargs; the Apple clang caller right against the DSS callee.
+        [[nodiscard]] bool isLastFixedArgument(std::size_t child) const noexcept {
+            return child == fnParamsSize;
+        }
+        [[nodiscard]] bool passesThroughEllipsis(std::size_t child) const noexcept {
+            return calleeVariadic && child > fnParamsSize;
+        }
+        // After child `child`'s operands are appended: at the last fixed argument, the
+        // fixed operands are every argument operand so far.
+        void stampFixedOperandsAt(std::size_t child) noexcept {
+            if (!isLastFixedArgument(child)) return;
+            fixedOperandCount = operands.size() - operandsBeforeArgs;
+            fixedOperandCountStamped = true;
+        }
     };
     // The outcome of advancing one argument (`processOneCallArg`): a struct arg
     // emits inline and reports `StructDone`; a scalar arg is NOT lowered here —
@@ -10142,15 +10177,14 @@ struct Lowerer {
     enum class CallArgStep : std::uint8_t { Done, ScalarPending, StructDone, Error };
 
     // What materializing ONE by-value aggregate argument produced: the Call
-    // operands to append (in order) and the per-class register cursor AFTER the
+    // operands to append (in order) and the placement cursor AFTER the
     // argument. Returned BY VALUE rather than written through a `CallLowerCtx&`
     // for the reason spelled out on `processOneCallArg` — the synthesis lowers,
     // and a lowering can move the ctx. `operands` is owned by the CALLER's frame,
     // so the `std::vector<MirInstId>&` the two appenders take can never dangle.
     struct ByValueArgResult {
         std::vector<MirInstId> operands;    // append to `ctx.operands`, in order
-        std::uint32_t          runGpr = 0;  // the ctx's NEW runGpr (not a delta)
-        std::uint32_t          runFpr = 0;  // the ctx's NEW runFpr (not a delta)
+        ArgOrdinalCounter      cursor;      // the ctx's NEW cursor (not a delta)
     };
 
     // Pre-arg-loop setup for a `Call` (mirrors the recursive arm's lines between
@@ -10205,19 +10239,27 @@ struct Lowerer {
           + ((ctx.structRetAbi.has_value()
               && ctx.structRetAbi->kind == AbiPassing::Kind::Memory
               && !config.aggregateSretViaHiddenArg) ? 1u : 0u);
-        ctx.fnParamsSize =
-            (ctx.byvalCalleeSig.valid()
-             && interner.kind(ctx.byvalCalleeSig) == TypeKind::FnSig)
-                ? interner.fnParams(ctx.byvalCalleeSig).size()
-                : 0;
-        ctx.runGpr = 0;
-        ctx.runFpr = 0;
-        if (ctx.structRetAbi.has_value()
-            && ctx.structRetAbi->kind == AbiPassing::Kind::Memory
-            && config.aggregateSretViaHiddenArg)
-            ctx.runGpr = 1;
+        ctx.fnParamsSize = fixedParameterCount(ctx.byvalCalleeSig);
+        // The result pointer (pushed above) is the call's first argument operand: the placement
+        // step places it as the callee's reception does (`lowerFunction`), in the first general
+        // register or in the convention's indirect-result register.
+        ctx.cursor = ArgOrdinalCounter{config.argSlotAligned};
+        if (ctx.structRetAbi.has_value() && ctx.structRetAbi->kind == AbiPassing::Kind::Memory)
+            (void)placeResultPointer(ctx.cursor);
         ctx.argIdx = 1;   // arg children start after the callee
         return true;
+    }
+
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): THE FIXED PARAMETERS of a function type, the
+    // ONE count both halves of a call read: the caller's last fixed argument is HIR child
+    // `fixedParameterCount` (`CallLowerCtx::fnParamsSize`, where the fixed-operand count every later
+    // tier asks through `call_payload::passesThroughEllipsis` is stamped), and the callee receives
+    // exactly these parameters (`lowerFunction`'s check) — `va_start`'s first slot is the cursor past
+    // the last of them. 0 for a type that is no function signature (an intrinsic's callee).
+    [[nodiscard]] std::size_t fixedParameterCount(TypeId fnSig) const {
+        return (fnSig.valid() && interner.kind(fnSig) == TypeKind::FnSig)
+                   ? interner.fnParams(fnSig).size()
+                   : 0;
     }
 
     // Advance ONE `Call` argument (`ctx.argIdx`), mirroring the recursive arm's
@@ -10258,27 +10300,19 @@ struct Lowerer {
                 // Copy every ctx INPUT out before the lowering, and apply every
                 // ctx OUTPUT after it — the ctx is untouched across the window.
                 bool          const variadicCallee = ctxOf().calleeVariadic;
-                // ★ P69 (lane `cs`, fold f26c2): an argument at or past the fixed
-                // parameters is passed through `...`.
-                bool          const throughEllipsis =
-                    variadicCallee && i >= ctxOf().fnParamsSize;
-                std::uint32_t const inGpr = ctxOf().runGpr;
-                std::uint32_t const inFpr = ctxOf().runFpr;
+                // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): the ctx's one boundary.
+                bool          const throughEllipsis = ctxOf().passesThroughEllipsis(i);
+                ArgOrdinalCounter const in = ctxOf().cursor;
                 ByValueArgResult materialized;
                 if (!emitByValueStructCallArg(kids[i], argTy, variadicCallee, throughEllipsis,
-                                              inGpr, inFpr, materialized))
+                                              in, materialized))
                     return CallArgStep::Error;
                 CallLowerCtx& ctx = ctxOf();   // RE-ACQUIRED after the lowering
                 ctx.operands.insert(ctx.operands.end(),
                                     materialized.operands.begin(),
                                     materialized.operands.end());
-                ctx.runGpr = materialized.runGpr;
-                ctx.runFpr = materialized.runFpr;
-                if (i == ctx.fnParamsSize) {
-                    ctx.fixedOperandCount =
-                        ctx.operands.size() - ctx.operandsBeforeArgs;
-                    ctx.fixedOperandCountStamped = true;
-                }
+                ctx.cursor = materialized.cursor;
+                ctx.stampFixedOperandsAt(i);
                 ++ctx.argIdx;
                 return CallArgStep::StructDone;   // caller pumps the next arg
             }
@@ -10290,18 +10324,18 @@ struct Lowerer {
     // arm's loop body (the ~200-line ABI block: classify, variadic carrier
     // selection per va_list strategy, the all-or-nothing register-exhaustion
     // split, the InRegisters piece push). Reads the ctx's `calleeVariadic` /
-    // `runGpr` / `runFpr` as VALUES and reports its operands + the new cursor
+    // cursor as VALUES and reports its operands + the new cursor
     // through `out`; it never sees the ctx, because it lowers (see
-    // `processOneCallArg`). Returns false on a fail-loud (already emitted).
+    // `processOneCallArg`). WHERE the argument travels is the placement step's
+    // answer (`placeAggregate`), the one the callee's reception asks
+    // (`receiveByValueParam`). Returns false on a fail-loud (already emitted).
     [[nodiscard]] bool emitByValueStructCallArg(HirNodeId argNode, TypeId argTy,
                                                 bool calleeVariadic,
                                                 bool throughEllipsis,
-                                                std::uint32_t runGpr,
-                                                std::uint32_t runFpr,
+                                                ArgOrdinalCounter cursor,
                                                 ByValueArgResult& out) {
         std::vector<MirInstId>& operands = out.operands;
-        out.runGpr = runGpr;
-        out.runFpr = runFpr;
+        out.cursor = cursor;
         auto const abi = byValueClassify(argTy, AggregatePosition::Argument);
         if (!abi.has_value()) {
             unsupported(argNode,
@@ -10323,29 +10357,10 @@ struct Lowerer {
             // ★★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
             // HOW A MEMORY-CLASS ARGUMENT TRAVELS IS THE CONVENTION'S FACT
             // (`aggregateMemoryArgument`), the SAME for a fixed and a variadic
-            // parameter: `Stack` ⇒ its bytes in the outgoing argument area (the
-            // `ByValueStackArg` carrier, no register consumed — SysV psABI 3.2.3);
-            // `CallerCopy` ⇒ a pointer to a caller copy in the next integer argument
-            // (Win64, AAPCS64). A FIXED SysV argument used to take the pointer — a
-            // silent miscompile against gcc and clang in both directions, ✔MEASURED
-            // 2026-10-07 by lane `lm`'s two-unit witnesses (the row) — and the
-            // variadic arm answered the same question from the va_list STRATEGY.
-            if (config.aggregate.memoryArgument == AggregateMemoryArgument::Stack) {
-                if (!appendByValueStackArg(operands, argNode, argTy))
-                    return false;
-            } else {
-                if (!appendByValueArg(operands, argNode, argTy, *abi))
-                    return false;
-                out.runGpr += 1;   // the pointer operand is GPR-class
-            }
+            // parameter — the placement step's first answer (`placeAggregate`).
         } else {
-            // InRegisters: count the eightbyte pieces per class.
-            std::uint32_t numGp = 0, numFp = 0;
-            for (AbiPiece const& p : abi->pieces) {
-                if (p.cls == AbiPieceClass::Fpr) ++numFp;
-                else ++numGp;
-            }
-            if (numGp == 0 && numFp == 0) {
+            AggregateRegisterNeed const need = aggregateRegisterNeed(argTy, *abi);
+            if (need.numGp == 0 && need.numFp == 0) {
                 unsupported(argNode,
                     "InRegisters struct/union arg has zero register "
                     "pieces (internal: classifier invariant "
@@ -10361,67 +10376,37 @@ struct Lowerer {
                     "(D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT)");
                 return false;
             }
-            // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14, its register half): an
-            // aggregate the convention begins at an EVEN general register (AAPCS64 C.8,
-            // `beginsAnEvenGprPair`) skips an odd one. The skipped register is a PADDING
-            // operand of the call — a value the callee never reads (it skips the
-            // register, `receiveByValueParam`), so every later argument's register and
-            // its operand position stay in step on both sides — and the skip counts
-            // toward whether the aggregate still fits (C.11: if not, it is stacked and
-            // the registers are spent).
-            std::uint32_t const padGpr =
-                (numFp == 0 && out.runGpr % 2u != 0u && beginsAnEvenGprPair(argTy, numGp)) ? 1u : 0u;
-            // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): where every argument
-            // through `...` is stacked (`variadicArgsAlwaysStack`, Apple arm64), a by-value
-            // aggregate there is the stacked carrier: its placement honours the alignment
-            // the convention places it by, where register pieces were each placed in the
-            // next 8-byte slot. ✔MEASURED (probe f14): Apple clang 21 puts a 16-aligned
-            // composite through `...` at +16 after one 8-byte vararg; DSS put it at +8.
-            // It spends no register of either class.
-            bool const alwaysStacked = throughEllipsis && config.variadicArgsAlwaysStack;
-            bool const routeToStack = alwaysStacked
-                || (!config.argSlotAligned
-                    && (out.runGpr + padGpr + numGp > config.argGprCount
-                        || out.runFpr + numFp > config.argFprCount));
-            if (routeToStack) {
-                std::uint8_t const exhaustClass =
-                    (config.aggregate.stackExhaustsRegisters && !alwaysStacked)
-                        ? (numFp > 0 ? kByValueStackArgExhaustFpr
-                                     : kByValueStackArgExhaustGpr)
-                        : kByValueStackArgExhaustNone;
-                if (!appendByValueStackArg(operands, argNode, argTy, exhaustClass))
-                    return false;
-                if (config.aggregate.stackExhaustsRegisters && !alwaysStacked) {
-                    if (out.runGpr + padGpr + numGp > config.argGprCount)
-                        out.runGpr = config.argGprCount;
-                    if (out.runFpr + numFp > config.argFprCount)
-                        out.runFpr = config.argFprCount;
-                }
-            } else {
-                if (padGpr != 0u) {
-                    MirInstId const pad =
-                        constIntOfType(0, interner.primitive(TypeKind::I64));
-                    if (!pad.valid()) return false;
-                    operands.push_back(pad);
-                    out.runGpr += padGpr;
-                }
-                if (!appendByValueArg(operands, argNode, argTy, *abi))
-                    return false;
-                out.runGpr += numGp;
-                out.runFpr += numFp;
-            }
         }
-        return true;
+        // WHERE IT TRAVELS — the placement step, the one the callee's reception asks.
+        // Stacked: its bytes ride the `ByValueStackArg` carrier, stating the class its
+        // stacking spends (C.11). In registers: the PADDING register an even pair skips
+        // (AAPCS64 C.8) leads, as an operand the callee never reads (it receives the
+        // register as an `Arg` of its own, `receiveRegisterAggregateParam`), so every later
+        // argument's register and operand position stay in step on both sides; then the
+        // pieces, or the pointer to the caller's copy (`CallerCopy`).
+        ArgPlacement const placed = placeAggregate(out.cursor, argTy, *abi, throughEllipsis);
+        if (placed.carrier == ArgCarrier::StackBytes)
+            return appendByValueStackArg(operands, argNode, argTy, placed.exhaustClass);
+        for (ArgRegister const& r : placed.registers) {
+            if (!r.padding) break;   // the padding leads
+            MirInstId const pad = constIntOfType(0, interner.primitive(TypeKind::I64));
+            if (!pad.valid()) return false;
+            operands.push_back(pad);
+        }
+        return appendByValueArg(operands, argNode, argTy, *abi);
     }
 
     // Collect a just-lowered SCALAR `Call` argument (`argResult`), mirroring the
-    // recursive arm's scalar tail after `lowerExpr(kids[i])`: push it, advance the
-    // running per-class register cursor by its scalar class, stamp the fixed-
-    // operand boundary if this was the last fixed param, and advance `ctx.argIdx`.
+    // recursive arm's scalar tail after `lowerExpr(kids[i])`: place it (the
+    // placement step, `placeScalar`, the callee's parameter loop asks the same),
+    // push it, stamp the fixed-operand boundary if this was the last fixed param,
+    // and advance `ctx.argIdx`. A refused placement (a vector) is reported and the
+    // value still pushed, so the operand list stays whole for the error's module.
     void finishScalarCallArg(CallLowerCtx& ctx, MirInstId argResult) {
         auto kids = hir.children(ctx.node);
         std::size_t const i = ctx.argIdx;          // the in-flight arg
         TypeId const argTy = hir.typeId(kids[i]);
+        std::optional<ArgPlacement> const placed = placeScalar(ctx.cursor, argTy, kids[i]);
         // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a SysV x87 80-bit `long
         // double` scalar arg is MEMORY-class — it rides the outgoing STACK (an
         // `fldt` from a stack slot), NOT an SSE register. WRAP its value (a
@@ -10429,10 +10414,11 @@ struct Lowerer {
         // in a `ByValueStackArg` carrier (payload = 16 bytes, exhaust NONE), so
         // lir_callconv reserves the outgoing slots + byte-copies the home onto
         // the stack — reusing the existing carrier + call-site copy VERBATIM
-        // (zero new caller-arg mir_to_lir). It consumes NO gpr/fpr ordinal: a
-        // bare `++runFpr` (the scalar tail below) would STEAL an SSE slot from a
-        // later F64 arg (an ABI-divergent register skew the runtime can't catch).
-        if (argTy.valid() && interner.kind(argTy) == TypeKind::F80) {
+        // (zero new caller-arg mir_to_lir). It consumes NO gpr/fpr ordinal: an FPR
+        // ordinal would STEAL an SSE slot from a later F64 arg (an ABI-divergent
+        // register skew the runtime can't catch). The placement step says so
+        // (`placeScalar`: the x87 value's carrier is its bytes).
+        if (placed.has_value() && placed->carrier == ArgCarrier::StackBytes) {
             std::array<MirInstId, 1> carrierOps{argResult};
             MirInstId const carrier =
                 mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
@@ -10442,24 +10428,12 @@ struct Lowerer {
                                        kByValueStackArgExhaustNone)
                                    << kByValueStackArgExhaustShift));
             ctx.operands.push_back(carrier.valid() ? carrier : argResult);
-            if (i == ctx.fnParamsSize) {
-                ctx.fixedOperandCount = ctx.operands.size() - ctx.operandsBeforeArgs;
-                ctx.fixedOperandCountStamped = true;
-            }
+            ctx.stampFixedOperandsAt(i);
             ++ctx.argIdx;
             return;
         }
         ctx.operands.push_back(argResult);
-        if (argTy.valid()) {
-            if (scalarArgClass(argTy) == AbiPieceClass::Fpr) ++ctx.runFpr;
-            else ++ctx.runGpr;
-        } else {
-            ++ctx.runGpr;   // typeless fallback: treat as GPR
-        }
-        if (i == ctx.fnParamsSize) {
-            ctx.fixedOperandCount = ctx.operands.size() - ctx.operandsBeforeArgs;
-            ctx.fixedOperandCountStamped = true;
-        }
+        ctx.stampFixedOperandsAt(i);
         ++ctx.argIdx;
     }
 
@@ -10505,22 +10479,212 @@ struct Lowerer {
         // from the CST→HIR side-table (a direct `setjmp`/`_setjmp` callee) — the EXACT
         // mirror of how `volatileFlagFor` rides onto a Load/Store. The optimizer's
         // returns-twice-aware passes read this MIR flag (noreturn never reaches MIR).
-        MirInstFlags const rtFlag = returnsTwiceFlagFor(node);
+        MirInstFlags callFlags = returnsTwiceFlagFor(node);
+        if (passesByItsDefinition(ctx)) callFlags = callFlags | MirInstFlags::PassesByItsDefinition;
         if (ctx.structRetAbi.has_value())
             return emitStructReturningCall(node, ctx.operands, callPayload,
-                                           *ctx.structRetAbi, ctx.structRetSlot, rtFlag);
+                                           *ctx.structRetAbi, ctx.structRetSlot, callFlags);
         return mir.addInst(MirOpcode::Call, ctx.operands, t, callPayload,
-                           /*flags=*/rtFlag);
+                           /*flags=*/callFlags);
     }
 
-    // The register class of a SCALAR/pointer param (for the per-class arg
-    // ordinal): FPR for a float type, GPR otherwise (ints, pointers, bool).
-    [[nodiscard]] AbiPieceClass scalarArgClass(TypeId ty) const {
-        TypeKind const k = interner.kind(ty);
-        return (k == TypeKind::F16 || k == TypeKind::F32
-                || k == TypeKind::F64 || k == TypeKind::F80
-                || k == TypeKind::F128)
-            ? AbiPieceClass::Fpr : AbiPieceClass::Gpr;
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of ledger 597): IS THIS CALL
+    // STAMPED (`MirInstFlags::PassesByItsDefinition`)? It is when its callee is NAMED (a direct
+    // reference, not a pointer) and is a function THIS UNIT DEFINES, and the call passes its
+    // arguments by the very signature that definition receives them by. Both halves then asked the
+    // one placement step with the same inputs, so an operand that disagrees with one of the
+    // callee's `Arg`s is a DSS defect and never a program — the MIR verifier refuses it
+    // (I_CallDisagreesWithItsDefinition) — while an unstamped call it accepts. The ruling's set is
+    // "the same unit's definition, its prototype visible at the call", and this is that set made
+    // EXACT: a prototype visible at a call of a function the unit defines is one the definition is
+    // compatible with (C 6.7p4, refused otherwise), and of those only the IDENTICAL signature is
+    // taken — a compatible spelling that differs (a qualified parameter, an array bound the other
+    // declaration completes) is left unstamped, so the check never refuses a program over a type's
+    // spelling; a call with no prototype is stamped only where its own promoted arguments ARE the
+    // definition's parameters (`typeOfACallWithoutAPrototype`), where the inputs are again
+    // identical. ✔MEASURED by probe n2p (gcc, clang, mingw-w64 gcc, Apple clang, cl): no reference
+    // refuses the unstamped shapes (`int f(); … f(1) … int f(double x)` and two units' incompatible
+    // prototypes), so the check is not widened to them.
+    [[nodiscard]] bool passesByItsDefinition(CallLowerCtx const& ctx) const {
+        auto kids = hir.children(ctx.node);
+        if (kids.empty() || hir.kind(kids[0]) != HirKind::Ref || !ctx.byvalCalleeSig.valid())
+            return false;
+        auto const it = definedFunctionSignatures_.find(hir.payload(kids[0]));
+        return it != definedFunctionSignatures_.end() && it->second.v == ctx.byvalCalleeSig.v;
+    }
+
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2, design audit N2-4): THE REGISTER
+    // CLASS OF A SCALAR ARGUMENT is the class its value's register is —
+    // `regClassForCoreType`, the one MIR→LIR's `regClassFor` reads and lir_callconv's
+    // pool follows, and the one the MIR verifier counts an `Arg` under. A VECTOR's
+    // class is its own (`VR`), and no convention this compiler ships passes one in a
+    // register: refused here BY NAME, where a two-class copy of this answer once counted
+    // it as a general register (latent in C, which has no vector types: the GNU
+    // `vector_size` attribute is refused). `at` is where the refusal is said.
+    [[nodiscard]] std::optional<AbiPieceClass> scalarArgClass(TypeId ty, HirNodeId at) {
+        TargetRegClass const rc =
+            ty.valid() ? regClassForCoreType(interner.kind(ty)) : TargetRegClass::GPR;
+        if (rc == TargetRegClass::FPR) return AbiPieceClass::Fpr;
+        if (rc != TargetRegClass::VR) return AbiPieceClass::Gpr;
+        unsupported(at, "an argument of vector type cannot be placed: its register class "
+                        "is the vector one, and the calling convention declares no vector "
+                        "argument registers — a general register is not where its value lives");
+        return std::nullopt;
+    }
+
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): THE ONE PLACEMENT STEP. Where an
+    // argument travels — which registers it takes (its padding included), whether it is
+    // stacked, and what stacking spends — is decided HERE, once per argument, and both
+    // halves of a call ask it with the same inputs, advancing the one cursor
+    // (`ArgOrdinalCounter`): the caller (`callSetup`'s result pointer,
+    // `emitByValueStructCallArg`, `finishScalarCallArg`) and the callee (the result
+    // pointer, `receiveByValueParam`, the parameter loop of `lowerFunction`). The inputs
+    // are the argument's type, its classification under the convention, and whether the
+    // call passes it through `...` (`CallLowerCtx::passesThroughEllipsis`, the one
+    // boundary — a callee's parameter never is). ✔MEASURED before it (design audit N2-2):
+    // the caller kept its own cursor and every decision was written twice — the even-pair
+    // skip, the straddle test, AAPCS64's clamp, the scalar class — so the halves agreed
+    // only because two copies of each expression agreed, the shape N1 was on the
+    // ellipsis boundary. Inverting the step's parity now moves caller and callee together.
+    enum class ArgCarrier : std::uint8_t {
+        Registers,        // one register per `Arg` and per call operand: its padding, then its pieces (a scalar: one)
+        StackBytes,       // its bytes in the argument area: ONE call operand, no `Arg` (the `ByValueStackArg`
+                          // carrier / `RecvByValueStackParam`)
+        IndirectResult,   // the result pointer in the convention's own register (`indirectResultRegister`, x8):
+                          // ONE call operand, no `Arg` (`ReadIndirectResult`)
+    };
+    struct ArgRegister {
+        AbiPieceClass cls;        // the register's class
+        std::uint32_t ordinal;    // the `Arg` payload: per class, or flat under `slotAligned`
+        std::uint32_t position;   // the call operand carrying it (`arg_payload.hpp`)
+        bool          padding;    // the register an even pair skips (AAPCS64 C.8): passed, never read
+    };
+    struct ArgPlacement {
+        ArgCarrier               carrier = ArgCarrier::Registers;
+        std::vector<ArgRegister> registers;      // Registers: in operand order, the padding first
+        std::uint32_t            position = 0;   // StackBytes / IndirectResult: its one operand
+        // Registers, a scalar: its register is past its class's pool, so its value rides the
+        // incoming stack — lir_callconv's cursor reads its `Arg` there, and the callee
+        // accounts it in the byte cursor `va_start` reads (`receiveScalarAt`).
+        bool                     pastPool = false;
+        // StackBytes: the class its stacking spends (AAPCS64 C.11), stated on the caller's carrier.
+        std::uint8_t             exhaustClass = kByValueStackArgExhaustNone;
+    };
+
+    // The registers an InRegisters argument of `aggTy` takes, per class, and whether the
+    // convention begins it at an EVEN general register (`beginsAnEvenGprPair`, AAPCS64
+    // C.8). The one count of an aggregate's pieces: the placement step and `va_arg`'s pair
+    // rounding (`lowerVaArgAggregate`) read it.
+    struct AggregateRegisterNeed {
+        std::uint32_t numGp = 0, numFp = 0;
+        bool          evenPair = false;
+    };
+    [[nodiscard]] AggregateRegisterNeed aggregateRegisterNeed(TypeId aggTy, AbiPassing const& abi) {
+        AggregateRegisterNeed need;
+        for (AbiPiece const& p : abi.pieces) {
+            if (p.cls == AbiPieceClass::Fpr) ++need.numFp; else ++need.numGp;
+        }
+        need.evenPair = need.numFp == 0 && beginsAnEvenGprPair(aggTy, need.numGp);
+        return need;
+    }
+
+    [[nodiscard]] static ArgRegister takeRegister(ArgOrdinalCounter& cursor, AbiPieceClass cls,
+                                                  bool padding) {
+        std::uint32_t const ordinal  = cursor.next(cls);
+        std::uint32_t const position = cursor.nextPosition();
+        return ArgRegister{cls, ordinal, position, padding};
+    }
+    [[nodiscard]] static ArgPlacement placeOneOperand(ArgOrdinalCounter& cursor, ArgCarrier carrier,
+                                                      std::uint8_t exhaustClass) {
+        ArgPlacement placed;
+        placed.carrier      = carrier;
+        placed.position     = cursor.nextPosition();
+        placed.exhaustClass = exhaustClass;
+        return placed;
+    }
+
+    // A scalar of class `cls`: its next register — and, on a convention that counts the
+    // classes apart, whether that register is past the class's pool.
+    [[nodiscard]] ArgPlacement placeScalarOfClass(ArgOrdinalCounter& cursor, AbiPieceClass cls) {
+        ArgPlacement placed;
+        std::uint32_t const taken = (cls == AbiPieceClass::Fpr) ? cursor.fpr : cursor.gpr;
+        std::uint32_t const pool  = (cls == AbiPieceClass::Fpr) ? config.argFprCount
+                                                                : config.argGprCount;
+        placed.pastPool = !config.argSlotAligned && taken >= pool;
+        placed.registers.push_back(takeRegister(cursor, cls, /*padding=*/false));
+        return placed;
+    }
+
+    // A SCALAR argument of type `ty`: the x87 `long double` travels as its bytes (LD-4: SysV
+    // makes it MEMORY class, `finishScalarCallArg`), every other scalar in its class's next
+    // register. nullopt where the class is refused (`scalarArgClass`, said at `at`).
+    [[nodiscard]] std::optional<ArgPlacement> placeScalar(ArgOrdinalCounter& cursor, TypeId ty,
+                                                          HirNodeId at) {
+        if (ty.valid() && interner.kind(ty) == TypeKind::F80)
+            return placeOneOperand(cursor, ArgCarrier::StackBytes, kByValueStackArgExhaustNone);
+        std::optional<AbiPieceClass> const cls = scalarArgClass(ty, at);
+        if (!cls.has_value()) return std::nullopt;
+        return placeScalarOfClass(cursor, *cls);
+    }
+
+    // A MEMORY-class result's pointer, the call's first argument operand: in the first
+    // general register where the convention passes it as a hidden argument
+    // (`aggregateSretViaHiddenArg`: SysV, Win64), else in its own register
+    // (AAPCS64's x8), which takes the operand and no argument register.
+    [[nodiscard]] ArgPlacement placeResultPointer(ArgOrdinalCounter& cursor) {
+        if (config.aggregateSretViaHiddenArg)
+            return placeScalarOfClass(cursor, AbiPieceClass::Gpr);
+        return placeOneOperand(cursor, ArgCarrier::IndirectResult, kByValueStackArgExhaustNone);
+    }
+
+    // A BY-VALUE AGGREGATE argument of `aggTy`, classified `abi`:
+    //   * MEMORY class travels by the convention's carrier (`aggregateMemoryArgument`): its
+    //     bytes in the argument area (`Stack`, SysV psABI 3.2.3), or a pointer to a caller
+    //     copy in the next general register (`CallerCopy`: Win64, AAPCS64). ✔MEASURED
+    //     2026-10-07 (lane `lm`'s two-unit witnesses): a fixed SysV argument once took the
+    //     pointer, a silent miscompile against gcc and clang in both directions.
+    //   * Through `...` where every such argument is stacked (`variadicArgsAlwaysStack`,
+    //     Apple arm64), its bytes, spending no register (✔MEASURED, probe f14: Apple clang
+    //     21 puts a 16-aligned composite through `...` at +16 after one 8-byte vararg).
+    //   * Begun at an EVEN general register (AAPCS64 C.8), one odd register is skipped
+    //     first, as a padding register, and the skip counts toward the fit.
+    //   * All or nothing: where its registers (the padding included) do not all fit what
+    //     is left of each class's pool, its bytes go to the stack, never split — and where
+    //     the convention says stacking spends the registers (`aggregateStackExhaustsRegisters`,
+    //     AAPCS64 C.11: NGRN/NSRN ← 8), the class that overflowed is spent. The spend only
+    //     RAISES the counter: one already past the pool (a scalar stacked before) keeps its
+    //     count, so no ordinal is handed out twice. A slot-aligned convention (Win64) places
+    //     every aggregate in one slot and never straddles.
+    [[nodiscard]] ArgPlacement placeAggregate(ArgOrdinalCounter& cursor, TypeId aggTy,
+                                              AbiPassing const& abi, bool throughEllipsis) {
+        if (abi.kind == AbiPassing::Kind::Memory) {
+            if (config.aggregate.memoryArgument == AggregateMemoryArgument::Stack)
+                return placeOneOperand(cursor, ArgCarrier::StackBytes, kByValueStackArgExhaustNone);
+            return placeScalarOfClass(cursor, AbiPieceClass::Gpr);   // the caller copy's pointer
+        }
+        AggregateRegisterNeed const need = aggregateRegisterNeed(aggTy, abi);
+        std::uint32_t const padGpr = (need.evenPair && cursor.gpr % 2u != 0u) ? 1u : 0u;
+        bool const alwaysStacked = throughEllipsis && config.variadicArgsAlwaysStack;
+        bool const gprOver = cursor.gpr + padGpr + need.numGp > config.argGprCount;
+        bool const fprOver = cursor.fpr + need.numFp > config.argFprCount;
+        if (alwaysStacked || (!config.argSlotAligned && (gprOver || fprOver))) {
+            bool const spends = config.aggregate.stackExhaustsRegisters && !alwaysStacked;
+            std::uint8_t const exhaust =
+                !spends ? kByValueStackArgExhaustNone
+                        : (need.numFp > 0 ? kByValueStackArgExhaustFpr : kByValueStackArgExhaustGpr);
+            ArgPlacement placed = placeOneOperand(cursor, ArgCarrier::StackBytes, exhaust);
+            if (spends) {
+                if (gprOver) cursor.gpr = std::max(cursor.gpr, config.argGprCount);
+                if (fprOver) cursor.fpr = std::max(cursor.fpr, config.argFprCount);
+            }
+            return placed;
+        }
+        ArgPlacement placed;
+        if (padGpr != 0u)
+            placed.registers.push_back(takeRegister(cursor, AbiPieceClass::Gpr, /*padding=*/true));
+        for (AbiPiece const& p : abi.pieces)
+            placed.registers.push_back(takeRegister(cursor, p.cls, /*padding=*/false));
+        return placed;
     }
 
     // Classify `aggTy` for by-value passing under the active CC's strategy, for
@@ -10557,8 +10721,8 @@ struct Lowerer {
     // argument of `aggTy` passed in `numGp` general registers begin at an EVEN one (the
     // convention's `evenGprPairAlignment`, AAPCS64 C.8)? Only an argument of two
     // registers can be aligned to 16 (its size is a multiple of its alignment), and its
-    // alignment is the one the stack places it by. The caller (`emitByValueStructCallArg`),
-    // the callee (`receiveByValueParam`) and `va_arg` (the AAPCS64 arm) each ask this.
+    // alignment is the one the stack places it by. Asked through `aggregateRegisterNeed`, by
+    // the placement step (both halves of a call) and by `va_arg` (the AAPCS64 arm).
     [[nodiscard]] bool beginsAnEvenGprPair(TypeId aggTy, std::uint32_t numGp) {
         if (config.evenGprPairAlignment == 0 || numGp != 2 || config.argSlotAligned) return false;
         StructLayout const* layout = cachedLayout(aggTy);
@@ -10686,7 +10850,7 @@ struct Lowerer {
     // eightbyte read can't over-run a non-padded source), then pushes ONE Call operand:
     // a `ByValueStackArg` wrapping the temp address, carrying the aggregate byte size as
     // its payload. lir_callconv places it at the next overflow offset(s) (NOT a register
-    // — runGpr/runFpr are NOT advanced by the caller). CC-NEUTRAL: no SysV-specific
+    // — the placement step takes none for it, `placeAggregate`). CC-NEUTRAL: no SysV-specific
     // assumption; the Win64/AAPCS64 struct-vararg cycles reuse this carrier. Returns
     // false (fail-loud already emitted).
     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register class the
@@ -10743,94 +10907,40 @@ struct Lowerer {
         return true;
     }
 
-    // Receive a by-value struct/union PARAM into its frame slot, consuming
-    // physical-arg ordinals from the per-class `ArgOrdinalCounter` (kept in
-    // lockstep with the caller's operand order). InRegisters ⇒ one Arg per
-    // eightbyte, each stored
-    // into the slot at its offset (the 16-rounded slot absorbs trailing
-    // padding). Memory ⇒ by the convention's carrier: under `Stack` its bytes are
-    // received from the incoming stack (`receiveStackedAggregateParam`); under
-    // `CallerCopy` the incoming pointer to the caller's private copy IS the param's
-    // storage (no re-copy). Returns false (fail-loud emitted).
+    // Receive a by-value struct/union PARAM into its frame slot where the placement
+    // step put it (`placeAggregate`, the answer the caller's `emitByValueStructCallArg`
+    // asks with the same inputs). Registers ⇒ one Arg per register — its padding, then
+    // one per eightbyte, each stored into the slot at its offset (the 16-rounded slot
+    // absorbs trailing padding); or, `CallerCopy`, the incoming pointer to the caller's
+    // private copy, which IS the param's storage (no re-copy). Its bytes ⇒ received
+    // from the incoming stack (`receiveStackedAggregateParam`): a MEMORY-class one under
+    // `Stack`, or one whose registers did not all fit. Returns false (fail-loud emitted).
     [[nodiscard]] bool receiveByValueParam(SymbolId sym, TypeId aggTy,
                                            HirNodeId anchor, AbiPassing const& abi,
                                            ArgOrdinalCounter& ctr) {
-        // ★★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
-        // a MEMORY-class parameter of a `Stack` convention arrives as its BYTES in the
-        // incoming argument area — the callee mirror of the caller's carrier — and is
-        // received there, consuming no register ordinal; only a `CallerCopy`
-        // convention hands a pointer (below).
-        if (abi.kind == AbiPassing::Kind::Memory
-            && config.aggregate.memoryArgument == AggregateMemoryArgument::Stack)
-            return receiveStackedAggregateParam(sym, aggTy, anchor, ctr, 0, 0);
+        ArgPlacement const placed = placeAggregate(ctr, aggTy, abi, /*throughEllipsis=*/false);
+        if (placed.carrier == ArgCarrier::StackBytes)
+            return receiveStackedAggregateParam(sym, aggTy, anchor, placed.position);
         if (abi.kind == AbiPassing::Kind::Memory) {
-            // The hidden pointer is GPR-class. If the GPR pool is already exhausted
-            // (an INDEPENDENT-counter CC) the pointer itself rides the incoming stack
-            // — a stacked SCALAR; account it in the byte cursor so va_start's
-            // overflow base skips it (D-FC12-...), and — after a stacked aggregate
-            // — read it at the offset that cursor gave it
-            // (D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED).
-            std::optional<std::uint32_t> stackedAt;
-            if (!config.argSlotAligned && ctr.gpr >= config.argGprCount)
-                stackedAt = accountFixedStackScalar(interner.pointer(aggTy));
-            std::uint32_t const pos = ctr.nextPosition();  // one call operand
-            std::uint32_t const ord = ctr.next(AbiPieceClass::Gpr);
-            MirInstId const ptr =
-                (stackedAt.has_value() && currentFnSawStackedAggregate_)
-                    ? receiveStackedScalarAt(*stackedAt, interner.pointer(aggTy))
-                    : mir.addArg(ord, interner.pointer(aggTy), pos);
+            // `CallerCopy`: the hidden pointer is a scalar of the general class, received
+            // where the step put it — past the pool, from the incoming stack
+            // (D-FC12-..., D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED).
+            MirInstId const ptr = receiveScalarAt(placed, interner.pointer(aggTy));
             if (!ptr.valid()) return false;
             addressableLocal[sym.v] = ptr;   // the caller's copy is the param
             return true;
         }
-        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: ALL-OR-NOTHING straddle.
-        // For an INDEPENDENT-counter CC, if the aggregate's eightbyte pieces do not all
-        // fit the remaining arg registers it is received WHOLLY from the incoming stack
-        // (never split) — the callee mirror of the caller's `ByValueStackArg` carrier.
-        // Win64 (slotAligned) never straddles (one struct = one positional slot).
-        std::uint32_t numGp = 0, numFp = 0;
-        for (AbiPiece const& p : abi.pieces) {
-            if (p.cls == AbiPieceClass::Fpr) ++numFp; else ++numGp;
-        }
-        // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14, its register half): an
-        // aggregate the convention begins at an EVEN general register (AAPCS64 C.8,
-        // `beginsAnEvenGprPair`) skips the odd one first — the register the caller's
-        // padding operand holds (`emitByValueStructCallArg`) — and that skip counts
-        // toward whether it still fits: when it does not, it is stacked and the
-        // registers are spent (C.11).
-        std::uint32_t const padGpr =
-            (numFp == 0 && ctr.gpr % 2u != 0u && beginsAnEvenGprPair(aggTy, numGp)) ? 1u : 0u;
-        bool const straddles = !config.argSlotAligned
-            && (ctr.gpr + padGpr + numGp > config.argGprCount
-                || ctr.fpr + numFp > config.argFprCount);
-        if (straddles)
-            return receiveStackedAggregateParam(sym, aggTy, anchor, ctr, padGpr + numGp, numFp);
-        // The skipped register is RECEIVED, as the caller's padding operand is passed: an
-        // `Arg` of its own, which the body never reads. A function's `Arg`s are the
-        // registers its convention gives it, one each, so their ordinals have no gap — the
-        // invariant the MIR verifier bounds every ordinal by (I_ArgIndexOutOfRange) and the
-        // inliner maps each to the call operand at its position (here, the padding operand).
-        // ✔MEASURED (run f26c2-f, linux-arm64-debug): skipping the register with no `Arg`
-        // left `paired(long, struct {__int128})`'s ordinals 0, 2, 3 under three `Arg`s, and
-        // the verifier refused the native witness's AAPCS64 callees.
-        if (padGpr != 0u) {
-            std::uint32_t const padPos = ctr.nextPosition();   // the caller's padding operand
-            MirInstId const pad =
-                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.primitive(TypeKind::I64), padPos);
-            if (!pad.valid()) return false;
-        }
-        // Register-resident: receive each eightbyte from its arg register into the
-        // 16-rounded slot at its offset (trailing padding absorbed).
-        return receiveRegisterAggregateParam(sym, aggTy, anchor, abi, ctr);
+        return receiveRegisterAggregateParam(sym, aggTy, anchor, abi, placed);
     }
 
     // A by-value aggregate PARAMETER received WHOLLY from the incoming stack: a
     // MEMORY-class one under a `Stack` convention, or an InRegisters one whose
-    // `numGp`/`numFp` pieces did not all fit the remaining registers (the straddle).
-    // Byte-copies it from its incoming address into the parameter's own slot.
+    // pieces did not all fit the remaining registers (the straddle) — the placement
+    // step's answer, which also spent the registers its stacking spends. `position`
+    // is the call operand of the caller's carrier. Byte-copies it from its incoming
+    // address into the parameter's own slot.
     [[nodiscard]] bool receiveStackedAggregateParam(SymbolId sym, TypeId aggTy, HirNodeId anchor,
-                                                    ArgOrdinalCounter& ctr, std::uint32_t numGp,
-                                                    std::uint32_t numFp) {
+                                                    std::uint32_t position) {
         // ★ SITED BY THE BYTE CURSOR, WHATEVER WAS STACKED BEFORE IT (P68 round
         // 8, D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED). This used
         // to refuse an aggregate that followed ANY stacked fixed parameter, on
@@ -10865,12 +10975,11 @@ struct Lowerer {
         // local slot (by-value semantics, the by-reference reception precedent
         // but reading from the stack).
         // The stacked aggregate rides ONE `ByValueStackArg` carrier
-        // operand on the call side (no Arg here — RecvByValueStackParam) —
-        // advance the flat position past that operand so later params stay
-        // aligned to the operand list (arg_payload.hpp). P69 (fold f26c): the
-        // position is STAMPED on the reception (payload2 = position + 1), so the
-        // inliner maps it to the call's carrier exactly as it maps an `Arg`.
-        std::uint32_t const position = ctr.nextPosition();
+        // operand on the call side (no Arg here — RecvByValueStackParam) — the
+        // placement step took its flat position, so later params stay aligned to
+        // the operand list (arg_payload.hpp). P69 (fold f26c): the position is
+        // STAMPED on the reception (payload2 = position + 1), so the inliner maps
+        // it to the call's carrier exactly as it maps an `Arg`.
         // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: round the cursor to the
         // boundary this CC honours for a stacked aggregate BEFORE taking the
         // offset, with the SAME call the caller's cursor makes ON THE SAME
@@ -10898,35 +11007,46 @@ struct Lowerer {
         if (!src.valid()) return false;
         if (!lowerByteWiseCopy(src, slot, layout->size)) return false;
         addressableLocal[sym.v] = slot;
-        // Advance the byte cursor by this aggregate's rounded incoming-stack span,
-        // then EXHAUST-or-BACKFILL the overflowed per-class cursor: AAPCS64 sets
-        // NGRN/NSRN ← pool (clamp, no backfill); SysV leaves the cursor (backfill).
-        // Config-driven (gcc aarch64_layout_arg vs function_arg_advance_64), never
-        // an arch identity branch.
+        // Advance the byte cursor by this aggregate's rounded incoming-stack span. The
+        // EXHAUST-or-BACKFILL of the overflowed class (AAPCS64 sets NGRN/NSRN ← pool;
+        // SysV leaves the cursor, backfilling) is the placement step's, made once for
+        // both halves of the call (`placeAggregate`).
         std::uint32_t const slot8 = stackSlotBytes();
         currentFnFixedStackBytes_ += roundUpToSlot(
             static_cast<std::uint32_t>(layout->size), slot8);
         currentFnSawStackedAggregate_ = true;
         currentFnSawFixedStackParam_  = true;
-        if (config.aggregate.stackExhaustsRegisters) {
-            if (ctr.gpr + numGp > config.argGprCount)
-                ctr.gpr = config.argGprCount;
-            if (ctr.fpr + numFp > config.argFprCount)
-                ctr.fpr = config.argFprCount;
-        }
         return true;
     }
 
-    // An InRegisters by-value aggregate PARAMETER whose pieces all fit: each
+    // An InRegisters by-value aggregate PARAMETER whose registers all fit, at the
+    // registers the placement step gave it. The PADDING register an even pair skips
+    // is RECEIVED, as the caller's padding operand is passed: an `Arg` of its own, which
+    // the body never reads — a function's `Arg`s are the registers its convention gives
+    // it, one each, so their ordinals have no gap (the MIR verifier's density rule) and
+    // the inliner maps each to the call operand at its position. ✔MEASURED (run
+    // f26c2-f, linux-arm64-debug): skipping the register with no `Arg` left
+    // `paired(long, struct {__int128})`'s ordinals 0, 2, 3 under three `Arg`s. Then each
     // eightbyte from its arg register into the 16-rounded slot at its offset.
     [[nodiscard]] bool receiveRegisterAggregateParam(SymbolId sym, TypeId aggTy, HirNodeId anchor,
-                                                     AbiPassing const& abi, ArgOrdinalCounter& ctr) {
+                                                     AbiPassing const& abi, ArgPlacement const& placed) {
+        std::size_t r = 0;
+        for (; r < placed.registers.size() && placed.registers[r].padding; ++r) {
+            ArgRegister const& pad = placed.registers[r];
+            if (!mir.addArg(pad.ordinal, interner.primitive(TypeKind::I64), pad.position).valid())
+                return false;
+        }
+        if (placed.registers.size() - r != abi.pieces.size()) {
+            unsupported(anchor, "by-value parameter: its placement holds a register count its "
+                                "classification does not (internal: placement invariant violated)");
+            return false;
+        }
         MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
         if (!slot.valid()) return false;
         for (AbiPiece const& p : abi.pieces) {
             TypeId const pty = pieceType(p);
-            std::uint32_t const pos = ctr.nextPosition();  // one operand per piece
-            MirInstId const a = mir.addArg(ctr.next(p.cls), pty, pos);
+            ArgRegister const& reg = placed.registers[r++];
+            MirInstId const a = mir.addArg(reg.ordinal, pty, reg.position);
             if (!a.valid()) return false;
             MirInstId const offK =
                 constInt(static_cast<std::int64_t>(p.byteOffset));
@@ -11044,6 +11164,25 @@ struct Lowerer {
         currentFnFixedStackBytes_ = off + size;
         currentFnSawFixedStackParam_  = true;
         return off;
+    }
+
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): a SCALAR parameter of type `ty` —
+    // or a `CallerCopy` aggregate's pointer, or a SysV `va_list` parameter's — received
+    // where the placement step put it (`placed`, of `placeScalar` / `placeScalarOfClass`):
+    // its register's `Arg`. Past its class's pool it rides the incoming stack, so it is
+    // accounted in the byte cursor (`va_start`'s overflow base, D-FC12-…) and — after a
+    // stacked aggregate — read at the offset that cursor gives it
+    // (D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED); before one, its `Arg` and
+    // lir_callconv's incoming cursor agree by construction. The `va_list` parameter took
+    // an `Arg` with no such test until this step was its one asker (a SysV
+    // `f(long ×6, va_list ap, ...)` stacks `ap`, which `va_start`'s base then missed).
+    [[nodiscard]] MirInstId receiveScalarAt(ArgPlacement const& placed, TypeId ty) {
+        ArgRegister const& reg = placed.registers.front();
+        if (placed.pastPool) {
+            std::uint32_t const off = accountFixedStackScalar(ty);
+            if (currentFnSawStackedAggregate_) return receiveStackedScalarAt(off, ty);
+        }
+        return mir.addArg(reg.ordinal, ty, reg.position);
     }
 
     // A stacked fixed SCALAR read at the byte offset `accountFixedStackScalar`
@@ -12392,7 +12531,9 @@ struct Lowerer {
             // GPR (integer/pointer) walks __gr_offs/__gr_top/gpSlotBytes; FPR (float)
             // walks __vr_offs/__vr_top/fpSlotBytes. The cursor is a NEGATIVE i32 that
             // counts up toward 0; while < 0 a register slot remains.
-            bool const isFpr = (scalarArgClass(t) == AbiPieceClass::Fpr);
+            std::optional<AbiPieceClass> const tCls = scalarArgClass(t, node);
+            if (!tCls.has_value()) return InvalidMirInst;
+            bool const isFpr = (*tCls == AbiPieceClass::Fpr);
             VaListLayout::Field const& offField =
                 isFpr ? vl.vrOffsField : vl.grOffsField;
             VaListLayout::Field const& topField =
@@ -12516,7 +12657,9 @@ struct Lowerer {
         // Classify the SCALAR: SSE (FPR) reads the fp cursor; INTEGER (GPR) the gp
         // cursor. (A scalar isn't an aggregate; `scalarArgClass` is the direct
         // equivalent of the eightbyte INTEGER/SSE split for one register.)
-        bool const isSse = (scalarArgClass(t) == AbiPieceClass::Fpr);
+        std::optional<AbiPieceClass> const tCls = scalarArgClass(t, node);
+        if (!tCls.has_value()) return InvalidMirInst;
+        bool const isSse = (*tCls == AbiPieceClass::Fpr);
         VaListLayout::Field const& offField =
             isSse ? vl.fpOffsetField : vl.gpOffsetField;
         std::uint32_t const offLimit = isSse ? vl.fpOffsetLimit : vl.gpOffsetLimit;
@@ -12780,11 +12923,10 @@ struct Lowerer {
             MirInstId const tagBase = vaTagBase(kids[0]);   // child 1 NEVER lowered
             if (!tagBase.valid()) return InvalidMirInst;
 
-            // Count + class-check the pieces (the classifier guarantees pure-class).
-            std::uint32_t numGp = 0, numFp = 0;
-            for (AbiPiece const& p : abi->pieces) {
-                if (p.cls == AbiPieceClass::Fpr) ++numFp; else ++numGp;
-            }
+            // Count + class-check the pieces (the classifier guarantees pure-class) — the
+            // placement step's count (`aggregateRegisterNeed`), its even-pair answer included.
+            AggregateRegisterNeed const need = aggregateRegisterNeed(t, *abi);
+            std::uint32_t const numGp = need.numGp, numFp = need.numFp;
             bool const isHfa =
                 (abi->kind == AbiPassing::Kind::InRegisters && numFp > 0 && numGp == 0);
             bool const isGprInReg =
@@ -12908,7 +13050,7 @@ struct Lowerer {
             // what gcc 13.3.0 and clang 18.1.3 emit (probe f14r: `__gr_offs` -56 read
             // as -48). The rounded cursor is the one consumed, so a pair that no longer
             // fits goes to the stack and spends the registers it skipped.
-            if (isGprInReg && beginsAnEvenGprPair(t, numGp)) {
+            if (isGprInReg && need.evenPair) {
                 std::int64_t const pairAlign = config.evenGprPairAlignment;
                 MirInstId const biasK = constIntOfType(pairAlign - 1, i32);
                 MirInstId const maskK = constIntOfType(-pairAlign, i32);
@@ -15929,7 +16071,7 @@ struct Lowerer {
             auto const s = interner.fnParams(signature);
             return std::vector<TypeId>(s.begin(), s.end());
         }();
-        if (params.size() != paramTypes.size()) {
+        if (params.size() != fixedParameterCount(signature)) {
             unsupported(node,
                 std::format("Function param count {} mismatches FnSig param "
                             "count {}", params.size(), paramTypes.size()));
@@ -16104,10 +16246,13 @@ struct Lowerer {
                     // ReadIndirectResult stands in for. Advance the flat
                     // position for it in BOTH cases so the real params start at
                     // position 1, matching the operand list (arg_payload.hpp).
-                    std::uint32_t const sretPos = argCtr.nextPosition();
-                    sretPtr_ = config.aggregateSretViaHiddenArg
-                        ? mir.addArg(argCtr.next(AbiPieceClass::Gpr),
-                                     interner.pointer(currentFnResult_), sretPos)
+                    // ★ P69 (fold f26d — review-csf26c2 N2): placed by the step the
+                    // caller's `callSetup` asks (`placeResultPointer`).
+                    ArgPlacement const sretAt = placeResultPointer(argCtr);
+                    sretPtr_ = sretAt.carrier == ArgCarrier::Registers
+                        ? mir.addArg(sretAt.registers.front().ordinal,
+                                     interner.pointer(currentFnResult_),
+                                     sretAt.registers.front().position)
                         : mir.addReadIndirectResult(
                               interner.pointer(currentFnResult_));
                     if (!sretPtr_.valid()) {
@@ -16219,9 +16364,10 @@ struct Lowerer {
             // params took the by-value-struct arm above.)
             if (isSysVVaListParam(ty)) {
                 auto const ops = interner.operands(ty);
-                std::uint32_t const pos = argCtr.nextPosition();  // one operand
-                MirInstId const ptr = mir.addArg(argCtr.next(AbiPieceClass::Gpr),
-                                                 interner.pointer(ops[0]), pos);
+                TypeId const tagPtr = interner.pointer(ops[0]);
+                std::optional<ArgPlacement> const ptrAt = placeScalar(argCtr, tagPtr, p);
+                MirInstId const ptr =
+                    ptrAt.has_value() ? receiveScalarAt(*ptrAt, tagPtr) : InvalidMirInst;
                 if (!ptr.valid()) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
@@ -16244,8 +16390,16 @@ struct Lowerer {
             // double-counts its slot and hands va_start a wrong overflow base
             // (invisible to a non-variadic witness). F80 forms ONLY on the x87-80
             // axis (SysV/darwin, !argSlotAligned) by construction, so the TypeKind
-            // is the ISA proxy — no CC/format gate needed.
-            if (interner.kind(ty) == TypeKind::F80) {
+            // is the ISA proxy — no CC/format gate needed. ★ P69 (fold f26d —
+            // review-csf26c2 N2): the placement step answers it (`placeScalar`: its
+            // bytes), the one the caller's `finishScalarCallArg` asks, and took its
+            // call operand.
+            std::optional<ArgPlacement> const placed = placeScalar(argCtr, ty, p);
+            if (!placed.has_value()) {
+                if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                return false;
+            }
+            if (placed->carrier == ArgCarrier::StackBytes) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
@@ -16275,7 +16429,6 @@ struct Lowerer {
                 currentFnFixedStackBytes_ += 16;   // the 16-byte x87 stack slot
                 currentFnSawStackedAggregate_ = true;
                 currentFnSawFixedStackParam_  = true;
-                (void)argCtr.nextPosition();       // one call operand (the carrier)
                 MirInstId const src =
                     mir.addInst(MirOpcode::RecvByValueStackParam, {},
                                 interner.pointer(ty), /*payload=*/byteOff);
@@ -16288,39 +16441,19 @@ struct Lowerer {
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA): a scalar
             // param's `Arg` payload is its PER-CLASS register ordinal (GPR/FPR
-            // counted separately for an independent CC), not the param index.
-            AbiPieceClass const sCls = scalarArgClass(ty);
+            // counted separately for an independent CC), not the param index — the
+            // placement step's register (`placeScalar`, above).
             // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a scalar whose
-            // per-class ordinal has reached the pool rides the INCOMING stack
-            // (independent CC); account it in the byte cursor so a body va_start's
-            // overflow base skips it, and fail loud on the post-stacked-aggregate
-            // desync residual. The byte cursor feeds EVERY va_start arm whose base is
+            // register is past its class's pool rides the INCOMING stack
+            // (independent CC) and is accounted in the byte cursor
+            // (`receiveScalarAt`), which feeds EVERY va_start arm whose base is
             // the incoming-overflow area: SysVRegisterSave, Aapcs64DualCursor, AND the
             // HomogeneousPointer/variadicUsesOverflowBase (Apple arm64) branch. Only
             // the OTHER HomogeneousPointer branch — Win64, slot-aligned, the home-base
-            // path keyed on currentFnFixedFlat_ — is independent of it, and that branch
-            // never reaches here (the `!argSlotAligned` gate above excludes it), which
-            // is why this cursor stays 0 on Win64.
-            std::optional<std::uint32_t> stackedAt;
-            if (!config.argSlotAligned) {
-                std::uint32_t const ord =
-                    (sCls == AbiPieceClass::Fpr) ? argCtr.fpr : argCtr.gpr;
-                std::uint32_t const pool =
-                    (sCls == AbiPieceClass::Fpr) ? config.argFprCount
-                                                 : config.argGprCount;
-                if (ord >= pool) stackedAt = accountFixedStackScalar(ty);
-            }
-            std::uint32_t const scalarPos = argCtr.nextPosition();  // one operand
-            std::uint32_t const scalarOrd = argCtr.next(sCls);
-            // D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED: a stacked
-            // scalar AFTER a stacked aggregate is read at the byte offset the cursor
-            // above gave it — the one placement model past the first stacked
-            // aggregate (`accountFixedStackScalar`'s docblock); before one, the
-            // `Arg` and lir_callconv's cursor agree with that cursor by construction.
-            MirInstId const arg =
-                (stackedAt.has_value() && currentFnSawStackedAggregate_)
-                    ? receiveStackedScalarAt(*stackedAt, ty)
-                    : mir.addArg(scalarOrd, ty, scalarPos);
+            // path keyed on currentFnFixedFlat_ — is independent of it, and a slot-
+            // aligned convention's register is never past the pool by the step's
+            // answer, which is why this cursor stays 0 on Win64.
+            MirInstId const arg = receiveScalarAt(*placed, ty);
             if (!arg.valid()) {
                 if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                 return false;
@@ -16463,6 +16596,7 @@ struct Lowerer {
             SymbolId const sym  = hir.functionSymbol(decl);
             if (!sig.valid() || !sym.valid()) continue;
             functionSymbols.insert(sym.v);
+            definedFunctionSignatures_.emplace(sym.v, sig);
             // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: read the
             // C99 6.7.4p7 mark here, in the SAME walk that registers the symbol,
             // so the two facts cannot disagree about which function they describe.
@@ -18590,6 +18724,11 @@ HirToMirResult lowerToMir(Hir const&               hir,
         ? MirAliasingMode::StrictTBAA
         : MirAliasingMode::Permissive);
     lwr.mir.setCharTypesAliasAll(config.charTypesAliasAll);
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): how this module's functions number their
+    // `Arg`s, STATED from the convention it is lowered for (`MirArgCounting`): one count over every
+    // slot where the convention aligns arguments to slots (Win64), one per register class
+    // otherwise. The MIR verifier holds every function dense under it.
+    lwr.mir.stateArgCounting(argCountingOf(config.argSlotAligned));
     // The END of the id space this unit was analysed in — its name table's end,
     // or the unit's own symbols where it is its own table. Stated ONCE, here,
     // where the module is made from the model; every minter of the module asks

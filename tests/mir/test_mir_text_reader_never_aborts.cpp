@@ -39,6 +39,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
 #include "mir/mir_text.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -101,7 +102,7 @@ void announce(char const* kind, std::size_t index, std::string_view detail) {
 }
 
 std::string oneFunction(std::string const& blocks) {
-    return "dssir 7\n"
+    return "dssir 8\n"
            "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n"
            "module {\n"
            "  function %1 : fn() -> i32 {\n" + blocks +
@@ -114,7 +115,7 @@ std::string entryBlock(std::string const& body) {
 }
 
 std::string twoFunctions(std::string const& first, std::string const& second) {
-    return "dssir 7\n"
+    return "dssir 8\n"
            "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n"
            "module {\n"
            "  function %1 : fn() -> i32 {\n" + first +
@@ -181,7 +182,7 @@ std::vector<Shape> measuredShapes() {
                     "      %v2 = const : i32 (lit int 2 : i32)\n      return %v2\n"),
          "globaladdr names symbol %0, the invalid sentinel", 1},
         {"EG a global of the invalid symbol",
-         "dssir 7\nmodule {\n  global %0 : i32 = zero\n}\n",
+         "dssir 8\nmodule {\n  global %0 : i32 = zero\n}\n",
          "a global names symbol %0, the invalid sentinel", 1},
         // ── the block rules (`openBlockHasTerminator`, `isBlockUnopened`) ──
         {"E7 an instruction after the terminator",
@@ -272,7 +273,7 @@ struct Truncation {
 };
 
 std::vector<Truncation> measuredTruncations() {
-    std::string const head = "dssir 7\nsymbols {\n  %1 \"f\"\n}\nmodule {\n"
+    std::string const head = "dssir 8\nsymbols {\n  %1 \"f\"\n}\nmodule {\n"
                              "  function %1 : fn() -> i32 {\n";
     return {
         {"H1 cut inside an operand list",
@@ -313,6 +314,7 @@ std::string goldenModule() {
     TypeId const hSig = in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     (void)b.addGlobal(i32, SymbolId{4}, b.literalPoolAdd(intLit(7)), MirFuncId{},
                       SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/true,
                       MirThreadStorage::Shared, /*alignmentBytes=*/16);
@@ -657,7 +659,7 @@ TEST(MirTextReaderNeverAborts, OneBadBlockCostsItsOwnDiagnosticAndLaterBlocksAre
 namespace {
 
 std::string preambleOnly(std::string const& symbols) {
-    return "dssir 7\nsymbols {\n" + symbols + "}\nmodule {\n}\n";
+    return "dssir 8\nsymbols {\n" + symbols + "}\nmodule {\n}\n";
 }
 
 struct ParsedTable {
@@ -734,7 +736,7 @@ TEST(MirTextSymbolTable, AClassLetterHandlePast32BitsIsRefusedNotWrapped) {
 // holding it reads, re-emits under the same id, and reads again.
 TEST(MirTextSymbolTable, AFunctionAtTheTopSymbolIdReadsAndRoundTrips) {
     std::string const text =
-        "dssir 7\nsymbols {\n  %4294967295 \"top\"\n}\nmodule {\n"
+        "dssir 8\nsymbols {\n  %4294967295 \"top\"\n}\nmodule {\n"
         "  function %4294967295 : fn() -> i32 {\n" + kOneBlockF + "  }\n}\n";
     DiagnosticReporter r1;
     auto const first = parseMir(text, CompilationUnitId{7}, r1);
@@ -831,6 +833,7 @@ Mir denseSwitchModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableEn
     std::array<TypeId, 1> params{i32};
     TypeId const fnSig = ti.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     stateIdSpace(b, tableEnd);
     b.addFunction(fnSig, SymbolId{sym});
     MirBlockId const entry = b.createBlock(StructCfMarker::SwitchHead);
@@ -891,7 +894,7 @@ Lowered lowerModule(Mir const& mir, TypeInterner const& ti, DiagnosticReporter::
     // refuses rows with none); which shape is not what these pins read.
     std::optional<ExternCallDispatch> dispatch;
     if (!imports.empty()) dispatch = ExternCallDispatch::DirectPlt;
-    Lowered out{lowerToLir(mir, *sch, ti, rep, std::move(imports), dispatch), {}, {}};
+    Lowered out{lowerToLir(mir, *sch, ti, rep, dss::test::kFirstConventionOfTheTarget, std::move(imports), dispatch), {}, {}};
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::L_SymbolIdSpaceExhausted) {
             EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
@@ -1256,12 +1259,12 @@ TEST(LoweringMintsPastTheHighWater, ABlockSymbolAnExportAlreadyOwnsIsNotMintedAg
 namespace {
 
 std::string literalGlobal(std::string const& type, std::string const& value) {
-    return "dssir 7\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
+    return "dssir 8\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
            " = lit " + value + "\n}\n";
 }
 
 std::string zeroGlobal(std::string const& type) {
-    return "dssir 7\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
+    return "dssir 8\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
            " = zero\n}\n";
 }
 
@@ -1303,7 +1306,7 @@ TEST(MirTextLiteralTwins, TheBitIntTypeWidthIsOneTheModelDefines) {
             << "_BitInt(" << w << ")" << listed(p.diagnostics);
     }
     DiagnosticReporter r;
-    auto const res = parseMir("dssir 7\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : _BitInt(" +
+    auto const res = parseMir("dssir 8\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : _BitInt(" +
                                   std::to_string(kBitIntMaxWidth) + ") = zero\n}\n",
                               CompilationUnitId{7}, r);
     std::vector<std::string> diags;

@@ -59,6 +59,7 @@
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/pe.hpp"
 #include "link/format/record_symbol_ids.hpp"
+#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV -- the module's holders
 #include "link/object_format_schema.hpp"
 
 #include "link_test_support.hpp"
@@ -101,6 +102,13 @@ struct Loaded {
         out.format = std::move(f).value();
     }
     return out;
+}
+
+// The sink of a record table built by a test, which never exhausts one (test_fresh_symbol_ids.cpp pins the
+// refusals).
+[[nodiscard]] DiagnosticReporter& recordIdsSink() {
+    static DiagnosticReporter sink;
+    return sink;
 }
 
 [[nodiscard]] bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
@@ -1219,7 +1227,7 @@ TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNam
         std::vector<std::uint32_t> owner;
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
-        RecordSymbolIds    ids{100};
+        RecordSymbolIds    ids{100, recordIdsSink(), "test::reader"};
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
         for (auto const& n : names) {
@@ -1254,7 +1262,7 @@ TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNam
         std::vector<std::uint32_t> owner;
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
-        RecordSymbolIds    ids{100};
+        RecordSymbolIds    ids{100, recordIdsSink(), "test::reader"};
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
         EXPECT_FALSE(refs.referenceFor(1, ids).has_value());
@@ -1263,7 +1271,7 @@ TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNam
 
     // An object with no symbol at all: nothing kept, and nothing to state.
     {
-        RecordSymbolIds           ids{0};
+        RecordSymbolIds           ids{0, recordIdsSink(), "test::reader"};
         WeakNameReferences        refs;
         std::vector<ModuleSymbol> rows;
         refs.decideFrom({}, {}, ids);
@@ -1293,7 +1301,7 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
 
     // A table of 100 records, none of these the first: each one's id is its
     // index, and the ids no record holds start at 101 (`RecordSymbolIds`).
-    RecordSymbolIds    ids{100};
+    RecordSymbolIds    ids{100, recordIdsSink(), "test::reader"};
     WeakNameReferences refs;
     refs.decideFrom(c, owner, ids);
     // The next id `ids` would hand out, read off a copy so the counter stays put.
@@ -1388,10 +1396,44 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
 // name through a relocatable link — is pinned where links are made
 // (`test_common_symbols.cpp`, the `RecordSymbolIds` suites).
 
+// ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): A READ MODULE CARRIES ITS RECORD TABLE'S END. Every reader hands
+// the module it builds the end of its record table (`RecordSymbolIds::end`, `AssembledModule::symbolIdEnd`): one past
+// every record's id and every fresh id it handed out, so a pass that mints on the module later
+// (`link/fresh_symbol_ids.hpp`) continues past them -- a record that became nothing of the module, and a fresh id
+// the reader dropped, included. RED-ON-DISABLE: drop a reader's carry, and its module's end stays 1, below the ids
+// the module holds.
+TEST(ObjectAtomCoverage, EveryReadModuleCarriesItsRecordTablesEnd) {
+    struct Leg {
+        char const* targetName;
+        char const* formatName;
+        EncodeFn    encode;
+        ReadFn      read;
+    };
+    Leg const legs[] = {
+        {"x86_64", "elf64-x86_64-linux", &encodeElf, &elf::readRelocatableObject},
+        {"x86_64", "pe64-x86_64-windows", &encodePe, &pe::readRelocatableObject},
+        {"arm64", "macho64-arm64-darwin", &encodeMacho, &macho::readRelocatableObject},
+    };
+    for (auto const& leg : legs) {
+        SCOPED_TRACE(leg.formatName);
+        auto loaded = loadShipped(leg.targetName, leg.formatName);
+        ASSERT_TRUE(loaded.target && loaded.format);
+        DiagnosticReporter wrep;
+        auto obj = leg.encode(subjectModule(/*withLocalHelper=*/true), *loaded.target, *loaded.format, wrep);
+        ASSERT_EQ(wrep.errorCount(), 0u);
+        DiagnosticReporter rep;
+        auto got = leg.read(obj, *loaded.target, *loaded.format, rep, {});
+        ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+        std::uint32_t const held = linker::maxExistingSymbolIdV(*got);
+        ASSERT_GT(held, 0u) << "the PREMISE: the read module holds ids";
+        EXPECT_GT(got->symbolIdEnd.value(), held) << "the module's end is past every id it holds";
+    }
+}
+
 TEST(ObjectAtomCoverage, ARecordsIdIsItsIndexAndRecordZeroTakesTheFirstIdPastTheTable) {
     using dss::link::format::RecordSymbolIds;
 
-    RecordSymbolIds ids{7};
+    RecordSymbolIds ids{7, recordIdsSink(), "test::reader"};
     EXPECT_EQ(ids.of(0), SymbolId{7}) << "record 0's index is the INVALID id: it takes the record count";
     std::vector<std::uint32_t> seen;
     for (std::uint32_t i = 0; i < 7; ++i) {
@@ -1410,10 +1452,10 @@ TEST(ObjectAtomCoverage, ARecordsIdIsItsIndexAndRecordZeroTakesTheFirstIdPastThe
 
     // The smallest tables: one record, and none (an object with no symbol can
     // still be given rows, and their ids must be valid).
-    RecordSymbolIds one{1};
+    RecordSymbolIds one{1, recordIdsSink(), "test::reader"};
     EXPECT_EQ(one.of(0), SymbolId{1});
     EXPECT_EQ(one.fresh(), SymbolId{2});
-    RecordSymbolIds none{0};
+    RecordSymbolIds none{0, recordIdsSink(), "test::reader"};
     EXPECT_TRUE(none.fresh().valid());
 }
 
@@ -1436,7 +1478,7 @@ TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIn
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
         ASSERT_EQ(owner, (std::vector<std::uint32_t>{0u, 0u}));
-        RecordSymbolIds    ids{6};
+        RecordSymbolIds    ids{6, recordIdsSink(), "test::reader"};
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
         EXPECT_FALSE(refs.referenceFor(0, ids).has_value()) << "the strong name at record 0 keeps the alias remap";
@@ -1466,7 +1508,7 @@ TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIn
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
         ASSERT_EQ(owner, (std::vector<std::uint32_t>{3u, 3u}));
-        RecordSymbolIds    ids{6};
+        RecordSymbolIds    ids{6, recordIdsSink(), "test::reader"};
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
         auto const ref = refs.referenceFor(0, ids);
@@ -1493,7 +1535,7 @@ TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIn
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
         ASSERT_EQ(owner, (std::vector<std::uint32_t>{0u, 0u}));
-        RecordSymbolIds    ids{6};
+        RecordSymbolIds    ids{6, recordIdsSink(), "test::reader"};
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
         auto const w0 = refs.referenceFor(0, ids);

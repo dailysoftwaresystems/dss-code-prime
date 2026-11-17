@@ -11,6 +11,7 @@
 #include "core/types/integer_literal_ladder.hpp"  // preprocessorLiteralSignedness (the ONE phase-4 signedness rule the shipped-constant spelling is verified against)
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/types/number_decode.hpp"   // decodeFloatLiteralAtKind (a spliced float constant read back, P69 round 4)
+#include "core/types/type_spelling.hpp"   // spellCoreKind: a declared type named as the language spells it
 #include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -810,11 +811,17 @@ shippedTypedefsForPredefines(std::span<PredefinedMacroDef const> rows,
     return out;
 }
 
-// A type identity as a sentence names it: its core, and its vocabulary tag if any.
-[[nodiscard]] std::string describeTypeIdentity(TypeKind core, std::string_view tag) {
-    std::string s{typeKindNameOrEmpty(core)};
-    if (!tag.empty()) s += " \"" + std::string{tag} + "\"";
-    return s;
+// A type identity as a sentence names it (P69 fold f26d, ruling 617): the language's own spelling — its
+// vocabulary tag, else the language document's word for its core kind (`spellCoreKind`, the ONE renderer's
+// base) — in quotes. A language whose document spells no types names none ("the declared type"); a kind its
+// table has no word for — one only a descriptor reaches, such as an `f16` constant in C — is said to be one.
+// Before, the sentence printed the engine's core kind name (`I64 "long"`).
+[[nodiscard]] std::string describeTypeIdentity(GrammarSchema const& language, TypeKind core,
+                                               std::string_view tag) {
+    TypeSpelling const& table = language.semantics().typeSpelling;
+    if (std::optional<std::string> const s = spellCoreKind(core, tag, table)) return "'" + *s + "'";
+    if (table.declared) return "a type this language does not spell";
+    return "the declared type";
 }
 
 // What the lattice's refusal means, in a sentence fragment.
@@ -864,7 +871,7 @@ realizeTypeDerivedPredefine(PredefinedMacroDef const&                 pm,
                         "is {} under data model {}, and {}",
                         pm.name, predefinedMacroKindName(pm.kind),
                         pm.sizedType.spelled,
-                        describeTypeIdentity(id->core, id->vocabularyName), dmName,
+                        describeTypeIdentity(language, id->core, id->vocabularyName), dmName,
                         why)};
     };
     switch (pm.kind) {
@@ -898,7 +905,7 @@ realizeTypeDerivedPredefine(PredefinedMacroDef const&                 pm,
                                            derivedLimitRefusalText(lim.refusal)));
             }
             std::string const valueType =
-                describeTypeIdentity(lim.core, lim.vocabularyName);
+                describeTypeIdentity(language, lim.core, lim.vocabularyName);
             if (pm.kind == PredefinedMacroKind::TypeLimit) {
                 // The lattice refuses a non-integer value type, so a realized
                 // result always carries its type's signedness and width.
@@ -2285,10 +2292,7 @@ struct SynthBuilder {
                                        + k.name + "' has no literal spelling this "
                                          "language's integerLiteralTyping ladder "
                                          "verifies as its declared type ("
-                                       + std::string{typeKindNameOrEmpty(k.core)}
-                                       + (k.vocabularyName.empty()
-                                              ? std::string{}
-                                              : " \"" + k.vocabularyName + "\"")
+                                       + describeTypeIdentity(*schema, k.core, k.vocabularyName)
                                        + ") (descriptor "
                                        + core::genericSpelling(p) + ")");
                         }
@@ -2315,7 +2319,7 @@ struct SynthBuilder {
                                    std::string{"shipped-header descriptor float constant '"}
                                        + fk.name + "' has no spelling this language "
                                          "verifies as its declared type ("
-                                       + std::string{typeKindNameOrEmpty(fk.core)}
+                                       + describeTypeIdentity(*schema, fk.core, {})
                                        + "): no 'floatLiteralTyping' suffix for a finite "
                                          "value, or no 'infinity' / 'quiet_nan' builtin of "
                                          "that type (descriptor "

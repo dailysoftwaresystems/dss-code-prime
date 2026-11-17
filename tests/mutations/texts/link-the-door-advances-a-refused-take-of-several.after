@@ -1,0 +1,5 @@
+            if (!id.valid()) {
+                reportSymbolIdSpaceExhausted(reporter, who, trial.value());
+                end_ = trial;
+                return std::nullopt;
+            }

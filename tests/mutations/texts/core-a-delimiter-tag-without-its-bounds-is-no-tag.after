@@ -1,0 +1,2 @@
+    if (dynamicTagRequested && obj.contains("tag")) {
+        if (!obj.contains("tag")) {

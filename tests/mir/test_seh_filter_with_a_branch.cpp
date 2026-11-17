@@ -184,6 +184,7 @@ template <typename EmitFilter>
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const pI32   = in.pointer(i32);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{kParentSym});
     MirBlockId const entry   = mb.createBlock(StructCfMarker::EntryBlock);
@@ -976,6 +977,7 @@ namespace {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const pI32   = in.pointer(i32);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{kParentSym});
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);

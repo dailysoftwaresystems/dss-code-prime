@@ -49,6 +49,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -206,7 +207,7 @@ lowerFixture(TargetSchema const& sch, DiagnosticReporter& rep,
     Mir m = std::move(mb).finish();
 
     Addressed out{
-        lowerToLir(m, sch, interner, rep, /*externImports=*/{},
+        lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget, /*externImports=*/{},
                    dispatch,
                    /*dataImportBinding=*/std::nullopt,
                    /*tlsAccess=*/std::nullopt,

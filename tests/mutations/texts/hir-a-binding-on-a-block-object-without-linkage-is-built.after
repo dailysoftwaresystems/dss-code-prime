@@ -1,1 +1,0 @@
-                    read.has_value() && read->binding != staticLinkage.binding && false) {

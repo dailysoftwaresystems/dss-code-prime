@@ -37,6 +37,7 @@ DiamondMir buildDiamond(TypeInterner& interner) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     d.entry = mb.createBlock(StructCfMarker::EntryBlock);
     d.tArm  = mb.createBlock(StructCfMarker::Linear);
@@ -329,6 +330,7 @@ TEST(MirDomScratch, AdversarialSequenceMatchesFreshOnEveryCall) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // fn0 — "big": a 3-level diamond cascade (10 blocks).
     mb.addFunction(fnSig, SymbolId{100});
     {
@@ -431,6 +433,7 @@ TEST(MirDomScratch, RandomizedCfgSweepMatchesFresh) {
         TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         std::uint32_t const nfn = 2u + rng() % 3u;   // 2..4 functions
         for (std::uint32_t fi = 0; fi < nfn; ++fi) {
             mb.addFunction(fnSig, SymbolId{100u + fi});
@@ -525,6 +528,7 @@ TEST(MirDomSlotsSwept, FreshSweepsTheModuleEveryCallScratchSweepsTheFunction) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     constexpr std::uint32_t kFns = 8;
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     for (std::uint32_t k = 0; k < kFns; ++k) {   // kFns four-block diamonds
         mb.addFunction(fnSig, SymbolId{100u + k});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

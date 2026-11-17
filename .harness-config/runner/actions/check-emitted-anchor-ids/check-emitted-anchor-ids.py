@@ -92,7 +92,7 @@ INVENTORY = {
     "src/ffi/shipped_lib_descriptor.cpp": 6,
     "src/hir/hir_verifier.cpp": 2,
     "src/hir/lowering/cst_to_hir.cpp": 12,
-    "src/link/branch_veneers.cpp": 15,
+    "src/link/branch_veneers.cpp": 14,
     "src/link/entry_trampoline.cpp": 12,
     "src/link/format/ar.cpp": 12,
     "src/link/format/coff_object_reader.cpp": 4,

@@ -4,6 +4,7 @@
 #include "core/types/arg_payload.hpp"
 #include "core/types/object_format_kind.hpp"   // isWriterReservedSymbolIdValue (a value no module may mint)
 #include "core/types/target_schema.hpp"   // TargetRegClass (the piece's result-register pool)
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
 
 #include <algorithm>
 #include <cstdio>
@@ -74,8 +75,9 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
 // an end saturates on it, and the door then refuses to mint rather than wrap onto
 // 0, the invalid id.
 [[nodiscard]] std::uint32_t onePastSymbolId(SymbolId s) noexcept {
-    constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
-    return s.v == kLast ? kLast : s.v + 1u;
+    SymbolIdEnd end;   // the core's rule (P69 f26d, N9): one past, saturating at the last value
+    end.keepClearOf(s);
+    return end.value();
 }
 
 } // namespace
@@ -100,8 +102,7 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)),
       asmDescriptorPool_(std::move(asmDescriptorPool)),
-      aliasingMode_(aliasingMode),
-      charTypesAliasAll_(charTypesAliasAll) {
+      facts_{aliasingMode, charTypesAliasAll, MirArgCounting::Unstated} {
     // The four arenas are tagged by ONE module id (the cross-tier guard relies
     // on it: a MirBlockId and a MirInstId of the same module share the tag). A
     // direct (non-builder) ctor that mismatched them would let an id from one
@@ -149,13 +150,11 @@ Mir::Mir(Mir&& other) noexcept
       succPool_(std::move(other.succPool_)),
       literalPool_(std::move(other.literalPool_)),
       asmDescriptorPool_(std::move(other.asmDescriptorPool_)),
-      aliasingMode_(other.aliasingMode_),
-      charTypesAliasAll_(other.charTypesAliasAll_),
+      facts_(other.facts_),
       symbolIdEnd_(other.symbolIdEnd_),
       symbolIdEndStated_(other.symbolIdEndStated_),
       aliases_(std::move(other.aliases_)) {
-    other.aliasingMode_ = MirAliasingMode::Permissive;
-    other.charTypesAliasAll_ = true;
+    other.facts_ = MirModuleFacts{};    // the emptied module states the defaults
     other.symbolIdEnd_ = 1;
     other.symbolIdEndStated_ = false;   // the emptied module is nobody's table
     other.aliases_.clear();             // and defines no second name
@@ -177,10 +176,8 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     succPool_    = std::move(other.succPool_);
     literalPool_ = std::move(other.literalPool_);
     asmDescriptorPool_ = std::move(other.asmDescriptorPool_);
-    aliasingMode_ = other.aliasingMode_;
-    other.aliasingMode_ = MirAliasingMode::Permissive;
-    charTypesAliasAll_ = other.charTypesAliasAll_;
-    other.charTypesAliasAll_ = true;
+    facts_ = other.facts_;
+    other.facts_ = MirModuleFacts{};
     symbolIdEnd_ = other.symbolIdEnd_;
     other.symbolIdEnd_ = 1;
     symbolIdEndStated_ = other.symbolIdEndStated_;
@@ -564,10 +561,12 @@ namespace {
 // when the space is exhausted — minting the last value would leave the end nowhere
 // to go, and a wrapped id would be 0, the invalid sentinel.
 [[nodiscard]] SymbolId takeSymbolIdAt(std::uint32_t& end) noexcept {
-    constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
-    while (end != kLast && isWriterReservedSymbolIdValue(end)) ++end;
-    if (end == kLast) return SymbolId{};
-    return SymbolId{end++};
+    // The rule is the core's (P69 f26d, N9: core/types/symbol_id_cursor.hpp), asked over the end this
+    // module carries as a plain value.
+    SymbolIdEnd cursor = SymbolIdEnd::startingAt(end);
+    SymbolId const id  = cursor.take();
+    end                = cursor.value();
+    return id;
 }
 
 [[noreturn]] void symbolIdSpaceExhausted(char const* who, std::uint32_t end) {
@@ -637,8 +636,7 @@ SymbolId MirBuilder::mintSymbolOrAbort(char const* who) {
 }
 
 void MirBuilder::carryModuleFactsOf(Mir const& rebuilt) {
-    aliasingMode_      = rebuilt.aliasingMode();
-    charTypesAliasAll_ = rebuilt.charTypesAliasAll();
+    facts_ = rebuilt.moduleFacts();   // the list whole (`MirModuleFacts`): COPIED, never made
     continueSymbolIdsOf(rebuilt);
     // Whole, and through the door: a rebuild that already stated one of them
     // stated it twice, which `addAlias` refuses by name.
@@ -816,6 +814,10 @@ MirFuncId MirBuilder::addFunction(TypeId signature, SymbolId symbol,
     f.noSanitizeThread = noSanitizeThread;   // TF-C92 (no_sanitize_thread)
     // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
     f.staticInit       = staticInit;
+    // ★ P69 (lane `cs`, fold f26d): the counting of the convention the builder lowers for
+    // (`stateArgCounting`); a function of another convention, or a clone, is restated
+    // (`stateFunctionArgCounting`).
+    f.argCounting      = facts_.argCounting;
     MirFuncId const id = funcArena_.addNode(f);
     openFunc_ = id;
     keepSymbolIdsClearOf(symbol);   // the id space is past every symbol the module defines
@@ -889,6 +891,12 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
 void MirBuilder::restateLinkageUnjudged(MirFuncId function, MirLinkage linkage) {
     checkSameModule_(function.arenaTag, "restateLinkageUnjudged function");
     funcArena_.at(function).linkage = linkage;
+}
+// A function's OWN counting (mir/mir.hpp): one of another convention than the pair's, or a clone's copy of its
+// source's — whatever it is, an `Unstated` one included (a hand-built function with no `Arg`).
+void MirBuilder::stateFunctionArgCounting(MirFuncId function, MirArgCounting counting) {
+    checkSameModule_(function.arenaTag, "stateFunctionArgCounting function");
+    funcArena_.at(function).argCounting = counting;
 }
 void MirBuilder::restateLinkageUnjudged(MirGlobalId global, MirLinkage linkage) {
     checkSameModule_(global.arenaTag, "restateLinkageUnjudged global");
@@ -1878,8 +1886,8 @@ Mir MirBuilder::finish() && {
               std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
               std::move(literalPool_),
               std::move(asmDescriptorPool_),
-              aliasingMode_,
-              charTypesAliasAll_};
+              facts_.aliasingMode,
+              facts_.charTypesAliasAll};
     // The module's id space is the builder's: the table end it was told, and
     // every id minted since (the constructor counted the defined symbols alone) —
     // and with the end, whether anyone ever STATED it. The frozen module once
@@ -1887,6 +1895,7 @@ Mir MirBuilder::finish() && {
     if (symbolIdEnd_ > built.symbolIdEnd_) built.symbolIdEnd_ = symbolIdEnd_;
     built.symbolIdEndStated_ = symbolIdEndStated_;
     built.aliases_ = std::move(aliases_);   // P69 (lane `cs`): no arena holds them
+    built.facts_ = facts_;   // the list whole: the constructor took two of its facts (P69 f26d)
     return built;
 }
 

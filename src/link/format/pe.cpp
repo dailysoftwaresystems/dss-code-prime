@@ -19,7 +19,7 @@
 #include "link/format/unwind_pointer_reloc.hpp"
 #include "link/format/win64_unwind_decode.hpp"   // the x64 unwind vocabulary, read and written as one
 #include "link/format/weak_definition_gate.hpp"
-#include "link/fresh_symbol_ids.hpp" // maxExistingSymbolIdV — the residue runner's symbols
+#include "link/fresh_symbol_ids.hpp" // ModuleSymbolIds — the residue runner's symbols
 #include "link/load_time_fixups.hpp" // synthesizeLoadTimeFixupRunner — the import-slot residue runner
 #include "link/pointer_reloc.hpp"   // absolutePointerRelocKind — a loader-bound slot's fixup
 #include "lir/lir_pass_util.hpp"
@@ -4609,21 +4609,26 @@ encodeExecWithImportSlotResidue(AssembledModule const&    module,
                           std::nullopt, SymbolId{});
     }
     AssembledModule augmented = module;
-    std::uint32_t maxV = linker::maxExistingSymbolIdV(augmented);
-    if (maxV > std::numeric_limits<std::uint32_t>::max() - 2u - fixups.size()) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "pe::encodeExec: SymbolId space exhausted naming the import-slot residue runner.");
-        return {};
-    }
+    linker::ModuleSymbolIds ids{augmented};
     // Each import a fix-up reads is read from its IAT entry — its ADDRESS SLOT,
     // a symbol the walker binds there.
     for (std::size_t k = 0; k < fixups.size(); ++k) {
         ExternImport& ext = augmented.externImports[fixupExtern[k]];
-        if (!ext.addressSlotSymbol.valid()) ext.addressSlotSymbol = SymbolId{++maxV};
+        if (!ext.addressSlotSymbol.valid()) {
+            std::optional<SymbolId> const slot =
+                ids.take(reporter, "pe::encodeExec: the address slot an import-slot fix-up reads");
+            if (!slot.has_value()) return {};
+            ext.addressSlotSymbol = *slot;
+        }
         fixups[k].sourceSlot = ext.addressSlotSymbol;
     }
-    SymbolId const runner{++maxV};
-    SymbolId const templateBase{++maxV};
+    std::optional<SymbolId> const runnerId = ids.take(reporter, "pe::encodeExec: the import-slot residue runner");
+    if (!runnerId.has_value()) return {};
+    std::optional<SymbolId> const baseId =
+        ids.take(reporter, "pe::encodeExec: the residue runner's thread-template base");
+    if (!baseId.has_value()) return {};
+    SymbolId const runner       = *runnerId;
+    SymbolId const templateBase = *baseId;
     auto fn = linker::synthesizeLoadTimeFixupRunner(fixups, runner, templateBase,
                                                     kTlsCallbackReasonArgument,
                                                     kDllProcessAttach, targetSchema, fmt,
@@ -6176,6 +6181,8 @@ encodeExec(AssembledModule const&    module,
     // VA below.
     std::unordered_map<SymbolId, std::uint64_t> externThunkVaBySym;
     externThunkVaBySym.reserve(numImportThunks);
+    std::vector<SymbolId> thunkSymbolsInOrder;   // the map's keys, in the order the thunks are laid out
+    thunkSymbolsInOrder.reserve(numImportThunks);
     if (numImportThunks > 0) {
         // Defense: step (a2) must have grown .text to hold the whole
         // block; a future reorder that drops the reservation would
@@ -6207,8 +6214,9 @@ encodeExec(AssembledModule const&    module,
                              iatIt->second, i, reporter)) {
                 return {};
             }
-            externThunkVaBySym.emplace(module.externImports[i].symbol,
-                                       thunkVa);
+            if (externThunkVaBySym.emplace(module.externImports[i].symbol, thunkVa).second) {
+                thunkSymbolsInOrder.push_back(module.externImports[i].symbol);
+            }
         }
     }
 
@@ -6409,7 +6417,10 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
     }
-    for (auto const& [sym, va] : externThunkVaBySym) {
+    // In the order the thunks were laid out (P69 fold f26d, the host-toolchain class): the walk stops at the first
+    // collision and names it, and walking the hash map itself named the standard library's first.
+    for (SymbolId const sym : thunkSymbolsInOrder) {
+        std::uint64_t const va = externThunkVaBySym.at(sym);
         // D-FFI-PE-IMPORT-THUNK: a FUNCTION extern's symbolVa names its
         // import THUNK (a .text code address) — the PE analog of an ELF
         // PLT stub / Mach-O __stubs entry — NOT the `.idata` IAT data

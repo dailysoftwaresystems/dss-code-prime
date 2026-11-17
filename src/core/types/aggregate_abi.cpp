@@ -21,8 +21,9 @@ struct LeafField {
     std::uint64_t offset;    // absolute byte offset within the top aggregate
     TypeKind      kind;      // a scalar/pointer leaf kind
     // D-CSUBSET-BITINT: the leaf's byte size, resolved at collection through
-    // `sizeOfScalarOrBitInt` (a `_BitInt(N)`'s size needs its width scalar, which
-    // `scalarByteSize(kind,...)` — kind-only — cannot see). 0 = un-sized (the
+    // `computeLayout` (a `_BitInt(N)`'s size needs its width scalar and, above 64
+    // bits, the target's chunk, which `scalarByteSize(kind,...)` — kind-only —
+    // cannot see). 0 = un-sized (the
     // classifier's defensive fsz=1). Carrying it here fixes a BitInt leaf that
     // STRADDLES an eightbyte boundary: sized as 1 byte it would leave the second
     // eightbyte marked SSE (a silent GPR→XMM ABI miscompile of a by-value struct).
@@ -119,10 +120,11 @@ struct LeafField {
         out.push_back(LeafField{base + elemLay->size, ek, elemLay->size});
         return true;
     }
-    // D-CSUBSET-BITINT: size the leaf through the TypeId-aware shim so a
-    // `_BitInt(N)` gets its CONTAINER size (not the kind-only nullopt→1 default).
-    out.push_back(LeafField{base, k,
-                            sizeOfScalarOrBitInt(in, ty, dm).value_or(0)});
+    // D-CSUBSET-BITINT: size the leaf by the layout authority so a `_BitInt(N)`
+    // gets its CONTAINER size (not the kind-only nullopt→1 default), the target's
+    // chunk included.
+    auto const leafLay = computeLayout(ty, in, lp, dm);
+    out.push_back(LeafField{base, k, leafLay.has_value() ? leafLay->size : 0});
     return true;
 }
 

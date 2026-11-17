@@ -28,6 +28,7 @@
 #include "mutate_target_schema.hpp"
 #include "landing_probe.hpp"
 #include "synthetic_fn.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -421,7 +422,7 @@ TEST(LirRegAlloc, HighPressureFunctionSpillsSome) {
             mb.addReturn(acc);
         });
     DiagnosticReporter rep;
-    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
@@ -1357,7 +1358,7 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
             mb.addReturn(acc);
         });
     DiagnosticReporter rep;
-    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
@@ -1501,7 +1502,7 @@ TEST(LirRegAlloc, FprClassRangesGetFprRegisters) {
             mb.addReturn(sum);
         });
     DiagnosticReporter rep;
-    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
@@ -1583,7 +1584,7 @@ TEST(LirRegAlloc, HighPressureFunctionEmitsSpillSummary) {
             mb.addReturn(acc);
         });
     DiagnosticReporter lirRep;
-    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, lirRep);
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, lirRep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
@@ -2851,7 +2852,7 @@ TEST(LirRegAllocCoalesce, SpillSlotsAreReusedOnceTheirOccupantHasDied) {
             mb.addReturn(second);
         });
     DiagnosticReporter rep;
-    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;

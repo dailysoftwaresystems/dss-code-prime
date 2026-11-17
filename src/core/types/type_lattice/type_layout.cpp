@@ -799,24 +799,6 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
     }
 }
 
-std::optional<std::uint64_t>
-sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept {
-    if (!id.valid()) return std::nullopt;
-    TypeKind const k = interner.kind(id);
-    if (k != TypeKind::BitInt) return scalarByteSize(k, dm);
-    // C23 _BitInt(N) (D-CSUBSET-BITINT): the CONTAINER size (params-independent, so
-    // no AggregateLayoutParams needed) — mirrors the `computeLayout` BitInt arm's
-    // size ladder exactly (N≤64 → {1,2,4,8}; N>64 → ceil(N/64) eightbytes).
-    std::int64_t const n = interner.bitIntWidth(id);
-    if (n <= 0) return std::nullopt;
-    std::uint64_t const bits = static_cast<std::uint64_t>(n);
-    if (bits <= 8)  return 1;
-    if (bits <= 16) return 2;
-    if (bits <= 32) return 4;
-    if (bits <= 64) return 8;
-    return ((bits + 63) / 64) * 8;
-}
-
 // ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──
 // The ONE place that knows WHICH kinds are multi-limb. TF-C94 generalized this from
 // the BitInt-only `isWideBitInt`: I128/U128 are exactly 2 limbs, so they ride the
@@ -831,7 +813,8 @@ bool isWideInt(TypeInterner const& interner, TypeId id) noexcept {
         // like `_BitInt(128)`. They join by SHAPE; the standard-rank vs bit-precise
         // distinction is a SEMANTIC one (type_rules.hpp `kindAtRank`) and does not
         // belong here. ⚠ `_BitInt(128)` (align 8) and U128 (align 16) remain
-        // INDEPENDENT layouts — see computeLayout's BitInt arm vs scalarByteSize.
+        // INDEPENDENT layouts on x86_64 — see computeLayout's BitInt arm vs scalarByteSize
+        // (on arm64 the target's 16-byte `bitPreciseChunk` makes the two coincide).
         case TypeKind::I128:
         case TypeKind::U128:
             return true;
@@ -990,10 +973,15 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // C23 _BitInt(N) (D-CSUBSET-BITINT): the ABI layout. scalars[0] = N bits.
             // N≤64 → the smallest native container {1,2,4,8}B, align == size (matches
             // gcc/clang: sizeof(_BitInt(4))==1, _BitInt(17)==4, _BitInt(40)==8). N>64
-            // (C2 multi-limb; C1 rejects it at semantic, but layout is ready) →
-            // ceil(N/64) eightbytes, align 8 per the x86-64 psABI — sizeof(_BitInt(128))
-            // ==16 but _Alignof==8 (NOT 16). A non-positive N is malformed (the
-            // semantic gate rejects it first) → fail loud (nullopt).
+            // → whole CHUNKS of the target's `aggregateLayout.bitPreciseChunk`, aligned to
+            // one. ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+            // the chunk is the TARGET's, never written here — this arm used to answer the
+            // x86-64 psABI's 8 for every target. x86_64: 8 (ceil(N/64) eightbytes, align 8 —
+            // sizeof(_BitInt(128)) 16 but _Alignof 8); arm64: 16 (AAPCS64 — _BitInt(128)
+            // 16/16, _BitInt(129) 32/16). An undeclared chunk (0) lays out no wide `_BitInt`
+            // (nullopt), and so does a non-positive N (the semantic gate rejects it first).
+            // This arm is the ONE size ladder of a bit-precise integer: the data-global
+            // encoder and the aggregate-ABI leaves ask `computeLayout`.
             auto const sc = interner.scalars(id);
             if (sc.empty() || sc[0] <= 0) return std::nullopt;
             std::uint64_t const n = static_cast<std::uint64_t>(sc[0]);
@@ -1004,8 +992,11 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             else if (n <= 32) { size = 4; alignBytes = 4; }
             else if (n <= 64) { size = 8; alignBytes = 8; }
             else {
-                size       = ((n + 63) / 64) * 8;   // ceil(N/64) eightbytes
-                alignBytes = 8;                       // psABI: align 8 even at N>64
+                std::uint64_t const chunk = params.bitPreciseChunk;
+                if (chunk == 0) return std::nullopt;   // undeclared: no guessed ABI
+                std::uint64_t const chunkBits = chunk * 8;
+                size       = ((n + chunkBits - 1) / chunkBits) * chunk;
+                alignBytes = chunk;
             }
             return StructLayout{size, scalarAlign(alignBytes, params), {}, false};
         }

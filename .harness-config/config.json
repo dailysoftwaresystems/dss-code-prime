@@ -226,6 +226,14 @@
         "repositoryPath": "~/src/Github/dss-code-prime",
         "connectTimeoutSeconds": 25,
         "keepAliveSeconds": 30
+      },
+      // A native x86_64 Ubuntu LTS machine on the operator's LAN (added 2026-11-17, P69 round 1, at the operator's
+      // word: "you can opt in this linux instead of wsl leg to run the units"). Its own physical machine, so its
+      // heavy legs take its own admission slots instead of sharing this machine's with the Windows legs, as WSL does.
+      "ubuntu": {
+        "repositoryPath": "~/src/2Github/dss-code-prime",
+        "connectTimeoutSeconds": 25,
+        "keepAliveSeconds": 30
       }
     }
   },
@@ -342,20 +350,20 @@
     "linux-x86_64-debug": {
       "os": "linux",
       "processor": "x86_64",
-      "wsl": "Ubuntu",
+      "ssh": "ubuntu",
       "project": "dss-code-prime",
       "toolchain": "gcc",
       "config": "debug",
-      "description": "Debug build and test on the WSL x86_64 distribution"
+      "description": "Debug build and test natively on the x86_64 Ubuntu LTS machine"
     },
     "linux-x86_64-release": {
       "os": "linux",
       "processor": "x86_64",
-      "wsl": "Ubuntu",
+      "ssh": "ubuntu",
       "project": "dss-code-prime",
       "toolchain": "gcc",
       "config": "release",
-      "description": "Release build and test on the WSL x86_64 distribution"
+      "description": "Release build and test natively on the x86_64 Ubuntu LTS machine"
     },
     "macos-arm64-debug": {
       "os": "macos",
@@ -1608,7 +1616,8 @@
   },
   "sshItems": [
     "macos",
-    "arm64-vps"
+    "arm64-vps",
+    "ubuntu"
   ],
   "wslDistros": [
     "Ubuntu"

@@ -3,9 +3,13 @@
 #include "asm/asm_local_labels.hpp"
 #include "asm/asm_template_to_lir.hpp"
 #include "asm/asm_variant_elect.hpp"
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/assembly_config.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -1145,7 +1149,7 @@ private:
                              "place data somewhere the source did not ask for, "
                              "with no diagnostic{}",
                              spelling, operands.size(),
-                             tree_.text(operands[1]), sink_.pairSuffix()));
+                             quotedSourceText(tree_.text(operands[1])), sink_.pairSuffix()));
             return nullptr;
         }
         std::string_view const introducer = tree_.text(kids[0]);
@@ -1158,7 +1162,7 @@ private:
                              "DIFFERENT sections — an undotted name creates a "
                              "section of exactly that name with no allocation "
                              "flag — so they are not synonyms{}",
-                             spelling, introducer, tree_.text(operands[0]),
+                             spelling, introducer, quotedSourceText(tree_.text(operands[0])),
                              sink_.pairSuffix()));
             return nullptr;
         }
@@ -2942,7 +2946,14 @@ private:
     // to write `if (sym.valid())` would silently drop function 0, and nothing
     // in the output would show it. D-ASM-FIRST-FUNCTION-TAKES-SYMBOLID-ZERO.
     [[nodiscard]] SymbolId mintSymbol() noexcept {
-        return SymbolId{nextSymbolId_++};
+        // The core's cursor (P69 f26d, N9): from 1, the reserved value stepped over, exhaustion refused by
+        // name -- it wrapped onto 0, the invalid id.
+        SymbolId const id = symbolIds_.take();
+        if (!id.valid()) {
+            std::fprintf(stderr, "dss::asm_text_to_lir fatal: the text's SymbolId space is exhausted\n");
+            std::abort();
+        }
+        return id;
     }
 
     // One `ModuleSymbol` per DATA label, so the linker can match it across CUs
@@ -3041,7 +3052,7 @@ private:
     std::optional<DataSectionKind>              scanSection_;
     std::optional<DataSectionKind>              emitSection_;
     std::size_t                                 openDataItem_      = kNoLabel;
-    std::uint32_t                               nextSymbolId_      = 1;
+    SymbolIdEnd                                 symbolIds_;   // `mintSymbol`'s space, from 1
     std::size_t                                 functionCount_     = 0;
     std::size_t                                 openFunctionLabel_ = kNoLabel;
     std::size_t                                 openBlockLabel_    = kNoLabel;

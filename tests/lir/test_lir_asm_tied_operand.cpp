@@ -71,6 +71,7 @@
 #include "mir/mir_opcode.hpp"
 #include "asm_region_test_support.hpp"
 #include "lowered_lir_fixture.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -316,7 +317,7 @@ TEST(LirAsmTiedOperand, ReadWriteOutputWithNoTiedInputIsRefused) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter reporter;
-    MirToLirResult const r = lowerToLir(mir, **target, interner, reporter);
+    MirToLirResult const r = lowerToLir(mir, **target, interner, reporter, dss::test::kFirstConventionOfTheTarget);
 
     EXPECT_FALSE(r.ok)
         << "binding a `+` output with no read half hands the template a "
@@ -369,7 +370,7 @@ TEST(LirAsmTiedOperand, ReadWriteInputWithNoTieIsRefused) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter reporter;
-    MirToLirResult const r = lowerToLir(mir, **target, interner, reporter);
+    MirToLirResult const r = lowerToLir(mir, **target, interner, reporter, dss::test::kFirstConventionOfTheTarget);
 
     EXPECT_FALSE(r.ok);
     ASSERT_FALSE(reporter.all().empty());

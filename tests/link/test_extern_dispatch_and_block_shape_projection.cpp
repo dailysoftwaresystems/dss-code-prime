@@ -69,6 +69,7 @@
 
 #include "repo_root.hpp"
 #include "vocabulary_message_probe.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -570,7 +571,7 @@ void runExternGateProbe(ExternGateProbe&                       probe,
     ext.mangledName = "extern_fn";
     ext.libraryPath = "fictional.lib";
 
-    (void)dss::lowerToLir(m, target, probe.interner, probe.reporter,
+    (void)dss::lowerToLir(m, target, probe.interner, probe.reporter, dss::test::kFirstConventionOfTheTarget,
                           std::vector<dss::ExternImport>{ext}, dispatch);
     for (auto const& d : probe.reporter.all()) {
         probe.messages.emplace_back(d.actual);

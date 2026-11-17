@@ -623,7 +623,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // invalid id, the first id past the table. Everything this reader keys by a
     // symbol below is keyed by the record INDEX; an id is made where a value
     // enters the module.
-    link::format::RecordSymbolIds symbolIds{nsyms};
+    link::format::RecordSymbolIds symbolIds{nsyms, reporter, "macho::readRelocatableObject"};
+    if (symbolIds.refused()) return std::nullopt;   // the table reaches a reserved id: refused by name
     std::vector<Nlist> syms(nsyms);
     for (std::uint32_t i = 0; i < nsyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(*symoff)
@@ -2334,6 +2335,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
+    if (symbolIds.refused()) return std::nullopt;
+    mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;
 }

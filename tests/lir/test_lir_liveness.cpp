@@ -25,6 +25,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "synthetic_fn.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -279,7 +280,7 @@ TEST(LirLiveness, SyntheticUnaryFunctionProducesArgRange) {
             mb.addReturn(a);
         });
     DiagnosticReporter rep;
-    auto const result = lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok);
     LirLiveness const out = analyzeLiveness(result.lir);
     ASSERT_EQ(out.perFunc.size(), 1u);

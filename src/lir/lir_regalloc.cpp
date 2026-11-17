@@ -1494,7 +1494,6 @@ void collectOutgoingArgHints(std::span<LirOperand const> ops,
     std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
     bool const variadicForcesStack =
         cc.variadicArgsAlwaysStack && ::dss::call_payload::isVariadic(payload);
-    std::uint32_t const fixedOps = ::dss::call_payload::fixedOperandCount(payload);
 
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
@@ -1511,7 +1510,7 @@ void collectOutgoingArgHints(std::span<LirOperand const> ops,
         // (a physical register, say) would shift every LATER argument's
         // position and hint them into the wrong registers.
         auto const slot = argCursors.next(cls);
-        bool const forceStack = variadicForcesStack && argRegionIdx >= fixedOps;
+        bool const forceStack = variadicForcesStack && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
         ++argRegionIdx;
         if (!slot.has_value()) continue;              // class owns no pool
         if (slot->index >= slot->poolSize) continue;  // stack-passed

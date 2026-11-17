@@ -27,6 +27,7 @@
 #include "core/types/target_schema.hpp"        // targetRegClassFromName / kOperableTargetRegClassNames — `assembly.templateModifiers[].registerClass` names a row of the ONE register-class envelope
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 #include "core/types/variant_when_json.hpp"   // decodeWhen — a builtin signature arm's `when` (S2a-1)
+#include "core/types/type_spelling_json.hpp"    // readTypeSpelling — the diagnostics' type spellings, refused at load when incomplete (P69 fold f26d)
 #include "core/types/type_name_resolve.hpp"    // resolveLanguageTypeName — the ONE type-name resolver (shared with the shipped-descriptor reader, P68 round 9)
 
 #include <nlohmann/json.hpp>
@@ -41,7 +42,6 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -642,13 +642,98 @@ void parseModeFields(json const& m,
 //   - `escapeKind`: required string, one of "char"/"doubled-delimiter"/"none".
 //   - `escapeChar`: required when escapeKind == "char"; single character.
 //   - `endsAt`: required non-empty string.
-//   - `endsAtLongestMatch`/`multiline`: optional bools.
-//   - `delimiterTag`: optional string; only "matched" is recognized.
-//   - `tagPattern`: optional regex string (default `[A-Za-z0-9_]{0,16}`);
-//     compiled at load time via std::regex to surface malformed patterns.
+//   - `endsAtLongestMatch`/`multiline`/`endsAtExclusive`: optional bools.
+//   - `delimiterTag`: optional string; only "matched" is recognized, and it
+//     REQUIRES `tag` (and `tag` requires it): `{"characters", "minLength",
+//     "maxLength"}`, every key required (`parseDelimiterTag`).
+//   - the object's keys are closed: an unknown key is refused by name, and the
+//     retired `tagPattern` with the sentence that names its successor.
 inline std::optional<StringStyle> parseStringStyle(json const& obj,
                                                    std::string const& path,
                                                    Collector& c);
+
+// Parse a `stringStyle`'s `tag` object (P69, lane `cs`, fold f26d, ruling 643 (3)): the
+// BOUNDED tag a `delimiterTag: "matched"` delimiter carries. Every key is required and
+// refused BY NAME when missing or malformed — the old hidden default (`[A-Za-z0-9_]{0,16}`)
+// is the document's to state now:
+//   - `characters`: the bytes a tag may hold, as single bytes and `x-y` ranges (a `-`
+//     that is first or last is the byte itself); empty, a reversed range or a byte
+//     outside ASCII is refused;
+//   - `minLength`: a non-negative integer — a shorter run is no tag;
+//   - `maxLength`: an integer of at least 1 and at least `minLength` — the run is read
+//     over at most this many bytes, so the work per opener is bounded by the document.
+std::optional<DelimiterTag> parseDelimiterTag(json const& obj, std::string const& path,
+                                              Collector& c) {
+    if (!obj.is_object()) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle, path,
+               "'tag' must be an object: {\"characters\", \"minLength\", \"maxLength\"}");
+        return std::nullopt;
+    }
+    static constexpr std::array<std::string_view, 3> kTagKeys{"characters", "minLength",
+                                                              "maxLength"};
+    DSS_CHECK_KEY_VOCABULARY(kTagKeys);
+    if (!checkKeysAgainst(obj, kTagKeys, path, "a delimiter 'tag' object",
+                          DiagnosticCode::C_InvalidStringStyle, c)) {
+        return std::nullopt;
+    }
+    DelimiterTag tag;
+    if (!obj.contains("characters") || !obj.at("characters").is_string()
+        || obj.at("characters").get<std::string>().empty()) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle, std::format("{}/characters", path),
+               "'characters' is required: a non-empty string of the bytes a tag may hold "
+               "(single bytes and 'x-y' ranges)");
+        return std::nullopt;
+    }
+    std::string const set = obj.at("characters").get<std::string>();
+    for (unsigned char const b : set) {
+        if (b >= 0x80) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle, std::format("{}/characters", path),
+                   std::format("'characters' holds the byte 0x{:02X}, which is not ASCII: a "
+                               "tag is matched byte by byte, so every byte it may hold is "
+                               "one ASCII character",
+                               static_cast<unsigned>(b)));
+            return std::nullopt;
+        }
+    }
+    for (std::size_t i = 0; i < set.size();) {
+        bool const range = i + 2 < set.size() && set[i + 1] == '-';
+        auto const lo = static_cast<unsigned char>(set[i]);
+        auto const hi = static_cast<unsigned char>(range ? set[i + 2] : set[i]);
+        if (hi < lo) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle, std::format("{}/characters", path),
+                   std::format("'characters' holds the reversed range '{}-{}': a range runs "
+                               "from its lower byte to its higher one",
+                               set[i], set[i + 2]));
+            return std::nullopt;
+        }
+        for (unsigned b = lo; b <= hi; ++b) tag.characters[b] = true;
+        i += range ? 3 : 1;
+    }
+    auto const count = [&](std::string const& key, std::string_view what) -> std::optional<std::size_t> {
+        if (!obj.contains(key) || !obj.at(key).is_number_unsigned()) {
+            c.emit(DiagnosticCode::C_InvalidStringStyle, std::format("{}/{}", path, key),
+                   std::format("'{}' is required and must be a non-negative integer: {}",
+                               key, what));
+            return std::nullopt;
+        }
+        return obj.at(key).get<std::size_t>();
+    };
+    auto const minLength = count("minLength", "a run of fewer admitted bytes is no tag");
+    if (!minLength) return std::nullopt;
+    auto const maxLength = count("maxLength", "a dynamic tag is matched over at most "
+                                              "maxLength characters");
+    if (!maxLength) return std::nullopt;
+    if (*maxLength == 0 || *maxLength < *minLength) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle, std::format("{}/maxLength", path),
+               std::format("'maxLength' is {} and 'minLength' {}: a tag is read over at "
+                           "least one byte, and 'maxLength' is at least 'minLength'",
+                           *maxLength, *minLength));
+        return std::nullopt;
+    }
+    tag.minLength = *minLength;
+    tag.maxLength = *maxLength;
+    return tag;
+}
 
 std::optional<StringStyle> parseStringStyle(json const& obj,
                                             std::string const& path,
@@ -657,6 +742,33 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
     if (!obj.is_object()) {
         c.emit(DiagnosticCode::C_InvalidStringStyle, path,
                "'stringStyle' must be an object");
+        return std::nullopt;
+    }
+
+    // ★ P69 (lane `cs`, fold f26d, ruling 643 (3)): `tagPattern` is RETIRED — a regular
+    // expression the loader compiled with `std::regex` and the tokenizer ran over the rest
+    // of the buffer at every opener, whose matcher recursed once per character it
+    // consumed. Its successor is the bounded `tag` object; a document that still says
+    // `tagPattern` is refused with the sentence that names it, never read as absent.
+    if (obj.contains("tagPattern")) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/tagPattern", path),
+               "'tagPattern' is retired: a delimiter tag is stated as "
+               "'tag': {\"characters\": …, \"minLength\": …, \"maxLength\": …} beside "
+               "'delimiterTag': \"matched\" — a bounded run of the bytes 'characters' "
+               "admits, matched without a regular-expression engine");
+        return std::nullopt;
+    }
+    // The object's keys are CLOSED (before 2026-11-17 none was checked, so a misspelled
+    // key left the feature it names switched off in silence). ✔MEASURED over the tree at
+    // fold f26d: every stringStyle object of every shipped document, example and test
+    // holds only keys of this list.
+    static constexpr std::array<std::string_view, 8> kStringStyleKeys{
+        "escapeKind", "escapeChar", "endsAt", "endsAtLongestMatch", "multiline",
+        "endsAtExclusive", "delimiterTag", "tag"};
+    DSS_CHECK_KEY_VOCABULARY(kStringStyleKeys);
+    if (!checkKeysAgainst(obj, kStringStyleKeys, path, "a 'stringStyle' object",
+                          DiagnosticCode::C_InvalidStringStyle, c)) {
         return std::nullopt;
     }
 
@@ -764,9 +876,9 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         s.endsAtExclusive = obj.at("endsAtExclusive").get<bool>();
     }
 
-    // delimiterTag — optional. Only "matched" is recognized; presence
-    // enables dynamic-tag capture. The signal at runtime is
-    // `tagPattern.empty()` — non-empty pattern means dynamic tag.
+    // delimiterTag — optional. Only "matched" is recognized; it enables dynamic-tag
+    // capture, and the tag's alphabet and bounds are the document's (`tag`). The signal
+    // at run time is `s.delimiterTag` being present.
     bool dynamicTagRequested = false;
     if (obj.contains("delimiterTag")) {
         if (!obj.at("delimiterTag").is_string() ||
@@ -778,59 +890,38 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
         }
         dynamicTagRequested = true;
     }
-
-    // tagPattern — optional regex. Must accompany delimiterTag:"matched"
-    // (otherwise the pattern is dead data). Default applied when
-    // delimiterTag is "matched" but tagPattern is omitted.
-    constexpr std::string_view kDefaultTagPattern = "[A-Za-z0-9_]{0,16}";
-    if (obj.contains("tagPattern")) {
-        if (!dynamicTagRequested) {
+    if (obj.contains("tag") && !dynamicTagRequested) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/tag", path),
+               "'tag' requires 'delimiterTag: \"matched\"' (without it the tag is never "
+               "read)");
+        return std::nullopt;
+    }
+    if (dynamicTagRequested) {
+        if (!obj.contains("tag")) {
             c.emit(DiagnosticCode::C_InvalidStringStyle,
-                   std::format("{}/tagPattern", path),
-                   "'tagPattern' requires 'delimiterTag: \"matched\"'");
+                   std::format("{}/tag", path),
+                   "'delimiterTag: \"matched\"' requires 'tag': {\"characters\", "
+                   "\"minLength\", \"maxLength\"} — the bytes a tag may hold and its "
+                   "bounds are the language's to state; no alphabet or width is the "
+                   "tokenizer's default");
             return std::nullopt;
         }
-        if (!obj.at("tagPattern").is_string()) {
-            c.emit(DiagnosticCode::C_InvalidStringStyle,
-                   std::format("{}/tagPattern", path),
-                   "'tagPattern' must be a regex string");
-            return std::nullopt;
-        }
-        s.tagPattern = obj.at("tagPattern").get<std::string>();
-    } else if (dynamicTagRequested) {
-        s.tagPattern = kDefaultTagPattern;
+        auto tag = parseDelimiterTag(obj.at("tag"), std::format("{}/tag", path), c);
+        if (!tag) return std::nullopt;
+        s.delimiterTag = *tag;
     }
 
     // Cross-field validation: longest-match terminator does not
     // compose with dynamic-tag matching. The tokenizer's tag-aware
-    // close (regex+endsAt) doesn't honor longest-match, so the two
+    // close (endsAt + the captured tag) doesn't honor longest-match, so the two
     // flags silently disagree if both are set. Reject at load.
-    if (s.endsAtLongestMatch && !s.tagPattern.empty()) {
+    if (s.endsAtLongestMatch && s.delimiterTag) {
         c.emit(DiagnosticCode::C_ConflictingField,
                std::format("{}/endsAtLongestMatch", path),
                "'endsAtLongestMatch' is incompatible with 'delimiterTag: \"matched\"' "
                "(longest-match close is not honored for dynamic tags)");
         return std::nullopt;
-    }
-
-    // Validate regex at load. Catch std::regex_error specifically; any
-    // other exception (std::bad_alloc, system errors) signals a deeper
-    // problem we don't want to silently translate to a diagnostic.
-    if (!s.tagPattern.empty()) {
-        try {
-            std::regex compiled(s.tagPattern);
-            (void)compiled;
-        } catch (std::regex_error const& e) {
-            c.emit(DiagnosticCode::C_InvalidStringStyle,
-                   std::format("{}/tagPattern", path),
-                   std::format("'tagPattern' is not a valid regex: {}", e.what()));
-            return std::nullopt;
-        } catch (std::exception const& e) {
-            c.emit(DiagnosticCode::C_InvalidStringStyle,
-                   std::format("{}/tagPattern", path),
-                   std::format("'tagPattern' regex compile failed: {}", e.what()));
-            return std::nullopt;
-        }
     }
 
     return s;
@@ -9416,13 +9507,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // ⓘ 66 → 67 (P69 L2, lane `lm`): `integerConstantExpressions` — the 6.6p10 forms
             // admitted per integer-constant position (`IntegerConstantForms`); a sibling of
             // `staticInitializers`.
-            static constexpr std::array<std::string_view, 67> kSemanticsKeys{
+            // ⓘ 67 → 68 (P69 fold f26d, lane `cs`): `typeSpelling` — how the language's
+            // diagnostics spell a type (`TypeSpelling`, core/types/type_spelling.hpp).
+            static constexpr std::array<std::string_view, 68> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
                 // the type surface
                 "builtinTypes", "typeShapes", "literalTypes", "typeSpecifiers",
-                "integerLiteralTyping", "floatLiteralTyping", "parameters",
+                "integerLiteralTyping", "floatLiteralTyping", "parameters", "typeSpelling",
                 "arithmeticConversions", "synthesizedTypes", "enumerationCompatibleTypes",
                 // SE4-SE7 expression facets
                 "assignments", "callRules", "casts",
@@ -10271,7 +10364,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // no-op the facet. Listed in reader order; the nested
                         // `gatedMarkers` entries carry their own closed-key
                         // check further down.
-                        static constexpr std::array<std::string_view, 42>
+                        static constexpr std::array<std::string_view, 43>
                             kDeclarationRowKeys{
                                 // the shape anchor + visible-child indices
                                 "rule", "name", "type", "init", "body",
@@ -10303,6 +10396,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // (P69 fold f26c2) the row whose tables read
                                 // this row's attribute specifiers per declarator
                                 "attributeLinkageTablesFrom",
+                                // (P69 fold f26d) `"none"`: its declarators never
+                                // have linkage
+                                "linkage",
                                 // attribute surface (TF-C73)
                                 "declarationAttrSlotRules",
                                 "unknownStrictAttributeIsError",
@@ -11517,6 +11613,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 rule.attributeLinkageRuleName =
                                     entry.at("attributeLinkageTablesFrom").get<std::string>();
+                            }
+                        }
+                        // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): optional
+                        // `linkage`, whose one value `"none"` says this row's declarators
+                        // never have linkage (`DeclarationRule::declaresNoLinkage`). A
+                        // closed token, so a misspelling is refused, never read as absent.
+                        if (entry.contains("linkage")) {
+                            json const& lv = entry.at("linkage");
+                            if (!lv.is_string() || lv.get<std::string>() != "none") {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/linkage",
+                                          "'linkage' takes the one value \"none\": the row's "
+                                          "declarators never have linkage (a member, a parameter, "
+                                          "an enumeration constant, a tag, a typedef name); a row "
+                                          "whose declarators can have linkage omits the key");
+                            } else {
+                                rule.declaresNoLinkage = true;
                             }
                         }
 
@@ -16136,15 +16248,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             coll.emit(DiagnosticCode::C_InvalidSemantics, spPath,
                                       "'spellings' must be a non-empty ARRAY of "
                                       "{ introducer, qualifier?, "
-                                      "availableObjectFormats?, afterCompositeBody? } "
+                                      "availableObjectFormats?, afterCompositeBody?, "
+                                      "standardNamespaces? } "
                                       "rows, one per frame of 'attrSpecRule' — a "
                                       "language with nothing to say about its "
                                       "attribute specifier's spelling omits the key");
                         } else {
-                            static constexpr std::array<std::string_view, 4>
+                            static constexpr std::array<std::string_view, 5>
                                 kSpellingKeys{"introducer", "qualifier",
                                               "availableObjectFormats",
-                                              "afterCompositeBody"};
+                                              "afterCompositeBody",
+                                              "standardNamespaces"};
                             DSS_CHECK_KEY_VOCABULARY(kSpellingKeys);
                             for (std::size_t si = 0; si < sp.size(); ++si) {
                                 json const& row = sp[si];
@@ -16271,6 +16385,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             "\"declaration\" (it decorates the "
                                             "entities the declaration declares)");
                                         rowOk = false;
+                                    }
+                                }
+                                // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5):
+                                // `standardNamespaces` — the attribute namespaces whose
+                                // items of the standard form are clauses of this
+                                // spelling (`standardItemClause`). Each is a non-empty
+                                // identifier written without its dunders (the reader
+                                // normalizes the source's), claimed by ONE row, and the
+                                // language must have a standard form to claim from.
+                                if (row.contains("standardNamespaces")) {
+                                    json const& ns = row.at("standardNamespaces");
+                                    std::string const nsPath = rowPath + "/standardNamespaces";
+                                    if (!cfg.stdAttrRule.valid()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, nsPath,
+                                                  "'standardNamespaces' claims items of the "
+                                                  "standard attribute form, and this language "
+                                                  "declares no 'stdAttrRule': nothing would "
+                                                  "read it");
+                                        rowOk = false;
+                                    } else if (!ns.is_array() || ns.empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, nsPath,
+                                                  "'standardNamespaces' must be a non-empty "
+                                                  "ARRAY of namespace names; a spelling that "
+                                                  "claims none omits the key");
+                                        rowOk = false;
+                                    } else {
+                                        for (json const& nv : ns) {
+                                            std::string const name =
+                                                nv.is_string() ? nv.get<std::string>() : std::string{};
+                                            bool const plain =
+                                                !name.empty() && stripDunder(name) == name
+                                                && name.find_first_of("():[] ") == std::string::npos;
+                                            bool claimed = false;
+                                            for (AttributeSpelling const& prior : cfg.attributeSpellings)
+                                                for (std::string const& n : prior.standardNamespaces)
+                                                    if (n == name) claimed = true;
+                                            for (std::string const& n : out.standardNamespaces)
+                                                if (n == name) claimed = true;
+                                            if (!plain || claimed) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics, nsPath,
+                                                    std::format(
+                                                        "'{}' {}", nv.is_string() ? name : nv.dump(),
+                                                        !plain ? "is not a namespace name: a "
+                                                                 "non-empty identifier, written "
+                                                                 "without its dunders"
+                                                               : "is already claimed by a "
+                                                                 "'spellings' row — one namespace's "
+                                                                 "items are one spelling's"));
+                                                rowOk = false;
+                                                continue;
+                                            }
+                                            out.standardNamespaces.push_back(name);
+                                        }
                                     }
                                 }
                                 if (rowOk)
@@ -16401,7 +16569,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // explicit validation further down — is-array, non-empty,
                         // every entry a string, every value a known kind, no
                         // duplicates.
-                        static constexpr std::array<std::string_view, 15>
+                        static constexpr std::array<std::string_view, 17>
                             kEffectRowKeys{"names", "effect", "appliesTo",
                                            "conventions", "reason",
                                            "withinDeclarator", "withoutOperand",
@@ -16409,6 +16577,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                            "leadingDecoratesDefinitionOf",
                                            "refusedOnDefinition", "ignoredOnAlias",
                                            "ignoredOnInlineDefinition",
+                                           "refusedWithoutLinkage",
+                                           "refusedWithoutLinkageOn",
                                            "availableObjectFormats",
                                            "machineModes"};
                         DSS_CHECK_KEY_VOCABULARY(kEffectRowKeys);
@@ -17123,24 +17293,74 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // the refusal's own reason. It is read by the
                             // declaration's kind gate, so it needs the row's kind
                             // axis: refused on a row with none.
-                            if (row.contains("refusedOnDefinition")) {
-                                json const& v = row.at("refusedOnDefinition");
+                            // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5):
+                            // `refusedWithoutLinkage` — the attribute, on an OBJECT
+                            // declared without linkage, is refused by name, the text
+                            // being the reason; `refusedWithoutLinkageOn` — the object
+                            // formats it is refused on (absent ⇒ every format; anywhere
+                            // else it is ignored and said). Read by the declaration-kind
+                            // gate too, so ONE reader holds both keys to the same two
+                            // rules; whether a linkage table keys the row's names is
+                            // asked once every row is read (the late cross-checks).
+                            auto const readRefusalReason = [&](char const* key, char const* what,
+                                                               std::string& into) {
+                                if (!row.contains(key)) return;
+                                json const& v = row.at(key);
+                                std::string const keyPath = rowPath + "/" + key;
                                 if (!v.is_string() || v.get<std::string>().empty()) {
                                     coll.emit(
-                                        DiagnosticCode::C_InvalidSemantics,
-                                        rowPath + "/refusedOnDefinition",
-                                        "'refusedOnDefinition' must be a non-empty "
-                                        "STRING: why a definition cannot carry the "
-                                        "attribute; it is the refusal's own text");
+                                        DiagnosticCode::C_InvalidSemantics, keyPath,
+                                        std::format("'{}' must be a non-empty STRING: why {} "
+                                                    "cannot carry the attribute; it is the "
+                                                    "refusal's own text", key, what));
                                 } else if (out.appliesTo.empty()) {
                                     coll.emit(
-                                        DiagnosticCode::C_InvalidSemantics,
-                                        rowPath + "/refusedOnDefinition",
-                                        "'refusedOnDefinition' is read by the "
-                                        "declaration-kind gate, and this row states "
-                                        "no 'appliesTo': nothing would read it");
+                                        DiagnosticCode::C_InvalidSemantics, keyPath,
+                                        std::format("'{}' is read by the declaration-kind "
+                                                    "gate, and this row states no "
+                                                    "'appliesTo': nothing would read it", key));
                                 } else {
-                                    out.refusedOnDefinition = v.get<std::string>();
+                                    into = v.get<std::string>();
+                                }
+                            };
+                            readRefusalReason("refusedOnDefinition", "a definition",
+                                              out.refusedOnDefinition);
+                            readRefusalReason("refusedWithoutLinkage", "an object without linkage",
+                                              out.refusedWithoutLinkage);
+                            if (row.contains("refusedWithoutLinkageOn")) {
+                                json const& v = row.at("refusedWithoutLinkageOn");
+                                std::string const onPath = rowPath + "/refusedWithoutLinkageOn";
+                                if (!row.contains("refusedWithoutLinkage")) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, onPath,
+                                              "'refusedWithoutLinkageOn' names where "
+                                              "'refusedWithoutLinkage' refuses, and this row "
+                                              "states no 'refusedWithoutLinkage'");
+                                } else if (!v.is_array() || v.empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, onPath,
+                                              "'refusedWithoutLinkageOn' must be a non-empty "
+                                              "ARRAY of object-format names; a refusal on every "
+                                              "format omits the key");
+                                } else {
+                                    for (json const& fv : v) {
+                                        auto const kind = fv.is_string()
+                                            ? objectFormatKindFromName(fv.get<std::string>())
+                                            : std::nullopt;
+                                        if (!kind.has_value() || !isSelectableObjectFormatKind(*kind)
+                                            || std::ranges::find(out.refusedWithoutLinkageOn, *kind)
+                                                   != out.refusedWithoutLinkageOn.end()) {
+                                            coll.emit(
+                                                DiagnosticCode::C_InvalidSemantics, onPath,
+                                                std::format(
+                                                    "'{}' is not an object format a build can "
+                                                    "have, or is listed twice — accepted: {}",
+                                                    fv.is_string() ? fv.get<std::string>() : fv.dump(),
+                                                    renderAllowedList(kSelectableObjectFormatKindNames,
+                                                                      " / ")));
+                                            continue;
+                                        }
+                                        out.refusedWithoutLinkageOn.push_back(*kind);
+                                    }
+                                    std::ranges::sort(out.refusedWithoutLinkageOn);
                                 }
                             }
                             // P69 (lane `cs`, fold f26b): `ignoredOnAlias` — the
@@ -18951,6 +19171,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 *slot = data.schemaTokens->find(name);
             }
 
+            // ── typeSpelling (P69 fold f26d, lane `cs`) ──
+            // How this language's diagnostics spell a type: OPTIONAL (absent = its
+            // diagnostics name no types), and complete when present — every core kind
+            // the document's own type rows reach, every declarator form its declarators
+            // have, and each qualifier word lexing as the marker just read above.
+            readTypeSpelling(doc, sem, data.lexemeTable, *data.schemaTokens,
+                             cfg.volatileMarker, cfg.atomicMarker, coll, cfg.typeSpelling);
+
             // ── THE QUALIFIER MARKERS OF A TYPED ROW ARE DERIVED, NOT WRITTEN
             //    (P68 round 9, lane `cs`) ──────────────────────────────────────
             // A row that declares a TYPED entity — it folds a C-style declarator
@@ -19601,6 +19829,88 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 "the attribute's row, so this entry would never be "
                                 "read",
                                 key));
+                    }
+                }
+                // ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): EVERY ROW'S
+                // ATTRIBUTE SPECIFIERS ARE READ BY ONE TABLE, AND EVERY TABLE ENTRY AN
+                // ATTRIBUTE NAMES IS READ. Asked of a language that declares an
+                // attribute-specifier rule, once every row and every attribute row is
+                // read, through the one accessor (`attributeTableOf`):
+                //   * a row is refused by name when NO table reads its attribute
+                //     specifiers (`Unread`: it neither reads them in its own fold, nor
+                //     borrows another row's tables, nor states `"linkage": "none"`) —
+                //     keyed on "its specifiers are read", never on "it states a table":
+                //     c's `param` states one (`register`) and skips every attribute rule;
+                //   * and when it says two things: `"linkage": "none"` beside a table
+                //     (its own fold's, or a borrowed one), or a borrowed table beside
+                //     its own fold's — which table would read a specifier would then be
+                //     a matter of which tier asked;
+                //   * an entry keyed by an attribute's NAME (any key that is not the
+                //     spelling of one of the language's lexemes) is refused when its row
+                //     is not a table that reads attribute specifiers (another table reads
+                //     that row's, so the entry is dead) or when no effects row names the
+                //     attribute (the declaration-kind and no-linkage gates judge a clause
+                //     through its row, so one with none would reach a table unjudged);
+                //   * an effects row's `refusedWithoutLinkage` is refused when no table
+                //     keys its names (nothing would ever be refused).
+                if (cfg.attrSpecRule.valid()) {
+                    auto const ownFoldReads = [&](DeclarationRule const& d) {
+                        if (d.linkageSpecifiers.empty()) return false;
+                        for (RuleId r : d.linkageSpecifierIgnoredRules)
+                            if (r.v == cfg.attrSpecRule.v) return false;
+                        return true;
+                    };
+                    for (DeclarationRule const& d : cfg.declarations) {
+                        std::string refusal;
+                        bool const borrows = !d.attributeLinkageRuleName.empty();
+                        if (d.declaresNoLinkage && (borrows || ownFoldReads(d))) {
+                            refusal = "states \"linkage\": \"none\" beside a table that reads its "
+                                      "attribute specifiers";
+                        } else if (borrows && ownFoldReads(d)) {
+                            refusal = "reads its attribute specifiers in its own fold and also names "
+                                      "'attributeLinkageTablesFrom'";
+                        } else if (attributeTableOf(cfg, d).answer == AttributeTableAnswer::Unread
+                                   && !borrows) {
+                            refusal = "has attribute specifiers no table reads: it neither reads them "
+                                      "in its own fold (a 'linkageSpecifiers' table, 'attrSpecRule' not "
+                                      "skipped), nor names 'attributeLinkageTablesFrom', nor states "
+                                      "\"linkage\": \"none\" (its declarators never have linkage)";
+                        }
+                        if (!refusal.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/declarations",
+                                      std::format("the '{}' row {}", d.ruleName, refusal));
+                        }
+                        bool const readsAttributes =
+                            attributeTableOf(cfg, d).answer == AttributeTableAnswer::Own;
+                        for (auto const& [key, unusedEffect] : d.linkageSpecifiers) {
+                            std::string const base{linkageSpecifierBaseName(key)};
+                            if (data.lexemeTable.contains(base)) continue;   // a lexeme's spelling
+                            if (readsAttributes && effectNames.contains(norm(base))) continue;
+                            coll.emit(
+                                DiagnosticCode::C_InvalidSemantics, "/semantics/declarations",
+                                std::format(
+                                    "the '{}' row's linkage specifier '{}' is keyed by an "
+                                    "attribute's name, and {}",
+                                    d.ruleName, key,
+                                    readsAttributes
+                                        ? "no 'semantics.attributeSemantics.effects' row names "
+                                          "the attribute: a clause is judged through its row, so "
+                                          "this one would reach the table unjudged"
+                                        : "another table reads this row's attribute specifiers "
+                                          "(or none does): this entry would never be read"));
+                        }
+                    }
+                    for (AttributeSemanticsRow const& row : cfg.attributeEffects) {
+                        if (row.refusedWithoutLinkage.empty()) continue;
+                        if (linkageFacetsOfAttribute(cfg, row).linkage) continue;
+                        coll.emit(
+                            DiagnosticCode::C_InvalidSemantics,
+                            "/semantics/attributeSemantics/effects",
+                            std::format(
+                                "the effects row naming '{}' says 'refusedWithoutLinkage', and no "
+                                "linkage table keys a binding or a visibility under its names: "
+                                "nothing would ever be refused",
+                                row.names.empty() ? std::string{} : row.names.front()));
                     }
                 }
                 for (DeclarationRule const& d : cfg.declarations) {

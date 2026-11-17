@@ -8,7 +8,7 @@
 #include "core/types/section_kind.hpp"     // DataSectionKind
 #include "core/types/target_schema.hpp"    // TargetSchema
 #include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize — the format's pointer width
-#include "link/fresh_symbol_ids.hpp"       // maxExistingSymbolIdV
+#include "link/fresh_symbol_ids.hpp"       // ModuleSymbolIds
 #include "link/object_format_schema.hpp"   // importAddressSymbolPrefix
 #include "link/pointer_reloc.hpp"          // absolutePointerRelocKind
 
@@ -87,27 +87,24 @@ struct ImportAddressFoldCounts {
                           : std::nullopt;
     std::string const targetName{target.name()};
     for (auto& mod : modules) {
-        std::uint32_t maxV = maxExistingSymbolIdV(mod);
-        std::vector<AssembledData> localPointers;
-        std::vector<ExternImport>  definitionRows;
-        for (auto it = mod.externImports.begin(); it != mod.externImports.end();) {
-            ExternImport& ext = *it;
+        // THE PLAN, before the module is touched (P69 fold f26d, the take sites): which `__imp_` rows this module
+        // rewrites, and how. Until this fold each row was rewritten as it was met and its id taken there, so a
+        // refusal at the second row -- the id space exhausted, or no slot relocation -- left the first rewritten.
+        enum class Fold : std::uint8_t { Imported, LocalPointer };
+        std::vector<std::pair<std::size_t, Fold>> plan;
+        for (std::size_t r = 0; r < mod.externImports.size(); ++r) {
+            ExternImport const& ext = mod.externImports[r];
             std::string_view const name{ext.mangledName};
             bool const prefixed = ext.libraryPath.empty() && !ext.addressSlotSymbol.valid()
                                && name.size() > prefix.size()
                                && name.substr(0, prefix.size()) == prefix;
-            if (!prefixed) { ++it; continue; }
-            std::string target{name.substr(prefix.size())};
+            if (!prefixed) continue;
+            std::string const target{name.substr(prefix.size())};
             if (definedNames.count(target) == 0) {
-                ext.addressSlotSymbol = ext.symbol;
-                ext.symbol            = SymbolId{++maxV};
-                ext.mangledName       = std::move(target);
-                ext.kindOrigin        = ExternKindOrigin::Pending;
-                ++counts.importedSlots;
-                ++it;
+                plan.emplace_back(r, Fold::Imported);
                 continue;
             }
-            if (!width.has_value()) { ++it; continue; }   // refused by name by the link (above)
+            if (!width.has_value()) continue;   // refused by name by the link (above)
             if (!absPtr.has_value()) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::K_AbsolutePointerRelocMissing;
@@ -123,10 +120,33 @@ struct ImportAddressFoldCounts {
                 reporter.report(std::move(d));
                 return std::nullopt;
             }
-            auto const pointerBytes = static_cast<std::uint8_t>(*width);   // engaged: `absPtr` is
+            plan.emplace_back(r, Fold::LocalPointer);
+        }
+        if (plan.empty()) continue;
+        // Every rewritten row's id from the module's door, ALL AT ONCE: a space too short for every one of them is
+        // refused there by name, and the module is left as it was.
+        std::optional<std::vector<SymbolId>> const taken = ModuleSymbolIds{mod}.take(
+            plan.size(), reporter, std::format("linker: the {} import-address row(s) of a unit", plan.size()));
+        if (!taken.has_value()) return std::nullopt;
+        // THE REWRITE, in the module's own row order.
+        std::vector<AssembledData> localPointers;
+        std::vector<ExternImport>  definitionRows;
+        std::vector<bool>          becomesALocalPointer(mod.externImports.size(), false);
+        for (std::size_t k = 0; k < plan.size(); ++k) {
+            ExternImport& ext = mod.externImports[plan[k].first];
+            std::string target = ext.mangledName.substr(prefix.size());
+            if (plan[k].second == Fold::Imported) {
+                ext.addressSlotSymbol = ext.symbol;
+                ext.symbol            = (*taken)[k];
+                ext.mangledName       = std::move(target);
+                ext.kindOrigin        = ExternKindOrigin::Pending;
+                ++counts.importedSlots;
+                continue;
+            }
+            auto const pointerBytes = static_cast<std::uint8_t>(*width);   // engaged: the plan read `absPtr`
             // The local pointer: the old `__imp_X` symbol names it now.
             ExternImport def;
-            def.symbol      = SymbolId{++maxV};
+            def.symbol      = (*taken)[k];
             def.mangledName = std::move(target);
             def.binding     = ext.binding;
             def.isData      = ext.isData;
@@ -144,11 +164,17 @@ struct ImportAddressFoldCounts {
             slot.relocations.push_back(fill);
             localPointers.push_back(std::move(slot));
             definitionRows.push_back(std::move(def));
-            it = mod.externImports.erase(it);
+            becomesALocalPointer[plan[k].first] = true;
             ++counts.localPointers;
         }
+        std::vector<ExternImport> kept;
+        kept.reserve(mod.externImports.size());
+        for (std::size_t r = 0; r < mod.externImports.size(); ++r) {
+            if (!becomesALocalPointer[r]) kept.push_back(std::move(mod.externImports[r]));
+        }
+        for (auto& r : definitionRows) kept.push_back(std::move(r));
+        mod.externImports = std::move(kept);
         for (auto& d : localPointers) mod.dataItems.push_back(std::move(d));
-        for (auto& r : definitionRows) mod.externImports.push_back(std::move(r));
     }
     return counts;
 }

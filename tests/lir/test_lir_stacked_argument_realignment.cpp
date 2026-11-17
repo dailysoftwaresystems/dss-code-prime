@@ -62,6 +62,7 @@
 #include "repo_root.hpp"   // configRoot: the shipped arm64 document the active-convention cell edits
 #include "scratch_dir.hpp"
 #include "shipped_read_pairs.hpp"   // shippedFormatNames
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -194,6 +195,7 @@ struct Descents {
     TypeId const ptr   = in.pointer(i64);
     TypeId const sig   = in.fnSig(std::vector<TypeId>{ptr}, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);
@@ -405,7 +407,7 @@ TEST(StackedArgumentRealignment, AFunctionWithNoOverAlignedLocalPassingA64Aligne
         TypeInterner in{CompilationUnitId{1}};
         Mir const m = buildStackedCall(in, 64, align);
         DiagnosticReporter rep;
-        MirToLirResult const r = lowerToLir(m, **target, in, rep, std::vector<ExternImport>{},
+        MirToLirResult const r = lowerToLir(m, **target, in, rep, dss::test::kFirstConventionOfTheTarget, std::vector<ExternImport>{},
                                             ExternCallDispatch::DirectPlt);
         ASSERT_TRUE(r.ok) << inventory(rep);
         Descents const d = descentsOf(r.lir, **target, 0, cc->stackPointer->ordinal);
@@ -446,6 +448,7 @@ TEST(StackedArgumentRealignment, ACarrierNoCallConsumesRealignsNothing) {
     TypeId const ptr = in.pointer(i64);
     TypeId const sig = in.fnSig(std::vector<TypeId>{ptr}, i64, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);
@@ -459,7 +462,7 @@ TEST(StackedArgumentRealignment, ACarrierNoCallConsumesRealignsNothing) {
     mb.addReturn(v);
     Mir const m = std::move(mb).finish();
     DiagnosticReporter rep;
-    MirToLirResult const r = lowerToLir(m, **target, in, rep, std::vector<ExternImport>{},
+    MirToLirResult const r = lowerToLir(m, **target, in, rep, dss::test::kFirstConventionOfTheTarget, std::vector<ExternImport>{},
                                         ExternCallDispatch::DirectPlt);
     ASSERT_TRUE(r.ok) << inventory(rep);
     Descents const d = descentsOf(r.lir, **target, 0, cc->stackPointer->ordinal);

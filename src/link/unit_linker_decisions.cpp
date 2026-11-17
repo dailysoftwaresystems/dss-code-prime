@@ -2,7 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/object_symbol_names.hpp"   // ObjectSymbolNames::hasExternalLinkage
-#include "link/fresh_symbol_ids.hpp"             // maxExistingSymbolIdV — the ONE taken-id scan
+#include "link/fresh_symbol_ids.hpp"             // ModuleSymbolIds — the module's one door of a fresh id
 
 #include <algorithm>
 #include <cstdint>
@@ -435,36 +435,40 @@ std::optional<StandingEntryRequest> standingEntryRequest(std::span<AssembledModu
     return standing;
 }
 
-void requireEntryReference(std::span<AssembledModule> namedUnits) {
+bool requireEntryReference(std::span<AssembledModule> namedUnits, DiagnosticReporter& reporter) {
     // The request that stands (`standingEntryRequest`), asked of the units named to the link before the archive
     // search runs; a link whose two requests have no order between them requires nothing here.
     auto const standing = standingEntryRequest(std::span<AssembledModule const>{namedUnits.data(), namedUnits.size()});
-    if (!standing.has_value()) return;
+    if (!standing.has_value()) return true;
     AssembledModule& unit  = namedUnits[standing->unit];
     auto const&      entry = std::get<UnitEntryRequest>(standing->request->value);
-    if (entry.runtimeStartup || !entry.unsupported.empty()) return;
+    if (entry.runtimeStartup || !entry.unsupported.empty()) return true;
     std::string const name = entry.symbol;   // `standing` points into the unit this function is about to grow
     for (auto const& ms : unit.symbols) {
-        if (ms.name == name && link::format::ObjectSymbolNames::hasExternalLinkage(ms)) return;   // its own definition
+        if (ms.name == name && link::format::ObjectSymbolNames::hasExternalLinkage(ms)) return true;   // its own definition
     }
     for (auto& e : unit.externImports) {
         if (e.mangledName != name) continue;
         // A COMMON of the name is the unit's own (tentative) definition — a datum, which the entry refuses by
         // name; any other row is its reference, now required.
         if (e.commonSize == 0u) e.requiredByDirective = true;
-        return;
+        return true;
     }
+    std::optional<SymbolId> const id =
+        ModuleSymbolIds{unit}.take(reporter, std::format("linker: the reference the entry '{}' requires", name));
+    if (!id.has_value()) return false;
     ExternImport required;
-    required.symbol              = SymbolId{maxExistingSymbolIdV(unit) + 1u};
+    required.symbol              = *id;
     required.mangledName         = name;
     // A directive states no code-vs-data kind; the definition the link finds decides it.
     required.kindOrigin          = ExternKindOrigin::Pending;
     required.requiredByDirective = true;
     unit.externImports.push_back(std::move(required));
+    return true;
 }
 
-void requireEntryReference(AssembledModule& unit) {
-    requireEntryReference(std::span<AssembledModule>{&unit, 1});
+bool requireEntryReference(AssembledModule& unit, DiagnosticReporter& reporter) {
+    return requireEntryReference(std::span<AssembledModule>{&unit, 1}, reporter);
 }
 
 }  // namespace dss::linker

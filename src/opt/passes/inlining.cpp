@@ -1,5 +1,6 @@
 #include "opt/passes/inlining.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "mir/mir_cfg.hpp"
@@ -597,6 +598,22 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                 if (pos >= callArgCount) {
                     return std::nullopt;
                 }
+                // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): an `Arg` is a FIXED
+                // parameter, so it maps only an operand the call passes as a fixed one —
+                // never one it passes through `...` (`call_payload::passesThroughEllipsis`,
+                // the one boundary every tier asks). A call whose fixed operands end before
+                // its callee's parameters do is a call and a callee that disagree about
+                // where `...` begins: refuse (fail-SAFE). The argument region starts past a
+                // prepended x8 result operand; such a callee is refused below anyway.
+                {
+                    std::uint32_t const callPayload = mir.instPayload(callId);
+                    std::uint32_t const irr =
+                        ::dss::call_payload::hasIndirectResult(callPayload) ? 1u : 0u;
+                    if (pos >= irr
+                        && ::dss::call_payload::passesThroughEllipsis(callPayload, pos - irr)) {
+                        return std::nullopt;
+                    }
+                }
                 // Type-consistency backstop (design-audit F6): the actual at
                 // this position must share the Arg's MIR type. This bug class
                 // ALWAYS crosses GPR/FPR (disjoint MIR type kinds), so a type
@@ -1091,7 +1108,7 @@ public:
         // OWN rebuild (it does not go through `MirFunctionRebuilder`), so it is a
         // second, independently-editable copy site for all four trailing flags —
         // and the only one for which no pass-behaviour test could notice a drop.
-        dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
+        MirFuncId const copied = dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
                          // P69: the linkage is copied as its ONE record
                          // (binding, visibility, weak kind).
                          src_.funcLinkage(caller),
@@ -1100,6 +1117,10 @@ public:
                          src_.funcNoSanitizeThread(caller),
                          // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
                          src_.funcStaticInit(caller));
+        // ★ P69 (lane `cs`, fold f26d): the counting of the convention the function is called by crosses
+        // with it — a clone that took the builder's default would count a foreign-convention function
+        // by the pair's.
+        dst_.stateFunctionArgCounting(copied, src_.funcArgCounting(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 

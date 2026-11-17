@@ -185,8 +185,6 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             bool const variadicForcesStack =
                 cc.variadicArgsAlwaysStack
                 && ::dss::call_payload::isVariadic(payload);
-            std::uint32_t const fixedOps =
-                ::dss::call_payload::fixedOperandCount(payload);
 
             std::vector<LirOperand> keepOps;
             keepOps.reserve(ops.size());
@@ -261,7 +259,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 // and `argRegionIdx` is still the ORIGINAL numbering at every
                 // call site below — which is what makes the restatement exact.
                 auto const noteKeptPosition = [&] {
-                    if (argRegionIdx < fixedOps) ++keptFixedArgs;
+                    if (!::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx)) ++keptFixedArgs;
                 };
                 if (lirIsByValueStackAggCarrier(ops, k)) {
                     // Wholly-stacked aggregate: its byte OFFSET is decided here,
@@ -342,7 +340,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 std::uint32_t const argIndex = slot.has_value() ? slot->index : 0u;
                 std::uint32_t const poolSize = slot.has_value() ? slot->poolSize : 0u;
                 bool const forceStack =
-                    variadicForcesStack && argRegionIdx >= fixedOps;
+                    variadicForcesStack && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
                 if (argIndex < poolSize && !forceStack) {
                     keepOps.push_back(argOp);      // register-resident
                     noteKeptPosition();
@@ -351,11 +349,10 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                     // VARARG and a NAMED scalar are DIFFERENT axes — ✔MEASURED,
                     // Apple packs named scalars naturally and keeps 8-byte slots
                     // for varargs — so the region decides which rule applies. The
-                    // vararg predicate is the SAME `argRegionIdx >= fixedOps` the
-                    // placement + pre-scan use, so all three agree on the boundary.
+                    // vararg predicate is the SAME `call_payload::passesThroughEllipsis`
+                    // the placement + pre-scan ask, so all three agree on the boundary.
                     bool const isVariadicRegion =
-                        ::dss::call_payload::isVariadic(payload)
-                        && argRegionIdx >= fixedOps;
+                        ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
                     std::uint32_t const nat = argOp.argNaturalBytes;
                     // ⚠ FAIL LOUD ON A DROPPED CARRIER. Under NATURAL packing an
                     // unstated natural size would silently revert THIS argument to

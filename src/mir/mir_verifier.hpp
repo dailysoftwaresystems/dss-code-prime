@@ -202,6 +202,19 @@ private:
     //     guessed at (see the gate in the .cpp). Those calls get no coverage.
     void checkCallSignatures(DiagnosticReporter& reporter) const;
 
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2): every function's `Arg`s are DENSE under the
+    // counting discipline the module STATES (`Mir::argCounting`) — I_ArgOrdinalGap,
+    // I_ArgOrdinalRepeated — and a module that holds an `Arg` and states none is refused
+    // (I_ArgCountingUnstated). The per-class rule is interner-gated.
+    void checkArgDensity(DiagnosticReporter& reporter) const;
+
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of ledger 597): a call stamped
+    // `MirInstFlags::PassesByItsDefinition` is held to its callee's receptions — each `Arg` and
+    // stamped `RecvByValueStackParam` finds the call's operand at its position, fixed, of its
+    // carrier and type (I_CallDisagreesWithItsDefinition). An unstamped call is not judged.
+    // Interner-gated.
+    void checkCallsAgainstTheirDefinitions(DiagnosticReporter& reporter) const;
+
     // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the atomic-lowering belt. A plain
     // `Load` (accessed type = its result type) or `Store` (accessed type = the
     // pointee of its address operand) whose accessed type `isAtomicQualified` is a

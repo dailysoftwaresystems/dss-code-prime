@@ -14,6 +14,7 @@
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
 
 #include <algorithm>
 #include <cstdint>
@@ -351,6 +352,13 @@ struct DSS_EXPORT SymbolRecord {
     // 6.5.2.2p6); a prototype of the merge is the composite (C 6.2.7p3), the type the record
     // takes. Set after Pass 1.5, before the redeclaration sweep. Default false.
     bool            declaresNoPrototype = false;
+    // ★ P69 (lane `cs`, fold f26d — main's ledger 598): TRUE iff the function's prototype is the
+    // one the platform's C library declares for its name, in a header the unit includes, while
+    // the unit's own declarations of it give none (`#include <stdio.h>` then `extern int
+    // printf();`). That prototype is the merge's composite — the type the record takes — and,
+    // being another tree's, it is in scope at every call (`callHasNoPrototypeAt`). Set by the
+    // check against the shipped declaration, before Pass 2. Default false.
+    bool            prototypeIsTheLibrarys = false;
     // D-CSUBSET-EXTERN-DEFINITION-MERGE: TRUE iff this symbol was minted from a
     // NON-DEFINING declaration — a declaration that announces a symbol whose
     // storage/body lives elsewhere (an `extern` declaration in C). Set by Pass 1
@@ -1405,7 +1413,7 @@ public:
         std::vector<SymbolId> out;
         for (std::size_t i = 1; i < symbols_.size(); ++i)
             if (symbols_[i].isImplicitDeclaration && symbols_[i].type.valid())
-                out.push_back(SymbolId{static_cast<std::uint32_t>(i)});
+                out.push_back(symbolIdOfIndex(i));   // the table's index rule (P69 f26d, N9)
         return out;
     }
 

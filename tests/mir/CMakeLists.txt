@@ -20,6 +20,7 @@ dss_add_test(NAME mir/test_mir_inline_asm SOURCES test_mir_inline_asm.cpp)
 dss_add_test(NAME mir/test_mir_lowering_c SOURCES test_mir_lowering_c.cpp)
 # P69 L2b2: `lowerC`'s language whose static objects may be initialized at run time is the
 # shipped c document with its `semantics.staticInitializers` erased — it reads the JSON.
+# P69 (fold f26d, N2): the placement universe reads each shipped convention row's own keys.
 target_link_libraries(dss_mir_test_mir_lowering_c PRIVATE nlohmann_json::nlohmann_json)
 
 # LK6 cycle 2d — HIR ExternFunction → MIR.externImports thread-through.

@@ -67,6 +67,7 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -119,7 +120,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
 [[nodiscard]] MirToLirResult lower(Mir const& m, TargetSchema const& t,
                                    TypeInterner const& in, DiagnosticReporter& rep,
                                    Model const& model) {
-    return lowerToLir(m, t, in, rep, std::vector<ExternImport>{},
+    return lowerToLir(m, t, in, rep, dss::test::kFirstConventionOfTheTarget, std::vector<ExternImport>{},
                       ExternCallDispatch::DirectPlt,
                       /*dataImportBinding=*/std::nullopt,
                       /*tlsAccess=*/std::nullopt, /*sehScopes=*/{},
@@ -134,6 +135,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);
@@ -161,6 +163,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, outPtr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);
@@ -185,6 +188,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);
@@ -206,6 +210,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const next = mb.createBlock(StructCfMarker::Linear);
@@ -232,6 +237,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
@@ -264,6 +270,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);
@@ -290,6 +297,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
     MirInstId const p = mb.addArg(0, ptr);

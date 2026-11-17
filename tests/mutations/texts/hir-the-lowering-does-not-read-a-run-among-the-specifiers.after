@@ -1,2 +1,2 @@
-                for (NodeId run : headAttributeRuns(sem, tree(), c)) {
+                    if (isStandardAttributeSpecifier(sem, tree(), run)) continue;
                     (void)run;

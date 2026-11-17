@@ -41,6 +41,7 @@
 //     splice path threads cleanly + the module verifies.
 //   * callsInlined counter accuracy + verifier-clean rebuild.
 
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
@@ -659,6 +660,7 @@ TEST(Inlining, MixedClassCalleeSplicesFpArgByPositionNotOrdinal) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // g(int a, double x) { return (int)x; }  — a=gpr#0/pos0, x=fpr#0/pos1.
     mb.addFunction(fnSig, SymbolId{200}, SymbolBinding::Global,
                    SymbolVisibility::Default);
@@ -737,6 +739,7 @@ TEST(Inlining, ArgPositionSurvivesRebuildRoundTrip) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{300});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -906,6 +909,54 @@ TEST(Inlining, VariadicCalleeCallingVaStartIsNotInlined) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
 }
 
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): AN `Arg` IS A FIXED PARAMETER, SO IT IS NEVER SPLICED FROM AN
+// OPERAND THE CALL PASSES THROUGH `...` — the gate asks the one boundary every tier asks
+// (`call_payload::passesThroughEllipsis`). The callee `g(int a, ...)` never starts its list, so it is inlinable;
+// its one `Arg` sits at position 0. A call stating ONE fixed operand inlines (the control); the same call stating
+// NONE — a call and a callee that disagree about where `...` begins, the shape the last-fixed-argument defect
+// produced — is refused, fail-safe, where the old gate (position in range, the operand's type equal) took it.
+// RED-ON-DISABLE: drop the gate's ellipsis refusal, or draw the boundary one operand late in `call_payload`,
+// and the disagreeing call is inlined.
+TEST(Inlining, AnArgIsNeverSplicedFromAnOperandTheCallPassesThroughTheEllipsis) {
+    for (std::uint32_t const fixedOperands : {1u, 0u}) {
+        SCOPED_TRACE(fixedOperands == 1u ? "the call's fixed operands end where its callee's parameters end"
+                                         : "the call passes its callee's fixed parameter through `...`");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i32 = interner.primitive(TypeKind::I32);
+        TypeId const params[] = {i32};
+        TypeId const variadicSig = interner.fnSig(params, i32, CallConv::CcSysV, /*isVariadic=*/true);
+        TypeId const mainSig = interner.fnSig(params, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
+        // g(int a, ...) { return a; }  — no va_start, so no frame-binding leaf.
+        mb.addFunction(variadicSig, SymbolId{300}, SymbolBinding::Global, SymbolVisibility::Default);
+        MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(gEntry);
+        MirInstId const a = mb.addArg(0, i32, 0);
+        mb.addReturn(a);
+        // main(int p) { return g(p, p); }  — the call's payload states its fixed operands.
+        mb.addFunction(mainSig, SymbolId{301});
+        MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(mEntry);
+        MirInstId const p = mb.addArg(0, i32, 0);
+        MirInstId const gAddr = mb.addGlobalAddr(SymbolId{300}, variadicSig);
+        MirInstId const callOps[] = {gAddr, p, p};
+        MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32,
+                                          ::dss::call_payload::encode(true, fixedOperands));
+        mb.addReturn(call);
+        Mir mir = std::move(mb).finish();
+
+        DiagnosticReporter rep;
+        auto const r = opt::passes::runInlining(mir, interner, rep, opt::kMaxInlineThreshold);
+        EXPECT_TRUE(r.ok);
+        EXPECT_EQ(r.callsInlined, fixedOperands == 1u ? 1u : 0u)
+            << "an Arg is spliced only from an operand the call passes as a fixed one";
+        EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), fixedOperands == 1u ? 0u : 1u);
+        MirVerifier verifier{mir, &interner};
+        EXPECT_TRUE(verifier.verify(rep)) << "the module verifies";
+    }
+}
+
 // D-OPT-SETJMP-RETURNS-TWICE-INLINE: a callee whose body CALLS a returns-twice
 // function (setjmp / _setjmp) MUST NOT be inlined. `setjmp` captures the CALLER's
 // frame (SP + callee-saved) into the jmp_buf; splicing the setjmp Call into the caller
@@ -967,6 +1018,7 @@ TEST(Inlining, ArgumentIsSubstitutedIntoSplicedBody) {
     TypeId const gSig     = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig  = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // g(int x): return x + 1
     mb.addFunction(gSig, SymbolId{60});
@@ -2028,6 +2080,7 @@ TEST(Inlining, RecoverParentFrameSlotCalleeIsNotInlined) {
     TypeId const params[] = {ptr};
     TypeId const fnSig  = interner.fnSig(params, ptr, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // f (SymbolId 55): recovers slot #3 off its establisher-frame arg.
     mb.addFunction(fnSig, SymbolId{55});
@@ -2088,6 +2141,7 @@ TEST(Inlining, RuntimeSizedAllocaCalleeIsNotInlined) {
         TypeId const params[] = {i64};
         TypeId const fSig    = interner.fnSig(params, block, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
 
         // f (SymbolId 55): the block, runtime-sized (operand n) or fixed (payload 16).
         mb.addFunction(fSig, SymbolId{55});
@@ -2884,6 +2938,7 @@ TEST(Inlining, LoopBearingCalleeInlinesLayoutClean) {
     TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // f(int k): alloca-based counted loop (Phi-free — the gate forbids
     // callee Phis; this is the pre-Mem2Reg lowering).
@@ -2978,6 +3033,7 @@ TEST(Inlining, RecursionCrossSccInlinesCallerSelfCallSurvives) {
     TypeId const recSig = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // rec(int k): if (k) return rec(k-1)+1; return 37;  (alloca-free,
     // Phi-free diamond — entry CondBr to a recursive-then arm + a base
@@ -3202,6 +3258,7 @@ Mir buildJoinPhiPlusTwoReturnsModule(TypeInterner& interner) {
     TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // f(int x): ternary-join then early-return diamond (markers
     // derivation-consistent: join is a real IfJoin reached by both arms;
@@ -3425,6 +3482,7 @@ Mir buildDiamondPhiModule(TypeInterner& interner, bool transpose,
     TypeId const params[] = {i32};
     TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const thenB = mb.createBlock(StructCfMarker::IfThen);
@@ -3562,6 +3620,7 @@ TEST(Inlining, LoopPhiCalleeInlinesBackEdgeRemapped) {
     TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // f(int n): a Phi-form counted loop summing 0..n-1 (hand-built SSA).
     // Markers are derivation-consistent: the header is a LoopHeader (rule
@@ -3711,6 +3770,7 @@ Mir buildLoopPhiModule(TypeInterner& interner, bool correct) {
     TypeId const params[] = {i32};
     TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fSig, SymbolId{100});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
@@ -3791,6 +3851,7 @@ TEST(Inlining, ArgKeyedTernaryPhiCalleeInlinesPaired) {
     TypeId const fSig  = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // pick(int k): the ternary diamond `k ? 7 : 9`, exactly as hir_to_mir
     // lowers it (entry CondBr → then(7)/else(9) → join-phi → return phi).
@@ -3884,6 +3945,7 @@ Mir buildArgValuedTernaryModule(TypeInterner& interner) {
     TypeId const fSig    = interner.fnSig(params, i32, CallConv::CcSysV);
     TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // f(int k, int a, int b): entry CondBr(k!=0)->then/else (both empty,
     // br join); join phi [a, then],[b, else]; return phi. The phi VALUES
@@ -4424,4 +4486,56 @@ TEST(Inlining, NoOptimizeFlagsClearedInlineTheSameCall) {
            "the two refusals above statements about the flag rather than about "
            "the fixture";
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u);
+}
+
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): THE INLINER'S OWN COPY OF A CALLER KEEPS THE CALLER'S ARG
+// COUNTING. A multi-block target routes the caller through `MultiBlockInliner`, which copies it with its own
+// `addFunction` and never through `MirFunctionRebuilder`; the caller is stamped flat in a per-class module — a
+// function of another convention — so a copy that took the rebuilt builder's default would be seen.
+// RED-ON-DISABLE: drop the copy's stamp, and the caller reads per class after the splice.
+TEST(Inlining, ACallersOwnArgCountingSurvivesTheInlinersCopyOfIt) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
+
+    // pick (SymbolId 50): entry → CondBr to two blocks that each return (MultiBlockLeafCalleeIsInlined's callee).
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const fThen  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fElse  = mb.createBlock(StructCfMarker::IfElse);
+    mb.beginBlock(fEntry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    mb.addCondBr(mb.addConst(tru, boolT), fThen, fElse);
+    mb.beginBlock(fThen);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+    mb.beginBlock(fElse);
+    mb.addReturn(mb.addConst(i32Lit(9), i32));
+
+    // main (SymbolId 100), of another convention: return pick();
+    MirFuncId const caller = mb.addFunction(fnSig, SymbolId{100});
+    mb.stateFunctionArgCounting(caller, MirArgCounting::Flat);
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    MirInstId const callOps[] = {fAddr};
+    mb.addReturn(mb.addInst(MirOpcode::Call, callOps, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep, opt::kMaxInlineThreshold);
+    ASSERT_TRUE(r.ok);
+    ASSERT_EQ(r.callsInlined, 1u) << "fixture precondition: the two-block leaf is spliced, so the caller is copied";
+    std::optional<MirArgCounting> callerCounting;
+    std::optional<MirArgCounting> calleeCounting;
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == 100) callerCounting = mir.funcArgCounting(f);
+        if (mir.funcSymbol(f).v == 50) calleeCounting = mir.funcArgCounting(f);
+    }
+    EXPECT_EQ(callerCounting, std::optional<MirArgCounting>{MirArgCounting::Flat})
+        << "the inliner's copy of the caller keeps its own convention's counting";
+    EXPECT_EQ(calleeCounting, std::optional<MirArgCounting>{MirArgCounting::PerClass}) << "and the callee its default";
 }

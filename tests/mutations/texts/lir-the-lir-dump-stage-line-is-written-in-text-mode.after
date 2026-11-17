@@ -1,0 +1,2 @@
+    if (std::FILE* const f = core::openFileStream(
+            std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a")) {   // at any length

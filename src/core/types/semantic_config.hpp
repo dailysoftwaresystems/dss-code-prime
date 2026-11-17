@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/attribute_naming.hpp"   // stripDunder (linkageFacetsOfAttribute)
 #include "core/types/constant_form.hpp"   // ConstantForms (StaticInitializerRule)
 #include "core/types/variant_when.hpp"   // WhenSpec — a builtin signature arm's `when`
 #include "core/types/data_model.hpp"
@@ -10,6 +11,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
+#include "core/types/type_spelling.hpp"   // TypeSpelling (semantics.typeSpelling)
 #include "core/types/type_lattice/type_layout.hpp"  // NonObjectTypeSizes (operand sizes)
 
 #include <algorithm>   // std::lower_bound (LibraryBuiltins::libraryFunctionOf)
@@ -1376,6 +1378,13 @@ struct DSS_EXPORT DeclarationRule {
     // reach no linkage fold.
     std::string                  attributeLinkageRuleName;
     std::optional<std::uint32_t> attributeLinkageRow;
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): config `"linkage": "none"` (the
+    // key's only value) — this row's declarators NEVER have linkage (C 6.2.2p6: a
+    // member, a parameter, an enumeration constant, a tag, a typedef name), so no
+    // linkage table reads their attribute specifiers, and an attribute one keys is
+    // ignored there and said (`attributeTableOf` answers `NoLinkage`). Refused at load
+    // beside a table that reads the row's attribute specifiers. Absent ⇒ false.
+    bool                         declaresNoLinkage = false;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears
@@ -3384,6 +3393,17 @@ struct DSS_EXPORT AttributeSemanticsRow {
     // any other definition. Read beside it, and refused by the loader on a row with no
     // kind axis.
     std::string              ignoredOnInlineDefinition;
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): non-empty ⇒ on an OBJECT
+    // declared without linkage (C 6.2.2p6: in a block without `extern`, automatic or
+    // `static`, a for-init declaration) the attribute is refused by name, this text
+    // being the reason (`refusedWithoutLinkage`), on the object formats
+    // `refusedWithoutLinkageOn` lists (sorted, unique; empty ⇒ every format). Anywhere
+    // else — and on every declarator that never has linkage (a row stating
+    // `"linkage": "none"`) — an attribute a linkage table keys is ignored there, and
+    // said. Read by the declaration-kind gate; the loader refuses it on a row whose
+    // names no linkage table keys, which nothing would read.
+    std::string                   refusedWithoutLinkage;
+    std::vector<ObjectFormatKind> refusedWithoutLinkageOn;
     // ★★ P69 (lane `cs`, fold f26b): non-empty ⇒ the row's names are attribute
     // vocabulary ONLY for these object formats (`availableObjectFormats`, sorted,
     // unique). On any other format — and where no format is in scope, so the question
@@ -3423,7 +3443,19 @@ struct DSS_EXPORT AttributeSemanticsRow {
 //   * `afterCompositeBodyIsTheDeclarations` (config `afterCompositeBody:
 //     "declaration"`; absent or `"type"` ⇒ false) — a specifier written after a
 //     composite's BODY and before the declarators decorates the DECLARED entities,
-//     where the default is the type just defined.
+//     where the default is the type just defined;
+//   * `standardNamespaces` — ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): the
+//     attribute NAMESPACES whose items of the standard form (`stdAttrRule`) are
+//     clauses of this spelling: `[[gnu::weak]]` is the GNU spelling's `weak`, read by
+//     every table and fold that reads that spelling (`standardItemClause`,
+//     core/types/decl_prefix_strip.hpp). Matched dunder-normalized (`__gnu__` is
+//     `gnu`). An item with no namespace, or one no spelling lists, is the standard
+//     form's own attribute. ✔MEASURED (lane `cs` probes n5p, n5q; gcc 13.3.0, clang
+//     18.1.3, Apple clang 21, mingw-w64 gcc 13.2.0, clang-cl): `[[gnu::weak]]`,
+//     `[[__gnu__::weak]]`, `[[gnu::visibility("hidden")]]`, `[[gnu::dllimport]]` and
+//     `[[gnu::selectany]]` confer exactly what their GNU spelling confers at the
+//     declaration's leading sequence and after an identifier declarator; `[[weak]]`
+//     and `[[clang::weak]]` confer nothing anywhere and are warned ignored.
 // The introducer of every declared spelling is never read as a clause name.
 struct DSS_EXPORT AttributeSpelling {
     SchemaTokenId               introducer{};
@@ -3431,6 +3463,7 @@ struct DSS_EXPORT AttributeSpelling {
     std::string                 qualifier;
     std::vector<ObjectFormatKind> availableObjectFormats;   // sorted, unique
     bool                        afterCompositeBodyIsTheDeclarations = false;
+    std::vector<std::string>    standardNamespaces;   // dunder-normalized, unique across rows
 
     // Whether the spelling exists for `format`. No format in scope ⇒ false for a
     // spelling that names its formats: the answer is unknown, and "unknown" must
@@ -4414,6 +4447,11 @@ struct DSS_EXPORT SemanticConfig {
     // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
     // engine reads THIS, never a hardcoded token name.
     std::optional<SchemaTokenId>    atomicMarker;
+    // P69 fold f26d (lane `cs`, ruling 617): how this language's diagnostics SPELL a
+    // type — read from `semantics.typeSpelling` by the grammar loader, which refuses an
+    // incomplete table; `declared` false = the language's diagnostics name no types.
+    // The ONE renderer over it is `spellType` (core/types/type_spelling.hpp).
+    TypeSpelling                    typeSpelling;
     // P68 round 9 (lane `cs`): the language's `const`- and `restrict`-class qualifier
     // tokens (c: `ConstKeyword`, `RestrictKeyword`). NEITHER IS INTERNED, so both ride
     // the qualifier spine beside a TypeId — a declaration's (the declarator walk, which
@@ -4868,6 +4906,92 @@ isAttributeRunRule(SemanticConfig const& cfg, RuleId rule) noexcept {
     return isAttributeSpecifierRule(cfg, rule)
         || (rule.valid() && cfg.attrSpecifierRunRule.valid()
             && rule.v == cfg.attrSpecifierRunRule.v);
+}
+
+// ★★ THE TOKEN KINDS THAT SPELL AN ATTRIBUTE CLAUSE'S NAME. `cfg.attributeClauseNameTokens`
+// is resolved from `tokenClasses.<clauseNameTokenClass>` — the SAME declaration the
+// `{"tokenClass": …}` grammar slot compiles from — so the parser and every reader of a
+// clause name cannot disagree about what a name is: `__attribute__((__const__))` spells
+// its name with a KEYWORD token, and a reader that looked for `identifierToken` alone
+// would let the clause parse, match no row and DISAPPEAR. The loader refuses a config
+// where only one side moved. EMPTY class ⇒ `identifierToken` alone (every language that
+// declares no class). One definition for the semantic tier and the shared item reader
+// (`standardItemClause`) — P69 fold f26d moved it here from the semantic tier's own copy.
+[[nodiscard]] inline bool isAttrClauseNameToken(SemanticConfig const& cfg,
+                                                SchemaTokenId kind) noexcept {
+    if (!cfg.attributeClauseNameTokens.empty()) {
+        for (SchemaTokenId const k : cfg.attributeClauseNameTokens)
+            if (k.v == kind.v) return true;
+        return false;
+    }
+    return cfg.identifierToken.valid() && kind == cfg.identifierToken;
+}
+
+// ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5) — WHICH TABLE READS A ROW'S
+// DECLARATORS' ATTRIBUTE SPECIFIERS, THE ONE ANSWER. Every facet a declarator's
+// attribute specifiers reach — the binding, the visibility, `selectany`, `imported`,
+// thread storage — is decided by the table this names, in EVERY tier that reads a
+// facet: the semantic tier's record-time scan (`declaratorAttributeStorage`: `imported`,
+// a qualified thread request), the lowering's linkage folds (`linkageFrom`,
+// `attributeLinkageOf`: binding, visibility, `selectany`), and which tier judges the
+// row's unknown attribute NAMES (`linkageTierJudgesAttributeNames`: the row's own fold,
+// exactly when the answer is `Own`). Before it, each tier decided for itself: the
+// semantic tier read the row's OWN table, so a typedef-named block head (no table)
+// read `__declspec(dllimport)` with nothing and lowered an import as an automatic
+// object, and a for-init row with a typedef-named head read no table in either tier.
+//   * `Own`       — the row's own fold reads its attribute specifiers: its table is
+//                   non-empty and it does not skip `attrSpecRule`; the table is the row;
+//   * `Borrowed`  — `attributeLinkageTablesFrom`: the named row's table (c's block rows,
+//                   which skip the specifiers in their own fold because an attribute
+//                   gives a block object no linkage, borrow `externDecl`'s);
+//   * `NoLinkage` — `"linkage": "none"`: the declarators never have linkage; no table;
+//   * `Unread`    — none of these: refused at load in a language that declares an
+//                   attribute-specifier rule (its specifiers would be read by nobody).
+enum class AttributeTableAnswer : std::uint8_t { Own, Borrowed, NoLinkage, Unread };
+struct AttributeTableOfRow {
+    AttributeTableAnswer   answer = AttributeTableAnswer::Unread;
+    DeclarationRule const* table  = nullptr;   // `Own` and `Borrowed` only
+};
+[[nodiscard]] inline AttributeTableOfRow
+attributeTableOf(SemanticConfig const& cfg, DeclarationRule const& row) noexcept {
+    if (row.declaresNoLinkage) return {AttributeTableAnswer::NoLinkage, nullptr};
+    if (row.attributeLinkageRow.has_value() && *row.attributeLinkageRow < cfg.declarations.size())
+        return {AttributeTableAnswer::Borrowed, &cfg.declarations[*row.attributeLinkageRow]};
+    if (!row.linkageSpecifiers.empty() && cfg.attrSpecRule.valid()) {
+        bool skipsAttributes = false;
+        for (RuleId r : row.linkageSpecifierIgnoredRules)
+            if (r.v == cfg.attrSpecRule.v) skipsAttributes = true;
+        if (!skipsAttributes) return {AttributeTableAnswer::Own, &row};
+    }
+    return {AttributeTableAnswer::Unread, nullptr};
+}
+
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): WHAT THE TABLES THAT READ
+// ATTRIBUTE SPECIFIERS KEY UNDER ONE OF AN ATTRIBUTE ROW'S NAMES — the closed set of
+// linkage attributes, derived from the data (every key of every `Own` table, the
+// tables every other row borrows), never listed. `keyed`: some entry; `linkage`: one
+// that decides a binding or a visibility (the facets a declarator without linkage
+// cannot have; thread storage is a storage duration's, `imported` gives the declarator
+// linkage). Names compared dunder-normalized, a composite key by its base name.
+struct AttributeLinkageFacets {
+    bool keyed   = false;
+    bool linkage = false;
+};
+[[nodiscard]] inline AttributeLinkageFacets
+linkageFacetsOfAttribute(SemanticConfig const& cfg, AttributeSemanticsRow const& attribute) {
+    AttributeLinkageFacets out;
+    for (DeclarationRule const& d : cfg.declarations) {
+        if (attributeTableOf(cfg, d).answer != AttributeTableAnswer::Own) continue;
+        for (auto const& [key, effect] : d.linkageSpecifiers) {
+            std::string_view const base = stripDunder(linkageSpecifierBaseName(key));
+            for (std::string const& name : attribute.names) {
+                if (stripDunder(name) != base) continue;
+                out.keyed = true;
+                if (effect.binding.has_value() || effect.visibility.has_value()) out.linkage = true;
+            }
+        }
+    }
+    return out;
 }
 
 } // namespace dss

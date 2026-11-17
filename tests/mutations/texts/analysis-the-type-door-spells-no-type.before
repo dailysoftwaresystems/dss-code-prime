@@ -1,0 +1,2 @@
+    if (!t.valid()) return std::nullopt;
+    return spellType(in, t, cfg.typeSpelling, options);

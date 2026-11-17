@@ -53,6 +53,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -183,6 +185,8 @@ std::size_t countOp(Mir const& mir, MirOpcode want) {
 Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    // Counted as the convention `sig` names (a FnSig's first scalar) counts its arguments.
+    mb.stateArgCounting(argCountingOf(static_cast<CallConv>(in.scalars(sig)[0]) == CallConv::CcMS64));
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -206,6 +210,8 @@ Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
 // would make the refusal test pass for the wrong reason.
 Mir buildVoidEntryOnly(TypeInterner& in, TypeId sig) {
     MirBuilder mb;
+    // Counted as the convention `sig` names (a FnSig's first scalar) counts its arguments.
+    mb.stateArgCounting(argCountingOf(static_cast<CallConv>(in.scalars(sig)[0]) == CallConv::CcMS64));
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -2892,6 +2898,7 @@ Mir buildSehParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
@@ -3034,6 +3041,7 @@ TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
@@ -3172,6 +3180,7 @@ Mir buildSehParentMultiBlockBody(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
@@ -3327,6 +3336,7 @@ Mir buildSehParentOrderSensitiveMarkers(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     // ⚠ CREATION ORDER IS THE EXPERIMENT. `h2BB` is deliberately created BETWEEN
@@ -3496,6 +3506,7 @@ Mir buildSehParentFilterReadsLocal(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
@@ -3732,6 +3743,7 @@ Mir buildSehNestedInnerLoopCreatedLast(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry      = mb.createBlock(StructCfMarker::EntryBlock);
@@ -3788,6 +3800,7 @@ Mir buildSehThreeDeep(TypeInterner& in, SymbolId sym) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -3837,6 +3850,7 @@ Mir buildSehTwoSiblingsInOneParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4003,6 +4017,7 @@ TEST(SynthSehFunclets, TwoRegionsThatOverlapWithoutNestingAreRefused) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4062,6 +4077,7 @@ TEST(SynthSehFunclets, ABodyThatCannotBeLaidOutAsOneRunIsRefused) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4137,6 +4153,7 @@ Mir buildSehFilterReadsValueFromBeforeTheRegion(TypeInterner& in, SymbolId sym,
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(7)),
                        MirFuncId{}, SymbolBinding::Global,
@@ -4280,6 +4297,7 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcSysV);  // the descriptor sig
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});   // main
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4332,6 +4350,7 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4364,6 +4383,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     TypeId const createSig = in.fnSig(cp, i32, CallConv::CcMS64);   // (thr, func, arg)->int
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4503,6 +4523,7 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         std::array<TypeId, 1> const ep{i32};
         TypeId const exitSig = in.fnSig(ep, voidTy, CallConv::CcMS64);
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::Flat);
         mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4616,6 +4637,7 @@ TEST(SynthThreadsShim, OnlyReferencedRecipesAreSynthesized) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4677,6 +4699,7 @@ TEST(SynthThreadsShim, UnreferencedRecipesNeedNoVehicle) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4724,6 +4747,7 @@ TEST(SynthThreadsShim, RetiredCallOnceRecipeIsRefusedOnBothVehicles) {
         TypeId const onceSig = in.fnSig(cp, voidTy, CallConv::CcMS64);   // (flag, fn)->void
 
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4763,6 +4787,7 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     TypeId const joinSig = in.fnSig(jp, i32, CallConv::CcMS64);   // (thrd_t, int*)->int
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4822,6 +4847,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4841,6 +4867,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4999,6 +5026,7 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcAAPCS64);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -5057,6 +5085,7 @@ TEST(SynthThreadsShim, MissingLibrarySynthesisWithReferencedRecipeFailsLoud) {
     std::array<TypeId, 1> const lockParams{pV};
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -5107,6 +5136,7 @@ TEST(SynthThreadsShim, PthreadEveryRecipeEmitsAndVerifies) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -5165,6 +5195,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -5183,6 +5214,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -5303,4 +5335,189 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
 
     MirVerifier verifier{mm, &hi};
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ★ P69 (lane `cs`, fold f26d): THE MERGED MODULE'S FACTS ARE ITS UNITS' FACTS JOINED, AND EACH FUNCTION KEEPS ITS
+// OWN ARG COUNTING. `mergeCuMirs` read the aliasing mode and the char-types rule from unit 0 ALONE — a disagreement
+// settled by unit order: a strict unit 0 merged with a permissive unit made the whole program strict, so the
+// permissive unit's accesses were optimized under a rule its source never promised (READ). The join, one home
+// (`joinUnitFacts`): strict TBAA only where every unit states it, the char-types rule where any does, the pair's
+// counting where they agree. A function stamped with another convention's counting (`g`) crosses with it.
+// RED-ON-DISABLE: take unit 0's facts, and "strict, then permissive" is strict; drop the clone's stamp, and `g`
+// reads per class.
+TEST(MirMerge, TheMergedModulesFactsAreItsUnitsJoinedAndEachFunctionKeepsItsCounting) {
+    constexpr MirAliasingMode S = MirAliasingMode::StrictTBAA;
+    constexpr MirAliasingMode P = MirAliasingMode::Permissive;
+    struct Facts {
+        MirAliasingMode aliasing;
+        bool            charTypes;
+    };
+    struct Cell {
+        char const* what;
+        Facts       u0, u1, merged;
+    };
+    std::vector<Cell> const cells = {
+        {"strict, then strict: strict", {S, false}, {S, false}, {S, false}},
+        {"strict, then permissive: permissive", {S, false}, {P, false}, {P, false}},
+        {"permissive, then strict: permissive", {P, false}, {S, false}, {P, false}},
+        {"the char-types rule in the second unit alone: it holds", {S, false}, {S, true}, {S, true}},
+        {"the char-types rule in the first unit alone: it holds", {S, true}, {S, false}, {S, true}},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.what);
+        // CU0: int main(void) { return 0; } and g(double, long), a function of another convention.
+        TypeInterner in0{CompilationUnitId{1}};
+        TypeId const i32_0 = in0.primitive(TypeKind::I32);
+        std::array<TypeId, 2> const gps{in0.primitive(TypeKind::F64), in0.primitive(TypeKind::I64)};
+        Mir mir0;
+        {
+            MirBuilder mb;
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.setAliasingMode(c.u0.aliasing);
+            mb.setCharTypesAliasAll(c.u0.charTypes);
+            mb.addFunction(in0.fnSig({}, i32_0, CallConv::CcSysV), SymbolId{100});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+            MirFuncId const g =
+                mb.addFunction(in0.fnSig(gps, in0.primitive(TypeKind::Void), CallConv::CcMS64), SymbolId{101});
+            mb.stateFunctionArgCounting(g, MirArgCounting::Flat);
+            MirBlockId const ge = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(ge);
+            (void)mb.addArg(0, gps[0], /*position=*/0);
+            (void)mb.addArg(1, gps[1], /*position=*/1);
+            mb.addReturn();
+            mir0 = std::move(mb).finish();
+        }
+        // CU1: int h(void) { return 7; }
+        TypeInterner in1{CompilationUnitId{2}};
+        TypeId const i32_1 = in1.primitive(TypeKind::I32);
+        Mir mir1;
+        {
+            MirBuilder mb;
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.setAliasingMode(c.u1.aliasing);
+            mb.setCharTypesAliasAll(c.u1.charTypes);
+            mb.addFunction(in1.fnSig({}, i32_1, CallConv::CcSysV), SymbolId{50});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+            mir1 = std::move(mb).finish();
+        }
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{100, "main"}, {101, "g"}}), {}},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "h"}}), {}},
+        };
+        std::vector<std::string> const entries = {"main"};
+        DiagnosticReporter rep;
+        auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries,
+                                  dss::test_support::ordinaryLinkFormat(), rep);
+        // A refused merge names what refused it, not only how many.
+        auto const said = [&rep] {
+            std::string s;
+            for (auto const& d : rep.all())
+                s += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+            return s;
+        };
+        ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount() << said();
+        Mir const& mm = merged->mir;
+        EXPECT_EQ(mm.aliasingMode(), c.merged.aliasing);
+        EXPECT_EQ(mm.charTypesAliasAll(), c.merged.charTypes);
+        EXPECT_EQ(mm.argCounting(), MirArgCounting::PerClass) << "the pair's counting, which both units state";
+        auto const gF = findFuncByName(mm, merged->symbolNames, "g");
+        ASSERT_TRUE(gF.has_value()) << "g is externally visible and is merged";
+        EXPECT_EQ(mm.funcArgCounting(*gF), MirArgCounting::Flat) << "g keeps its own convention's counting";
+        auto const hF = findFuncByName(mm, merged->symbolNames, "h");
+        ASSERT_TRUE(hF.has_value());
+        EXPECT_EQ(mm.funcArgCounting(*hF), MirArgCounting::PerClass) << "and h the pair's";
+    }
+}
+
+// THE JOIN NAMES THE FACT THAT DISAGREES (ledger 637): a fact that must be equal across the units one module joins
+// is refused by ITS name and both values -- a second such fact (a data model) would otherwise be reported as the
+// first. The CONTROL: a unit that states none adds nothing, and two equal statements join.
+TEST(MirMerge, TwoUnitsStatingAMustAgreeFactDifferentlyAreRefusedByTheFactsName) {
+    MirModuleFacts flat;
+    flat.argCounting = MirArgCounting::Flat;
+    MirModuleFacts perClass;
+    perClass.argCounting = MirArgCounting::PerClass;
+    auto const refused = joinUnitFacts(flat, perClass);
+    ASSERT_FALSE(refused.has_value()) << "two countings joined";
+    EXPECT_STREQ(refused.error().fact, "argCounting");
+    EXPECT_EQ(refused.error().a, static_cast<std::uint32_t>(MirArgCounting::Flat));
+    EXPECT_EQ(refused.error().b, static_cast<std::uint32_t>(MirArgCounting::PerClass));
+    auto const withNone = joinUnitFacts(MirModuleFacts{}, perClass);
+    ASSERT_TRUE(withNone.has_value()) << "a unit stating no counting refused";
+    EXPECT_EQ(withNone->argCounting, MirArgCounting::PerClass);
+    auto const same = joinUnitFacts(perClass, perClass);
+    ASSERT_TRUE(same.has_value());
+    EXPECT_EQ(same->argCounting, MirArgCounting::PerClass);
+}
+
+// THE NO-EXEMPTION FORM (ledger 637(3)): a fact every unit must STATE refuses an unstated unit by the fact's name,
+// exactly as a mismatch -- on either side, and both. Its CONTROL: two units stating one value join to it. (The
+// exempt form beside it, for contrast: an unstated unit adds nothing.)
+TEST(MirMerge, AFactEveryUnitMustStateRefusesAnUnstatedUnitByName) {
+    using C = MirArgCounting;
+    for (auto const& [a, b] : {std::pair{C::Unstated, C::Flat}, std::pair{C::Flat, C::Unstated},
+                               std::pair{C::Unstated, C::Unstated}, std::pair{C::Flat, C::PerClass}}) {
+        auto const r = joinMustAgreeFact("everyUnitStatesIt", a, b, C::Unstated, MirUnstatedFact::IsRefused);
+        ASSERT_FALSE(r.has_value()) << "joined " << static_cast<unsigned>(a) << " with " << static_cast<unsigned>(b);
+        EXPECT_STREQ(r.error().fact, "everyUnitStatesIt");
+        EXPECT_EQ(r.error().a, static_cast<std::uint32_t>(a));
+        EXPECT_EQ(r.error().b, static_cast<std::uint32_t>(b));
+    }
+    auto const agreed =
+        joinMustAgreeFact("everyUnitStatesIt", C::Flat, C::Flat, C::Unstated, MirUnstatedFact::IsRefused);
+    ASSERT_TRUE(agreed.has_value()) << "two units stating one value refused";
+    EXPECT_EQ(*agreed, C::Flat);
+    auto const exempt =
+        joinMustAgreeFact("addsNothing", C::Unstated, C::Flat, C::Unstated, MirUnstatedFact::AddsNothing);
+    ASSERT_TRUE(exempt.has_value());
+    EXPECT_EQ(*exempt, C::Flat);
+}
+
+// ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): THE MERGE'S FRESH IDS AT THE LAST VALUE. The merged module's
+// counting door (`SymbolAllocator`) takes from the core's cursor (core/types/symbol_id_cursor.hpp), seeded past unit
+// 0's highest id: a unit 0 whose highest id is the last value but one leaves no fresh id, and the merge aborts by
+// name. It seeded `maxCu0 + 1`, which at the last value wrapped onto 0, the invalid id, and minted live ids from
+// there. RED-ON-DISABLE: let `mint` count past the cursor (`next_++`), and the merge hands unit 1's function an id.
+TEST(MirMergeDeathTest, AMergeWhoseFreshIdsAreExhaustedAbortsByName) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto const mergeAtTheEdge = [] {
+        TypeInterner in0{CompilationUnitId{1}};
+        TypeId const i32_0 = in0.primitive(TypeKind::I32);
+        Mir mir0;
+        {
+            MirBuilder mb;
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.addFunction(in0.fnSig({}, i32_0, CallConv::CcSysV),
+                           SymbolId{std::numeric_limits<std::uint32_t>::max() - 1u});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+            mir0 = std::move(mb).finish();
+        }
+        TypeInterner in1{CompilationUnitId{2}};
+        TypeId const i32_1 = in1.primitive(TypeKind::I32);
+        Mir mir1;
+        {
+            MirBuilder mb;
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.addFunction(in1.fnSig({}, i32_1, CallConv::CcSysV), SymbolId{50});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+            mir1 = std::move(mb).finish();
+        }
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{std::numeric_limits<std::uint32_t>::max() - 1u, "main"}}), {}},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "h"}}), {}},
+        };
+        std::vector<std::string> const entries = {"main"};
+        DiagnosticReporter rep;
+        (void)mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(),
+                          rep);
+    };
+    EXPECT_DEATH(mergeAtTheEdge(), "merged module's SymbolId space is exhausted");
 }

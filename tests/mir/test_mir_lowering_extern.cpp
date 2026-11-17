@@ -17,6 +17,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -651,7 +652,7 @@ TEST(MirLoweringExtern, LowerToLirPropagatesExternsToMirToLirResult) {
     externs.push_back(
         ExternImport{SymbolId{99}, "printf", "libc.so.6"});
     DiagnosticReporter rep;
-    auto result = lowerToLir(emptyMir, **target, ti, rep,
+    auto result = lowerToLir(emptyMir, **target, ti, rep, dss::test::kFirstConventionOfTheTarget,
                              std::move(externs));
     ASSERT_EQ(result.externImports.size(), 1u);
     EXPECT_EQ(result.externImports[0].symbol, SymbolId{99});

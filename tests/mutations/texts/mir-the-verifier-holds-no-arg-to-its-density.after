@@ -1,0 +1,1 @@
+        if (counting != MirArgCounting::Unstated) continue;

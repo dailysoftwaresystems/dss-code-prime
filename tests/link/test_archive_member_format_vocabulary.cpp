@@ -67,6 +67,7 @@
 #include "link/object_format_schema.hpp"
 
 #include "repo_root.hpp"
+#include "shipped_read_pairs.hpp"   // shippedFormatNames -- the one home
 
 #include <gtest/gtest.h>
 
@@ -104,36 +105,11 @@ struct Divergence {
     }
 };
 
-[[nodiscard]] fs::path objectFormatsDir() {
-    auto const root = dss::test::findConfigRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::configRootDiagnostic();
-        return {};
-    }
-    return *root / "object-formats";
-}
-
 // Every shipped format's NAME, enumerated from disk. A format added tomorrow is
 // in the census the day it lands -- a hard-coded list would make this guard
 // blind to exactly the new-family drift it is watching for.
-[[nodiscard]] std::vector<std::string> shippedFormatNames() {
-    std::vector<std::string> names;
-    auto const dir = objectFormatsDir();
-    if (dir.empty()) return names;
-    constexpr std::string_view kSuffix = ".format.json";
-    std::error_code ec;
-    for (auto const& entry : fs::directory_iterator{dir, ec}) {
-        std::string const filename = entry.path().filename().string();
-        if (filename.size() <= kSuffix.size()) continue;
-        if (filename.compare(filename.size() - kSuffix.size(), kSuffix.size(),
-                             kSuffix) != 0) {
-            continue;
-        }
-        names.push_back(filename.substr(0, filename.size() - kSuffix.size()));
-    }
-    std::sort(names.begin(), names.end());
-    return names;
-}
+// P69 fold f26d (review-csf26c2 N3): every shipped format document's name has ONE home.
+using dss::test_support::shippedFormatNames;
 
 // The family grouping, DERIVED from the corpus rather than from a list of
 // suffixes: a format whose name is another shipped format's name plus `-<tail>`

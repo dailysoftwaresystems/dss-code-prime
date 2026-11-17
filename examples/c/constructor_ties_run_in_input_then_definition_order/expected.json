@@ -1,0 +1,16 @@
+{
+  "$comment": "Constructors of ONE priority run in the units' input order, then each unit's definition order -- one rule for every format (src/link/static_init_tables.hpp states the decision, its measurement and what it refuses). The link's input is main.c u1.c u2.c u3.c w.c; `w` prototypes `wc` before it defines `wa` and `wb`, so its own numbering puts `wc` first and an order taken from ids runs it first. The stdout is the order (each constructor notes its number), the exit code the count (six ran). The twin `constructor_ties_run_in_input_then_definition_order_reversed` links the same units in the opposite order; the unit-tier pins are tests/link/test_constructor_order_through_the_link.cpp and tests/link/test_static_init_schedule.cpp. FOUR TARGETS: pe runs natively on the Windows gate host, elf x86_64 + arm64 under qemu on Linux, macho on darwin.",
+  "language": "c",
+  "sources": ["main.c", "u1.c", "u2.c", "u3.c", "w.c"],
+  "exitCode": 6,
+  "expectedStdout": "1 2 3 21 22 23 ",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

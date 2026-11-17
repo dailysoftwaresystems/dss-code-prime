@@ -492,6 +492,91 @@ constexpr int kReportedChecks = kPairChecksBegin + kPairChecks;
     return s;
 }
 
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): THE LAST FIXED PARAMETER OF A VARIADIC CALLEE IS A FIXED
+// PARAMETER, on every convention. Where every argument through `...` is stacked (Apple arm64's
+// `variadicArgsAlwaysStack`), the caller decided "through `...`" for a by-value argument one HIR child early, so the
+// LAST FIXED one was stacked while the callee received it from registers. Its own caller, `run_caller_ellipsis`, has
+// its own mask (the driver's `ellipsis` line), bit 3*shape + count: `ell_S(n, x, ...)` takes a `long long` count, then
+// the shape S as the last fixed parameter, then n `long long`s, and answers n * 1000 + lo + 2 * hi of `x` (12 for the
+// caller's values) + the varargs' sum, for n in {0, 1, 3}. The shapes: a scalar, a two-register struct, `__int128`
+// (GNU arms), an HFA, `double _Complex` (where the reference has `_Complex`) and a MEMORY-class struct; a shape an
+// arm's reference lacks keeps its bits, unset.
+struct EllipsisShape {
+    char const* tag;    // ell_<tag>
+    char const* decl;   // its declaration ("" for a built-in type)
+    char const* type;   // the parameter's type
+    char const* set;    // a statement giving `x` its value (lo 4, hi 4)
+    char const* halves; // lo + 2 * hi of `x`, as `long long`
+    bool        gnu;    // the arm's reference must be GNU (`__int128`)
+    bool        complex;   // the arm's reference must have `_Complex` double
+};
+constexpr EllipsisShape kEllipsisShapes[] = {
+    {"l", "", "long long", "x = 12;", "x", false, false},
+    {"s", "struct ES { long long a, b; };\n", "struct ES", "x.a = 4; x.b = 4;", "x.a + 2 * x.b", false, false},
+    {"i", "", "__int128", "x = ((__int128)4 << 64) | 4;", "(long long)x + 2 * (long long)(x >> 64)", true, false},
+    {"h", "struct EH { double a, b; };\n", "struct EH", "x.a = 4.0; x.b = 4.0;", "(long long)(x.a + 2 * x.b)", false,
+     false},
+    {"c", "typedef double _Complex ELLC;\n", "ELLC", "{ double *q = (double *)&x; q[0] = 4.0; q[1] = 4.0; }",
+     "(long long)(((double *)&x)[0] + 2 * ((double *)&x)[1])", false, true},
+    {"m", "struct EM { long long a, b, c; };\n", "struct EM", "x.a = 4; x.b = 4; x.c = 0;", "x.a + 2 * x.b + x.c",
+     false, false},
+};
+constexpr int kEllipsisCounts[] = {0, 1, 3};
+constexpr int kEllipsisChecks = static_cast<int>(sizeof kEllipsisShapes / sizeof kEllipsisShapes[0])
+                              * static_cast<int>(sizeof kEllipsisCounts / sizeof kEllipsisCounts[0]);
+static_assert(kEllipsisChecks == 18 && kEllipsisChecks <= 63, "the ellipsis caller's checks are bits 0-17");
+
+[[nodiscard]] bool ellipsisShapeTaken(EllipsisShape const& e, bool gnu, int complexElements) {
+    return (!e.gnu || gnu) && (!e.complex || complexElements >= 2);
+}
+[[nodiscard]] std::string ellipsisShapes(bool gnu, int complexElements) {
+    std::string s;
+    for (EllipsisShape const& e : kEllipsisShapes)
+        if (ellipsisShapeTaken(e, gnu, complexElements)) s += e.decl;
+    return s;
+}
+[[nodiscard]] std::string ellipsisSignatures(bool gnu, int complexElements, bool definitions) {
+    std::string s;
+    for (EllipsisShape const& e : kEllipsisShapes) {
+        if (!ellipsisShapeTaken(e, gnu, complexElements)) continue;
+        s += std::string{"long long ell_"} + e.tag + "(long long n, " + e.type + " x, ...)";
+        s += definitions ? std::string{" {\n    va_list ap;\n    va_start(ap, x);\n    long long t = 0;\n"
+                                       "    for (long long k = 0; k < n; ++k) t += va_arg(ap, long long);\n"
+                                       "    va_end(ap);\n    return n * 1000 + "} + e.halves + " + t;\n}\n"
+                         : std::string{";\n"};
+    }
+    return s;
+}
+[[nodiscard]] std::string ellipsisCaller(bool gnu, int complexElements) {
+    std::string s = "int run_caller_ellipsis(long long *bad_out, long long *misplaced_out) {\n"
+                    "    long long bad = 0;\n";
+    int bit = 0;
+    for (EllipsisShape const& e : kEllipsisShapes) {
+        bool const taken = ellipsisShapeTaken(e, gnu, complexElements);
+        for (int n : kEllipsisCounts) {
+            std::string args = "(long long)" + std::to_string(n) + ", x";
+            long long want = n * 1000LL + 12;
+            for (int k = 0; k < n; ++k) {
+                args += ", " + std::to_string(5 + k) + "LL";
+                want += 5 + k;
+            }
+            if (taken)
+                s += std::string{"    { "} + e.type + " x; " + e.set + "\n      if (ell_" + e.tag + "(" + args
+                   + ") != " + std::to_string(want) + "LL) bad |= 1LL << " + std::to_string(bit) + "; }\n";
+            ++bit;
+        }
+    }
+    s += "    *bad_out = bad;\n    *misplaced_out = 0;\n"
+         "    for (int i = 0; i < " + std::to_string(kEllipsisChecks) + "; ++i)\n"
+         "        if (bad & (1LL << i)) return 170 + i;\n"
+         "    return 42;\n}\n";
+    return s;
+}
+constexpr char const* kEllipsisCheckText =
+    "the ellipsis caller's bits, 3 * shape + count: shapes long long, struct { long long a, b; }, __int128, "
+    "struct { double a, b; }, double _Complex, struct { long long a, b, c; } as the LAST FIXED parameter of "
+    "ell_S(long long n, S x, ...), counts 0, 1 and 3 `long long` varargs; exit 170 + the first";
+
 struct CallerVariant {
     char const* tag;       // the driver's line for it
     char const* head;      // the function's head, through the declarations of `bad` and `misplaced`
@@ -700,7 +785,8 @@ constexpr char const* kX87CallerChecks =
     s += "#include <stdio.h>\n";
     if (walk) s += "#include <dlfcn.h>\n#include <unwind.h>\n";
     s += "int run_caller(long long *bad_out, long long *misplaced_out);\n"
-         "int run_caller_va(long long *bad_out, long long *misplaced_out, ...);\n";
+         "int run_caller_va(long long *bad_out, long long *misplaced_out, ...);\n"
+         "int run_caller_ellipsis(long long *bad_out, long long *misplaced_out);\n";
     if (gnu) s += "int run_caller_vla(int n, long long *bad_out, long long *misplaced_out);\n";
     s += "static void *caller_under_test;\n";
     if (walk)
@@ -747,6 +833,10 @@ constexpr char const* kX87CallerChecks =
          "    caller_under_test = (void *)&run_caller_va;\n"
          "    rc = run_caller_va(&bad, &misplaced, 27);\n"
          "    report(\"va\", rc, bad, misplaced);\n"
+         "    bad = -1; misplaced = -1;\n"
+         "    caller_under_test = (void *)&run_caller_ellipsis;\n"
+         "    rc = run_caller_ellipsis(&bad, &misplaced);\n"
+         "    report(\"ellipsis\", rc, bad, misplaced);\n"
          "    return first;\n"
          "}\n";
     return s;
@@ -802,7 +892,8 @@ static_assert(kReportedChecks <= 63, "every check is one bit of a `long long`");
          + (gnu ? pairShapes() : "") + complexShapes(complexElements) + kCalleeBody + alignedCallees(refused)
          + tailCallee(refused) + (x87 ? std::string{kX87CalleeBody} + complexX87Callees() : std::string{})
          + (gnu ? scalarCallees() + pairSignatures(/*definitions=*/true) : "") + complexCallees(complexElements)
-         + (walk ? kWalkCallee : "");
+         + (walk ? kWalkCallee : "") + ellipsisShapes(gnu, complexElements)
+         + ellipsisSignatures(gnu, complexElements, /*definitions=*/true);
 }
 
 [[nodiscard]] std::string callerSource(bool x87, bool gnu, bool walk, int complexElements, Alignments const& refused) {
@@ -819,6 +910,8 @@ static_assert(kReportedChecks <= 63, "every check is one bit of a `long long`");
                   + tailFunctions(refused, gnu);
     for (CallerVariant const& v : callerVariants(gnu))
         s += std::string{v.head} + checks + tailCheck(refused, v) + v.frame + callerTail();
+    s += ellipsisShapes(gnu, complexElements) + ellipsisSignatures(gnu, complexElements, /*definitions=*/false)
+       + ellipsisCaller(gnu, complexElements);
     return s;
 }
 
@@ -1213,6 +1306,24 @@ TEST(SysVMemoryClassReferenceLinkNative, EveryPairingOfDssAndTheHostsCompilerAgr
                                   : " (the walk, check 28, PASSED: the row it waited on, "
                                     "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS, no longer stops it -- assert it)")
                           << "\n";
+            }
+            {
+                // The last fixed parameter of a variadic callee, its own caller and mask (review-csf26c2 N1).
+                auto const masks = masksOf(r.capturedStdout, "ellipsis");
+                EXPECT_TRUE(masks.has_value()) << arm.label << ", " << pair.label << ": the driver printed no masks "
+                                               << "for the ellipsis caller (exit " << r.exitCode
+                                               << "): " << r.capturedStdout;
+                if (!masks.has_value()) {
+                    everyCallerClean = false;
+                } else {
+                    EXPECT_EQ(masks->bad, 0ULL)
+                        << arm.label << ", " << pair.label << ", the ellipsis caller: the last fixed parameter's "
+                        << "values did not arrive at check(s) of mask 0x" << std::hex << masks->bad << std::dec
+                        << ", exit " << r.exitCode << " -- " << kEllipsisCheckText;
+                    if (masks->bad != 0ULL) everyCallerClean = false;
+                    std::cout << "[native-arm] " << arm.label << ", " << pair.label << ", the ellipsis caller: bad 0x"
+                              << std::hex << masks->bad << std::dec << "\n";
+                }
             }
             EXPECT_EQ(r.exitCode == 42u, everyCallerClean)
                 << "the exit and the printed masks disagree: exit " << r.exitCode << ", " << r.capturedStdout;

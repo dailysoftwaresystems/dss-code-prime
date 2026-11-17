@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/substrate/walk_steps.hpp"
+#include "core/types/attribute_naming.hpp"   // stripDunder (standardItemClause)
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
@@ -212,16 +213,88 @@ attributeSpellingOf(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode
     return nullptr;
 }
 
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5) — AN ITEM OF THE STANDARD FORM THAT
+// IS A CLAUSE OF A SPELLING. `item` is one item of a specifier of the language's
+// `stdAttrRule` (c: one `stdAttrItem` of `[[a, ns::b(…)]]`). When it is written
+// `ns::name` and some spelling row lists `ns` (dunder-normalized) among its
+// `standardNamespaces`, it is that spelling's clause `name` (`[[gnu::weak]]` is the GNU
+// spelling's `weak`): `spelling` is the row, `name` the clause-name token (the `::`-final
+// segment), `args` its argument group (the language's `attributeArgRule`) when written.
+// Otherwise `spelling` is null: an item with no namespace, or one no spelling lists, is
+// the standard form's own attribute (`[[weak]]`, `[[clang::weak]]` — warned and
+// ignored by every reference, probe n5q), which no table keyed by a spelling's names
+// reads. The one reader of the fact, for every tier.
+struct StandardItemClause {
+    AttributeSpelling const* spelling = nullptr;
+    NodeId                   name{};
+    NodeId                   args{};
+};
+[[nodiscard]] inline StandardItemClause
+standardItemClause(SemanticConfig const& cfg, Tree const& tree, NodeId item) {
+    StandardItemClause out;
+    if (cfg.attributeSpellings.empty() || !item.valid()) return out;
+    if (tree.kind(item) != NodeKind::Internal) return out;
+    NodeId namespaceToken{};
+    NodeId nameToken{};
+    NodeId args{};
+    std::size_t names = 0;
+    for (NodeId c : decl_prefix_detail::visibleChildren(tree, item)) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (!isAttrClauseNameToken(cfg, tree.tokenKind(c))) continue;
+            if (names++ == 0) namespaceToken = c;
+            nameToken = c;
+            continue;
+        }
+        if (cfg.attributeArgRule.valid() && tree.rule(c).v == cfg.attributeArgRule.v) args = c;
+    }
+    if (names < 2) return out;   // no namespace: the standard form's own attribute
+    std::string_view const ns = stripDunder(tree.text(namespaceToken));
+    for (AttributeSpelling const& sp : cfg.attributeSpellings) {
+        for (std::string const& claimed : sp.standardNamespaces) {
+            if (claimed != ns) continue;
+            out.spelling = &sp;
+            out.name     = nameToken;
+            out.args     = args;
+            return out;
+        }
+    }
+    return out;
+}
+
+// ★ P69 (fold f26d): a clause-name or argument token inside an item of the standard
+// form has the spelling that CLAIMS the item (`standardItemClause`), so a qualified
+// lookup, a format gate and the linkage tables read `[[gnu::X]]` exactly as they read
+// `__attribute__((X))`; an item no spelling claims has none, as the whole form had.
 [[nodiscard]] inline AttributeSpelling const*
 enclosingAttributeSpelling(SemanticConfig const& cfg, Tree const& tree, NodeId n) {
     if (cfg.attributeSpellings.empty() || !cfg.attrSpecRule.valid()) return nullptr;
-    for (NodeId cur = n; cur.valid(); cur = tree.parent(cur)) {
+    NodeId below{};
+    for (NodeId cur = n; cur.valid(); below = cur, cur = tree.parent(cur)) {
         if (tree.kind(cur) != NodeKind::Internal) continue;
         RuleId const r = tree.rule(cur);
         if (r.v == cfg.attrSpecRule.v) return attributeSpellingOf(cfg, tree, cur);
-        if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) return nullptr;
+        if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) {
+            return below.valid() ? standardItemClause(cfg, tree, below).spelling : nullptr;
+        }
     }
     return nullptr;
+}
+
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): whether `spec` is a specifier of
+// the STANDARD form. One written AMONG A HEAD'S SPECIFIERS or BESIDE THE NAME INSIDE A
+// DECLARATOR appertains to the TYPE formed there (C23 6.7: the sequence that ends the
+// declaration specifiers appertains to the type they determine; 6.7.6.1: the one after a
+// pointer's `*` to the pointer), so no linkage table reads it at those positions.
+// ✔MEASURED (lane `cs` probe n5q): `int [[gnu::weak]] fx;` and `int * [[gnu::weak]] px;`
+// leave the symbol strong on gcc 13.3.0, mingw-w64 gcc 13.2.0 and Apple clang 21, each
+// warning "'weak' attribute does not apply to types" (clang ELF alone confers, and
+// warns: a reference whose diagnostic and output disagree casts no vote) — where the
+// GNU spelling at the same two positions is the declaration's (lane `cs` probes ta3,
+// ta7, ta8). Both tiers' linkage readers ask it at both positions.
+[[nodiscard]] inline bool
+isStandardAttributeSpecifier(SemanticConfig const& cfg, Tree const& tree, NodeId spec) {
+    return cfg.stdAttrRule.valid() && spec.valid() && tree.kind(spec) == NodeKind::Internal
+        && tree.rule(spec).v == cfg.stdAttrRule.v;
 }
 
 // ★★ P69 (lane `cs`) — THE SPECIFIERS, WRITTEN AFTER A COMPOSITE'S BODY, THAT ARE THE

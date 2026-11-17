@@ -86,16 +86,11 @@ using TypeLayoutTable = substrate::ArenaAttribute<TypeInterner, StructLayout>;
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 scalarByteSize(TypeKind kind, DataModel dm) noexcept;
 
-// C23 _BitInt(N) (D-CSUBSET-BITINT): the TypeId-aware companion to
-// `scalarByteSize`. A `_BitInt(N)`'s size cannot be derived from its KIND alone
-// (the width N lives in the interned record's scalars), so a caller that has a
-// TypeId — a data-global leaf, an aggregate-ABI leaf — routes through here: it
-// returns the `_BitInt(N)` CONTAINER byte size (N≤64 → {1,2,4,8}; N>64 →
-// ceil(N/64) eightbytes, the C2 multi-limb layout) and, for every OTHER kind,
-// exactly `scalarByteSize(kind, dm)`. nullopt for a non-sized kind (aggregate /
-// Void / FnSig / …) — the caller's fail-loud signal, same as `scalarByteSize`.
-[[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
-sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept;
+// ⓘ A `_BitInt(N)`'s size is NOT `scalarByteSize`'s to answer (its width lives in the
+// interned record, and above 64 bits its chunk is the target's): a caller holding a
+// TypeId asks `computeLayout`, the one size ladder. (P69 fold f26d deleted a second,
+// TypeId-aware ladder beside it, which answered the x86-64 psABI's chunk for every
+// target.)
 
 // ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──
 //

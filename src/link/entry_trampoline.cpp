@@ -1,5 +1,5 @@
 #include "link/entry_trampoline.hpp"
-#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — shared with linker.cpp
+#include "link/fresh_symbol_ids.hpp"   // ModuleSymbolIds — the module's one door of a fresh id
 #include "link/static_init_tables.hpp"
 
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
@@ -24,14 +24,9 @@ namespace dss::linker {
 
 namespace {
 
-// ⓘ `maxExistingSymbolIdV` USED TO LIVE HERE and is now
-// `link/fresh_symbol_ids.hpp`, unchanged in behaviour. It gained a SECOND
-// caller — the object-carried data-import slot mint
-// (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET) — and the
-// scan has already been widened twice by a collision that reached a walker
-// (dataItems, then blockSymbols), so a copy would have inherited the old rule
-// and failed the same way from the other pass. The two widenings and the
-// sequential-mint caller contract are recorded in full at the new home.
+// ⓘ The taken-id scan USED TO LIVE HERE. Every link-tier mint now comes
+// through the module's door (`link/fresh_symbol_ids.hpp`), whose scan reads
+// every holder the types declare; its history is recorded there.
 
 // Resolve the user-entry SymbolId: the ELECTED entry the module states
 // (`userEntrySymbol`), else the format's `entryPoint` field. A module that
@@ -440,37 +435,21 @@ bool injectEntryTrampoline(AssembledModule&          module,
         return false;
     }
 
-    // Mint trampoline + (ByNameImport) synthetic-extern SymbolIds
-    // SEQUENTIALLY (maxV+1, maxV+2, ...). Calling the mint helper
-    // twice without intermediate module mutation produces a
-    // collision (max() of unchanged input is the same — first bug
-    // caught at Slice C build).
-    //
-    // SymbolId space-exhaustion guard (3-agent convergence:
-    // silent-failure + test-analyzer + dim-2 at the Slice C audit
-    // fold). `maxV+1` / `maxV+2` are uint32 — at UINT32_MAX they
-    // wrap silently to 0/1 (the InvalidSymbol sentinel + low-ID
-    // user fns), silently colliding with declared symbols. The
-    // BOTH-defined-AND-ExternImport guard — `buildCompoundIndex`'s
-    // duplicate-compound-key `declare()` gate in `linker.cpp` — would
-    // catch the ByNameImport arm but the pure Syscall arm has no
-    // cross-table check. Fail loud HERE before the wrap can
-    // corrupt the module.
-    std::uint32_t const maxV = maxExistingSymbolIdV(module);
-    std::uint32_t const needed =
-        (pe.mechanism == ExitMechanism::ByNameImport) ? 2u : 1u;
-    if (maxV > std::numeric_limits<std::uint32_t>::max() - needed) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             std::format("entry-trampoline: SymbolId space exhausted "
-                         "— module's max SymbolId is {} + {} fresh "
-                         "IDs would wrap uint32. Reduce module size "
-                         "OR reset CU SymbolId allocator.",
-                         maxV, needed));
-        return false;
-    }
-    SymbolId const trampSym{maxV + 1};
+    // The trampoline's id and, on the ByNameImport exit, the synthetic
+    // extern's come from the module's door (`link/fresh_symbol_ids.hpp`),
+    // BOTH AT ONCE before the module is touched: each is past every id the
+    // module holds or a door handed out, and a space too short for them is
+    // refused there by name with nothing written -- never a wrap onto 0
+    // (the invalid id) or onto a declared symbol's id, which the pure
+    // Syscall arm has no cross-table check to catch.
+    bool const exitsByImport = pe.mechanism == ExitMechanism::ByNameImport;
+    std::size_t const ids = exitsByImport ? 2u : 1u;   // the trampoline, and its process-exit import
+    std::optional<std::vector<SymbolId>> const taken = ModuleSymbolIds{module}.take(
+        ids, reporter, std::format("entry-trampoline: the {} id(s) of the trampoline and its exit", ids));
+    if (!taken.has_value()) return false;
+    SymbolId const trampSym = (*taken)[0];
     SymbolId exitImportSym{0};
-    if (pe.mechanism == ExitMechanism::ByNameImport) {
+    if (exitsByImport) {
         // Append the synthetic ExternImport so the PE walker's IAT
         // writer (LK6 cycle 2a) emits the IAT slot. The reloc-apply
         // kernel populates `symbolVa[exitImportSym]` from the IAT
@@ -478,7 +457,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
         // `call_indirect_via_extern` patches that VA into its
         // disp32 patch site via the REL32 reloc.
         ExternImport synth;
-        synth.symbol      = SymbolId{maxV + 2};
+        synth.symbol      = (*taken)[1];
         synth.mangledName = pe.importMangledName;
         synth.libraryPath = pe.importLibraryPath;
         exitImportSym     = synth.symbol;

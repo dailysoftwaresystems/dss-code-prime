@@ -434,6 +434,7 @@ TEST(Licm, MayFaultLoadNotHoistedFromConditionallyExecutedBlock) {
     TypeId const params[] = {ptrI32, ptrI32, boolT, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → header → {guard → {deref, latch}} → latch → header (back)
     // header → exitB is the ONLY way out of the loop.
@@ -506,6 +507,7 @@ TEST(Licm, MayFaultLoadHoistedFromGuaranteedNonHeaderBlock) {
     TypeId const params[] = {ptrI32, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → header → mid → latch → {header (back), exitB}
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
@@ -569,6 +571,7 @@ TEST(Licm, MayFaultLoadNotHoistedWhenLoopCanReturnBeforeIt) {
     TypeId const params[] = {ptrI32, boolT, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → header → {retBlk (Return, IN the loop), cont} → latch →
     // {header (back), exitB}
@@ -628,6 +631,7 @@ TEST(Licm, MayFaultLoadNotHoistedWhenLoopHasNoExit) {
     TypeId const params[] = {ptrI32, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → header → {deref, skip} → latch → header (back). NOTHING
     // leaves the loop: no block has a successor outside the body.
@@ -681,6 +685,7 @@ TEST(Licm, MayFaultLoadNotHoistedWhenPreheaderCanSkipTheLoop) {
     TypeId const params[] = {ptrI32, boolT, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → {header, skip}; header → {body, exitB}; body → header (back).
     // `entry` IS the preheader and it can skip the loop entirely.
@@ -752,6 +757,7 @@ TEST(Licm, TrapEligibleSDivHoistedWhenGuaranteedToExecute) {
     TypeId const params[] = {i32, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
@@ -805,6 +811,7 @@ TEST(Licm, MayFaultSDivNotHoistedWhenLoopBodyContainsACall) {
     TypeId const params[] = {i32, boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // The callee — stands in for `exit()`: LICM cannot know it returns.
     mb.addFunction(calleeSig, SymbolId{50});
     MirBlockId const cEntry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1023,6 +1030,7 @@ TEST(Licm, LoadHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAA) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.setAliasingMode(MirAliasingMode::StrictTBAA);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1082,6 +1090,7 @@ TEST(Licm, LoadNotHoistedAcrossDistinctPrimitiveStoreInLoopUnderPermissive) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // Explicit (not relying on default) so a future flip of the default
     // can't silently make this test vacuous.
     mb.setAliasingMode(MirAliasingMode::Permissive);
@@ -1139,6 +1148,7 @@ TEST(Licm, LoadHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAANoCharExc
     TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.setAliasingMode(MirAliasingMode::StrictTBAA);
     mb.setCharTypesAliasAll(false);  // Rust-like / strict-typed DSL
     mb.addFunction(fnSig, SymbolId{100});
@@ -1196,6 +1206,7 @@ TEST(Licm, LoadNotHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAAWithCh
     TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.setAliasingMode(MirAliasingMode::StrictTBAA);
     mb.setCharTypesAliasAll(true);  // C/C++/ObjC default — explicit
     mb.addFunction(fnSig, SymbolId{100});
@@ -1518,6 +1529,7 @@ TEST(Licm, MultiplePreheaderPredsSkipsLoop) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → {p1, p2} → header → body → header back-edge; header → exit.
     // header has TWO external preds (p1, p2) + one back-edge pred (body).

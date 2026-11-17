@@ -16,6 +16,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/object_format_schema.hpp"  // TLS C1: the shipped-format tlsAccess reject pins
@@ -153,7 +154,7 @@ struct Lowered {
                                     // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED
                                     &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
-    auto lir = lowerToLir(mir.mir, *tgt, model.lattice().interner(), lirReporter);
+    auto lir = lowerToLir(mir.mir, *tgt, model.lattice().interner(), lirReporter, dss::test::kFirstConventionOfTheTarget);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -398,6 +399,7 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
     TypeId const params[] = {i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -412,7 +414,7 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     Lir const& lir = lirR.lir;
 
@@ -472,6 +474,7 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
     TypeId const params[]   = {i8};                        // one ignored param
     TypeId const fnSig      = interner.fnSig(params, filePtr, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -494,7 +497,7 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
     ei.libraryPath = "/usr/lib/libSystem.B.dylib";
     ei.isData      = true;
     externs.push_back(ei);
-    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                            ExternCallDispatch::DirectPlt,
                            DataImportBinding::GotIndirect);
     ASSERT_TRUE(lirR.ok);
@@ -587,7 +590,7 @@ TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
     {
         Mir mir = buildMir();
         DiagnosticReporter rep;
-        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                                ExternCallDispatch::IndirectSlot,
                                DataImportBinding::GotIndirect);
         ASSERT_TRUE(lirR.ok);
@@ -601,7 +604,7 @@ TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
     {
         Mir mir = buildMir();
         DiagnosticReporter rep;
-        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                                ExternCallDispatch::DirectPlt,
                                DataImportBinding::GotIndirect);
         ASSERT_TRUE(lirR.ok);
@@ -622,7 +625,7 @@ TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
     {
         Mir mir = buildMir();
         DiagnosticReporter rep;
-        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                                ExternCallDispatch::IndirectSlot,
                                DataImportBinding::GotIndirect,
                                /*tlsAccess=*/std::nullopt,
@@ -645,7 +648,7 @@ TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
         DiagnosticReporter rep;
         std::vector<dss::ExternImport> weakExterns = externs;
         weakExterns[0].binding = SymbolBinding::Weak;
-        auto lirR = lowerToLir(mir, **target, interner, rep, weakExterns,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, weakExterns,
                                ExternCallDispatch::IndirectSlot,
                                DataImportBinding::GotIndirect,
                                /*tlsAccess=*/std::nullopt,
@@ -709,7 +712,7 @@ TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
     ei.libraryPath = "libc.so.6";
     ei.isData      = false;  // a FUNCTION extern whose ADDRESS is taken
     externs.push_back(ei);
-    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                            ExternCallDispatch::DirectPlt,
                            /*dataImportBinding=*/std::nullopt,
                            /*tlsAccess=*/std::nullopt,
@@ -786,7 +789,7 @@ TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
     ei.isData      = false;
     externs.push_back(ei);
     // externAddrBinding OMITTED (defaults to nullopt).
-    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                            ExternCallDispatch::DirectPlt);
     ASSERT_TRUE(lirR.ok);
     Lir const& lir = lirR.lir;
@@ -871,7 +874,7 @@ TEST(MirToLir, BothBindingsKeepADatumOnItsSlotAndSendAFunctionAddressToTheGot) {
         externs.push_back(func);
 
         DiagnosticReporter rep;
-        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                                ExternCallDispatch::DirectPlt,
                                DataImportBinding::GotIndirect,
                                /*tlsAccess=*/std::nullopt,
@@ -959,6 +962,7 @@ namespace {
     TypeId const params[] = {i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1053,7 +1057,7 @@ TEST(MirToLir, UnsignedModuloLowersToXorDivWithRemainderCaptureNotCqoIdiv) {
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     Lir const& lir = lirR.lir;
 
@@ -1107,7 +1111,7 @@ TEST(MirToLir, Arm64SignedDivisionLowersToSingleNativeSdiv) {
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -1145,7 +1149,7 @@ TEST(MirToLir, Arm64SignedModuloFusesToSdivMsub) {
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -1229,7 +1233,7 @@ struct ConstChain {
     EXPECT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     EXPECT_TRUE(lirR.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     ConstChain out;
@@ -1463,7 +1467,7 @@ TEST(MirToLir, Arm64GlobalAddrLoadKeepsLeaPlusBaseFormLoad) {
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -1514,7 +1518,7 @@ TEST(MirToLir, Arm64ModuloWithoutMsubFallsBackToSdivMulSub) {
            "capability, not a required verb)";
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -1566,7 +1570,7 @@ TEST(MirToLir, Arm64UnsignedModuloExpandsViaUdivNotSdiv) {
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     Lir const& lir = lirR.lir;
 
@@ -1630,7 +1634,7 @@ TEST(MirToLir, MissingOutputRolesFailsLoudOnDivLowering) {
     Mir mir = buildBinFnMir(MirOpcode::SDiv, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, *mutated, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, *mutated, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     EXPECT_FALSE(lirR.ok)
         << "an idiv_op without outputRoles must FAIL the div lowering "
            "(the projection reads BY ROLE — no positional fallback).";
@@ -1658,7 +1662,7 @@ TEST(MirToLir, MissingInputRolesFailsLoudOnDivLowering) {
     Mir mir = buildBinFnMir(MirOpcode::SDiv, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, *mutated, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, *mutated, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     EXPECT_FALSE(lirR.ok);
     bool sawRoleDiag = false;
     for (auto const& d : rep.all()) {
@@ -1700,6 +1704,7 @@ namespace {
     TypeId const params[] = {i32p};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1719,6 +1724,7 @@ namespace {
     TypeId const params[] = {i32p, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1768,7 +1774,7 @@ TEST(MirToLirAtomic, StoreSeqCstEmitsStoreSeqCstNotPlainStore) {
     Mir mir = buildAtomicStoreFnMir(/*seq_cst=*/5, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
         << "a seq_cst AtomicStore must lower to the store_seqcst (xchg) slot.";
@@ -1784,7 +1790,7 @@ TEST(MirToLirAtomic, StoreReleaseEmitsStoreReleaseNotSeqCst) {
     Mir mir = buildAtomicStoreFnMir(/*release=*/3, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 1)
         << "a release AtomicStore must lower to the store_release (mov) slot.";
@@ -1800,7 +1806,7 @@ TEST(MirToLirAtomic, StoreRelaxedEmitsPlainStore) {
     Mir mir = buildAtomicStoreFnMir(/*relaxed=*/0, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 1)
         << "a relaxed AtomicStore reuses the plain scalar store (mov; no fence).";
@@ -1815,7 +1821,7 @@ TEST(MirToLirAtomic, LoadSeqCstEmitsLoadAcquireNotPlainLoad) {
     Mir mir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1)
         << "a seq_cst AtomicLoad must lower to the load_acquire slot.";
@@ -1830,7 +1836,7 @@ TEST(MirToLirAtomic, LoadAcquireEmitsLoadAcquire) {
     Mir mir = buildAtomicLoadFnMir(/*acquire=*/2, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 0);
@@ -1843,7 +1849,7 @@ TEST(MirToLirAtomic, LoadRelaxedEmitsPlainLoadNotLoadAcquire) {
     Mir mir = buildAtomicLoadFnMir(/*relaxed=*/0, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 1)
         << "a relaxed AtomicLoad reuses the plain scalar load (mov; no fence).";
@@ -1862,12 +1868,12 @@ TEST(MirToLirAtomic, SeqCstRoutesToStlrAndLdarOnArm64) {
     std::vector<dss::ExternImport> noExterns;
 
     Mir storeMir = buildAtomicStoreFnMir(/*seq_cst=*/5, interner);
-    auto storeR = lowerToLir(storeMir, **target, interner, rep, noExterns);
+    auto storeR = lowerToLir(storeMir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(storeR.ok);
     EXPECT_EQ(countLirMnemonic(storeR.lir, **target, "store_seqcst"), 1);
 
     Mir loadMir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
-    auto loadR = lowerToLir(loadMir, **target, interner, rep, noExterns);
+    auto loadR = lowerToLir(loadMir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(loadR.ok);
     EXPECT_EQ(countLirMnemonic(loadR.lir, **target, "load_acquire"), 1);
 }
@@ -1885,7 +1891,7 @@ TEST(MirToLirAtomic, AcquireLoadFailsLoudWhenLoadAcquireSlotMissing) {
     Mir mir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **mutated, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **mutated, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     EXPECT_FALSE(lirR.ok)
         << "an acquire/seq_cst load with no load_acquire slot MUST fail the "
            "lowering — never a silent plain-load under-fence.";
@@ -1913,7 +1919,7 @@ TEST(MirToLirAtomic, FenceSeqCstEmitsAtomicFenceSeqCstOnX86) {
     Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "atomic_fence_seqcst"), 1)
         << "a seq_cst AtomicFence must lower to EXACTLY ONE atomic_fence_seqcst "
@@ -1929,7 +1935,7 @@ TEST(MirToLirAtomic, FenceSeqCstEmitsAtomicFenceSeqCstOnArm64) {
     Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
     ASSERT_TRUE(lirR.ok);
     EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "atomic_fence_seqcst"), 1)
         << "a seq_cst AtomicFence must lower to EXACTLY ONE atomic_fence_seqcst "
@@ -1951,7 +1957,7 @@ TEST(MirToLirAtomic, FenceNonSeqCstOrderFailsLoud) {
         Mir mir = buildAtomicFenceFnMir(order, interner);
         DiagnosticReporter rep;
         std::vector<dss::ExternImport> noExterns;
-        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
         EXPECT_FALSE(lirR.ok)
             << "AtomicFence payload " << order
             << " (non-seq_cst) must FAIL the lowering — no producer emits it.";
@@ -1987,7 +1993,7 @@ TEST(MirToLirAtomic, FenceSeqCstFailsLoudWhenAtomicFenceSeqCstSlotMissing) {
         Mir mir = buildAtomicFenceFnMir(/*seq_cst=*/5, interner);
         DiagnosticReporter rep;
         std::vector<dss::ExternImport> noExterns;
-        auto lirR = lowerToLir(mir, **mutated, interner, rep, noExterns);
+        auto lirR = lowerToLir(mir, **mutated, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns);
         EXPECT_FALSE(lirR.ok)
             << targetName
             << ": a seq_cst fence with no atomic_fence_seqcst slot MUST fail "
@@ -2055,7 +2061,7 @@ struct ShiftProbe {
         mb.addReturn(mb.addInst(op, ops, ty));
     }
     ::dss::Mir m = std::move(mb).finish();
-    auto result = ::dss::lowerToLir(m, *schema, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, *schema, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -2268,7 +2274,7 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
     assertUpstreamClean(L);
 
     DiagnosticReporter rep;
-    auto result = lowerToLir(L.mir.mir, **incomplete, L.model.lattice().interner(), rep);
+    auto result = lowerToLir(L.mir.mir, **incomplete, L.model.lattice().interner(), rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool found = false;
     int  missingCount = 0;
@@ -2326,7 +2332,7 @@ TEST(MirToLir, SehOpcodesFailLoudCitingC116Anchor) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool sawAnchor = false;
     for (auto const& d : rep.all()) {
@@ -2368,7 +2374,7 @@ TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool foundUnsupported = false;
     for (auto const& d : rep.all()) {
@@ -2842,7 +2848,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "wide-literal MIR Const must lower cleanly via the LIR literal pool";
 
@@ -2910,7 +2916,7 @@ TEST(MirToLir, IntegerBitwiseAndShiftLowerToBitwiseOpcodes) {
                 (void)itn;
             });
         ::dss::DiagnosticReporter rep;
-        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok) << "bitwise " << c.mnem << " must lower cleanly";
         auto const expectedOp = *sch.opcodeByMnemonic(c.mnem);
         ::dss::Lir const& lir = result.lir;
@@ -2948,7 +2954,7 @@ TEST(MirToLir, IntegerNotAndNegLowerToUnaryOpcodes) {
                 mb.addReturn(mb.addInst(c.mir, ops, retT));
             });
         ::dss::DiagnosticReporter rep;
-        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok) << c.mnem;
         ::dss::Lir const& lir = result.lir;
         LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
@@ -2992,7 +2998,7 @@ TEST(MirToLir, FloatArithmeticLowersToFPRClassResults) {
                 mb.addReturn(op);
             });
         ::dss::DiagnosticReporter rep;
-        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok) << c.mnem;
         auto const expectedOp = *sch.opcodeByMnemonic(c.mnem);
         ::dss::Lir const& lir = result.lir;
@@ -3043,7 +3049,7 @@ void expectCrossClassBitcastUsesTheDeclaredPairMove(
             mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
         });
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << "a cross-class Bitcast must lower";
     auto const pairMove =
         sch.regClassOpOpcode(fromCls, toCls, ::dss::RegClassOp::Move);
@@ -3124,7 +3130,7 @@ TEST(MirToLir, BitcastSameClassStaysOnTheDiagonal) {
                 mb.addReturn(mb.addInst(::dss::MirOpcode::Bitcast, ops, retT));
             });
         ::dss::DiagnosticReporter rep;
-        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep);
+        auto const result = ::dss::lowerToLir(syn.mir, sch, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok);
         auto const toFpr = *sch.regClassOpOpcode(::dss::TargetRegClass::GPR,
                                                  ::dss::TargetRegClass::FPR,
@@ -3198,7 +3204,7 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "cast (MirOpcode " << static_cast<int>(param.mirOp) << ")"
         << " must lower cleanly via mnemonic `" << param.expectedMnemonic << "`";
@@ -3327,7 +3333,7 @@ lowerOneCast(::dss::TargetSchema const& sch, ::dss::MirOpcode mirOp,
     mb.addReturn(mb.addInst(mirOp, castOps, dstT));
     ::dss::Mir m = std::move(mb).finish();
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_TRUE(result.ok);
     LoweredCast out{std::move(result.lir), {}};
     out.ops = entryBlockOpcodes(out.lir);
@@ -3531,7 +3537,7 @@ TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << "dynamic-index Gep must lower cleanly";
 
     auto const leaOp = *sch.opcodeByMnemonic("lea");
@@ -3594,7 +3600,7 @@ TEST(MirToLir, GepCharRuntimeIndexWidenIsTargetKeyed) {
                               ::dss::TypeInterner const& interner,
                               ::dss::DiagnosticReporter& rep,
                               std::optional<bool> charIsUnsigned) {
-        return ::dss::lowerToLir(m, sch, interner, rep, {}, std::nullopt,
+        return ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget, {}, std::nullopt,
                                  std::nullopt, std::nullopt, {}, std::nullopt,
                                  std::nullopt, charIsUnsigned);
     };
@@ -3765,7 +3771,7 @@ TEST(MirToLir, SwitchCharDiscriminantJumpTableWidenIsTargetKeyed) {
                               ::dss::TypeInterner const& interner,
                               ::dss::DiagnosticReporter& rep,
                               std::optional<bool> charIsUnsigned) {
-        return ::dss::lowerToLir(m, sch, interner, rep, {}, std::nullopt,
+        return ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget, {}, std::nullopt,
                                  std::nullopt, std::nullopt, {}, std::nullopt,
                                  std::nullopt, charIsUnsigned);
     };
@@ -3932,7 +3938,7 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << "FPR-typed phi must lower cleanly";
 
     ::dss::Lir const& lir = result.lir;
@@ -4021,7 +4027,7 @@ TEST(MirToLir, MultiSuccessorBlockDoesNotCarryItsPhiEdgeCopies) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << "a self-looping i32 phi must lower cleanly";
 
     ::dss::Lir const& lir = result.lir;
@@ -4093,7 +4099,7 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok);
     ::dss::Lir const& lir = result.lir;
     ASSERT_EQ(lir.literalPool().size(), 1u);
@@ -4131,7 +4137,7 @@ TEST(MirToLir, FprConstAtMirToLirFailsLoudPointingAtPromotion) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "an F64 Const at MIR→LIR must fail loud (the LiteralIndex "
            "route is a dead end; promotion happens at HIR→MIR)";
@@ -4171,7 +4177,7 @@ TEST(MirToLir, F32FAddLowersWithWidth32Flag) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -4216,7 +4222,7 @@ TEST(MirToLir, F16FAddStillFailsLoudViaTheWidthGuard) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "F16 FAdd must fail loud — no scalar encodings at any width";
     bool sawWidthDiag = false;
@@ -4271,7 +4277,7 @@ TEST(MirToLir, FprStoreLowersViaDeclaredMovsdStore) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto const result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok);
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -4313,7 +4319,7 @@ TEST(MirToLir, FprStoreFailsLoudWithoutDeclaredStoreOp) {
 
     auto [m, interner] = buildF64StoreMir();
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep);
+    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool sawClassDiag = false;
     for (auto const& d : rep.all()) {
@@ -4358,7 +4364,7 @@ TEST(MirToLir, StrippedClassOpsTableFailsLoudOnFprLoad) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep);
+    auto const result = ::dss::lowerToLir(m, **mutated, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool sawClassDiag = false;
     for (auto const& d : rep.all()) {
@@ -4392,7 +4398,7 @@ TEST(MirToLir, F32FpToSiSourceLowersWithSourceWidth32Flag) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const fpToSiOp = (*target)->opcodeByMnemonic("fp_to_si");
@@ -4435,7 +4441,7 @@ TEST(MirToLir, F64FpToSiWithI32ResultKeepsSourceWidth64) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const fpToSiOp = (*target)->opcodeByMnemonic("fp_to_si");
@@ -4607,7 +4613,7 @@ TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
     // an extern call dereferences the import POINTER slot via FF 15. (This
     // is what the historical x86_64-PE path used unconditionally; it is now
     // selected by the format's dispatch, not assumed.)
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep,
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget,
                                           externImports,
                                           ::dss::ExternCallDispatch::IndirectSlot);
     ASSERT_TRUE(result.ok)
@@ -4729,7 +4735,7 @@ lowerStdExternFixture(::dss::TargetSchema const& sch,
     std::vector<::dss::ExternImport> externImports{ext};
 
     ExternCallLowering out{
-        ::dss::lowerToLir(m, sch, interner, rep, externImports, dispatch,
+        ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget, externImports, dispatch,
                           /*dataImportBinding=*/std::nullopt,
                           /*tlsAccess=*/std::nullopt,
                           /*sehScopes=*/{},
@@ -5015,7 +5021,7 @@ TEST(MirToLir, ExtractValueZeroIndexLowersToLoad) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "ExtractValue with zero-index Const must lower cleanly";
     auto const loadOp = *sch.opcodeByMnemonic("load");
@@ -5057,7 +5063,7 @@ TEST(MirToLir, ExtractValueNonZeroIndexDefersWithDiagnostic) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "non-zero index ExtractValue must defer with L_Unsupported";
     bool found = false;
@@ -5096,7 +5102,7 @@ TEST(MirToLir, ExtractValueZeroIndexAcceptsUintLiteralVariant) {
     mb.addReturn(ext);
     ::dss::Mir m = std::move(mb).finish();
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_TRUE(result.ok)
         << "uint64_t-0 index must be accepted as zero (was silently rejected "
            "in cycle 3e first cut)";
@@ -5122,7 +5128,7 @@ TEST(MirToLir, IntrinsicCallLowersToIntrinsicCallOpcode) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok);
     auto const intrOp = *sch.opcodeByMnemonic("intrinsic_call");
     ::dss::Lir const& lir = result.lir;
@@ -5265,7 +5271,7 @@ struct GuardProbe {
     mb.addReturn(r);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -5384,7 +5390,7 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
     mb.addReturn(r);
     ::dss::Mir m = std::move(mb).finish();
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_TRUE(result.ok);
     auto const widths = widthsOfMnemonic(result.lir, **target, "cmp");
     ASSERT_EQ(widths.size(), 1u);
@@ -5460,7 +5466,7 @@ lowerFusedSltShape(std::string_view targetName, ::dss::TypeKind k) {
         });
     ::dss::DiagnosticReporter rep;
     auto const result =
-        ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+        ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     if (!result.ok) return out;
     out.lowered = true;
     auto const& sch = **target;
@@ -5561,7 +5567,7 @@ namespace {
     mb.addReturn(r);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -5742,7 +5748,7 @@ TEST(MirToLir, CharLoadIsByteExactWidth8) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const widths = widthsOfMnemonic(result.lir, **target, "load");
@@ -5775,7 +5781,7 @@ TEST(MirToLir, CharStoreIsByteExactWidth8) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const widths = widthsOfMnemonic(result.lir, **target, "store");
@@ -5802,7 +5808,7 @@ TEST(MirToLir, CharConstMaterializesAtPromotedWidthNotByte) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep);
+    auto const result = ::dss::lowerToLir(syn.mir, **target, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const widths = widthsOfMnemonic(result.lir, **target, "mov");
@@ -5952,7 +5958,7 @@ namespace {
     mb.addReturn(std::nullopt);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -5987,7 +5993,7 @@ namespace {
     mb.addReturn(std::nullopt);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -6014,7 +6020,7 @@ namespace {
     mb.addReturn(std::nullopt);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -6036,7 +6042,7 @@ namespace {
     mb.addReturn(x);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -6203,7 +6209,7 @@ namespace {
     mb.addReturnMulti(rets);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -6236,7 +6242,7 @@ namespace {
     mb.addReturn(std::nullopt);
     ::dss::Mir m = std::move(mb).finish();
     GuardProbe probe;
-    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep, dss::test::kFirstConventionOfTheTarget);
     probe.ok  = result.ok;
     probe.lir = std::move(result.lir);
     return probe;
@@ -6374,7 +6380,7 @@ TEST(MirToLir, F80PhiControlMergeLowersToMemoryHomeCopy) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "an F80 phi (long double control-flow merge) must LOWER to the "
            "memory-home merge — the SAME diamond that lowers for an F64 phi: "
@@ -6497,7 +6503,7 @@ TEST(MirToLir, F80PhiSwapOnABackEdgeStagesEveryIncomingBeforeAnyHomeWrite) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "two swapping long-double phis on a back edge must lower: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -6596,7 +6602,7 @@ TEST(MirToLir, F80ArithmeticAndStoreLowerToX87Sequence) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "F80 FMul + Load + Store must lower on the x87-80 axis: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -6704,7 +6710,7 @@ lowerF128Arm64(::dss::Mir const& m, ::dss::TargetSchema const& target,
                ::dss::DiagnosticReporter& rep) {
     std::vector<::dss::ExternImport> noExterns;
     return ::dss::lowerToLir(
-        m, target, interner, rep, std::move(noExterns),
+        m, target, interner, rep, dss::test::kFirstConventionOfTheTarget, std::move(noExterns),
         ::dss::ExternCallDispatch::DirectPlt,
         /*dataImportBinding=*/std::nullopt, /*tlsAccess=*/std::nullopt,
         /*sehScopes=*/{},
@@ -7033,7 +7039,7 @@ TEST(MirToLir, F128ArithmeticFailsLoudWithoutConfigRow) {
     ::dss::DiagnosticReporter rep;
     // Lower on x86_64 with the DEFAULTS (no softcall library) — the config-row
     // absence alone must gate it.
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "F128 arith on a target with no softcall row must fail loud, "
            "not silently take the softcall path";
@@ -7824,7 +7830,7 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
         << "MIR lowering emits the componentwise F80 ops: "
         << (mirReporter.all().empty() ? "" : mirReporter.all()[0].actual);
     DiagnosticReporter lirReporter;
-    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
+    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lir.ok)
         << "long-double-complex LOCAL arithmetic must LOWER on the x87-80 axis — "
            "its F80 components ride the LD-1 x87 memory sequence: "
@@ -7944,7 +7950,7 @@ TEST(MirToLirTls, X64ThreadLocalLowersToTlsBasePlusTpoffLea) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, elfLocalExecTls());
     ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -8024,7 +8030,7 @@ TEST(MirToLirTls, X64ThreadLocalNeverRiprelFoldsWhileControlDoes) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, elfLocalExecTls());
     ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -8078,7 +8084,7 @@ TEST(MirToLirTls, X64PeIndexedThreadLocalLowersToTebIndexedSequence) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, (*pe)->tlsAccess());
     ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -8174,7 +8180,7 @@ TEST(MirToLirTls, NoTlsAccessFormatFailsLoud0x8015) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt,
                            std::optional<::dss::TlsAccessInfo>{});
     EXPECT_FALSE(lirR.ok);
@@ -8204,7 +8210,7 @@ TEST(MirToLirTls, Arm64MachoTlvLowersToDescriptorCallSequence) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, (*fmt)->tlsAccess());
     ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -8273,7 +8279,7 @@ TEST(MirToLirTls, Arm64ThreadLocalLowersToBareTlsBasePlusSymbolLea) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, (*fmt)->tlsAccess());
     ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = lirR.lir;
@@ -8327,7 +8333,7 @@ TEST(MirToLirTls, Arm64WithoutTlsBaseOpcodeFailsLoudMissingOpcode) {
     ASSERT_TRUE(target.has_value());
     ASSERT_FALSE((*target)->opcodeByMnemonic("tlsbase").has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, elfLocalExecTls());
     EXPECT_FALSE(lirR.ok);
     bool sawTlsBaseMissing = false;
@@ -8361,7 +8367,7 @@ TEST(MirToLirTls, DoublyUnlandedLegFormatGateFiresBeforeOpcodeGate) {
     ASSERT_TRUE(target.has_value());
     ASSERT_FALSE((*target)->opcodeByMnemonic("tlsbase").has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt,
                            /*tlsAccess=*/std::nullopt);
     EXPECT_FALSE(lirR.ok);
@@ -8402,7 +8408,7 @@ TEST(MirToLirTls, TlsBaseRowWithUnrecognizedShapeFailsLoud) {
     ASSERT_TRUE(target.has_value());
     ASSERT_TRUE((*target)->opcodeByMnemonic("tlsbase").has_value());
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, elfLocalExecTls());
     EXPECT_FALSE(lirR.ok);
     bool sawShapeReject = false;
@@ -8434,7 +8440,7 @@ TEST(MirToLirTls, PeIndexedWithoutTlsIndexSlotNameFailsLoud) {
     pe.baseDisplacement  = 0x58;
     // tlsIndexSlotName left EMPTY on purpose.
     DiagnosticReporter rep;
-    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, dss::test::kFirstConventionOfTheTarget, {},
                            std::nullopt, std::nullopt, pe);
     EXPECT_FALSE(lirR.ok);
     EXPECT_TRUE(sawDiagnosticCode(
@@ -9083,7 +9089,7 @@ TEST(MirToLir, Int128MemoryAccessFailsLoud) {
     ::dss::Mir m = std::move(mb).finish();
 
     ::dss::DiagnosticReporter rep;
-    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "red-on-disable: remove the 128-bit memory arms from "
            "requireNativeIntWidth (and reprKind's wall) and this lowers CLEAN — "
@@ -9127,6 +9133,7 @@ namespace {
     TypeId const params[] = {i32p};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -9147,6 +9154,7 @@ namespace {
     TypeId const params[] = {i32p, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -9184,7 +9192,7 @@ TEST(MirToLirPackedAtomic, UnderAlignedStoreCallsTheAtomicsRuntimeNotStlr) {
     Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, elfAtomicsRuntime());
@@ -9220,7 +9228,7 @@ TEST(MirToLirPackedAtomic, NaturallyAlignedStoreKeepsTheNativeStlr) {
     Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/4, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, elfAtomicsRuntime());
@@ -9240,7 +9248,7 @@ TEST(MirToLirPackedAtomic, UnderAlignedLoadCallsTheAtomicsRuntimeNotLdar) {
     Mir mir = buildAtomicLoadFnMirAligned(/*provableAlign=*/1, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, elfAtomicsRuntime());
@@ -9262,7 +9270,7 @@ TEST(MirToLirPackedAtomic, NaturallyAlignedLoadKeepsTheNativeLdar) {
     Mir mir = buildAtomicLoadFnMirAligned(/*provableAlign=*/4, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, elfAtomicsRuntime());
@@ -9282,7 +9290,7 @@ TEST(MirToLirPackedAtomic, UnknownAlignmentKeepsTheNativeFormByteForByte) {
     Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/0, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, elfAtomicsRuntime());
@@ -9300,7 +9308,7 @@ TEST(MirToLirPackedAtomic, TrapsTargetWithNoAtomicsRuntimeRefusesLoud) {
     Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, std::nullopt);
@@ -9347,7 +9355,7 @@ TEST(MirToLirPackedAtomic,
     Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::IndirectSlot, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, std::nullopt);
@@ -9370,7 +9378,7 @@ TEST(MirToLirPackedAtomic, LosesAtomicityTargetWithARuntimeStillTakesTheLibcall)
     Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
     DiagnosticReporter rep;
     std::vector<dss::ExternImport> noExterns;
-    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+    auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                            ExternCallDispatch::DirectPlt, std::nullopt,
                            std::nullopt, {}, std::nullopt, std::nullopt,
                            std::nullopt, elfAtomicsRuntime());
@@ -9437,7 +9445,7 @@ TEST(MirToLirPackedAtomic, ShippedPe64FormatRoutesTheUnderAlignedAccessToTheRunt
         Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
         DiagnosticReporter rep;
         std::vector<dss::ExternImport> noExterns;
-        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                                ExternCallDispatch::DirectPlt, std::nullopt,
                                std::nullopt, {}, std::nullopt, std::nullopt,
                                std::nullopt, ar);
@@ -9478,7 +9486,7 @@ TEST(MirToLirPackedAtomic, ShippedPe64FormatRoutesTheUnderAlignedAccessToTheRunt
         Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/4, interner);
         DiagnosticReporter rep;
         std::vector<dss::ExternImport> noExterns;
-        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                                ExternCallDispatch::DirectPlt, std::nullopt,
                                std::nullopt, {}, std::nullopt, std::nullopt,
                                std::nullopt, ar);
@@ -9711,7 +9719,7 @@ TEST(MirToLir, F80CompareLowersToX87SequenceAndPushesTheLeftOperandLast) {
     ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F80,
                                          ::dss::MirOpcode::FCmpOgt);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "an F80 comparison must lower on the x87-80 axis: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -9760,7 +9768,7 @@ TEST(MirToLir, F80CompareSwapCanonicalizationReversesThePushOrder) {
     ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F80,
                                          ::dss::MirOpcode::FCmpOlt);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     Lir const& lir = result.lir;
     LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
@@ -9790,7 +9798,7 @@ TEST(MirToLir, F80CompareFusesIntoTheConditionalBranch) {
     ::dss::Mir m = buildWideFloatCompareBranch(interner, ::dss::TypeKind::F80,
                                                ::dss::MirOpcode::FCmpOgt);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "an F80 compare feeding a branch must lower: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -9942,7 +9950,7 @@ TEST(MirToLir, F128CompareFailsLoudWithoutConfigRow) {
     ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F128,
                                          ::dss::MirOpcode::FCmpOlt);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "an F128 comparison on a target with no comparison row must fail "
            "loud, not silently take the softcall path";
@@ -10095,7 +10103,7 @@ TEST(MirToLir, F80NegLowersToTheX87SignFlipSequence) {
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     ::dss::Mir m = buildWideFloatNeg(interner, ::dss::TypeKind::F80);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "an F80 negate must lower on the x87-80 axis: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10170,7 +10178,7 @@ TEST(MirToLir, F80FloatConversionsPickTheWidthExactX87MemoryForm) {
         ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
         ::dss::Mir m = buildWideFloatConvert(interner, c.src, c.dst, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok)
             << c.x87 << ": the conversion must lower: "
             << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10232,7 +10240,7 @@ TEST(MirToLir, F80ToIntegerPicksTheTruncatingStoreWidthTheResultNeeds) {
         ::dss::Mir m =
             buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok)
             << c.form << ": the conversion must lower: "
             << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10286,7 +10294,7 @@ TEST(MirToLir, F80UnsignedSixtyFourBitConversionIsTheBiasedSelectInOrder) {
                                          ::dss::TypeKind::U64,
                                          ::dss::MirOpcode::FPToUI);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "a 64-bit unsigned conversion from long double must lower: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10348,7 +10356,7 @@ TEST(MirToLir, F80UnsignedSixtyFourBitMaskComesFromTheDirectTruncation) {
                                          ::dss::TypeKind::U64,
                                          ::dss::MirOpcode::FPToUI);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const loadOp  = (*target)->opcodeByMnemonic("load");
@@ -10397,7 +10405,7 @@ TEST(MirToLir, F80UnsignedSixtyFourBitBiasIsTwoToTheSixtyThirdInBinary64) {
                                          ::dss::TypeKind::U64,
                                          ::dss::MirOpcode::FPToUI);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
     bool found = false;
@@ -10504,7 +10512,7 @@ TEST(MirToLir, F128UnsignedSixtyFourBitConversionFailsLoudWithoutItsConfigRow) {
                                          ::dss::TypeKind::U64,
                                          ::dss::MirOpcode::FPToUI);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok)
         << "an F128 unsigned 64-bit conversion on a target with no row must "
            "fail loud, not silently take some other helper";
@@ -10574,7 +10582,7 @@ TEST(MirToLir, IntToF80UsesTheWidthExactIntegerLoad) {
         ::dss::Mir m = buildWideFloatConvert(interner, c.src,
                                              ::dss::TypeKind::F80, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok)
             << c.form << ": the conversion must lower: "
             << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10635,7 +10643,7 @@ TEST(MirToLir, UInt64ToF80IsTheExactSplitInOrder) {
                                          ::dss::TypeKind::F80,
                                          ::dss::MirOpcode::UIToFP);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok)
         << "a 64-bit unsigned source must convert to long double: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10683,7 +10691,7 @@ TEST(MirToLir, UInt64ToF80DoublesTheHalvedSlotAndNotTheLowBitOne) {
                                          ::dss::TypeKind::F80,
                                          ::dss::MirOpcode::UIToFP);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
     auto const fildOp  = (*target)->opcodeByMnemonic("fild_m64");
     auto const storeOp = (*target)->opcodeByMnemonic("store");
@@ -10743,7 +10751,7 @@ TEST(MirToLir, UInt64ToF80HalvesLogicallyAndMasksExactlyTheLowBit) {
                                          ::dss::TypeKind::F80,
                                          ::dss::MirOpcode::UIToFP);
     ::dss::DiagnosticReporter rep;
-    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
 
     EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_l"), 1)
@@ -10906,7 +10914,7 @@ TEST(MirToLir, IntToF128FailsLoudWithoutItsConfigRow) {
         ::dss::Mir m = buildWideFloatConvert(interner, c.src,
                                              ::dss::TypeKind::F128, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         EXPECT_FALSE(result.ok)
             << c.name << ": an integer→F128 conversion on a target with no row "
                          "must fail loud, not silently take some other helper";
@@ -10952,7 +10960,7 @@ TEST(MirToLir, LongDoubleToSubNativeIntegerUsesTheRegisterWidthNotTheMemoryOne) 
         ::dss::Mir m =
             buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok)
             << c.why << " must lower: "
             << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -10984,7 +10992,7 @@ TEST(MirToLir, LongDoubleToSubNativeIntegerUsesTheRegisterWidthNotTheMemoryOne) 
         ::dss::Mir m =
             buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         ASSERT_TRUE(result.ok)
             << c.why << " must lower: "
             << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -11059,7 +11067,7 @@ TEST(MirToLir, SubNativeIntegerSourceToLongDoubleFailsLoudOnBothAxes) {
             ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
             ::dss::Mir m = buildWideFloatConvert(interner, c.src, a.dst, c.op);
             ::dss::DiagnosticReporter rep;
-            auto result = ::dss::lowerToLir(m, **target, interner, rep);
+            auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
             EXPECT_FALSE(result.ok)
                 << a.target << ": a sub-native integer source must fail loud";
             EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-SUBNATIVE-ALU-FORMS"))
@@ -11175,7 +11183,7 @@ TEST(MirToLir, F128ConversionsFailLoudWithoutConfigRow) {
         ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
         ::dss::Mir m = buildWideFloatConvert(interner, c.src, c.dst, c.op);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         EXPECT_FALSE(result.ok)
             << c.arm << ": an F128 conversion on a target with no row must "
                         "fail loud, not silently take the softcall path";
@@ -11189,7 +11197,7 @@ TEST(MirToLir, F128ConversionsFailLoudWithoutConfigRow) {
         ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
         ::dss::Mir m = buildWideFloatNeg(interner, ::dss::TypeKind::F128);
         ::dss::DiagnosticReporter rep;
-        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        auto result = ::dss::lowerToLir(m, **target, interner, rep, dss::test::kFirstConventionOfTheTarget);
         EXPECT_FALSE(result.ok)
             << "an F128 negate with no `neg` row must fail loud";
         EXPECT_TRUE(sawAnchor(rep, "MIR FNeg"))
@@ -11363,6 +11371,7 @@ TEST(MirToLir, TheRowLeavesStatingWhetherItsCodeReadsThroughASlot) {
         TypeId const params[] = {i32};
         TypeId const fnSig    = interner.fnSig(params, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(fnSig, SymbolId{100});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(entry);
@@ -11383,7 +11392,7 @@ TEST(MirToLir, TheRowLeavesStatingWhetherItsCodeReadsThroughASlot) {
         ei.isData          = isData;
         ei.readThroughSlot = !(isData && binding.has_value());  // stale, opposite
         externs.push_back(ei);
-        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+        auto lirR = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                                ExternCallDispatch::DirectPlt, binding);
         if (!lirR.ok) return std::nullopt;
         for (auto const& row : lirR.externImports) {

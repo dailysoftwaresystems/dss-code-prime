@@ -1,6 +1,7 @@
 #include "core/types/tree_builder.hpp"
 
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/trivia_token.hpp"
@@ -949,7 +950,7 @@ void TreeBuilder::pushToken(Token const& tok) {
         d.severity    = DiagnosticSeverity::Error;
         d.buffer      = source_->id();
         d.span        = tok.span;
-        d.actual      = std::format("'{}'", lexeme);
+        d.actual      = std::format("'{}'", quotedSourceText(lexeme));
         d.ruleContext = open_.back().rule;
         emitDiagnostic_(std::move(d));
 
@@ -972,7 +973,7 @@ void TreeBuilder::pushToken(Token const& tok) {
         d.severity    = DiagnosticSeverity::Warning;
         d.buffer      = source_->id();
         d.span        = tok.span;
-        d.actual      = std::format("'{}'", lexeme);
+        d.actual      = std::format("'{}'", quotedSourceText(lexeme));
         d.ruleContext = open_.back().rule;
         emitDiagnostic_(std::move(d));
     }
@@ -1020,7 +1021,7 @@ void TreeBuilder::pushToken(Token const& tok) {
             d.buffer      = source_->id();
             d.span        = tok.span;
             d.actual      = std::format("'{}' as Identifier (demoted from {})",
-                                        lexeme,
+                                        quotedSourceText(lexeme),
                                         schema_->schemaTokens().name(demotedFrom));
             d.ruleContext = open_.back().rule;
             emitDiagnostic_(std::move(d));

@@ -1273,3 +1273,43 @@ TEST(MirRebuildHelperDeathTest, FatalStillNamesTheHelperAsWellAsThePass) {
 // ⇒ What is claimed is that ALL NINE compose through one attributed helper (a
 // structural property, and the mutant below is what proves it is load-bearing),
 // and that FIVE of them are additionally witnessed end-to-end by a dying process.
+
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): THE REBUILD UNDER EVERY OPTIMIZER PASS — and the synthesis
+// passes' copies of their module's functions — KEEPS EACH FUNCTION'S OWN ARG COUNTING AND THE MODULE'S FACTS. A
+// function's counting is its convention's (`Mir::funcArgCounting`), which differs from the module's default for a
+// function of another convention: a copy that took the rebuilt builder's default would count it by the pair's.
+// Function #0 is stamped flat in a per-class module, #1 takes the default, and the module states facts that are not
+// the builder's defaults (StrictTBAA, the char-types rule off).
+// RED-ON-DISABLE: drop the rebuild's stamp, and #0 reads per class.
+TEST(MirRebuildHelper, RebuildFunctionKeepsItsOwnArgCountingAndTheModulesFacts) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
+    mb.setAliasingMode(MirAliasingMode::StrictTBAA);
+    mb.setCharTypesAliasAll(false);
+    MirFuncId const own = mb.addFunction(fnSig, SymbolId{1});
+    mb.stateFunctionArgCounting(own, MirArgCounting::Flat);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    MirLiteralValue v0; v0.value = std::int64_t{11}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    (void)mb.addFunction(fnSig, SymbolId{2});
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b1);
+    MirLiteralValue v1; v1.value = std::int64_t{12}; v1.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v1, i32));
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.funcArgCounting(src.funcAt(0)), MirArgCounting::Flat);
+    ASSERT_EQ(src.funcArgCounting(src.funcAt(1)), MirArgCounting::PerClass);
+
+    Mir dst;
+    ASSERT_TRUE(identityRebuild(src, dst));
+    ASSERT_EQ(dst.moduleFuncCount(), 2u);
+    EXPECT_EQ(dst.funcArgCounting(dst.funcAt(0)), MirArgCounting::Flat)
+        << "the rebuild keeps a function's own convention's counting";
+    EXPECT_EQ(dst.funcArgCounting(dst.funcAt(1)), MirArgCounting::PerClass) << "and the default one's";
+    EXPECT_EQ(dst.moduleFacts(), src.moduleFacts()) << "and the module's facts, whole";
+}

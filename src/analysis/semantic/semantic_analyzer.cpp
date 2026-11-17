@@ -21,6 +21,7 @@
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: run analyze on a large stack
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/anon_member_name.hpp"   // isSyntheticAnonymousName (one owner)
 #include "core/types/alignment.hpp"          // Alignment::kMaxBytes — the ONE representable-alignment bound
 #include "core/types/attribute_naming.hpp"   // D-CSUBSET-PACKED: stripDunder (shared with the preprocessor)
@@ -62,6 +63,9 @@
 #include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
 #include "core/types/variant_when.hpp"   // whenMatches — a builtin's per-pair signature arm (S2a-1)
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include "core/types/float_format.hpp"       // the `mode` refusal names a representation by its facts
+#include "core/types/type_spelling.hpp"      // the ONE spelling of a type in a diagnostic (rulings 617, 621)
 
 #include <algorithm>
 #include <bit>
@@ -2125,16 +2129,30 @@ compositeIncompleteAt(EngineState const& s, Tree const& tree, TypeId t,
     return streamRankPast(s, tree, sc.anchor) > pointRank;
 }
 
-// The spelling of a struct/union TYPE in a diagnostic sentence — `struct S` /
-// `union U` (the lattice kind and the tag; qualifier skins seen through).
-[[nodiscard]] std::string compositeSpelling(TypeInterner const& in, TypeId t) {
-    TypeId const m = in.stripVolatile(t);
-    std::string out = in.kind(m) == TypeKind::Union ? "union" : "struct";
-    if (std::string_view const tag = in.name(m); !tag.empty()) {
-        out += ' ';
-        out += tag;
-    }
-    return out;
+// ★ THE ONE DOOR OF A TYPE INTO A DIAGNOSTIC SENTENCE (P69 fold f26d, lane `cs`, rulings 617 and 621): the
+// type as the language spells it — `spellType` over the language document's `semantics.typeSpelling` — or
+// nullopt when the document states no table (that language's diagnostics name no types) or its table has no
+// word for a piece of the type (a kind only a descriptor reaches): each site then says its sentence without
+// one. The analyzer's own renderers went into it (a struct/union speller that knew only two tag words, a
+// lambda that printed core kind names such as `I32`), so no core kind name and no DSS type text reaches a
+// diagnostic of the language.
+[[nodiscard]] std::optional<std::string> spelledType(SemanticConfig const& cfg, TypeInterner const& in,
+                                                     TypeId t, SpellOptions options = {}) {
+    if (!t.valid()) return std::nullopt;
+    return spellType(in, t, cfg.typeSpelling, options);
+}
+
+// `'T'` where the language spells types; the given words where it does not.
+[[nodiscard]] std::string quotedTypeOr(SemanticConfig const& cfg, TypeInterner const& in, TypeId t,
+                                       std::string_view otherwise) {
+    if (std::optional<std::string> const sp = spelledType(cfg, in, t)) return "'" + *sp + "'";
+    return std::string{otherwise};
+}
+
+// ` ('T')` after a category word where the language spells types; nothing where it does not.
+[[nodiscard]] std::string typeAfterCategory(SemanticConfig const& cfg, TypeInterner const& in, TypeId t) {
+    if (std::optional<std::string> const sp = spelledType(cfg, in, t)) return " ('" + *sp + "')";
+    return {};
 }
 
 // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): does THIS declarator declare a
@@ -2971,7 +2989,7 @@ void refuseDecorationsOffTheOutermostBracket(EngineState& s, SemanticConfig cons
                 d.actual   = "an array declarator's `static` / type-qualifier decoration is "
                              "permitted only on a function parameter's OUTERMOST array "
                              "derivation (C 6.7.6.2p1): `"
-                             + std::string{tree.text(c)} + "`";
+                             + quotedSourceText(tree.text(c)) + "`";
                 s.reporter.report(std::move(d));
                 break;
             }
@@ -3159,6 +3177,24 @@ paramRowSpine(SchemaIndexes const& idx, Tree const& tree, NodeId row,
         }
     }
     return false;
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — F6; fold f26d): WHETHER ONE DECLARATION GIVES ITS FUNCTION NO
+// PROTOTYPE — the one predicate `SymbolRecord::declaresNoPrototype` is set from: a declaration that
+// is not a definition (`isProtoDeclaration`), typed a function of no parameters, whose own
+// declarator writes an EMPTY list (`functionDeclaratorWritesNoParameters` — `()`, not `(void)`),
+// where the language says such a list declares no prototype
+// (`parameters.emptyListDeclaresNoPrototype`). Asked by the one sweep that sets the field, once every
+// function's type is resolved and before Pass 2 walks a use; every other reader reads the field.
+[[nodiscard]] bool declarationGivesNoPrototype(SchemaIndexes const& idx, Tree const& tree,
+                                               SymbolRecord const& rec, TypeInterner const& in) {
+    if (rec.kind != DeclarationKind::Function || !rec.isProtoDeclaration
+        || rec.isImplicitDeclaration || !rec.type.valid()
+        || in.kind(rec.type) != TypeKind::FnSig || !in.fnParams(rec.type).empty()
+        || in.fnIsVariadic(rec.type))
+        return false;
+    if (idx.cfg == nullptr || !idx.cfg->parameters.emptyListDeclaresNoPrototype) return false;
+    return functionDeclaratorWritesNoParameters(idx, tree, ownDeclaratorOf(idx, tree, rec));
 }
 
 [[nodiscard]] std::optional<DeclaredQualification>
@@ -3708,7 +3744,7 @@ applyBaseQualifiers(EngineState& s, Tree const& tree, TypeId base,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(diagNode);
-                d.actual   = std::string{tree.text(diagNode)};
+                d.actual   = quotedSourceText(tree.text(diagNode));
                 s.reporter.report(std::move(d));
             }
         } else {
@@ -4027,7 +4063,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(node);
-                d.actual   = std::string{tree.text(node)};
+                d.actual   = quotedSourceText(tree.text(node));
                 s.reporter.report(std::move(d));
                 return InvalidType;
             }
@@ -4138,7 +4174,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     d.severity = DiagnosticSeverity::Error;
                     d.buffer   = tree.source().id();
                     d.span     = tree.span(node);
-                    d.actual   = std::string{tree.text(node)};
+                    d.actual   = quotedSourceText(tree.text(node));
                     s.reporter.report(std::move(d));
                     specifierDiagnosed = true;
                     return InvalidType;
@@ -4150,7 +4186,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     d.severity = DiagnosticSeverity::Error;
                     d.buffer   = tree.source().id();
                     d.span     = tree.span(bitSpec);
-                    d.actual   = std::string{tree.text(bitSpec)};
+                    d.actual   = quotedSourceText(tree.text(bitSpec));
                     s.reporter.report(std::move(d));
                     specifierDiagnosed = true;
                     return InvalidType;
@@ -4179,7 +4215,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (!width.has_value()) {
                     emitWidth(DiagnosticCode::S_BitIntWidthNotConstant,
                               "`_BitInt(N)` requires an integer constant-expression "
-                              "width: " + std::string{tree.text(bitSpec)});
+                              "width: " + quotedSourceText(tree.text(bitSpec)));
                     return InvalidType;
                 }
                 std::int64_t const n = *width;
@@ -4280,7 +4316,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     d.actual   = std::format(
                         "'{}' is not realized on this object format: the "
                         "format declares no longDoubleFormat axis",
-                        tree.text(node));
+                        quotedSourceText(tree.text(node)));
                     s.reporter.report(std::move(d));
                     specifierDiagnosed = true;   // outer S_UnknownType suppressed
                     return InvalidType;
@@ -4290,7 +4326,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(node);
-                d.actual   = std::string{tree.text(node)};
+                d.actual   = quotedSourceText(tree.text(node));
                 s.reporter.report(std::move(d));
                 specifierDiagnosed = true;   // outer S_UnknownType suppressed
                 return InvalidType;
@@ -4451,7 +4487,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     d.severity = DiagnosticSeverity::Error;
                     d.buffer   = tree.source().id();
                     d.span     = tree.span(node);
-                    d.actual   = std::string{tree.text(node)};
+                    d.actual   = quotedSourceText(tree.text(node));
                     s.reporter.report(std::move(d));
                 }
                 return InvalidType;
@@ -4482,7 +4518,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         d.severity = DiagnosticSeverity::Error;
                         d.buffer   = tree.source().id();
                         d.span     = tree.span(node);
-                        d.actual   = std::string{tree.text(node)};
+                        d.actual   = quotedSourceText(tree.text(node));
                         s.reporter.report(std::move(d));
                         specifierDiagnosed = true;
                     }
@@ -4620,7 +4656,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 d.buffer   = tree.source().id();
                                 d.span     = tree.span(operandNode);
                                 d.actual   =
-                                    std::string{tree.text(operandNode)};
+                                    quotedSourceText(tree.text(operandNode));
                                 s.reporter.report(std::move(d));
                                 specifierDiagnosed = true;
                                 return InvalidType;
@@ -5004,10 +5040,10 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         "position must contain exactly one type — a decoration "
                         "(attribute / specifier run) belongs BESIDE the head, "
                         "never inside it",
-                        tree.text(node),
-                        headChild.valid() ? tree.text(headChild)
-                                          : std::string_view{"<head>"},
-                        tree.text(child));
+                        quotedSourceText(tree.text(node)),
+                        quotedSourceText(headChild.valid() ? tree.text(headChild)
+                                                           : std::string_view{"<head>"}),
+                        quotedSourceText(tree.text(child)));
                     s.reporter.report(std::move(d));
                     specifierDiagnosed = true;
                     return InvalidType;
@@ -5112,7 +5148,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         d.severity = DiagnosticSeverity::Error;
                         d.buffer   = tree.source().id();
                         d.span     = tree.span(absDirect);
-                        d.actual   = std::string{tree.text(absDirect)};
+                        d.actual   = quotedSourceText(tree.text(absDirect));
                         s.reporter.report(std::move(d));
                     }
                     return InvalidType;
@@ -5132,7 +5168,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             d.severity = DiagnosticSeverity::Error;
             d.buffer   = tree.source().id();
             d.span     = tree.span(node);
-            d.actual   = std::string{tree.text(node)};
+            d.actual   = quotedSourceText(tree.text(node));
             s.reporter.report(std::move(d));
         }
         return InvalidType;
@@ -5874,7 +5910,7 @@ void sayAdmittedForms(EngineState& s, Tree const& tree, std::vector<NodeId> cons
         d.span     = tree.span(at);
         d.actual   = std::format("'{}' uses the comma operator in an integer constant expression "
                                  "(C 6.6p3 excludes it; the language admits it in this position)",
-                                 tree.text(at));
+                                 quotedSourceText(tree.text(at)));
         s.reporter.report(std::move(d));
     }
 }
@@ -6018,35 +6054,35 @@ foldCompileTimeAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tre
             case MemberOffsetStatus::NotAComposite:
                 (void)refuse(nameTok,
                     std::format("'{}' cannot be reached: the type it is looked up in "
-                                "is not a struct or union", tree.text(nameTok)));
+                                "is not a struct or union", quotedSourceText(tree.text(nameTok))));
                 return false;
             case MemberOffsetStatus::Incomplete:
                 (void)refuse(nameTok,
                     std::format("'{}' cannot be reached: its containing struct/union "
                                 "is INCOMPLETE here, so it has no layout yet",
-                                tree.text(nameTok)));
+                                quotedSourceText(tree.text(nameTok))));
                 return false;
             case MemberOffsetStatus::NotAMember:
                 (void)refuse(nameTok,
                     std::format("'{}' is not a member of that struct/union",
-                                tree.text(nameTok)));
+                                quotedSourceText(tree.text(nameTok))));
                 return false;
             case MemberOffsetStatus::Ambiguous:
                 (void)refuse(nameTok,
                     std::format("'{}' names two different members of that struct/union, "
                                 "each reached through one of its anonymous members",
-                                tree.text(nameTok)));
+                                quotedSourceText(tree.text(nameTok))));
                 return false;
             case MemberOffsetStatus::BitField:
                 (void)refuse(nameTok,
                     std::format("'{}' is a BIT-FIELD, which has no byte offset (C "
                                 "6.5.3.2 also forbids taking its address)",
-                                tree.text(nameTok)));
+                                quotedSourceText(tree.text(nameTok))));
                 return false;
             case MemberOffsetStatus::NoLayout:
                 (void)refuse(nameTok,
                     std::format("'{}' has no computable layout offset in its "
-                                "containing type", tree.text(nameTok)));
+                                "containing type", quotedSourceText(tree.text(nameTok))));
                 return false;
         }
         return false;
@@ -6604,7 +6640,7 @@ void validateConstexprObject(EngineState& s, SemanticConfig const& cfg, Tree con
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(at);
-        d.actual   = std::string{tree.text(at)};
+        d.actual   = quotedSourceText(tree.text(at));
         s.reporter.report(std::move(d));
     };
     if (!declTy.valid()) return;   // cascade — the type failure already reported
@@ -6859,7 +6895,7 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(nameNode);
-        d.actual   = std::string{tree.text(nameNode)};
+        d.actual   = quotedSourceText(tree.text(nameNode));
         s.reporter.report(std::move(d));
         return;
     }
@@ -6954,7 +6990,7 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         d.buffer   = tree.source().id();
         d.span     = tree.span(suffix);
         d.actual   = std::string{what} + ": `"
-                     + std::string{tree.text(suffix)} + "`";
+                     + quotedSourceText(tree.text(suffix)) + "`";
         s.reporter.report(std::move(d));
     };
 
@@ -8307,34 +8343,12 @@ attrNodeAppertainment(SemanticConfig const& cfg, Tree const& tree,
 }
 
 // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
-// THE ONE ANSWER to "may this token SPELL an attribute clause name?", shared by
-// every reader below (`collectAttrClauses`'s trailing-clause detector,
-// `extractOneAttrClause`'s name scan and its sibling-clause skip, and the
-// composite `packed`/`aligned` scan).
-//
-// ★★ THE SET IS THE GRAMMAR'S OWN. `cfg.attributeClauseNameTokens` is resolved
-// from `tokenClasses.<clauseNameTokenClass>` — the SAME declaration the
-// `{"tokenClass": …}` grammar slot compiles from — so the parser and these
-// readers cannot disagree about what a name is. That is the entire point of the
-// row: `__attribute__((__const__))` spells its clause name with a KEYWORD token
-// (glibc writes it 50 times in ONE preprocessed TU), and admitting it in the
-// grammar while these readers still looked for `identifierToken` alone would have
-// made the clause parse, match no effect row, and DISAPPEAR — a silently dropped
-// attribute, which is worse than the parse error it replaced. The loader refuses
-// a config where only one side moved.
-//
-// EMPTY class ⇒ `identifierToken` alone, byte-identical to the behaviour before
-// the class existed (every language that declares no class: toy, tsql, shader,
-// asm).
-[[nodiscard]] inline bool isAttrClauseNameToken(SemanticConfig const& cfg,
-                                                SchemaTokenId kind) noexcept {
-    if (!cfg.attributeClauseNameTokens.empty()) {
-        for (SchemaTokenId const k : cfg.attributeClauseNameTokens)
-            if (k.v == kind.v) return true;
-        return false;
-    }
-    return cfg.identifierToken.valid() && kind == cfg.identifierToken;
-}
+// THE ONE ANSWER to "may this token SPELL an attribute clause name?" is
+// `isAttrClauseNameToken` (core/types/semantic_config.hpp) — the set is the grammar's
+// own — shared by every reader below (`collectAttrClauses`'s trailing-clause detector,
+// `extractOneAttrClause`'s name scan and its sibling-clause skip, the composite
+// `packed`/`aligned` scan) and by the standard form's item reader
+// (`standardItemClause`, P69 fold f26d, which is why it left this file).
 
 // ★★ P69 (lane `cs`) — THE NAME TOKEN OF ONE ATTRIBUTE CLAUSE: the LAST
 // clause-name token among the clause node's DIRECT visible children (the final
@@ -8486,6 +8500,11 @@ struct AttributeStorageRequest {
     // it, for the diagnostics that name the request.
     bool        imported = false;
     std::string importedBy;
+    // P69 (lane `cs`, fold f26d): the first clause that requested thread storage, and
+    // its name token and key, for the declaration that cannot take it to say so.
+    NodeId      threadClause{};
+    NodeId      threadName{};
+    std::string threadBy;
 };
 
 // ★★ P69 (lane `cs`, fold f26b) — THE ATTRIBUTE ROW A CLAUSE NAMES, THE ONE LOOKUP
@@ -8532,8 +8551,16 @@ attributeRowOfClause(SemanticConfig const& cfg, AttributeSpelling const* spellin
     return out;
 }
 
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): `table` is the table the
+// declaration's row NAMES (`attributeTableOf`), never assumed to be the row's own — the
+// row's own table read a typedef-named block head's `__declspec(dllimport)` with
+// nothing, so the import lowered as an automatic object (lane `cs` probe n5p: cl 19.52,
+// mingw-w64 gcc and clang-cl import it, exactly as its keyword-head twin). A specifier
+// of the STANDARD form is read for the items a spelling claims (`standardItemClause`:
+// `[[gnu::dllimport]]` is the GNU spelling's `dllimport`, probe n5q); its other items
+// are the attribute fold's.
 void scanAttributeStorage(SemanticConfig const& cfg, Tree const& tree, NodeId root,
-                          DeclarationRule const& decl,
+                          DeclarationRule const& table,
                           std::optional<ObjectFormatKind> format,
                           AttributeStorageRequest& out) {
     if (!root.valid()) return;
@@ -8541,20 +8568,28 @@ void scanAttributeStorage(SemanticConfig const& cfg, Tree const& tree, NodeId ro
     collectAttrNodes(cfg, tree, root, attrNodes);
     std::vector<NodeId> clauses;
     for (NodeId an : attrNodes) {
-        // A specifier with no spelling row (the standard `[[ ]]` form) carries no
-        // request this scan reads: its clauses are judged by the attribute fold.
         AttributeSpelling const* const spelling = attributeSpellingOf(cfg, tree, an);
-        if (spelling == nullptr) continue;
+        bool const standardForm = isStandardAttributeSpecifier(cfg, tree, an);
+        if (spelling == nullptr && !standardForm) continue;
         clauses.clear();
         (void)collectAttrClauses(cfg, tree, an, clauses);
         for (NodeId cl : clauses) {
-            NodeId const nameTok = attrClauseNameToken(cfg, tree, cl, spelling);
+            AttributeSpelling const* clauseSpelling = spelling;
+            NodeId nameTok{};
+            if (standardForm) {
+                StandardItemClause const item = standardItemClause(cfg, tree, cl);
+                clauseSpelling = item.spelling;
+                nameTok        = item.name;
+                if (clauseSpelling == nullptr) continue;
+            } else {
+                nameTok = attrClauseNameToken(cfg, tree, cl, spelling);
+            }
             if (!nameTok.valid()) continue;
             AttributeRowLookup const found = attributeRowOfClause(
-                cfg, spelling, stripDunder(tree.text(nameTok)), format);
+                cfg, clauseSpelling, stripDunder(tree.text(nameTok)), format);
             if (found.row == nullptr) continue;
-            auto const it = decl.linkageSpecifiers.find(found.matched);
-            if (it == decl.linkageSpecifiers.end()) continue;
+            auto const it = table.linkageSpecifiers.find(found.matched);
+            if (it == table.linkageSpecifiers.end()) continue;
             LinkageSpecifierEffect const& effect = it->second;
             bool const qualifiedMatch = found.matched.find('(') != std::string::npos;
             if (!qualifiedMatch && !effect.imported) continue;
@@ -8564,6 +8599,11 @@ void scanAttributeStorage(SemanticConfig const& cfg, Tree const& tree, NodeId ro
             }
             if (!effect.threadStorage) continue;
             out.thread = true;
+            if (!out.threadClause.valid()) {
+                out.threadClause = cl;
+                out.threadName   = nameTok;
+                out.threadBy     = it->first;
+            }
             if (!effect.threadStorageYieldsOnMismatch) {
                 out.everyRequestYields = false;
             }
@@ -8578,10 +8618,15 @@ declaratorAttributeStorage(SemanticConfig const& cfg, Tree const& tree,
                            std::optional<ObjectFormatKind> format) {
     AttributeStorageRequest out;
     if (cfg.attributeSpellings.empty()) return out;
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): every position below is read
+    // with the ONE table the row names (`attributeTableOf`); a row that names none (its
+    // declarators never have linkage) reads nothing.
+    DeclarationRule const* const table = attributeTableOf(cfg, decl).table;
+    if (table == nullptr) return out;
     // Most rows key no request by an attribute's name, and for them this must cost
     // one pass over a small map and no tree walk.
     bool keyed = false;
-    for (auto const& [key, effect] : decl.linkageSpecifiers) {
+    for (auto const& [key, effect] : table->linkageSpecifiers) {
         if ((effect.threadStorage && key.find('(') != std::string::npos)
             || effect.imported) {
             keyed = true;
@@ -8589,11 +8634,12 @@ declaratorAttributeStorage(SemanticConfig const& cfg, Tree const& tree,
         }
     }
     if (!keyed) return out;
-    scanAttributeStorage(cfg, tree, specifierPrefixChild(tree, declNode, decl), decl,
+    scanAttributeStorage(cfg, tree, specifierPrefixChild(tree, declNode, decl), *table,
                          format, out);
     for (NodeId run :
          headAttributeRuns(cfg, tree, declarationHeadNode(tree, declNode, decl))) {
-        scanAttributeStorage(cfg, tree, run, decl, format, out);
+        if (isStandardAttributeSpecifier(cfg, tree, run)) continue;   // the type's
+        scanAttributeStorage(cfg, tree, run, *table, format, out);
     }
     for (NodeId slot : visibleChildren(tree, declNode)) {
         if (tree.kind(slot) != NodeKind::Internal) continue;
@@ -8602,14 +8648,15 @@ declaratorAttributeStorage(SemanticConfig const& cfg, Tree const& tree,
             if (sr.appertainsTo == AttrAppertainment::Declaration
                 || (sr.appertainsTo == AttrAppertainment::Declarator
                     && isLastDeclarator)) {
-                scanAttributeStorage(cfg, tree, slot, decl, format, out);
+                scanAttributeStorage(cfg, tree, slot, *table, format, out);
             }
             break;
         }
     }
     if (!dNode.valid() || !cfg.declarators.has_value()) return out;
     for (NodeId an : nameAdjacentAttributeSpecifiers(tree, cfg, dNode)) {
-        scanAttributeStorage(cfg, tree, an, decl, format, out);
+        if (isStandardAttributeSpecifier(cfg, tree, an)) continue;   // the type's
+        scanAttributeStorage(cfg, tree, an, *table, format, out);
     }
     DeclaratorConfig const& dc = *cfg.declarators;
     if (tree.kind(dNode) != NodeKind::Internal) return out;
@@ -8619,7 +8666,7 @@ declaratorAttributeStorage(SemanticConfig const& cfg, Tree const& tree,
             if (tree.rule(c).v != ar.rule.v) continue;
             if (runAppertainmentFor(tree, dc, ar, dNode)
                 == AttrAppertainment::Declarator) {
-                scanAttributeStorage(cfg, tree, c, decl, format, out);
+                scanAttributeStorage(cfg, tree, c, *table, format, out);
             }
             break;
         }
@@ -9092,14 +9139,16 @@ languageModelsAttributeName(SemanticConfig const& cfg, std::string_view name) {
 // everywhere. It is DERIVED from config that already exists rather than from a
 // second opt-in key, so the two tiers cannot drift into both claiming a name or
 // neither claiming it.
+//
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): DERIVED FROM THE ONE ACCESSOR. The
+// linkage tier judges a row's attribute names exactly when the row's OWN fold reads its
+// attribute specifiers (`attributeTableOf` answers `Own`); a row that borrows another's
+// tables has its names judged here, and the lowering passes them over
+// (`linkageFrom`'s reading row) — the same answer, read once.
 [[nodiscard]] bool
 linkageTierJudgesAttributeNames(SemanticConfig const& cfg,
                                 DeclarationRule const& decl) {
-    if (decl.linkageSpecifiers.empty()) return false;
-    if (!cfg.attrSpecRule.valid()) return false;
-    for (RuleId r : decl.linkageSpecifierIgnoredRules)
-        if (r.v == cfg.attrSpecRule.v) return false;
-    return true;
+    return attributeTableOf(cfg, decl).answer == AttributeTableAnswer::Own;
 }
 
 // ★★★ P66
@@ -9189,7 +9238,7 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 d.severity = DiagnosticSeverity::Warning;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(clauseNode);
-                d.actual   = std::string{tree.text(clauseNode)};
+                d.actual   = quotedSourceText(tree.text(clauseNode));
                 s.reporter.report(std::move(d));
             }
             // ★ TF-C73 — THE STRICT UNKNOWN-NAME GATE (work item 3).
@@ -9250,7 +9299,7 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                                     : DiagnosticSeverity::Warning;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(clauseNode);
-                d.actual   = std::string{tree.text(clauseNode)};
+                d.actual   = quotedSourceText(tree.text(clauseNode));
                 s.reporter.report(std::move(d));
             }
             return;
@@ -9619,7 +9668,12 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
         }
         clauses.clear();
         bool const stdForm = collectAttrClauses(cfg, tree, an, clauses);
-        for (NodeId cl : clauses) foldClause(cl, stdForm);
+        // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): an item a spelling CLAIMS
+        // (`[[gnu::X]]`, `standardItemClause`) is that spelling's clause, judged as it
+        // is — so an unknown name is reported by the tier that reads the spelling's
+        // names for this row, once, and never by both.
+        for (NodeId cl : clauses)
+            foldClause(cl, stdForm && standardItemClause(cfg, tree, cl).spelling == nullptr);
     }
 }
 
@@ -9770,9 +9824,15 @@ machineModeType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         TypeId const t = firstTypeOf(mm->floatCore);
         if (!t.valid()) {
-            return refuse(std::format(
-                "mode '{}' is the floating representation {}, and this target's C has "
-                "no type of it", written, typeKindNameOrEmpty(mm->floatCore)));
+            // The representation by its format's own facts (float_format.hpp), never a
+            // core kind's name (P69 fold f26d, ruling 617).
+            FloatFormat const* const ff = floatFormatOf(mm->floatCore);
+            return refuse(ff != nullptr
+                ? std::format("mode '{}' is the {}-bit floating representation of a {}-digit "
+                              "significand, and this target's C has no type of it",
+                              written, storageBits(*ff), ff->precision)
+                : std::format("mode '{}' is a floating representation this target's C has "
+                              "no type of", written));
         }
         return requalify(t);
     }
@@ -10446,7 +10506,7 @@ void judgeAttributeSpecifier(EngineState& s, SemanticConfig const& cfg,
                 // No convention of this target at all: a word its toolchains do
                 // not have, and it takes the path an unknown name takes.
                 reportAt(cl, DiagnosticCode::S_UnknownAttribute,
-                         DiagnosticSeverity::Warning, std::string{tree.text(cl)});
+                         DiagnosticSeverity::Warning, quotedSourceText(tree.text(cl)));
             }
             continue;
         }
@@ -10454,7 +10514,7 @@ void judgeAttributeSpecifier(EngineState& s, SemanticConfig const& cfg,
             if (onATypeUnfolded
                 && (stdForm || !languageModelsAttributeName(cfg, clause->name))) {
                 reportAt(cl, DiagnosticCode::S_UnknownAttribute,
-                         DiagnosticSeverity::Warning, std::string{tree.text(cl)});
+                         DiagnosticSeverity::Warning, quotedSourceText(tree.text(cl)));
             }
             continue;
         }
@@ -10556,7 +10616,7 @@ foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree
         s.reporter.report(std::move(d));
     };
     auto emit = [&](DiagnosticCode code) {
-        emitWith(code, std::string{tree.text(diagNode)});
+        emitWith(code, quotedSourceText(tree.text(diagNode)));
     };
     // The `alignasArg` speculative alt commits EITHER the `alignasTypeName` wrapper
     // (TYPE form) OR a value expression (VALUE form); discriminate by the committed
@@ -10658,7 +10718,7 @@ foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree
                  std::format("{} requests {}-byte alignment, above the {}-byte "
                              "maximum this target declares it can be asked for "
                              "(aggregateLayout.maxRequestedAlignment)",
-                             tree.text(diagNode), uv, declaredMax));
+                             quotedSourceText(tree.text(diagNode)), uv, declaredMax));
         return std::nullopt;
     }
     return static_cast<std::uint32_t>(uv);
@@ -11224,7 +11284,7 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                             : DiagnosticSeverity::Warning;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(cl);
-                d.actual   = std::string{tree.text(cl)};
+                d.actual   = quotedSourceText(tree.text(cl));
                 s.reporter.report(std::move(d));
             } else if (strict && !stdForm && emitDiagnostics
                        && clause->row != nullptr) {
@@ -11305,7 +11365,7 @@ resolveAlignasOverride(EngineState& s, SemanticConfig const& cfg, Tree const& tr
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(specs.empty() ? declNode : specs.front());
-                d.actual   = std::string{tree.text(specs.empty() ? declNode : specs.front())};
+                d.actual   = quotedSourceText(tree.text(specs.empty() ? declNode : specs.front()));
                 s.reporter.report(std::move(d));
                 // Still return the requested override — the layout carrier's
                 // MAX(natural, override) makes a too-weak override a no-op anyway; the
@@ -11799,7 +11859,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 // bound-suffix arms, which this star arm had kept as the bare `[*]`.
                 d.actual   = "an array declarator's unspecified-size `*` is permitted only "
                              "in a function parameter's declaration with prototype scope "
-                             "(C 6.7.6.2p4): `" + std::string{tree.text(suffix)} + "`";
+                             "(C 6.7.6.2p4): `" + quotedSourceText(tree.text(suffix)) + "`";
                 s.reporter.report(std::move(d));
             }
             return InvalidType;
@@ -11815,7 +11875,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 d.span     = tree.span(suffix);
                 d.actual   = "an array's element type cannot be an array of unknown "
                              "size — only the outermost bound of an array may be "
-                             "omitted (C 6.7.6.2p1): `" + std::string{tree.text(suffix)}
+                             "omitted (C 6.7.6.2p1): `" + quotedSourceText(tree.text(suffix))
                              + "`";
                 s.reporter.report(std::move(d));
             }
@@ -11836,7 +11896,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             d.buffer   = tree.source().id();
             d.span     = tree.span(suffix);
             d.actual   = std::string{what} + ": `"
-                         + std::string{tree.text(suffix)} + "`";
+                         + quotedSourceText(tree.text(suffix)) + "`";
             s.reporter.report(std::move(d));
         };
         // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the array-PARAMETER
@@ -12718,7 +12778,7 @@ readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return fail(DiagnosticCode::S_AsmLabelDuplicate,
                     std::format("'{}' — a declarator may carry at most one asm "
                                 "label; which assembler name was intended cannot "
-                                "be inferred", tree.text(dNode)));
+                                "be inferred", quotedSourceText(tree.text(dNode))));
     }
     NodeId payload{};
     for (NodeId c : visibleChildren(tree, labelNode)) {
@@ -12728,7 +12788,7 @@ readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
     if (!payload.valid()) {
         return fail(DiagnosticCode::S_AsmLabelInvalid,
-                    std::string{tree.text(labelNode)});
+                    quotedSourceText(tree.text(labelNode)));
     }
     auto decoded = decodeAdjacentStringBodies(tree, payload,
                                               s.idx().stringLiteralBodyToken);
@@ -12736,7 +12796,7 @@ readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return fail(DiagnosticCode::S_AsmLabelInvalid,
                     std::format("'{}' — the asm label has a malformed escape; the "
                                 "assembler name cannot be decoded",
-                                tree.text(payload)));
+                                quotedSourceText(tree.text(payload))));
     }
     if (decoded->empty()) {
         return fail(DiagnosticCode::S_AsmLabelInvalid,
@@ -12791,7 +12851,7 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(at);
-        d.actual   = what.empty() ? std::string{tree.text(at)} : std::move(what);
+        d.actual   = what.empty() ? quotedSourceText(tree.text(at)) : std::move(what);
         s.reporter.report(std::move(d));
     };
     if (!declTy.valid()) return;   // cascade — the type failure already reported
@@ -12815,7 +12875,7 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
         emit(DiagnosticCode::S_ThreadLocalInvalidCombination, bad,
              std::format("'{}' may not be combined with a thread-storage "
                          "specifier (C 6.7.1p2 admits only 'static' or "
-                         "'extern')", tree.text(bad)));
+                         "'extern')", quotedSourceText(tree.text(bad))));
         return;
     }
     if (rec.isExternDeclaration) return;   // extern satisfies 6.7.1p3
@@ -13406,7 +13466,7 @@ findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tr
                 if (!ops.empty() && calleeIsDefinedHere(ops[0])) {
                     NodeId const id = identifierOf(peel(ops[0]));
                     prove(cur, std::format("calls '{}', a function this translation unit "
-                                           "defines", tree.text(id)));
+                                           "defines", quotedSourceText(tree.text(id))));
                 }
                 continue;
             }
@@ -13573,13 +13633,13 @@ void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree c
                    f.notConstant,
                    std::format("'{}' is not a constant expression: it {} — an initializer of an "
                                "object of static or thread storage duration must be one "
-                               "(C 6.7.9p4)", tree.text(f.notConstant), f.why));
+                               "(C 6.7.9p4)", quotedSourceText(tree.text(f.notConstant)), f.why));
         } else if (f.comma.valid()) {
             report(DiagnosticCode::S_StaticInitializerUsesTheCommaOperator,
                    DiagnosticSeverity::Warning, f.comma,
                    std::format("'{}' uses the comma operator in a static initializer (C 6.6p3 "
                                "names it; the language admits it as a constant)",
-                               tree.text(f.comma)));
+                               quotedSourceText(tree.text(f.comma))));
         }
     };
     NodeId const v = descendInitWrappers(s, tree, initNode);
@@ -13950,9 +14010,18 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(nameNode);
+        // P69 fold f26d (ruling 617 (3)): the later declaration's TYPE, where the language
+        // spells types — gcc names it (MEASURED, probe n507c: "have 'double(void)'"), and a
+        // declaration without a prototype as one (`double ()`). `declaresNoPrototype` is set
+        // by its one sweep after Pass 1.5, before Pass 2, the only walk that reaches a call.
+        std::optional<std::string> const laterSpelled = spelledType(
+            tree.schema().semantics(), in, rec.type,
+            SpellOptions{.declaredWithoutPrototype = rec.declaresNoPrototype});
         d.actual   = std::format("conflicting types for '{}': the call declared it implicitly, "
-                                 "returning '{}', and its later declaration returns another type",
-                                 name, call.implicitDeclarationResult);
+                                 "returning '{}', and its later declaration {}",
+                                 name, call.implicitDeclarationResult,
+                                 laterSpelled ? "has the type '" + *laterSpelled + "'"
+                                              : std::string{"returns another type"});
         related(d, "the later declaration is here");
         s.reporter.report(std::move(d));
     }
@@ -14039,6 +14108,9 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
     for (SymbolId const r : group) {
         SymbolRecord const& rec = s.symbols.at(r);
         if (rec.kind != DeclarationKind::Function) continue;
+        // The C library's prototype of the name, its header included (`prototypeIsTheLibrarys`), is another
+        // tree's declaration: in scope at every call, as any other tree's prototype is.
+        if (rec.prototypeIsTheLibrarys) return false;
         bool const none = rec.isImplicitDeclaration || rec.declaresNoPrototype;
         withoutOne = withoutOne || none;
         if (none) continue;
@@ -14047,6 +14119,59 @@ void recordBlockFunctionDeclaration(EngineState& s, TreeId tree, std::string_vie
         if (visible) return false;   // a prototype is in scope at the call
     }
     return withoutOne;
+}
+
+// ★★ P69 (lane `cs`, fold f26d — main's ledgers 598/599, review-csf26c2 N4): THE ONE ANSWER for a declaration
+// WITHOUT a prototype beside a PROTOTYPE of the function, the unit's own (the redeclaration sweep) or the C
+// library's its header declares (the check against the shipped declaration). C 6.7.6.3p15 makes the pair
+// compatible where the prototype ends in no `...` and each parameter's UNQUALIFIED type is COMPATIBLE with its
+// default argument promotion — the interner's one relation, `compatibleTypes`: an enumerated type is compatible
+// with the integer type it promotes to when that type is its own (C 6.7.2.2p4), and `const int` is its own
+// promotion once unqualified. Either way the prototype is the function's type from there on, and a call that
+// sees it is checked against it. ✔MEASURED (lane `cs` probe rcp, each program built and RUN; gcc 13.3.0,
+// clang 18.1.3, mingw-w64 gcc 13.2.0, Apple clang 21, cl 19.52, each at its default standard and its C23 one):
+// cl builds and runs every pair, the incompatible ones too (`q(const char *, ...)` and `q()`, either order;
+// `extern int printf();` after <stdio.h>, which prints), silent, at both standards; gcc, clang, mingw-w64 gcc
+// and Apple clang build the compatible pair and refuse the incompatible ones at their default standard, and
+// refuse every pair under C23 (`()` is `(void)` there); and EVERY reference refuses a call the prototype in force
+// rejects (`p(1)` after `p()` and `p(int, int)`; `printf()` — cl C2198 "too few arguments for call"). One
+// working reference makes the incompatible pair accepted: it is warned
+// (S_PrototypeIncompatibleWithADeclarationWithoutOne, `warnPrototypeIncompatibleWithoutOne`).
+[[nodiscard]] bool prototypeFitsADeclarationWithoutOne(EngineState& s, SemanticConfig const& cfg, TypeId proto) {
+    auto& in = s.lattice.interner();
+    if (!proto.valid() || in.kind(proto) != TypeKind::FnSig || in.fnIsVariadic(proto)) return false;
+    // A copy: the promotion interns (a pointer, `double`), which would move the storage a span of the parameters
+    // points into.
+    auto const protoParams = in.fnParams(proto);
+    std::vector<TypeId> const params(protoParams.begin(), protoParams.end());
+    for (TypeId const p : params) {
+        TypeId const u = in.stripVolatile(p);
+        if (!compatibleTypes(in, u, defaultArgumentPromotion(s, cfg, u), ArraysCompared::BelowAPointer))
+            return false;
+    }
+    return true;
+}
+
+// The warning of a pair the p15 judgement above finds incompatible, said at the unit's declaration: taken, as cl
+// takes it, with the prototype as the function's type. The other declaration is the unit's own (a related
+// location) or, `theLibrarys`, the one the C library's included header makes (no location of its own).
+void warnPrototypeIncompatibleWithoutOne(EngineState& s, Tree const& at, NodeId declNode, std::string const& name,
+                                         Tree const* otherTree, NodeId otherDecl, bool theLibrarys) {
+    ParseDiagnostic w;
+    w.code     = DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne;
+    w.severity = DiagnosticSeverity::Warning;
+    w.buffer   = at.source().id();
+    w.span     = at.span(declNode);
+    w.actual   = std::format(
+        "'{}' — a prototype whose parameters are not each compatible with their default argument promotions, or "
+        "that ends in `...`, is not compatible with a declaration of it without a prototype (C 6.7.6.3p15){}: "
+        "taken, as cl takes it, with the prototype as its type; gcc and clang refuse it",
+        name, theLibrarys ? " — the prototype is the one the C library's included header declares" : "");
+    if (otherTree != nullptr && otherDecl.valid()) {
+        w.related.push_back(RelatedLocation{otherTree->source().id(), otherTree->span(otherDecl),
+                                            "the other declaration"});
+    }
+    s.reporter.report(std::move(w));
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -14496,7 +14621,7 @@ void checkVariadicMarkerTerminatesParamList(EngineState& s,
     d.severity = DiagnosticSeverity::Error;
     d.buffer   = tree.source().id();
     d.span     = tree.span(marker);
-    d.actual   = std::string{tree.text(marker)};
+    d.actual   = quotedSourceText(tree.text(marker));
     d.related.push_back(RelatedLocation{
         tree.source().id(),
         tree.span(after),
@@ -14655,7 +14780,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(hit);
-                d.actual   = std::string{tree.text(hit)};
+                d.actual   = quotedSourceText(tree.text(hit));
                 s.reporter.report(std::move(d));
             }
 
@@ -14692,8 +14817,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.actual   = std::format(
                     "'{}' and '{}' are both {} specifiers — a declaration may "
                     "carry at most one",
-                    tree.text(facts.conflictFirst),
-                    tree.text(facts.conflictSecond), facts.conflictGroup);
+                    quotedSourceText(tree.text(facts.conflictFirst)),
+                    quotedSourceText(tree.text(facts.conflictSecond)), facts.conflictGroup);
                 s.reporter.report(std::move(d));
             }
 
@@ -14764,7 +14889,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 d.severity = DiagnosticSeverity::Error;
                                 d.buffer   = tree.source().id();
                                 d.span     = tree.span(dNode);
-                                d.actual   = std::string{tree.text(dNode)};
+                                d.actual   = quotedSourceText(tree.text(dNode));
                                 s.reporter.report(std::move(d));
                             }
                             continue;   // abstract — mints nothing
@@ -15199,7 +15324,40 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                     cfg, tree, node, decl, dNode,
                                     dNode.v == declarators.back().v,
                                     objectFormatKindOf(s.activeFormat));
-                            if (byAttribute.thread) {
+                            // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): AN
+                            // AUTOMATIC OBJECT HAS NO THREAD STORAGE TO TAKE. A request an
+                            // attribute clause makes for one (no `static`, no `extern`,
+                            // not an import, in a block) is ignored and said, the object
+                            // keeping its automatic storage. ✔MEASURED (lane `cs` probe
+                            // n5p): `{ __declspec(thread) int x; }`, through a keyword or
+                            // a typedef-named head, a for-init declaration and a C23
+                            // inferred one, is built by mingw-w64 gcc 13.2.0 ("'thread'
+                            // attribute directive ignored") and refused by cl 19.52
+                            // (C2480) and clang-cl; DSS refused it as C 6.7.1's keyword
+                            // constraint, for a keyword nobody wrote.
+                            bool const automaticObject =
+                                !atFileScope && !nonDefiningHere
+                                && !scanSpecifierPrefixStorage(cfg, tree, node, decl)
+                                        .staticStorage;
+                            if (byAttribute.thread && automaticObject) {
+                                if (byAttribute.threadName.valid())
+                                    s.attributeNamesIgnoredForKind.set(
+                                        byAttribute.threadName, true);
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                                d.severity = DiagnosticSeverity::Warning;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(byAttribute.threadClause.valid()
+                                                           ? byAttribute.threadClause
+                                                           : nameNode);
+                                d.actual   = std::format(
+                                    "attribute '{}' is ignored on this declaration and its "
+                                    "effect was discarded: '{}' is an automatic object, and "
+                                    "only an object of static extent can have thread "
+                                    "storage (C 6.7.1p3)",
+                                    byAttribute.threadBy, quotedSourceText(tree.text(nameNode)));
+                                s.reporter.report(std::move(d));
+                            } else if (byAttribute.thread) {
                                 rec.isThreadLocal = true;
                                 rec.threadStorageYieldsOnMismatch =
                                     byAttribute.everyRequestYields;
@@ -16436,7 +16594,7 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
         d.span     = tree.span(initNode);
         d.actual   = "an array of unknown size needs an initializer that "
                      "determines a POSITIVE length (C 6.7.9p22): `"
-                     + std::string{tree.text(initNode)} + "`";
+                     + quotedSourceText(tree.text(initNode)) + "`";
         s.reporter.report(std::move(d));
         return InvalidType;
     };
@@ -16450,7 +16608,7 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
         d.span     = tree.span(initNode);
         d.actual   = "an array of unknown size takes its length from a string literal or a "
                      "brace list (C 6.7.9p14, p16, p22), and this initializer is neither: `"
-                     + std::string{tree.text(initNode)} + "`";
+                     + quotedSourceText(tree.text(initNode)) + "`";
         s.reporter.report(std::move(d));
         return InvalidType;
     };
@@ -16802,10 +16960,16 @@ void checkBraceInitializerElements(EngineState& s, SemanticConfig const& cfg,
         d.buffer   = tree.source().id();
         d.span     = tree.span(value);
         d.actual   = std::format(
-            "`{}` is {}, and what this brace element initializes is {}: an element that "
+            "`{}` is {}, and what this brace element initializes is {}{}: an element that "
             "initializes a scalar takes the type constraints of simple assignment (C 6.7.9p11), "
             "as the initializer of a scalar declaration does",
-            tree.text(value), category(vt), category(slot));
+            quotedSourceText(tree.text(value)), category(vt), category(slot),
+            [&]() -> std::string {
+                std::optional<std::string> const v = spelledType(cfg, interner, vt);
+                std::optional<std::string> const t = spelledType(cfg, interner, slot);
+                return v && t ? " (an element of type '" + *v + "' for a slot of type '" + *t + "')"
+                              : std::string{};
+            }());
         s.reporter.report(std::move(d));
     };
     // C 6.7.9p6-p7: a designator names a subobject of an array, a structure or a union.
@@ -16818,7 +16982,7 @@ void checkBraceInitializerElements(EngineState& s, SemanticConfig const& cfg,
         d.actual   = std::format(
             "`{}` designates a subobject of what it initializes, and that is a scalar: a "
             "designator names a member of a structure or a union, or an element of an array "
-            "(C 6.7.9p6-p7)", tree.text(element));
+            "(C 6.7.9p6-p7)", quotedSourceText(tree.text(element)));
         s.reporter.report(std::move(d));
     };
     forEachPlacedBraceValue(s, tree, braceList, object, scope, judge, refuseScalarDesignator);
@@ -17001,7 +17165,7 @@ judgeCompoundLiteral(EngineState& s, SemanticConfig const& cfg, Tree const& tree
             report(DiagnosticCode::S_ConflictingStorageClassSpecifiers, sf.conflictSecond,
                    std::format("'{}' and '{}' are both {} specifiers — a compound literal, like "
                                "the definition it stands for, may carry at most one",
-                               tree.text(sf.conflictFirst), tree.text(sf.conflictSecond),
+                               quotedSourceText(tree.text(sf.conflictFirst)), quotedSourceText(tree.text(sf.conflictSecond)),
                                sf.conflictGroup));
         }
         f.addressNotTakeable = sf.addressNotTakeable;
@@ -17024,7 +17188,7 @@ judgeCompoundLiteral(EngineState& s, SemanticConfig const& cfg, Tree const& tree
                 report(DiagnosticCode::S_ThreadLocalInvalidCombination, incompatible,
                        std::format("'{}' may not be combined with a thread-storage specifier "
                                    "(C 6.7.1p2 admits only 'static' or 'extern')",
-                                   tree.text(incompatible)));
+                                   quotedSourceText(tree.text(incompatible))));
             } else if (blockScope && !sf.staticStorage) {
                 // C 6.7.1p3, asked of the block-scope definition the literal stands for.
                 report(DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern, specs,
@@ -17385,8 +17549,8 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         d.actual   = std::move(what);
         s.reporter.report(std::move(d));
     };
-    auto const snippet = [&](NodeId at) {
-        return std::string{tree.text(at.valid() ? at : node)};
+    auto const snippet = [&](NodeId at) {   // a declarator, quoted for a message
+        return quotedSourceText(tree.text(at.valid() ? at : node));
     };
 
     // (1) ★C1 — the required-specifier presence gate. A bounded descendant
@@ -17694,8 +17858,9 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
     // types are the SAME id and a structural walk would be a second, driftable
     // answer to a question the interner already answers.
     TypeInterner& types = s.lattice.interner();
-    // The user-facing spelling of a deduced type, in THE LANGUAGE'S OWN WORDS.
-    // Three tiers, none of them a language-name branch:
+    // ⓘ P69 fold f26d (ruling 617): the deduced types are spelled by the ONE renderer
+    // (`spelledType`, the language document's table). This file used to carry its own
+    // lambda here, whose note follows, kept for the record of why it went:
     //   1. the interner's vocabulary tag when the type carries one (a named
     //      primitive; `vocabularyName` sees THROUGH a qualifier skin, so
     //      `volatile long` reads `long`);
@@ -17719,35 +17884,24 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
     // are also what every parser refusal in this compiler already prints
     // (`expected 'EndStatement' … got '('`), so this stays inside the existing
     // convention rather than inventing a second one from a heuristic.
-    auto const typeText = [&](TypeId t) {
-        auto render = [&](TypeId ty, auto&& self, int depth) -> std::string {
-            if (!ty.valid()) return std::string{"<unresolved type>"};
-            if (std::string_view const v = types.vocabularyName(ty); !v.empty())
-                return std::string{v};
-            TypeKind const k = types.kind(ty);
-            if (depth < 8 && k == TypeKind::Ptr) {
-                auto const ops = types.operands(ty);
-                if (!ops.empty() && ops[0].valid())
-                    return self(ops[0], self, depth + 1) + " *";
-            }
-            if (std::string_view const kn = typeKindNameOrEmpty(k); !kn.empty())
-                return std::string{kn};
-            return std::string{"<unnamed type>"};
-        };
-        return render(t, render, 0);
-    };
     TypeId const shared = inferOneDeclarator(declarators[0]);
     if (!shared.valid()) return InvalidType;   // the ladder already emitted
     for (std::size_t i = 1; i < declarators.size(); ++i) {
         TypeId const t = inferOneDeclarator(declarators[i]);
         if (!t.valid()) return InvalidType;    // the ladder already emitted
         if (t.v == shared.v) continue;
+        std::optional<std::string> const sharedSpelled = spelledType(cfg, types, shared);
+        std::optional<std::string> const thisSpelled = spelledType(cfg, types, t);
         emit(DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes,
              declarators[i],
-             "initializer-inferred declaration deduces '" + typeText(shared)
-                 + "' for '" + snippet(declarators[0]) + "' and '" + typeText(t)
-                 + "' for '" + snippet(declarators[i])
-                 + "' — every declarator of ONE inferred declaration shares ONE "
+             (sharedSpelled && thisSpelled
+                  ? "initializer-inferred declaration deduces '" + *sharedSpelled
+                        + "' for '" + snippet(declarators[0]) + "' and '" + *thisSpelled
+                        + "' for '" + snippet(declarators[i]) + "'"
+                  : "initializer-inferred declaration deduces one type for '"
+                        + snippet(declarators[0]) + "' and another for '"
+                        + snippet(declarators[i]) + "'")
+                 + " — every declarator of ONE inferred declaration shares ONE "
                    "deduced type (C23 6.7.10 fn.164)");
         return InvalidType;
     }
@@ -17764,6 +17918,170 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
 // `return;` did. The body is byte-identical to the prior post-child portion of
 // resolveDeclTypes; it reads only `here`/`node`/`s`/`cfg`/`tree` (never the
 // pre-part's `current`, which the recursion consumed ONLY to derive `here`).
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): THE ONE JUDGEMENT OF A DECLARATION'S ATTRIBUTE CLAUSES BY
+// WHAT IT DECLARES — the declaration-kind gate (TF-C93: a clause whose row applies to other kinds of declaration is
+// ignored there and said) and the no-linkage gate (a linkage attribute on a declarator without linkage is refused by
+// name or ignored and said). `kind` is the declaration's effective kind, `attrFacts` its folded clauses, `dNode` the
+// declarator (the declaration for a name-mode row), `declKindAttrReported` the clauses the kind gate has said for
+// this declaration. Asked by every declarator a declaration row binds and by every enumerator an enumeration
+// composes: an enumerator's clauses once reached neither gate (✔MEASURED, run n2a: `enum E { A
+// __attribute__((weak)) = 1 };` built in silence, where every reference warns it ignored).
+void judgeDeclarationAttributeClauses(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                                      DeclarationRule const& decl, NodeId dNode, NodeId nameNode, SymbolId sym,
+                                      DeclarationKind kind, bool isFnPointerObject,
+                                      AttributeSemanticsFacts const& attrFacts,
+                                      std::vector<decltype(NodeId{}.v)>& declKindAttrReported) {
+    for (auto const& ksc : attrFacts.kindScopedClauses) {
+        if (ksc.row == nullptr) continue;
+        if (ksc.row->appliesTo.empty()) continue;
+        DeclarationKind const eff =
+            kind;
+        if (std::ranges::any_of(
+                ksc.row->appliesTo,
+                [&](AttributeAppliesKind ak) {
+                    return declarationSatisfiesAppliesKind(
+                        ak, eff, isFnPointerObject);
+                })) continue;
+        // P69 (lane `cs`): THE GATE'S VERDICT IS A FACT OF THE
+        // MODEL, not only a diagnostic. "Its effect was
+        // discarded" has to be true of every effect the name
+        // has, and one of them is not this tier's to discard:
+        // a name of the LINKAGE vocabulary (`selectany`,
+        // `weak`, `visibility`) is applied by the CST→HIR
+        // linkage fold, which reads the same tokens again and
+        // knows nothing of the kind axis. Recorded BEFORE the
+        // once-per-clause dedup and independent of what the
+        // reporter stores, so a suppressed or repeated warning
+        // cannot leave the effect applied
+        // (`SemanticModel::attributeNameIgnoredForKind`).
+        if (ksc.nameToken.valid())
+            s.attributeNamesIgnoredForKind.set(ksc.nameToken,
+                                               true);
+        if (std::ranges::find(declKindAttrReported,
+                              ksc.clauseNode.v)
+            != declKindAttrReported.end()) continue;
+        declKindAttrReported.push_back(ksc.clauseNode.v);
+        std::string allowed;
+        for (AttributeAppliesKind ak : ksc.row->appliesTo) {
+            if (!allowed.empty()) allowed += ", ";
+            allowed += attributeAppliesKindName(ak);
+        }
+        ParseDiagnostic d;
+        d.code = DiagnosticCode::
+            S_AttributeIgnoredForDeclarationKind;
+        d.severity = DiagnosticSeverity::Warning;
+        d.buffer   = tree.source().id();
+        // Underline the CLAUSE the programmer wrote when it is
+        // available (that is the text to fix); fall back to the
+        // declared name, then to the declaration, so the
+        // diagnostic always has a position.
+        d.span     = tree.span(
+            ksc.clauseNode.valid() ? ksc.clauseNode
+            : nameNode.valid()     ? nameNode
+                                   : node);
+        d.actual   = std::format(
+            "attribute '{}' is ignored on this declaration and "
+            "its effect was discarded: the declaration declares "
+            "a {}, and this language declares the attribute "
+            "applicable to {} only",
+            ksc.name, declarationKindName(eff), allowed);
+        s.reporter.report(std::move(d));
+    }
+    // ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): A LINKAGE
+    // ATTRIBUTE ON A DECLARATOR WITHOUT LINKAGE IS REFUSED BY NAME OR
+    // IGNORED AND SAID — NEVER SILENT, AND NEVER BY A SECOND TIER.
+    // Two declarators have no linkage (C 6.2.2p6): one of a row that
+    // NEVER has any (`"linkage": "none"` — a member, a parameter, a
+    // typedef name), where every attribute a linkage table keys is
+    // ignored there and said; and an OBJECT declared in a block
+    // without `extern` (automatic or `static`, a for-init
+    // declaration, a C23 inferred one, through any head), where an
+    // attribute deciding a binding or a visibility takes its row's
+    // verdict: refused by name where the row says so on this object
+    // format (`refusedWithoutLinkage[On]`), else ignored and said.
+    // The name token is marked, so the lowering's linkage fold
+    // confers nothing from it. ✔MEASURED (lane `cs` probes n5p, wb3,
+    // wb4; gcc 13.3.0, clang 18.1.3, Apple clang 21, clang-cl,
+    // mingw-w64 gcc 13.2.0, cl 19.52): on a member, a parameter, an
+    // enumerator and a typedef name NO linkage attribute is refused
+    // by every reference (`weak` is warned ignored everywhere); on a
+    // block object `weak` is refused everywhere ("weak declaration of
+    // 'x' must be public"), `selectany` everywhere but on gcc ELF,
+    // which has no such attribute and builds it ("directive
+    // ignored"), and a visibility is built everywhere (gcc and
+    // mingw-w64 gcc warn it ignored, clang is silent). DSS built the
+    // first class in silence and refused `selectany` on ELF in the
+    // lowering, for every format alike.
+    {
+        AttributeTableAnswer const answer = attributeTableOf(cfg, decl).answer;
+        bool const neverLinked = answer == AttributeTableAnswer::NoLinkage;
+        bool objectWithoutLinkage = false;
+        if (!neverLinked
+            && kind == DeclarationKind::Variable) {
+            ScopeId const at = s.symbols.at(sym).scope;
+            bool const inBlock =
+                at.valid() && at.v != fileScopeOf(s, tree, at).v;
+            objectWithoutLinkage =
+                inBlock
+                && !declarationIsNonDefining(
+                    cfg, tree, node, decl, dNode, /*atFileScope=*/false,
+                    objectFormatKindOf(s.activeFormat));
+        }
+        for (auto const& ksc : attrFacts.kindScopedClauses) {
+            if (!neverLinked && !objectWithoutLinkage) break;
+            if (ksc.row == nullptr) continue;
+            AttributeLinkageFacets const facets =
+                linkageFacetsOfAttribute(cfg, *ksc.row);
+            if (neverLinked ? !facets.keyed : !facets.linkage) continue;
+            if (ksc.nameToken.valid()) {
+                bool const* ignored =
+                    s.attributeNamesIgnoredForKind.tryGet(ksc.nameToken);
+                if (ignored != nullptr && *ignored) continue;
+                s.attributeNamesIgnoredForKind.set(ksc.nameToken, true);
+            }
+            std::uint64_t const key =
+                (static_cast<std::uint64_t>(tree.id().v) << 32)
+                | ksc.clauseNode.v;
+            if (!s.attributeClausesReported.insert(key).second) continue;
+            bool const refused =
+                objectWithoutLinkage
+                && !ksc.row->refusedWithoutLinkage.empty()
+                && (ksc.row->refusedWithoutLinkageOn.empty()
+                    || objectFormatListAdmits(
+                        ksc.row->refusedWithoutLinkageOn,
+                        objectFormatKindOf(s.activeFormat)));
+            ParseDiagnostic d;
+            d.code     = refused
+                ? DiagnosticCode::S_AttributeNotHonoured
+                : DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+            d.severity = refused ? DiagnosticSeverity::Error
+                                 : DiagnosticSeverity::Warning;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(ksc.clauseNode.valid() ? ksc.clauseNode
+                                   : nameNode.valid()     ? nameNode
+                                                          : node);
+            std::string const why = neverLinked
+                ? std::format("the declaration declares a {} that never "
+                              "has linkage (C 6.2.2p6)",
+                              declarationKindName(kind))
+                : std::format("'{}' is declared in a block without "
+                              "'extern', so it has no linkage (C 6.2.2p6)",
+                              quotedSourceText(tree.text(nameNode)));
+            d.actual   = refused
+                ? std::format("attribute '{}' on '{}' cannot be honoured: "
+                              "{}, and {}",
+                              ksc.name, quotedSourceText(tree.text(nameNode)), why,
+                              ksc.row->refusedWithoutLinkage)
+                : std::format("attribute '{}' is ignored on this "
+                              "declaration and its effect was "
+                              "discarded: {}, and the attribute decides "
+                              "only what a name with linkage is",
+                              ksc.name, why);
+            s.reporter.report(std::move(d));
+        }
+    }
+}
+
 void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                           NodeId node, ScopeId here) {
     if (tree.kind(node) == NodeKind::Internal) {
@@ -18613,7 +18931,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 d.severity = DiagnosticSeverity::Error;
                                 d.buffer   = tree.source().id();
                                 d.span     = tree.span(nameNode);
-                                d.actual   = std::string{tree.text(nameNode)};
+                                d.actual   = quotedSourceText(tree.text(nameNode));
                                 s.reporter.report(std::move(d));
                             }
                         }
@@ -19267,62 +19585,9 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         bool const isFnPointerObject =
                             declTy.valid()
                             && isFnPointerType(s.lattice.interner(), declTy);
-                        for (auto const& ksc : attrFacts.kindScopedClauses) {
-                            if (ksc.row == nullptr) continue;
-                            if (ksc.row->appliesTo.empty()) continue;
-                            DeclarationKind const eff =
-                                effectiveDeclarationKind();
-                            if (std::ranges::any_of(
-                                    ksc.row->appliesTo,
-                                    [&](AttributeAppliesKind ak) {
-                                        return declarationSatisfiesAppliesKind(
-                                            ak, eff, isFnPointerObject);
-                                    })) continue;
-                            // P69 (lane `cs`): THE GATE'S VERDICT IS A FACT OF THE
-                            // MODEL, not only a diagnostic. "Its effect was
-                            // discarded" has to be true of every effect the name
-                            // has, and one of them is not this tier's to discard:
-                            // a name of the LINKAGE vocabulary (`selectany`,
-                            // `weak`, `visibility`) is applied by the CST→HIR
-                            // linkage fold, which reads the same tokens again and
-                            // knows nothing of the kind axis. Recorded BEFORE the
-                            // once-per-clause dedup and independent of what the
-                            // reporter stores, so a suppressed or repeated warning
-                            // cannot leave the effect applied
-                            // (`SemanticModel::attributeNameIgnoredForKind`).
-                            if (ksc.nameToken.valid())
-                                s.attributeNamesIgnoredForKind.set(ksc.nameToken,
-                                                                   true);
-                            if (std::ranges::find(declKindAttrReported,
-                                                  ksc.clauseNode.v)
-                                != declKindAttrReported.end()) continue;
-                            declKindAttrReported.push_back(ksc.clauseNode.v);
-                            std::string allowed;
-                            for (AttributeAppliesKind ak : ksc.row->appliesTo) {
-                                if (!allowed.empty()) allowed += ", ";
-                                allowed += attributeAppliesKindName(ak);
-                            }
-                            ParseDiagnostic d;
-                            d.code = DiagnosticCode::
-                                S_AttributeIgnoredForDeclarationKind;
-                            d.severity = DiagnosticSeverity::Warning;
-                            d.buffer   = tree.source().id();
-                            // Underline the CLAUSE the programmer wrote when it is
-                            // available (that is the text to fix); fall back to the
-                            // declared name, then to the declaration, so the
-                            // diagnostic always has a position.
-                            d.span     = tree.span(
-                                ksc.clauseNode.valid() ? ksc.clauseNode
-                                : nameNode.valid()     ? nameNode
-                                                       : node);
-                            d.actual   = std::format(
-                                "attribute '{}' is ignored on this declaration and "
-                                "its effect was discarded: the declaration declares "
-                                "a {}, and this language declares the attribute "
-                                "applicable to {} only",
-                                ksc.name, declarationKindName(eff), allowed);
-                            s.reporter.report(std::move(d));
-                        }
+                        judgeDeclarationAttributeClauses(s, cfg, tree, node, decl, dNode, nameNode, sym,
+                                                         effectiveDeclarationKind(), isFnPointerObject,
+                                                         attrFacts, declKindAttrReported);
                         // ★★ P69 (lane `cs`, fold f26b) — AN ATTRIBUTE A DEFINITION CANNOT
                         // CARRY (`refusedOnDefinition`, the row's own reason). The kind
                         // gate above kept the clause; this declarator DEFINES what it
@@ -19385,7 +19650,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         "attribute '{}' is ignored on this declaration and its "
                                         "effect was discarded: '{}' is an inline definition, "
                                         "and {}",
-                                        ksc.name, tree.text(nameNode),
+                                        ksc.name, quotedSourceText(tree.text(nameNode)),
                                         ksc.row->ignoredOnInlineDefinition);
                                     s.reporter.report(std::move(w));
                                     continue;
@@ -19400,7 +19665,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 d.actual   = std::format(
                                     "attribute '{}' on '{}' cannot be honoured: this "
                                     "declaration defines '{}', and {}",
-                                    ksc.name, tree.text(nameNode), tree.text(nameNode),
+                                    ksc.name, quotedSourceText(tree.text(nameNode)), quotedSourceText(tree.text(nameNode)),
                                     ksc.row->refusedOnDefinition);
                                 s.reporter.report(std::move(d));
                             }
@@ -19450,7 +19715,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 d.actual   = std::format(
                                     "attribute '{}' is ignored on this declaration and its "
                                     "effect was discarded: '{}' is an alias, and {}",
-                                    ksc.name, tree.text(nameNode), ksc.row->ignoredOnAlias);
+                                    ksc.name, quotedSourceText(tree.text(nameNode)), ksc.row->ignoredOnAlias);
                                 s.reporter.report(std::move(d));
                             }
                         }
@@ -20250,7 +20515,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     "an unspecified-size `[*]` array parameter is "
                                     "permitted only where the function declarator is "
                                     "not part of a definition (C 6.7.6.3p12): `"
-                                    + std::string{tree.text(starSuffix)} + "`";
+                                    + quotedSourceText(tree.text(starSuffix)) + "`";
                                 s.reporter.report(std::move(d));
                             }
                             // ★★ C 6.9.1p3 AND C 6.7.6.3p4 (P68 round 8, lane `ht`, part
@@ -20290,9 +20555,9 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     d.span     = tree.span(nameNode);
                                     d.actual   =
                                         "the return type of a function definition must "
-                                        "be void or a complete object type (C 6.9.1p3) — '"
-                                        + compositeSpelling(ti, ret)
-                                        + "' is incomplete here";
+                                        "be void or a complete object type (C 6.9.1p3) — "
+                                        + quotedTypeOr(cfg, ti, ret, "its result type")
+                                        + " is incomplete here";
                                     s.reporter.report(std::move(d));
                                 }
                                 NodeId const ownSuffix = declaratorFnSuffixNode(
@@ -20323,7 +20588,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         d.buffer   = tree.source().id();
                                         d.span     = tree.span(pNode);
                                         d.actual   = std::move(what) + ": `"
-                                            + std::string{tree.text(pNode)} + "`";
+                                            + quotedSourceText(tree.text(pNode)) + "`";
                                         s.reporter.report(std::move(d));
                                     };
                                     if (ti.kind(pTy) == TypeKind::Void) {
@@ -20363,9 +20628,9 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         refuseParam(
                                             DiagnosticCode::S_IncompleteTypeObject,
                                             "a parameter of a function definition must "
-                                            "have a complete type (C 6.7.6.3p4) — '"
-                                                + compositeSpelling(ti, pTy)
-                                                + "' is incomplete here");
+                                            "have a complete type (C 6.7.6.3p4) — "
+                                                + quotedTypeOr(cfg, ti, pTy, "its type")
+                                                + " is incomplete here");
                                     }
                                 }
                             }
@@ -20777,7 +21042,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 d.severity = DiagnosticSeverity::Error;
                                 d.buffer   = tree.source().id();
                                 d.span     = tree.span(node);
-                                d.actual   = std::string{tree.text(node)};
+                                d.actual   = quotedSourceText(tree.text(node));
                                 s.reporter.report(std::move(d));
                             }
                         }
@@ -21259,7 +21524,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             d.severity = DiagnosticSeverity::Error;
                                             d.buffer   = tree.source().id();
                                             d.span     = tree.span(fn);
-                                            d.actual   = std::string{tree.text(fn)};
+                                            d.actual   = quotedSourceText(tree.text(fn));
                                             s.reporter.report(std::move(d));
                                         };
                                         if (in.isIncompleteComposite(ft)) {
@@ -21638,6 +21903,23 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             SymbolRecord& erec =
                                                 s.symbols.at(eSymId);
                                             erec.type = compositeTy;
+                                            // ★ P69 (fold f26d, N5): the enumerator's attribute clauses are judged
+                                            // by the one judgement of a declaration's clauses, as every
+                                            // declarator's are -- an enumeration constant never has linkage
+                                            // (C 6.2.2p6), so a linkage attribute on it is ignored and said.
+                                            if (auto const ed = s.idx().declByRule.find(tree.rule(erec.declRuleNode).v);
+                                                ed != s.idx().declByRule.end()) {
+                                                DeclarationRule const& edecl = cfg.declarations[ed->second];
+                                                AttributeSemanticsFacts eFacts;
+                                                foldDeclarationAttributeRoots(s, cfg, tree, erec.declRuleNode, edecl,
+                                                                              erec.scope, /*emitUnknown=*/true,
+                                                                              eFacts);
+                                                std::vector<decltype(NodeId{}.v)> eSaid;
+                                                judgeDeclarationAttributeClauses(
+                                                    s, cfg, tree, erec.declRuleNode, edecl, erec.declRuleNode,
+                                                    NodeId{}, eSymId, erec.kind, /*isFnPointerObject=*/false, eFacts,
+                                                    eSaid);
+                                            }
                                             // Optional `= expr`: pass through
                                             // the shared CST const-eval engine
                                             // (plan 12.5 §0.2 D6). Folds
@@ -22143,7 +22425,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             d.severity = DiagnosticSeverity::Error;
                             d.buffer   = tree.source().id();
                             d.span     = tree.span(node);
-                            d.actual   = std::string{tree.text(node)};
+                            d.actual   = quotedSourceText(tree.text(node));
                             s.reporter.report(std::move(d));
                         }
                     }
@@ -22323,7 +22605,7 @@ void reportAbiTypedefUndeclared(EngineState& s, Tree const& tree, NodeId owningN
         "the literal {} takes its type from the platform ABI typedef '{}', and target "
         "'{}' declares no '{}' for object format '{}' (its `abiTypedefs` table) — "
         "on this pair the literal has no type",
-        tree.text(owningNode), typedefName,
+        quotedSourceText(tree.text(owningNode)), typedefName,
         s.target != nullptr ? std::string{s.target->name()} : std::string{"<none>"},
         typedefName,
         s.activeFormat.has_value()
@@ -22580,7 +22862,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                     d.actual   = std::format(
                         "'{}' is a long double literal, not realized on this "
                         "object format: the format declares no "
-                        "longDoubleFormat axis", tree.text(node));
+                        "longDoubleFormat axis", quotedSourceText(tree.text(node)));
                     s.reporter.report(std::move(d));
                     return;
                 }
@@ -22628,7 +22910,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                     d.span     = tree.span(node);
                     d.actual   = std::format(
                         "floating constant '{}' exceeds the range of '{}' and "
-                        "rounds to infinity", tree.text(node),
+                        "rounds to infinity", quotedSourceText(tree.text(node)),
                         fk.typeName.empty() ? std::string_view{"this floating type"}
                                             : fk.typeName);
                     s.reporter.report(std::move(d));
@@ -22742,7 +23024,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(node);
-                d.actual   = std::string{tree.text(node)};
+                d.actual   = quotedSourceText(tree.text(node));
                 s.reporter.report(std::move(d));
             } else {
                 TypeKind const core = coreInfo.core;
@@ -22854,8 +23136,9 @@ renderFoldedValue(HirLiteralValue const& v) {
     return std::nullopt;
 }
 
-// A node's source text, made SAFE TO PUT IN A MESSAGE: whitespace runs collapse
-// to one space and the result is capped.
+// A node's source text, made SAFE TO PUT IN A MESSAGE: the one rendering every
+// diagnostic quote takes (`quotedSourceText`, core/types/diagnostic_quote.hpp — one
+// line, cut past the configuration's limit), in backticks.
 //
 // ⚠ THE CAP IS NOT TIDINESS. A composite node's span can cover unrelated bytes
 // when its tokens were spelled in different macro replacement lists, and an
@@ -22865,18 +23148,7 @@ renderFoldedValue(HirLiteralValue const& v) {
 // repair a wrong span (see [[D-PP-DIAGNOSTIC-ATTRIBUTED-TO-BUILTIN-PROLOGUE]]),
 // but it can stop one wrong span from burying every other diagnostic in the run.
 [[nodiscard]] std::string operandSpelling(Tree const& tree, NodeId n) {
-    constexpr std::size_t kMaxChars = 48;
-    std::string_view const raw = tree.text(n);
-    std::string out;
-    bool pendingSpace = false;
-    for (char const c : raw) {
-        bool const ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r'
-                         || c == '\f' || c == '\v');
-        if (ws) { pendingSpace = !out.empty(); continue; }
-        if (pendingSpace) { out.push_back(' '); pendingSpace = false; }
-        if (out.size() >= kMaxChars) { out += "..."; break; }
-        out.push_back(c);
-    }
+    std::string const out = quotedSourceText(tree.text(n));
     if (out.empty()) return "<no source text>";
     return "`" + out + "`";
 }
@@ -23114,7 +23386,7 @@ void reportDiagnosedClass(EngineState& s, Tree const& tree, NodeId at,
     d.severity   = DiagnosticSeverity::Warning;
     d.buffer     = tree.source().id();
     d.span       = tree.span(at);
-    d.actual     = diagnosedConversionSentence(cls, site, tree.text(at));
+    d.actual     = diagnosedConversionSentence(cls, site, quotedSourceText(tree.text(at)));
     d.suggestion = "cast the operand explicitly if the conversion is intended";
     s.reporter.report(std::move(d));
 }
@@ -23170,7 +23442,7 @@ reportQualifierIncompatiblePointer(EngineState& s, SemanticConfig const& cfg,
     d.severity = DiagnosticSeverity::Error;
     d.buffer   = tree.source().id();
     d.span     = tree.span(sourceNode);
-    d.actual   = std::string{tree.text(sourceNode)};
+    d.actual   = quotedSourceText(tree.text(sourceNode));
     s.reporter.report(std::move(d));
     return true;
 }
@@ -23636,10 +23908,10 @@ void reportWriteToConstLvalue(EngineState& s, SemanticConfig const& cfg,
     d.buffer   = tree.source().id();
     d.span     = tree.span(lvalueNode);
     d.actual   = increment
-        ? "increment or decrement of `" + std::string{tree.text(lvalueNode)}
+        ? "increment or decrement of `" + quotedSourceText(tree.text(lvalueNode))
               + "`, which designates a const-qualified object — C 6.5.2.4p1 / "
                 "6.5.3.1p1 require a MODIFIABLE lvalue as the operand"
-        : "assignment to `" + std::string{tree.text(lvalueNode)}
+        : "assignment to `" + quotedSourceText(tree.text(lvalueNode))
               + "`, which designates a const-qualified object — C 6.5.16.1 "
                 "requires a MODIFIABLE lvalue as the left operand";
     s.reporter.report(std::move(d));
@@ -23920,7 +24192,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(at);
-                d.actual   = std::string{tree.text(at)};
+                d.actual   = quotedSourceText(tree.text(at));
                 s.reporter.report(std::move(d));
             };
 
@@ -24001,7 +24273,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // context catches it. The text carries what the code cannot.
                 d.actual   = "an expression of type `void` has no value to use "
                              "(C 6.3.2.2) — it is admissible only where the value "
-                             "is discarded: " + std::string{tree.text(at)};
+                             "is discarded: " + quotedSourceText(tree.text(at));
                 s.reporter.report(std::move(d));
             };
             if (isBin) {
@@ -24440,7 +24712,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         d.severity = DiagnosticSeverity::Error;
                         d.buffer   = tree.source().id();
                         d.span     = tree.span(node);
-                        d.actual   = std::string{tree.text(node)};
+                        d.actual   = quotedSourceText(tree.text(node));
                         s.reporter.report(std::move(d));
                     }
                 }
@@ -24487,13 +24759,13 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     "`sizeof` of an array of unknown size is {} — MSVC's extension "
                     "(warning C4034); ISO C makes it a constraint violation "
                     "(6.5.3.4p1): `{}`",
-                    *cfg.sizeofIncompleteArraySize, tree.text(node));
+                    *cfg.sizeofIncompleteArraySize, quotedSourceText(tree.text(node)));
             } else {
                 d.code     = DiagnosticCode::S_SizeofIncompleteType;
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = std::format(
                     "`sizeof` of an incomplete type, which has no size "
-                    "(C 6.5.3.4p1): `{}`", tree.text(node));
+                    "(C 6.5.3.4p1): `{}`", quotedSourceText(tree.text(node)));
             }
             s.reporter.report(std::move(d));
         };
@@ -24696,7 +24968,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(apNode);
-                d.actual   = std::string{tree.text(apNode)};
+                d.actual   = quotedSourceText(tree.text(apNode));
                 s.reporter.report(std::move(d));
             };
             if (cfg.vaArgRule.valid() && rule.v == cfg.vaArgRule.v) {
@@ -25190,7 +25462,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             d.severity = DiagnosticSeverity::Error;
                             d.buffer   = tree.source().id();
                             d.span     = tree.span(initNode);
-                            d.actual   = std::string{tree.text(initNode)};
+                            d.actual   = quotedSourceText(tree.text(initNode));
                             s.reporter.report(std::move(d));
                         }
                         // P69 (lane `cs`, D-C-A-INCOMPATIBLE-BRACE-ELEMENT-IS-REFUSED-BY-AN-INTERNAL-VERIFIER-FAILURE):
@@ -25261,7 +25533,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             d.severity = DiagnosticSeverity::Error;
                             d.buffer   = tree.source().id();
                             d.span     = tree.span(initNode);
-                            d.actual   = std::string{tree.text(initNode)};
+                            d.actual   = quotedSourceText(tree.text(initNode));
                             s.reporter.report(std::move(d));
                         }
                     }
@@ -25382,7 +25654,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             d.severity = DiagnosticSeverity::Error;
                             d.buffer   = tree.source().id();
                             d.span     = tree.span(rhsN);
-                            d.actual   = std::string{tree.text(rhsN)};
+                            d.actual   = quotedSourceText(tree.text(rhsN));
                             s.reporter.report(std::move(d));
                         }
                     }
@@ -25480,13 +25752,13 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             || admitsNullPointerConstant(s, tree, pointerSide, n,
                                                          ptrRulesT, here, cfg);
                     };
-                NodeId ptrN{}, intN{};
+                NodeId intN{};
                 TypeId ptrT{};
                 if (pointerArm(thenT) && integerArm(elseT)) {
-                    ptrN = arms[1]; intN = arms[2];
+                    intN = arms[2];
                     ptrT = arrayToPointerDecay(in, thenT);
                 } else if (pointerArm(elseT) && integerArm(thenT)) {
-                    ptrN = arms[2]; intN = arms[1];
+                    intN = arms[1];
                     ptrT = arrayToPointerDecay(in, elseT);
                 }
                 if (intN.valid() && !nullConstantArm(intN, ptrT)) {
@@ -25495,13 +25767,30 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     d.severity = DiagnosticSeverity::Warning;
                     d.buffer   = tree.source().id();
                     d.span     = tree.span(intN);
+                    // ★ THE ARMS ARE NAMED BY WHAT THEY ARE, NEITHER IS QUOTED
+                    // ([[D-DIAG-A-DIAGNOSTIC-QUOTES-ITS-OPERAND-WHOLE]]). A nest of
+                    // conditionals reports one of these per level, and the pointer arm
+                    // of level k IS the nest below it: quoting it made each warning
+                    // carry every level beneath, O(N²) bytes for N levels, where gcc
+                    // prints the caret's line and clang names the two types. The caret
+                    // marks the integer arm, so the snippet carries the location.
+                    // P69 fold f26d (ruling 617 (3)): and by their TYPES, in the arms'
+                    // order, where the language spells types — clang 18 names both
+                    // (MEASURED, probe n507c: "('int *' and 'int')"); a type's spelling is
+                    // bounded by the type, never by the nest.
+                    bool const thenIsThePointer = pointerArm(thenT) && integerArm(elseT);
+                    std::optional<std::string> const thenSpelled =
+                        spelledType(cfg, in, thenIsThePointer ? ptrT : thenT);
+                    std::optional<std::string> const elseSpelled =
+                        spelledType(cfg, in, thenIsThePointer ? elseT : ptrT);
                     d.actual   = "the second and third operands of this "
-                                 "conditional are a pointer (`"
-                               + std::string{tree.text(ptrN)}
-                               + "`) and an integer (`"
-                               + std::string{tree.text(intN)}
-                               + "`), which is none of the operand pairings C "
-                                 "6.5.15p3 admits";
+                                 "conditional are a pointer and an integer"
+                               + (thenSpelled && elseSpelled
+                                      ? " ('" + *thenSpelled + "' and '" + *elseSpelled + "')"
+                                      : std::string{})
+                               + " (the "
+                                 "integer is the operand marked), which is none "
+                                 "of the operand pairings C 6.5.15p3 admits";
                     d.suggestion =
                         "an integer arm may pair with a pointer arm only when it "
                         "is a null pointer constant; write `0` (or cast the "
@@ -25736,14 +26025,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             d.buffer   = tree.source().id();
             d.span     = tree.span(at);
             if (unary) {
-                d.actual = "`" + std::string{tree.text(at)} + "`: the operand of unary `"
+                d.actual = "`" + quotedSourceText(tree.text(at)) + "`: the operand of unary `"
                     + std::string{opText} + "` is " + std::string{category(lt)}
+                    + typeAfterCategory(cfg, in, lt)
                     + ", and C23 6.5.4.3 requires an arithmetic operand ("
                       "an integer one for `~`)";
             } else {
-                d.actual = "`" + std::string{tree.text(at)} + "`: the operands of `"
+                d.actual = "`" + quotedSourceText(tree.text(at)) + "`: the operands of `"
                     + std::string{opText} + "` are " + std::string{category(lt)}
+                    + typeAfterCategory(cfg, in, lt)
                     + " and " + std::string{category(rt)}
+                    + typeAfterCategory(cfg, in, rt)
                     + ", which is none of the pairings C23 6.5.6-6.5.13 admit (a "
                       "pointer takes part only in `+` beside an integer and in `-` "
                       "before an integer or a pointer)";
@@ -25841,8 +26133,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                            != std::optional<bool>{false}) {
                     TypeId const t = subtreeType(s, tree, opndN, here);
                     if (pointerOperandRefusedByUnary(in, e->target, t)) {
-                        refuse(node, opTok.valid() ? tree.text(opTok)
-                                                   : std::string_view{e->target},
+                        refuse(node, quotedSourceText(opTok.valid() ? tree.text(opTok)
+                                                                    : std::string_view{e->target}),
                                t, InvalidType, /*unary=*/true);
                     }
                 }
@@ -25970,7 +26262,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(node);
-        d.actual   = std::string{tree.text(node)};
+        d.actual   = quotedSourceText(tree.text(node));
         s.reporter.report(std::move(d));
     }
 
@@ -26096,7 +26388,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(value);
                 d.actual   = std::format("case label '{}' is not an integer constant expression "
-                                         "(C 6.8.4.2p3)", tree.text(value));
+                                         "(C 6.8.4.2p3)", quotedSourceText(tree.text(value)));
                 s.reporter.report(std::move(d));
             }
         }
@@ -26821,7 +27113,7 @@ void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
             d.span     = tree.span(params[0].first);
             d.actual   = "'void' as the only parameter may not be `_Atomic`-qualified "
                          "(no reference compiler accepts it): `"
-                         + std::string{tree.text(params[0].first)} + "`";
+                         + quotedSourceText(tree.text(params[0].first)) + "`";
             s.reporter.report(std::move(d));
         }
         params.clear();
@@ -26850,7 +27142,7 @@ void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(n);
-        d.actual   = std::string{why} + ": `" + std::string{tree.text(n)} + "`";
+        d.actual   = std::string{why} + ": `" + quotedSourceText(tree.text(n)) + "`";
         s.reporter.report(std::move(d));
     }
 }
@@ -26966,9 +27258,9 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(node);
-        d.actual   = "the called function returns '"
-                     + compositeSpelling(s.lattice.interner(), resultTy)
-                     + "', which is incomplete at this call (C 6.5.2.2p1) — its "
+        d.actual   = "the called function returns "
+                     + quotedTypeOr(cfg, s.lattice.interner(), resultTy, "a type")
+                     + ", which is incomplete at this call (C 6.5.2.2p1) — its "
                        "result has no size";
         s.reporter.report(std::move(d));
     }
@@ -26984,10 +27276,11 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(argNodes[i]);
-        d.actual   = std::format("argument {} has type '{}', which is incomplete at "
+        std::optional<std::string> const argSpelled = spelledType(cfg, s.lattice.interner(), argTy);
+        d.actual   = std::format("argument {} has {}, which is incomplete at "
                                  "this call (C 6.5.2.2p4) — it has no size to pass",
                                  i + 1,
-                                 compositeSpelling(s.lattice.interner(), argTy));
+                                 argSpelled ? "type '" + *argSpelled + "'" : std::string{"a type"});
         s.reporter.report(std::move(d));
     }
     bool const tooFewForVariadic =
@@ -27097,7 +27390,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
             d.severity = DiagnosticSeverity::Error;
             d.buffer   = tree.source().id();
             d.span     = tree.span(argNodes[i]);
-            d.actual   = std::string{tree.text(argNodes[i])};
+            d.actual   = quotedSourceText(tree.text(argNodes[i]));
             s.reporter.report(std::move(d));
         }
     }
@@ -27118,7 +27411,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(argNodes[i]);
-                d.actual   = std::string{tree.text(argNodes[i])};
+                d.actual   = quotedSourceText(tree.text(argNodes[i]));
                 s.reporter.report(std::move(d));
             }
         }
@@ -28109,7 +28402,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(cur);
-                d.actual   = std::string{tree.text(cur)};
+                d.actual   = quotedSourceText(tree.text(cur));
                 s.reporter.report(std::move(d));
                 return;
             }
@@ -28184,7 +28477,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(calleeNode);
-        d.actual   = std::string{tree.text(calleeNode)};
+        d.actual   = quotedSourceText(tree.text(calleeNode));
         s.reporter.report(std::move(d));
         return;
     }
@@ -30964,7 +31257,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(span);
-        d.actual   = std::string{tree.text(span)};
+        d.actual   = quotedSourceText(tree.text(span));
         s.reporter.report(std::move(d));
     };
 
@@ -31222,7 +31515,7 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
     {
         std::size_t const count = s.symbols.records().size();
         for (std::size_t i = 1; i < count; ++i) {
-            SymbolId const id{static_cast<std::uint32_t>(i)};
+            SymbolId const id = symbolIdOfIndex(i);   // the table's index rule (P69 f26d, N9)
             SymbolRecord const& rec = s.symbols.at(id);
             if (defines(rec) && !aliasOfSurvivor.contains(survivorOf(id).v))
                 definitionNamed.emplace(symbolNameOf(rec), id);
@@ -31348,7 +31641,7 @@ void completeTentativeArrays(EngineState& s, std::span<Tree const> trees) {
     auto& interner = s.lattice.interner();
     std::size_t const count = s.symbols.records().size();
     for (std::size_t i = 1; i < count; ++i) {
-        SymbolRecord& rec = s.symbols.at(SymbolId{static_cast<std::uint32_t>(i)});
+        SymbolRecord& rec = s.symbols.at(symbolIdOfIndex(i));   // the table's index rule
         if (!rec.isTentativeDefinition || rec.isAbsorbedProto) continue;
         if (rec.kind != DeclarationKind::Variable || !rec.type.valid()) continue;
         if (!interner.isIncompleteArray(rec.type)) continue;
@@ -32874,7 +33167,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::vector<std::pair<SymbolId, SymbolId>> absorbedAcrossScopes;
         // Symbol ids are dense and minted from 1; the store only grows.
         for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
-            SymbolId const sid{sv};
+            SymbolId const sid = symbolIdOfIndex(sv);   // the table's index rule (P69 f26d, N9)
             auto& rec = s.symbols.at(sid);
             // ★ P69 (lane `cs`, fold f26b): and every BARE block-scope prototype —
             // linked exactly as if declared `extern` (C 6.2.2p5), so it takes this
@@ -32931,7 +33224,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         {
             std::unordered_map<std::string, SymbolId> firstBlockDeclaration;
             for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
-                SymbolId const sid{sv};
+                SymbolId const sid = symbolIdOfIndex(sv);   // the table's index rule (P69 f26d, N9)
                 auto& rec = s.symbols.at(sid);
                 if (!(rec.isExternDeclaration || rec.isProtoDeclaration) || rec.isAbsorbedProto)
                     continue;
@@ -33042,21 +33335,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         auto& in = s.lattice.interner();
         // Symbol ids are dense and minted from 1; the store only grows.
         for (std::uint32_t sv = 1; sv <= s.symbols.size(); ++sv) {
-            SymbolRecord& rec = s.symbols.at(SymbolId{sv});
-            if (rec.kind != DeclarationKind::Function || !rec.isProtoDeclaration
-                || rec.isImplicitDeclaration || !rec.type.valid()
-                || in.kind(rec.type) != TypeKind::FnSig || !in.fnParams(rec.type).empty()
-                || in.fnIsVariadic(rec.type))
-                continue;
+            SymbolRecord& rec = s.symbols.at(symbolIdOfIndex(sv));   // the table's index rule
+            if (rec.kind != DeclarationKind::Function) continue;
             auto const treeIt = treeOf.find(rec.tree.v);
             if (treeIt == treeOf.end()) continue;
             Tree const& tree = *treeIt->second;
             auto const idxIt = s.schemaIndexes.find(tree.schema().schemaId().v);
-            if (idxIt == s.schemaIndexes.end() || idxIt->second.cfg == nullptr
-                || !idxIt->second.cfg->parameters.emptyListDeclaresNoPrototype)
-                continue;
-            rec.declaresNoPrototype = functionDeclaratorWritesNoParameters(
-                idxIt->second, tree, ownDeclaratorOf(idxIt->second, tree, rec));
+            if (idxIt == s.schemaIndexes.end()) continue;
+            rec.declaresNoPrototype = declarationGivesNoPrototype(idxIt->second, tree, rec, in);
         }
     }
 
@@ -33474,41 +33760,22 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // gcc 13.2.0 and Apple clang refuse those and build the compatible ones. One
                     // working reference makes the pair accepted; the incompatible one is warned
                     // (S_PrototypeIncompatibleWithADeclarationWithoutOne). The results are held
-                    // to each other as any redeclaration's are (the oracle below).
+                    // to each other as any redeclaration's are (the oracle below). ★ P69 (fold
+                    // f26d — ledgers 598/599): the judgement is `prototypeFitsADeclarationWithoutOne`,
+                    // the one the check against the C library's declaration asks too.
                     if (sRec.declaresNoPrototype != aRec.declaresNoPrototype
                         && in.fnResult(sRec.type).v == in.fnResult(aRec.type).v) {
                         SymbolRecord const& proto = sRec.declaresNoPrototype ? aRec : sRec;
                         SemanticConfig const* pCfg =
                             aIdxIt != s.schemaIndexes.end() ? aIdxIt->second.cfg : nullptr;
-                        bool fits = !in.fnIsVariadic(proto.type);
-                        // A copy: the promotion interns (a pointer, `double`), which would move the
-                        // storage a span of the parameters points into.
-                        auto const protoParams = in.fnParams(proto.type);
-                        std::vector<TypeId> const params(protoParams.begin(), protoParams.end());
-                        for (TypeId const p : params) {
-                            if (!fits || pCfg == nullptr) break;
-                            fits = defaultArgumentPromotion(s, *pCfg, p).v == p.v;
-                        }
+                        bool const fits = pCfg != nullptr
+                                              ? prototypeFitsADeclarationWithoutOne(s, *pCfg, proto.type)
+                                              : !in.fnIsVariadic(proto.type);
                         if (!fits && aTreeIt2 != treeById.end()) {
-                            Tree const&     aTree2 = *aTreeIt2->second;
-                            ParseDiagnostic w;
-                            w.code     = DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne;
-                            w.severity = DiagnosticSeverity::Warning;
-                            w.buffer   = aTree2.source().id();
-                            w.span     = aTree2.span(aRec.declNode);
-                            w.actual   = std::format(
-                                "'{}' — a prototype whose parameters are not each their own default "
-                                "argument promotion, or that ends in `...`, is not compatible with a "
-                                "declaration of it without a prototype (C 6.7.6.3p15): taken, as cl "
-                                "takes it, with the prototype as its type; gcc and clang refuse it",
-                                aRec.name);
-                            if (sTreeIt2 != treeById.end()) {
-                                Tree const& sTree2 = *sTreeIt2->second;
-                                w.related.push_back(RelatedLocation{
-                                    sTree2.source().id(), sTree2.span(sRec.declNode),
-                                    "the other declaration"});
-                            }
-                            s.reporter.report(std::move(w));
+                            warnPrototypeIncompatibleWithoutOne(
+                                s, *aTreeIt2->second, aRec.declNode, aRec.name,
+                                sTreeIt2 != treeById.end() ? sTreeIt2->second : nullptr, sRec.declNode,
+                                /*theLibrarys=*/false);
                         }
                         if (sRec.declaresNoPrototype) {
                             SymbolRecord& survivorRec = s.symbols.at(survivor);
@@ -33955,6 +34222,25 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // rows that spell no qualifier this walks nothing at all; it runs
             // exactly for the annotated rows, where the answer is read.
             Tree const& tree = *treeIt->second;
+            // ★★ P69 (lane `cs`, fold f26d — main's ledgers 598/599): the unit's declaration of the name WITHOUT a
+            // prototype (`extern int printf();`) beside the library's prototype is the redeclaration sweep's pair,
+            // and asks its one judgement (`prototypeFitsADeclarationWithoutOne`): compatible, or — cl builds and
+            // runs it (probe rcp) — warned. Either way the library's prototype is the function's type from here
+            // on, in scope at every call (`prototypeIsTheLibrarys`), so a call it rejects (`printf()`) is the
+            // arity error every reference gives, and `printf("hi\n")` the call cl builds. This check used to hold
+            // the pair to the prototype oracle below — an error where cl builds the program — and the calls saw
+            // no prototype at all. A different result is no such pair: the oracle refuses it.
+            if (rec.declaresNoPrototype && in.fnResult(rec.type).v == in.fnResult(shippedSig).v) {
+                if (!prototypeFitsADeclarationWithoutOne(s, *s.idx().cfg, shippedSig)) {
+                    warnPrototypeIncompatibleWithoutOne(s, tree, rec.declNode, name, nullptr, NodeId{},
+                                                        /*theLibrarys=*/true);
+                }
+                SymbolRecord& merged = s.symbols.at(sym);
+                merged.type                   = shippedSig;
+                merged.prototypeIsTheLibrarys = true;
+                if (merged.declNode.valid()) s.nodeToType.set(merged.declNode, shippedSig);
+                continue;
+            }
             std::optional<DeclaredQualification> userQual;
             if (shippedIt->second.qualification != nullptr) {
                 userQual = harvestFunctionQualification(
@@ -34142,7 +34428,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             d.actual   = std::format(
                 "'{}' calls the C library function '{}', which this translation unit does "
                 "not declare and the platform does not provide here: {}",
-                tree.text(at), name,
+                quotedSourceText(tree.text(at)), name,
                 why != libraryImportRefusal.end() ? why->second : std::string{"unknown"});
             s.reporter.report(std::move(d));
         };
@@ -34366,7 +34652,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         for (auto const& tree : trees) treeById[tree.id().v] = &tree;
         std::size_t const recordCount = s.symbols.records().size();
         for (std::size_t i = 1; i < recordCount; ++i) {
-            SymbolRecord& rec = s.symbols.at(SymbolId{static_cast<std::uint32_t>(i)});
+            SymbolRecord& rec = s.symbols.at(symbolIdOfIndex(i));   // the table's index rule
             if (!rec.denotesItsRegister) continue;
             auto const useIt = s.usesBySymbol.find(static_cast<std::uint32_t>(i));
             auto const treeIt = treeById.find(rec.tree.v);

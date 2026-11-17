@@ -363,6 +363,7 @@ TEST(MirMemoryClobbers, DiamondOneArmClobberDifferentialEquality) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -411,6 +412,7 @@ TEST(MirMemoryClobbers, LoopBackEdgeRegionDifferentialEquality) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
@@ -660,6 +662,7 @@ TEST(MirMemoryClobbers, RandomizedCfgDifferentialSweep) {
         TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(fnSig, SymbolId{100});
         std::uint32_t const nb = 3u + rng() % 5u;   // 3..7 blocks
         std::vector<MirBlockId> blocks;
@@ -917,6 +920,7 @@ SlotVsParamShape buildSlotVsParamShape(TypeInterner& interner,
     TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1067,6 +1071,7 @@ TEST(MirMemoryClobbers, WalkPastMemoNeverMasksAFartherAliasingClobber) {
     TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
@@ -1165,6 +1170,7 @@ ReloadPair buildReloadPair(TypeInterner& interner, bool published) {
     TypeId const fnSig   = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);

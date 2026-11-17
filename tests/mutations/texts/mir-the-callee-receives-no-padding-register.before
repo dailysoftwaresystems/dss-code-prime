@@ -1,3 +1,2 @@
-            MirInstId const pad =
-                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.primitive(TypeKind::I64), padPos);
-            if (!pad.valid()) return false;
+            if (!mir.addArg(pad.ordinal, interner.primitive(TypeKind::I64), pad.position).valid())
+                return false;

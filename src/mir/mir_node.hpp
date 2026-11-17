@@ -76,7 +76,17 @@ enum class MirInstFlags : std::uint8_t {
     // optimizer pass (it is a verifier-only exemption marker) — distinct from any
     // atomic-OP marker (the atomic ops carry their own opcode identity, not a flag).
     AtomicInitExempt = 1u << 3,
-    // bits 4-7 reserved
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of ledger 597): marks a
+    // `Call` whose callee is a function its own unit DEFINES, called by the very signature that
+    // definition receives its arguments by (HIR→MIR's `passesByItsDefinition`). Both halves then
+    // asked the one placement step with the same inputs, so the MIR verifier holds each of the
+    // callee's `Arg`s (and each stamped `RecvByValueStackParam`) to the call's operand at its
+    // position (I_CallDisagreesWithItsDefinition): a disagreement there is a DSS defect, never a
+    // program. An UNSTAMPED call is not held — a call through a declaration without a prototype,
+    // or two units' incompatible prototypes merged into one module, is a program the references
+    // compile (C 6.5.2.2p6, 6.2.7p2 undefined; ✔MEASURED, probe n2p) and a refusal would refuse it.
+    PassesByItsDefinition = 1u << 4,
+    // bits 5-7 reserved
 };
 
 [[nodiscard]] inline constexpr MirInstFlags operator|(MirInstFlags a, MirInstFlags b) noexcept {
@@ -349,6 +359,13 @@ struct MirAlias {
     friend constexpr bool operator==(MirAlias const&, MirAlias const&) = default;
 };
 
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): HOW A FUNCTION NUMBERS ITS `Arg`s (the `Arg` payload,
+// `argIndex`) — the counting of the calling convention the function is called by. `PerClass`: each register
+// class counts its own registers from 0 (SysV, AAPCS64); `Flat`: one count over every argument slot (Win64,
+// `slotAligned`); `Unstated`: nobody said. Each FUNCTION carries one (`detail::MirFunc::argCounting`); the
+// module's default, which every function the builder adds is stamped with, is in `MirModuleFacts` (mir.hpp).
+enum class MirArgCounting : std::uint8_t { Unstated, PerClass, Flat };
+
 namespace detail {
 
 // ── instruction POD ───────────────────────────────────────────────────────────
@@ -574,6 +591,14 @@ struct MirFunc {
     // below, re-measured at TF-C92) sizeof stays 28 and the `<= 32` static_assert
     // holds with room to spare.
     bool             noSanitizeThread = false;                // 1
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of 2026-11-14): THE COUNTING OF THE
+    // CONVENTION THIS FUNCTION IS CALLED BY (`MirArgCounting`). A function's, not the module's: one module holds
+    // functions of two conventions once a convention attribute naming another one is emitted (gcc and clang
+    // give `ms_abi` its own sequence on x86-64 Linux), and a flat function's `Arg`s read per class are a gap.
+    // Stamped by `addFunction` with the builder's stated default (the pair's convention), restated by
+    // `stateFunctionArgCounting`, copied by every clone, written by the text (`arg_counting(...)`), and read by
+    // the MIR verifier's density rule (`Mir::funcArgCounting`).
+    MirArgCounting   argCounting = MirArgCounting::Unstated;   // 1
     // NOTE (TF-C81, amended TF-C85 and TF-C92): there is deliberately NO `_pad`
     // member. The six 1-byte fields above (binding, visibility, noInline,
     // alwaysInline, noOptimize, noSanitizeThread) sit in the tail slot, so explicit
@@ -669,15 +694,19 @@ struct MirFunc {
 // is the slack: there is none left before the schedule, so the next one-byte
 // flag takes the size to 40 (the budget's edge) and the one after it breaches.
 // The offsets are pinned below, not only stated.
-static_assert(sizeof(MirFunc) == 36,
-              "detail::MirFunc is 36 bytes (20 + the 4-byte MirLinkage record + 4 "
-              "one-byte flags + an 8-byte StaticInitSchedule) — if you added a "
-              "member, re-measure and update the padding-budget comment above "
-              "along with this number");
+// ★★ 2026-11-14 (P69 fold f26d, lane `cs`): that next one-byte member is `argCounting`, at 28 — the counting
+// of the function's own convention (review-csf26c2 N2). `roundUp4(20 + 4 + 5) + 8` = **40**, the BUDGET'S
+// EDGE: the schedule moves to 32 behind three bytes of padding, and the next member breaches `<= 40` — the
+// moment to re-do this arithmetic (or to pack the four flags), not to widen the ceiling.
+static_assert(sizeof(MirFunc) == 40,
+              "detail::MirFunc is 40 bytes (20 + the 4-byte MirLinkage record + 4 "
+              "one-byte flags + the one-byte Arg counting, padded to 32, + an 8-byte "
+              "StaticInitSchedule) — if you added a member, re-measure and update the "
+              "padding-budget comment above along with this number");
 static_assert(offsetof(MirFunc, linkage) == 20 && offsetof(MirFunc, noInline) == 24
-                  && offsetof(MirFunc, staticInit) == 28,
+                  && offsetof(MirFunc, argCounting) == 28 && offsetof(MirFunc, staticInit) == 32,
               "detail::MirFunc: the linkage record sits at 20, the flags at "
-              "24-27, the schedule at 28 — the size pin above is that sum");
+              "24-27, the Arg counting at 28, the schedule at 32 — the size pin above is that sum");
 static_assert(alignof(MirFunc) == 4,
               "detail::MirFunc is 4-byte aligned because TypeId is two uint32_t "
               "— the whole padding budget above assumes 4-byte growth steps");

@@ -332,6 +332,14 @@ lowerToLir(Mir const&          mir,
            TargetSchema const& target,
            TypeInterner const& interner,
            DiagnosticReporter& reporter,
+           // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F7; REQUIRED since fold f26d,
+           // review-csf26c2 N8): the ACTIVE calling convention, by the index HIR→MIR lowered
+           // under (`takeCallingConvention`) and every later tier reads. Every convention fact
+           // this lowering reads comes from it — a stacked carrier's cap, the FP argument and
+           // result registers, the stack alignment. It was a trailing default of 0, the
+           // target's first convention, which a caller lowering under another convention could
+           // leave out: two tests did, allocating under `ccIndex` an LIR lowered under 0.
+           std::uint16_t callingConventionIndex,
            // Extern symbols extracted by HIR→MIR lowering
            // (`HirToMirResult.externImports`). Propagated verbatim
            // through the returned `MirToLirResult.externImports`.
@@ -557,14 +565,6 @@ lowerToLir(Mir const&          mir,
            // ends in will define). Such a name is in the image, never an import,
            // so a reference to it is DIRECT and takes no slot. Empty = no name
            // is exempt, the lowering unchanged.
-           std::vector<std::string> imageDefinedNames = {},
-           // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F7): the ACTIVE calling
-           // convention, by the index HIR→MIR lowered under (`takeCallingConvention`)
-           // and every later tier reads. Every convention fact this lowering reads
-           // comes from it — a stacked carrier's cap, the FP argument and result
-           // registers, the stack alignment — where index 0 was read for all of them,
-           // which on a target of two conventions is the other one's for half of its
-           // units. 0 = the target's first convention, every caller's previous answer.
-           std::uint16_t callingConventionIndex = 0);
+           std::vector<std::string> imageDefinedNames = {});
 
 } // namespace dss

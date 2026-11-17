@@ -1,1 +1,3 @@
-                (numFp == 0 && out.runGpr % 2u != 0u && beginsAnEvenGprPair(argTy, numGp)) ? 0u : 0u;
+            MirInstId const pad = constIntOfType(0, interner.primitive(TypeKind::I64));
+            if (!pad.valid()) return false;
+            (void)operands;

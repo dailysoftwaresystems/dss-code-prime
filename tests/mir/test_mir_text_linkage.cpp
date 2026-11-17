@@ -45,7 +45,7 @@ using Kind = WeakDefinitionKind;
 
 // A module of ONE global `%10`, its attribute list `attrs` (with its leading space) and its initializer `init`.
 [[nodiscard]] std::string globalDoc(std::string_view attrs, std::string_view init = "zero") {
-    return std::string{"dssir 7\nmodule {\n  global %10 : i32"} + std::string{attrs} + " = " + std::string{init}
+    return std::string{"dssir 8\nmodule {\n  global %10 : i32"} + std::string{attrs} + " = " + std::string{init}
            + "\n}\n";
 }
 
@@ -115,7 +115,7 @@ TEST(MirTextLinkage, AWeakDefinitionsKindAndATentativeMarkSurviveTheRoundTrip) {
     DiagnosticReporter emitRep;
     MirTextContext     ctx{&in, &shapes.names};
     std::string const  text = emitMir(shapes.mir, ctx, emitRep);
-    EXPECT_NE(text.find("dssir 7"), std::string::npos) << text;
+    EXPECT_NE(text.find("dssir 8"), std::string::npos) << text;
     EXPECT_NE(text.find("weak(select-any)"), std::string::npos) << "the kind is the binding word's argument\n" << text;
     EXPECT_NE(text.find("weak(overridable)"), std::string::npos) << text;
     EXPECT_NE(text.find("tentative"), std::string::npos) << "a tentative global says so\n" << text;
@@ -224,12 +224,15 @@ TEST(MirTextLinkage, ATentativeMarkIsRefusedWhereNoTentativeDefinitionCanBe) {
 }
 
 TEST(MirTextLinkage, AVersionFiveTextIsRefusedByTheVersionCheck) {
-    expectRefused({"version 5", "dssir 5\nmodule {\n}\n", "expected version 7, got '5'"});
+    expectRefused({"version 5", "dssir 5\nmodule {\n}\n", "expected version 8, got '5'"});
     // Version 6 named two grammars (the alias item arrived inside it, and a reader built before that refuses the
     // item): the step to 7 makes the number say which grammar a text is written in, so a v6 text is refused too.
-    expectRefused({"version 6", "dssir 6\nmodule {\n}\n", "expected version 7, got '6'"});
+    expectRefused({"version 6", "dssir 6\nmodule {\n}\n", "expected version 8, got '6'"});
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2): v8 states a module's `Arg` counting (`arg_counting`), which
+    // the verifier requires of a module holding an `Arg`, so a v7 text — which cannot state it — is refused too.
+    expectRefused({"version 7", "dssir 7\nmodule {\n}\n", "expected version 8, got '7'"});
     DiagnosticReporter rep;
-    auto const         res = parseMir("dssir 7\nmodule {\n}\n", CompilationUnitId{1}, rep);
+    auto const         res = parseMir("dssir 8\nmodule {\n}\n", CompilationUnitId{1}, rep);
     ASSERT_NE(res, nullptr);
     EXPECT_TRUE(res->ok) << "CONTROL: the empty module of the current version" << diagnosticsOf(rep);
 }

@@ -812,7 +812,14 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // MSVC link and run it -- so suppressing it hides advice while the build proceeds to the program every
 // reference makes: it fails both prongs, as gcc's -Wmain is suppressible. The program-entry block below
 // is rewritten in place. Written from main's 203; a fold landing another member first reconciles the count.
-constexpr std::array<UnsuppressableEntry, 202> kUnsuppressableCodes{{
+// ⓘ EXTENT 202 → 206 (2026-11-14, P69 round 1, fold f26d, lane `cs`, review-csf26c2 N2):
+// `I_ArgOrdinalGap`, `I_ArgOrdinalRepeated`, `I_ArgCountingUnstated` and
+// `I_CallDisagreesWithItsDefinition` join under `kWhyMirVerifier`, members like every I_* verifier
+// invariant (a function whose `Arg`s skip or share a register, a module that cannot say how its
+// `Arg`s are counted, a stamped call its callee receives otherwise). Written from main's 203 and
+// reconciled on the refresh onto checkpoint 44 with 3e's departure of `S_EntryShapeNotDeclared`
+// (above); a fold landing another member first reconciles the count.
+constexpr std::array<UnsuppressableEntry, 206> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1257,6 +1264,10 @@ constexpr std::array<UnsuppressableEntry, 202> kUnsuppressableCodes{{
     {DiagnosticCode::I_TerminatorTypeMismatch, kWhyMirVerifier},
     {DiagnosticCode::I_ArgIndexOutOfRange, kWhyMirVerifier},
     {DiagnosticCode::I_ArgPositionDuplicate, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgOrdinalGap, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgOrdinalRepeated, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgCountingUnstated, kWhyMirVerifier},
+    {DiagnosticCode::I_CallDisagreesWithItsDefinition, kWhyMirVerifier},
     {DiagnosticCode::I_ExtensionTypeInMir, kWhyMirVerifier},
     {DiagnosticCode::I_NullptrTypeInMir, kWhyMirVerifier},
     {DiagnosticCode::I_StructCfMismatch, kWhyMirVerifier},

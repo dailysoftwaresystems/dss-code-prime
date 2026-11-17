@@ -1,0 +1,1 @@
+    return quotedSourceText(text, diagnosticQuoteLimit());

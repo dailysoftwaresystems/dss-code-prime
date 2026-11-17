@@ -1,1 +1,1 @@
-            (numFp == 0 && ctr.gpr % 2u != 0u && beginsAnEvenGprPair(aggTy, numGp)) ? 0u : 0u;
+        std::uint32_t const padGpr = (need.evenPair && cursor.gpr % 2u != 0u) ? 0u : 0u;

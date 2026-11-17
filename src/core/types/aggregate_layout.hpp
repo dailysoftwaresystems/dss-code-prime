@@ -657,7 +657,7 @@ struct AggregateLayoutParams {
     // greater than maximum object file alignment 8192"* / `C2345`) while
     // BUILDING AND RUNNING the same alignment on a TYPE and on a LOCAL.
     std::uint32_t       maxRequestedAlignment = 0;  // required; power of two
-    // ★ IT SITS LAST, AND THE POSITION IS A MEASUREMENT. Placed between
+    // ★ IT SITS AFTER EVERY OLDER FIELD, AND THE POSITION IS A MEASUREMENT. Placed between
     // `maxAlignment` and `bitFieldStrategy` — where it reads best — it re-seated
     // every POSITIONAL aggregate initialiser of this struct in the tree: ✔34 sites
     // across `tests/{analysis,asm,core,ffi,mir}` plus two `src/` headers. Four of
@@ -666,6 +666,20 @@ struct AggregateLayoutParams {
     // silence. Appending keeps every existing brace-init valid and confines the
     // change to the sites that actually care about the ceiling. Field ORDER in a
     // params struct carries no meaning; the blast radius of moving it does.
+
+    // ── D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64 (P69, lane `cs`, fold f26d) ──
+    //
+    // THE CHUNK A BIT-PRECISE INTEGER WIDER THAN 64 BITS IS MADE OF, in bytes: its
+    // alignment, and the granule its size is a whole number of — `_BitInt(N)` of N > 64
+    // occupies ceil(N / (8·chunk)) chunks (`type_layout`'s bit-precise arm, its one
+    // reader). REQUIRED whenever an `aggregateLayout` block is declared, for
+    // `maxAlignment`'s reason: the two documents disagree, and a default would be one of
+    // them chosen for the other. The x86-64 psABI: 8 (a struct of 64-bit chunks —
+    // `sizeof(_BitInt(129))` 24, `_Alignof` 8). AAPCS64: 16 (N ≤ 128 maps to the
+    // quadword, N > 128 to `unsigned __int128[M]` — 32 and 16). 0 = not declared: a
+    // wide `_BitInt` then has no layout, refused by name where one is asked, never a
+    // guessed one. Appended after `maxRequestedAlignment` for that field's reason.
+    std::uint32_t       bitPreciseChunk = 0;   // required; a power of two in [8, maxAlignment]
 };
 
 } // namespace dss

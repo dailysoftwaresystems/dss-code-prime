@@ -11,6 +11,7 @@
 #include "analysis/semantic/redeclaration_compat.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/anon_member_name.hpp"       // isSyntheticAnonymousName (one owner)
 #include "core/types/attribute_naming.hpp"       // D-CSUBSET-PACKED (F4): stripDunder
 #include "core/types/data_model.hpp"
@@ -46,6 +47,9 @@
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"
 #include "hir/hir_verifier.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -1328,7 +1332,7 @@ struct Lowerer {
                   "an expression of type `void` has no value to use (C 6.3.2.2), "
                   "and a controlling expression must have scalar type "
                   "(C 6.8.4.1p1 / 6.8.5p2 / 6.5.15p2): "
-                      + std::string{tree().text(anchor)});
+                      + quotedSourceText(tree().text(anchor)));
             return {errorNode(anchor), InvalidType};
         }
         // ★★ C 6.2.5: `isArithmeticCore` is the INT+FLOAT core roster, and C's
@@ -1963,6 +1967,9 @@ struct Lowerer {
             if (tree().kind(c) != NodeKind::Internal) continue;
             if (head.valid() && c.v == head.v) {
                 for (NodeId run : headAttributeRuns(sem, tree(), c)) {
+                    // P69 (fold f26d — N5): a standard-form specifier there is the type's
+                    // (`isStandardAttributeSpecifier`), read by no linkage table.
+                    if (isStandardAttributeSpecifier(sem, tree(), run)) continue;
                     roots.push_back(run);
                 }
                 continue;
@@ -2006,6 +2013,9 @@ struct Lowerer {
         // __attribute__((weak)) p3 = 0, q3 = 0;` is `V p3` / `B q3`.
         for (NodeId an :
                  nameAdjacentAttributeSpecifiers(tree(), sem, declaratorNode)) {
+            // P69 (fold f26d — N5): a standard-form specifier there is the type's
+            // (`isStandardAttributeSpecifier`), read by no linkage table.
+            if (isStandardAttributeSpecifier(sem, tree(), an)) continue;
             roots.push_back(an);
         }
         if (dc.afterDeclaratorAttrRules.empty()) return roots;   // language has none
@@ -2076,14 +2086,19 @@ struct Lowerer {
     // subtrees, which the row's own fold skips) and its own name-adjacent and trailing ones -- with those tables,
     // seeded by the row's own prefix fold (`seed`: a `static` there is the residue a binding then conflicts with).
     // The names those tables do not key are passed over in silence: this row's attribute NAMES are the semantic
-    // tier's to judge (`linkageTierJudgesAttributeNames` gives them to it for a row that skips `attrSpec`), so one
-    // typo is never reported twice. The caller decides what the answer is: a declarator WITH linkage (a function
-    // declared in a block, C 6.2.2p5) merges it into its entity; one WITHOUT refuses a binding in it. nullopt: the
-    // row names no such tables (or the language has no attribute-specifier rule).
+    // tier's to judge (`linkageTierJudgesAttributeNames` gives them to it for a row that borrows its tables), so one
+    // typo is never reported twice. Its caller is the declarator WITH linkage (a function declared in a block, C
+    // 6.2.2p5), which merges the answer into its entity; a declarator WITHOUT linkage is the semantic tier's to
+    // judge (its no-linkage gate refuses an attribute by name or ignores it and says so, and marks the name, so
+    // nothing reaches here from one). nullopt: the row borrows no tables.
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): WHICH tables is the one accessor's answer
+    // (`attributeTableOf`, `Borrowed`), and the specifiers collected are both forms' (`isAttributeSpecifierRule`):
+    // a standard-form specifier is read for the items a spelling claims (`[[gnu::weak]]`, in `linkageFrom`).
     [[nodiscard]] std::optional<LinkageAttr>
     attributeLinkageOf(NodeId node, DeclarationRule const& decl, NodeId declaratorNode, LinkageAttr seed) {
-        if (!decl.attributeLinkageRow.has_value() || !sem.attrSpecRule.valid()) return std::nullopt;
-        DeclarationRule const& tables = sem.declarations[*decl.attributeLinkageRow];
+        AttributeTableOfRow const reading = attributeTableOf(sem, decl);
+        if (reading.answer != AttributeTableAnswer::Borrowed) return std::nullopt;
+        DeclarationRule const& tables = *reading.table;
         std::vector<NodeId> roots;
         {   // the prefix's attribute specifiers, in source order -- an explicit stack, no recursion
             std::vector<NodeId> const prefix = linkagePrefixRoots(node, decl, /*forAttributeTables=*/true);
@@ -2094,7 +2109,7 @@ struct Lowerer {
                 NodeId const n = stack.back();
                 stack.pop_back();
                 if (isToken(n)) continue;
-                if (tree().rule(n).v == sem.attrSpecRule.v) { roots.push_back(n); continue; }
+                if (isAttributeSpecifierRule(sem, tree().rule(n))) { roots.push_back(n); continue; }
                 auto const kids = visible(n);
                 for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(*it);
             }
@@ -2102,7 +2117,7 @@ struct Lowerer {
         for (NodeId r : declaratorAttrRoots(decl, declaratorNode, /*forAttributeTables=*/true)) roots.push_back(r);
         if (roots.empty()) return seed;
         return linkageFrom(roots, tables, /*staticStorageOut=*/nullptr, seed, /*nonDefiningOut=*/nullptr,
-                           /*attributeNamesAreAnotherTiers=*/true);
+                           /*readingRow=*/&decl);
     }
 
     // `seed` is the linkage ALREADY folded from an earlier-in-source root set —
@@ -2119,11 +2134,18 @@ struct Lowerer {
                                           bool* staticStorageOut = nullptr,
                                           LinkageAttr seed = {},
                                           bool* nonDefiningOut = nullptr,
-                                          // F9 (fold f26c2): `attributeLinkageOf`'s reading -- a name the
-                                          // tables do not key is the semantic tier's, passed over in silence.
-                                          bool attributeNamesAreAnotherTiers = false) {
+                                          // ★★ P69 (fold f26d — N5): the row whose declarator is read, when it
+                                          // is not `decl` itself (`attributeLinkageOf`: a row that borrows
+                                          // `decl`'s tables). Whether an attribute NAME the tables do not key
+                                          // is this tier's to report is that row's accessor answer (`Own`) --
+                                          // the one `linkageTierJudgesAttributeNames` reads, so one typo is
+                                          // reported by one tier by construction.
+                                          DeclarationRule const* readingRow = nullptr) {
         LinkageAttr attr = seed;
         if (roots.empty() || decl.linkageSpecifiers.empty()) return attr;
+        bool const attributeNamesAreThisTiers =
+            attributeTableOf(sem, readingRow != nullptr ? *readingRow : decl).answer
+            == AttributeTableAnswer::Own;
         // Collect every root's tokens in SOURCE order (the composite-key
         // pairing below is order-sensitive), skipping the subtrees of any
         // `linkageSpecifierIgnoredRules` rule wholesale (FC4 c1 / D14 —
@@ -2191,6 +2213,34 @@ struct Lowerer {
                               "'packed' is not honored as a leading attribute here — "
                               "place __attribute__((packed)) / [[gnu::packed]] AFTER "
                               "the struct/union body");
+                    }
+                    continue;
+                }
+                // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): A SPECIFIER OF THE STANDARD FORM
+                // IS READ FOR THE ITEMS A SPELLING CLAIMS, and for nothing else. `[[gnu::weak]]` is the
+                // GNU spelling's `weak` (`standardItemClause`): its name token is read as an attribute
+                // name and its argument group as an argument, exactly as `__attribute__((weak))`'s; an
+                // item with no namespace, or another vendor's, is the standard form's own attribute,
+                // which no table keys, passed over as the whole specifier was before a spelling
+                // claimed items. ✔MEASURED (lane `cs` probes n5p, n5q; gcc 13.3.0, clang 18.1.3, Apple
+                // clang 21, mingw-w64 gcc 13.2.0): `[[gnu::weak]]` and `[[gnu::visibility("hidden")]]`
+                // confer `weak` and `hidden` at a declaration's leading sequence and after its
+                // declarator; DSS read them in no tier and built a strong, default-visibility symbol.
+                // A leading `packed` keeps the one report above, the claimed `packed` being a name the
+                // fold skips by name.
+                if (isStandardAttributeSpecifier(sem, tree(), n)) {
+                    if (subtreeNamesPacked(n)) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              "'packed' is not honored as a leading attribute here — "
+                              "place __attribute__((packed)) / [[gnu::packed]] AFTER "
+                              "the struct/union body");
+                    }
+                    auto const items = visible(n);
+                    for (auto it = items.rbegin(); it != items.rend(); ++it) {
+                        StandardItemClause const item = standardItemClause(sem, tree(), *it);
+                        if (item.spelling == nullptr || !item.name.valid()) continue;
+                        if (item.args.valid()) stack.push_back({item.args, true, true});
+                        stack.push_back({item.name, false, true});
                     }
                     continue;
                 }
@@ -2788,7 +2838,7 @@ struct Lowerer {
                 // typo protection this gate exists for survives as a diagnostic;
                 // a program that wants the old refusal has `--warnings-as-errors`,
                 // and the code stays suppressible, as it already was.
-                if (!attributeNamesAreAnotherTiers)
+                if (attributeNamesAreThisTiers || !inAttrName)
                     emitHAt(DiagnosticCode::H_UnknownLinkageSpecifier,
                             decl.unknownStrictAttributeIsError
                                 ? DiagnosticSeverity::Error
@@ -5301,7 +5351,7 @@ struct Lowerer {
             "octal escape names a raw code-unit VALUE, not a code point, so its bound is "
             "the element width{} — DSS refuses rather than truncating, because a "
             "truncated escape is a silent wrong answer",
-            std::string{tree().text(node)},
+            quotedSourceText(tree().text(node)),
             bad.hex ? "\\x hexadecimal" : "octal",
             bad.value, bits, limit,
             bad.hex ? " (note that \\x consumes EVERY following hex digit, so a letter "
@@ -5456,7 +5506,7 @@ struct Lowerer {
         WideCharDiag const d = wideCharErrorDetail(werr);
         emitH(d.code, node,
               std::format("wide/UTF character constant {} cannot be lowered: {}",
-                          std::string{tree().text(node)}, d.why));
+                          quotedSourceText(tree().text(node)), d.why));
         return {errorNode(node), InvalidType};
     }
 
@@ -5542,10 +5592,10 @@ struct Lowerer {
                       std::format("string literal {} has an invalid universal character "
                                   "name (\\u needs 4 hex digits, \\U needs 8, and it must "
                                   "not name a surrogate half or a value > U+10FFFF)",
-                                  std::string{tree().text(node)}));
+                                  quotedSourceText(tree().text(node))));
             } else {
                 unsupported(node, std::format("string literal {} has an unsupported escape",
-                                              std::string{tree().text(node)}));
+                                              quotedSourceText(tree().text(node))));
             }
             return {errorNode(node), InvalidType};
         }
@@ -5575,7 +5625,7 @@ struct Lowerer {
                               "string literals may be concatenated is implementation-"
                               "defined (C 6.4.5p5) and this implementation rejects it — "
                               "use a single encoding prefix for the whole literal",
-                              std::string{tree().text(node)}));
+                              quotedSourceText(tree().text(node))));
             return {errorNode(node), InvalidType};
         }
 
@@ -5626,7 +5676,7 @@ struct Lowerer {
                   std::format("wide/UTF string literal {} cannot be lowered: its body is "
                               "not well-formed UTF-8, or a code point exceeds U+10FFFF "
                               "(not a Unicode scalar value)",
-                              std::string{tree().text(node)}));
+                              quotedSourceText(tree().text(node))));
             return {errorNode(node), InvalidType};
         }
         // NARROW (`"`, SQL, u8's byte width is Char-equal — but u8 still routes the
@@ -5670,7 +5720,7 @@ struct Lowerer {
                 ? "a code point exceeds U+10FFFF (not a Unicode scalar value)"
                 : "the string body is not well-formed UTF-8";
         return std::format("wide/UTF string literal {} cannot be lowered: {}",
-                           std::string{tree().text(node)}, what);
+                           quotedSourceText(tree().text(node)), what);
     }
 
     // SQL `NULL` (typeless) → a leaf Extension node of the configured kind.
@@ -5714,7 +5764,7 @@ struct Lowerer {
             auto it = binOp_.find(tree().tokenKind(opToks[i]).v);
             if (it == binOp_.end()) {
                 unsupported(opToks[i], std::format("binary operator '{}' has no hirLowering mapping",
-                                                   tree().text(opToks[i])));
+                                                   quotedSourceText(tree().text(opToks[i]))));
                 return {errorNode(node), InvalidType};
             }
             acc = combineBinary(opToks[i], cfg.binaryOps[it->second], acc, lowerFlatOperand(operands[i + 1]));
@@ -6890,7 +6940,7 @@ struct Lowerer {
         auto it = binOp_.find(tree().tokenKind(opTok).v);
         if (it == binOp_.end()) {
             unsupported(node, std::format("binary operator '{}' has no hirLowering mapping",
-                                          tree().text(opTok)));
+                                          quotedSourceText(tree().text(opTok))));
             return {errorNode(node), InvalidType};
         }
         // ⛔ P68 round 9 (lane `cs`): NOTHING PAST THE LOOKUP ABOVE IS REACHABLE, SO
@@ -6912,7 +6962,7 @@ struct Lowerer {
             "reached the malformed-node fallback although its operator maps; a "
             "well-formed binary node lowers through the expression driver's "
             "Binary, Comma or Assign frame",
-            tree().text(opTok), cfg.binaryOps[it->second].target));
+            quotedSourceText(tree().text(opTok)), cfg.binaryOps[it->second].target));
     }
 
     // The COMMA epilogue given the lhs `effect` (the `ExprStmt(lhs)` already
@@ -6977,7 +7027,7 @@ struct Lowerer {
         auto it = unOp_.find(tree().tokenKind(opTok).v);
         if (it == unOp_.end()) {
             unsupported(node, std::format("unary operator '{}' has no hirLowering mapping",
-                                          tree().text(opTok)));
+                                          quotedSourceText(tree().text(opTok))));
             return {errorNode(node), InvalidType};
         }
         HirOperatorEntry const& e = cfg.unaryOps[it->second];
@@ -7352,7 +7402,7 @@ struct Lowerer {
         auto it = postOp_.find(tree().tokenKind(opTok).v);
         if (it == postOp_.end()) {
             unsupported(node, std::format("postfix operator '{}' has no hirLowering mapping "
-                                          "(++/-- deferred to HR9)", tree().text(opTok)));
+                                          "(++/-- deferred to HR9)", quotedSourceText(tree().text(opTok))));
             return {errorNode(node), InvalidType};
         }
         HirOperatorEntry const& e = cfg.postfixOps[it->second];
@@ -8885,7 +8935,7 @@ struct Lowerer {
                     if (!inserted) {   // C 6.8.1: a label name has function scope
                         emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
                               std::format("duplicate label '{}' in this function",
-                                          tree().text(nameTok)));
+                                          quotedSourceText(tree().text(nameTok))));
                     }
                 }
             } else if (m != nullptr && m->hirKind == "GotoStmt") {
@@ -8926,10 +8976,10 @@ struct Lowerer {
                                         "statement expression from outside it — a computed "
                                         "goto would enter the statement expression (GNU C "
                                         "6.1)",
-                                        tree().text(j.nameTok))
+                                        quotedSourceText(tree().text(j.nameTok)))
                           : std::format("goto '{}' jumps into a statement expression it is "
                                         "not inside (GNU C 6.1)",
-                                        tree().text(j.nameTok)));
+                                        quotedSourceText(tree().text(j.nameTok))));
                 if (j.address) refusedAddress.insert(tree().text(j.nameTok));
                 break;
             }
@@ -8984,7 +9034,7 @@ struct Lowerer {
         auto it = labelOrdinals_.find(std::string{tree().text(nameTok)});
         if (it == labelOrdinals_.end()) {        // pre-scan covers every label
             unsupported(node, std::format("label '{}' was not pre-scanned",
-                                          tree().text(nameTok)));
+                                          quotedSourceText(tree().text(nameTok))));
             return false;
         }
         ord = it->second;
@@ -9019,7 +9069,7 @@ struct Lowerer {
         if (it == labelOrdinals_.end()) {   // C 6.8.6.1: goto needs a defined label
             emitH(DiagnosticCode::S_UndefinedLabel, nameTok,
                   std::format("goto target label '{}' is not defined in this function",
-                              tree().text(nameTok)));
+                              quotedSourceText(tree().text(nameTok))));
             return errorNode(node);
         }
         return track(builder.makeGotoStmt(it->second), node);
@@ -9905,7 +9955,7 @@ struct Lowerer {
         }
         emitHAt(diagnosedConversionCode(cls), DiagnosticSeverity::Warning, valueNode,
                 diagnosedConversionSentence(cls, DiagnosedConversionSite::Initialization,
-                                            tree().text(valueNode)));
+                                            quotedSourceText(tree().text(valueNode))));
     }
 
     // The scalar arm of a brace element: lower, report a diagnosed conversion, then
@@ -10898,7 +10948,7 @@ struct Lowerer {
             emitH(DiagnosticCode::S_UndefinedLabel, nameTok,
                   std::format("'&&{}' references label '{}' which is not defined "
                               "in this function",
-                              tree().text(nameTok), tree().text(nameTok)));
+                              quotedSourceText(tree().text(nameTok)), quotedSourceText(tree().text(nameTok))));
             return {errorNode(node), InvalidType};
         }
         TypeId const result = voidPtrType();
@@ -12882,12 +12932,27 @@ struct Lowerer {
     // temps are self-contained (declared + referenced within one SeqExpr/Block),
     // so they need no name table — the `.dsshir` writer falls back to a `%sN`
     // handle and MIR maps them by their VarDecl node, not by an external table.
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N9): the lowerer's synthesized symbols continue the model's
+    // table through the core's cursor, seeded EXPLICITLY past it when the lowerer is made (the model's table does
+    // not grow while it lowers). The `nextSyntheticSym_ == 0` "not yet seeded" sentinel is gone: after a wrap it
+    // re-seeded to the table's end and handed those ids out again. Reconciled with the MIR space by
+    // `keepSymbolIdEndClearOfUnitSymbols` (hir_to_mir).
     [[nodiscard]] SymbolId freshSymbol() {
-        if (nextSyntheticSym_ == 0)
-            nextSyntheticSym_ = static_cast<std::uint32_t>(model.symbols().size());
-        return SymbolId{nextSyntheticSym_++};
+        SymbolId const id = syntheticSymbols_.take();
+        if (!id.valid()) {
+            std::fprintf(stderr, "dss::cst_to_hir fatal: the unit's SymbolId space is exhausted (its end is %u) -- "
+                                 "no synthesized symbol can be minted\n", syntheticSymbols_.value());
+            std::abort();
+        }
+        return id;
     }
-    std::uint32_t nextSyntheticSym_ = 0;
+    SymbolIdEnd syntheticSymbols_ = [this] {
+        SymbolIdEnd end;   // past every id the model's table holds (its slot 0 is the invalid id)
+        end.keepClearOfHighest(model.symbols().empty()
+                                   ? 0u
+                                   : static_cast<std::uint32_t>(model.symbols().size() - 1u));
+        return end;
+    }();
 
     // (`struct Lvalue` is defined up near `ExprFrame`/`AssignCtx`, which embeds it.)
 
@@ -15124,28 +15189,13 @@ struct Lowerer {
                 }
                 continue;
             }
-            // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): AN OBJECT DECLARED IN A BLOCK WITHOUT `extern`
-            // HAS NO LINKAGE (C 6.2.2p6), so its attribute specifiers may give it no BINDING. Read with the
-            // tables its row names (`attributeLinkageOf`) and seeded by its own prefix: a `static` object's
-            // `weak` is the binding conflict that fold already refuses; an automatic one's binding is refused
-            // here. ✔MEASURED (lane `cs` probes wb3, wb4): `weak` on an automatic or a `static` object, through
-            // a plain or a typedef-named head, a for-init declaration and a C23 inferred one, is refused by
-            // gcc 13.3.0, clang 18.1.3, mingw-w64 gcc and Apple clang ("weak declaration of 'x' must be
-            // public"); cl's own text for `selectany` states the rule ("can only be applied to data items with
-            // external linkage"). DSS built them in silence. A visibility there changes nothing (gcc warns it
-            // ignored, clang is silent) and is passed over.
-            if (!asGlobal) {
-                if (std::optional<LinkageAttr> const read = attributeLinkageOf(node, *decl, d, staticLinkage);
-                    read.has_value() && read->binding != staticLinkage.binding) {
-                    auto const* rec = model.recordFor(sym);
-                    emitH(DiagnosticCode::H_UnknownLinkageSpecifier, d,
-                          std::format("'{}' is declared in a block without 'extern', so it has no linkage "
-                                      "(C 6.2.2p6), and an attribute gives it a '{}' binding, which only a "
-                                      "name with external linkage can have",
-                                      rec != nullptr ? rec->name : std::string{},
-                                      symbolBindingName(read->binding)));
-                }
-            }
+            // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9; fold f26d — review-csf26c2 N5): AN OBJECT
+            // DECLARED IN A BLOCK WITHOUT `extern` HAS NO LINKAGE (C 6.2.2p6), so its attribute specifiers give it
+            // no binding and no visibility. The verdict on each one -- refused by name, or ignored and said --
+            // is the semantic tier's no-linkage gate's, read from the attribute's row per object format
+            // (`refusedWithoutLinkage[On]`); it marks every such name, so the lowering folds nothing from this
+            // declarator and gives no second verdict. (Fold f26c2 refused any binding here, for every format
+            // alike: `selectany` on ELF, which gcc 13.3.0 builds, was refused with `weak`.)
             TypeId type = InvalidType;
             if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
             // P69 (lane `cs`): the declaration that survived the merge of an OBJECT
@@ -15785,7 +15835,7 @@ struct Lowerer {
         emitHAt(DiagnosticCode::S_DeclarationDeclaresNothing,
                 dc.emptyDeclarationWarns ? DiagnosticSeverity::Warning
                                          : DiagnosticSeverity::Error,
-                node, std::string{tree().text(node)});
+                node, quotedSourceText(tree().text(node)));
     }
 
     // c35: does composite specifier `n` carry a tag NAME — i.e. is its `name`
@@ -16061,19 +16111,6 @@ struct Lowerer {
         }
         DeclaratorConfig const& dc = *sem.declarators;
         auto vis = declRoleChildren(tree(), node, decl);
-        // The SHARED base: the declaration-specifier prefix, folded once. Each
-        // declarator folds its OWN after-declarator run on top of this below, so
-        // `int a __attribute__((weak)), b;` weakens `a` alone.
-        //
-        // P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): the SAME fold
-        // also answers "is this declaration non-defining?" — see the route
-        // decision below. Reading it out of this walk is the whole point: the
-        // route is selected by the FOLDED SPECIFIER, not by which rule matched.
-        bool prefixNonDefining = false;
-        LinkageAttr const prefixLink =
-            linkageFrom(linkagePrefixRoots(node, decl), decl,
-                        /*staticStorageOut=*/nullptr, /*seed=*/{},
-                        &prefixNonDefining);
         // Function iff the kindByChild discriminator matches (the block
         // tail). bodyPath empty ⇒ the matched node IS the body (the
         // declarator-mode convention — params live in the declarator).
@@ -16092,6 +16129,35 @@ struct Lowerer {
         if (!carrier.has_value() || *carrier >= vis.size()) return;
         std::vector<NodeId> declarators;
         collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        // ★ P69 L2b2 (lane `lm`): NO declarator at all — the empty declaration's one home decides
+        // whether it declares anything (a tag, an enumeration's constants) and how loud it is when not;
+        // a composite head that defines a type still lowers its TypeDecl (`struct P { … };` — the
+        // init-declarator-list is grammar-optional, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION).
+        // ★ P69 (lane `cs`, fold f26d): ASKED BEFORE THE PREFIX'S LINKAGE IS FOLDED. The declaration declares
+        // no entity, so its specifiers fold no linkage — the fold judged two bindings of an object that does
+        // not exist. ✔MEASURED 2026-11-17 (probe tn5b, gcc 13.3.0 and clang 18.1.3, file scope):
+        // `static int __attribute__((weak));`, `__attribute__((weak)) static int;`, `static T
+        // __attribute__((weak));` and `static __attribute__((weak)) T;` each draw the one empty-declaration
+        // warning and no conflict, where DSS refused each ('weak' conflicting with 'local').
+        if (!isFn && declarators.empty()) {
+            NodeId const spec = findCompositeSpecifierIn(node);
+            if (spec.valid()) out.push_back(lowerTypeDecl(spec));
+            reportIfDeclaresNothing(node, spec, dc);
+            return;
+        }
+        // The SHARED base: the declaration-specifier prefix, folded once. Each
+        // declarator folds its OWN after-declarator run on top of this below, so
+        // `int a __attribute__((weak)), b;` weakens `a` alone.
+        //
+        // P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): the SAME fold
+        // also answers "is this declaration non-defining?" — see the route
+        // decision below. Reading it out of this walk is the whole point: the
+        // route is selected by the FOLDED SPECIFIER, not by which rule matched.
+        bool prefixNonDefining = false;
+        LinkageAttr const prefixLink =
+            linkageFrom(linkagePrefixRoots(node, decl), decl,
+                        /*staticStorageOut=*/nullptr, /*seed=*/{},
+                        &prefixNonDefining);
 
         if (isFn) {
             // A definition has exactly one declarator, so "the declarator's run"
@@ -16123,28 +16189,15 @@ struct Lowerer {
             return;
         }
 
-        // No-object declaration: a top-level head that declares ONLY a type,
-        // with no init-declarator-list (`struct P { … };` / `union U { … };` /
-        // `enum E { … };`). The init-declarator-list is grammar-optional
-        // (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION folded the bare top-level
-        // composite definitions into topLevelDecl), so `declarators` is empty
-        // here. Emit a TypeDecl from the head's composite-body node — the same
-        // HirKind the retired structDecl/unionDecl/enumDecl rules produced (so
-        // the type registers in HIR exactly as before).
+        // A declaration with NO declarator was decided above, before the prefix fold. Here every
+        // declarator may still be ABSTRACT (`int *;`): a composite head then lowers its TypeDecl
+        // from its body node, the HirKind the retired structDecl/unionDecl/enumDecl rules produced.
         bool hasNamedDeclarator = false;
         for (NodeId d : declarators) {
             if (declaratorNameNode(tree(), d, dc).valid()) {
                 hasNamedDeclarator = true;
                 break;
             }
-        }
-        if (!hasNamedDeclarator && declarators.empty()) {
-            // ★ P69 L2b2 (lane `lm`): NO declarator at all — the empty declaration's one
-            // home decides whether it declares anything, and how loud it is when not.
-            NodeId const spec = findCompositeSpecifierIn(node);
-            if (spec.valid()) out.push_back(lowerTypeDecl(spec));
-            reportIfDeclaresNothing(node, spec, dc);
-            return;
         }
         if (!hasNamedDeclarator) {
             // ABSTRACT declarators only (`int *;`): no empty declaration — every reference
@@ -16176,7 +16229,7 @@ struct Lowerer {
                 // analyzer's requireNamedDeclarators arm.
                 // D-CSUBSET-STRUCT-BODY-VARDECL-POSITION.
                 emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
-                      std::string{tree().text(node)});
+                      quotedSourceText(tree().text(node)));
             }
             return;
         }
@@ -17067,7 +17120,7 @@ struct Lowerer {
             // Fail loud on a malformed escape (`extern void f() "k\xZZ.dll";`) — a
             // silent fallback to the format default would hide the bad override.
             emitH(DiagnosticCode::H_ExternDeclMalformed, c,
-                  std::string{tree().text(c)});
+                  quotedSourceText(tree().text(c)));
             return {};
         }
         return {};

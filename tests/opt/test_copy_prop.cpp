@@ -60,6 +60,7 @@ TEST(CopyProp, DiamondSameValueCollapsesPhi) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -121,6 +122,7 @@ TEST(CopyProp, DiamondDifferentValuesPhiPreserved) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -160,6 +162,7 @@ TEST(CopyProp, TransitiveChainCollapses) {
 
     // entry -> {tA, fA} -> join1 -> {tB, fB} -> join2 -> return
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tA = mb.createBlock(StructCfMarker::IfThen);
@@ -315,6 +318,7 @@ TEST(CopyProp, MultiFunctionModuleEachCollapsedIndependently) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // Build TWO functions, each with one collapsible diamond Phi.
     for (std::uint32_t fnIdx = 0; fnIdx < 2; ++fnIdx) {
         mb.addFunction(fnSig, SymbolId{100u + fnIdx});

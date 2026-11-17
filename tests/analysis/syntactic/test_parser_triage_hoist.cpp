@@ -238,8 +238,8 @@ struct Synth {
     {4}
     "identifierToken": "Identifier",
     "declarations": [
-      {{ "rule": "vardecl",   "name": 1, "kind": "variable"{5} }},
-      {{ "rule": "aliasdecl", "name": 1, "kind": "type" }}
+      {{ "rule": "vardecl",   "name": 1, "kind": "variable", "linkage": "none"{5} }},
+      {{ "rule": "aliasdecl", "name": 1, "kind": "type", "linkage": "none" }}
     ]
   }}
 }})JSON",

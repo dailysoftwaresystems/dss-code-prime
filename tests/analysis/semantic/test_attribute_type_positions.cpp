@@ -632,7 +632,8 @@ TEST(AttributeTypePositions, ACallingConventionNameWithNoPairInScopeIsRefusedByN
 //              a per-function convention is not something this compiler emits;
 //   UNKNOWN  — no id is known to the target at all: an unknown word, warned
 //              (`aarch64_vector_pcs` on x86-64, where every reference ignores it).
-// The whole matrix, seven names on the five shipped pairs (Mach-O x86_64's `sysv_amd64_darwin`, Apple's
+// The whole matrix, thirteen names on the five shipped pairs (the six after `aarch64_vector_pcs` are the
+// convention-name census of fold f26d, ruling 620, each answer MEASURED by probe f8) (Mach-O x86_64's `sysv_amd64_darwin`, Apple's
 // realization of SysV, answers as Linux's SysV does: P69 lane `cs`, fold f26c, main's ledger 454).
 //
 // RED-ON-DISABLE, one per answer: drop the "is the active convention" test and
@@ -659,14 +660,20 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
     constexpr Answer A = Answer::Active;
     constexpr Answer F = Answer::Foreign;
     constexpr Answer U = Answer::Unknown;
-    constexpr Name kNames[7] = {
+    constexpr Name kNames[13] = {
         {"ms_abi", {F, F, A, F, F}},
         {"sysv_abi", {A, A, F, U, U}},
         {"vectorcall", {F, F, F, U, U}},
         {"regcall", {F, F, F, U, U}},
         {"preserve_most", {F, F, F, F, F}},
         {"preserve_all", {F, F, F, F, F}},
-        {"aarch64_vector_pcs", {U, U, U, F, F}}};
+        {"aarch64_vector_pcs", {U, U, U, F, F}},
+        {"swiftcall", {F, F, F, F, F}},
+        {"swiftasynccall", {F, F, F, F, F}},
+        {"preserve_none", {F, F, F, F, F}},
+        {"intel_ocl_bicc", {F, F, F, U, U}},
+        {"no_caller_saved_registers", {F, F, F, U, U}},
+        {"aarch64_sve_pcs", {U, U, U, F, F}}};
     // ★ P69 (lane `cs`, fold f26c2; main's feature-query item): the matrix's names ARE the table's -- every name a
     // `callingConvention` row states is asked below and nothing else is, so a row added tomorrow is red here until
     // its five answers (each a measurement of the references) are written into `kNames`.
@@ -741,8 +748,8 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
     }
     // The matrix exercises every answer (a table that lost one would still pass).
     EXPECT_EQ(seen[static_cast<std::size_t>(A)], 3u);
-    EXPECT_EQ(seen[static_cast<std::size_t>(F)], 23u);
-    EXPECT_EQ(seen[static_cast<std::size_t>(U)], 9u);
+    EXPECT_EQ(seen[static_cast<std::size_t>(F)], 46u);
+    EXPECT_EQ(seen[static_cast<std::size_t>(U)], 16u);
 }
 
 // A CONVENTION ID OF THE LANGUAGE'S TABLE THAT NO SHIPPED TARGET KNOWS would select

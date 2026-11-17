@@ -2074,9 +2074,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // this block accepts, `bitFieldStrategy` silently absent. A message narrower
     // than its own check tells an author, by name, that a key the loader takes
     // is not allowed.
-    static constexpr std::array<std::string_view, 4> kAggregateLayoutKeys{
+    static constexpr std::array<std::string_view, 5> kAggregateLayoutKeys{
         "scalarAlignment", "maxAlignment", "maxRequestedAlignment",
-        "bitFieldStrategy"};
+        "bitFieldStrategy", "bitPreciseChunk"};
     DSS_CHECK_KEY_VOCABULARY(kAggregateLayoutKeys);
     if (doc.contains("aggregateLayout")) {
         auto const& al = doc.at("aggregateLayout");
@@ -2186,6 +2186,34 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 } else {
                     data.aggregateLayout.maxRequestedAlignment =
                         static_cast<std::uint32_t>(v);
+                }
+            }
+            // ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+            // the CHUNK a `_BitInt(N)` of N > 64 is made of — its alignment and its size
+            // granule (`AggregateLayoutParams::bitPreciseChunk`). REQUIRED, for
+            // `maxAlignment`'s reason: the x86-64 psABI says 8 and AAPCS64 says 16, so a
+            // default is one ABI chosen for the other. A chunk holds whole 64-bit limbs (at
+            // least 8) and no more than the ISA's fundamental alignment.
+            if (!al.contains("bitPreciseChunk")
+                || !al.at("bitPreciseChunk").is_number_integer()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/aggregateLayout/bitPreciseChunk",
+                          "missing required 'bitPreciseChunk' integer (the alignment, and "
+                          "the size granule, of a _BitInt wider than 64 bits: a power of "
+                          "two in [8, maxAlignment])");
+                ok = false;
+            } else {
+                auto const v = al.at("bitPreciseChunk").get<std::int64_t>();
+                if (v < 8 || (v & (v - 1)) != 0
+                    || v > static_cast<std::int64_t>(data.aggregateLayout.maxAlignment)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/aggregateLayout/bitPreciseChunk",
+                              std::format("bitPreciseChunk {} must be a power of two in "
+                                          "[8, maxAlignment {}]",
+                                          v, data.aggregateLayout.maxAlignment));
+                    ok = false;
+                } else {
+                    data.aggregateLayout.bitPreciseChunk = static_cast<std::uint32_t>(v);
                 }
             }
             // FC8 bitfields (D-CSUBSET-BITFIELD): OPTIONAL bit-field packing

@@ -1,1 +1,1 @@
-            if (false && isGprInReg && beginsAnEvenGprPair(t, numGp)) {
+            if (false && isGprInReg && need.evenPair) {

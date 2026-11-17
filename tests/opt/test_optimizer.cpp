@@ -450,6 +450,7 @@ Mir buildAliasArcStrictCapstoneMir(TypeInterner& interner) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     // Match the c config: strictAliasingOnDistinctTypes=true
     // + charTypesAliasAll=true. The capstone exercises Rule 6 (not
     // Rule 5), so charTypesAliasAll's value doesn't gate the
@@ -943,6 +944,7 @@ TEST(Optimizer, EffectivenessSDivSurvivesShippedReleasePipeline) {
         TypeId const params[] = {i32, i32};
         TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
         MirBuilder b;
+        b.stateArgCounting(MirArgCounting::PerClass);
         b.addFunction(fnSig, SymbolId{100},
                       SymbolBinding::Global, SymbolVisibility::Default);
         MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -1011,6 +1013,7 @@ TEST(Optimizer, EffectivenessUDivSurvivesShippedReleasePipeline) {
         TypeId const params[] = {i32, i32};
         TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
         MirBuilder b;
+        b.stateArgCounting(MirArgCounting::PerClass);
         b.addFunction(fnSig, SymbolId{100},
                       SymbolBinding::Global, SymbolVisibility::Default);
         MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -1060,6 +1063,7 @@ TEST(Optimizer, EffectivenessSModSurvivesShippedReleasePipeline) {
         TypeId const params[] = {i32, i32};
         TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
         MirBuilder b;
+        b.stateArgCounting(MirArgCounting::PerClass);
         b.addFunction(fnSig, SymbolId{100},
                       SymbolBinding::Global, SymbolVisibility::Default);
         MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -1223,6 +1227,7 @@ TEST(Optimizer, ShippedReleasePipelineCompilesBothProbeShapes) {
         TypeId const recSig  = interner.fnSig(params, i32, CallConv::CcSysV);
         TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder b;
+        b.stateArgCounting(MirArgCounting::PerClass);
         b.addFunction(recSig, SymbolId{50},
                       SymbolBinding::Global, SymbolVisibility::Default);
         MirBlockId const rEntry = b.createBlock(StructCfMarker::EntryBlock);
@@ -1275,6 +1280,7 @@ TEST(Optimizer, ShippedReleasePipelineCompilesBothProbeShapes) {
         TypeId const fSig    = interner.fnSig(params, i32, CallConv::CcSysV);
         TypeId const mainSig = interner.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder b;
+        b.stateArgCounting(MirArgCounting::PerClass);
         b.addFunction(fSig, SymbolId{50},
                       SymbolBinding::Global, SymbolVisibility::Default);
         MirBlockId const fEntry  = b.createBlock(StructCfMarker::EntryBlock);
@@ -1419,6 +1425,7 @@ TEST(Optimizer, PromotedVaListArrivesAtTheCallOperandWithItsDeclaredPointee) {
     TypeId const callerSig = interner.fnSig(callerParams, i32, CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     // The callee is EXTERNALLY VISIBLE and its body is deliberately non-trivial-
     // looking; what actually keeps the call alive under this pipeline is that
     // `full-release-like` runs no Inlining at all.

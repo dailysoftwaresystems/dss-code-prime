@@ -1,0 +1,2 @@
+    {"src/link/linker.cpp", "linker: a GOT slot"},
+    {"src/link/linker.cpp", "linker: a slot no pass takes"},

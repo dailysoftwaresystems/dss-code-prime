@@ -336,6 +336,10 @@ TEST(TypeKindVocabulary, TheCoreFieldAcceptsExactlyTheTwentyPrimitiveSpellings) 
            "them is silently not being tested";
 
     auto doc = shippedLanguageDoc("c");
+    // The type-spelling table must spell every kind the document's rows reach, so a row's `core` turned into a
+    // kind the table has no word for (F16) would be refused for THAT reason, not by the `core` field's filter
+    // this pin asks. The table is erased: an absent table loads, and the filter is asked alone.
+    doc["semantics"].erase("typeSpelling");
     // The pointer must RESOLVE, or both halves below probe nothing.
     auto& core = at(doc, kCorePointer, "semantics.builtinTypes[0].core");
     ASSERT_TRUE(core.is_string())

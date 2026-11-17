@@ -3,7 +3,7 @@
 #include "core/types/extern_import.hpp"      // ExternKindOrigin
 #include "core/types/parse_diagnostic.hpp"   // DiagnosticCode
 #include "link/branch_sites.hpp"             // BranchSites, isBranchReference
-#include "link/fresh_symbol_ids.hpp"         // maxExistingSymbolIdV
+#include "link/fresh_symbol_ids.hpp"         // ModuleSymbolIds
 
 #include <cstddef>
 #include <cstdint>
@@ -131,15 +131,9 @@ bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
     for (std::size_t ui = 0; ui < units.size(); ++ui) {
         if (found[ui].empty()) continue;
         AssembledModule& u = out[ui];
-        std::uint32_t maxV = maxExistingSymbolIdV(u);
+        ModuleSymbolIds ids{u};
         auto const mint = [&]() -> std::optional<SymbolId> {
-            if (maxV == std::numeric_limits<std::uint32_t>::max()) {
-                report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
-                       "linker: SymbolId space exhausted binding a unit to an import's "
-                       "call entry.");
-                return std::nullopt;
-            }
-            return SymbolId{++maxV};
+            return ids.take(reporter, "linker: an import's call entry a unit is bound to");
         };
         std::unordered_map<std::uint32_t, SymbolId> entryOf;   // import symbol -> its call entry
         for (auto const& [row, site] : found[ui]) {

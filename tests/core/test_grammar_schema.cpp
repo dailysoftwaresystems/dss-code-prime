@@ -28,6 +28,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -3513,10 +3514,17 @@ TEST(GrammarSchema, AttributeVocabularyRowClaimingNothingAboutAttrsIsExempt) {
 // `stdAttr` wholesale — flipped the old gate on and demanded six more names be
 // added to a silence list that could never be consulted. A guard whose remedy
 // is "silence more things" teaches the wrong lesson even when it is right.
+//
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): a row whose own fold skips its attribute
+// rules states which table reads its attribute specifiers, or the load refuses it (no table
+// would: `EveryRowsAttributeSpecifiersAreReadByOneTableAndTheLoadSaysWhich`). The shipped
+// `varDecl` names `externDecl`'s (`attributeLinkageTablesFrom`); this one-row fixture states
+// `"linkage": "none"`, which leaves the vocabulary question below exactly as it was.
 TEST(GrammarSchema, AttributeVocabularyRowIgnoringAttrRulesWholesaleIsExempt) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects,
-        R"("linkageSpecifierIgnoredNames": ["restrict"],
+        R"("linkage": "none",
+           "linkageSpecifierIgnoredNames": ["restrict"],
            "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_TRUE(r.has_value())
@@ -3534,10 +3542,11 @@ TEST(GrammarSchema, AttributeVocabularyRowIgnoringAttrRulesWholesaleIsExempt) {
 // the derivation applies to every row whose strict scan runs, which is a simpler
 // rule and a stricter one (tier 3's documented reachability hole — a row that
 // mentions no attribute rule and ignores nothing by name — closed with it).
+// (P69 fold f26d, N5: the row states its reader, `"linkage": "none"`, as (ii) does.)
 TEST(GrammarSchema, AttributeVocabularyPartialWholesaleSkipStillGetsTheDerivation) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects,
-        R"("linkageSpecifierIgnoredRules": ["attrSpec"],)", "");
+        R"("linkage": "none", "linkageSpecifierIgnoredRules": ["attrSpec"],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
     EXPECT_TRUE(ignoresName((*r)->semantics().declarations[0], "deprecated"))
@@ -4152,7 +4161,7 @@ namespace {
           { "rule": "vdecl", "name": 0, "kind": "variable",
             "specifierPrefix": "vprefix",
             "linkageSpecifiers": { %LINKEXTRA%"st": { "binding": "local" } } },
-          { "rule": "spec", "name": 0, "kind": "type", "definesWhenChild": "body" }
+          { "rule": "spec", "name": 0, "kind": "type", "definesWhenChild": "body", "linkage": "none" }
         ],
         "references": [ { "rule": "spec" } ],
         "attributeSemantics": {
@@ -4180,6 +4189,12 @@ constexpr std::string_view kTwoSpellings =
                         "afterCompositeBody": "declaration" } ],)";
 constexpr std::string_view kInertEffects =
     R"([ { "names": ["fallthrough"], "effect": "none" } ])";
+// The effects row a linkage table's `ds(thread)` key is judged through. ★ P69 (lane `cs`, fold
+// f26d — review-csf26c2 N5): a table entry keyed by an attribute's name loads only beside the
+// row that names the attribute (the declaration-kind and no-linkage gates judge the clause
+// through it), so every fixture keying `ds(thread)` states one.
+constexpr std::string_view kThreadEffects =
+    R"J([ { "names": ["ds(thread)"], "appliesTo": ["variable"], "effect": "none" } ])J";
 
 struct LoadRefusal {
     char const*    what;
@@ -4296,7 +4311,7 @@ TEST(GrammarSchema, AttributeSpellingsAndTheirQualifiedRowsReachConfig) {
     EXPECT_TRUE((*bare)->semantics().attributeSpellings.empty());
     // CONTROL: a thread-storage effect that does not say it yields does not yield.
     auto firm = GrammarSchema::loadFromText(attrSpellingsSchema(
-        kTwoSpellings, kInertEffects,
+        kTwoSpellings, kThreadEffects,
         R"J("ds(thread)": { "threadStorage": true },)J"));
     ASSERT_TRUE(firm.has_value()) << errorDiags(firm.error());
     for (auto const& d : (*firm)->semantics().declarations) {
@@ -4465,7 +4480,8 @@ TEST(GrammarSchema, AParenthesizedTableKeyMustBeQualifiedByADeclaredSpelling) {
     // CONTROLS: the well-formed qualified name loads in both tables.
     auto e = GrammarSchema::loadFromText(effectsNamed("ds(thread)"));
     ASSERT_TRUE(e.has_value()) << errorDiags(e.error());
-    auto l = GrammarSchema::loadFromText(linkageKeyed(kTwoSpellings, "ds(thread)"));
+    auto l = GrammarSchema::loadFromText(attrSpellingsSchema(
+        kTwoSpellings, kThreadEffects, R"J("ds(thread)": { "threadStorage": true },)J"));
     ASSERT_TRUE(l.has_value()) << errorDiags(l.error());
 }
 
@@ -5652,6 +5668,14 @@ TEST(GrammarSchema, PerModeTokensMapDollarLexemeIsHonored) {
 // `$linkageSpecifiersComment` already does exactly that.
 TEST(GrammarSchema, LinkageSpecifiersMapDollarKeyIsASpecifierNotAComment) {
     auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
+    // The specifier is a LEXEME of the language (P69 fold f26d, N5: a key that is no lexeme's
+    // spelling is an attribute's name, judged through its effects row) — so the key below is
+    // the source text of a real token, as the shipped c's keys are.
+    constexpr std::string_view kTokens = R"("tokens": {)";
+    auto const tokensAt = cfg.find(kTokens);
+    ASSERT_NE(tokensAt, std::string::npos);
+    cfg.insert(tokensAt + kTokens.size(), R"(
+        "$st": [{ "kind": "DollarSt" }],)");
     constexpr std::string_view kNeedle =
         R"("linkageSpecifiers": { "st": { "binding": "local" } })";
     auto const pos = cfg.find(kNeedle);
@@ -8607,6 +8631,16 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
     }
     EXPECT_GT(unsupportedPlain, 0u) << "the loop asked no plain `unsupported` name";
     EXPECT_GT(unsupportedQualified, 0u) << "the loop asked no qualified `unsupported` name";
+    // ★ P69 (lane `cs`, fold f26d -- main's ledger 600): the loop asks every refused row its reason, but only a NAME
+    // asks that a refused request IS a row. The two the shipped document refuses by spelling, one of each spelling,
+    // are asked by name: a deleted or misspelled row leaves the request warned as unknown, and an `allocate`
+    // placement silently does not happen (fold f26c2 had folded this list into the loop, and the arm that deletes
+    // `__declspec(allocate)`'s row then reddened nothing here).
+    for (char const* name : {"naked", "__declspec(allocate)"}) {
+        AttributeSemanticsRow const* const row = rowNamed(name);
+        ASSERT_NE(row, nullptr) << name << " is a row of the shipped document";
+        EXPECT_EQ(row->effect, AttributeEffect::Unsupported) << name;
+    }
     for (char const* name : {"__declspec(dllimport)", "__declspec(dllexport)",
                              "__declspec(restrict)", "__declspec(noalias)",
                              "__declspec(thread)"}) {
@@ -8637,9 +8671,13 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
     // ignored and said (mingw-w64 gcc's reading, lane `cs` probe dl).
     EXPECT_FALSE(dllimport->ignoredOnInlineDefinition.empty());
 
-    // The thread-storage request of the qualified spelling: every row that can
-    // declare an object carries it, and on each it yields to a declaration of the
-    // same object that does not make it.
+    // The thread-storage request of the qualified spelling: every row whose OWN fold
+    // reads its attribute specifiers carries it, and on each it yields to a
+    // declaration of the same object that does not make it. ★ P69 (fold f26d —
+    // review-csf26c2 N5): the block rows (`varDecl` and the rows like it) read theirs
+    // through the table `attributeLinkageTablesFrom` names, `externDecl`'s, so an
+    // entry of their own would never be read — the load refuses one
+    // (`EveryRowsAttributeSpecifiersAreReadByOneTableAndTheLoadSaysWhich`).
     std::vector<std::string> carriers;
     for (auto const& d : sem.declarations) {
         auto const it = d.linkageSpecifiers.find("__declspec(thread)");
@@ -8651,9 +8689,8 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
     }
     std::ranges::sort(carriers);
     EXPECT_EQ(carriers,
-              (std::vector<std::string>{"autoInferredTopLevelDecl",
-                                        "autoInferredVarDecl", "externDecl",
-                                        "topLevelDecl", "varDecl"}));
+              (std::vector<std::string>{"autoInferredTopLevelDecl", "externDecl",
+                                        "topLevelDecl"}));
     // CONTROL: the keyword forms of thread storage do NOT yield — two declarations
     // that disagree through them stay the constraint violation they are.
     std::size_t firm = 0;
@@ -10124,4 +10161,259 @@ TEST(GrammarSchema, ARowTakesAnotherRowsLinkageTablesAndStatesOnlyWhatDiffers) {
             EXPECT_TRUE(said) << says << " -- " << errorDiags(r.error());
         }
     }
+}
+
+// ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): EVERY ROW'S ATTRIBUTE SPECIFIERS ARE READ BY ONE TABLE, AND
+// THE LOAD SAYS WHICH. A hand-built language with a file-scope row whose own fold reads its attribute specifiers
+// (`vdecl`), a block row that borrows its table (`bdecl`), and %THIRD% a row under test; each refusal names the row
+// and why, so a document that fails for another reason is red.
+// RED-ON-DISABLE: drop the UNREAD refusal and the `param`-shaped row loads, its specifiers read by nobody; drop the
+// token's reader and `"linkage": "none"` is refused as an unknown key; drop a contradiction arm and its document
+// loads with two answers.
+namespace {
+[[nodiscard]] std::string attributeTablesSchema(std::string_view third, std::string_view effects,
+                                                std::string_view spellings = "",
+                                                std::string_view vdeclExtra = "") {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "AttrTables", "version": "0.1.0" },
+      "tokens": {
+        " ": [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "(": [{ "kind": "ParenOpen" }],
+        ")": [{ "kind": "ParenClose" }],
+        "[": [{ "kind": "BracketOpen" }],
+        "]": [{ "kind": "BracketClose" }],
+        "{": [{ "kind": "BlockOpen" }],
+        "}": [{ "kind": "BlockClose" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      "keywords": [ { "word": "st", "kind": "StKw" }, { "word": "pk", "kind": "PkKw" } ],
+      "shapes": {
+        "root":     { "sequence": [ { "repeat": { "alt": [ "vdecl", "blk", "pdecl" ] } } ] },
+        "vdecl":    { "sequence": [ "vprefix", "Identifier", "Semi" ] },
+        "blk":      { "sequence": [ "BlockOpen", { "repeat": "bdecl" }, "BlockClose" ] },
+        "bdecl":    { "sequence": [ "vprefix", "Identifier", "Semi" ] },
+        "pdecl":    { "sequence": [ "PkKw", "vprefix", "Identifier", "Semi" ] },
+        "vprefix":  { "sequence": [ { "repeat": { "alt": [ "StKw", "attrSpec", "stdAttr" ] } } ] },
+        "attrSpec": { "sequence": [ "ParenOpen", "Identifier", "ParenClose" ] },
+        "stdAttr":  { "sequence": [ "BracketOpen", "BracketOpen", "Identifier", "BracketClose", "BracketClose" ] },
+        "bare":     { "sequence": [ "Semi" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "declarations": [
+          { "rule": "vdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix",
+            %VDECL%
+            "linkageSpecifiers": { "st": { "binding": "local" },
+                                   "wk": { "binding": "weak", "weakKind": "overridable" } } },
+          { "rule": "bdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix",
+            "linkageSpecifiers": { "st": { "binding": "local" } },
+            "linkageSpecifierIgnoredRules": [ "attrSpec", "stdAttr" ],
+            "attributeLinkageTablesFrom": "vdecl" }%THIRD%
+        ],
+        "attributeSemantics": {
+          %SPELLINGS%
+          "attrSpecRule":      "attrSpec",
+          "stdAttrRule":       "stdAttr",
+          "bareStatementRule": "bare",
+          "effects": %EFFECTS%
+        }
+      }
+    })JSON";
+    cfg.replace(cfg.find("%VDECL%"), 7, vdeclExtra);
+    cfg.replace(cfg.find("%THIRD%"), 7, third);
+    cfg.replace(cfg.find("%SPELLINGS%"), 11, spellings);
+    cfg.replace(cfg.find("%EFFECTS%"), 9, effects);
+    return cfg;
+}
+constexpr std::string_view kWeakEffect =
+    R"([ { "names": ["wk"], "appliesTo": ["variable"], "effect": "none" } ])";
+constexpr std::string_view kNoLinkageThird =
+    R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix", "linkage": "none" })";
+} // namespace
+
+TEST(GrammarSchema, EveryRowsAttributeSpecifiersAreReadByOneTableAndTheLoadSaysWhich) {
+    // THE POSITIVE HALF: the three answers, each row's table, the verdict keys and the claimed namespaces.
+    {
+        auto const r = GrammarSchema::loadFromText(attributeTablesSchema(
+            kNoLinkageThird,
+            R"([ { "names": ["wk"], "appliesTo": ["variable"], "effect": "none",
+                   "refusedWithoutLinkage": "only a linked name is weak", "refusedWithoutLinkageOn": ["pe", "macho"] } ])",
+            R"("spellings": [ { "introducer": "ParenOpen", "standardNamespaces": ["gv"] } ],)"));
+        ASSERT_TRUE(r.has_value()) << (r.has_value() ? "" : errorDiags(r.error()));
+        SemanticConfig const& sem = (*r)->semantics();
+        ASSERT_EQ(sem.declarations.size(), 3u);
+        AttributeTableOfRow const v = attributeTableOf(sem, sem.declarations[0]);
+        AttributeTableOfRow const b = attributeTableOf(sem, sem.declarations[1]);
+        AttributeTableOfRow const p = attributeTableOf(sem, sem.declarations[2]);
+        EXPECT_EQ(v.answer, AttributeTableAnswer::Own);
+        EXPECT_EQ(v.table, &sem.declarations[0]) << "the row's own";
+        EXPECT_EQ(b.answer, AttributeTableAnswer::Borrowed);
+        EXPECT_EQ(b.table, &sem.declarations[0]) << "the named row's";
+        EXPECT_EQ(p.answer, AttributeTableAnswer::NoLinkage);
+        EXPECT_EQ(p.table, nullptr);
+        EXPECT_TRUE(sem.declarations[2].declaresNoLinkage);
+        ASSERT_EQ(sem.attributeEffects.size(), 1u);
+        EXPECT_EQ(sem.attributeEffects[0].refusedWithoutLinkage, "only a linked name is weak");
+        EXPECT_EQ(sem.attributeEffects[0].refusedWithoutLinkageOn,
+                  (std::vector<ObjectFormatKind>{ObjectFormatKind::Pe, ObjectFormatKind::MachO}))
+            << "sorted";
+        EXPECT_TRUE(linkageFacetsOfAttribute(sem, sem.attributeEffects[0]).linkage) << "vdecl's table keys `wk`";
+        ASSERT_EQ(sem.attributeSpellings.size(), 1u);
+        EXPECT_EQ(sem.attributeSpellings[0].standardNamespaces, std::vector<std::string>{"gv"});
+    }
+    // THE REFUSALS, each naming why.
+    std::vector<LoadRefusal> const rows{
+        {"a row whose own table skips the attribute rule and that borrows none and states no token (c's `param` "
+         "shape) -- its specifiers are read by nobody",
+         attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix",
+            "linkageSpecifiers": { "st": { "binding": "local" } },
+            "linkageSpecifierIgnoredRules": [ "attrSpec", "stdAttr" ] })", kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "the 'pdecl' row has attribute specifiers no table reads"},
+        {"a row with no table at all, no borrow, no token",
+         attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix" })", kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "the 'pdecl' row has attribute specifiers no table reads"},
+        {"the token beside a borrowed table",
+         attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix", "linkage": "none",
+            "attributeLinkageTablesFrom": "vdecl" })", kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "states \"linkage\": \"none\" beside a table"},
+        {"the token beside the row's own fold",
+         attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix", "linkage": "none",
+            "linkageSpecifiers": { "st": { "binding": "local" } } })", kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "states \"linkage\": \"none\" beside a table"},
+        {"a borrowed table beside the row's own fold",
+         attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix",
+            "linkageSpecifiers": { "st": { "binding": "local" } }, "attributeLinkageTablesFrom": "vdecl" })",
+                               kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "reads its attribute specifiers in its own fold and also names"},
+        {"a misspelled token value", attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix", "linkage": "nil" })",
+                                                           kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "'linkage' takes the one value"},
+        {"an attribute-keyed entry on a row whose specifiers another table reads",
+         attributeTablesSchema(R"(,
+          { "rule": "pdecl", "name": 0, "kind": "variable", "specifierPrefix": "vprefix",
+            "linkageSpecifiers": { "st": { "binding": "local" },
+                                   "wk": { "binding": "weak", "weakKind": "overridable" } },
+            "linkageSpecifierIgnoredRules": [ "attrSpec", "stdAttr" ], "attributeLinkageTablesFrom": "vdecl" })",
+                               kWeakEffect),
+         DiagnosticCode::C_InvalidSemantics, "another table reads this row's attribute specifiers"},
+        {"an attribute-keyed entry no effects row names",
+         attributeTablesSchema(kNoLinkageThird, R"([ { "names": ["zz"], "appliesTo": ["variable"], "effect": "none" } ])"),
+         DiagnosticCode::C_InvalidSemantics, "linkage specifier 'wk' is keyed by an attribute's name"},
+        {"`refusedWithoutLinkage` on a row no table keys a binding under",
+         attributeTablesSchema(kNoLinkageThird, R"([ { "names": ["wk"], "appliesTo": ["variable"], "effect": "none" },
+             { "names": ["zz"], "appliesTo": ["variable"], "effect": "none", "refusedWithoutLinkage": "never" } ])"),
+         DiagnosticCode::C_InvalidSemantics, "nothing would ever be refused"},
+        {"`refusedWithoutLinkage` on a row with no kind axis (the declaration-kind gate reads it)",
+         attributeTablesSchema(kNoLinkageThird, R"([ { "names": ["wk"], "effect": "none",
+                   "refusedWithoutLinkage": "only a linked name is weak" } ])"),
+         DiagnosticCode::C_InvalidSemantics, "'refusedWithoutLinkage' is read by the declaration-kind gate"},
+        {"`refusedWithoutLinkageOn` with no `refusedWithoutLinkage`",
+         attributeTablesSchema(kNoLinkageThird, R"([ { "names": ["wk"], "appliesTo": ["variable"], "effect": "none",
+                   "refusedWithoutLinkageOn": ["pe"] } ])"),
+         DiagnosticCode::C_InvalidSemantics, "this row states no 'refusedWithoutLinkage'"},
+        {"`refusedWithoutLinkageOn` naming no object format",
+         attributeTablesSchema(kNoLinkageThird, R"([ { "names": ["wk"], "appliesTo": ["variable"], "effect": "none",
+                   "refusedWithoutLinkage": "x", "refusedWithoutLinkageOn": ["coff"] } ])"),
+         DiagnosticCode::C_InvalidSemantics, "'coff' is not an object format a build can have"},
+        {"a claimed namespace written with its dunders",
+         attributeTablesSchema(kNoLinkageThird, kWeakEffect,
+                               R"("spellings": [ { "introducer": "ParenOpen", "standardNamespaces": ["__gv__"] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'__gv__' is not a namespace name"},
+        {"an empty list of claimed namespaces",
+         attributeTablesSchema(kNoLinkageThird, kWeakEffect,
+                               R"("spellings": [ { "introducer": "ParenOpen", "standardNamespaces": [] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'standardNamespaces' must be a non-empty"},
+        {"one namespace claimed twice",
+         attributeTablesSchema(kNoLinkageThird, kWeakEffect,
+                               R"("spellings": [ { "introducer": "ParenOpen", "standardNamespaces": ["gv", "gv"] } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'gv' is already claimed"},
+    };
+    expectEachRefused(rows);
+}
+
+// ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): THE SHIPPED c DOCUMENT, WALKED. Every declaration row answers
+// the accessor as the N5 home audit's table says (a row added later fails here until its answer is written), the
+// GNU spelling claims the `gnu` namespace, the two linkage attributes whose verdicts differ on an object without
+// linkage say so, and the document without `param`'s token is refused by name -- the refusal's negative cell on the
+// shipped data.
+TEST(GrammarSchema, TheShippedCRowsEachNameTheTableThatReadsTheirAttributeSpecifiers) {
+    auto const shipped = dss::test_support::shippedSchemaOrThrow("c");
+    SemanticConfig const& sem = shipped->semantics();
+    std::map<std::string, AttributeTableAnswer, std::less<>> const expected{
+        {"topLevelDecl", AttributeTableAnswer::Own},           {"externDecl", AttributeTableAnswer::Own},
+        {"autoInferredTopLevelDecl", AttributeTableAnswer::Own},
+        {"varDecl", AttributeTableAnswer::Borrowed},           {"identVarDecl", AttributeTableAnswer::Borrowed},
+        {"forDecl", AttributeTableAnswer::Borrowed},           {"forIdentDecl", AttributeTableAnswer::Borrowed},
+        {"autoInferredVarDecl", AttributeTableAnswer::Borrowed},
+        {"autoInferredForDecl", AttributeTableAnswer::Borrowed},
+        {"param", AttributeTableAnswer::NoLinkage},            {"typedefDecl", AttributeTableAnswer::NoLinkage},
+        {"structSpec", AttributeTableAnswer::NoLinkage},       {"unionSpec", AttributeTableAnswer::NoLinkage},
+        {"enumSpec", AttributeTableAnswer::NoLinkage},         {"structField", AttributeTableAnswer::NoLinkage},
+        {"unionField", AttributeTableAnswer::NoLinkage},       {"enumerator", AttributeTableAnswer::NoLinkage},
+        // the typedef-named EMPTY declarations (`const T;`, `T;`, and their for-init twins): they declare no
+        // entity, so their rows state "linkage": "none"
+        {"typeNameEmptyDecl", AttributeTableAnswer::NoLinkage},
+        {"typeNameEmptyForDecl", AttributeTableAnswer::NoLinkage},
+        {"typeNameBareEmptyDecl", AttributeTableAnswer::NoLinkage},
+        {"typeNameBareEmptyForDecl", AttributeTableAnswer::NoLinkage},
+    };
+    DeclarationRule const* externDecl = nullptr;
+    for (DeclarationRule const& d : sem.declarations)
+        if (d.ruleName == "externDecl") externDecl = &d;
+    ASSERT_NE(externDecl, nullptr);
+    for (DeclarationRule const& d : sem.declarations) {
+        SCOPED_TRACE(d.ruleName);
+        auto const it = expected.find(d.ruleName);
+        ASSERT_NE(it, expected.end()) << "a shipped row with no expected answer: write it";
+        AttributeTableOfRow const reading = attributeTableOf(sem, d);
+        EXPECT_EQ(reading.answer, it->second);
+        if (reading.answer == AttributeTableAnswer::Borrowed)
+            EXPECT_EQ(reading.table, externDecl) << "every block row borrows externDecl's table";
+    }
+    bool claimed = false;
+    for (AttributeSpelling const& sp : sem.attributeSpellings)
+        for (std::string const& n : sp.standardNamespaces) claimed = claimed || (n == "gnu" && sp.qualifier.empty());
+    EXPECT_TRUE(claimed) << "the GNU spelling claims `[[gnu::…]]`";
+    AttributeSemanticsRow const* weak = nullptr;
+    AttributeSemanticsRow const* selectany = nullptr;
+    AttributeSemanticsRow const* visibility = nullptr;
+    for (AttributeSemanticsRow const& r : sem.attributeEffects)
+        for (std::string const& n : r.names) {
+            if (n == "weak") weak = &r;
+            if (n == "selectany") selectany = &r;
+            if (n == "visibility") visibility = &r;
+        }
+    ASSERT_NE(weak, nullptr);
+    ASSERT_NE(selectany, nullptr);
+    ASSERT_NE(visibility, nullptr);
+    EXPECT_FALSE(weak->refusedWithoutLinkage.empty());
+    EXPECT_TRUE(weak->refusedWithoutLinkageOn.empty()) << "refused on every format";
+    EXPECT_FALSE(selectany->refusedWithoutLinkage.empty());
+    EXPECT_EQ(selectany->refusedWithoutLinkageOn,
+              (std::vector<ObjectFormatKind>{ObjectFormatKind::Pe, ObjectFormatKind::MachO}))
+        << "refused where every reference of the format refuses it; gcc ELF builds it";
+    EXPECT_TRUE(visibility->refusedWithoutLinkage.empty()) << "a visibility is built everywhere";
+    EXPECT_NE(weak, visibility) << "the two take different verdicts, so they are two rows";
+    // the negative cell on the shipped data
+    std::string text = shippedCTextForPrefixTest();
+    std::string const token = "\"linkage\": \"none\",\n";
+    auto const at = text.find("\"rule\": \"param\"");
+    ASSERT_NE(at, std::string::npos);
+    auto const tok = text.find(token, at);
+    ASSERT_NE(tok, std::string::npos);
+    text.erase(tok, token.size());
+    auto const r = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(r.has_value()) << "the shipped document without param's token is refused";
+    bool said = false;
+    for (auto const& d : r.error())
+        said = said || d.message.find("the 'param' row has attribute specifiers no table reads") != std::string::npos;
+    EXPECT_TRUE(said) << errorDiags(r.error());
 }

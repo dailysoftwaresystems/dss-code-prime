@@ -1,7 +1,7 @@
 #include "link/branch_veneers.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
-#include "link/fresh_symbol_ids.hpp"
+#include "link/fresh_symbol_ids.hpp"   // ModuleSymbolIds -- the module's one door of a fresh id
 #include "link/object_format_schema.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_node.hpp"
@@ -916,17 +916,12 @@ bool injectBranchVeneers(AssembledModule&                  module,
     if (plan.veneers.empty()) return true;
 
     // ── MATERIALIZE, IN ONE MERGE ─────────────────────────────────────
-    std::uint32_t const maxV = maxExistingSymbolIdV(module);
-    if (static_cast<std::uint64_t>(maxV) + plan.veneers.size()
-        > std::numeric_limits<std::uint32_t>::max()) {
-        emit(reporter, std::format(
-            "branch-veneer: SymbolId space exhausted: the module's max SymbolId is "
-            "{} and {} veneer(s) need fresh ids "
-            "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-            maxV, plan.veneers.size()));
-        return false;
-    }
-    std::uint32_t const firstId = maxV + 1u;
+    // Every veneer's id from the module's door (`link/fresh_symbol_ids.hpp`), ALL AT ONCE before the module is
+    // touched: a space too short for all of them is refused there by name, and nothing is written.
+    std::optional<std::vector<SymbolId>> const taken = ModuleSymbolIds{module}.take(
+        plan.veneers.size(), reporter, std::format("branch-veneer: the {} veneer(s)", plan.veneers.size()));
+    if (!taken.has_value()) return false;
+    std::vector<SymbolId> const& veneerId = *taken;
 
     // Bucket the veneers by boundary — stable, so the order within an island is
     // the placement order the exact check measured.
@@ -985,14 +980,14 @@ bool injectBranchVeneers(AssembledModule&                  module,
         if (v < 0) continue;
         auto const& ref = collected.refs[si];
         auto& rel = module.functions[ref.function].relocations[ref.relocation];
-        rel.target = SymbolId{firstId + static_cast<std::uint32_t>(v)};
+        rel.target = veneerId[static_cast<std::size_t>(v)];
         rel.addend = 0;
     }
 
     auto const makeVeneer = [&](std::uint32_t i) {
         auto const& pv  = plan.veneers[i];
         auto const& tp  = templateOf(pv);
-        SymbolId const self{firstId + i};
+        SymbolId const self        = veneerId[i];
         SymbolId const aim         = collected.targetSymbol[pv.target];
         std::int64_t const aimPlus = L.targets[pv.target].addend;
         AssembledFunction vf;

@@ -1,0 +1,5 @@
+    std::ranges::sort(out, [](StaticInitOrderEntry const& a,
+                              StaticInitOrderEntry const& b) {
+        if (a.priority != b.priority) return a.priority < b.priority;
+        return a.symbol.v < b.symbol.v;
+    });

@@ -210,6 +210,13 @@ dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c
 # per-format RUNNER axis (including the `imageLoader` arm no shipped document
 # selects, which nothing else exercises), and the shipped-document sweep.
 dss_add_test(NAME link/test_static_init_schedule SOURCES test_static_init_schedule.cpp)
+# ... and that order READ FROM THE IMAGE: constructors of one priority, units built in memory and linked through
+# `linker::link` into a pe64 exec, run in the units' input order and then each unit's definition order -- the entry
+# trampoline's calls decoded from the bytes, so every leg reads it (the RUN of it is
+# examples/c/constructor_ties_run_in_input_then_definition_order, its `_reversed` twin and
+# examples/c/constructor_ties_in_one_unit_run_in_definition_order).
+dss_add_test(NAME link/test_constructor_order_through_the_link
+             SOURCES test_constructor_order_through_the_link.cpp)
 
 # D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the format half of the environment entry forms —
 # the shipped verb sets and environment declarations per exec format, and the load
@@ -774,6 +781,24 @@ dss_add_test(NAME link/test_glibc_gotpcrel_resolution
 # exec, a PIE and a shared object, each slot filled as its image kind requires.
 dss_add_test(NAME link/test_got_slot_lowering
              SOURCES test_got_slot_lowering.cpp)
+# The link tier's doors of a fresh SymbolId (link/fresh_symbol_ids.hpp, link/format/record_symbol_ids.hpp): a mint
+# past every holder of the module, a second door, an erased holder, exhaustion refused by name (P69 f26d, N9).
+dss_add_test(NAME link/test_fresh_symbol_ids
+             SOURCES test_fresh_symbol_ids.cpp)
+# THE HOLDERS OF AN ASSEMBLED MODULE, derived from the TYPES and compared with the door's table in both
+# directions. `repo-guard`: it judges the source tree, the same bytes on every leg.
+dss_add_test(NAME link/test_module_symbol_id_holders
+             SOURCES test_module_symbol_id_holders.cpp)
+dss_label_repo_guard(link/test_module_symbol_id_holders)
+# EVERY TAKE SITE OF THE LINK TIER at the edge of its id space (tests/link/module_door_take_sites.hpp): refused by
+# name, once, with what its caller holds unchanged and nothing returned, and the one-short control that links.
+dss_add_test(NAME link/test_module_door_take_sites
+             SOURCES test_module_door_take_sites.cpp)
+# ... and the universe of that table BY DATA: every take site src/ states is a row, and every row a site.
+# `repo-guard`: it judges the source tree, the same bytes on every leg.
+dss_add_test(NAME link/test_module_door_take_sites_guard
+             SOURCES test_module_door_take_sites_guard.cpp)
+dss_label_repo_guard(link/test_module_door_take_sites_guard)
 
 # P68 round 11 (D-LK-MACHO-GOT-RELOCATIONS-REFUSED-AT-READ): clang's Mach-O
 # GOT_LOAD / GOT relocations — x86_64's in-place remainder read as the addend,

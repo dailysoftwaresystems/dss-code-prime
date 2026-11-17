@@ -712,8 +712,6 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             bool const variadicForcesStack =
                 cc.variadicArgsAlwaysStack
                 && ::dss::call_payload::isVariadic(payload);
-            std::uint32_t const fixedOps =
-                ::dss::call_payload::fixedOperandCount(payload);
 
             // Single pass over the arg operands (ops[1..]) that MIRRORS the
             // materialize placement loop exactly. ⓘ No by-value stacked-aggregate
@@ -749,7 +747,7 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 // such a CC is stacked regardless of class/pool. Count it as forced
                 // overflow and do NOT add it to the class tallies (it never fills a
                 // register slot). Named args fall through to the class tallies.
-                if (variadicForcesStack && argRegionIdx >= fixedOps) {
+                if (variadicForcesStack && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx)) {
                     (void)stackCursor.placeVariadic(argOp.argNaturalBytes);
                     ++argRegionIdx;
                     continue;
@@ -4915,8 +4913,6 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     && cc.vaListLayout.has_value()
                     && cc.vaListLayout->strategy
                            == VaListStrategy::HomogeneousPointer;
-                std::uint32_t const fixedOperandCnt =
-                    ::dss::call_payload::fixedOperandCount(payload);
                 // FC12c (D-FC12C-APPLE-ARM64-VARIADIC-CALLEE): Apple arm64 passes EVERY
                 // variadic arg (operand past the fixed ones) on the stack regardless of
                 // free arg registers. Gated on the CC flag + the call's isVariadic bit,
@@ -5060,10 +5056,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     std::uint32_t const poolSize = slot->poolSize;
                     // FC12c: a VARARG (operand past the fixed ones) under a CC that
                     // always-stacks varargs is forced to the overflow area even if a
-                    // register slot is free. Named args (argRegionIdx < fixedOperandCnt)
+                    // register slot is free. Named args (not `passesThroughEllipsis`)
                     // are unaffected — they stay register-placed via argIndex<poolSize.
                     bool const forceStack =
-                        variadicForcesStack && argRegionIdx >= fixedOperandCnt;
+                        variadicForcesStack && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
                     if (argIndex < poolSize && !forceStack) {
                         // Register-resident arg: existing path.
                         auto const destReg =
@@ -5071,21 +5067,21 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                           "materializeOneFunc: call", reporter);
                         if (!destReg.has_value()) return false;
                         // D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE: a VARARG
-                        // (argRegionIdx >= fixedOperandCnt) that landed in a vector ARG
+                        // (`passesThroughEllipsis`) that landed in a vector ARG
                         // register (this branch, class FPR) consumes one vector arg
                         // register → count it toward the SysV variadic vector-count
                         // (AL). This fires for BOTH a register-resident FP vararg (a
                         // live FPR `srcReg`) AND a spilled one (`isSpillRef` — the c77
                         // direct-arg-reload form, `destReg` filled by the mem-src move
                         // pushed below), so the count no longer depends on the operand's
-                        // post-regalloc residency. Gated on `isVariadicCall` because a
-                        // non-variadic call has `fixedOperandCnt == 0`, which would make
-                        // the `argRegionIdx >= fixedOperandCnt` vararg predicate true for
-                        // every FP arg. It is the SAME vararg predicate the Win64 FP-dup
+                        // post-regalloc residency. `passesThroughEllipsis` is false for
+                        // every operand of a non-variadic call (its payload's fixed count
+                        // is 0, and the predicate asks the variadic bit first). It is the
+                        // SAME vararg predicate the Win64 FP-dup
                         // below uses; an FP vararg past the SSE pool falls to the
                         // overflow branch — correctly excluded.
-                        if (isVariadicCall && cls == LirRegClass::FPR
-                            && argRegionIdx >= fixedOperandCnt) {
+                        if (cls == LirRegClass::FPR
+                            && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx)) {
                             ++fpVarargsInVectorArgRegs;
                         }
                         // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef arg
@@ -5107,7 +5103,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // pairs with argFprs[slot]. Only the VARARG region (operand
                         // index past the fixed operands) is duplicated.
                         if (win64FpDup && cls == LirRegClass::FPR
-                            && argRegionIdx >= fixedOperandCnt
+                            && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx)
                             && argIndex
                                    < static_cast<std::uint32_t>(cc.argGprs.size())) {
                             auto const homeGpr = resolveCcReg(
@@ -5172,10 +5168,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED:
                         // the placement + its access width come from the shared
                         // cursor, and the named/variadic axes are distinguished by
-                        // the SAME `argRegionIdx >= fixedOperandCnt` predicate the
-                        // register arm above uses.
+                        // the SAME `call_payload::passesThroughEllipsis` the register
+                        // arm above asks.
                         bool const isVariadicRegion =
-                            isVariadicCall && argRegionIdx >= fixedOperandCnt;
+                            ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
                         auto const place =
                             isVariadicRegion
                                 ? stackCursor.placeVariadic(argOp.argNaturalBytes)

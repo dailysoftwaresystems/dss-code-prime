@@ -49,6 +49,7 @@
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+#include "text_scan.hpp"
 #include "host_native_target.hpp"
 #include "host_translations.hpp"
 #include "../core/native_c_probe.hpp"
@@ -68,7 +69,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <regex>
 #include <set>
 #include <span>
 #include <string>
@@ -1394,13 +1394,12 @@ TEST(TentativeDefinitionLinks, ADefinitionAtAnOffsetIsAlignedAsItsOffsetAllows) 
     ASSERT_FALSE(image.empty()) << diagnosticsOf(rep);
     auto const sentences = said(rep);
     ASSERT_EQ(sentences.size(), 1u) << diagnosticsOf(rep);
-    std::smatch sizeAt, alignAt;
     std::string const& sentence = sentences.front();
-    ASSERT_TRUE(std::regex_search(sentence, sizeAt, std::regex{R"(is 8 bytes \(linked unit #([0-9]+)\))"}))
-        << sentence;
-    ASSERT_TRUE(std::regex_search(sentence, alignAt, std::regex{R"(aligned to 64 \(linked unit #([0-9]+)\))"}))
-        << sentence;
-    EXPECT_NE(sizeAt[1].str(), alignAt[1].str())
+    auto const sizeAt  = dss::test::digitsBetween(sentence, "is 8 bytes (linked unit #", ")");
+    auto const alignAt = dss::test::digitsBetween(sentence, "aligned to 64 (linked unit #", ")");
+    ASSERT_TRUE(sizeAt.has_value()) << sentence;
+    ASSERT_TRUE(alignAt.has_value()) << sentence;
+    EXPECT_NE(*sizeAt, *alignAt)
         << "the size is com_w8's and the alignment com_wide's, two units: " << sentence;
 }
 

@@ -17,6 +17,7 @@
 // shape of the MIR each one builds. The values are run by
 // `examples/c/bool_bit_field_read_and_written`.
 
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
@@ -119,7 +120,7 @@ struct Lowered {
                                     &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
     if (mir.ok) {
-        auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
+        auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter, dss::test::kFirstConventionOfTheTarget);
         (void)lir;
     }
     return Lowered{

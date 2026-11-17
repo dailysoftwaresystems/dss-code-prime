@@ -4,6 +4,7 @@
 #include "asm/asm_local_labels.hpp"
 #include "asm/asm_variant_elect.hpp"
 #include "core/substrate/path_identity.hpp"   // genericSpelling — the UNC-safe path spelling
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/assembly_config.hpp"
 #include "core/types/source_buffer.hpp"
 #include "lir/lir_node.hpp"
@@ -891,7 +892,7 @@ struct AsmInstructionLowering::Impl {
                              "the block structure is planned before the "
                              "operands are read — the dialect row must keep "
                              "the two arms' block effect the same{}",
-                             tree_.text(mnemonicNode), sink_.pairSuffix()));
+                             quotedSourceText(tree_.text(mnemonicNode)), sink_.pairSuffix()));
             return AsmBlockEffect::None;
         }
         return direct.has_value()   ? *direct

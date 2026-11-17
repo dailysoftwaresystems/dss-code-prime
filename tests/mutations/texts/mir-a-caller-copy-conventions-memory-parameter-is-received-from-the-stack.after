@@ -1,2 +1,0 @@
-        if (abi.kind == AbiPassing::Kind::Memory
-            && (config.aggregate.memoryArgument == AggregateMemoryArgument::Stack || true))

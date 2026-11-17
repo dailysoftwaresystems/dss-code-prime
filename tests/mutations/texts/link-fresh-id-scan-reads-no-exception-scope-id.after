@@ -1,1 +1,7 @@
-            (void)scope;   // a scope's two ids are not counted
+         (void)m;
+         (void)h;
+     }},
+    {"functions.sehScopes.personalitySymbol",
+     [](AssembledModule const& m, std::uint32_t& h) {
+         (void)m;
+         (void)h;

@@ -411,15 +411,14 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // `compile_pipeline.cpp` passes it — the format facts between stay their defaults.
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),
-                                    lirReporter,
+                                    lirReporter, mirCcIndex,
                                     /*externImports=*/{}, /*externCallDispatch=*/std::nullopt,
                                     /*dataImportBinding=*/std::nullopt, /*tlsAccess=*/std::nullopt,
                                     /*sehScopes=*/{}, /*wideFloatSoftcallLibrary=*/std::nullopt,
                                     /*externAddrBinding=*/std::nullopt, /*charIsUnsigned=*/std::nullopt,
                                     /*atomicsRuntime=*/std::nullopt, /*indirectSlotBindings=*/{},
                                     /*preemptibleDefinitionBindings=*/{}, /*definedSymbolNames=*/{},
-                                    /*assemblyFormatKind=*/std::nullopt, /*imageDefinedNames=*/{},
-                                    mirCcIndex);
+                                    /*assemblyFormatKind=*/std::nullopt, /*imageDefinedNames=*/{});
     LoweredLir out{std::move(model), std::move(hir), std::move(hirReporter),
                    std::move(mir), std::move(mirReporter), std::move(target),
                    std::move(lirReporter), std::move(lir)};

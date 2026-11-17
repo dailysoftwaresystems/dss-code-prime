@@ -32,7 +32,8 @@
 //
 // Text grammar (representative):
 //
-//   dssir 7
+//   dssir 8
+//   arg_counting per_class
 //   types {
 //     type 1 = struct "Node" {i32, ptr<type 1>}
 //     type 2 = union "U" {i32, f32}
@@ -92,6 +93,12 @@
 // 'global' or 'function'") — loud, but a version that no longer says what a text spells. So the
 // step: a v6 text is refused by the version check, and a v6 reader refuses a v7 text by its header.
 //
+// ★ v8 (P69, lane `cs`, review-csf26c2 N2): A MODULE STATES HOW ITS FUNCTIONS NUMBER THEIR `Arg`s —
+// `arg_counting per_class` or `arg_counting flat`, a header line right after the version, written
+// whenever the module states it (`MirArgCounting`); the MIR verifier refuses a module that holds an
+// `Arg` and states none. And a call passing by its callee's own definition's signature carries the
+// flag `passes_by_definition` (`MirInstFlags::PassesByItsDefinition`).
+//
 // HISTORY of the format's version (the reader accepts exactly the current one):
 //   1  the first form.
 //   2  composites defined once, in a `types` section (above).
@@ -100,6 +107,8 @@
 //   5  a union value names its member (above).
 //   6  a weak definition states its kind; `tentative` (above).
 //   7  a module states its aliases, `alias %A [linkage] = %T` (above).
+//   8  a module states its `Arg` counting, `arg_counting per_class|flat`; the call flag
+//      `passes_by_definition` (above).
 //
 // ★★ ONE INSTRUCTION PER LINE, and it is a RULE of this grammar rather than a
 // habit of the emitter. `parseInstruction` refuses any instruction whose line

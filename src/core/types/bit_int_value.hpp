@@ -45,7 +45,7 @@ inline constexpr std::uint32_t kBitIntMaxWidth = 8388608u;
 
 // ══ D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS ═════════════════════════
 // ★★★ THE ONE STATEMENT OF DSS's `_BitInt` PADDING-BIT POLICY. A `_BitInt(N)`
-// object occupies a container WIDER than N (`sizeOfScalarOrBitInt`); C23 6.2.6.1p6
+// object occupies a container WIDER than N (`computeLayout`'s size); C23 6.2.6.1p6
 // leaves the values of the bits above N-1 UNSPECIFIED, so more than one
 // representation conforms and the choice has to be MADE. DSS's is:
 //

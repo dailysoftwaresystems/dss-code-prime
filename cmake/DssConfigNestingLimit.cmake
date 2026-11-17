@@ -17,35 +17,18 @@
 #   level that is not an object, no `maxNesting`, or a `maxNesting` that is not a
 #   positive whole number. There is no default: a build without the value does not
 #   configure, and the library does not compile without its forward.
+#
+# The read is the one every configure-time count takes (cmake/DssConfigureTimeCount.cmake,
+# cycle P69 f26d), so this limit and the diagnostics' quoted-source-text limit are refused in
+# the same sentences by the same code.
+
+include("${CMAKE_CURRENT_LIST_DIR}/DssConfigureTimeCount.cmake")
 
 function(dss_read_config_nesting_limit _dss_cnl_doc _dss_cnl_out)
-    set(_dss_cnl_where "the config documents' nesting limit ('${_dss_cnl_doc}')")
-    if(NOT EXISTS "${_dss_cnl_doc}" OR IS_DIRECTORY "${_dss_cnl_doc}")
-        message(FATAL_ERROR
-            "${_dss_cnl_where}: no such document. Every config document's reader takes "
-            "its `maxNesting`, so the build cannot be configured without it.")
-    endif()
-    file(READ "${_dss_cnl_doc}" _dss_cnl_text)
-    string(JSON _dss_cnl_type ERROR_VARIABLE _dss_cnl_error TYPE "${_dss_cnl_text}")
-    if(_dss_cnl_error)
-        message(FATAL_ERROR "${_dss_cnl_where}: not JSON (${_dss_cnl_error}).")
-    endif()
-    if(NOT _dss_cnl_type STREQUAL "OBJECT")
-        message(FATAL_ERROR
-            "${_dss_cnl_where}: its top level is ${_dss_cnl_type}, not an object.")
-    endif()
-    string(JSON _dss_cnl_kind ERROR_VARIABLE _dss_cnl_error TYPE "${_dss_cnl_text}" maxNesting)
-    if(_dss_cnl_error)
-        message(FATAL_ERROR "${_dss_cnl_where}: it declares no `maxNesting`.")
-    endif()
-    string(JSON _dss_cnl_value GET "${_dss_cnl_text}" maxNesting)
-    if(NOT _dss_cnl_kind STREQUAL "NUMBER" OR NOT _dss_cnl_value MATCHES "^[1-9][0-9]*$")
-        message(FATAL_ERROR
-            "${_dss_cnl_where}: `maxNesting` is '${_dss_cnl_value}' (${_dss_cnl_kind}); "
-            "it must be a positive whole number of levels.")
-    endif()
-    if(NOT CMAKE_SCRIPT_MODE_FILE)   # a script (the refusals' test) has no build to re-configure
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_dss_cnl_doc}")
-    endif()
+    dss_read_configure_time_count(
+        "${_dss_cnl_doc}" maxNesting
+        "the config documents' nesting limit"
+        "Every config document's reader takes its `maxNesting`, so the build cannot be configured without it."
+        levels _dss_cnl_value)
     set(${_dss_cnl_out} "${_dss_cnl_value}" PARENT_SCOPE)
 endfunction()

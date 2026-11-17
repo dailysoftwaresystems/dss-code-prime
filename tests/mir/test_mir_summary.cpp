@@ -153,6 +153,7 @@ TEST(MirSummary, SummaryDistinguishesIndirectCalls) {
     // `int main(int (*p)(void)) { return p(); }` — the callee operand is an
     // Arg, not a GlobalAddr, so there is NO call-graph edge to record.
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);

@@ -22,6 +22,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
@@ -123,7 +124,7 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), rep);
+    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lir.ok) << "MIR->LIR failed";
     auto const liveness = analyzeLiveness(lir.lir);
     auto const alloc = allocateRegisters(lir.lir, **target, liveness,

@@ -1,0 +1,4 @@
+    if (!vocabularyName.empty()) return std::string{vocabularyName};
+    std::string const& s = table.kind(k);
+    if (s.empty()) return std::nullopt;
+    return s;

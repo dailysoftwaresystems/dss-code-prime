@@ -27,6 +27,17 @@ namespace {
 // Shipped-target params: natural alignment, 16-byte ISA cap, LP64.
 constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
 
+// ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+// a wide `_BitInt` leaf is sized by the TARGET's chunk, so each convention classifies
+// under its own target's: x86_64 (SysV, Win64) 8, arm64 (AAPCS64) 16.
+[[nodiscard]] constexpr AggregateLayoutParams withBitPreciseChunk(AggregateLayoutParams p,
+                                                                  std::uint32_t chunk) noexcept {
+    p.bitPreciseChunk = chunk;
+    return p;
+}
+constexpr AggregateLayoutParams kX86_64Layout = withBitPreciseChunk(kNatural16, 8);
+constexpr AggregateLayoutParams kArm64Layout  = withBitPreciseChunk(kNatural16, 16);
+
 [[nodiscard]] TypeInterner makeInterner(std::uint32_t owner) {
     return TypeInterner{CompilationUnitId{owner}};
 }
@@ -35,7 +46,7 @@ constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
 classifySysV(TypeId t, TypeInterner const& ti,
              AggregatePosition position = AggregatePosition::Argument) {
     return classifyAggregate(AggregateConventionRules{AggregateClassKind::SysVEightbyte, 16}, t, ti,
-                             kNatural16, DataModel::Lp64, position);
+                             kX86_64Layout, DataModel::Lp64, position);
 }
 
 [[nodiscard]] TypeId structOf(TypeInterner& ti, std::string_view name,
@@ -539,7 +550,7 @@ namespace {
 classifyWin64(TypeId t, TypeInterner const& ti,
               AggregatePosition position = AggregatePosition::Argument) {
     return classifyAggregate(AggregateConventionRules{AggregateClassKind::Win64BySize, 8}, t, ti,
-                             kNatural16, DataModel::Lp64, position);
+                             kX86_64Layout, DataModel::Lp64, position);
 }
 }  // namespace
 
@@ -606,7 +617,7 @@ namespace {
 classifyAapcs64(TypeId t, TypeInterner const& ti,
                 AggregatePosition position = AggregatePosition::Argument) {
     return classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, t, ti,
-                             kNatural16, DataModel::Lp64, position);
+                             kArm64Layout, DataModel::Lp64, position);
 }
 }  // namespace
 

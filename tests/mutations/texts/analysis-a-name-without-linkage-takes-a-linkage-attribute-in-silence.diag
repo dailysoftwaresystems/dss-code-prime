@@ -1,0 +1,1 @@
+is declared in a block without 'extern', so it has no linkage

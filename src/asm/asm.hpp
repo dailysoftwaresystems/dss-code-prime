@@ -10,6 +10,7 @@
 #include "core/types/object_format_kind.hpp"   // ImageDefinedAddress
 #include "core/types/section_kind.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // SymbolIdEnd -- the module's carried id end
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -920,6 +921,14 @@ struct DSS_EXPORT AssembledModule {
     // 3e — a lone function is never taken for the entry). Set ⇒
     // load-bearing: the election's answer (`resolveProgramEntry`).
     std::optional<SymbolId>        userEntrySymbol;     // SymbolId of user-written entry fn
+
+    // ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): ONE PAST EVERY ID THIS MODULE HOLDS OR A DOOR HANDED
+    // OUT, GROW-ONLY -- the module's id space at the link tier (`link/fresh_symbol_ids.hpp`, `ModuleSymbolIds`).
+    // A door opened on the module raises it past every holder and takes from it, so a second door continues the
+    // first and an id an erasure freed is never handed out again. A reader's module carries its record table's
+    // end; every other module starts past nothing (the link merge's too: it is the one holder of the ids it
+    // numbered); a copy copies it.
+    SymbolIdEnd                    symbolIdEnd;
 
     // Derived: true iff every function received its parallel-index slot —
     // `functions.size() == expectedFuncCount`. The reporter separately tracks

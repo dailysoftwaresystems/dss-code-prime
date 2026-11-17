@@ -983,6 +983,59 @@ round's close; each checkpoint's commit message says what was and was not run on
     of record at v3g after four design-audit passes (ledgers 713–725). The support routines are split into H7b1
     (the platform-floor homes, the Mach-O stack probe and the fixture), H7b2 (the binding, the atomics arbiter and
     binary128) and H7c (the bodies).
+- **Checkpoint 47 (2026-11-17) = the C front end and convention lane's fold f26d**, the answer to f26c2's review:
+  - ONE rule of a fresh symbol id: `ModuleSymbolIds::take` is the one door, and a refused take moves nothing. Its
+    universe is 14 take sites: 13 are driven by a table and the merge is pinned at the door. The tier guard
+    SynthSymbolFloor is RETIRED: ✔MEASURED, the mint guard lists all 21 sites the old rule finds at `ae057909`.
+  - Constructors of one priority run in input order, then in definition order. gcc, clang, Apple clang and cl agree
+    (✔MEASURED). The refused cost: MinGW gcc's reverse order, and gcc ELF's first-declaration order at an explicit
+    equal priority.
+  - A diagnostic quotes its operand whole through one home, `quotedSourceText`, whose limit is read from config. It
+    names a type by the language document's own `semantics.typeSpelling` (c, toy and tsql-subset), at 18 sites,
+    through one door, `spelledType`.
+  - StringStyle's tag regex is RETIRED for the required `delimiterTag`; `<regex>` is gone from the tokenizer and the
+    grammar schema. A wide `_BitInt`'s chunk is a target fact (`sizeOfScalarOrBitInt` is gone).
+  - The shipped `<windows.h>` gains the module and memory queries (P0). ✔MEASURED: cl and MinGW run 42 at both
+    levels.
+  - An attribute on an empty declaration is said of nothing, as gcc and clang warn. A struct member takes a standard
+    attribute sequence before its width; one after a GNU run is refused, as every reference refuses it.
+  - Known defect (13) is FIXED, ✔MEASURED by the lane:
+    - test_redeclaration_compat is green on all five legs;
+    - varargs_struct_straddle_fixed is green in both runners on macos-arm64-debug;
+    - D-C-A-BLOCK-SCOPE-FUNCTION-DECLARATION-HIDES-NOTHING-IN-ITS-BLOCK is closed again (all nine of its arms passed).
+  - That re-close went through main's `set-anchor`, from the lane's cells, verbatim. The fold refuses a row an
+    earlier fold applied whose status cell re-declares the same text after main reopened it. That is a DssHarness
+    issue, held for the operator.
+  - Rows:
+    - closed 3: D-DIAG-A-DIAGNOSTIC-QUOTES-ITS-OPERAND-WHOLE, D-FFI-SHIPPED-CONSTANTS-TYPED-OTHERWISE-THAN-THE-REAL-HEADERS,
+      D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64;
+    - closed again 1; born closed 3;
+    - new 🔵 DISCLOSED 4, each HEAD's debt and each f26e's to CLOSE: D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0,
+      D-C-A-C23-SEQUENCE-AFTER-A-WIDTH-OR-AFTER-A-GNU-RUN-IS-ACCEPTED-OTHERWISE-THAN-THE-REFERENCES,
+      D-FFI-SHIPPED-WINDOWS-H-LACKS-THE-CONTEXT-STRUCTURE, D-MIR-A-SYNTHESIS-REBUILD-THE-MERGE-AND-THE-TEXT-DROP-A-MODULES-FACTS.
+  - Also carried into f26e (rulings): a deprecated member is not warned at its use, and the `__vectorcall` /
+    `__regcall` keywords.
+  - Arms: 112 new, 3 retired; 1893 arms.
+  - Main's own: the arm registry was SETTLED. 0 reverts; 157 of the 158 arm changes checkpoint 46 made are carried,
+    and 1 is restated by the lane's measurement. Four closing cells that dropped main's f26c2 run ids were sent back
+    and restored before the fold.
+  - ✔MEASURED by the lane on the final bytes:
+    - the whole suite on windows-x86_64-debug: 3017/3019. The two reds are doc_census_guard, which this fold's
+      census write settles, and program/test_entry_envp_run, xa's (14);
+    - every changed runner whole (151 names): windows-x86_64-release 153/153, linux-x86_64-debug 149/149,
+      macos-arm64-debug 149/149, linux-arm64-debug 149/149;
+    - its sweeps: every arm passed or was restated, except the two Windows-only LIR text-mode arms, unswept there
+      because the mutant path is 277 characters, over 260. Main's sweep owes them.
+  - Balance: 692 open against 620 at `71648598` (29 closed; 101 opened, of which 3 created and 98 disclosed;
+    counted −26, REAL net +72); 692 against 692 at HEAD. `check-anchor-arms` names 121 claims that do not hold, all
+    owed to the fold's sweep.
+  - THE LINUX x86_64 LEGS MOVED from WSL to a native Ubuntu LTS machine (the operator, 2026-11-17), so their heavy
+    legs stop taking this machine's admission slots. It has g++ 15.2.0 (WSL had 13.3.0). Its `qemu-aarch64` and
+    arm64 cross runtime are being installed by the operator.
+  - Fold order now: f26e → H6c2 → f26f → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c. f26f is f26e's
+    stage 6, split off by size (ruled 2026-11-17 on cs's MEASURED census of 38 cells): the 17
+    `unimplementedCallingConventions` rows on every axis, and the swift parameter attributes. aarch64_sve_pcs's
+    scalable types are being measured before a ruling.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -1032,8 +1085,8 @@ round's close; each checkpoint's commit message says what was and was not run on
   first element (`static const int z[2] = {0, 7}; if (!z) ...` folds true, so reachable code is marked unreachable).
   The library lane's next fold, first items: a folded constant states its C type, and braces are stepped through
   only for a scalar's initializer.
-  (13) IN MAIN SINCE CHECKPOINT 43, ✔MEASURED by its five-leg suite and its macos-arm64-debug sweep; both in the C
-  front end and convention lane's next fold (f26d), first items:
+  (13) FIXED by checkpoint 47 (the fold's own runs on five legs, above). It was IN MAIN SINCE CHECKPOINT 43,
+  ✔MEASURED by its five-leg suite and its macos-arm64-debug sweep:
   - A REGRESSION on apple_arm64. The last FIXED by-value argument of a variadic callee is stacked by the caller and
     read from registers by the callee, because `processOneCallArg`'s "through `...`" test counted the callee as an
     argument. The corpus example `varargs_struct_straddle_fixed` is red in both runners on macos-arm64-debug.
@@ -1062,6 +1115,12 @@ round's close; each checkpoint's commit message says what was and was not run on
     them in `hir_to_mir.cpp`'s limb emitters.
   - It closes in xa's 3f: the sorted walk, every argument-order site, the guard `check-evaluation-order` with no
     allow-list, and a host-equality step across windows, linux and the Mac at the round close.
+  (16) A REGRESSION OF CHECKPOINT 46, ✔MEASURED on both columns (compile-and-keep, windows-x86_64-release):
+  - `typedef int T; _Generic(T, int: 42, default: 1)` was accepted at `ae057909`, exiting 42, the clangs' value. At
+    `1eea9b3a` it is refused with S_TypeNameInValuePosition.
+  - With it, a pre-existing SILENT WRONG VALUE: `_Generic(CT, const int: 1, int: 2)` exited 2 at `ae057909`, where
+    the clangs select 1.
+  - Both close in lm's L2b4: the type-operand alternative of `genericExpr`, selected by the unconverted type.
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the

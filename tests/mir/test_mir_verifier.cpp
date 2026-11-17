@@ -4,6 +4,7 @@
 // valid), or construct a malformed Mir via the direct ctor to exercise
 // the verifier's catch-the-bad-state path.
 
+#include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
@@ -74,6 +75,7 @@ TEST(MirVerifier, MinimalModulePasses) {
 // A simple straight-line function (Arg + Const + BinaryOp + Return).
 TEST(MirVerifier, StraightLineFunctionPasses) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);   // a module holding an `Arg` states how it counts them
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{1});
     (void)f;
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -477,6 +479,7 @@ TEST(MirVerifier, ArgIndexOutOfRange) {
     TypeId const fnSig = interner.fnSig(params, voidTy, CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = b.addFunction(fnSig, SymbolId{1});
     (void)f;
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -1693,6 +1696,7 @@ TEST(MirVerifier, IndirectCallWithNoStaticCalleeIsSkipped) {
     TypeId const callerSig = in.fnSig(cps, voidTy, CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     (void)b.addFunction(callerSig, SymbolId{1});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -2837,5 +2841,249 @@ TEST(MirVerifier, AStackCarrierWhoseAlignmentIsNoPowerOfTwoIsRefused) {
         } else {
             EXPECT_FALSE(said) << "alignment " << align << " is legal and must not be refused";
         }
+    }
+}
+
+// ── P69 (lane `cs`, fold f26d — review-csf26c2 N2): DENSITY UNDER THE STATED DISCIPLINE ─────────────────────────
+//
+// A function's `Arg`s are dense over every register its convention assigns, under the counting it is STAMPED with
+// (`MirArgCounting`, `Mir::funcArgCounting`: its builder's stated default here, the pair's convention's): per
+// register class (the class `regClassForCoreType` gives the `Arg`'s type), or flat. Each
+// cell is one module of one function whose `Arg`s are written as the cell says; a refused cell names its code, and
+// the twin of every refused shape is accepted, so a rule that refused everything is red too.
+// RED-ON-DISABLE: drop `checkArgDensity` and the gap, repeat and unstated cells verify; let it count the classes
+// together and the flat-written mixed signature verifies under a per-class module.
+namespace {
+struct ArgSpec {
+    std::uint32_t ordinal;
+    TypeKind      kind;
+};
+[[nodiscard]] Mir moduleWithArgs(TypeInterner& in, MirArgCounting counting, std::vector<ArgSpec> const& args) {
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::vector<TypeId> params;
+    for (ArgSpec const& a : args) params.push_back(in.primitive(a.kind));
+    TypeId const sig = in.fnSig(params, voidTy, CallConv::CcSysV);
+    MirBuilder b;
+    b.stateArgCounting(counting);
+    (void)b.addFunction(sig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    for (std::uint32_t p = 0; p < args.size(); ++p)
+        (void)b.addArg(args[p].ordinal, in.primitive(args[p].kind), /*position=*/p);
+    b.addReturn();
+    return std::move(b).finish();
+}
+struct DensityCell {
+    char const*          what;
+    MirArgCounting       counting;
+    std::vector<ArgSpec> args;
+    bool                 accepted;
+    DiagnosticCode       refusedWith;
+};
+} // namespace
+
+TEST(MirVerifier, AFunctionsArgsAreDenseUnderTheCountingItIsStampedWith) {
+    constexpr DiagnosticCode kGap      = DiagnosticCode::I_ArgOrdinalGap;
+    constexpr DiagnosticCode kRepeat   = DiagnosticCode::I_ArgOrdinalRepeated;
+    constexpr DiagnosticCode kUnstated = DiagnosticCode::I_ArgCountingUnstated;
+    std::vector<DensityCell> const cells = {
+        {"per class: a double, then two longs, each class from 0", MirArgCounting::PerClass,
+         {{0, TypeKind::F64}, {0, TypeKind::I64}, {1, TypeKind::I64}}, true, kGap},
+        {"per class: the FLAT-written mixed signature — the long has no register 0", MirArgCounting::PerClass,
+         {{0, TypeKind::F64}, {1, TypeKind::I64}}, false, kGap},
+        {"per class: its twin, each class from 0", MirArgCounting::PerClass,
+         {{0, TypeKind::F64}, {0, TypeKind::I64}}, true, kGap},
+        {"per class: a gap behind another class's Args", MirArgCounting::PerClass,
+         {{0, TypeKind::F64}, {1, TypeKind::F64}, {0, TypeKind::I64}, {2, TypeKind::I64}}, false, kGap},
+        {"per class: two longs on one register", MirArgCounting::PerClass,
+         {{0, TypeKind::I64}, {0, TypeKind::I64}}, false, kRepeat},
+        {"per class: an int and a long are one class", MirArgCounting::PerClass,
+         {{0, TypeKind::I64}, {1, TypeKind::I32}}, true, kGap},
+        {"flat: a double, then a long, one count", MirArgCounting::Flat,
+         {{0, TypeKind::F64}, {1, TypeKind::I64}}, true, kGap},
+        {"flat: the per-class-written twin repeats slot 0", MirArgCounting::Flat,
+         {{0, TypeKind::F64}, {0, TypeKind::I64}}, false, kRepeat},
+        {"flat: a skipped slot", MirArgCounting::Flat, {{0, TypeKind::I64}, {2, TypeKind::I64}}, false, kGap},
+        {"unstated: a module holding an Arg says nothing of how it counts", MirArgCounting::Unstated,
+         {{0, TypeKind::I64}}, false, kUnstated},
+    };
+    for (DensityCell const& c : cells) {
+        SCOPED_TRACE(c.what);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir m = moduleWithArgs(in, c.counting, c.args);
+        DiagnosticReporter r;
+        MirVerifier v{m, &in};
+        bool const ok = v.verify(r);
+        if (c.accepted) {
+            EXPECT_TRUE(ok) << allActuals(r);
+        } else {
+            EXPECT_FALSE(ok);
+            EXPECT_EQ(countCode(r, c.refusedWith), 1u) << allActuals(r);
+        }
+        for (DiagnosticCode const other : {kGap, kRepeat, kUnstated})
+            if (c.accepted || other != c.refusedWith) EXPECT_EQ(countCode(r, other), 0u) << allActuals(r);
+    }
+    // CONTROL: a module holding NO `Arg` needs no statement.
+    TypeInterner in{CompilationUnitId{1}};
+    Mir none = moduleWithArgs(in, MirArgCounting::Unstated, {});
+    DiagnosticReporter r;
+    MirVerifier v{none, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+}
+
+// ── P69 (lane `cs`, fold f26d — main's ruling of 2026-11-14: the counting is each FUNCTION'S) ─────────────────────
+//
+// One module holds a function of the pair's convention and one of ANOTHER — the shape a module takes once a
+// calling-convention attribute naming another convention is emitted (gcc 13.3.0 and clang 18.1.3 give `ms_abi` its
+// own sequence on x86-64 Linux; DSS refuses it today, a disclosed row): each function's `Arg`s are counted by ITS
+// stamp (`Mir::funcArgCounting`), never by the module's default. Under a per-class default, the function stamped
+// flat and written flat is accepted; the same signature stamped as the module counts is refused (the long has no
+// register 0), and the per-class-written twin stamped flat is refused (two Args on slot 0). The pair's own function
+// beside them is written per class and accepted in every cell.
+// RED-ON-DISABLE: read the module's default instead of the function's stamp, and the flat function is refused.
+TEST(MirVerifier, EachFunctionOfOneModuleIsCountedByItsOwnStamp) {
+    struct Cell {
+        char const*          what;
+        MirArgCounting       stamp;
+        std::vector<ArgSpec> args;
+        bool                 accepted;
+    };
+    std::vector<Cell> const cells = {
+        {"the flat function of a per-class module, written flat", MirArgCounting::Flat,
+         {{0, TypeKind::F64}, {1, TypeKind::I64}}, true},
+        {"the same signature stamped as the module counts: the long has no register 0", MirArgCounting::PerClass,
+         {{0, TypeKind::F64}, {1, TypeKind::I64}}, false},
+        {"the per-class-written twin stamped flat repeats slot 0", MirArgCounting::Flat,
+         {{0, TypeKind::F64}, {0, TypeKind::I64}}, false},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.what);
+        TypeInterner in{CompilationUnitId{1}};
+        TypeId const voidTy = in.primitive(TypeKind::Void);
+        MirBuilder b;
+        b.stateArgCounting(MirArgCounting::PerClass);   // the pair's convention: every function's default
+        {   // the pair's own function: a double, then a long, each class from 0
+            std::array<TypeId, 2> const ps{in.primitive(TypeKind::F64), in.primitive(TypeKind::I64)};
+            (void)b.addFunction(in.fnSig(ps, voidTy, CallConv::CcSysV), SymbolId{1});
+            MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
+            b.beginBlock(e);
+            (void)b.addArg(0, ps[0], /*position=*/0);
+            (void)b.addArg(0, ps[1], /*position=*/1);
+            b.addReturn();
+        }
+        std::vector<TypeId> params;
+        for (ArgSpec const& a : c.args) params.push_back(in.primitive(a.kind));
+        MirFuncId const other = b.addFunction(in.fnSig(params, voidTy, CallConv::CcMS64), SymbolId{2});
+        b.stateFunctionArgCounting(other, c.stamp);   // the other convention's function, restated for itself
+        MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
+        b.beginBlock(e);
+        for (std::uint32_t p = 0; p < c.args.size(); ++p) (void)b.addArg(c.args[p].ordinal, params[p], p);
+        b.addReturn();
+        Mir m = std::move(b).finish();
+        ASSERT_EQ(m.funcArgCounting(m.funcAt(0)), MirArgCounting::PerClass) << "the pair's function took the default";
+        ASSERT_EQ(m.funcArgCounting(m.funcAt(1)), c.stamp) << "the other keeps its own stamp";
+        DiagnosticReporter r;
+        MirVerifier v{m, &in};
+        EXPECT_EQ(v.verify(r), c.accepted) << allActuals(r);
+        std::size_t const refusals = countCode(r, DiagnosticCode::I_ArgOrdinalGap)
+                                     + countCode(r, DiagnosticCode::I_ArgOrdinalRepeated);
+        EXPECT_EQ(refusals, c.accepted ? 0u : 1u) << "exactly the other function's Args, never the pair's"
+                                                  << allActuals(r);
+    }
+}
+
+// ── P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of ledger 597): A STAMPED CALL IS HELD TO ITS
+// CALLEE ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// `f(long, long)` defined in the module, called by its own signature. Stamped (`PassesByItsDefinition`) and
+// agreeing: accepted. Stamped and disagreeing in the N1 shape (the caller STACKED the argument the callee reads from
+// registers — a `ByValueStackArg` carrier at the position of a register `Arg`, the operand list a register short),
+// or with the last fixed operand passed through `...`: refused, I_CallDisagreesWithItsDefinition — under both
+// spellings of the callee's type (its signature, or a pointer to it). The SAME disagreeing calls UNSTAMPED: not
+// this rule's (a call through a declaration without a prototype is a program the references build). A stamped call
+// whose callee's definition in the module has another signature is not judged either (a merge kept another unit's
+// definition) — its operands would be refused if it were.
+// RED-ON-DISABLE: drop `checkCallsAgainstTheirDefinitions` and the stamped N1 shape verifies.
+namespace {
+enum class CallShape : std::uint8_t { Agreeing, StackedWhereTheCalleeReadsRegisters, ThroughTheEllipsis };
+struct StampCell {
+    char const* what;
+    CallShape   shape;
+    bool        stamped;
+    bool        calleeSigDiffers;
+    bool        calleeSpelledAsPointer;
+    bool        refused;
+};
+[[nodiscard]] Mir moduleCallingItsDefinition(TypeInterner& in, StampCell const& c) {
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const two{i64, i64};
+    TypeId const calleeSig = in.fnSig(two, voidTy, CallConv::CcSysV);
+    std::array<TypeId, 3> const three{i64, i64, i64};
+    TypeId const definedSig = c.calleeSigDiffers ? in.fnSig(three, voidTy, CallConv::CcSysV) : calleeSig;
+    TypeId const callerSig  = in.fnSig({}, voidTy, CallConv::CcSysV);
+    MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
+    (void)b.addFunction(definedSig, SymbolId{2});   // the callee
+    MirBlockId const calleeEntry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(calleeEntry);
+    (void)b.addArg(0, i64, /*position=*/0);
+    (void)b.addArg(1, i64, /*position=*/1);
+    if (c.calleeSigDiffers) (void)b.addArg(2, i64, /*position=*/2);
+    b.addReturn();
+    (void)b.addFunction(callerSig, SymbolId{1});   // the caller
+    MirBlockId const callerEntry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(callerEntry);
+    MirInstId const ga  = b.addGlobalAddr(SymbolId{2}, c.calleeSpelledAsPointer ? in.pointer(calleeSig) : calleeSig);
+    MirInstId const one = b.addConst(litOf(1, TypeKind::I64), i64);
+    MirInstFlags const flags = c.stamped ? MirInstFlags::PassesByItsDefinition : MirInstFlags::None;
+    if (c.shape == CallShape::StackedWhereTheCalleeReadsRegisters) {
+        MirInstId const copy = b.addInst(MirOpcode::Alloca, {}, in.pointer(i64), /*bytes=*/16);
+        std::array<MirInstId, 1> const carried{copy};
+        MirInstId const carrier = b.addInst(MirOpcode::ByValueStackArg, carried, in.pointer(i64), /*size=*/16);
+        std::array<MirInstId, 2> const ops{ga, carrier};
+        b.addInst(MirOpcode::Call, ops, InvalidType, /*payload=*/0, flags);
+    } else {
+        std::array<MirInstId, 3> const ops{ga, one, one};
+        std::uint32_t const payload = c.shape == CallShape::ThroughTheEllipsis
+                                          ? ::dss::call_payload::encode(/*isVariadic=*/true, /*fixed=*/1)
+                                          : 0u;
+        b.addInst(MirOpcode::Call, ops, InvalidType, payload, flags);
+    }
+    b.addReturn();
+    return std::move(b).finish();
+}
+} // namespace
+
+TEST(MirVerifier, AStampedCallIsHeldToItsCalleesReceptionsAndAnUnstampedOneIsNot) {
+    StampCell const cells[] = {
+        {"stamped, agreeing", CallShape::Agreeing, true, false, false, false},
+        {"stamped, agreeing, the callee spelled as a pointer to its signature", CallShape::Agreeing, true, false,
+         true, false},
+        {"stamped, the N1 shape: a carrier where the callee reads registers",
+         CallShape::StackedWhereTheCalleeReadsRegisters, true, false, false, true},
+        {"stamped, the N1 shape, the callee spelled as a pointer to its signature",
+         CallShape::StackedWhereTheCalleeReadsRegisters, true, false, true, true},
+        {"stamped, the last fixed operand passed through `...`", CallShape::ThroughTheEllipsis, true, false, false,
+         true},
+        {"UNSTAMPED, the N1 shape", CallShape::StackedWhereTheCalleeReadsRegisters, false, false, false, false},
+        {"UNSTAMPED, through `...`", CallShape::ThroughTheEllipsis, false, false, false, false},
+        {"stamped, but the module's definition has another signature", CallShape::Agreeing, true, true, false,
+         false},
+    };
+    for (StampCell const& c : cells) {
+        SCOPED_TRACE(c.what);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir m = moduleCallingItsDefinition(in, c);
+        DiagnosticReporter r;
+        MirVerifier v{m, &in};
+        bool const ok = v.verify(r);
+        if (c.refused) {
+            EXPECT_FALSE(ok);
+            EXPECT_GE(countCode(r, DiagnosticCode::I_CallDisagreesWithItsDefinition), 1u) << allActuals(r);
+        } else {
+            EXPECT_EQ(countCode(r, DiagnosticCode::I_CallDisagreesWithItsDefinition), 0u) << allActuals(r);
+        }
+        if (c.shape == CallShape::Agreeing && !c.calleeSigDiffers) EXPECT_TRUE(ok) << allActuals(r);
     }
 }

@@ -1,0 +1,2 @@
+        Body const* const b = bodies.holding(offset);
+        if (b == nullptr) return fileWide;

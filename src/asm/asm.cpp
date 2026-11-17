@@ -1793,7 +1793,7 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
 
 // ── D-CSUBSET-BITINT-DATA-GLOBAL: the SOLE `_BitInt(N)` STATIC-IMAGE producer ──
 //
-// A `_BitInt(N)` object occupies `sizeOfScalarOrBitInt` bytes and carries only N
+// A `_BitInt(N)` object occupies its `computeLayout` size and carries only N
 // value bits (C23 6.2.6.2). Its image is therefore WIDER than the `std::uint64_t`
 // `decodeScalarLiteralBits` returns whenever N > 64, which is why that chokepoint
 // cannot carry one and why this producer exists beside it rather than inside it.
@@ -1949,7 +1949,7 @@ bitIntLiteralValue(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 
 [[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
-                  DataModel dm, EncodeFailure& why) {
+                  AggregateLayoutParams const& lp, DataModel dm, EncodeFailure& why) {
     auto const valOpt = bitIntLiteralValue(v, in, ty, why);
     if (!valOpt.has_value()) return std::nullopt;   // `why` already written
     BitIntValue const& val   = *valOpt;
@@ -1960,11 +1960,13 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
     // it, and asking the interner a second time is how a producer grows a second
     // opinion about a value it was handed. `val.paddingByte()` below is the only
     // consumer that ever needed it.
-    // The width comes from `sizeOfScalarOrBitInt` — the TypeId-aware companion to
-    // `scalarByteSize`, which is the layout authority's OWN size ladder and the one
-    // this file's callers are documented to use for a data-global leaf. Not
-    // re-derived here: a second ladder is a second ABI.
-    auto const wOpt = sizeOfScalarOrBitInt(in, ty, dm);
+    // The width comes from `computeLayout` — the layout authority's ONE size ladder,
+    // the target's `bitPreciseChunk` included. Not re-derived here: a second ladder is
+    // a second ABI (the TypeId-aware size ladder P69 fold f26d deleted was one, answering
+    // the x86-64 psABI's chunk on arm64 too).
+    auto const layOpt = computeLayout(ty, in, lp, dm);
+    std::optional<std::uint64_t> const wOpt =
+        layOpt.has_value() ? std::optional<std::uint64_t>{layOpt->size} : std::nullopt;
     if (!wOpt.has_value() || *wOpt == 0) {
         why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                 std::format("`_BitInt({})` has no computable container size "
@@ -2502,13 +2504,13 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // ★ MUST PRECEDE the `scalarByteSize` / `decodeScalarLiteralBits` pair below,
     // and neither of them could serve this leaf anyway — `scalarByteSize` takes a
     // KIND and a `_BitInt`'s size lives in its interned WIDTH (hence
-    // `sizeOfScalarOrBitInt` inside the producer), and the decode chokepoint returns
+    // `computeLayout` inside the producer), and the decode chokepoint returns
     // a `std::uint64_t` that structurally cannot carry an N>64 image. Before this
     // arm existed the leaf fell to `scalarByteSize(BitInt) == nullopt` and refused —
     // LOUD, but with the generic aggregate text that names f16/f80/f128 and not
     // `_BitInt`; the producer's `why` now reaches the caller with the real cause.
     if (k == TypeKind::BitInt) {
-        auto const img = encodeBitIntImage(v, in, ty, dm, why);
+        auto const img = encodeBitIntImage(v, in, ty, lp, dm, why);
         if (!img.has_value()) return false;              // `why` already written
         if (base + img->size() > buf.size()) {
             why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
@@ -3118,7 +3120,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // shifted by 64+ bits (UB, and on both shipped host arches a repeat of the
         // low word), and `scalarByteSize` takes a KIND, which cannot know N. Both are
         // answered by `encodeBitIntImage`: a wider SOURCE (the wrapped limbs) and the
-        // TypeId-aware `sizeOfScalarOrBitInt` ladder. The producer is SHARED with the
+        // layout authority's own ladder (`computeLayout`). The producer is SHARED with the
         // aggregate-leaf recursion, so closing this does not leave a member of a
         // struct refusing a width the scalar arm emits.
         //
@@ -3140,8 +3142,19 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // the image the producer actually built: a disagreement is a wrong record, so
         // it refuses rather than shipping a short or long item.
         if (k == TypeKind::BitInt) {
+            if (!aggregateLayout.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
+                                 "SymbolId={{ {} }} needs the target's "
+                                 "`aggregateLayout` block to resolve its size and "
+                                 "alignment and none is declared — refusing rather "
+                                 "than guessing an ABI layout "
+                                 "(D-CSUBSET-BITINT-DATA-GLOBAL).",
+                                 sym.v));
+                continue;
+            }
             EncodeFailure why;
-            auto const    img = encodeBitIntImage(v, interner, ty, dataModel, why);
+            auto const    img = encodeBitIntImage(v, interner, ty, *aggregateLayout, dataModel, why);
             if (!img.has_value()) {
                 // `encodeBitIntImage` writes a cause on EVERY refusal path, so the
                 // fallback here is unreachable-by-construction rather than a real
@@ -3152,17 +3165,6 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 emit(why.codeOr(DiagnosticCode::K_NoMatchingObjectFormat),
                      std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
                                  "— {}.", sym.v, why.text));
-                continue;
-            }
-            if (!aggregateLayout.has_value()) {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                     std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
-                                 "SymbolId={{ {} }} needs the target's "
-                                 "`aggregateLayout` block to resolve its alignment "
-                                 "and none is declared — refusing rather than "
-                                 "guessing an ABI alignment "
-                                 "(D-CSUBSET-BITINT-DATA-GLOBAL).",
-                                 sym.v));
                 continue;
             }
             auto const lay = computeLayout(ty, interner, *aggregateLayout, dataModel);

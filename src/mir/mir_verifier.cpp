@@ -5,6 +5,7 @@
 #include "core/types/call_payload.hpp"   // TF-C112: hasIndirectResult (sret prepend)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"   // regClassForCoreType — an `Arg`'s register class (P69 N2)
 #include "core/types/type_lattice/core_type.hpp"   // typeKindNameOrEmpty (describeType)
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"   // TF-C94: isWideInt (return ABI);
@@ -18,10 +19,12 @@
 #include "mir/seh_filter_region.hpp"   // readSehFilterRegion (what a `__try` filter is)
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <format>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -341,7 +344,9 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     // use-dom-def scan computes, so they share one computation.
     checkDomination(reporter);
     checkTypeInvariants(reporter);
+    checkArgDensity(reporter);
     checkCallSignatures(reporter);
+    checkCallsAgainstTheirDefinitions(reporter);
     checkAtomicAccessLowered(reporter);
     checkStoreValueTypes(reporter);
     checkLinkageRecords(reporter);
@@ -1447,6 +1452,209 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
             }
         }
     }
+}
+
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): A FUNCTION'S `Arg`s ARE DENSE OVER EVERY
+// REGISTER ITS CONVENTION ASSIGNS, padding included, under the counting discipline ITS OWN STAMP
+// STATES (`Mir::funcArgCounting` — the function's convention's, never the module's default: one
+// module holds functions of two conventions once a foreign convention is emitted): per register
+// class, each class's ordinals are exactly {0..k−1} for
+// its k `Arg`s; flat, all of them are {0..n−1}. The class of an `Arg` is its type's register class
+// (`regClassForCoreType`, the one MIR→LIR's `regClassFor` reads and lir_callconv's pool follows),
+// never a two-class copy of it. A gap is a register the callee never receives while its caller
+// fills it — every later `Arg` of the class then reads the register before its own
+// (I_ArgOrdinalGap); a repeat is two parameters read from one register (I_ArgOrdinalRepeated). A
+// function that holds an `Arg` and is stamped with NO discipline is refused (I_ArgCountingUnstated): the
+// `Arg`s alone cannot say how they are counted — a mixed-class signature written with flat
+// ordinals on a per-class convention is dense when the classes are counted together (design audit
+// N2-3), so a rule that accepted "per class OR flat" accepted it. An ordinal past the `Arg` count
+// is still I_ArgIndexOutOfRange (`checkTypeInvariants`). Classifying needs the interner, so the
+// per-class rule is skipped without one, as every interner-gated rule is; the flat rule and the
+// statement are not.
+void MirVerifier::checkArgDensity(DiagnosticReporter& reporter) const {
+    struct Ordinal { std::size_t cls; std::uint32_t ordinal; MirInstId id; };
+    constexpr std::array<std::string_view, 3> kClassName{"general", "floating-point", "vector"};
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir_.funcAt(fi);
+        MirArgCounting const counting = mir_.funcArgCounting(f);   // the function's own convention's
+        std::vector<Ordinal> args;
+        std::uint32_t const nBlocks = mir_.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
+            MirBlockId const b = mir_.funcBlockAt(f, bi);
+            std::uint32_t const n = mir_.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const id = mir_.blockInstAt(b, i);
+                if (mir_.instOpcode(id) != MirOpcode::Arg) continue;
+                std::size_t cls = 0;   // the one count of a flat discipline
+                if (counting == MirArgCounting::PerClass) {
+                    TypeId const t = mir_.instType(id);
+                    if (interner_ != nullptr && t.valid()) {
+                        TargetRegClass const rc = regClassForCoreType(interner_->kind(t));
+                        cls = rc == TargetRegClass::FPR ? 1u : rc == TargetRegClass::VR ? 2u : 0u;
+                    }
+                }
+                args.push_back(Ordinal{cls, mir_.argIndex(id), id});
+            }
+        }
+        if (args.empty()) continue;
+        if (counting == MirArgCounting::Unstated) {
+            reportInst(reporter, DiagnosticCode::I_ArgCountingUnstated, args.front().id,
+                std::format("func #{} receives arguments (`Arg`) and is stamped with no counting "
+                            "discipline for them (MirArgCounting): a function is stamped with its "
+                            "convention's — by `addFunction`, from the counting its builder states "
+                            "(HIR→MIR from the calling convention, the merge from its units, the "
+                            ".dssir text's `arg_counting` header, a test by hand: "
+                            "MirBuilder::stateArgCounting), or for itself "
+                            "(MirBuilder::stateFunctionArgCounting)", f.v));
+            continue;
+        }
+        if (counting == MirArgCounting::PerClass && interner_ == nullptr) continue;
+        std::array<std::uint32_t, 3> count{};
+        for (Ordinal const& a : args) ++count[a.cls];
+        std::array<std::vector<bool>, 3> taken;
+        for (std::size_t c = 0; c < taken.size(); ++c) taken[c].assign(count[c], false);
+        std::string_view const discipline =
+            counting == MirArgCounting::Flat ? "flat" : "per-class";
+        for (Ordinal const& a : args) {
+            std::string const cls = counting == MirArgCounting::Flat
+                ? std::string{"its one"}
+                : std::format("the {}", kClassName[a.cls]);
+            if (a.ordinal >= count[a.cls]) {
+                reportInst(reporter, DiagnosticCode::I_ArgOrdinalGap, a.id,
+                    std::format("func #{}: an `Arg` takes register ordinal {} of {} class, which "
+                                "has {} `Arg`(s) under its {} counting — so an ordinal "
+                                "below it is received by no `Arg`, a register the caller fills "
+                                "and the callee never reads", f.v, a.ordinal, cls,
+                                count[a.cls], discipline));
+                continue;
+            }
+            if (taken[a.cls][a.ordinal]) {
+                reportInst(reporter, DiagnosticCode::I_ArgOrdinalRepeated, a.id,
+                    std::format("func #{}: two `Arg`s take register ordinal {} of {} class under "
+                                "its {} counting — two parameters read from one register",
+                                f.v, a.ordinal, cls, discipline));
+                continue;
+            }
+            taken[a.cls][a.ordinal] = true;
+        }
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of ledger 597): A STAMPED CALL IS
+// HELD TO ITS CALLEE. A call carrying `MirInstFlags::PassesByItsDefinition` names a function its
+// own unit defines and passes by that definition's own signature, so both halves asked the one
+// placement step with the same inputs, and a disagreement between them is a DSS defect, never a
+// program: each of the callee's `Arg`s at position p must find the call's operand p — present
+// (the operand list is no shorter), passed as a FIXED operand (never through `...`,
+// `call_payload::passesThroughEllipsis`), not a stacked carrier (a `ByValueStackArg` is received
+// only from the stack), and of its type (`sameSlotType`, this file's one notion); and each stamped
+// `RecvByValueStackParam` (payload2 = position + 1) must find a `ByValueStackArg` carrier there.
+// ✔MEASURED shape it refuses (review-csf26c2 N1): a DSS caller that stacked the last fixed by-value
+// argument where its DSS callee read registers — a carrier at the position of a register `Arg`.
+// The premise is re-read here: the callee must still be the module's one definition of the name,
+// and the call's callee type its signature — a merge that kept another unit's definition of the
+// name (a weak or inline one) holds the call to nothing it was asked against, so it is not judged.
+// An UNSTAMPED call is never held (a call through a declaration without a prototype, two units'
+// incompatible prototypes: programs the references compile — ✔MEASURED, probe n2p).
+// Interner-gated, as `checkCallSignatures` is.
+void MirVerifier::checkCallsAgainstTheirDefinitions(DiagnosticReporter& reporter) const {
+    if (interner_ == nullptr) return;
+    std::unordered_map<std::uint32_t, MirFuncId> definitionOf;
+    std::unordered_set<std::uint32_t> definedTwice;
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir_.funcAt(fi);
+        std::uint32_t const s = mir_.funcSymbol(f).v;
+        if (s == 0) continue;
+        if (!definitionOf.emplace(s, f).second) definedTwice.insert(s);
+    }
+    struct Reception { std::uint32_t position; MirInstId id; bool fromStack; };
+    std::unordered_map<std::uint32_t, std::vector<Reception>> receptionsOf;
+    auto const receptions = [&](MirFuncId f) -> std::vector<Reception> const& {
+        auto const [it, fresh] = receptionsOf.try_emplace(f.v);
+        if (!fresh) return it->second;
+        std::uint32_t const nBlocks = mir_.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
+            MirBlockId const b = mir_.funcBlockAt(f, bi);
+            std::uint32_t const n = mir_.blockInstCount(b);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const id = mir_.blockInstAt(b, i);
+                MirOpcode const op = mir_.instOpcode(id);
+                if (op == MirOpcode::Arg) {
+                    it->second.push_back(Reception{mir_.argPosition(id), id, false});
+                } else if (op == MirOpcode::RecvByValueStackParam && mir_.instPayload2(id) != 0) {
+                    it->second.push_back(Reception{mir_.instPayload2(id) - 1u, id, true});
+                }
+            }
+        }
+        return it->second;
+    };
+    forEachInst(mir_, [&](MirInstId id) {
+        if (mir_.instOpcode(id) != MirOpcode::Call
+            || !has(mir_.instFlags(id), MirInstFlags::PassesByItsDefinition))
+            return;
+        auto const ops = mir_.instOperands(id);
+        if (ops.empty() || mir_.instOpcode(ops[0]) != MirOpcode::GlobalAddr) {
+            reportInst(reporter, DiagnosticCode::I_CallDisagreesWithItsDefinition, id,
+                "the call is stamped as passing by its callee's own definition, and it names no "
+                "callee — the stamp is made only for a call of a NAMED function");
+            return;
+        }
+        std::uint32_t const sym = mir_.globalAddrSymbol(ops[0]).v;
+        auto const def = definitionOf.find(sym);
+        if (def == definitionOf.end() || definedTwice.contains(sym)) return;
+        TypeId sig = mir_.instType(ops[0]);
+        if (sig.valid()) {
+            if (TypeKind const k = interner_->kind(sig); k == TypeKind::Ptr || k == TypeKind::FnPtr) {
+                auto const pointee = interner_->operands(sig);
+                sig = pointee.empty() ? TypeId{} : pointee[0];
+            }
+        }
+        if (!sig.valid() || sig.v != mir_.funcSignature(def->second).v) return;
+        std::uint32_t const payload = mir_.instPayload(id);
+        std::uint32_t const resultFirst =
+            ::dss::call_payload::hasIndirectResult(payload) ? 1u : 0u;
+        std::size_t const nArgs = ops.size() - 1;
+        for (Reception const& r : receptions(def->second)) {
+            auto const disagree = [&](std::string why) {
+                reportInst(reporter, DiagnosticCode::I_CallDisagreesWithItsDefinition, id,
+                    std::format("call of symbol #{} (func #{}), which passes by its definition's "
+                                "own signature: the callee receives position {} (inst #{}), and {} "
+                                "— the two halves of one call placed it apart",
+                                sym, def->second.v, r.position, r.id.v, why));
+            };
+            if (r.position >= nArgs) {
+                disagree(std::format("the call passes {} argument operand(s)", nArgs));
+                continue;
+            }
+            MirInstId const operand = ops[1 + r.position];
+            bool const carrier = mir_.instOpcode(operand) == MirOpcode::ByValueStackArg;
+            if (r.fromStack) {
+                if (!carrier)
+                    disagree(std::format("the call's operand there (value #{}) is no stacked "
+                                         "carrier, where the callee reads its bytes from the stack",
+                                         operand.v));
+                continue;
+            }
+            if (carrier) {
+                disagree(std::format("the call's operand there (value #{}) is a stacked carrier, "
+                                     "where the callee receives a register", operand.v));
+                continue;
+            }
+            if (r.position >= resultFirst
+                && ::dss::call_payload::passesThroughEllipsis(payload, r.position - resultFirst)) {
+                disagree("the call passes that operand through `...`, where the callee receives "
+                         "a fixed parameter");
+                continue;
+            }
+            TypeId const want = mir_.instType(r.id);
+            TypeId const got  = mir_.instType(operand);
+            if (!sameSlotType(*interner_, got, want))
+                disagree(std::format("the call's operand there (value #{}) has type {} ({}), where "
+                                     "the callee's `Arg` has type {} ({})", operand.v, got.v,
+                                     describeType(*interner_, got), want.v,
+                                     describeType(*interner_, want)));
+        }
+    });
 }
 
 void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {

@@ -1,0 +1,1 @@
+        if (counting == MirArgCounting::PerClass && interner_ == nullptr) continue;

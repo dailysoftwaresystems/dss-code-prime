@@ -31,6 +31,7 @@
 #include "ffi/abi/abi_catalog.hpp"
 #include "link/object_format_schema.hpp"
 #include "diagnostic_count.hpp"
+#include "shipped_read_pairs.hpp"   // shippedFormatNames -- the one home
 
 #include <nlohmann/json.hpp>
 
@@ -145,24 +146,8 @@ formatWithConvention(std::string_view name, std::string const& convention) {
 // Every shipped format name, read off the shipped directory rather than
 // hand-listed — a hand-listed set silently stops covering the format added
 // after it was written.
-[[nodiscard]] std::vector<std::string> shippedFormatNames() {
-    std::vector<std::string> out;
-    auto dirR = findShippedConfigDir("object-formats");
-    if (!dirR.has_value()) {
-        ADD_FAILURE() << "cannot locate the shipped object-formats directory";
-        return out;
-    }
-    for (auto const& e : std::filesystem::directory_iterator{*dirR}) {
-        auto const fn = e.path().filename().string();
-        constexpr std::string_view kSuffix = ".format.json";
-        if (fn.size() > kSuffix.size()
-            && fn.compare(fn.size() - kSuffix.size(), kSuffix.size(), kSuffix)
-                   == 0) {
-            out.push_back(fn.substr(0, fn.size() - kSuffix.size()));
-        }
-    }
-    return out;
-}
+// P69 fold f26d (review-csf26c2 N3): every shipped format document's name has ONE home.
+using dss::test_support::shippedFormatNames;
 
 } // namespace
 

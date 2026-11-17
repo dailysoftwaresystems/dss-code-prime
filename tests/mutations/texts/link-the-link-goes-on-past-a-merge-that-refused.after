@@ -1,0 +1,2 @@
+        mergedStorage = mergeModules(modules, image, targetSchema,
+                                     objectFormatSchema, reporter);

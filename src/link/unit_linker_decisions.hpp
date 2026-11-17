@@ -116,9 +116,12 @@ DSS_EXPORT void dropPulledMemberEntryRequests(UnitLinkerRequests& requests);
 // image — before anything is required. Making each stating unit's entry a
 // required reference as it was read, which this function did until fold 2,
 // refused a link link.exe runs.
-DSS_EXPORT void requireEntryReference(std::span<AssembledModule> namedUnits);
+// The reference's id comes from the unit's door (`link/fresh_symbol_ids.hpp`); false: its id space is exhausted,
+// refused there by name on `reporter`.
+[[nodiscard]] DSS_EXPORT bool requireEntryReference(std::span<AssembledModule> namedUnits,
+                                                    DiagnosticReporter&        reporter);
 // One unit named to the link alone: the same rule, among the entries it states.
-DSS_EXPORT void requireEntryReference(AssembledModule& unit);
+[[nodiscard]] DSS_EXPORT bool requireEntryReference(AssembledModule& unit, DiagnosticReporter& reporter);
 
 // THE ENTRY REQUEST THAT STANDS among the units named to the link, in their
 // order, by the precedence each request's own vocabulary row states -- the

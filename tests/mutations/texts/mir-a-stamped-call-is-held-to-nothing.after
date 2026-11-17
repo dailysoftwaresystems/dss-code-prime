@@ -1,0 +1,2 @@
+void MirVerifier::checkCallsAgainstTheirDefinitions(DiagnosticReporter& reporter) const {
+    if (interner_ != nullptr) return;

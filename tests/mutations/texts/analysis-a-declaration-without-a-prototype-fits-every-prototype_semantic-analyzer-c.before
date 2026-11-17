@@ -1,0 +1,11 @@
+    if (!proto.valid() || in.kind(proto) != TypeKind::FnSig || in.fnIsVariadic(proto)) return false;
+    // A copy: the promotion interns (a pointer, `double`), which would move the storage a span of the parameters
+    // points into.
+    auto const protoParams = in.fnParams(proto);
+    std::vector<TypeId> const params(protoParams.begin(), protoParams.end());
+    for (TypeId const p : params) {
+        TypeId const u = in.stripVolatile(p);
+        if (!compatibleTypes(in, u, defaultArgumentPromotion(s, cfg, u), ArraysCompared::BelowAPointer))
+            return false;
+    }
+    return true;

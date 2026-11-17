@@ -1,0 +1,2 @@
+    DeclarationRule const* const table = &decl;
+    if (table == nullptr) return out;

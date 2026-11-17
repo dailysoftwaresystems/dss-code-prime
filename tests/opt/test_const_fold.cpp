@@ -59,6 +59,7 @@ BuildResult buildArgPlusConstant(TypeInterner& interner,
     br.fnSig = interner.fnSig(params, br.i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(br.fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -586,6 +587,7 @@ TEST(ConstFold, PreservesMultiBlockCondBrCfg) {
     TypeId const params[] = {boolT};
     br.fnSig = interner.fnSig(params, br.i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(br.fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::Linear);
@@ -661,6 +663,7 @@ TEST(ConstFold, PreservesPhiIncomingsAtMergeBlock) {
     TypeId const params[] = {boolT};
     br.fnSig = interner.fnSig(params, br.i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(br.fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::Linear);

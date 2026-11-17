@@ -130,6 +130,7 @@ Mir buildMtxInitCaller(TypeInterner& in, CallConv cc) {
     TypeId const initSig = in.fnSig(params, i32, cc);
 
     MirBuilder mb;
+    mb.stateArgCounting(argCountingOf(cc == CallConv::CcMS64));
     // This hand-built module is its own table: nothing beside it names an id it
     // does not define, so its end is the counted one, STATED (the symbol-id door
     // refuses to mint past an end nobody stated).

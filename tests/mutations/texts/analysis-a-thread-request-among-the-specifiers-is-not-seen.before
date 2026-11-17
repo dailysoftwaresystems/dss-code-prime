@@ -1,1 +1,1 @@
-        scanAttributeStorage(cfg, tree, run, decl, format, out);
+        scanAttributeStorage(cfg, tree, run, *table, format, out);

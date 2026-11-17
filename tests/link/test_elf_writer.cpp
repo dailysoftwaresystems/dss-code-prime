@@ -41,6 +41,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -687,7 +688,7 @@ TEST(ElfWriter, GotExternAddrValueEmitsAdrGotPageAndLd64GotLo12OnAarch64) {
     std::vector<ExternImport> externs{ext};
     // FULL back-half WITH the got extern-address binding threaded in — the same
     // stage order as compile_pipeline.cpp's lowerMirModuleToAssembly.
-    auto lir = lowerToLir(mir, **target, interner, rep, externs,
+    auto lir = lowerToLir(mir, **target, interner, rep, dss::test::kFirstConventionOfTheTarget, externs,
                           ExternCallDispatch::DirectPlt,
                           /*dataImportBinding=*/std::nullopt,
                           /*tlsAccess=*/std::nullopt,

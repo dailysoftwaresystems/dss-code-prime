@@ -378,7 +378,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // witness to fall back on, by construction: `MirRebuildHelper.
     // RebuildFunctionPreservesNoSanitizeThread` is the ONLY thing standing between
     // this argument and silent deletion.
-    dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
+    MirFuncId const rebuilt = dst_.addFunction(src_.funcSignature(oldFn), src_.funcSymbol(oldFn),
                      // P69: the linkage is copied as its ONE record (binding,
                      // visibility, weak kind) — under all 8 rebuild passes.
                      src_.funcLinkage(oldFn),
@@ -392,6 +392,10 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
                      // correct — the exact split a corpus example's release arm
                      // exists to catch.
                      src_.funcStaticInit(oldFn));
+    // ★ P69 (lane `cs`, fold f26d): the counting of the convention the function is called by crosses
+    // with it — a clone that took the builder's default would count a foreign-convention function
+    // by the pair's.
+    dst_.stateFunctionArgCounting(rebuilt, src_.funcArgCounting(oldFn));
 
     // ★★ TF-C85 (D-OPT-NOOPTIMIZE-NEUTERS-POLICY): THE per-function optimizer
     // opt-out, applied at the ONE shared chokepoint under all 8 rebuild passes.

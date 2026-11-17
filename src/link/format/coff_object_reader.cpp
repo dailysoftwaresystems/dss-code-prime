@@ -1074,7 +1074,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // its aux slots, and the `1 + numAux` walk is what keeps a relocation's
     // symbol index meaning the same record on the way back in as it did on the
     // way out (`PeWriter.RelocationToAWeakDefinitionResolvesPastTheAuxSlot`).
-    link::format::RecordSymbolIds symbolIds{numSymbols};
+    link::format::RecordSymbolIds symbolIds{numSymbols, reporter, "pe::readRelocatableObject"};
+    if (symbolIds.refused()) return std::nullopt;   // the table reaches a reserved id: refused by name
     std::vector<Sym>  syms(numSymbols);
     std::vector<bool> auxSlot(numSymbols, false);
     // A `std::size_t` cursor (not u32): the `+= 1 + numAux` skip past a
@@ -3546,6 +3547,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
+    if (symbolIds.refused()) return std::nullopt;
+    mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;
 }

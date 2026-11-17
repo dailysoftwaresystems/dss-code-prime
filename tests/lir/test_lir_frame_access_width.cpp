@@ -147,6 +147,7 @@ struct PipelineOut {
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, conv);
     MirBuilder mb;
+    mb.stateArgCounting(argCountingOf(conv == CallConv::CcMS64));
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -173,7 +174,7 @@ struct PipelineOut {
 void runToBytes(Mir& mir, TypeInterner const& interner,
                 TargetSchema const& target, std::uint16_t ccIndex,
                 PipelineOut& out) {
-    auto lir = lowerToLir(mir, target, interner, out.rep);
+    auto lir = lowerToLir(mir, target, interner, out.rep, ccIndex);
     ASSERT_TRUE(lir.ok) << "MIR->LIR failed";
     auto const liveness = analyzeLiveness(lir.lir);
     auto const alloc = allocateRegisters(lir.lir, target, liveness, ccIndex,

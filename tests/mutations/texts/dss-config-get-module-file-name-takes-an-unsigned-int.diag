@@ -1,0 +1,1 @@
+GetModuleFileNameA is DWORD (WINAPI *)(HMODULE, LPSTR, DWORD)

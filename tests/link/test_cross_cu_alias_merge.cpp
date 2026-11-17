@@ -1069,3 +1069,156 @@ TEST(CrossCuAliasMerge, DefinitionWhoseThreeNamesResolveThreeWaysIsRefusedOnce) 
     }
     EXPECT_TRUE(sawIt);
 }
+
+// ── (14) THE MERGED MODULE'S IDS ARE MINTED IN THE LINK'S INPUT ORDER, AND AN ARTIFACT SHOWS THEM ──────────────────
+//
+// (P69 fold f26d, the host-toolchain class: its site in `mergeModules`.) The merge numbers every winning definition
+// afresh; it walked the winners' hash map, so the numbering was the standard library's hash order of their names.
+// Most of the link never shows a merged id -- names, input order and addresses decide the bytes -- but a RELOCATABLE
+// object's writer gives a weak definition its unit references by row a record of its own (`ObjectSymbolNames`, where
+// this format's linkers keep a superseded definition's bytes), and that record is named `sym_<id>`: the merged id,
+// written into the artifact's string table. THE CELL: unit 1 defines sixteen functions and unit 2 eight such weak
+// definitions, so the eight records name the merged ids 17..24 -- unit 2 after unit 1, and each in the order unit 2
+// defines it. A numbering in any other order (the hash map's) names other ids.
+TEST(CrossCuAliasMerge, AMergedRelocatableObjectNamesItsRecordsByTheLinksInputOrder) {
+    Loaded const L = loadShippedPair("x86_64", "elf64-x86_64-linux");
+    ASSERT_NE(L.target, nullptr);
+    ASSERT_NE(L.format, nullptr);
+    constexpr std::uint32_t kStrong = 16;
+    constexpr std::uint32_t kWeak   = 8;
+
+    AssembledModule strong;
+    strong.cuId = CompilationUnitId{1};
+    for (std::uint32_t k = 1; k <= kStrong; ++k) {
+        AssembledFunction fn;
+        fn.symbol = SymbolId{k};
+        fn.bytes  = {0xB8, static_cast<std::uint8_t>(k), 0x00, 0x00, 0x00, 0xC3};
+        strong.functions.push_back(std::move(fn));
+        strong.symbols.push_back(sym(k, "g_" + std::to_string(k), SymbolBinding::Global));
+    }
+    strong.expectedFuncCount = strong.functions.size();
+
+    // Unit 2: `w_k` (id k) is its definition's FIRST and only name, weak, and the unit reaches it through its
+    // reference row (id kWeak + k), as an object reader states a reference written through a weak name.
+    AssembledModule weak;
+    weak.cuId = CompilationUnitId{2};
+    for (std::uint32_t k = 1; k <= kWeak; ++k) {
+        AssembledFunction fn;
+        fn.symbol = SymbolId{k};
+        fn.bytes  = {0xB8, static_cast<std::uint8_t>(0x40 + k), 0x00, 0x00, 0x00, 0xC3};
+        weak.functions.push_back(std::move(fn));
+        ModuleSymbol row = sym(k, "w_" + std::to_string(k), SymbolBinding::Weak);
+        row.referencedByName = true;
+        weak.symbols.push_back(std::move(row));
+        ExternImport ext;
+        ext.symbol      = SymbolId{kWeak + k};
+        ext.mangledName = "w_" + std::to_string(k);
+        weak.externImports.push_back(std::move(ext));
+    }
+    AssembledFunction user;
+    user.symbol = SymbolId{2 * kWeak + 1};
+    for (std::uint32_t k = 1; k <= kWeak; ++k) {
+        Relocation rel;
+        rel.offset = static_cast<std::uint32_t>(user.bytes.size() + 1);
+        rel.target = SymbolId{kWeak + k};
+        rel.kind   = RelocationKind{1};   // the x86_64 target's rel32
+        rel.addend = 0;
+        user.relocations.push_back(rel);
+        user.bytes.insert(user.bytes.end(), {0xE8, 0, 0, 0, 0});   // call rel32
+    }
+    user.bytes.push_back(0xC3);
+    weak.functions.push_back(std::move(user));
+    weak.symbols.push_back(sym(2 * kWeak + 1, "user", SymbolBinding::Global));
+    weak.expectedFuncCount = weak.functions.size();
+
+    std::vector<AssembledModule> mods{std::move(strong), std::move(weak)};
+    DiagnosticReporter rep;
+    LinkedImage const img = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+    for (auto const& d : rep.all()) {
+        EXPECT_NE(d.severity, DiagnosticSeverity::Error) << diagnosticCodeName(d.code) << ": " << d.actual;
+    }
+    ASSERT_TRUE(img.ok());
+
+    auto const secs = readSections(img.bytes);
+    auto const syms = readSymbols(img.bytes, secs, ".symtab", ".strtab");
+    for (std::uint32_t k = 1; k <= kWeak; ++k) {
+        std::string const name = "w_" + std::to_string(k);
+        auto const named = rowsNamed(syms, name);
+        ASSERT_EQ(named.size(), 1u) << name;
+        // The record of its bytes: the LOCAL row at the weak name's address (the format keeps a superseded
+        // definition's bytes, so they have a record of their own).
+        std::vector<std::string> records;
+        for (auto const& r : syms) {
+            if (r.bind == 0 && r.value == named.front()->value && r.name.rfind("sym_", 0) == 0) records.push_back(r.name);
+        }
+        EXPECT_EQ(records, std::vector<std::string>{"sym_" + std::to_string(kStrong + k)})
+            << name << ": its record names the merged id the link's input order gives it";
+    }
+}
+
+// ── (15) A UNIT'S REFUSALS COME IN ITS TABLE'S ORDER ─────────────────────────────────────────────────────────────
+//
+// (P69 fold f26d, the host-toolchain class: its site in the election before the merge.) Where a format's linkers
+// replace a superseded definition WHOLE (Mach-O), a definition whose names win in two other places has no one winner
+// to send its kept name to, and the link refuses it, once per definition. That walk ranged over a hash map of the
+// unit's ids, so a unit's several refusals came in the standard library's hash order. THE CELL: twenty-four such
+// definitions in one unit (each keeps `c_k`, loses `a_k` to unit 2 and `b_k` to unit 3); the refusals name them in
+// the unit's table order.
+TEST(CrossCuAliasMerge, AUnitsRefusalsOfDefinitionsWithTwoWinnersComeInItsTableOrder) {
+    Loaded const L = loadShippedPair("x86_64", "macho64-x86_64-darwin-exec");
+    ASSERT_NE(L.target, nullptr);
+    ASSERT_NE(L.format, nullptr);
+    constexpr std::uint32_t kN = 24;
+
+    AssembledModule split;
+    split.cuId = CompilationUnitId{1};
+    for (std::uint32_t k = 1; k <= kN; ++k) {
+        AssembledFunction fn;
+        fn.symbol = SymbolId{k};
+        fn.bytes  = {0xB8, static_cast<std::uint8_t>(k), 0x00, 0x00, 0x00, 0xC3};
+        split.functions.push_back(std::move(fn));
+        split.symbols.push_back(sym(k, "a_" + std::to_string(k), SymbolBinding::Weak));
+        split.symbols.push_back(sym(k, "b_" + std::to_string(k), SymbolBinding::Weak));
+        split.symbols.push_back(sym(k, "c_" + std::to_string(k), SymbolBinding::Global));
+    }
+    split.expectedFuncCount = split.functions.size();
+    auto const winnersOf = [&](std::uint32_t cu, std::string const& prefix, bool entry) {
+        AssembledModule m;
+        m.cuId = CompilationUnitId{cu};
+        for (std::uint32_t k = 1; k <= kN; ++k) {
+            AssembledFunction fn;
+            fn.symbol = SymbolId{k};
+            fn.bytes  = {0xB8, static_cast<std::uint8_t>(0x80 + k), 0x00, 0x00, 0x00, 0xC3};
+            m.functions.push_back(std::move(fn));
+            m.symbols.push_back(sym(k, prefix + std::to_string(k), SymbolBinding::Global));
+        }
+        if (entry) {
+            AssembledFunction fn;
+            fn.symbol = SymbolId{kN + 1};
+            fn.bytes  = {0x31, 0xC0, 0xC3};   // xor eax, eax; ret
+            m.functions.push_back(std::move(fn));
+            m.symbols.push_back(sym(kN + 1, "_main", SymbolBinding::Global));
+            m.userEntrySymbol = SymbolId{kN + 1};
+        }
+        m.expectedFuncCount = m.functions.size();
+        return m;
+    };
+    std::vector<AssembledModule> mods{std::move(split), winnersOf(2, "a_", true), winnersOf(3, "b_", false)};
+    DiagnosticReporter rep;
+    LinkedImage const img = linker::link(std::span<AssembledModule const>{mods}, *L.target, *L.format, rep);
+    EXPECT_FALSE(img.ok());
+
+    std::vector<std::string> refused;   // the definition each refusal names, in the order they were reported
+    std::string const        lead = "the definition of '";
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::K_CrossCuMergeUnsupported) continue;
+        if (d.actual.find("replace a superseded definition WHOLE") == std::string::npos) continue;
+        auto const at = d.actual.find(lead);
+        ASSERT_NE(at, std::string::npos) << d.actual;
+        auto const from = at + lead.size();
+        refused.push_back(d.actual.substr(from, d.actual.find('\'', from) - from));
+    }
+    std::vector<std::string> inTableOrder;
+    for (std::uint32_t k = 1; k <= kN; ++k) inTableOrder.push_back("a_" + std::to_string(k));
+    EXPECT_EQ(refused, inTableOrder) << "one refusal per definition, in the order its unit's table lists them";
+}

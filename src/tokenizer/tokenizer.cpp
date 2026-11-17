@@ -1,18 +1,21 @@
 #include "tokenizer/tokenizer.hpp"
 
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/lexer_mode.hpp"
 #include "core/types/number_style.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/string_style.hpp"
 #include "tokenizer/source_reader.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <format>
-#include <regex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -237,8 +240,8 @@ struct LookupHit {
 //
 // `endsAt`        — the static suffix from the StringStyle (e.g. `'`,
 //                   `*/`, `\n`).
-// `dynamicSuffix` — the captured-at-opener tag for tagPattern-style
-//                   raw strings (C++ `R"DELIM(...)DELIM"`). The full
+// `dynamicSuffix` — the captured-at-opener tag of a style with a
+//                   `delimiterTag` (C++ `R"DELIM(...)DELIM"`). The full
 //                   close pattern is `endsAt + dynamicSuffix`. Empty
 //                   for static-endsAt configs (the common case).
 // `longestMatch`  — when true AND `endsAt.size() == 1` AND no
@@ -249,7 +252,7 @@ struct LookupHit {
 //                   any non-empty run terminates. When `endsAt` is
 //                   multi-char OR dynamicSuffix is non-empty the flag
 //                   is silently a no-op (exact-length match runs).
-//                   The loader rejects the longestMatch + tagPattern
+//                   The loader rejects the longestMatch + delimiterTag
 //                   combo at load time.
 [[nodiscard]] std::size_t matchEndsAt(SourceReader const& r,
                                       std::string_view endsAt,
@@ -1081,12 +1084,30 @@ TokenizeResult Tokenizer::tokenize() && {
             schema_->lexerMode(f.mode).name);
     };
 
-    // Tokenizer-local cache of compiled tagPattern regexes, keyed by
-    // StringStyleId.v. `std::regex` construction is expensive and the
-    // schema's tagPattern is constant per StringStyle for the
-    // tokenizer's lifetime — compiling once per opener was a real perf
-    // cliff for raw-string-heavy sources. Lazily populated on first use.
-    std::unordered_map<std::uint32_t, std::regex> tagRegexCache;
+    // The dynamic delimiter tag of a frame entered with a tagged style (C++
+    // `R"DELIM(...)DELIM"`): the longest run, of at most `maxLength` bytes, that the
+    // document's `characters` admit, from the opener's end; captured — and consumed —
+    // only when it is at least `minLength` long. The body's close is then `endsAt +
+    // the tag`. ★ P69 (lane `cs`, fold f26d, ruling 643 (3)): a LOOP over at most
+    // `maxLength` bytes. It replaced a `std::regex` run over the rest of the buffer,
+    // whose matcher recursed once per character a repetition consumed (a stack depth
+    // proportional to the input) and which the tokenizer compiled at run time.
+    // The tag is text the author WROTE, so the buffer's bytes only — never an implied
+    // tail.
+    auto captureDelimiterTag = [&](StringStyle const* style) -> std::string {
+        if (style == nullptr || !style->delimiterTag) return {};
+        DelimiterTag const& tag = *style->delimiterTag;
+        auto const remaining = r.remainingInBuffer();
+        std::size_t n = 0;
+        while (n < tag.maxLength && n < remaining.size()
+               && tag.characters[static_cast<unsigned char>(remaining[n])]) {
+            ++n;
+        }
+        if (n < tag.minLength) return {};
+        std::string captured{remaining.substr(0, n)};
+        r.advance(n);
+        return captured;
+    };
 
     // Apply a meaning's mode-stack side-effect after the corresponding
     // token has been emitted. Every mutation to the frame stack lives
@@ -1106,40 +1127,9 @@ TokenizeResult Tokenizer::tokenize() && {
                     && schema_->lexerMode(m.modeArg).defaultToken.has_value()) {
                     tokenizerFatal("PushMode into a defaultToken-bearing mode without a stringStyle");
                 }
-                std::string captured;
-                if (style && !style->tagPattern.empty()) {
-                    // Dynamic tagPattern: capture at opener time so
-                    // the body-mode close pattern is `endsAt + tag`.
-                    // Cache keyed by `m.stringStyleId.v` — same
-                    // StringStyle slot reused across multiple openers
-                    // gets a single compiled regex.
-                    auto it = tagRegexCache.find(m.stringStyleId.v);
-                    if (it == tagRegexCache.end()) {
-                        try {
-                            it = tagRegexCache.emplace(m.stringStyleId.v,
-                                                       std::regex(style->tagPattern)).first;
-                        } catch (std::exception const&) {
-                            // Loader pre-validates tagPattern (see
-                            // grammar_schema_json), so a runtime
-                            // construction failure means a deep config
-                            // bug. Surface it loudly rather than
-                            // silently swallowing — would otherwise
-                            // mis-tokenize as static-endsAt only.
-                            tokenizerFatal("tagPattern regex failed to compile at runtime");
-                        }
-                    }
-                    std::cmatch match;
-                    // The tag is text the author WROTE, so the buffer's bytes
-                    // only — never an implied tail.
-                    const auto remaining = r.remainingInBuffer();
-                    if (std::regex_search(remaining.data(),
-                                          remaining.data() + remaining.size(),
-                                          match, it->second,
-                                          std::regex_constants::match_continuous)) {
-                        captured.assign(match[0].first, match[0].second);
-                        r.advance(static_cast<std::size_t>(match[0].length()));
-                    }
-                }
+                // Dynamic tag: captured at opener time so the body-mode close
+                // pattern is `endsAt + tag`.
+                std::string captured = captureDelimiterTag(style);
                 // `start` is still the OPENER's first byte: the opener token was
                 // emitted with it just before this side effect runs.
                 frames.push_back(Frame{
@@ -1171,17 +1161,16 @@ TokenizeResult Tokenizer::tokenize() && {
                     tokenizerFatal("ReplaceMode applied at bottom-frame depth");
                 }
                 StringStyle const* style = schema_->stringStyle(m);
-                // The replaced frame starts with no dynamicSuffix.
-                // Dynamic-tag capture happens only at pushMode time —
-                // a replaceMode meaning that names a tagPattern-bearing
-                // style would silently get an empty suffix here. No
-                // shipped config exercises that combo; if a future one
-                // does, capture logic needs to be hoisted out of the
-                // PushMode arm and applied here too.
+                // A frame entered by replacement captures its style's tag exactly
+                // as a pushed one does (P69, fold f26d: before, a replaceMode meaning
+                // whose style carries a dynamic tag entered its body with NO tag, so
+                // its close was `endsAt` alone — a comment here said so and called it
+                // the next author's job).
+                std::string captured = captureDelimiterTag(style);
                 frames.back() = Frame{
                     .mode          = m.modeArg,
                     .style         = style,
-                    .dynamicSuffix = {},
+                    .dynamicSuffix = std::move(captured),
                     .openerStart   = start,
                 };
                 break;
@@ -1643,7 +1632,7 @@ TokenizeResult Tokenizer::tokenize() && {
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = source_->id();
                 d.span     = SourceSpan::of(start, static_cast<ByteOffset>(r.position()));
-                d.actual   = std::format("'{}'", r.slice(start, r.position()));
+                d.actual   = std::format("'{}'", quotedSourceText(r.slice(start, r.position())));
                 reporter_->report(std::move(d));
             }
             continue;

@@ -35,6 +35,7 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -68,6 +69,7 @@ struct Lowered {
     TypeId const params[] = {i32};
     TypeId const fnSig    = interner.fnSig(params, i32, cc);
     MirBuilder mb;
+    mb.stateArgCounting(argCountingOf(cc == CallConv::CcMS64));
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -86,7 +88,7 @@ struct Lowered {
     ei.binding         = binding;
     ei.readThroughSlot = isThreadLocal;   // stale, and the opposite of the right answer
     DiagnosticReporter rep;
-    auto r = lowerToLir(mir, target, interner, rep, {ei}, format.externCallDispatch(),
+    auto r = lowerToLir(mir, target, interner, rep, dss::test::kFirstConventionOfTheTarget, {ei}, format.externCallDispatch(),
                         format.dataImportBinding(), tlsAccess, {}, std::nullopt,
                         format.externAddrBinding(), std::nullopt, std::nullopt,
                         format.indirectSlotBindings());

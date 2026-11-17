@@ -461,6 +461,11 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_StoreValueTypeMismatch:   return "I_StoreValueTypeMismatch";
         case DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor:
             return "I_PhiIncomingsNotOnePerPredecessor";
+        case DiagnosticCode::I_ArgOrdinalGap:            return "I_ArgOrdinalGap";
+        case DiagnosticCode::I_ArgOrdinalRepeated:       return "I_ArgOrdinalRepeated";
+        case DiagnosticCode::I_ArgCountingUnstated:      return "I_ArgCountingUnstated";
+        case DiagnosticCode::I_CallDisagreesWithItsDefinition:
+            return "I_CallDisagreesWithItsDefinition";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -674,6 +679,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ProgramEntryChosenByPrecedence";
         case DiagnosticCode::K_PointerWidthNotTheWritersClass:
             return "K_PointerWidthNotTheWritersClass";
+        case DiagnosticCode::K_SymbolIdSpaceExhausted:
+            return "K_SymbolIdSpaceExhausted";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

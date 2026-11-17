@@ -44,12 +44,16 @@
 namespace dss {
 
 // Opens a synthesis pass's rebuild of `mir` into `builder`: the rebuilt module
-// continues `mir`'s symbol-id space, kept clear of every import row handed beside it.
-// Call it BEFORE the first `mintSymbolOrAbort` — which aborts on a builder that was
-// never told whose ids it continues.
+// carries `mir`'s module facts whole (`MirBuilder::carryModuleFactsOf` -- its Arg
+// counting, aliasing mode, char-types rule, aliases, and its symbol-id space) and is
+// kept clear of every import row handed beside it. Call it BEFORE the first
+// `mintSymbolOrAbort` — which aborts on a builder that was never told whose ids it
+// continues. ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): it continued the ids
+// ALONE, so every synthesis rebuild dropped the rest (✔MEASURED, run n2a: the module's
+// Arg counting, refused by the MIR verifier once the pass added functions with `Arg`s).
 inline void continueSymbolIdsPastImports(MirBuilder& builder, Mir const& mir,
-                                         std::span<ExternImport const> imports) noexcept {
-    builder.continueSymbolIdsOf(mir);
+                                         std::span<ExternImport const> imports) {
+    builder.carryModuleFactsOf(mir);
     for (ExternImport const& e : imports) builder.keepSymbolIdsClearOf(e.symbol);
 }
 

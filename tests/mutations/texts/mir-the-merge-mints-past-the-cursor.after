@@ -1,0 +1,2 @@
+            SymbolId const id{next_.value()};
+            next_.keepClearOfHighest(next_.value());

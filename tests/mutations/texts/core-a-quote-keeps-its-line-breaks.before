@@ -1,0 +1,1 @@
+                lineBreak ? std::string_view{" "} : text.substr(i, j - i);

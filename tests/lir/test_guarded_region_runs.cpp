@@ -99,6 +99,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
 #include "program/compile_pipeline.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -249,7 +250,7 @@ Lowered lowerWithScopes(Mir const& mir, TypeInterner const& ti, std::span<MirSeh
     EXPECT_TRUE(target.has_value());
     Lowered out;
     if (!target.has_value()) return out;
-    out.result = lowerToLir(mir, **target, ti, out.rep, std::vector<ExternImport>{},
+    out.result = lowerToLir(mir, **target, ti, out.rep, dss::test::kFirstConventionOfTheTarget, std::vector<ExternImport>{},
                             std::nullopt, std::nullopt, std::nullopt, scopes);
     return out;
 }
@@ -483,6 +484,7 @@ TEST(GuardedRegionRuns, ARegionsRunIsEveryBlockCreatedForItsBlocks) {
     TypeId const boolT = ti.primitive(TypeKind::Bool);
     std::array<TypeId, 1> const params{i32};
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a dense switch's table symbol is minted
     mb.addFunction(ti.fnSig(params, i32, CallConv::CcSysV), SymbolId{1});
     constexpr std::size_t kDense = 10, kSparse = 3;
@@ -601,6 +603,7 @@ FedPhi buildFedPhi(TypeInterner& ti, bool twoWaysOut) {
     TypeId const boolT = ti.primitive(TypeKind::Bool);
     std::array<TypeId, 1> const params{i32};
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();
     mb.addFunction(ti.fnSig(params, i32, CallConv::CcSysV), SymbolId{1});
     MirBlockId const entry   = mb.createBlock(StructCfMarker::EntryBlock);
@@ -967,7 +970,7 @@ LoweredSource lowerSource(Toolchain const& tc, CompileConfig config, std::string
 
     // The funclet synthesis imports the format's personality routine, so the module
     // holds an import and its calls take the call-site form the format declares.
-    out.lowered = lowerToLir(mir, *tc.target, interner, rep, unit.externImports,
+    out.lowered = lowerToLir(mir, *tc.target, interner, rep, dss::test::kFirstConventionOfTheTarget, unit.externImports,
                              tc.format->externCallDispatch(), std::nullopt, std::nullopt, scopes);
     EXPECT_TRUE(out.lowered.ok) << allDiagText(rep);
     out.ok = out.lowered.ok;

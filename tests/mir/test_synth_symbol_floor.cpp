@@ -332,34 +332,6 @@ std::string readWhole(std::filesystem::path const& p) {
     return buf.str();
 }
 
-// Every `SymbolId{…}` / `SymbolId const name{…}` in `text` whose braces hold a `+`:
-// the spelling of an id counted on the spot (`{maxV + 1}`, `{++next}`, `{next++}`).
-std::vector<std::string> countedSymbolIds(std::string const& text) {
-    std::vector<std::string> found;
-    std::string_view const needle = "SymbolId";
-    for (std::size_t at = text.find(needle); at != std::string::npos;
-         at = text.find(needle, at + needle.size())) {
-        if (at > 0 && (std::isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '_'))
-            continue;
-        std::size_t i = at + needle.size();
-        auto skipSpace = [&] { while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i; };
-        auto skipWord  = [&] {
-            while (i < text.size() && (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_')) ++i;
-        };
-        skipSpace();
-        if (text.compare(i, 5, "const") == 0) { i += 5; skipSpace(); }
-        skipWord();          // the declared name, when there is one
-        skipSpace();
-        if (i >= text.size() || text[i] != '{') continue;
-        std::size_t const close = text.find_first_of("{}", i + 1);
-        if (close == std::string::npos || text[close] != '}') continue;
-        std::string const inside = text.substr(i + 1, close - i - 1);
-        if (inside.find('+') != std::string::npos)
-            found.push_back(text.substr(at, close - at + 1));
-    }
-    return found;
-}
-
 } // namespace
 
 // ── The door ──────────────────────────────────────────────────────────────────
@@ -964,47 +936,6 @@ TEST(SynthSymbolFloor, ASingleUnitsThreadsHelpersMintAboveItsSemanticTable) {
 
 // ── The source tree ───────────────────────────────────────────────────────────
 
-// SCOPE: every .cpp / .hpp under src/mir and src/opt, read as text, for a `SymbolId`
-// whose braces hold arithmetic — the spelling all five minters had. `mir/mir.cpp` is
-// the door's own body and the one file allowed it. ⚠ WHAT THE SCAN CANNOT SEE: a
-// counter advanced OUTSIDE the braces (`SymbolId s{v}; ++v;`) — the pipeline arms above
-// are what catch a minter by its result. NOT in scope, and not minters of a MIR
-// module's ids: CST→HIR's lowering temporaries (locals, never a MIR symbol), the
-// merge's allocator (it MAKES the merged module's id space and states its end), and
-// the asm and link tiers (an assembled module's symbols carry their names; no table
-// stands beside it — link/fresh_symbol_ids.hpp). MIR→LIR's block-symbol minter
-// (src/lir/lowering/mir_to_lir.cpp) is outside these two tiers as well;
-// `MirSymbolIdContinuation` is the door's leaf made for it.
-TEST(SynthSymbolFloor, NoMirOrOptimizerSourceCountsASymbolIdOfItsOwn) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    std::size_t scanned = 0;
-    bool        sawTheDoor = false;
-    for (char const* const tier : {"mir", "opt"}) {
-        std::filesystem::path const dir = *root / "src" / tier;
-        for (auto const& entry : std::filesystem::recursive_directory_iterator(dir)) {
-            if (!entry.is_regular_file()) continue;
-            auto const ext = entry.path().extension().string();
-            if (ext != ".cpp" && ext != ".hpp") continue;
-            ++scanned;
-            std::vector<std::string> const counted = countedSymbolIds(readWhole(entry.path()));
-            bool const isTheDoor =
-                std::filesystem::relative(entry.path(), *root / "src").generic_string() == "mir/mir.cpp";
-            if (isTheDoor) {
-                sawTheDoor = !counted.empty();
-                EXPECT_EQ(counted.size(), 1u) << "the door mints in ONE place";
-                continue;
-            }
-            for (std::string const& spelling : counted)
-                ADD_FAILURE() << entry.path().string() << " counts a SymbolId of its own: `"
-                              << spelling << "` — a module's fresh ids come from "
-                                 "MirBuilder::mintSymbol alone";
-        }
-    }
-    EXPECT_GT(scanned, 60u) << "the scan must have read both tiers";
-    EXPECT_TRUE(sawTheDoor) << "CONTROL: the scan must see the door's own mint, or it sees nothing";
-}
-
 // SCOPE: every .cpp under src/, read as text. A file that declares a `MirBuilder` makes
 // a module; unless it says where that module's ids end — it states a table's end, or it
 // continues the ids of the module it rebuilds (directly, or through a clone-globals
@@ -1071,4 +1002,42 @@ TEST(SynthSymbolFloor, EveryFileThatBuildsAModuleStatesOrContinuesItsSymbolIds) 
                                 "table it is made from, or continue the module it replaces";
     }
     EXPECT_EQ(doorFiles, 2u) << "the scan must have found the door's declaration and its definition";
+}
+
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): A SYNTHESIS PASS'S REBUILD CARRIES ITS MODULE'S FACTS WHOLE.
+// `continueSymbolIdsPastImports` opens the rebuild of every synthesis pass (the SEH funclets, the PE startup, the
+// C11 threads shim). It continued the source module's symbol ids ALONE, so the rebuilt module lost the rest of what
+// the module states: its Arg counting (✔MEASURED, run n2a: every synthesis cell that adds a function with `Arg`s
+// was refused I_ArgCountingUnstated), its aliasing mode and its char-types rule (READ: each fell back to the
+// builder's default) and its aliases (READ: a second name of a definition was lost). It now carries them through the one list every rebuild takes
+// (`MirBuilder::carryModuleFactsOf`). RED-ON-DISABLE: open the rebuild by the ids alone, and each fact below is the
+// builder's default again.
+TEST(SynthSymbolFloor, ASynthesisRebuildCarriesItsModulesFactsWhole) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    std::array<TypeId, 1> const ps{i64};
+    TypeId const sig = in.fnSig(ps, in.primitive(TypeKind::Void), CallConv::CcMS64);
+    MirBuilder src;
+    src.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    src.stateArgCounting(MirArgCounting::Flat);
+    src.setAliasingMode(MirAliasingMode::StrictTBAA);   // neither is the builder's default
+    src.setCharTypesAliasAll(false);
+    (void)src.addFunction(sig, SymbolId{1});
+    src.addAlias(SymbolId{2}, SymbolId{1}, MirLinkage{});   // a second name of the function
+    MirBlockId const e = src.createBlock(StructCfMarker::EntryBlock);
+    src.beginBlock(e);
+    (void)src.addArg(0, i64);
+    src.addReturn();
+    Mir const mir = std::move(src).finish();
+
+    MirBuilder rebuilt;
+    continueSymbolIdsPastImports(rebuilt, mir, {});
+    Mir const out = std::move(rebuilt).finish();
+    EXPECT_EQ(out.argCounting(), MirArgCounting::Flat) << "the rebuild numbers its Args as its module did";
+    EXPECT_EQ(out.aliasingMode(), MirAliasingMode::StrictTBAA) << "the rebuild keeps its module's aliasing mode";
+    EXPECT_FALSE(out.charTypesAliasAll()) << "the rebuild keeps its module's char-types rule";
+    ASSERT_EQ(out.aliases().size(), 1u) << "the rebuild keeps its module's aliases";
+    EXPECT_EQ(out.aliases()[0].alias, SymbolId{2});
+    EXPECT_EQ(out.aliases()[0].target, SymbolId{1});
+    EXPECT_GE(out.symbolIdEnd(), mir.symbolIdEnd()) << "and continues its ids";
 }

@@ -5461,3 +5461,64 @@ TEST(TargetSchema, AConventionIdIsARowOrListedAsUnimplementedNeverBoth) {
                           << "\"";
     }
 }
+
+// ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+// the CHUNK a `_BitInt` wider than 64 bits is made of (its alignment and size granule) is
+// REQUIRED in every target's `aggregateLayout`, a power of two in [8, maxAlignment]: the x86-64
+// psABI says 8 and AAPCS64 says 16, so no value is a default. Over every shipped target, each
+// wrong statement is refused BY NAME at its path, and the two values both ABIs use load.
+TEST(TargetSchema, ABitPreciseChunkIsRequiredAndAPowerOfTwoUpToTheMaxAlignment) {
+    struct Wrong {
+        char const*                   what;
+        std::optional<nlohmann::json> value;   // nullopt: the key is removed
+        DiagnosticCode                code;
+        char const*                   says;
+    };
+    Wrong const wrongs[] = {
+        {"no key",                std::nullopt,           DiagnosticCode::C_MissingField,
+         "missing required 'bitPreciseChunk' integer"},
+        {"a string",              nlohmann::json("16"),   DiagnosticCode::C_MissingField,
+         "missing required 'bitPreciseChunk' integer"},
+        {"zero",                  nlohmann::json(0),      DiagnosticCode::C_MalformedJson,
+         "must be a power of two in [8, maxAlignment"},
+        {"a negative chunk",      nlohmann::json(-8),     DiagnosticCode::C_MalformedJson,
+         "must be a power of two in [8, maxAlignment"},
+        {"under a limb",          nlohmann::json(4),      DiagnosticCode::C_MalformedJson,
+         "must be a power of two in [8, maxAlignment"},
+        {"no power of two",       nlohmann::json(24),     DiagnosticCode::C_MalformedJson,
+         "must be a power of two in [8, maxAlignment"},
+        {"past the maxAlignment", nlohmann::json(32),     DiagnosticCode::C_MalformedJson,
+         "must be a power of two in [8, maxAlignment"},
+    };
+    for (char const* target : {"arm64", "x86_64"}) {
+        for (Wrong const& w : wrongs) {
+            SCOPED_TRACE(std::string{target} + ": " + w.what);
+            auto r = dss::test_support::mutateShippedTargetSchemaDoc(
+                target, [&](nlohmann::json& doc) {
+                    ASSERT_EQ(doc["aggregateLayout"]["maxAlignment"], 16)
+                        << "the rows assume a 16-byte maxAlignment";
+                    if (w.value) doc["aggregateLayout"]["bitPreciseChunk"] = *w.value;
+                    else doc["aggregateLayout"].erase("bitPreciseChunk");
+                });
+            ASSERT_FALSE(r.has_value()) << "the document loaded";
+            bool said = false;
+            for (auto const& d : r.error())
+                if (d.code == w.code && d.path.ends_with("/aggregateLayout/bitPreciseChunk")
+                    && d.message.find(w.says) != std::string::npos) said = true;
+            EXPECT_TRUE(said) << allRefusals(r);
+        }
+        // The controls: the psABI's 8 and AAPCS64's 16 load on every target.
+        for (int const chunk : {8, 16}) {
+            SCOPED_TRACE(std::string{target} + ": " + std::to_string(chunk));
+            auto r = dss::test_support::mutateShippedTargetSchemaDoc(
+                target, [&](nlohmann::json& doc) {
+                    doc["aggregateLayout"]["bitPreciseChunk"] = chunk;
+                    // The helper refuses a no-op mutation; a documentation key makes every
+                    // control one, the target's own value included.
+                    doc["aggregateLayout"]["$bitPreciseChunkControl"] = "a documentation key";
+                });
+            ASSERT_TRUE(r.has_value()) << allRefusals(r);
+            EXPECT_EQ((*r)->aggregateLayout().bitPreciseChunk, static_cast<std::uint32_t>(chunk));
+        }
+    }
+}

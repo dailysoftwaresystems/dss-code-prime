@@ -4,6 +4,7 @@
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <cstdio>    // selectableObjectFormat's refusal (stderr)
 #include <cstdlib>   // selectableObjectFormat's refusal (abort)
@@ -796,10 +797,25 @@ inline constexpr std::uint32_t kTlsIndexReservedSymbolIdValue = 0xFFFF'FF01u;
 // no TLS machinery, e.g. an ELF module that somehow carried the id). Keeps the
 // linker free of any format-name branch: it asks "is this a writer-reserved
 // id", not "is this PE".
+//
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N9): the reserved values are ONE LIST, read by this predicate
+// (which a COUNTING id space steps over: core/types/symbol_id_cursor.hpp's `SymbolIdEnd`) and by the end of an
+// INDEX id space (`kFirstWriterReservedSymbolIdValue`, where an id IS a position and so cannot step over one).
+// A reserved value added lower lowers every index space's end with it.
+inline constexpr std::array<std::uint32_t, 1> kWriterReservedSymbolIdValues{kTlsIndexReservedSymbolIdValue};
 [[nodiscard]] constexpr bool
 isWriterReservedSymbolIdValue(std::uint32_t v) noexcept {
-    return v == kTlsIndexReservedSymbolIdValue;
+    for (std::uint32_t const r : kWriterReservedSymbolIdValues)
+        if (r == v) return true;
+    return false;
 }
+// The lowest reserved value: where an index space ends (`symbolIdOfIndex`).
+inline constexpr std::uint32_t kFirstWriterReservedSymbolIdValue = [] {
+    std::uint32_t lowest = kWriterReservedSymbolIdValues[0];
+    for (std::uint32_t const r : kWriterReservedSymbolIdValues)
+        if (r < lowest) lowest = r;
+    return lowest;
+}();
 
 // The format's TLS access block (`"tlsAccess"` in `.format.json`).
 // `segmentPrefixByte` is the x86 segment-override prefix byte the

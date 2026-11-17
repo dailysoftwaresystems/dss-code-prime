@@ -1268,7 +1268,7 @@ TEST(CoffDirectiveImageRequests, AnIncludeOfTheObjectsOwnDefinitionIsHandedOn) {
 TEST(CoffDirectiveImageRequests, AnEntryANamedObjectDoesNotDefineIsARequiredReference) {
     AssembledModule stating = requestingUnit(2, requestsOf(" /ENTRY:dss_far_entry"));
     ASSERT_TRUE(stating.externImports.empty());
-    linker::requireEntryReference(stating);
+    { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(stating, idRep)) << diagnosticsOf(idRep); }
     ASSERT_EQ(stating.externImports.size(), 1u);
     {
         ExternImport const& row = stating.externImports.back();
@@ -1279,14 +1279,14 @@ TEST(CoffDirectiveImageRequests, AnEntryANamedObjectDoesNotDefineIsARequiredRefe
         for (auto const& fn : stating.functions) EXPECT_NE(fn.symbol.v, row.symbol.v) << "a fresh id";
         for (auto const& d : stating.dataItems) EXPECT_NE(d.symbol.v, row.symbol.v) << "a fresh id";
     }
-    linker::requireEntryReference(stating);
+    { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(stating, idRep)) << diagnosticsOf(idRep); }
     EXPECT_EQ(stating.externImports.size(), 1u) << "the row it made is the name's reference: flagged, not doubled";
     // CONTROLS: no reference for an entry the unit defines, the C runtime's startups, or a startup no DSS image has.
     for (char const* text :
          {" /ENTRY:dss_entry", " /ENTRY:mainCRTStartup", " /ENTRY:wmainCRTStartup", " /ENTRY:WinMainCRTStartup"}) {
         SCOPED_TRACE(text);
         AssembledModule m = requestingUnit(2, requestsOf(text));
-        linker::requireEntryReference(m);
+        { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(m, idRep)) << diagnosticsOf(idRep); }
         EXPECT_TRUE(m.externImports.empty());
     }
     // A sibling unit's definition binds the reference, and the image starts there.
@@ -1320,7 +1320,7 @@ TEST(CoffDirectiveImageRequests, TheEntrysReferenceTakesAnIdNoRowOfTheUnitHolds)
     stating.symbols.push_back(
         ModuleSymbol{SymbolId{largest + 1u}, ".only_a_row", SymbolBinding::Local, SymbolVisibility::Default});
     EXPECT_EQ(linker::maxExistingSymbolIdV(stating), largest + 1u) << "an id only a symbol row holds is TAKEN";
-    linker::requireEntryReference(stating);
+    { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(stating, idRep)) << diagnosticsOf(idRep); }
     ASSERT_EQ(stating.externImports.size(), 1u);
     EXPECT_GT(stating.externImports.back().symbol.v, largest + 1u)
         << "the entry's reference took the id of the row `.only_a_row`: one id, two symbols";
@@ -1382,7 +1382,7 @@ TEST(CoffDirectiveImageRequests, OnlyTheEntryThatStandsIsARequiredReference) {
         // The first unit defines the entry it states; the second states one NOTHING defines.
         std::vector<AssembledModule> units{requestingUnit(2, requestsOf(" /ENTRY:dss_entry")),
                                            extraUnit(3, requestsOf(" /ENTRY:dss_dropped_entry"))};
-        linker::requireEntryReference(std::span<AssembledModule>{units});
+        { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(std::span<AssembledModule>{units}, idRep)) << diagnosticsOf(idRep); }
         EXPECT_TRUE(required(units[0]).empty()) << "it defines its entry";
         EXPECT_TRUE(required(units[1]).empty()) << "the DROPPED entry requires nothing";
         auto const l = linkExe({programUnit(), units[0], units[1]});
@@ -1398,7 +1398,7 @@ TEST(CoffDirectiveImageRequests, OnlyTheEntryThatStandsIsARequiredReference) {
         // link.exe refuses it (LNK2001).
         std::vector<AssembledModule> units{extraUnit(3, requestsOf(" /ENTRY:dss_dropped_entry")),
                                            requestingUnit(2, requestsOf(" /ENTRY:dss_entry"))};
-        linker::requireEntryReference(std::span<AssembledModule>{units});
+        { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(std::span<AssembledModule>{units}, idRep)) << diagnosticsOf(idRep); }
         EXPECT_EQ(required(units[0]), std::vector<std::string>{"dss_dropped_entry"});
         EXPECT_TRUE(required(units[1]).empty());
         auto const l = linkExe({programUnit(), units[0], units[1]});
@@ -1411,7 +1411,7 @@ TEST(CoffDirectiveImageRequests, OnlyTheEntryThatStandsIsARequiredReference) {
         std::vector<AssembledModule> units{
             requestingUnit(2, withPrecedence(requestsOf(" /ENTRY:dss_entry"), UnitRequestPrecedence::Last)),
             extraUnit(3, withPrecedence(requestsOf(" /ENTRY:dss_dropped_entry"), UnitRequestPrecedence::Last))};
-        linker::requireEntryReference(std::span<AssembledModule>{units});
+        { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(std::span<AssembledModule>{units}, idRep)) << diagnosticsOf(idRep); }
         EXPECT_TRUE(required(units[0]).empty());
         EXPECT_EQ(required(units[1]), std::vector<std::string>{"dss_dropped_entry"});
     }
@@ -1420,7 +1420,7 @@ TEST(CoffDirectiveImageRequests, OnlyTheEntryThatStandsIsARequiredReference) {
         std::vector<AssembledModule> units{
             requestingUnit(2, withPrecedence(requestsOf(" /ENTRY:dss_entry"), UnitRequestPrecedence::First)),
             extraUnit(3, withPrecedence(requestsOf(" /ENTRY:dss_dropped_entry"), UnitRequestPrecedence::Last))};
-        linker::requireEntryReference(std::span<AssembledModule>{units});
+        { DiagnosticReporter idRep; ASSERT_TRUE(linker::requireEntryReference(std::span<AssembledModule>{units}, idRep)) << diagnosticsOf(idRep); }
         EXPECT_TRUE(required(units[0]).empty());
         EXPECT_TRUE(required(units[1]).empty());
         auto const l = linkExe({programUnit(), units[0], units[1]});

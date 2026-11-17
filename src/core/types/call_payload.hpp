@@ -64,4 +64,17 @@ fixedOperandCount(std::uint32_t payload) noexcept {
     return payload & kFixedOperandMask;
 }
 
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): THE ONE BOUNDARY OF "THROUGH `...`", asked by every
+// tier after the MIR call lowering. `argOperand` is 0-based in the call's ARGUMENT region (past the callee,
+// and past the prepended x8 result operand of a `hasIndirectResult` call). The MIR call lowering decides the
+// boundary once (`CallLowerCtx`: child `fnParamsSize` of the HIR call is the last fixed argument, and its
+// by-value placements ask the same rule) and stamps it here as `fixedOperandCount`; lir_callconv's pre-scan
+// and placement, lir_wide_call_args, lir_regalloc and lir_rewrite (under `variadicArgsAlwaysStack`, and for
+// the SysV vector count and the Win64 FP duplicate) and the inliner's splice all ASK this, so no tier can
+// draw it one operand off another. False for every operand of a non-variadic call.
+[[nodiscard]] inline constexpr bool
+passesThroughEllipsis(std::uint32_t payload, std::uint32_t argOperand) noexcept {
+    return isVariadic(payload) && argOperand >= fixedOperandCount(payload);
+}
+
 } // namespace dss::call_payload

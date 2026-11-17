@@ -2,8 +2,9 @@
 
 // READERS OF A pe64 IMAGE, FOR PINS THAT READ WHAT THE DRIVER REALLY WROTE.
 //
-// Shared by `program/test_driver_argument_supply` (where they were born) and
-// `program/test_guarded_region_examples_on_every_host`, so the two read an
+// Shared by `program/test_driver_argument_supply` (where they were born),
+// `program/test_guarded_region_examples_on_every_host` and
+// `link/test_constructor_order_through_the_link`, so they read an
 // image's section table, its function table, its unwind codes, its scope
 // tables and its handlers' instructions with ONE decoder. Every reader is bounds-safe: a truncated or
 // unexpected artifact yields zeros and empty lists, so a pin fails with its own

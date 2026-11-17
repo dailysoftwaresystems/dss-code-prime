@@ -1,2 +1,7 @@
-            if (scope.filterFuncletSymbol.v > maxV) maxV = scope.filterFuncletSymbol.v;
-            if (scope.personalitySymbol.v > maxV) maxV = scope.personalitySymbol.v;
+         for (auto const& f : m.functions)
+             for (auto const& s : f.sehScopes) seeHeldSymbolId(h, s.filterFuncletSymbol);
+     }},
+    {"functions.sehScopes.personalitySymbol",
+     [](AssembledModule const& m, std::uint32_t& h) {
+         for (auto const& f : m.functions)
+             for (auto const& s : f.sehScopes) seeHeldSymbolId(h, s.personalitySymbol);

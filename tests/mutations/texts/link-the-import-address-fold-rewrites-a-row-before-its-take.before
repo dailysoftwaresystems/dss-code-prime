@@ -1,0 +1,2 @@
+        if (plan.empty()) continue;
+        // Every rewritten row's id from the module's door, ALL AT ONCE: a space too short for every one of them is

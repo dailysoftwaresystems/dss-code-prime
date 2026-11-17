@@ -9908,6 +9908,43 @@ TEST(SemanticAnalyzerC, ADeclarationWithAnEmptyParameterListGivesItsFunctionNoPr
                   "int f(char c);\nint f();\nint f(char c) { return c; }\nint main(void) { return f(2); }\n", 1},
              Cell{"np3 cell 5: then `int f(short s)`",
                   "int f();\nint f(short s) { return s; }\nint main(void) { return f(2); }\n", 1},
+             // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N4): p15 asks COMPATIBILITY of each
+             // parameter's unqualified type with its promotion (probe n4p, the references' answer).
+             Cell{"n4p cell 1: an enumerated type of int's rank",
+                  "enum E { A, B, C };\nint f();\nint f(enum E x) { return (int)x + 1; }\n"
+                  "int main(void) { return f(B); }\n", 0},
+             Cell{"n4p cell 1, the prototype first",
+                  "enum E { A, B, C };\nint f(enum E x);\nint f();\nint f(enum E x) { return (int)x + 1; }\n"
+                  "int main(void) { return f(B); }\n", 0},
+             Cell{"n4p cell 9: an enumerated type with a negative member",
+                  "enum E { A = -1, B, C };\nint f();\nint f(enum E x) { return (int)x + 1; }\n"
+                  "int main(void) { return f(C); }\n", 0},
+             Cell{"n4p cell 2: a fixed underlying type narrower than int",
+                  "enum E : unsigned char { A, B, C };\nint f();\nint f(enum E x) { return (int)x + 1; }\n"
+                  "int main(void) { return f(B); }\n", 1},
+             Cell{"n4p cell 3: a fixed underlying type wider than int",
+                  "enum E : long long { A, B, C };\nint f();\nint f(enum E x) { return (int)x + 1; }\n"
+                  "int main(void) { return f(B); }\n", 0},
+             Cell{"n4p cell 4: `_Bool`",
+                  "int f();\nint f(_Bool x) { return (int)x + 1; }\nint main(void) { return f(1); }\n", 1},
+             Cell{"n4p cell 5: a typedef of int",
+                  "typedef int T;\nint f();\nint f(T x) { return (int)x + 1; }\nint main(void) { return f(1); }\n",
+                  0},
+             Cell{"n4p cell 6: a typedef of short",
+                  "typedef short S;\nint f();\nint f(S x) { return (int)x + 1; }\nint main(void) { return f(1); }\n",
+                  1},
+             Cell{"n4p cell 7: `const int`",
+                  "int f();\nint f(const int x) { return (int)x + 1; }\nint main(void) { return f(1); }\n", 0},
+             Cell{"n4p cell 8: `const short`",
+                  "int f();\nint f(const short x) { return (int)x + 1; }\nint main(void) { return f(1); }\n",
+                  1},
+             // ★ P69 (lane `cs`, fold f26d — main's ledgers 598/599): probe rcp cell 11 — a call through the
+             // composite of an incompatible pair, built and run by cl 19.52 at both standards (the probe's `q`,
+             // spelled `f` here: every cell of this table is asked of `f`).
+             Cell{"rcp cell 11: `int f(const char *, ...)`, then `int f()`, a call through the composite",
+                  "int f(const char *, ...);\nint f();\nint main(void) { return f(\"x\", 1, 2) - 3; }\n"
+                  "int f(const char *s, ...) { return s[0] == 'x' ? 3 : 4; }\n",
+                  1},
          }) {
         SCOPED_TRACE(c.what);
         auto model = analyzeShipped("c", {c.src});
@@ -9920,6 +9957,14 @@ TEST(SemanticAnalyzerC, ADeclarationWithAnEmptyParameterListGivesItsFunctionNoPr
         for (std::size_t i = 1; i < model.symbols().size(); ++i)
             none = none || (model.symbols()[i].name == "f" && model.symbols()[i].declaresNoPrototype);
         EXPECT_TRUE(none) << "a record of `f` declares no prototype";
+    }
+    // ★ P69 (lane `cs`, fold f26d — ledgers 598/599): A CALL THE PROTOTYPE IN FORCE REJECTS is the arity error every
+    // reference gives (probe rcp cell 10: "too few arguments to function 'p'"; cl C2198), in either order of the
+    // pair — the composite is the type the call is checked against, never the declaration without a prototype.
+    for (char const* src : {"int p();\nint p(int, int);\nint g(void) { return p(1); }\n",
+                            "int p(int, int);\nint p();\nint g(void) { return p(1); }\n"}) {
+        auto model = analyzeShipped("c", {src});
+        EXPECT_TRUE(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch) >= 1u) << src;
     }
     // CONTROLS: `(void)`, and a definition's empty list, declare a prototype of no parameters.
     for (char const* src : {"int f(void);\nint g(void) { return f(42); }\n",

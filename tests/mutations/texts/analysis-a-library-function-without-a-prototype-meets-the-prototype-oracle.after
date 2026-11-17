@@ -1,0 +1,2 @@
+            if (rec.isImplicitDeclaration && rec.declaresNoPrototype
+                && in.fnResult(rec.type).v == in.fnResult(shippedSig).v) {

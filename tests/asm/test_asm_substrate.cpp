@@ -1089,8 +1089,10 @@ struct LoweredAgg {
     return v;
 }
 
-// The shipped-target params (natural alignment, 16-byte ISA cap).
-constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
+// The x86_64 shipped params: natural alignment, the 16-byte ISA cap, and the psABI's 8-byte bit-precise chunk
+// (the wide `_BitInt` images below are x86_64's; a params value with no chunk lays out no wide `_BitInt`).
+constexpr AggregateLayoutParams kNatural16{
+    .scalarAlignment = ScalarAlignmentRule::Natural, .maxAlignment = 16, .bitPreciseChunk = 8};
 
 // Lower ONE scalar (I32) module global through `lowerMirGlobalsToDataItems`
 // with a chosen mutability + init shape, returning the single emitted item +
@@ -1178,8 +1180,8 @@ TEST(AsmDataSection, MutableInitializedGlobalLowersToData) {
 // INVERSION IS DELIBERATE, NOT AN OVERSIGHT. C4b walled the arm fail-loud because
 // the encoder could not carry the image: `appendLE` takes a `std::uint64_t` (so any
 // width past 8 is a >>64 UB) and `scalarByteSize` takes a KIND (so it cannot know N).
-// P42 answered both — a wider SOURCE (the wrapped limbs) and the TypeId-aware
-// `sizeOfScalarOrBitInt` ladder — so the arm is a PRODUCER and the assertions turn
+// P42 answered both — a wider SOURCE (the wrapped limbs) and a TypeId-aware size
+// ladder (`computeLayout` since P69 fold f26d) — so the arm is a PRODUCER and the assertions turn
 // over with it. Leaving the old refusal pin standing would be the P36 mistake
 // [[D-CSUBSET-INT128-DATA-GLOBAL]] recorded: a gate that contradicts the shipped
 // binary.

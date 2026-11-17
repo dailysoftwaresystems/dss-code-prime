@@ -4404,6 +4404,24 @@ enum class DiagnosticCode : std::uint16_t {
     // they say the Phi's inputs ARE its block's ways in. A pass that drops an input is caught
     // at the pass (verify runs after every pass), not where the LIR lowering emits the edge.
     I_PhiIncomingsNotOnePerPredecessor = 0xA01B,
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2): a function's `Arg`s are DENSE over every
+    // register its convention assigns, under the counting discipline the module STATES
+    // (`Mir::argCounting`: per register class, or flat). A GAP — an ordinal past its class's
+    // `Arg` count, so an ordinal below it is received by no `Arg` (a register the caller fills
+    // and the callee never reads: every later `Arg` of the class reads the register before its
+    // own); a REPEAT — two `Arg`s on one register; and a module holding an `Arg` that states no
+    // discipline at all, which the `Arg`s cannot say for it (a mixed-class signature written
+    // with flat ordinals on a per-class convention is dense when the classes are counted
+    // together).
+    I_ArgOrdinalGap                = 0xA01C,
+    I_ArgOrdinalRepeated           = 0xA01D,
+    I_ArgCountingUnstated          = 0xA01E,
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2): a call stamped as passing by its callee's
+    // own definition's signature (`MirInstFlags::PassesByItsDefinition`) whose operand at one of
+    // the callee's reception positions is missing, passed through `...`, the wrong carrier, or
+    // of another type. Both halves asked the one placement step with the same inputs, so it is
+    // a DSS defect, never a program; an unstamped call is not judged.
+    I_CallDisagreesWithItsDefinition = 0xA01F,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -5712,7 +5730,16 @@ enum class DiagnosticCode : std::uint16_t {
     //   width, the writer and the format, rather than writing slots of the
     //   wrong width. UNSUPPRESSABLE in effect: nothing is written.
     K_PointerWidthNotTheWritersClass = 0x8032,
-    // K-NEXT-SLOT: 0x8033 — grep this marker before adding a K_* code.
+    // K_SymbolIdSpaceExhausted (P69 fold f26d, lane `cs`, review-csf26c2 N9) — ERROR. A link-tier id space --
+    //   an assembled module's, the link merge's numbering, an object's record table -- has no fresh SymbolId
+    //   left: the next would be the last value, which leaves the space's end nowhere to go, or an object's
+    //   record count reaches the first value a format writer reserves (a record's id is its index, and an
+    //   index space ends there). Refused by the space's door (`link/fresh_symbol_ids.hpp`,
+    //   `link/format/record_symbol_ids.hpp`), naming what was being minted, rather than wrapping onto 0, the
+    //   invalid id, or onto an id a symbol already holds. Always an Error, so the unsuppressable table needs no
+    //   entry for it (its rule: an Error is never silenced).
+    K_SymbolIdSpaceExhausted       = 0x8033,
+    // K-NEXT-SLOT: 0x8034 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

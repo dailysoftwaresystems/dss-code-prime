@@ -1,1 +1,1 @@
-            rec.declaresNoPrototype = functionDeclaratorWritesNoParameters(
+            rec.declaresNoPrototype = declarationGivesNoPrototype(idxIt->second, tree, rec, in);

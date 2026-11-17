@@ -466,9 +466,13 @@ TEST(LK10EntrySliceC, SymbolIdSpaceExhaustionFailsLoud) {
     ASSERT_FALSE(linker::injectEntryTrampoline(
         mod, **target, **format, rep))
         << "trampoline injection must fail loud at UINT32_MAX wrap";
+    // The module's one door of a fresh id refuses by its own name (P69 f26d, N9: link/fresh_symbol_ids.hpp), not
+    // by the undefined-symbol code the trampoline's own guard borrowed.
     EXPECT_GT(::dss::test_support::countCode(
-                  rep, DiagnosticCode::K_SymbolUndefined), 0u)
-        << "UINT32_MAX wrap must fire K_SymbolUndefined specifically";
+                  rep, DiagnosticCode::K_SymbolIdSpaceExhausted), 0u)
+        << "UINT32_MAX wrap must fire K_SymbolIdSpaceExhausted specifically";
+    EXPECT_EQ(::dss::test_support::countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "an exhausted id space is no undefined symbol";
 }
 
 // code-architect FOLD-NOW (7f8b843 audit fold): all prior Slice C

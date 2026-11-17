@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>       // AsmGotoResult::continuation's fail-loud (inline, see below)
 #include <cstdlib>      //   ditto — std::abort
+#include <expected>     // joinUnitFacts: the facts joined, or the one that disagrees
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -53,6 +54,98 @@ namespace dss {
 // `charTypesAliasAll == true`). Closes
 // `D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING` end-to-end.
 enum class MirAliasingMode : std::uint8_t { Permissive, StrictTBAA };
+
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): HOW A FUNCTION NUMBERS ITS `Arg`s — `MirArgCounting`
+// (mir_node.hpp, beside the function record that carries it). Each FUNCTION is stamped with the counting of the
+// convention it is called by: `addFunction` stamps the builder's stated default (the pair's convention:
+// HIR→MIR from the convention's `slotAligned`, the merge from its units, the `.dssir` reader from the text's
+// header, a unit test by hand), a function of another convention is restated (`stateFunctionArgCounting`), and
+// every clone copies the stamp — never inferred from the `Arg`s, because the `Arg`s cannot say it: a
+// mixed-class signature written with flat ordinals on a per-class convention (`addArg(0, f64), addArg(1, i64)`)
+// is dense when the classes are counted together, and lir_callconv then reads the `long` from the second
+// general register, where every caller wrote the first (design audit N2-3). The MIR verifier holds every
+// function's `Arg`s DENSE under its own stamp and refuses a function that holds an `Arg` and is stamped with
+// none (`Unstated`). Data, not a target identity: nothing is derived from the `CallConv` a signature names.
+// THE RULE, its one home: a convention that aligns its arguments to slots (`slotAligned`, Win64) counts
+// them FLAT, every other one PER REGISTER CLASS. Asked by every producer that states a module's counting
+// from a convention (HIR->MIR, the startup module of a link that compiles nothing).
+[[nodiscard]] constexpr MirArgCounting argCountingOf(bool conventionIsSlotAligned) noexcept {
+    return conventionIsSlotAligned ? MirArgCounting::Flat : MirArgCounting::PerClass;
+}
+
+// ★★ P69 (lane `cs`, fold f26d): A MODULE'S FACTS, THEIR ONE LIST — what a module STATES about how its contents
+// are read, as opposed to what it holds: its alias-analysis polarity, its char-types rule, and the counting of
+// the pair's convention (the default every function it gains is stamped with). `Mir` and `MirBuilder` hold the
+// list WHOLE and every carrier copies it whole: a rebuild (`MirBuilder::carryModuleFactsOf`), the moves, the
+// merge of units (`joinUnitFacts`), the `.dssir` text (a header line for each fact that is not the default).
+// ✔MEASURED/READ before it (the facts row of fold f26d): the synthesis rebuilds kept the symbol ids alone and
+// dropped the rest; the merge read the aliasing mode and the char-types rule from unit 0 alone; the text wrote
+// neither. A fact added here is a binding added to each structured binding over the list (the join, the text
+// writer), which do not compile until it is read.
+struct MirModuleFacts {
+    MirAliasingMode aliasingMode      = MirAliasingMode::Permissive;
+    bool            charTypesAliasAll = true;
+    MirArgCounting  argCounting       = MirArgCounting::Unstated;
+
+    friend constexpr bool operator==(MirModuleFacts const&, MirModuleFacts const&) = default;
+};
+
+// A fact two units state DIFFERENTLY where it must be equal across the units one module joins: its NAME (the
+// field's, as the `.dssir` header spells it) and both values, so the merge's refusal names the fact that
+// disagrees -- never the first such fact the list happened to have.
+struct MirFactsDisagreement {
+    char const*   fact;   // the field's name: "argCounting", ...
+    std::uint32_t a;      // the earlier unit's value
+    std::uint32_t b;      // the later unit's
+};
+
+// What a unit that states NO value of a must-agree fact does at the join -- stated by each fact, never a default
+// (ledger 637): `AddsNothing`, the other unit's value stands (the pair's counting: a module that lowered no
+// function counts nothing); `IsRefused`, every unit must state it and an unstated one is refused by the fact's
+// name exactly as a mismatch is -- adopting another unit's value would be a silent default.
+enum class MirUnstatedFact : std::uint8_t { AddsNothing, IsRefused };
+
+// ONE must-agree fact of two units, joined: the agreed value, or the disagreement by `fact`'s name.
+template <typename T>
+[[nodiscard]] constexpr std::expected<T, MirFactsDisagreement>
+joinMustAgreeFact(char const* fact, T a, T b, T unstated, MirUnstatedFact rule) noexcept {
+    auto const refused = [&] {
+        return std::unexpected(
+            MirFactsDisagreement{fact, static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b)});
+    };
+    if (a == unstated || b == unstated) {
+        if (rule == MirUnstatedFact::IsRefused) return refused();
+        return a == unstated ? b : a;
+    }
+    if (a != b) return refused();
+    return a;
+}
+
+// THE MERGED MODULE'S FACTS, of two units' (the merge folds every unit's through it): strict TBAA only where
+// BOTH state it — a permissive unit's accesses were never promised to follow the effective-type rule, so the
+// one module they join is read permissively; the char-types rule where EITHER states it (the same direction:
+// the rule that assumes less); the pair's counting where they agree, a unit that states none adding nothing.
+// A fact that MUST BE EQUAL across the units (the pair's counting): two DIFFERENT values are the disagreement,
+// by the fact's name — the units were lowered for two pairs, which one link never merges (the merge refuses).
+// Each function's own counting crosses with the function, not through this. ★ A FACT ADDED to the list is a
+// binding added below (the structured bindings do not compile until it is), joined either by a rule like the
+// first two or, when it must be equal, by ONE `joinMustAgreeFact` line stating its own unstated rule — the
+// record stays a plain list joined field by field.
+[[nodiscard]] constexpr std::expected<MirModuleFacts, MirFactsDisagreement>
+joinUnitFacts(MirModuleFacts a, MirModuleFacts b) noexcept {
+    auto const& [aAliasing, aCharTypes, aCounting] = a;   // every fact of the list is joined below
+    auto const& [bAliasing, bCharTypes, bCounting] = b;
+    auto const counting = joinMustAgreeFact("argCounting", aCounting, bCounting, MirArgCounting::Unstated,
+                                            MirUnstatedFact::AddsNothing);
+    if (!counting.has_value()) return std::unexpected(counting.error());
+    MirModuleFacts joined;
+    joined.aliasingMode = aAliasing == MirAliasingMode::StrictTBAA && bAliasing == MirAliasingMode::StrictTBAA
+                              ? MirAliasingMode::StrictTBAA
+                              : MirAliasingMode::Permissive;
+    joined.charTypesAliasAll = aCharTypes || bCharTypes;
+    joined.argCounting = *counting;
+    return joined;
+}
 
 class DSS_EXPORT Mir {
 public:
@@ -472,12 +565,21 @@ public:
     // (`mir_rebuild_helper`) propagates this mode to every pass's fresh
     // `MirBuilder` so a release pipeline doesn't silently downgrade
     // strict-TBAA to Permissive after the first rebuild.
-    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return aliasingMode_; }
+    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return facts_.aliasingMode; }
     // Per-source-language C99 §6.5 ¶7 character-type exception flag.
     // Composes with `aliasingMode`: Rule 5 in `mirMayAlias` fires only
     // when this is `true`. Default `true` matches C/C++/Objective-C;
     // Rust / strict-typed DSLs declare `false`.
-    [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
+    [[nodiscard]] bool charTypesAliasAll() const noexcept { return facts_.charTypesAliasAll; }
+
+    // ── how the module's functions number their `Arg`s (P69, review-csf26c2 N2) ──
+    // Each FUNCTION's (`funcArgCounting`): the counting of the convention it is called by. `argCounting()` is the
+    // module's DEFAULT — the pair's convention's, which every function the builder added was stamped with unless
+    // it was restated for itself; `Unstated` where nobody stated one.
+    [[nodiscard]] MirArgCounting argCounting() const noexcept { return facts_.argCounting; }
+    [[nodiscard]] MirArgCounting funcArgCounting(MirFuncId id) const { return funcArena_.at(id).argCounting; }
+    // The module's facts, whole (`MirModuleFacts`) — what a carrier copies.
+    [[nodiscard]] MirModuleFacts const& moduleFacts() const noexcept { return facts_; }
 
     // ── the module's SYMBOL-ID SPACE (P69 round 5,
     //    D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE) ──
@@ -543,8 +645,7 @@ private:
     std::vector<MirBlockId>     succPool_;      // terminator CFG successors
     MirLiteralPool              literalPool_;
     MirAsmDescriptorPool        asmDescriptorPool_;  // inline-asm templates + constraints
-    MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
-    bool                        charTypesAliasAll_ = true;
+    MirModuleFacts              facts_;   // the module's facts, whole (`MirModuleFacts`)
     std::uint32_t               symbolIdEnd_ = 1;   // see `symbolIdEnd()`
     bool                        symbolIdEndStated_ = false;   // see `symbolIdEndIsStated()`
     std::vector<MirAlias>       aliases_;           // see `aliases()`
@@ -602,10 +703,23 @@ public:
     // `finish()` (last value wins); the optimizer rebuild substrate
     // (`mir_rebuild_helper`) also calls these on its own builders to
     // propagate the mode through every pipeline pass.
-    void setAliasingMode(MirAliasingMode mode) noexcept { aliasingMode_ = mode; }
-    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return aliasingMode_; }
-    void setCharTypesAliasAll(bool v) noexcept { charTypesAliasAll_ = v; }
-    [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
+    void setAliasingMode(MirAliasingMode mode) noexcept { facts_.aliasingMode = mode; }
+    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return facts_.aliasingMode; }
+    void setCharTypesAliasAll(bool v) noexcept { facts_.charTypesAliasAll = v; }
+    [[nodiscard]] bool charTypesAliasAll() const noexcept { return facts_.charTypesAliasAll; }
+
+    // ── how the module's functions number their `Arg`s (`MirArgCounting`, P69 N2) ──
+    // `stateArgCounting`: the counting of the PAIR's convention — the default every function this builder adds
+    // AFTERWARDS is stamped with (`addFunction`). Stated where the module is MADE: HIR→MIR from the convention's
+    // `slotAligned`, the merge from its units, the `.dssir` reader from the text's header, a unit test by hand.
+    // A rebuild states nothing of its own: it copies the module it replaces (`carryModuleFactsOf`).
+    // `stateFunctionArgCounting`: a function's OWN counting — one of another convention, or a clone's copy.
+    void stateArgCounting(MirArgCounting counting) noexcept { facts_.argCounting = counting; }
+    [[nodiscard]] MirArgCounting argCounting() const noexcept { return facts_.argCounting; }
+    void stateFunctionArgCounting(MirFuncId function, MirArgCounting counting);
+    // The module's facts, whole (`MirModuleFacts`): stated at once by the merge (its units' joined).
+    void stateModuleFacts(MirModuleFacts const& facts) noexcept { facts_ = facts; }
+    [[nodiscard]] MirModuleFacts const& moduleFacts() const noexcept { return facts_; }
 
     // ── THE SYMBOL-ID SPACE: the ONE DOOR a fresh SymbolId comes through ──
     // (P69 round 5, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE)
@@ -672,8 +786,9 @@ public:
     //    carries ──
     // Not what a function or a global carries — that is cloned where the function
     // or the global is — but the facts that belong to the module as a whole: the
-    // alias-analysis polarity, the character-type aliasing rule, and the
-    // symbol-id space (`continueSymbolIdsOf`). Every rebuild calls it: the three
+    // alias-analysis polarity, the character-type aliasing rule, the
+    // symbol-id space (`continueSymbolIdsOf`), and how its functions number their
+    // `Arg`s (`MirArgCounting`, P69 N2). Every rebuild calls it: the three
     // clone-globals helpers (opt/passes/mir_rebuild_helper.cpp), through which
     // every optimizer pass and synthesis pass rebuilds, and DCE's own rebuild. A
     // module-level fact added later is added HERE and reaches them all. Each
@@ -1264,8 +1379,7 @@ private:
     std::vector<MirBlockId>     succPool_;
     MirLiteralPool              literalPool_;
     MirAsmDescriptorPool        asmDescriptorPool_;
-    MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
-    bool                        charTypesAliasAll_ = true;
+    MirModuleFacts              facts_;   // the module's facts, whole (`MirModuleFacts`)
     // The symbol-id space's end (see `mintSymbol`), and whether it was ever
     // STATED — here (`stateSymbolIdEnd`, `stateSelfContainedSymbolIds`) or by a
     // module this builder continues (`continueSymbolIdsOf`). `finish` hands both

@@ -617,11 +617,15 @@ TEST(AttributeSecondSpelling, ThreadGivesTheObjectThreadStorageWhereverItIsWritt
     EXPECT_FALSE(findSym(m, "shared")->isThreadLocal);
 }
 
-// ON A FUNCTION OR A TYPE ALIAS the request is ignored and said so (cl refuses
-// both; MinGW ignores both with a warning); on a block-scope object with automatic
-// storage it is refused, as every thread-storage request there is (C 6.7.1p3; cl
-// refuses it too).
-TEST(AttributeSecondSpelling, ThreadOnAFunctionOrAnAliasIsIgnoredAndOnAnAutomaticRefused) {
+// ON A FUNCTION, A TYPE ALIAS OR AN AUTOMATIC OBJECT the request is ignored and said
+// so (cl refuses all three; MinGW ignores all three with a warning). ★ P69 (lane `cs`,
+// fold f26d — review-csf26c2 N5): on a block-scope object with automatic storage this
+// pin once asserted a refusal, as the keyword `_Thread_local` there is one (C 6.7.1p3,
+// a constraint every reference holds); the ATTRIBUTE is no keyword, and ✔MEASURED
+// (lane `cs` probe n5q): mingw-w64 gcc 13.2.0 builds `{ __declspec(thread) int x; }`
+// ("'thread' attribute directive ignored"), so by the one working reference DSS builds
+// it too — the object stays automatic, and the discarded request is said.
+TEST(AttributeSecondSpelling, ThreadOnAFunctionAnAliasOrAnAutomaticObjectIsIgnoredAndSaid) {
     for (char const* src : {"__declspec(thread) void f(void);\n",
                             "__declspec(thread) typedef int tt;\n"}) {
         auto m = analyzePe({src});
@@ -633,11 +637,24 @@ TEST(AttributeSecondSpelling, ThreadOnAFunctionOrAnAliasIsIgnoredAndOnAnAutomati
         EXPECT_EQ(m.diagnostics().all().size(), 1u) << src << everyDiagnostic(m);
     }
     auto m = analyzePe({"void g(void) { __declspec(thread) int a; a = 1; }\n"});
-    EXPECT_TRUE(m.hasErrors());
-    EXPECT_EQ(countCode(m.diagnostics(),
-                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+    EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
+    EXPECT_EQ(countSaying(m, DiagnosticCode::S_AttributeIgnoredForDeclarationKind,
+                          "is an automatic object"),
               1u)
         << everyDiagnostic(m);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              0u)
+        << everyDiagnostic(m);
+    ASSERT_NE(findSym(m, "a"), nullptr);
+    EXPECT_FALSE(findSym(m, "a")->isThreadLocal) << "the object stays automatic";
+    // CONTROL: the keyword there is still the constraint violation it is (C 6.7.1p3).
+    auto kw = analyzePe({"void g(void) { _Thread_local int a; a = 1; }\n"});
+    EXPECT_TRUE(kw.hasErrors());
+    EXPECT_EQ(countCode(kw.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u)
+        << everyDiagnostic(kw);
 }
 
 // TWO DECLARATIONS OF ONE OBJECT THAT DISAGREE. cl and MinGW both compile `extern
@@ -699,9 +716,10 @@ TEST(AttributeSecondSpelling, AThreadRequestYieldsToADeclarationThatDoesNotMakeI
 TEST(AttributeSecondSpelling, WithoutTheRowsAnswerADisagreeingThreadRequestIsRefused) {
     auto const firm = shippedCWith(
         R"J("__declspec(thread)": { "threadStorage": true, "yieldsOnMismatch": true })J",
-        // Three rows state the key since fold f26c2 (varDecl, topLevelDecl, externDecl): the two C23 inferred rows
-        // take it from varDecl and topLevelDecl (`linkageTablesFrom`), so the edit reaches them through those.
-        R"J("__declspec(thread)": { "threadStorage": true })J", 3);
+        // Two rows state the key since fold f26d (topLevelDecl, externDecl): every block row reads its attribute
+        // specifiers through externDecl's table (`attributeLinkageTablesFrom`, review-csf26c2 N5), and the C23
+        // inferred file-scope row takes topLevelDecl's (`linkageTablesFrom`), so the edit reaches them through those.
+        R"J("__declspec(thread)": { "threadStorage": true })J", 2);
     ASSERT_NE(firm, nullptr);
     for (char const* src : {"extern __declspec(thread) int e;\nint e = 1;\n",
                             "int e = 1;\nextern __declspec(thread) int e;\n"}) {

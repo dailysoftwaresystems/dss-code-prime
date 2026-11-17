@@ -257,7 +257,6 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
     std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
     bool const variadicForcesStack =
         cc.variadicArgsAlwaysStack && ::dss::call_payload::isVariadic(payload);
-    std::uint32_t const fixedOps = ::dss::call_payload::fixedOperandCount(payload);
 
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
@@ -272,7 +271,7 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
         std::uint32_t const argIndex = slot.has_value() ? slot->index : 0u;
         std::uint32_t const poolSize = slot.has_value() ? slot->poolSize : 0u;
         bool const forceStack =
-            variadicForcesStack && argRegionIdx >= fixedOps;
+            variadicForcesStack && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
         if (argIndex < poolSize && !forceStack) {
             out[k] = cls;   // register-passed scalar arg — eligible to defer
         }
@@ -1073,8 +1072,11 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
     auto const minInsts =
         static_cast<std::uint32_t>(std::strtoul(minEnv, nullptr, 10));
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
+    // BINARY ("ab"): the dump is the same bytes whichever host's DSS writes it -- in text mode a Windows-built DSS
+    // wrote every line ending as CR LF, so two hosts' dumps of one module differed (P69 fold f26d, the
+    // host-toolchain class).
     std::FILE* const f = core::openFileStream(
-        std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a");   // at any length
+        std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "ab");   // at any length
     if (f == nullptr) return;
     for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
         LirFuncId const fn = lir.funcAt(i);
@@ -1136,8 +1138,8 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
 void dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage) {
     if (std::getenv("DSS_DUMP_LIR_MIN_INSTS") == nullptr) return;
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
-    if (std::FILE* const f = core::openFileStream(
-            std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "a")) {   // at any length
+    if (std::FILE* const f = core::openFileStream(   // BINARY, as the function dump above (its note)
+            std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "ab")) {   // at any length
         auto const c = lir_pass_util::censusIdentityClassMoves(lir, schema);
         std::fprintf(f,
                      "########## STAGE %s ##########"

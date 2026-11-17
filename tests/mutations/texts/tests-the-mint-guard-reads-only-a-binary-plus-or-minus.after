@@ -1,0 +1,11 @@
+        char const c = arg[p];
+        if (c != '+' && c != '-') continue;
+        char const next = p + 1 < n ? arg[p + 1] : '\0';
+        if (next == c || next == '=') return true;   // ++ -- += -=
+        if (next == '>' || next == '+' || next == '-') continue;
+        std::size_t b = p;   // the nearest non-space before
+        while (b > 0 && isSpace(arg[b - 1])) --b;
+        bool const leftOk = b > 0 && (isWordChar(arg[b - 1]) || arg[b - 1] == ')' || arg[b - 1] == ']');
+        std::size_t const a = skipSpace(arg, p + 1);
+        bool const rightOk = a < n && (isWordChar(arg[a]) || arg[a] == '(');
+        if (leftOk && rightOk) return true;

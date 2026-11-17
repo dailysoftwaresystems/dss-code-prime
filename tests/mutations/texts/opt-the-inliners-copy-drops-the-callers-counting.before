@@ -1,0 +1,1 @@
+        dst_.stateFunctionArgCounting(copied, src_.funcArgCounting(caller));

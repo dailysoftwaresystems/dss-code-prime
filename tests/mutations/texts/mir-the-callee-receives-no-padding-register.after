@@ -1,2 +1,1 @@
-            (void)ctr.next(AbiPieceClass::Gpr);
-            (void)padPos;
+            (void)pad;

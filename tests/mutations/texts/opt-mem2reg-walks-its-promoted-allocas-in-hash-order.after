@@ -1,0 +1,1 @@
+    for (std::uint32_t aid : promoted_) {

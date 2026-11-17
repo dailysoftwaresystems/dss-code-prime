@@ -494,7 +494,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // index, as it always was; the rule is asked all the same, so that no reader
     // keeps one of its own.
     std::size_t const numSyms = static_cast<std::size_t>(symtab.size / kSymSz);
-    link::format::RecordSymbolIds symbolIds{static_cast<std::uint32_t>(numSyms)};
+    link::format::RecordSymbolIds symbolIds{numSyms, reporter, "elf::readRelocatableObject"};
+    if (symbolIds.refused()) return std::nullopt;   // the table reaches a reserved id: refused by name
     std::vector<Sym> syms(numSyms);
     for (std::size_t i = 0; i < numSyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(symtab.offset) + i * kSymSz;
@@ -2452,6 +2453,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
+    if (symbolIds.refused()) return std::nullopt;
+    mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;
 }

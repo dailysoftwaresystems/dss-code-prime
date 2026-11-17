@@ -200,6 +200,22 @@ dss_add_test(NAME analysis/semantic/test_constant_conditional_is_balanced
 target_include_directories(dss_analysis_semantic_test_constant_conditional_is_balanced
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 f26d (lane `cs`): a diagnostic's size does not grow with the operand it names — a conditional
+# nest 8 / 32 / 128 deep reports one bounded sentence per level, a quoted operand is one line cut past
+# the configured limit, and a short operand is still named in full.
+dss_add_test(NAME analysis/semantic/test_diagnostic_operand_quote
+             SOURCES test_diagnostic_operand_quote.cpp)
+target_include_directories(dss_analysis_semantic_test_diagnostic_operand_quote
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 f26d (lane `cs`, rulings 617 and 621): every analyzer sentence that names a type names it as the
+# language spells it (the ONE renderer over the document's `semantics.typeSpelling`), and says itself
+# without one where the document states no table — each migrated site read under both documents.
+dss_add_test(NAME analysis/semantic/test_diagnostic_type_spelling
+             SOURCES test_diagnostic_type_spelling.cpp)
+target_include_directories(dss_analysis_semantic_test_diagnostic_type_spelling
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P69 L2 (lane `lm`, the review of checkpoint 29, BLOCKER 1 and MAJOR 3): a folded constant's
 # core states its C type — a float operation rounds to its type, an integer operand converts to
 # it once, a folded builtin has its rule's type. Shares `semantic_test_fixture.hpp`.

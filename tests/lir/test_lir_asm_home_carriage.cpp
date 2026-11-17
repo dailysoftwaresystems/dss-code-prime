@@ -49,6 +49,7 @@
 #include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -101,6 +102,7 @@ namespace {
     std::array<TypeId, 1> const params{ty};
     TypeId const fnSig = interner.fnSig(params, ty, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -125,6 +127,7 @@ namespace {
     std::array<TypeId, 3> const params{f128, f128, ptr};
     TypeId const fnSig = interner.fnSig(params, f128, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -171,6 +174,7 @@ namespace {
     std::array<TypeId, 3> const params{f128, i64, ptr};
     TypeId const fnSig = interner.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const yes   = mb.createBlock(StructCfMarker::Linear);
@@ -345,7 +349,7 @@ TEST(LirAsmHomeCarriage, ALongDoubleBoundToAnFpRegisterTravelsByItsHome) {
     Mir const m = buildCopyThroughAsm(L.interner, TypeKind::F128,
                                       TargetRegClass::FPR, "w",
                                       "mov %0.16b, %1.16b");
-    L.result = lowerToLir(m, t, L.interner, L.reporter);
+    L.result = lowerToLir(m, t, L.interner, L.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(L.result.ok)
         << "a `long double` on `\"w\"` must LOWER — gcc 13.3.0 and clang "
            "18.1.3 both compile and run it: " << inventory(L.reporter);
@@ -401,7 +405,7 @@ TEST(LirAsmHomeCarriage, ADoubleBoundToAnFpRegisterKeepsItsMove) {
     Mir const m = buildCopyThroughAsm(L.interner, TypeKind::F64,
                                       TargetRegClass::FPR, "w",
                                       "mov %0.16b, %1.16b");
-    L.result = lowerToLir(m, t, L.interner, L.reporter);
+    L.result = lowerToLir(m, t, L.interner, L.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(L.result.ok) << inventory(L.reporter);
     Lir const& lir = L.result.lir;
     auto const templ = templateWithOpcode(lir, opOf(t, "move_bytes"));
@@ -424,7 +428,7 @@ TEST(LirAsmHomeCarriage, EveryOutputRouteStoresIntoAHome) {
     TargetSchema const& t = **target;
     Lowered L;
     Mir const m = buildTwoOutputsAndATie(L.interner);
-    L.result = lowerToLir(m, t, L.interner, L.reporter);
+    L.result = lowerToLir(m, t, L.interner, L.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(L.result.ok)
         << "two long double outputs, a piece and a `\"+w\"` must lower — "
            "gcc and clang run the C twin to the right answer: "
@@ -463,7 +467,7 @@ TEST(LirAsmHomeCarriage, AnAsmGotoOutputIsStoredOnEveryEdge) {
     TargetSchema const& t = **target;
     Lowered L;
     Mir const m = buildAsmGotoWithOutput(L.interner);
-    L.result = lowerToLir(m, t, L.interner, L.reporter);
+    L.result = lowerToLir(m, t, L.interner, L.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(L.result.ok)
         << "an `asm goto` with a long double output must lower — gcc and "
            "clang run the C twin: " << inventory(L.reporter);
@@ -497,7 +501,7 @@ TEST(LirAsmHomeCarriage, ALongDoubleOnAGeneralRegisterTravelsAsAPair) {
     Mir const m = buildCopyThroughAsm(L.interner, TypeKind::F128,
                                       TargetRegClass::GPR, "r",
                                       "mov %0, %1\n\tmov %H0, %H1");
-    L.result = lowerToLir(m, t, L.interner, L.reporter);
+    L.result = lowerToLir(m, t, L.interner, L.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(L.result.ok)
         << "a `long double` on `\"r\"` must LOWER as a register pair — gcc "
            "13.3.0 runs it: " << inventory(L.reporter);
@@ -551,7 +555,7 @@ TEST(LirAsmHomeCarriage, ALongDoubleOnAGeneralRegisterTravelsAsAPair) {
     Lowered ok;
     Mir const c = buildCopyThroughAsm(ok.interner, TypeKind::I64,
                                       TargetRegClass::GPR, "r", "mov %0, %1");
-    ok.result = lowerToLir(c, t, ok.interner, ok.reporter);
+    ok.result = lowerToLir(c, t, ok.interner, ok.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(ok.result.ok) << inventory(ok.reporter);
     EXPECT_TRUE(loadsOf(ok.result.lir, opOf(t, "load"), 64,
                         LirRegClass::GPR).empty())
@@ -562,7 +566,7 @@ TEST(LirAsmHomeCarriage, ALongDoubleOnAGeneralRegisterTravelsAsAPair) {
     Lowered bad;
     Mir const h = buildCopyThroughAsm(bad.interner, TypeKind::I64,
                                       TargetRegClass::GPR, "r", "mov %0, %H1");
-    bad.result = lowerToLir(h, t, bad.interner, bad.reporter);
+    bad.result = lowerToLir(h, t, bad.interner, bad.reporter, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(bad.result.ok);
     EXPECT_TRUE(anyTextContains(bad.reporter,
                                 "names the SECOND register of a two-register"))
@@ -584,7 +588,7 @@ TEST(LirAsmHomeCarriage, AnX87LongDoubleTravelsAsAPairAndHasNoXmmCarriage) {
     Lowered pair;
     Mir const m1 = buildCopyThroughAsm(pair.interner, TypeKind::F80,
                                        TargetRegClass::GPR, "r", "movq %1, %0");
-    pair.result = lowerToLir(m1, t, pair.interner, pair.reporter);
+    pair.result = lowerToLir(m1, t, pair.interner, pair.reporter, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(pair.result.ok)
         << "an x87 long double on `\"r\"` must LOWER as a register pair: "
         << inventory(pair.reporter);
@@ -605,7 +609,7 @@ TEST(LirAsmHomeCarriage, AnX87LongDoubleTravelsAsAPairAndHasNoXmmCarriage) {
     Lowered view;
     Mir const m2 = buildCopyThroughAsm(view.interner, TypeKind::F80,
                                        TargetRegClass::FPR, "x", "nop");
-    view.result = lowerToLir(m2, t, view.interner, view.reporter);
+    view.result = lowerToLir(m2, t, view.interner, view.reporter, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(view.result.ok);
     EXPECT_TRUE(anyTextContains(view.reporter, "10-byte 'F80' value"))
         << inventory(view.reporter);
@@ -616,6 +620,6 @@ TEST(LirAsmHomeCarriage, AnX87LongDoubleTravelsAsAPairAndHasNoXmmCarriage) {
     Lowered ok;
     Mir const c = buildCopyThroughAsm(ok.interner, TypeKind::F64,
                                       TargetRegClass::FPR, "x", "nop");
-    ok.result = lowerToLir(c, t, ok.interner, ok.reporter);
+    ok.result = lowerToLir(c, t, ok.interner, ok.reporter, dss::test::kFirstConventionOfTheTarget);
     EXPECT_TRUE(ok.result.ok) << inventory(ok.reporter);
 }

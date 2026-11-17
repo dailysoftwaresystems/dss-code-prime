@@ -40,6 +40,7 @@ ArgModule buildArgModule(
     TypeId const voidT = interner.primitive(TypeKind::Void);
     TypeId const fnSig = interner.fnSig(paramTypes, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -640,6 +641,7 @@ TEST(MirAlias, ProbeSubstitutionPreservesEveryClobberVerdict) {
     TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -822,6 +824,7 @@ EscapeShape buildEscapeShape(TypeInterner& interner) {
     TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -987,6 +990,7 @@ TEST(MirAlias, Rule3b_PhiMergingASlotAndAParameterIsUnknownAndEscapesTheSlot) {
     TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const armA  = mb.createBlock(StructCfMarker::Linear);
@@ -1043,6 +1047,7 @@ TEST(MirEscape, AnInlineAsmTemplateEscapesEverySlotInItsFunction) {
     struct Shape { Mir mir; MirInstId param, slot; };
     auto build = [&](bool withAsm) {
         MirBuilder mb;
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(fnSig, SymbolId{100});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(entry);

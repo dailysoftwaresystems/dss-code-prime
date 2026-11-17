@@ -13,6 +13,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (post-merge stamp)
 #include "mir/mir_verifier.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
 
 #include <algorithm>
 #include <cstdint>
@@ -43,7 +44,9 @@ namespace {
 // ids from a counter seeded above CU0's max.
 class SymbolAllocator {
 public:
-    explicit SymbolAllocator(std::uint32_t seedNextFresh) : next_(seedNextFresh) {}
+    // Seeded past `highestHeld`, the highest id unit 0 holds (0: none): the next id is the core cursor's, never a
+    // `+ 1` here (P69 f26d, N9 -- `maxCu0 + 1` wrapped onto 0 at the last value).
+    explicit SymbolAllocator(std::uint32_t highestHeld) { next_.keepClearOfHighest(highestHeld); }
 
     // Claim a specific value (CU0 retention). Caller guarantees it is free.
     [[nodiscard]] SymbolId claim(std::uint32_t v) {
@@ -58,11 +61,17 @@ public:
     }
     // Mint the next free id.
     [[nodiscard]] SymbolId mint() {
-        while (used_.count(next_)) ++next_;
-        std::uint32_t const v = next_++;
-        used_.insert(v);
-        handedOut_(v);
-        return SymbolId{v};
+        while (true) {   // the claimed values are asked again, inside the door
+            SymbolId const id = next_.take();
+            if (!id.valid()) {
+                std::fprintf(stderr, "dss::mergeCuMirs fatal: the merged module's SymbolId space is "
+                                     "exhausted -- no fresh symbol can be minted\n");
+                std::abort();
+            }
+            if (!used_.insert(id.v).second) continue;
+            handedOut_(id.v);
+            return id;
+        }
     }
     [[nodiscard]] bool isFree(std::uint32_t v) const { return used_.count(v) == 0; }
 
@@ -73,17 +82,13 @@ public:
     // module's builder, so whatever mints into the merged module afterwards asks
     // the module and clears every merged id — the ones the module holds, the
     // imports' (their rows live beside it) and the ones a name alone holds.
-    [[nodiscard]] std::uint32_t end() const noexcept { return end_; }
+    [[nodiscard]] std::uint32_t end() const noexcept { return end_.value(); }
 
 private:
-    void handedOut_(std::uint32_t v) noexcept {
-        constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
-        std::uint32_t const past = v == kLast ? kLast : v + 1u;
-        if (past > end_) end_ = past;
-    }
+    void handedOut_(std::uint32_t v) noexcept { end_.keepClearOfHighest(v); }
 
-    std::uint32_t                     next_;
-    std::uint32_t                     end_ = 1;
+    SymbolIdEnd                       next_;   // the next fresh id's cursor
+    SymbolIdEnd                       end_;    // past every id handed out, claimed or minted
     std::unordered_set<std::uint32_t> used_;
 };
 
@@ -299,6 +304,10 @@ public:
             // in one translation unit stops running the moment a second unit
             // joins the link — the sharpest form of the drop this axis fears.
             keptAsModulePrivate ? StaticInitSchedule{} : src_.funcStaticInit(f));
+        // ★ P69 (lane `cs`, fold f26d): the counting of the convention the function is called by crosses
+        // with it — a clone that took the builder's default would count a foreign-convention function
+        // by the pair's.
+        dst_.stateFunctionArgCounting(newF, src_.funcArgCounting(f));
         plan_.funcMerged.emplace(CuSymKey{cuIdx_, src_.funcSymbol(f).v}, newF);
 
         std::uint32_t const nb = src_.funcBlockCount(f);
@@ -1123,7 +1132,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             maxCu0 = std::max(maxCu0, a.alias.v);
         }
     }
-    SymbolAllocator alloc{maxCu0 + 1};
+    SymbolAllocator alloc{maxCu0};   // past unit 0's highest id
 
     auto cuIdxOf = [](LinkedSymbolKey const& k) -> std::uint32_t {
         return k.cuId.v - 1;
@@ -1441,10 +1450,31 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     auto const definedIn = [&unitOfDefinition](SymbolId merged, std::uint32_t ci) {
         unitOfDefinition.emplace(merged.v, ci);
     };
-    // Carry CU0's module-level alias polarity (the driver merges homogeneous-
-    // language CUs; CU0 is representative). Agnostic — a flag value, no branch.
-    builder.setAliasingMode(cus[0].mir->aliasingMode());
-    builder.setCharTypesAliasAll(cus[0].mir->charTypesAliasAll());
+    // ★ P69 (lane `cs`, fold f26d): THE MERGED MODULE'S FACTS ARE ITS UNITS' FACTS JOINED (`joinUnitFacts`,
+    // beside the one list `MirModuleFacts`). It read the aliasing mode and the char-types rule from unit 0
+    // ALONE — a disagreement settled by unit order: a strict unit 0 merged with a permissive unit made the
+    // whole program strict, so the permissive unit's accesses were optimized under a rule its source never
+    // promised (READ). Two units stating DIFFERENT countings of the pair's convention were lowered for two
+    // pairs, which no link merges: refused by name, never settled by unit order. A function's own counting
+    // crosses with the function (the clone above).
+    {
+        MirModuleFacts facts = cus[0].mir->moduleFacts();
+        for (std::size_t ci = 1; ci < cus.size(); ++ci) {
+            auto const joined = joinUnitFacts(facts, cus[ci].mir->moduleFacts());
+            if (!joined.has_value()) {
+                // The fact that disagrees, BY NAME (`MirFactsDisagreement`), never the first the list has.
+                std::fprintf(stderr,
+                    "dss::mergeCuMirs fatal: unit %zu states the module fact '%s' differently from an "
+                    "earlier unit (%u vs %u) -- the units were lowered for two pairs, and one link "
+                    "never merges two pairs\n",
+                    ci, joined.error().fact, static_cast<unsigned>(joined.error().b),
+                    static_cast<unsigned>(joined.error().a));
+                std::abort();
+            }
+            facts = *joined;
+        }
+        builder.stateModuleFacts(facts);
+    }
 
     auto isShadowedLoser = [&](std::uint32_t ci, std::string const& name,
                                SymbolId sym, bool isLocal) -> bool {

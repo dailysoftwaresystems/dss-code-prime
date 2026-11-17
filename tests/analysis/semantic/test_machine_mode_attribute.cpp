@@ -373,6 +373,14 @@ TEST(MachineModeAttribute, FloatingModesAreTheTargetsTypeOfThatRepresentation) {
         auto const tf = analyzeC("long double tf __attribute__((mode(TF)));\n");
         EXPECT_EQ(countCode(tf.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u)
             << everyDiagnostic(tf);
+        // P69 fold f26d (ruling 617): the representation is named by its format's facts
+        // (core/types/float_format.hpp), never by a core kind's name (`F128`).
+        for (auto const& d : tf.diagnostics().all()) {
+            if (d.code != DiagnosticCode::S_AttributeNotHonoured) continue;
+            EXPECT_NE(d.actual.find("the 128-bit floating representation of a 113-digit significand"),
+                      std::string::npos) << d.actual;
+            EXPECT_EQ(d.actual.find("F128"), std::string::npos) << d.actual;
+        }
     }
     {   // binary128 `long double` (AAPCS64 Linux): TF is it, XF is refused.
         auto const m = analyzeC("long double rld;\n"

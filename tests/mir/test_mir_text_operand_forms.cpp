@@ -125,7 +125,7 @@ TEST(MirTextOperandForms, IndirectBrRoundTripsThroughTheReader) {
 // input reaches it directly.
 TEST(MirTextOperandForms, HandWrittenIndirectBrIsReadBack) {
     std::string const text =
-        "dssir 7\n"
+        "dssir 8\n"
         "symbols {\n"
         "  %1 \"cg\"\n"
         "}\n"
@@ -446,7 +446,7 @@ TEST(MirTextOperandForms, TheUndecodableTypeMarkerIsRefusedByNameAndWarnsOnce) {
 TEST(MirTextOperandForms, UnknownOpcodeRefusalNamesTheAcceptedSet) {
     DiagnosticReporter r;
     auto parsed = parseMir(
-        "dssir 7\nsymbols { %1 \"f\" }\nmodule {\n"
+        "dssir 8\nsymbols { %1 \"f\" }\nmodule {\n"
         "  function %1 : fn() -> void {\n    block %b1 [entry] {\n"
         "      nosuchopcode\n      return\n    }\n  }\n}\n",
         CompilationUnitId{1}, r);
@@ -487,11 +487,11 @@ TEST(MirTextOperandForms, AnUnknownTypeNameIsRefusedRatherThanAborting) {
         EXPECT_FALSE(parsed->ok);
         EXPECT_TRUE(named) << "the refusal must name the offending spelling";
     };
-    probe("dssir 7\nsymbols { %1 \"f\" %2 \"g\" }\nmodule {\n"
+    probe("dssir 8\nsymbols { %1 \"f\" %2 \"g\" }\nmodule {\n"
           "  global %2 : bogus = zero\n"
           "  function %1 : fn() -> void {\n    block %b1 [entry] {\n"
           "      return\n    }\n  }\n}\n");
-    probe("dssir 7\nsymbols { %1 \"f\" }\nmodule {\n"
+    probe("dssir 8\nsymbols { %1 \"f\" }\nmodule {\n"
           "  function %1 : bogus {\n    block %b1 [entry] {\n"
           "      return\n    }\n  }\n}\n");
 }
@@ -503,7 +503,7 @@ TEST(MirTextOperandForms, ARefusedFunctionHeaderDoesNotCascadeOverItsBody) {
     // is re-offered to the MODULE loop and refused in turn.
     DiagnosticReporter r;
     auto parsed = parseMir(
-        "dssir 7\nsymbols { %1 \"f\" }\nmodule {\n"
+        "dssir 8\nsymbols { %1 \"f\" }\nmodule {\n"
         "  function %1 : bogus {\n"
         "    block %b1 [entry] {\n      return\n    }\n"
         "    block %b2 {\n      return\n    }\n"
@@ -534,7 +534,7 @@ TEST(MirTextOperandForms, ARefusedFunctionHeaderDoesNotCascadeOverItsBody) {
 // (a well-formed instruction plus an unconsumed remainder) without needing one.
 TEST(MirTextOperandForms, UnconsumedOperandTailIsRefusedByName) {
     std::string const text =
-        "dssir 7\n"
+        "dssir 8\n"
         "symbols {\n"
         "  %1 \"f\"\n"
         "}\n"
@@ -585,7 +585,7 @@ Mir symbolAddressGlobal(TypeInterner& ti, std::int64_t addend) {
 }
 
 std::string symaddrDoc(std::string const& symbols, std::string const& value) {
-    return "dssir 7\nsymbols {\n" + symbols + "}\nmodule {\n  global %1 : ptr<i32> = lit " + value +
+    return "dssir 8\nsymbols {\n" + symbols + "}\nmodule {\n  global %1 : ptr<i32> = lit " + value +
            " : ptr\n}\n";
 }
 

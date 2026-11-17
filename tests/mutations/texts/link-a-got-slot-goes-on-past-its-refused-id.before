@@ -1,0 +1,3 @@
+                std::optional<SymbolId> const minted = ids.take(reporter, "linker: a GOT slot");
+                if (!minted.has_value()) return false;
+                SymbolId const slotSym = *minted;

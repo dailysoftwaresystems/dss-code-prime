@@ -1,0 +1,16 @@
+{
+  "$comment": "The twin of `constructor_ties_run_in_input_then_definition_order`: the same units linked in the OPPOSITE order, main.c w.c u3.c u2.c u1.c. Constructors of one priority run in the units' input order, then each unit's definition order (src/link/static_init_tables.hpp states the decision, its measurement and what it refuses), so `w`'s three run first and in the order `w` defines them, then u3, u2, u1. The stdout is the order, the exit code the count (six ran). FOUR TARGETS: pe runs natively on the Windows gate host, elf x86_64 + arm64 under qemu on Linux, macho on darwin.",
+  "language": "c",
+  "sources": ["main.c", "w.c", "u3.c", "u2.c", "u1.c"],
+  "exitCode": 6,
+  "expectedStdout": "21 22 23 3 2 1 ",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

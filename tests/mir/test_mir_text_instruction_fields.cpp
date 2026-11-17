@@ -148,6 +148,7 @@ TEST(MirTextInstructionFields, EveryFieldOfEveryInstructionSurvivesARoundTrip) {
     TypeId const fnSig = in.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     (void)b.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tail  = b.createBlock(StructCfMarker::Linear);
@@ -225,7 +226,7 @@ TEST(MirTextInstructionFields, AFlaglessDefaultAlignedModuleIsSpelledAsBefore) {
     MirTextContext ctx{&in, &names};
     DiagnosticReporter r;
     EXPECT_EQ(emitMir(m, ctx, r),
-              "dssir 7\n"
+              "dssir 8\n"
               "symbols {\n"
               "  %1 \"f\"\n"
               "}\n"
@@ -280,7 +281,7 @@ TEST(MirTextInstructionFields, ANonPowerOfTwoAlignmentReadBackIsRefusedByTheRule
 // set — never read as "no flags".
 TEST(MirTextInstructionFields, AnUnknownFlagIsRefusedByNameWithTheAcceptedSet) {
     std::string const text =
-        "dssir 7\n"
+        "dssir 8\n"
         "symbols {\n  %1 \"f\"\n}\n"
         "module {\n"
         "  function %1 : fn() -> i32 {\n"

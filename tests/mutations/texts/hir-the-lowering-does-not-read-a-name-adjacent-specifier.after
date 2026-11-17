@@ -1,2 +1,2 @@
-                 nameAdjacentAttributeSpecifiers(tree(), sem, declaratorNode)) {
+            if (isStandardAttributeSpecifier(sem, tree(), an)) continue;
             (void)an;

@@ -1,8 +1,16 @@
 #pragma once
 
-#include "core/types/strong_ids.hpp"  // SymbolId
+#include "core/types/diagnostic_reporter.hpp"   // DiagnosticReporter, report
+#include "core/types/object_format_kind.hpp"    // kFirstWriterReservedSymbolIdValue
+#include "core/types/parse_diagnostic.hpp"      // K_SymbolIdSpaceExhausted
+#include "core/types/strong_ids.hpp"            // SymbolId
+#include "core/types/symbol_id_cursor.hpp"      // symbolIdOfIndex, SymbolIdEnd -- the one rule of a fresh id
 
+#include <cstddef>
 #include <cstdint>
+#include <format>
+#include <string>
+#include <string_view>
 
 // ═══ THE ID OF A SYMBOL-TABLE RECORD ═══════════════════════════════════════
 //    D-LK-OBJECT-READERS-GAVE-RECORD-ZERO-THE-INVALID-SYMBOL-ID
@@ -39,9 +47,10 @@
 // this class; the ELF reader too, whose record 0 names nothing, so that
 // nothing of an ELF object moves. A pass that mints on the unit AFTER the read
 // (the link's, for an entry a directive names or a name handed to a common)
-// continues that counter: it asks the taken-id scan
-// (`link/fresh_symbol_ids.hpp`), which reads every id this class gave — a
-// record that became a symbol ROW and nothing else included.
+// continues that counter: the module the reader builds carries this table's
+// end, and the pass opens the module's door (`link/fresh_symbol_ids.hpp`) on
+// it -- a record that became a symbol ROW and nothing else, and a fresh id the
+// reader dropped, included.
 //
 // ★ WHY NOT `index + 1` FOR EVERY RECORD. A site that forgot that rule would
 // mint the NEIGHBOUR record's id: a reference bound to the wrong symbol, which
@@ -56,22 +65,60 @@
 // INDEX and stay so; an id is made where a value enters the module, by `of`.
 namespace dss::link::format {
 
+// ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): TWO SPACES, EACH BY THE ONE RULE OF A FRESH ID
+// (core/types/symbol_id_cursor.hpp). A record's id is an INDEX id -- `symbolIdOfIndex` of its position, record 0's
+// of the record count -- so the table ENDS below the first value a format writer reserves: a table whose count
+// reaches it is refused at the read, by name. The ids no record holds are a COUNTING space past the table, taken
+// through the cursor, which steps over a reserved value and refuses the last. This table is their door: it reports
+// either refusal itself, once, and hands out the invalid id from then on; the reader that owns it refuses its whole
+// output (`refused()`), so no module carries such an id. The module the reader builds carries the table's end
+// (`end()`, `AssembledModule::symbolIdEnd`): an id `fresh` handed out and the reader later dropped is never handed
+// out again by a pass that mints on the module.
 class RecordSymbolIds {
 public:
-    explicit constexpr RecordSymbolIds(std::uint32_t recordCount) noexcept
-        : recordCount_{recordCount}, nextFresh_{recordCount + 1u} {}
+    RecordSymbolIds(std::size_t recordCount, DiagnosticReporter& reporter, std::string_view reader)
+        : recordCount_{recordCount}, reporter_{&reporter}, reader_{reader} {
+        if (recordCount_ != 0u && !symbolIdOfIndex(recordCount_).valid()) {
+            refuse(std::format("its {} symbol records reach {}, the first SymbolId a format writer reserves -- a "
+                               "record's id is its index, and an index space ends there",
+                               recordCount_, kFirstWriterReservedSymbolIdValue));
+            return;
+        }
+        fresh_.keepClearOfHighest(static_cast<std::uint32_t>(recordCount_));
+    }
 
     // The id of record `index` of the table (`index` < the record count).
     [[nodiscard]] constexpr SymbolId of(std::uint32_t index) const noexcept {
-        return SymbolId{index == 0u ? recordCount_ : index};
+        return symbolIdOfIndex(index == 0u ? recordCount_ : index);
     }
 
-    // An id no record holds and no earlier call returned.
-    [[nodiscard]] constexpr SymbolId fresh() noexcept { return SymbolId{nextFresh_++}; }
+    // An id no record holds and no earlier call returned; the invalid id once the table is refused.
+    [[nodiscard]] SymbolId fresh() {
+        if (refused_) return SymbolId{};
+        SymbolId const id = fresh_.take();
+        if (!id.valid()) {
+            refuse(std::format("its ids past the table are exhausted (the end is {})", fresh_.value()));
+        }
+        return id;
+    }
+
+    // The table or its fresh ids were refused (reported here): the reader refuses its output.
+    [[nodiscard]] bool refused() const noexcept { return refused_; }
+    // One past every id this table gave: the module the reader builds carries it.
+    [[nodiscard]] SymbolIdEnd end() const noexcept { return fresh_; }
 
 private:
-    std::uint32_t recordCount_;
-    std::uint32_t nextFresh_;
+    void refuse(std::string const& why) {
+        refused_ = true;
+        report(*reporter_, DiagnosticCode::K_SymbolIdSpaceExhausted, DiagnosticSeverity::Error,
+               std::format("{}: the object's SymbolId space is exhausted: {}", reader_, why));
+    }
+
+    std::size_t         recordCount_;
+    DiagnosticReporter* reporter_;
+    std::string_view    reader_;
+    SymbolIdEnd         fresh_;
+    bool                refused_ = false;
 };
 
 }  // namespace dss::link::format

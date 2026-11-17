@@ -1831,6 +1831,23 @@ constexpr WindowsConstant kWindowsConstants[] = {
     {"DRIVE_REMOTE",                       "int",           "4"},
     {"DRIVE_CDROM",                        "int",           "5"},
     {"DRIVE_RAMDISK",                      "int",           "6"},
+    // P69 fold f26d (lane `cs`, P0): the lines both references printed for the constants the module and
+    // memory-query calls take and answer with (probe p0, 2026-11-17: cl 19.52 and MinGW-w64 gcc 13.2,
+    // identical), which the header lacked.
+    {"GET_MODULE_HANDLE_EX_FLAG_PIN",       "int",           "1"},
+    {"GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT", "int",           "2"},
+    {"GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS", "int",           "4"},
+    {"MEM_FREE",                            "int",           "65536"},
+    {"MEM_PRIVATE",                         "int",           "131072"},
+    {"MEM_MAPPED",                          "int",           "262144"},
+    {"MEM_IMAGE",                           "int",           "16777216"},
+    {"PAGE_EXECUTE",                        "int",           "16"},
+    {"PAGE_EXECUTE_READ",                   "int",           "32"},
+    {"PAGE_EXECUTE_READWRITE",              "int",           "64"},
+    {"PAGE_EXECUTE_WRITECOPY",              "int",           "128"},
+    {"PAGE_GUARD",                          "int",           "256"},
+    {"PAGE_NOCACHE",                        "int",           "512"},
+    {"PAGE_WRITECOMBINE",                   "int",           "1024"},
 };
 
 // One translation unit holding the two assertions of each row given.
@@ -1856,9 +1873,9 @@ constexpr std::string_view kWindowsConstantsMain =
 } // namespace
 
 TEST(DriverArgumentSupply, WindowsHeaderConstantsHaveTheTypesAndValuesTheReferencesGive) {
-    ASSERT_EQ(std::size(kWindowsConstants), 117u)
-        << "the table is the references' 117 lines; a row added to the header "
-           "arrives with its own measured line";
+    ASSERT_EQ(std::size(kWindowsConstants), 131u)
+        << "the table is the references' lines (117 of 2026-10-10 and 14 of 2026-11-17); a row "
+           "added to the header arrives with its own measured line";
     {
         ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-constants"};
         scratch.useAsCwd();
@@ -1896,6 +1913,66 @@ TEST(DriverArgumentSupply, WindowsHeaderConstantsHaveTheTypesAndValuesTheReferen
             << "the failure must be THIS assertion's, by its own text: "
             << allDiagnosticText(rep);
     }
+}
+
+// ── THE MODULE AND MEMORY-QUERY CALLS OF <windows.h> ───────────────────────
+//
+// P69 fold f26d (lane `cs`, P0): the shipped <windows.h> lacked the calls a program uses to find its own image and
+// to ask what a page is (lane `xa` met it: a test had to reach its own image through `LoadLibraryA` of its path).
+// Each declaration's TYPE is the SDK's, by `_Generic` over the designator in the SDK's own type names, and
+// MEMORY_BASIC_INFORMATION's layout is the SDK's, member by member: every line MEASURED by probe p0 (2026-11-17),
+// identical under cl 19.52 /std:c17 and MinGW-w64 gcc 13.2 -std=c17, which also RAN the calls on their own image
+// (examples/c/windows_module_and_memory_query runs them here). The negative proves the assertions are read:
+// `DWORD` is `unsigned long`, so a prototype asserted over `unsigned int` must fail by its own text.
+namespace {
+[[nodiscard]] std::string windowsDeclarationAssertions(char const* extra) {
+    std::string src =
+        "#include <windows.h>\n#include <stddef.h>\n"
+        "#define PROTO(f, T) _Static_assert(_Generic(&(f), T: 1, default: 0), #f \" is \" #T)\n"
+        "#define AT(m, o, s) _Static_assert(offsetof(MEMORY_BASIC_INFORMATION, m) == (o) && "
+        "sizeof(((MEMORY_BASIC_INFORMATION *)0)->m) == (s), #m \" at \" #o)\n"
+        "PROTO(GetModuleHandleA, HMODULE (WINAPI *)(LPCSTR));\n"
+        "PROTO(GetModuleHandleW, HMODULE (WINAPI *)(LPCWSTR));\n"
+        "PROTO(GetModuleHandleExA, BOOL (WINAPI *)(DWORD, LPCSTR, HMODULE *));\n"
+        "PROTO(GetModuleHandleExW, BOOL (WINAPI *)(DWORD, LPCWSTR, HMODULE *));\n"
+        "PROTO(GetModuleFileNameA, DWORD (WINAPI *)(HMODULE, LPSTR, DWORD));\n"
+        "PROTO(GetModuleFileNameW, DWORD (WINAPI *)(HMODULE, LPWSTR, DWORD));\n"
+        "PROTO(VirtualQuery, SIZE_T (WINAPI *)(LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T));\n"
+        "_Static_assert(_Generic((BOOLEAN)0, unsigned char: 1, default: 0), \"BOOLEAN is unsigned char\");\n"
+        "_Static_assert(sizeof(MEMORY_BASIC_INFORMATION) == 48 && _Alignof(MEMORY_BASIC_INFORMATION) == 8, "
+        "\"MEMORY_BASIC_INFORMATION is 48 bytes, 8-aligned\");\n"
+        "AT(BaseAddress, 0, 8); AT(AllocationBase, 8, 8); AT(AllocationProtect, 16, 4); AT(PartitionId, 20, 2);\n"
+        "AT(RegionSize, 24, 8); AT(State, 32, 4); AT(Protect, 36, 4); AT(Type, 40, 4);\n"
+        "_Static_assert(_Generic(((MEMORY_BASIC_INFORMATION *)0)->RegionSize, unsigned long long: 1, default: 0), "
+        "\"RegionSize is SIZE_T\");\n";
+    src += extra;
+    src += "int windows_constants_unit(void) { return 0; }\n";
+    return src;
+}
+} // namespace
+
+TEST(DriverArgumentSupply, WindowsModuleAndMemoryQueryDeclarationsAreTheReferences) {
+    {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-declarations"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildMergedPair(scratch, "wd_a.c", windowsDeclarationAssertions(""), "wd_b.c",
+                                  kWindowsConstantsMain, kPeExecSpec, scratch.path() / "wd_out", rep), 0)
+            << "a declaration of the shipped <windows.h> is not the one both references give:\n"
+            << allDiagnosticText(rep);
+    }
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-declarations-negative"};
+    scratch.useAsCwd();
+    DiagnosticReporter rep;
+    EXPECT_NE(buildMergedPair(scratch, "wd_a.c",
+                              windowsDeclarationAssertions(
+                                  "PROTO(GetModuleFileNameA, DWORD (WINAPI *)(HMODULE, LPSTR, unsigned int));\n"),
+                              "wd_b.c", kWindowsConstantsMain, kPeExecSpec, scratch.path() / "wd_out", rep),
+              0)
+        << "a false assertion must fail the build";
+    EXPECT_NE(allDiagnosticText(rep).find("GetModuleFileNameA is DWORD (WINAPI *)(HMODULE, LPSTR, unsigned int)"),
+              std::string::npos)
+        << "the failure must be THIS assertion's, by its own text: " << allDiagnosticText(rep);
 }
 
 // ── A `sysconf` NAME IS ITS PLATFORM'S OWN NUMBER ──────────────────────────

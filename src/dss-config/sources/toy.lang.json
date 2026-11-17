@@ -152,6 +152,8 @@
 
   "semantics": {
     "identifierToken": "Identifier",
+    "$typeSpellingComment": "P69 fold f26d (lane `cs`, ruling 621): the toy language's rows reach three core kinds, so its diagnostics spell them by the names its rows give them; it has no declarators, bit-precise or complex types, so the block names kinds only.",
+    "typeSpelling": { "kinds": { "Void": "void", "Bool": "bool", "I32": "int" } },
     "declarations": [
       { "rule": "funcDef", "name": 1, "kind": "function", "type": 4,
         "params": 2, "body": 5 },

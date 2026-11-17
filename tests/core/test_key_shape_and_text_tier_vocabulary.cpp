@@ -472,7 +472,7 @@ struct HirAttrVocabulary {
 // Everything else is the minimum a module needs, so a diagnostic can only be
 // about the hole.
 [[nodiscard]] std::string mirGlobalModule(std::string_view globalTail) {
-    return std::string{"dssir 7\n"
+    return std::string{"dssir 8\n"
                        "symbols { %1 \"f\" %2 \"g\" }\n"
                        "module {\n"
                        "  global %2 : "} + std::string{globalTail} + "\n"
@@ -600,7 +600,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
     // in the test. Found only because a sibling pin added a POSITIVE control and
     // the control reddened; the negative arm alone can never see this.
     auto const module = [](std::string_view marker) {
-        return std::string{"dssir 7\n"
+        return std::string{"dssir 8\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -686,7 +686,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
 // anchored for later.
 TEST(TextTierVocabulary, UnknownMirCallingConventionIsRefusedAndNamesTheAcceptedSet) {
     auto const module = [](std::string_view cc) {
-        return std::string{"dssir 7\n"
+        return std::string{"dssir 8\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void cc "} +
@@ -988,7 +988,7 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
 // is this file's own rule, written beside the inline-asm arm.
 TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
     auto const module = [](char const* arms, char const* extraBlock) {
-        return std::string{"dssir 7\n"
+        return std::string{"dssir 8\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1027,7 +1027,7 @@ TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
 // SILENT. `%b`, `%vx`, `%b3x` all fell out of the prefix-stripping loop as 0.
 TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 7\n"
+        return std::string{"dssir 8\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1070,7 +1070,7 @@ TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
 // crash is not a guard.
 TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 7\n"
+        return std::string{"dssir 8\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1103,7 +1103,7 @@ TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
 // the two arms pinned above were being converted in the same file.
 TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility) {
     auto const module = [](std::string_view attr) {
-        return std::string{"dssir 7\n"
+        return std::string{"dssir 8\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void ["} + std::string{attr} + "] {\n"
@@ -1127,7 +1127,9 @@ TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility
     // of the version-6 sentence advertised `weak` and the two kind names as three
     // words, and the loop below said so on three legs: "the refusal advertises
     // attribute 'overridable' and the reader then calls it UNKNOWN".
-    EXPECT_EQ(advertised.size(), 14u)
+    // P69 fold f26d (lane `cs`): a function's OWN Arg counting, advertised as the two spellings a list can state
+    // (`arg_counting(per_class)`, `arg_counting(flat)`), as the weak binding is spelled once per kind.
+    EXPECT_EQ(advertised.size(), 16u)
         << "the advertised function-attribute set changed size — a SHRINK means "
            "an attribute the reader takes stopped being advertised.\nmessage:\n  "
         << msg;

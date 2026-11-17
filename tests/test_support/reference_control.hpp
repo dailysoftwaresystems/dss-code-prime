@@ -17,6 +17,7 @@
 // words (`13.3.0`, `2.42`, `ld-1267`) found in those lines.
 
 #include "arm_verdict_ledger.hpp"   // readStrictArmVerdicts, kStrictArmVerdictsEnv
+#include "text_scan.hpp"            // digitsEnd, isDigit
 
 #include <gtest/gtest.h>
 
@@ -24,8 +25,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <iostream>
-#include <regex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,12 +35,29 @@ namespace dss::test_support {
 
 // The version tokens of a table's `measuredWith` words: each dotted number (`13.3.0`, `19.44`) and each ld64
 // project name (`ld-1267`). A token-free text has none, and no live toolchain is then "the measured one".
+// Read by a loop (text_scan.hpp), left to right, resuming after each mark: the language of
+// `ld-\d+|\d+(?:\.\d+)+`, its first alternative tried first.
 [[nodiscard]] inline std::vector<std::string> measuredVersionMarks(std::string_view measuredWith) {
-    static std::regex const kMark{R"(ld-\d+|\d+(?:\.\d+)+)"};
     std::vector<std::string> marks;
-    std::string const        text{measuredWith};
-    for (auto it = std::sregex_iterator(text.begin(), text.end(), kMark); it != std::sregex_iterator(); ++it) {
-        marks.push_back(it->str());
+    std::string_view const   text = measuredWith;
+    std::size_t              i    = 0;
+    while (i < text.size()) {
+        std::size_t end = i;
+        if (text.compare(i, 3, "ld-") == 0 && dss::test::digitsEnd(text, i + 3) > i + 3) {
+            end = dss::test::digitsEnd(text, i + 3);
+        } else if (dss::test::isDigit(text[i])) {
+            std::size_t const run = dss::test::digitsEnd(text, i);
+            std::size_t       k   = run;
+            while (k + 1 < text.size() && text[k] == '.' && dss::test::isDigit(text[k + 1]))
+                k = dss::test::digitsEnd(text, k + 1);
+            if (k > run) end = k;   // at least one `.digits`
+        }
+        if (end > i) {
+            marks.emplace_back(text.substr(i, end - i));
+            i = end;
+        } else {
+            ++i;
+        }
     }
     return marks;
 }

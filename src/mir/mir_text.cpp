@@ -196,7 +196,37 @@ namespace {
 // = %T`. The item first appeared inside v6, where a reader built before it refuses it by name — two
 // grammars under one number. The step makes the header say which: a v6 text is refused here, and a v6
 // reader refuses a v7 text before reading an item.
-constexpr int kVersion = 7;
+// v8 (P69, lane `cs`, review-csf26c2 N2): a module states how its functions number their `Arg`s,
+// `arg_counting per_class` / `arg_counting flat` — a header line right after the version, written
+// whenever the module states it (`Mir::argCounting`) — and a call that passes by its callee's own
+// definition's signature carries the flag `passes_by_definition`. The MIR verifier refuses a module
+// that holds an `Arg` and states no counting, so a v7 text with an `arg` line would read back
+// refused, and a v7 reader has no rule for either word.
+// Within v8 (P69, lane `cs`, fold f26d): the module's other facts are header lines after `arg_counting`
+// (`aliasing <permissive|strict_tbaa>`, `char_types_alias_all <true|false>`), and a function whose counting is
+// not the module's says so (`arg_counting(<per_class|flat>)` in its attribute list). Every line is OPTIONAL and
+// absent means the default, which is what a text written before them states, so no v8 text reads otherwise.
+constexpr int kVersion = 8;
+
+// The `arg_counting` header's spellings (`MirArgCounting`). `Unstated` has none: it is never
+// written, and a text that writes no header states nothing.
+inline constexpr EnumNameTable<MirArgCounting, 2> kMirTextArgCountingTable{{{
+    { MirArgCounting::PerClass, "per_class" },
+    { MirArgCounting::Flat,     "flat"      },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextArgCountingTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextArgCountingTable));
+// P69 (lane `cs`, fold f26d): the module's other facts (`MirModuleFacts`), each a header line where it is not
+// the default — `aliasing strict_tbaa`, `char_types_alias_all false` — and a function's OWN counting, where it
+// is not the module's, the function attribute `arg_counting(<per_class|flat>)`. A reader that meets none
+// states the default, which is what the writer left out, so a module reads back as it was written.
+inline constexpr EnumNameTable<MirAliasingMode, 2> kMirTextAliasingTable{{{
+    { MirAliasingMode::Permissive, "permissive"  },
+    { MirAliasingMode::StrictTBAA, "strict_tbaa" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextAliasingTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextAliasingTable));
+inline constexpr std::string_view kMirTextArgCountingAttr = "arg_counting";
 
 // The canonical quiet NaN is core's `kCanonicalQuietNanBits` (core/types/wide_float_value.hpp,
 // P69 review n13): the ONE NaN the text spells `nan`, every other NaN being `float nanbits
@@ -447,11 +477,12 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextExhaustTable));
 // list right after the mnemonic (`load [volatile] : i32 (%v1)`), written only
 // when a bit is set, so a flagless instruction reads exactly as before. A bit
 // with no row here is refused by the writer, not dropped.
-inline constexpr EnumNameTable<MirInstFlags, 4> kMirTextInstFlagTable{{{
-    { MirInstFlags::Synthetic,        "synthetic"          },
-    { MirInstFlags::Volatile,         "volatile"           },
-    { MirInstFlags::ReturnsTwice,     "returns_twice"      },
-    { MirInstFlags::AtomicInitExempt, "atomic_init_exempt" },
+inline constexpr EnumNameTable<MirInstFlags, 5> kMirTextInstFlagTable{{{
+    { MirInstFlags::Synthetic,             "synthetic"            },
+    { MirInstFlags::Volatile,              "volatile"             },
+    { MirInstFlags::ReturnsTwice,          "returns_twice"        },
+    { MirInstFlags::AtomicInitExempt,      "atomic_init_exempt"   },
+    { MirInstFlags::PassesByItsDefinition, "passes_by_definition" },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kMirTextInstFlagTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextInstFlagTable));
@@ -509,6 +540,18 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextInstFlagTable));
 // "the refusal advertises attribute 'overridable' and the reader then calls it
 // UNKNOWN". A reader of the message who wrote what it listed got a second
 // refusal.
+// P69 (lane `cs`, fold f26d): the spellings of a function's own counting a list can state — each as the reader
+// takes it, with its argument (`'arg_counting(per_class)' | 'arg_counting(flat)'`), as `bindingSpellings` spells
+// the weak binding once per kind.
+[[nodiscard]] std::string argCountingSpellings() {
+    std::string out;
+    for (std::string_view const name : allNames(kMirTextArgCountingTable)) {
+        if (!out.empty()) out += " | ";
+        out += std::format("'{}({})'", kMirTextArgCountingAttr, name);
+    }
+    return out;
+}
+
 [[nodiscard]] std::string bindingSpellings() {
     std::vector<std::string> spellings;
     for (auto const& [binding, name] : kSymbolBindingTable.rows) {
@@ -542,7 +585,17 @@ public:
         // and GlobalAddr instruction payloads. Each gets a stable handle
         // (its SymbolId.v value, so the parser can re-mint the same id).
         collectSymbols();
-        std::string const head = std::format("dssir {}\n", kVersion);
+        std::string head = std::format("dssir {}\n", kVersion);
+        // The module's facts (`MirModuleFacts`), each where it is not the default: every fact of the list is bound
+        // here, so one added to it does not compile until it is written.
+        auto const& [aliasing, charTypes, counting] = mir_.moduleFacts();
+        MirModuleFacts const defaults{};
+        if (auto const word = kMirTextArgCountingTable.findName(counting))
+            head += std::format("arg_counting {}\n", *word);
+        if (auto const word = kMirTextAliasingTable.findName(aliasing); word && aliasing != defaults.aliasingMode)
+            head += std::format("aliasing {}\n", *word);
+        if (charTypes != defaults.charTypesAliasAll)
+            head += std::format("char_types_alias_all {}\n", charTypes ? "true" : "false");
         emitSymbolsPreamble();
         std::string symbols = takeOut();
         // ★ THE BODY IS RENDERED BEFORE THE `types` SECTION THAT PRECEDES IT IN THE
@@ -1281,7 +1334,12 @@ private:
         bool             const no = mir_.funcNoOptimize(f);     // TF-C85
         bool             const ns = mir_.funcNoSanitizeThread(f);   // TF-C92
         StaticInitSchedule const si = mir_.funcStaticInit(f);
-        if (lk == MirLinkage{} && !ni && !ai && !no && !ns && !si.any()) {
+        // P69 (lane `cs`, fold f26d): the function's own counting, where it is not the module's default.
+        std::optional<std::string_view> const ownCounting =
+            mir_.funcArgCounting(f) == mir_.argCounting()
+                ? std::nullopt
+                : kMirTextArgCountingTable.findName(mir_.funcArgCounting(f));
+        if (lk == MirLinkage{} && !ni && !ai && !no && !ns && !si.any() && !ownCounting) {
             return;
         }
         out_ += " [";
@@ -1292,6 +1350,7 @@ private:
         if (ai)                             { sep(); out_ += kMirTextAlwaysInlineAttr; }
         if (no)                             { sep(); out_ += kMirTextNoOptimizeAttr; }
         if (ns)                             { sep(); out_ += kMirTextNoSanitizeThreadAttr; }
+        if (ownCounting) { sep(); out_ += std::format("{}({})", kMirTextArgCountingAttr, *ownCounting); }
         // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: one arm per
         // channel, read through `priorityFor` so neither is spelled by member name
         // — the same reason the DCE root clause asks `any()` rather than testing
@@ -1915,6 +1974,42 @@ public:
             d.actual   = std::format("expected version {}, got '{}'", kVersion, ver.text);
             reporter_.report(std::move(d));
             return makeEmptyResult();
+        }
+        // P69 (lane `cs`, N2): the optional `arg_counting <per_class|flat>` header — how the
+        // module's functions number their `Arg`s (`MirArgCounting`).
+        if (peekIdent("arg_counting")) {
+            lex_.take();
+            Tok const word = lex_.take();
+            if (auto const counting = kMirTextArgCountingTable.fromName(word.text);
+                word.kind == TokKind::Ident && counting.has_value()) {
+                builder_.stateArgCounting(*counting);
+            } else {
+                emitMalformed(std::format("'arg_counting' takes one of {}, got '{}'",
+                                          detail::renderAllowedList(allNames(kMirTextArgCountingTable)),
+                                          word.text));
+            }
+        }
+        // P69 (lane `cs`, fold f26d): the module's other facts, each optional (absent: the default).
+        if (peekIdent("aliasing")) {
+            lex_.take();
+            Tok const word = lex_.take();
+            if (auto const mode = kMirTextAliasingTable.fromName(word.text);
+                word.kind == TokKind::Ident && mode.has_value()) {
+                builder_.setAliasingMode(*mode);
+            } else {
+                emitMalformed(std::format("'aliasing' takes one of {}, got '{}'",
+                                          detail::renderAllowedList(allNames(kMirTextAliasingTable)),
+                                          word.text));
+            }
+        }
+        if (peekIdent("char_types_alias_all")) {
+            lex_.take();
+            Tok const word = lex_.take();
+            if (word.kind == TokKind::Ident && (word.text == "true" || word.text == "false")) {
+                builder_.setCharTypesAliasAll(word.text == "true");
+            } else {
+                emitMalformed(std::format("'char_types_alias_all' takes true or false, got '{}'", word.text));
+            }
         }
         // Optional `types { ... }` then `symbols { ... }` preamble.
         if (peekIdent("types")) {
@@ -3708,6 +3803,7 @@ private:
         bool             noOptimize   = false;   // TF-C85
         bool             noSanitizeThread = false;   // TF-C92
         StaticInitSchedule staticInit{};   // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
+        std::optional<MirArgCounting> ownCounting;   // P69 f26d: `arg_counting(...)`
         if (lex_.peek().kind == TokKind::LBracket) {
             lex_.take();
             while (true) {
@@ -3730,6 +3826,22 @@ private:
                 }
                 if (a.text == kMirTextNoSanitizeThreadAttr) {   // TF-C92
                     noSanitizeThread = true;
+                    continue;
+                }
+                // P69 (lane `cs`, fold f26d): the function's own counting, `arg_counting(<per_class|flat>)`.
+                if (a.text == kMirTextArgCountingAttr) {
+                    Tok const open = lex_.take();
+                    Tok const word = lex_.take();
+                    auto const counting = kMirTextArgCountingTable.fromName(word.text);
+                    if (open.kind != TokKind::LParen || word.kind != TokKind::Ident || !counting.has_value()
+                        || lex_.take().kind != TokKind::RParen) {
+                        emitMalformed(std::format("'{}' takes one of {} in parentheses, got '{}'",
+                                                  kMirTextArgCountingAttr,
+                                                  detail::renderAllowedList(allNames(kMirTextArgCountingTable)),
+                                                  word.text));
+                        break;
+                    }
+                    ownCounting = *counting;
                     continue;
                 }
                 // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: the
@@ -3795,13 +3907,14 @@ private:
                 // of this sentence advertised and the reader refused.
                 emitMalformed(std::format(
                     "unknown function attribute '{}' — expected a binding ({}), "
-                    "a visibility ({}), '{}', '{}', '{}', '{}', '{}' or '{}'",
+                    "a visibility ({}), '{}', '{}', '{}', '{}', '{}', '{}' or a counting ({})",
                     a.text,
                     bindingSpellings(),
                     detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
                     kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
                     kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr,
-                    kMirTextRunBeforeEntryAttr, kMirTextRunAfterEntryAttr));
+                    kMirTextRunBeforeEntryAttr, kMirTextRunAfterEntryAttr,
+                    argCountingSpellings()));
                 break;
             }
         }
@@ -3846,6 +3959,7 @@ private:
                                  noOptimize,      // TF-C85
                                  noSanitizeThread,   // TF-C92
                                  staticInit);   // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
+        if (ownCounting.has_value()) builder_.stateFunctionArgCounting(f, *ownCounting);   // P69 f26d
         // Text initfunc references use %f<MirFuncId.v>. Track in
         // parse order so deferred-resolution at finalize works even
         // when a global with `initfunc` precedes its target function.

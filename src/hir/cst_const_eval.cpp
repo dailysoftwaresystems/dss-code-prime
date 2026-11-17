@@ -2545,6 +2545,15 @@ findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
     auto positional = [&](std::optional<std::uint32_t> pos, std::uint32_t i) {
         return pos.has_value() && *pos == i;
     };
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): an ATTRIBUTE RUN the row reads by its
+    // slot list (`declarationAttrSlotRules`) is no value either — c's enumerator writes its
+    // attribute specifiers between its name and its `= value`, and the first Internal child
+    // there is an `attrSpec` or a `stdAttr`.
+    auto const isAttributeSlot = [&](NodeId n) {
+        for (AttrRunRule const& slot : decl.declarationAttrSlotRules)
+            if (slot.rule.valid() && tree.rule(n) == slot.rule) return true;
+        return false;
+    };
     for (std::uint32_t i = 0; i < kids.size(); ++i) {
         if (tree.kind(kids[i]) != NodeKind::Internal) continue;
         if (positional(decl.typeChild,   i)) continue;
@@ -2552,6 +2561,7 @@ findInitExprInDecl(Tree const& tree, DeclarationRule const& decl,
         if (positional(decl.paramsChild, i)) continue;
         if (positional(decl.bodyChild,   i)) continue;
         if (arraySufRule.valid() && tree.rule(kids[i]) == arraySufRule) continue;
+        if (isAttributeSlot(kids[i])) continue;
         return kids[i];
     }
     return std::nullopt;

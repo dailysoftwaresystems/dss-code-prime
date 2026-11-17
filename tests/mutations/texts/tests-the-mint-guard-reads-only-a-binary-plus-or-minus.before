@@ -1,0 +1,2 @@
+        if (arg[p] == '+') return true;                                  // + ++ += and a unary plus
+        if (arg[p] == '-' && (p + 1 >= n || arg[p + 1] != '>')) return true;   // - -- -= -1, never ->

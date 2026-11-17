@@ -1,0 +1,1 @@
+            if (con.name != receiver || true) return false;

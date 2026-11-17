@@ -12,10 +12,12 @@
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
+#include "shipped_read_pairs.hpp"   // shippedReadPairs: every shipped target x format
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <string>
 
 using namespace dss;
 
@@ -48,6 +50,19 @@ constexpr AggregateLayoutParams kGnuIgnored16{
 constexpr AggregateLayoutParams kGnuContributes16{
     ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked,
     UnnamedBitFieldAlignment::Contributes};
+
+// ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+// the chunk a `_BitInt(N)` of N > 64 is made of is the TARGET's (`bitPreciseChunk`), so
+// a fixture that lays one out names its ABI — the x86-64 psABI's 8, AAPCS64's 16.
+// `kNatural16` declares none: under it a wide `_BitInt` has no layout (the refusal's
+// own fixture).
+[[nodiscard]] constexpr AggregateLayoutParams withBitPreciseChunk(AggregateLayoutParams p,
+                                                                  std::uint32_t chunk) noexcept {
+    p.bitPreciseChunk = chunk;
+    return p;
+}
+constexpr AggregateLayoutParams kPsAbi16 = withBitPreciseChunk(kNatural16, 8);
+constexpr AggregateLayoutParams kAapcs16 = withBitPreciseChunk(kNatural16, 16);
 
 [[nodiscard]] StructLayout layoutOf(TypeId id, TypeInterner const& ti,
                                     AggregateLayoutParams p = kNatural16,
@@ -2339,35 +2354,127 @@ TEST(TypeLayout, AtomicQualifierDoesNotChangeLayout) {
         EXPECT_EQ(las.fieldOffsets[i], ls.fieldOffsets[i]);
 }
 
-// ── C23 _BitInt(N) ABI (D-CSUBSET-BITINT) — witnessed vs clang-19 x86-64 psABI ──
-
+// ── C23 _BitInt(N) ABI (D-CSUBSET-BITINT) — witnessed vs the references ──
+//
+// N ≤ 64 → the smallest {1,2,4,8}-byte container, align == size, on every ABI (no
+// chunk asked). N > 64 → whole CHUNKS of the target's, aligned to one. ★ P69 (lane
+// `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64): the
+// x86-64 psABI's chunk is 8 (ceil(N/64) eightbytes — `_BitInt(128)` 16/8, `_BitInt(129)`
+// 24/8) and AAPCS64's 16 (N ≤ 128 the quadword, N > 128 `unsigned __int128[M]` —
+// 16/16 and 32/16). This arm answered the psABI's 8 for every target.
+// ✔MEASURED (probe f26bi, 2026-11-14, -O1 -std=c2x, each reference's layout read from its assembly): x86-64 clang 18.1.3 (linux-gnu), Apple clang 21 (x86_64-apple-macos11) and clang for x86_64-pc-windows-msvc and x86_64-w64-windows-gnu lay _BitInt(65) and (128) out 16/8, (129) 24/8, (256) 32/8; arm64 Apple clang 21 (65) and (128) 16/16 (clang 18.1.3 aarch64-linux-gnu 16/8, older than AAPCS64's bit-precise rules); no arm64 reference has a _BitInt past 128 bits, and gcc 13 has none.
 TEST(TypeLayout, BitIntSizeAndAlign) {
     auto ti = makeInterner(70);
-    struct Case { std::int64_t n; bool sgned; std::uint64_t size; std::uint32_t align; };
-    // N<=64 → smallest {1,2,4,8}B container, align == size. N>64 → ceil(N/64) eight-
-    // bytes, align 8 (the _BitInt(128) size-16 / align-8 quirk). Matches clang-19.
+    struct Case {
+        std::int64_t n; bool sgned;
+        std::uint64_t psSize; std::uint32_t psAlign;   // the x86-64 psABI
+        std::uint64_t aaSize; std::uint32_t aaAlign;   // AAPCS64
+    };
     for (Case const c : {
-             Case{4,  true,  1, 1}, Case{4,  false, 1, 1},
-             Case{8,  false, 1, 1}, Case{9,  false, 2, 2},
-             Case{16, true,  2, 2}, Case{17, true,  4, 4},
-             Case{32, false, 4, 4}, Case{33, true,  8, 8},
-             Case{40, false, 8, 8}, Case{64, true,  8, 8},
-             Case{128, true, 16, 8}, Case{200, false, 32, 8}}) {
-        auto const l = layoutOf(ti.bitInt(c.n, c.sgned), ti);
-        EXPECT_EQ(l.size, c.size) << "sizeof(_BitInt(" << c.n << "))";
-        EXPECT_EQ(l.align.bytes(), c.align) << "_Alignof(_BitInt(" << c.n << "))";
+             Case{4,  true,  1, 1, 1, 1},     Case{4,  false, 1, 1, 1, 1},
+             Case{8,  false, 1, 1, 1, 1},     Case{9,  false, 2, 2, 2, 2},
+             Case{16, true,  2, 2, 2, 2},     Case{17, true,  4, 4, 4, 4},
+             Case{32, false, 4, 4, 4, 4},     Case{33, true,  8, 8, 8, 8},
+             Case{40, false, 8, 8, 8, 8},     Case{64, true,  8, 8, 8, 8},
+             Case{65, false, 16, 8, 16, 16},  Case{128, true, 16, 8, 16, 16},
+             Case{129, false, 24, 8, 32, 16}, Case{200, false, 32, 8, 32, 16},
+             Case{256, true, 32, 8, 32, 16}}) {
+        auto const ps = layoutOf(ti.bitInt(c.n, c.sgned), ti, kPsAbi16);
+        EXPECT_EQ(ps.size, c.psSize) << "psABI: sizeof(_BitInt(" << c.n << "))";
+        EXPECT_EQ(ps.align.bytes(), c.psAlign) << "psABI: _Alignof(_BitInt(" << c.n << "))";
+        auto const aa = layoutOf(ti.bitInt(c.n, c.sgned), ti, kAapcs16);
+        EXPECT_EQ(aa.size, c.aaSize) << "AAPCS64: sizeof(_BitInt(" << c.n << "))";
+        EXPECT_EQ(aa.align.bytes(), c.aaAlign) << "AAPCS64: _Alignof(_BitInt(" << c.n << "))";
     }
 }
 
-// `sizeOfScalarOrBitInt` — the TypeId-aware shim (aggregate-ABI / data-global leaf
-// sizing): a BitInt gets its container size; every other scalar defers to
-// `scalarByteSize`.
-TEST(TypeLayout, SizeOfScalarOrBitIntShim) {
+// ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+// a target that declares no chunk lays out NO wide `_BitInt` — not the scalar, nor a
+// struct, an array or a union holding one — and a narrow one asks no chunk. Before, a
+// second, TypeId-aware size ladder pinned here answered the psABI's 8 for every target;
+// it is deleted, and its readers ask `computeLayout`.
+TEST(TypeLayout, AWideBitIntHasNoLayoutWhereTheTargetDeclaresNoChunk) {
     auto ti = makeInterner(71);
-    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.bitInt(4, false),  DataModel::Lp64), 1u);
-    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.bitInt(40, false), DataModel::Lp64), 8u);
-    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.bitInt(128, true), DataModel::Lp64), 16u);
-    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.primitive(TypeKind::I32), DataModel::Lp64), 4u);
+    for (std::int64_t const n : {65, 128, 129, 256}) {
+        TypeId const b = ti.bitInt(n, false);
+        std::string const sn = "S" + std::to_string(n);
+        std::string const un = "U" + std::to_string(n);
+        std::array<TypeId, 1> const one{b};
+        std::array<TypeId, 2> const two{ti.primitive(TypeKind::Char), b};
+        for (TypeId const t : {b, ti.structType(sn, one), ti.array(b, 2), ti.unionType(un, two)}) {
+            EXPECT_FALSE(computeLayout(t, ti, kNatural16, DataModel::Lp64).has_value())
+                << "a _BitInt(" << n << ") laid out under no declared chunk";
+            EXPECT_TRUE(computeLayout(t, ti, kPsAbi16, DataModel::Lp64).has_value())
+                << "the control: the same type under a declared chunk";
+        }
+    }
+    EXPECT_TRUE(computeLayout(ti.bitInt(64, true), ti, kNatural16, DataModel::Lp64).has_value())
+        << "a narrow _BitInt asks no chunk";
+}
+
+// ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+// the layout every SHIPPED pair (target × format) gives the row's universe — N ∈ {65,
+// 128, 129, 256} × {the scalar, a struct member after a `char`, an array of three, a
+// union with a `char`} — read off the target's own document, against the table its
+// references lay out. A pair with no row in the table fails: a new pair states its
+// references first. ✔MEASURED (probe f26bi, 2026-11-14, -O1 -std=c2x, each reference's layout read from its assembly): x86-64 clang 18.1.3 (linux-gnu), Apple clang 21 (x86_64-apple-macos11) and clang for x86_64-pc-windows-msvc and x86_64-w64-windows-gnu lay _BitInt(65) and (128) out 16/8, (129) 24/8, (256) 32/8; arm64 Apple clang 21 (65) and (128) 16/16 (clang 18.1.3 aarch64-linux-gnu 16/8, older than AAPCS64's bit-precise rules); no arm64 reference has a _BitInt past 128 bits, and gcc 13 has none.
+TEST(TypeLayout, EveryShippedPairLaysAWideBitIntOutAsItsReferencesDo) {
+    struct Cell {
+        std::int64_t n;
+        std::uint64_t size; std::uint32_t align;          // the scalar
+        std::uint64_t memberOffset, memberSize;           // struct { char c; _BitInt(N) v; }
+        std::uint64_t array3;                             // _BitInt(N)[3]
+        std::uint64_t unionSize; std::uint32_t unionAlign; // union { char c; _BitInt(N) v; }
+    };
+    // The x86-64 psABI (chunk 8) and AAPCS64 (chunk 16), each cell as the references lay it out.
+    std::array<Cell, 4> const psAbi{{{65, 16, 8, 8, 24, 48, 16, 8},
+                                     {128, 16, 8, 8, 24, 48, 16, 8},
+                                     {129, 24, 8, 8, 32, 72, 24, 8},
+                                     {256, 32, 8, 8, 40, 96, 32, 8}}};
+    std::array<Cell, 4> const aapcs64{{{65, 16, 16, 16, 32, 48, 16, 16},
+                                       {128, 16, 16, 16, 32, 48, 16, 16},
+                                       {129, 32, 16, 16, 48, 96, 32, 16},
+                                       {256, 32, 16, 16, 48, 96, 32, 16}}};
+    struct Row { std::string_view arch; ObjectFormatKind kind; std::array<Cell, 4> const* table; };
+    std::array<Row, 5> const references{{{"x86_64", ObjectFormatKind::Elf, &psAbi},
+                                         {"x86_64", ObjectFormatKind::MachO, &psAbi},
+                                         {"x86_64", ObjectFormatKind::Pe, &psAbi},
+                                         {"arm64", ObjectFormatKind::Elf, &aapcs64},
+                                         {"arm64", ObjectFormatKind::MachO, &aapcs64}}};
+
+    auto const& pairs = test_support::shippedReadPairs();
+    ASSERT_GE(pairs.size(), 5u) << "the shipped pairs collapsed: a sweep over too few passes in silence";
+    for (auto const& p : pairs) {
+        auto const* row = [&]() -> Row const* {
+            for (Row const& r : references)
+                if (r.arch == p.arch && r.kind == p.kind) return &r;
+            return nullptr;
+        }();
+        ASSERT_NE(row, nullptr) << p.label() << ": a shipped pair with no references' row — measure it first";
+        auto const target = TargetSchema::loadShipped(p.arch);
+        ASSERT_TRUE(target.has_value()) << p.label();
+        ASSERT_TRUE((*target)->aggregateLayoutLoaded()) << p.label();
+        AggregateLayoutParams const lp = (*target)->aggregateLayout();
+        TypeInterner ti = makeInterner(76);
+        for (Cell const& c : *row->table) {
+            TypeId const b = ti.bitInt(c.n, true);
+            std::string const at = p.label() + " _BitInt(" + std::to_string(c.n) + ")";
+            auto const s = layoutOf(b, ti, lp, p.dataModel());
+            EXPECT_EQ(s.size, c.size) << at << ": sizeof";
+            EXPECT_EQ(s.align.bytes(), c.align) << at << ": _Alignof";
+            std::array<TypeId, 2> const cv{ti.primitive(TypeKind::Char), b};
+            std::string const sn = "M" + std::to_string(c.n);
+            auto const m = layoutOf(ti.structType(sn, cv), ti, lp, p.dataModel());
+            ASSERT_EQ(m.fieldOffsets.size(), 2u) << at;
+            EXPECT_EQ(m.fieldOffsets[1], c.memberOffset) << at << ": offsetof(struct, v)";
+            EXPECT_EQ(m.size, c.memberSize) << at << ": sizeof(struct)";
+            EXPECT_EQ(layoutOf(ti.array(b, 3), ti, lp, p.dataModel()).size, c.array3) << at << ": sizeof([3])";
+            std::string const un = "N" + std::to_string(c.n);
+            auto const u = layoutOf(ti.unionType(un, cv), ti, lp, p.dataModel());
+            EXPECT_EQ(u.size, c.unionSize) << at << ": sizeof(union)";
+            EXPECT_EQ(u.align.bytes(), c.unionAlign) << at << ": _Alignof(union)";
+        }
+    }
 }
 
 // D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE: the memory-resident / by-value-
@@ -2445,7 +2552,7 @@ TEST(TypeLayout, WideBitIntTypeShapePredicates) {
 // and a SIZE but NOT a LAYOUT, and the whole 128-bit design depends on those two facts
 // staying independent. `_BitInt(128)` is 16/8 — size 16, align EIGHT — because the
 // x86-64 psABI aligns a bit-precise type to its limb, not its size (computeLayout's
-// BitInt arm hardcodes alignBytes=8 for N>64, and examples/c/c23_bitint_wide
+// BitInt arm reads x86_64's `bitPreciseChunk`, 8, and examples/c/c23_bitint_wide
 // pins it from real C). U128 is 16/16 — the ordinary natural-alignment rule applied to
 // a 16-byte scalar via scalarByteSize. MEASURED against the shipped consumer: the pe/
 // x86_64 `jmp_buf` is `arr<u128,16>` (shippedLibs/setjmp.json), sizeof 256, _Alignof 16
@@ -2455,7 +2562,7 @@ TEST(TypeLayout, WideBitIntTypeShapePredicates) {
 TEST(TypeLayout, Int128AndBitInt128AreIndependentLayouts) {
     auto ti = makeInterner(74);
 
-    auto const lb = layoutOf(ti.bitInt(128, true), ti);
+    auto const lb = layoutOf(ti.bitInt(128, true), ti, kPsAbi16);
     EXPECT_EQ(lb.size, 16u);
     EXPECT_EQ(lb.align.bytes(), 8u) << "_Alignof(_BitInt(128)) must stay 8 (psABI)";
 
@@ -2471,6 +2578,13 @@ TEST(TypeLayout, Int128AndBitInt128AreIndependentLayouts) {
     // is the assertion, not just two coincidental constants.
     EXPECT_EQ(lb.size, lu.size);
     EXPECT_NE(lb.align.bytes(), lu.align.bytes());
+
+    // ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+    // the independence is the psABI's. Under AAPCS64 the two COINCIDE — `_BitInt(128)`
+    // maps to the quadword, `__int128`'s own layout, 16/16.
+    auto const la = layoutOf(ti.bitInt(128, true), ti, kAapcs16);
+    EXPECT_EQ(la.size, li.size) << "AAPCS64: sizeof(_BitInt(128)) == sizeof(__int128)";
+    EXPECT_EQ(la.align.bytes(), li.align.bytes()) << "AAPCS64: _Alignof(_BitInt(128)) == _Alignof(__int128)";
 
     // The shipped consumer: `arr<u128,16>` is the pe/x86_64 jmp_buf — 256 bytes,
     // 16-aligned. Element alignment propagates to the array (setjmp_longjmp depends
@@ -2511,7 +2625,7 @@ TEST(TypeLayout, Int128AggregateLayoutVsBitInt128) {
 
     std::array<TypeId, 3> const bFields{
         ti.array(ti.bitInt(128, false), 32), u32Ty, u32Ty};
-    auto const lb = layoutOf(ti.structType("NBitInt128", bFields), ti);
+    auto const lb = layoutOf(ti.structType("NBitInt128", bFields), ti, kPsAbi16);
     EXPECT_EQ(lb.size, 520u)
         << "the _BitInt(128) twin: same 520 bytes of payload, but align 8 makes the "
            "tail round-up a NO-OP — this is what makes the 528 above non-vacuous";

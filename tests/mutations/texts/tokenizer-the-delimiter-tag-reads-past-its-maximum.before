@@ -1,0 +1,1 @@
+        while (n < tag.maxLength && n < remaining.size()

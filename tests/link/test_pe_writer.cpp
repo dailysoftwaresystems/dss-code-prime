@@ -2960,6 +2960,41 @@ TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
     EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
 }
 
+// ★ AN EXTERN WHOSE ID COLLIDES WITH A FUNCTION'S IS NAMED BY ITS PLACE IN THE TABLE (P69 fold f26d, the
+// host-toolchain class: its site in this writer). The writer refuses the first collision it meets, by id. It met
+// them walking the hash map of the thunks, so with several the one it named was the standard library's first. THE
+// CELL: twenty-four function externs, listed against their ids (24 down to 1), each colliding with the function
+// of its id; the refusal names the FIRST of the table, #24.
+TEST(PeExecWriter, AnExternIdCollisionIsReportedForTheFirstExternOfTheTable) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+    constexpr std::uint32_t kN = 24;
+    AssembledModule mod;
+    for (std::uint32_t k = 1; k <= kN; ++k) {
+        AssembledFunction fn;
+        fn.symbol = SymbolId{k};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+    }
+    mod.expectedFuncCount = kN;
+    for (std::uint32_t k = kN; k >= 1; --k) {
+        mod.externImports.push_back(ExternImport{SymbolId{k}, "f_" + std::to_string(k), "msvcrt.dll"});
+    }
+    DiagnosticReporter rep;
+    auto const img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(img.empty());
+    std::vector<std::string> collisions;
+    std::string              said;
+    for (auto const& d : rep.all()) {
+        said += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+        if (d.actual.find("collides with another symbol") != std::string::npos) collisions.push_back(d.actual);
+    }
+    ASSERT_EQ(collisions.size(), 1u) << said;
+    EXPECT_NE(collisions.front().find("extern SymbolId #24 "), std::string::npos)
+        << "the first extern of the table, not the hash map's first: " << collisions.front();
+}
+
 TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
     // c149 walker-side binding assertion (the SAME assertion elf.cpp and
     // macho.cpp carry): the PE exec walker implements exactly

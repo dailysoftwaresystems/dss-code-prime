@@ -297,3 +297,56 @@ TEST(EmptyDeclaration, TheSeverityIsTheLanguagesAndTheKeyIsABoolean) {
             named = true;
     EXPECT_TRUE(named) << "refused for its reason";
 }
+
+// ── AN ATTRIBUTE ON AN EMPTY DECLARATION IS SAID OF NOTHING (P69 fold f26d, lane `cs`) ──────
+// The declaration declares no entity, so an attribute written on it is said of nothing: the one
+// warning is the empty declaration's, and no attribute, conflict or linkage is judged.
+// ✔MEASURED 2026-11-17 (lane `cs` probes tn5 and tn5b; gcc 13.3.0 and clang 18.1.3, each cell an
+// object at -Wall): every cell below is accepted with the one empty-declaration warning and no word
+// on the attribute — at block scope, at file scope and as a for-init, the attribute before or AFTER
+// the typedef name, and `static` beside `weak` (no conflict: nothing has linkage). `[[gnu::weak]] T;`
+// by gcc alone (clang: "an attribute list cannot appear here"). DSS refused the six forms with the
+// attribute after the typedef name at block scope (an initializer-inferred variable named T, or a
+// parse error at the `;`) and the four file-scope forms with `static` beside `weak` ('weak'
+// conflicting with 'local', H_UnknownLinkageSpecifier).
+// RED-ON-DISABLE: the bare form's trailing attribute run gone → its cells meet a parse error; the
+// prefix's linkage folded before the empty declaration is asked → the `static`-beside-`weak`
+// file-scope cells are refused.
+TEST(EmptyDeclaration, AnAttributeOnAnEmptyDeclarationIsSaidOfNothing) {
+    struct Cell {
+        std::string what, src, lead, decl;
+    };
+    std::vector<Cell> cells;
+    for (char const* stmt : {"__attribute__((weak)) T;", "const __attribute__((weak)) T;",
+                             "static T __attribute__((weak));", "const T __attribute__((weak));",
+                             "T __attribute__((weak));", "T const __attribute__((weak));",
+                             "[[gnu::weak]] T;", "__attribute__((unused)) T;",
+                             "static int __attribute__((weak));", "static __attribute__((weak)) int;",
+                             "__attribute__((weak)) int;"}) {
+        cells.push_back({std::string{"block: "} + stmt, atBlockScope(stmt), "  ", stmt});
+    }
+    for (char const* init : {"__attribute__((weak)) T", "const T __attribute__((weak))",
+                             "T __attribute__((weak))", "const __attribute__((weak)) T"}) {
+        cells.push_back({std::string{"for-init: "} + init,
+                         atBlockScope(std::string{"for ("} + init + "; 0; ) { }"), "",
+                         std::string{init} + "; 0"});
+    }
+    for (char const* decl : {"T __attribute__((weak));", "static T __attribute__((weak));",
+                             "__attribute__((weak)) T;", "static __attribute__((weak)) T;",
+                             "static int __attribute__((weak));", "__attribute__((weak)) static int;",
+                             "extern T __attribute__((weak));", "T const __attribute__((weak));",
+                             "__attribute__((weak)) int;"}) {
+        cells.push_back({std::string{"file: "} + decl, atFileScope(decl), "\n", decl});
+    }
+    for (Cell const& c : cells) {
+        expectWarnsOnce(c.what.c_str(), c.src, c.lead, c.decl);
+        auto const l = lowerC(c.src);
+        for (DiagnosticCode const code :
+             {DiagnosticCode::S_AttributeIgnoredForDeclarationKind, DiagnosticCode::S_AttributeNotHonoured,
+              DiagnosticCode::S_UnknownAttribute, DiagnosticCode::H_UnknownLinkageSpecifier}) {
+            EXPECT_EQ(countCode(l->model.diagnostics(), code) + countCode(l->reporter, code), 0u)
+                << c.what << ": the attribute is said of nothing, yet " << diagnosticCodeName(code)
+                << dump(l->model.diagnostics()) << dump(l->reporter);
+        }
+    }
+}

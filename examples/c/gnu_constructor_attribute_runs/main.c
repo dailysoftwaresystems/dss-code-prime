@@ -10,14 +10,17 @@
 // `constructor` is vocabulary the references IMPLEMENT, so acceptance was never
 // agreement.
 //
-// ★★ THE EXIT CODE IS BUILT COMMUTATIVELY ON PURPOSE, AND CHANGING THAT WOULD
-// PIN A FACT NO REFERENCE AGREES ON. ⚠⚠ ORDER AMONG EQUAL-PRIORITY
-// CONSTRUCTORS IS NOT PORTABLE — ✔MEASURED 2026-08-28: two bare same-priority
-// constructors run 1,2 under Linux gcc 13.3.0 and clang 18.1.3 and **2,1** under
-// mingw-w64 gcc 13.2.0. `bump_a` and `bump_b` below therefore both `+= 10`, so
-// either order gives the same total. If you are tempted to "improve" this into a
-// sequence assertion, that is the trap: it would assert an order the references
-// themselves disagree about.
+// ★★ THE EXIT CODE IS BUILT COMMUTATIVELY ON PURPOSE: THIS EXAMPLE'S SUBJECT IS
+// THE PRIORITY AXIS, AND THE ORDER OF A TIE IS PINNED ELSEWHERE. The references
+// disagree on a tie — ✔MEASURED 2026-08-28: two bare same-priority constructors
+// run 1,2 under Linux gcc 13.3.0 and clang 18.1.3 and **2,1** under mingw-w64
+// gcc 13.2.0 — and DSS settles it by one rule for every format: the units' input
+// order, then each unit's definition order (`src/link/static_init_tables.hpp`
+// states the decision, its measurement and what it refuses; the RUN of it is
+// `examples/c/constructor_ties_run_in_input_then_definition_order` and its
+// siblings). `bump_a` and `bump_b` below therefore both `+= 10`, so this
+// example's total is the same under either order and it pins nothing of the
+// tie's.
 //
 // ★★ WHAT *IS* PORTABLE, AND IS ASSERTED: DISTINCT PRIORITIES ORDER, AND THE BARE
 // FORM RUNS LAST. ✔MEASURED, unanimous across gcc 13.3.0 (`-std=c2x`), clang

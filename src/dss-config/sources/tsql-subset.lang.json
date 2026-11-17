@@ -312,6 +312,8 @@
   "semantics": {
     "identifierToken": "Identifier",
     "bracketIdentifierToken": "BracketIdStart",
+    "$typeSpellingComment": "P69 fold f26d (lane `cs`, ruling 621): the T-SQL subset's rows reach two core kinds, spelled by the names its rows give them; no declarator forms.",
+    "typeSpelling": { "kinds": { "Bool": "BIT", "I32": "INT" } },
     "declarations": [
       { "rule": "createTableStmt", "name": 2, "kind": "table",
         "nameMatch": "lastIdentifier" },

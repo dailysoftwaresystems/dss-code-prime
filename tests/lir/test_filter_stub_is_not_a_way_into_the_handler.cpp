@@ -36,6 +36,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -74,6 +75,7 @@ struct Lowered {
     TypeId const pI32 = interner.pointer(i32);
     TypeId const params[] = {i32};
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();
     mb.addFunction(interner.fnSig(params, i32, CallConv::CcSysV), SymbolId{100});
     MirBlockId const entry   = mb.createBlock(StructCfMarker::EntryBlock);
@@ -116,7 +118,7 @@ struct Lowered {
     std::array<MirSehScope, 1> const scopes{scope};
     Lowered out;
     std::vector<ExternImport> noExterns;
-    out.result = lowerToLir(mir, target, interner, out.rep, noExterns,
+    out.result = lowerToLir(mir, target, interner, out.rep, dss::test::kFirstConventionOfTheTarget, noExterns,
                             ExternCallDispatch::DirectPlt, std::nullopt, std::nullopt,
                             scopes);
     return out;

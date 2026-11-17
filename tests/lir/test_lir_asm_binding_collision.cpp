@@ -48,6 +48,7 @@
 #include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -193,7 +194,7 @@ TEST(LirAsmBindingCollision, TwoOperandsAnsweringToOneSpellingAreRefused) {
     Mir const          bad = buildTwoOperandAsm(badInterner, /*dupSymbolic=*/true);
     DiagnosticReporter badReporter;
     MirToLirResult const badResult =
-        lowerToLir(bad, **target, badInterner, badReporter);
+        lowerToLir(bad, **target, badInterner, badReporter, dss::test::kFirstConventionOfTheTarget);
 
     EXPECT_FALSE(badResult.ok)
         << "publishing `%[v]` at two registers lets a first-match lookup keep "
@@ -216,7 +217,7 @@ TEST(LirAsmBindingCollision, TwoOperandsAnsweringToOneSpellingAreRefused) {
     Mir const          ok = buildTwoOperandAsm(okInterner, /*dupSymbolic=*/false);
     DiagnosticReporter okReporter;
     MirToLirResult const okResult =
-        lowerToLir(ok, **target, okInterner, okReporter);
+        lowerToLir(ok, **target, okInterner, okReporter, dss::test::kFirstConventionOfTheTarget);
     EXPECT_TRUE(okResult.ok)
         << "two DISTINCT symbolic names on the same statement are the ordinary "
            "case and must lower: " << inventory(okReporter);
@@ -238,7 +239,7 @@ TEST(LirAsmBindingCollision, TwoAsmGotoLabelsAnsweringToOneSpellingAreRefused) {
     Mir const          bad = buildTwoLabelAsmGoto(badInterner, true);
     DiagnosticReporter badReporter;
     MirToLirResult const badResult =
-        lowerToLir(bad, **target, badInterner, badReporter);
+        lowerToLir(bad, **target, badInterner, badReporter, dss::test::kFirstConventionOfTheTarget);
 
     EXPECT_FALSE(badResult.ok)
         << "two labels answering to `%l[hit]` leave `resolveBranchTarget` free "
@@ -253,7 +254,7 @@ TEST(LirAsmBindingCollision, TwoAsmGotoLabelsAnsweringToOneSpellingAreRefused) {
     Mir const          ok = buildTwoLabelAsmGoto(okInterner, false);
     DiagnosticReporter okReporter;
     MirToLirResult const okResult =
-        lowerToLir(ok, **target, okInterner, okReporter);
+        lowerToLir(ok, **target, okInterner, okReporter, dss::test::kFirstConventionOfTheTarget);
     EXPECT_TRUE(okResult.ok)
         << "two DISTINCT label names on one `asm goto` must lower: "
         << inventory(okReporter);

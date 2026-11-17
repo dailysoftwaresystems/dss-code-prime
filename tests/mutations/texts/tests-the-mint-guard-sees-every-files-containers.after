@@ -1,0 +1,2 @@
+        for (auto const& every : fileScoped) seen.insert(seen.end(), every.begin(), every.end());
+        auto const here = refusedIn(sources[i], seen, judged);

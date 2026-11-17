@@ -1,1 +1,1 @@
-            bool const alwaysStacked = throughEllipsis && config.variadicArgsAlwaysStack;
+        bool const alwaysStacked = throughEllipsis && config.variadicArgsAlwaysStack;

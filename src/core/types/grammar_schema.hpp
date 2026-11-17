@@ -532,7 +532,7 @@ struct DSS_EXPORT GrammarSchemaData {
 
     // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
     // InvalidStringStyle sentinel; real ids 1..N. Each StringStyle
-    // owns its `endsAt`/`tagPattern` strings; the vector may reallocate
+    // owns its `endsAt` string and tag; the vector may reallocate
     // (LexemeMeaning carries the id, not a pointer).
     std::vector<StringStyle>                          stringStyles;
 

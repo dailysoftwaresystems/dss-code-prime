@@ -23,6 +23,8 @@
 #include "hir/hir_op.hpp"
 #include "hir/hir_op_registry.hpp"
 #include "hir/hir_verifier.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
@@ -1070,7 +1072,16 @@ private:
     void noteSymbol(std::uint32_t sv) {
         if (!symHandle_.contains(sv)) {
             symOrder_.push_back(sv);
-            symHandle_.emplace(sv, static_cast<std::uint32_t>(symOrder_.size()));
+            // An INDEX door (P69 f26d, N9): the handle IS the rebuilt SymbolId.v, dense by the reader's
+            // contract, so the table ends at the first writer-reserved value (`symbolIdOfIndex`).
+            SymbolId const handle = symbolIdOfIndex(symOrder_.size());
+            if (!handle.valid()) {
+                std::fprintf(stderr, "dss::hir_text fatal: %zu symbols reach the first writer-reserved "
+                                     "SymbolId value -- a .dsshir table cannot number them\n",
+                             symOrder_.size());
+                std::abort();
+            }
+            symHandle_.emplace(sv, handle.v);
         }
     }
 
@@ -4325,6 +4336,14 @@ private:
             return;
         }
         std::size_t const n = entries.size();
+        // P69 (lane `cs`, fold f26d — N9): a handle is an index, so a table ends at the first
+        // writer-reserved SymbolId value (`symbolIdOfIndex`) -- refused by name, before it is sized.
+        if (n != 0 && !symbolIdOfIndex(n).valid()) {
+            malformed(std::format("a `.dsshir` symbol table of {} entries reaches the first "
+                                  "writer-reserved SymbolId value ({}) -- a table of handles ends there",
+                                  n, kFirstWriterReservedSymbolIdValue));
+            return;
+        }
         symbolNames_.assign(n + 1, std::string{});
         std::vector<bool> declared(n + 1, false);
         for (auto& [handle, name] : entries) {
