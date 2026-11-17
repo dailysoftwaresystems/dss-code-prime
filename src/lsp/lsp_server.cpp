@@ -677,25 +677,27 @@ LspServer::ParsePlan LspServer::planParse_(std::string const&      uri,
     };
 
     if (!workspaceBuild_.has_value()) {
-        auto const& err = workspaceBuild_.error();
+        auto const& refused = workspaceBuild_.error();
         // "There is no build" — no workspace folder, no manifest — is not a
         // refusal: there is nothing to agree with, and the document is analyzed
         // under its language alone, exactly as before.
-        if (err.kind != WorkspaceProjectErrorKind::NoWorkspaceRoot
-            && err.kind != WorkspaceProjectErrorKind::ProjectFileNotFound) {
-            // A manifest the BUILD refuses is published on the document under
-            // the build's own code, so the editor says why it cannot answer with
-            // the build's configuration instead of silently answering without it.
+        if (!refused.namesNoBuild()) {
+            // Every refusal of the workspace the BUILD refuses is published on
+            // the document, ONE diagnostic each, under the build's own code and
+            // in the list's order (P69 H6c2), so the editor says every reason it
+            // cannot answer with the build's configuration.
             DocumentAnalysis refusal;
-            dss::ParseDiagnostic d;
-            d.code     = err.code;
-            d.severity = dss::DiagnosticSeverity::Error;
-            d.actual   = "the workspace's build configuration could not be read ["
-                         + std::string{workspaceProjectErrorName(err.kind)}
-                         + "]: " + err.detail
-                         + " — this document is analyzed under its language "
-                           "alone until the manifest loads";
-            refusal.diagnostics.push_back(std::move(d));
+            for (auto const& err : refused.refusals) {
+                dss::ParseDiagnostic d;
+                d.code     = err.code;
+                d.severity = dss::DiagnosticSeverity::Error;
+                d.actual   = "the workspace's build configuration could not be read ["
+                             + std::string{workspaceProjectErrorName(err.kind)}
+                             + "]: " + err.detail
+                             + " — this document is analyzed under its language "
+                               "alone until the manifest loads";
+                refusal.diagnostics.push_back(std::move(d));
+            }
             plan.refusals.push_back(std::move(refusal));
         }
         languageOnly();

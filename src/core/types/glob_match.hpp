@@ -11,6 +11,7 @@
 // cheapest strong test surface; the filesystem walk (`expandGlob`) layers on top.
 
 #include "core/export.hpp"
+#include "core/substrate/path_identity.hpp"   // reasonText: the ONE rendering of an OS reason
 
 #include <filesystem>
 #include <string>
@@ -73,7 +74,8 @@ struct GlobError {
     std::error_code       code;    // the reason; clear when the expansion did not fail
     std::filesystem::path where;   // the directory it could not list, or the entry it could not examine
     [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(code); }
-    [[nodiscard]] std::string message() const { return code.message(); }
+    // The reason rendered by the home's ONE rendering (`core::reasonText`: the code AND the system's text).
+    [[nodiscard]] std::string message() const { return ::dss::core::reasonText(code); }
 };
 
 // Returns false and sets `error` ONLY on a genuine filesystem I/O error -- a

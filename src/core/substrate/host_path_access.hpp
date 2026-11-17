@@ -23,6 +23,13 @@ struct HostPathAccess {
 
     // The text as it was given or made, for a call that must hand a caller-visible spelling on (a diagnostic's).
     [[nodiscard]] static std::filesystem::path const& text(HostPath const& value) { return value.text_; }
+    // Whether the value is a GIVEN narrow text that was no UTF-8 (T4): it names nothing, so every operation refuses it
+    // (`PathRefusal::IllFormedSpelling`), and its references are EMPTY.
+    [[nodiscard]] static bool illFormed(HostPath const& value) noexcept { return value.illFormed_; }
+    // A value made from `value` by a text operation (a composition, a level): ill-formed when `value` is.
+    static void inheritIllFormed(HostPath& made, HostPath const& value) noexcept {
+        made.illFormed_ = made.illFormed_ || value.illFormed_;
+    }
 
     // A LISTED value: the entry `name` of the directory whose container reference is `parentReference` and whose
     // text is `parentText`.

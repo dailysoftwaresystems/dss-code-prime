@@ -1,0 +1,4 @@
+    std::expected<std::ifstream, std::error_code> opened{std::in_place};
+    clearRuntimeReason();
+    opened->open(fs::path{reference}, mode);
+    if (!opened->is_open()) return std::unexpected(runtimeReason());   // read AT the failing open

@@ -203,18 +203,18 @@ private:
     bool                               initializeReceived_ = false;
     std::vector<std::filesystem::path> workspaceRoots_;
     WorkspacePreferenceResult          workspacePreference_ =
-        std::unexpected(WorkspaceProjectError{
+        std::unexpected(WorkspaceProjectRefusals{{WorkspaceProjectError{
             WorkspaceProjectErrorKind::NoWorkspaceRoot,
             "the client has not sent `initialize` yet, so no workspace folder "
-            "is known"});
+            "is known"}}});
     // The workspace's build configurations (see `ParsePlan`), re-derived with
     // the preference and under the same rules: written and read on the `run()`
     // thread only, and "no workspace yet" until `initialize` says otherwise.
     WorkspaceBuildResult               workspaceBuild_ =
-        std::unexpected(WorkspaceProjectError{
+        std::unexpected(WorkspaceProjectRefusals{{WorkspaceProjectError{
             WorkspaceProjectErrorKind::NoWorkspaceRoot,
             "the client has not sent `initialize` yet, so no workspace folder "
-            "is known"});
+            "is known"}}});
 
     // `shutdownReceived_` flips on `shutdown` — observed by `run()`
     // to distinguish a clean (exit-code 0) EOF from a premature one

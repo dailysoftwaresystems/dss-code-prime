@@ -3495,14 +3495,14 @@ def pin_dc29(t, x):
          on["onPin"] is True and "the pinned revision" in on_md and "NOT the pinned" not in on_md, (on, on_md[:400]))
     # (MS16, "a blocked shared clone exits 5", retired 2026-09-26 with the clone: the benchmark no longer reads or
     # writes the shared corpus clone, and its own checkout is covered by the output tree's run lock -- MS13.)
-    # ★ THE POSIX HALF ENTERS THE WSL LEGS' OWN DISTRIBUTION (2026-09-30, the round-12 audit's S8): the recompile's
+    # ★ THE POSIX HALF ENTERS THE TREE'S DECLARED DISTRIBUTION (2026-09-30, the round-12 audit's S8): the recompile's
     # re-stage, the corpus's derive and the benchmark's hop all reach WSL through `PosixSide`, which used to enter
-    # `wsl.exe -e` -- the machine's DEFAULT distribution. The distribution the tree's WSL legs declare is read HERE
+    # `wsl.exe -e` -- the machine's DEFAULT distribution. The distribution the tree declares (hosts.wsl) is read HERE
     # from the SHIPPED config.json, independently of the code under test, and every door into the POSIX side --
     # a command, a path in, a path out -- must name it.
     ot = Cm.owning_tree_module()
     shipped = ot.load_jsonc(os.path.join(Cm.driver_tree(), ".harness-config", "config.json"))
-    declared = sorted(set(d["wsl"] for d in shipped["legs"].values() if isinstance(d, dict) and d.get("wsl")))
+    declared = sorted(str(k) for k in ((shipped.get("hosts") or {}).get("wsl") or {}))
     asked = []
     real_capture = Cm.capture
 
@@ -3519,27 +3519,30 @@ def pin_dc29(t, x):
     side.to_posix("C:\\x")
     side.to_host("/mnt/c/x")
     t.ck("MS18", "every door into the POSIX side on a Windows host -- a command, a path in (wslpath -a -u), a path out "
-         "(wslpath -m) -- enters `wsl.exe -d <the distribution the tree's WSL legs declare> -e`, read from the shipped "
-         "config.json (legs.<leg>.wsl), never the machine's default; a POSIX host enters nothing",
+         "(wslpath -m) -- enters `wsl.exe -d <the distribution the tree declares> -e`, read from the shipped "
+         "config.json (hosts.wsl), never the machine's default; a POSIX host enters nothing",
          len(declared) == 1 and got_argv == entry + ["python3", "x.py"]
          and asked == [entry + ["wslpath", "-a", "-u", "C:\\x"], entry + ["wslpath", "-m", "/mnt/c/x"]]
          and Cs.PosixSide("linux").argv(["python3", "x.py"]) == ["python3", "x.py"],
          (declared, got_argv, asked))
 
-    def tree_with(legs_text):
+    def tree_with(wsl_text, legs_text=""):
         root = x.sub("dc29-wsl-tree")
         write_bytes(os.path.join(root, ".harness-config", "config.json"),
-                    "{\n  // a JSONC configuration, as DssHarness reads one\n  \"legs\": {%s}\n}\n" % legs_text)
+                    "{\n  // a JSONC configuration, as DssHarness reads one\n  \"legs\": {%s},\n"
+                    "  \"hosts\": {\"local\": {}%s}\n}\n"
+                    % (legs_text, (", \"wsl\": {%s}" % wsl_text) if wsl_text else ""))
         return root
-    one = tree_with('"a": {"os": "linux", "wsl": "Distro-A"}, "b": {"os": "linux", "wsl": "Distro-A"}, '
-                    '"c": {"os": "windows"}')
-    two = tree_with('"a": {"os": "linux", "wsl": "Distro-A"}, "b": {"os": "linux", "wsl": "Distro-B"}')
-    none = tree_with('"c": {"os": "windows"}')
+    # `one` is checkpoint 47's shape: hosts.wsl declares the distribution and no leg names it.
+    one = tree_with('"Distro-A": {"repositoryPath": "~/a"}', '"a": {"os": "linux", "ssh": "box"}, "c": {"os": "windows"}')
+    two = tree_with('"Distro-A": {"repositoryPath": "~/a"}, "Distro-B": {"repositoryPath": "~/b"}')
+    none = tree_with('', '"a": {"os": "linux", "wsl": "Distro-A"}')
     r_one, got_one = refused(Cm.wsl_distribution, one)
     r_two, why_two = refused(Cm.wsl_distribution, two)
     r_none, why_none = refused(Cm.wsl_distribution, none)
-    t.ck("MS19", "the distribution is the ONE the WSL legs declare (control: two legs naming the same one); legs naming "
-         "TWO are refused naming both, and a configuration naming NONE is refused -- never a guess, never the default",
+    t.ck("MS19", "the distribution is the ONE the tree declares under hosts.wsl, whether or not a leg names it (control: no "
+         "leg naming it, checkpoint 47's shape); a configuration declaring TWO is refused naming both, and one "
+         "declaring NONE is refused, whatever a leg names -- never a guess, never the default",
          not r_one and got_one == "Distro-A" and r_two and "Distro-A" in why_two and "Distro-B" in why_two
          and r_none and "no WSL distribution" in why_none, (got_one, why_two, why_none))
     # ★ AND THE LEGS' OWN ARGVS (the same audit item, its resolver half): every argv the resolver hands a Windows
@@ -4666,7 +4669,7 @@ REDS = (
         "        return S.consumer_checkout(run.host, run.out_dir, env)\n",
         new="        return (env or {}).get(\"HOME\", os.path.expanduser(\"~\")) + \"/src/sqlite\"\n",
         expect=("K01", "K02"), stay_green=("K04",)),
-    # ── the WSL legs' own distribution (2026-09-30, the round-12 audit's S8)
+    # ── the tree's declared WSL distribution (2026-09-30, the round-12 audit's S8)
     red("RD-98", "DC-29", "sqlite_common", "new (P69 hm, S8, 2026-09-30)",
         "enter the machine's DEFAULT WSL distribution again (`wsl.exe -e`)",
         "        return [\"wsl.exe\", \"-d\", self.distribution, \"-e\"] if self.needs_wsl else []\n",
@@ -4829,7 +4832,7 @@ MUTATOR_ARMS = (
 # then, P68 round 13, RD-75 retired with the benchmark's clone lock and four added, RD-81..RD-84; then, the PR
 # exit's X1, DC-31 and its six arms RD-85..RD-90, and RD-91 on DC-27; then its lane ci59b, RD-92 on DC-13; then
 # P69 lane hm, RD-93..RD-96 on DC-27 (the recompile's subject: the stage's own sha, the pin beside it, an in-place
-# stage's tracked files), DC-32 and RD-97 (one checkout per consumer), RD-98 on DC-29 (the WSL legs' own
+# stage's tracked files), DC-32 and RD-97 (one checkout per consumer), RD-98 on DC-29 (the tree's declared
 # distribution), RD-99..RD-102 on DC-30 (step mode: ambient variables refused, strict, the step's exact flags, the
 # stage's git without a caller's GIT_DIR), RD-103 on DC-24 (Step 0's skip ceiling), RD-104 on DC-29 (the resolver
 # enters the same distribution into the legs' own argvs), RD-105 on DC-24 (Step 0's skip allowance keyed by

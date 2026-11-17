@@ -1,0 +1,3 @@
+        manifests.size(),
+        refused.naming(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                       [&](std::size_t i) { return "project file `" + manifests[i].string() + "`"; },

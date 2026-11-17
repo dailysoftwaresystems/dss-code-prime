@@ -388,7 +388,7 @@ constexpr IncludeNameCell kIncludeNameCells[] = {
 
 // Which object a found header is: the MARK it holds, read through the home, as the preprocessor reads a header.
 [[nodiscard]] std::string markOf(fs::path const& found) {
-    std::ifstream in = dss::core::openInputStream(dss::core::HostPath{found}, std::ios::binary);
+    std::ifstream in = dss::core::openInputStream(dss::core::HostPath{found}, std::ios::binary).value_or(std::ifstream{});
     std::string   line;
     std::getline(in, line);
     return line == "LIT_MARK" ? "LIT" : line == "TWIN_MARK" ? "TWIN" : "(unreadable: `" + line + "`)";

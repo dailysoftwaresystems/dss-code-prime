@@ -1,0 +1,1 @@
+    if (fd < 0) return std::unexpected(std::error_code{errno, std::generic_category()});   // read AT the failing call

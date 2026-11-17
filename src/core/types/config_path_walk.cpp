@@ -95,12 +95,21 @@ std::optional<fs::path> runningExecutablePath() {
 // repo-shaped config tree's version is simply the version of the tree that
 // contains it.
 //
-// nullopt => the tree declares no version (unreadable/absent `VERSION`). That is
-// NOT a mismatch and is not treated as one: the guard makes a positive claim
-// only when it has BOTH facts.
-std::optional<std::string> declaredTreeVersion(fs::path const& treeRoot) {
-    std::ifstream in = core::openInputStream(treeRoot / "VERSION", std::ios::binary);   // at any length (the home)
-    if (!in) return std::nullopt;
+// nullopt => the tree declares no version (an ABSENT or empty `VERSION`). That
+// is NOT a mismatch and is not treated as one: the guard makes a positive claim
+// only when it has BOTH facts. An ERROR => a `VERSION` that is there and could
+// not be opened, its OS reason named (H6c2 (d)): the caller refuses, since a
+// version it could not read is not a version it may assume.
+std::expected<std::optional<std::string>, std::string> declaredTreeVersion(fs::path const& treeRoot) {
+    fs::path const file   = treeRoot / "VERSION";
+    auto           opened = core::openInputStream(file, std::ios::binary);   // at any length (the home)
+    if (!opened) {
+        std::error_code kindEc;
+        if (core::reachedKind(file, core::Use::Leaf, kindEc) == core::EntryKind::Absent && !kindEc)
+            return std::nullopt;   // absent: no version declared
+        return std::unexpected(core::reasonText(opened.error()));
+    }
+    std::ifstream& in = *opened;
     std::string text{std::istreambuf_iterator<char>(in),
                      std::istreambuf_iterator<char>()};
     auto const isSpace = [](char c) {
@@ -136,13 +145,18 @@ std::optional<std::string> declaredTreeVersion(fs::path const& treeRoot) {
 // Engaged => the human-readable explanation; nullopt => no disagreement.
 std::optional<std::string> repoTreeVersionSkew(fs::path const& treeRoot) {
     auto const declared = declaredTreeVersion(treeRoot);
-    if (!declared.has_value()) return std::nullopt;
+    if (!declared.has_value())
+        return "shipped-config version unreadable: the config tree at '"
+             + core::genericSpelling(repoShapedConfigRoot(treeRoot)) + "' declares its version in '"
+             + core::genericSpelling(treeRoot / "VERSION") + "', which could not be opened (" + declared.error()
+             + "). Refusing to compile against a config tree whose version cannot be checked.";
+    if (!declared->has_value()) return std::nullopt;
     std::string const mine{detail::kBuildVersionText};
-    if (*declared == mine) return std::nullopt;
+    if (**declared == mine) return std::nullopt;
     return "shipped-config version skew: this compiler is version " + mine
          + " but the config tree at '"
          + core::genericSpelling(repoShapedConfigRoot(treeRoot))
-         + "' belongs to version " + *declared
+         + "' belongs to version " + **declared
          + " (declared by '" + core::genericSpelling(treeRoot / "VERSION")
          + "'). Refusing to compile against a config tree from a different "
            "version — it would not fail, it would silently compile something "
@@ -653,7 +667,7 @@ shippedConfigDocuments(std::filesystem::path const& directory, std::string_view 
         return std::unexpected(std::format(
             "the config directory '{}' could not be listed whole ({}), so which "
             "'*{}' documents it holds cannot be told",
-            directory.generic_string(), walk.error.message(), suffix));
+            directory.generic_string(), core::reasonText(walk.error), suffix));
     }
     for (fs::path const& entry : listed) {
         std::string const leaf = entry.filename().generic_string();
@@ -677,7 +691,7 @@ shippedConfigDocuments(std::filesystem::path const& directory, std::string_view 
                 "the config document '{}' cannot be examined ({}): what it reaches is "
                 "unknown, so whether config directory '{}' holds a '*{}' document "
                 "there cannot be told, and the listing is refused",
-                entry.generic_string(), typeEc.message(), directory.generic_string(), suffix));
+                entry.generic_string(), core::reasonText(typeEc), directory.generic_string(), suffix));
         }
         if (reached != core::EntryKind::File) continue;
         out.push_back(ShippedConfigDocument{leaf.substr(0, leaf.size() - suffix.size()), entry});

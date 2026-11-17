@@ -1,0 +1,1 @@
+                 + pathForDiag(candidate) + "' for binary write: " + core::reasonText(refused ? std::error_code{static_cast<int>(::GetLastError()), std::system_category()} : refused)

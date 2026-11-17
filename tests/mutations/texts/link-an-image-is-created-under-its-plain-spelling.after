@@ -1,3 +1,5 @@
     HANDLE const h = ::CreateFileW(std::filesystem::path{p.spelling().display()}.c_str(), GENERIC_WRITE,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return std::unexpected(std::error_code{static_cast<int>(::GetLastError()), std::system_category()});

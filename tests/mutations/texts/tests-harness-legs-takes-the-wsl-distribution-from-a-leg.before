@@ -1,0 +1,1 @@
+    wsl = hosts.get("wsl") if isinstance(hosts, dict) else None

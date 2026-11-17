@@ -9,6 +9,7 @@
 #include "link/format/section_relative_target.hpp"
 #include "link/format/unwind_pointer_reloc.hpp"
 #include "link/format/win64_unwind_decode.hpp"   // (7.5) the unwind carry
+#include "link/standing_fallback.hpp"   // standingFallback -- which of a name's fallbacks stands (P69 H6c2)
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -986,6 +987,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             for (auto const& name : requests->included) {
                 if (includedSeen.insert(name).second) includedByDirective.push_back(name);
             }
+            // ★ Of two directives of THIS object for one name, the first in the
+            // section's order stands (P69 H6c2, ✔MEASURED u8: link.exe takes it,
+            // silently) -- one statement each, at one place, so the one met first
+            // stands, and the other is warned about (`standingFallback`).
             for (auto const& alt : requests->alternates) {
                 auto const prior = std::find_if(
                     alternatesByDirective.begin(), alternatesByDirective.end(),
@@ -993,11 +998,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 if (prior == alternatesByDirective.end()) {
                     alternatesByDirective.push_back(alt);
                 } else if (prior->fallback != alt.fallback) {
-                    return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                        "pe::readRelocatableObject: the object's linker directives give '"
-                        + alt.name + "' two fallbacks, '" + prior->fallback + "' and '"
-                        + alt.fallback + "' -- a name that nothing defines can resolve "
-                          "to only one of them.");
+                    linker::FallbackStatement standing{prior->fallback, linker::FallbackSource::Directive,
+                                                       std::nullopt, "this object's directive section"};
+                    linker::standingFallback(alt.name, standing,
+                                             {alt.fallback, linker::FallbackSource::Directive, std::nullopt,
+                                              "this object's directive section"},
+                                             reporter);
+                    prior->fallback = standing.fallback;
                 }
             }
             for (auto const& c : requests->commonAlignments) {
@@ -2185,20 +2192,27 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     for (auto const& alt : alternatesByDirective) {
         if (definesExternally(alt.name)) continue;
         if (auto const row = rowNamed(alt.name); row.has_value()) {
-            // A row that already states a fallback is a weak external whose
-            // default is another undefined symbol (the record arm above): a
-            // directive naming a DIFFERENT one gives the name two, which no
-            // order between them settles.
-            std::string& fallback = mod.externImports[*row].fallbackName;
-            if (!fallback.empty() && fallback != alt.fallback) {
-                return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                    "pe::readRelocatableObject: weak external '" + alt.name
-                    + "' defers to '" + fallback + "', and the object's linker "
-                      "directives give it the fallback '" + alt.fallback
-                    + "' -- two fallbacks, and a name that nothing defines can "
-                      "resolve to only one of them.");
+            ExternImport& named = mod.externImports[*row];
+            if (named.binding == SymbolBinding::Weak) {
+                // ★ A WEAK EXTERNAL'S OWN DEFAULT STANDS OVER THE DIRECTIVE (P69
+                // H6c2, ✔MEASURED u11: a MinGW gcc object whose own `.drectve`
+                // gives its weak `aa` the fallback `cc` -- link.exe and GNU ld take
+                // the weak's default, a defined one and the absolute 0 alike; GNU
+                // ld does not read the directive). The record arm above made this
+                // row; its default -- another undefined symbol, or none, the
+                // absolute 0 -- is kept, and the directive is dropped and warned
+                // about (`standingFallback`). Nothing refers to the dropped
+                // fallback, so it gets no row of its own.
+                linker::FallbackStatement standing{named.fallbackName, linker::FallbackSource::WeakDefault,
+                                                   std::nullopt, "its weak external record"};
+                linker::standingFallback(alt.name, standing,
+                                         {alt.fallback, linker::FallbackSource::Directive, std::nullopt,
+                                          "its linker directive"},
+                                         reporter);
+                named.fallbackName = standing.fallback;
+                continue;
             }
-            fallback = alt.fallback;
+            named.fallbackName = alt.fallback;
         } else {
             freshRow(alt.name).fallbackName = alt.fallback;
         }

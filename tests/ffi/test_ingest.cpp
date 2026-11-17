@@ -618,49 +618,10 @@ TEST(FfiIngest, EmptyExternDeclRefCanonicalNameRejectedLoud) {
     EXPECT_TRUE(sawEmpty);
 }
 
-// ── Post-fold #6 H2 + Gap 2: partial-failure surface ──────────
-
-TEST(FfiIngest, ReadCHeaderDirectoryPartialFailureReturnsSurface) {
-    // Pin H1: one bad header in a directory must NOT amputate the
-    // good headers' symbols from the aggregated surface.
-    ScratchDir scratch{Location::Temp, "ff5-partial"};
-    auto const tmpDir = scratch.path();
-    {
-        std::ofstream{tmpDir / "good.h"}
-            << "extern int puts(const char* s);\n";
-        std::ofstream{tmpDir / "bad.h"}
-            << "this is not valid C at all @@@\n";
-    }
-    DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", elfPair(), rep);
-    // Partial success: good.h's row reaches the surface; bad.h's
-    // failure is in the reporter; readCHeaderDirectory returns
-    // expected (not unexpected) because at least one file parsed.
-    ASSERT_TRUE(rows.has_value())
-        << "partial-success contract: at least one file parsed";
-    bool sawPuts = false;
-    for (auto const& r : *rows) {
-        if (r.mangledName == "puts") sawPuts = true;
-    }
-    EXPECT_TRUE(sawPuts);
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "bad.h's parse failure is recorded in the reporter";
-}
-
-TEST(FfiIngest, ReadCHeaderDirectoryAllFailuresPropagatesError) {
-    // Pin the other branch: when EVERY file fails, return unexpected
-    // with the first failure's HeaderReadError detail.
-    ScratchDir scratch{Location::Temp, "ff5-allfail"};
-    auto const tmpDir = scratch.path();
-    {
-        std::ofstream{tmpDir / "bad1.h"} << "garbage 1 @@@\n";
-        std::ofstream{tmpDir / "bad2.h"} << "garbage 2 @@@\n";
-    }
-    DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", elfPair(), rep);
-    ASSERT_FALSE(rows.has_value());
-    EXPECT_EQ(rows.error().kind, HeaderReadErrorKind::HeaderParseFailed);
-}
+// ── The header directory's every-header rule ────────────────────────────────
+// MOVED (P69 H6c2) to tests/program/test_every_unit.cpp, the several-unit home's runner:
+// EveryHeaderOfAHeaderDirectoryIsReadBeforeTheReadFails -- every header is read and reported, and the read FAILS
+// when any header failed (the old partial-success cell inverts there).
 
 // ── Post-fold #6 H7: ok() snapshot semantics pin ──────────────
 

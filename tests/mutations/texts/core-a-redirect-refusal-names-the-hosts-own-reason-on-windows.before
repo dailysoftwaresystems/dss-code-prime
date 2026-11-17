@@ -1,0 +1,1 @@
+            DWORD const createFailure = ::GetLastError();

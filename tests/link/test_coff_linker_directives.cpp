@@ -1321,15 +1321,77 @@ TEST(CoffLinkerDirectivesLink, AFallbackNothingDefinesIsRefusedAsTheFallback) {
     EXPECT_NE(diagnosticsOf(l->rep).find("'real_target'"), std::string::npos) << diagnosticsOf(l->rep);
 }
 
-TEST(CoffLinkerDirectivesLink, TwoFallbacksForOneNameAcrossUnitsAreRefused) {
-    AssembledModule other = callerUnit("my_alias", "second_target");
+// A second unit calling through the same name, with its own fallback for it.
+[[nodiscard]] AssembledModule secondCaller(std::string callee, std::string fallback) {
+    AssembledModule other = callerUnit(std::move(callee), std::move(fallback));
     other.cuId            = CompilationUnitId{3};
     other.userEntrySymbol.reset();
     other.symbols[0].name = "caller_two";
-    auto const l = linkElfExec({callerUnit("my_alias", "real_target"), other,
-                                definer(2, {{"real_target", kTargetBody}, {"second_target", kRivalBody}})});
-    EXPECT_FALSE(l->image.ok());
-    EXPECT_NE(diagnosticsOf(l->rep).find("two fallbacks"), std::string::npos) << diagnosticsOf(l->rep);
+    return other;
+}
+
+// ★ OF TWO FALLBACKS THE LINK GIVES ONE NAME, THE FIRST IN LINK ORDER STANDS (P69 H6c2; ✔MEASURED 2026-11-16, u7:
+// link.exe of cl 19.52 takes the first object's, silently, in both orders) -- by the PLACE each input holds in the
+// link, never by the order the modules come in: the span below holds the two units in one order and their places say
+// both. The dropped one is warned about.
+TEST(CoffLinkerDirectivesLink, TheFirstFallbackInLinkOrderStandsAcrossUnits) {
+    for (bool const firstPlacedFirst : {true, false}) {
+        SCOPED_TRACE(firstPlacedFirst ? "the span's first unit placed first" : "the span's first unit placed second");
+        AssembledModule first  = callerUnit("my_alias", "real_target");
+        AssembledModule second = secondCaller("my_alias", "second_target");
+        first.linkPosition     = firstPlacedFirst ? 0u : 2u;
+        second.linkPosition    = firstPlacedFirst ? 2u : 0u;
+        auto const l = linkElfExec(
+            {first, second, definer(2, {{"real_target", kTargetBody}, {"second_target", kRivalBody}})});
+        ASSERT_TRUE(l->image.ok()) << diagnosticsOf(l->rep);
+        auto const t = elfText(l->image.bytes);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(callLanding(l->image.bytes, *t),
+                  vaOfBody(l->image.bytes, *t, firstPlacedFirst ? kTargetBody : kRivalBody))
+            << "the call through `my_alias` does not land on the fallback of the unit placed first";
+        std::string const said = diagnosticsOf(l->rep);
+        EXPECT_NE(said.find(firstPlacedFirst ? "'second_target' is dropped" : "'real_target' is dropped"),
+                  std::string::npos)
+            << "the dropped fallback is not warned about: " << said;
+    }
+}
+
+// ★ A WEAK EXTERNAL'S OWN DEFAULT STANDS OVER ANOTHER UNIT'S DIRECTIVE, WHEREVER EITHER IS PLACED (P69 H6c2;
+// ✔MEASURED 2026-11-16, u9 F2: a MinGW gcc weak `aa` with a defined default beside a cl object's
+// `/alternatename:aa=cc`, link.exe and GNU ld, both orders, take the default).
+TEST(CoffLinkerDirectivesLink, AWeakExternalsDefaultStandsOverAnotherUnitsDirective) {
+    for (bool const weakPlacedFirst : {true, false}) {
+        SCOPED_TRACE(weakPlacedFirst ? "the weak external placed first" : "the directive placed first");
+        AssembledModule weak = callerUnit("my_alias", "real_target");
+        weak.externImports[0].binding = SymbolBinding::Weak;   // a weak external whose default is `real_target`
+        AssembledModule directive = secondCaller("my_alias", "second_target");
+        weak.linkPosition         = weakPlacedFirst ? 0u : 2u;
+        directive.linkPosition    = weakPlacedFirst ? 2u : 0u;
+        auto const l = linkElfExec(
+            {weak, directive, definer(2, {{"real_target", kTargetBody}, {"second_target", kRivalBody}})});
+        ASSERT_TRUE(l->image.ok()) << diagnosticsOf(l->rep);
+        auto const t = elfText(l->image.bytes);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ(callLanding(l->image.bytes, *t), vaOfBody(l->image.bytes, *t, kTargetBody))
+            << "the call through `my_alias` does not land on the weak external's default";
+        std::string const said = diagnosticsOf(l->rep);
+        EXPECT_NE(said.find("'second_target' is dropped"), std::string::npos) << said;
+        EXPECT_NE(said.find("a weak external's own default stands over every directive"), std::string::npos) << said;
+    }
+}
+
+// The absolute 0 is a weak external's default too (u9 F2, GNU ld, both orders: the weak reference reads as null): the
+// directive another unit states for the name is dropped, and the name keeps no fallback.
+TEST(CoffLinkerDirectivesLink, AWeakExternalOfTheAbsoluteZeroStandsOverAnotherUnitsDirective) {
+    AssembledModule weak = callerUnit("my_alias", "");
+    weak.externImports[0].binding = SymbolBinding::Weak;   // a weak external whose default is the absolute 0
+    weak.linkPosition             = 2u;
+    AssembledModule directive     = secondCaller("my_alias", "second_target");
+    directive.linkPosition        = 0u;
+    auto const l = linkElfExec({weak, directive, definer(2, {{"second_target", kRivalBody}})});
+    std::string const said = diagnosticsOf(l->rep);
+    EXPECT_NE(said.find("nothing (the absolute 0) stands"), std::string::npos) << said;
+    EXPECT_NE(said.find("'second_target' is dropped"), std::string::npos) << said;
 }
 
 TEST(CoffLinkerDirectivesLink, AFallbackCycleNothingDefinesIsRefused) {

@@ -239,10 +239,17 @@ MACHO_CPU_TYPES = {
 # argv this resolver hands out that enters WSL -- a leg's launcher, the path
 # translator, the run filesystem's mkdir/rm/copy, its requirement probes and its
 # kernel entry -- used to say `wsl.exe -e`, which enters the machine's DEFAULT
-# distribution: whatever a person last set with `wsl --set-default`. The WSL legs
-# of this tree's DssHarness configuration run in the ONE distribution they declare
-# (`.harness-config/config.json`, `legs.<leg>.wsl`), so a Windows-driven corpus
+# distribution: whatever a person last set with `wsl --set-default`. This tree's
+# DssHarness configuration declares the ONE distribution its WSL work runs in
+# (`.harness-config/config.json`, `hosts.wsl`), so a Windows-driven corpus
 # could build in one Linux and run its Linux legs in another.
+#
+# ★ (2026-11-17, P69: checkpoint 47's red) The fact is the HOST's declaration,
+# never a leg's reference to it. It was read from `legs.<leg>.wsl` until the
+# tree's linux-x86_64 DssHarness legs moved to a native Linux host: then no leg
+# named a distribution, every Windows plan was refused, and the resolver's
+# self-test, the leg lint and the corpus lints went red on every host, though
+# `hosts.wsl` still declared the one distribution the corpus enters.
 #
 # So the templates name the distribution with a PLACEHOLDER, and the fact is
 # ENTERED where an argv is materialized (`enter_host_facts`), read from the tree's
@@ -261,18 +268,19 @@ _WSL_DISTRIBUTION = []
 
 
 def wsl_distribution_of(config, where):
-    """The ONE WSL distribution a DssHarness configuration's legs declare
-    (`legs.<leg>.wsl`), or a LegError naming why there is not exactly one: none
-    declared (entering the default would be a guess), or two (which one a leg's
-    launcher should enter would be a guess). `where` names the file."""
-    legs = config.get("legs") if isinstance(config, dict) else None
-    named = sorted(set(str(d["wsl"]) for d in (legs.values() if isinstance(legs, dict) else ())
-                       if isinstance(d, dict) and d.get("wsl")))
+    """The ONE WSL distribution a DssHarness configuration declares (`hosts.wsl`,
+    whose keys name the distributions; a leg's `legs.<leg>.wsl` only refers to
+    one), or a LegError naming why there is not exactly one: none declared
+    (entering the default would be a guess), or two (which one a leg's launcher
+    should enter would be a guess). `where` names the file."""
+    hosts = config.get("hosts") if isinstance(config, dict) else None
+    wsl = hosts.get("wsl") if isinstance(hosts, dict) else None
+    named = sorted(str(k) for k in (wsl if isinstance(wsl, dict) else ()) if str(k))
     if len(named) != 1:
         raise LegError(
-            "the WSL legs of %s declare %s WSL distribution%s (legs.<leg>.wsl): an argv "
-            "that enters WSL enters the ONE distribution those legs run in, never the "
-            "machine's default" % (
+            "%s declares %s WSL distribution%s (hosts.wsl): an argv that enters WSL "
+            "enters the ONE distribution the tree declares, never the machine's "
+            "default" % (
                 where, "no" if not named else "%d different" % len(named),
                 "" if len(named) == 1 else "s" + ((" (%s)" % ", ".join(named)) if named else "")))
     return named[0]
@@ -285,8 +293,8 @@ def tree_wsl_distribution(tree=None):
     root = tree or _own_checkout()
     if not root:
         raise LegError(
-            "the WSL distribution an argv enters is the one this tree's WSL legs declare "
-            "(%s legs.<leg>.wsl), and this copy of the harness lives in no DSS tree"
+            "the WSL distribution an argv enters is the one this tree declares "
+            "(%s hosts.wsl), and this copy of the harness lives in no DSS tree"
             % "/".join(DSSHARNESS_CONFIG_REL))
     path = os.path.join(root, *DSSHARNESS_CONFIG_REL)
     ot = _owning_tree_module()
@@ -398,7 +406,7 @@ PATH_TRANSLATIONS = {
         # to own that path's spelling is the same string surgery the paragraph
         # above refuses. Do not re-add it: if a translation ever fails again,
         # the input the tool saw must be the input this driver had.
-        # `-d {wslDistribution}`: the distribution the WSL legs declare, entered
+        # `-d {wslDistribution}`: the distribution the tree declares, entered
         # where the argv is run (see A HOST FACT INSIDE AN ARGV TEMPLATE) -- the
         # drive mount a path translates to is that distribution's own.
         "translator": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e",
@@ -762,7 +770,7 @@ RUN_FILESYSTEMS = {
         # matters because the corpus writes multi-gigabyte databases.
         "root": "/tmp/dss-sqlite-harness",
         "workingDirArgv": ["--cd", "{dir}"],
-        # Every argv below enters the distribution the WSL legs declare
+        # Every argv below enters the distribution the tree declares
         # (`-d {wslDistribution}`, entered where it is materialized -- A HOST FACT
         # INSIDE AN ARGV TEMPLATE), never the machine's default one.
         "mkdirArgv": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e", "mkdir", "-p"],
@@ -815,7 +823,7 @@ RUN_FILESYSTEMS = {
         # `-e` is load-bearing here for the same reason it is in every other argv on
         # this entry: without it WSL rebuilds a command LINE and feeds it to the
         # distro's default shell. `-d` names WHICH kernel's userland: the one the
-        # WSL legs declare, never the machine's default.
+        # tree declares (hosts.wsl), never the machine's default.
         "kernelEntryArgv": ["wsl.exe", "-d", WSL_DISTRIBUTION_PLACEHOLDER, "-e"],
         # ⓘ THE DISTRO'S python3, NOT THIS DRIVER'S. Its ABSENCE is an ordinary,
         # expected answer on a minimal distro and it is handled as one: the
@@ -10116,7 +10124,7 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
             missing = [c for c in needed if not launcher_available(c, available)]
             if not missing:
                 # The launcher and its translator as they will be SPAWNED: the host
-                # facts their templates name (the WSL legs' distribution) entered
+                # facts their templates name (the tree's WSL distribution) entered
                 # here, where the leg is known to run through them.
                 command, translator = enter_host_facts(command), enter_host_facts(translator)
                 run["mode"] = "launched"
@@ -11544,7 +11552,7 @@ def lint(path=CATALOGUE):
                     # {wslDistribution} -e`. A launcher spelling its own entry
                     # (`wsl.exe -e`) ran its leg in the machine's DEFAULT
                     # distribution while every probe, copy and sweep of that leg
-                    # entered the one the WSL legs declare.
+                    # entered the one the tree declares.
                     _kentry = list(RUN_FILESYSTEMS[fverb]["kernelEntryArgv"])
                     _cmd = list(entry.get("command") or [])
                     if _kentry and _cmd[:len(_kentry)] != _kentry:
@@ -13545,32 +13553,38 @@ def _self_test(path=CATALOGUE, out=sys.stdout):
     import tempfile as _tf_hf
     _hf_dir = _tf_hf.mkdtemp(prefix="dss-legs-host-facts-")
     try:
-        def _hf_tree(name, legs_text):
+        def _hf_tree(name, wsl_text, legs_text=""):
+            # `wsl_text` is what `hosts.wsl` holds ('' writes no such section);
+            # None writes no configuration at all.
             _root = os.path.join(_hf_dir, name)
             os.makedirs(os.path.join(_root, *DSSHARNESS_CONFIG_REL[:-1]))
-            if legs_text is not None:
+            if wsl_text is not None:
                 with open(os.path.join(_root, *DSSHARNESS_CONFIG_REL), "w",
                           encoding="utf-8") as _fh:
                     _fh.write("{\n  // a JSONC configuration, as DssHarness reads one\n"
-                              "  \"legs\": {%s}\n}\n" % legs_text)
+                              "  \"legs\": {%s},\n  \"hosts\": {\"local\": {}%s}\n}\n"
+                              % (legs_text, (", \"wsl\": {%s}" % wsl_text) if wsl_text else ""))
             return _root
-        _hf_one = _hf_tree("one", '"a": {"os": "linux", "wsl": "Distro-A"}, '
-                                  '"b": {"os": "linux", "wsl": "Distro-A"}, '
-                                  '"c": {"os": "windows"}')
-        _hf_two = _hf_tree("two", '"a": {"os": "linux", "wsl": "Distro-A"}, '
-                                  '"b": {"os": "linux", "wsl": "Distro-B"}')
-        _hf_none = _hf_tree("none", '"c": {"os": "windows"}')
+        # `one` is checkpoint 47's shape: the distribution declared under hosts.wsl,
+        # and no leg naming it (the Linux legs run on an ssh host).
+        _hf_one = _hf_tree("one", '"Distro-A": {"repositoryPath": "~/a"}',
+                           '"a": {"os": "linux", "ssh": "box"}, "c": {"os": "windows"}')
+        _hf_two = _hf_tree("two", '"Distro-A": {"repositoryPath": "~/a"}, '
+                                  '"Distro-B": {"repositoryPath": "~/b"}')
+        # `none`: a leg still names a distribution, but hosts.wsl declares none.
+        _hf_none = _hf_tree("none", '', '"a": {"os": "linux", "wsl": "Distro-A"}')
         _hf_absent = _hf_tree("absent", None)
-        check("HOST FACTS: the WSL distribution is the ONE a configuration's WSL legs "
-              "declare (control: two legs naming the same one)",
+        check("HOST FACTS: the WSL distribution is the ONE the configuration declares "
+              "under hosts.wsl, whether or not a leg names it (control: no leg naming "
+              "it, checkpoint 47's shape)",
               tree_wsl_distribution(_hf_one) == "Distro-A")
         _hf_why_two = _raise_text(lambda: tree_wsl_distribution(_hf_two))
-        check("...legs naming TWO distributions are REFUSED, naming both -- never a "
-              "guess between them",
+        check("...a configuration declaring TWO distributions is REFUSED, naming both "
+              "-- never a guess between them",
               "Distro-A" in _hf_why_two and "Distro-B" in _hf_why_two, _hf_why_two)
         _hf_why_none = _raise_text(lambda: tree_wsl_distribution(_hf_none))
-        check("...a configuration naming NONE is REFUSED -- never the machine's "
-              "default", "no WSL distribution" in _hf_why_none, _hf_why_none)
+        check("...a configuration declaring NONE is REFUSED, whatever a leg names -- "
+              "never the machine's default", "no WSL distribution" in _hf_why_none, _hf_why_none)
         _hf_why_absent = _raise_text(lambda: tree_wsl_distribution(_hf_absent))
         check("...and a configuration that cannot be read is REFUSED, naming it",
               "cannot be read" in _hf_why_absent, _hf_why_absent)
@@ -18819,9 +18833,9 @@ def main(argv=None):
                         "'<verb>\\t<translator argv>', one per line")
     p.add_argument("--wsl-distribution", action="store_true",
                    help="print {\"wslDistribution\": NAME} (JSON): the ONE WSL "
-                        "distribution the WSL legs of the tree's DssHarness "
-                        "configuration declare (.harness-config/config.json "
-                        "legs.<leg>.wsl), the one every argv this resolver hands "
+                        "distribution the tree's DssHarness configuration "
+                        "declares (.harness-config/config.json "
+                        "hosts.wsl), the one every argv this resolver hands "
                         "out that enters WSL names. The driver's POSIX half reads "
                         "THIS instead of carrying its own reader; rc 2, naming "
                         "why, when there is not exactly one.")

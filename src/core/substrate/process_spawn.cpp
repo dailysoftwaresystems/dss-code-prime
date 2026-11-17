@@ -121,134 +121,17 @@ namespace {
 namespace fs = std::filesystem;
 
 // ── Host error text ────────────────────────────────────────────────────────
-// Both arms report the NUMERIC code as well as the message: the message is
-// localized (and, on Windows, may be absent for some codes), so the number is
-// what a bug report can be searched on.
+// The home's ONE rendering of the OS's reason (`core::reasonText`, P69 H6c2): the NUMERIC code first -- the message
+// is localized (and, on Windows, may be absent for some codes), so the number is what a bug report can be searched
+// on -- then the system's text, as UTF-8. The strerror_r mechanism and its measurement (a thread-safe text for
+// every errno, known to the libc or not) moved there with it.
 
 #if defined(_WIN32)
-
 std::string windowsErrorText(DWORD code) {
-    std::string text;
-    LPSTR       buffer = nullptr;
-    DWORD const len    = ::FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM
-            | FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, code, 0, reinterpret_cast<LPSTR>(&buffer), 0, nullptr);
-    if (len != 0 && buffer != nullptr) {
-        text.assign(buffer, len);
-        // FormatMessage terminates its text with CRLF; strip it so the
-        // message composes into a single-line diagnostic.
-        while (!text.empty()
-               && (text.back() == '\r' || text.back() == '\n'
-                   || text.back() == ' ')) {
-            text.pop_back();
-        }
-    }
-    if (buffer != nullptr) {
-        ::LocalFree(buffer);
-    }
-    if (text.empty()) {
-        text = "<no message text for this code>";
-    }
-    return "GetLastError=" + std::to_string(code) + ": " + text;
+    return core::reasonText(std::error_code{static_cast<int>(code), std::system_category()});
 }
-
 #else
-
-// ★ WHICH `strerror_r` THIS PLATFORM DECLARED, DECIDED BY OVERLOAD RESOLUTION
-// RATHER THAN BY GUESSING AT FEATURE MACROS. There are two incompatible
-// functions behind one name — GNU's returns `char*` (and is free to hand back
-// an immutable static instead of touching the caller's buffer), XSI's returns
-// `int` (0, or an errno). Which one a header declares depends on `_GNU_SOURCE`,
-// `_POSIX_C_SOURCE`, the libc and the platform, and every `#if` that tries to
-// predict it is a guess that compiles on the host it was written for. Handing
-// the return value to an overload SET asks the compiler instead, and the
-// compiler is reading the actual declaration. MEASURED: glibc 2.39 / g++ 13.3
-// `-std=c++23` selects the GNU arm, Apple clang 21 / Darwin 25.5 selects the
-// XSI arm, and both produce text byte-identical to `std::strerror` across all
-// 145 codes probed (0..140 plus four invalid ones) — which is what keeps the
-// exact-string pins in `test_process_spawn.cpp` green, since they rebuild their
-// expectations through `std::strerror`.
-//
-// A host that declares NEITHER fails to compile here, loudly, which is the same
-// posture the `pipe2` predicate at the top of this file takes: a port to an
-// unforeseen POSIX host should be given the mechanism it does have, not left to
-// discover a silent fallback.
-//
-// `[[maybe_unused]]` on BOTH, because exactly one of them is ever selected and
-// the other is then a defined-but-unused function in an anonymous namespace —
-// which is the whole design working, not a leftover. Marking them is what keeps
-// a `-Wunused-function` leg from reporting the mechanism as a defect.
-[[maybe_unused]] char const* selectStrerrorResult(char* gnuResult,
-                                                  char* buffer) {
-    // GNU: the RETURN VALUE is the message. It may or may not be `buffer`.
-    return gnuResult != nullptr ? gnuResult : buffer;
-}
-
-[[maybe_unused]] char const* selectStrerrorResult(int xsiResult, char* buffer) {
-    // XSI: the BUFFER is the message. A non-zero return is EINVAL (no such
-    // errno) or ERANGE (buffer too small); both still normally leave usable
-    // text, and the caller cleared `buffer[0]` beforehand so a genuinely
-    // untouched buffer reads back as empty and gets the fallback sentence
-    // instead of whatever was on the stack.
-    (void)xsiResult;
-    return buffer;
-}
-
-std::string errnoText(int code) {
-    // ★ `std::strerror` USED TO BE CALLED HERE, under a comment arguing its
-    // thread-safety exposure was "nil" because this is a failure-path call.
-    // ⚠ MEASURED, AND THE ANSWER IS NARROWER AND SHARPER THAN EITHER THE OLD
-    // COMMENT OR A FIRST PROBE SUGGESTED. Darwin 25.5 / Apple clang 21, 12
-    // threads x 20,000 calls each, every thread on its OWN error code:
-    //
-    //   codes the libc KNOWS      0 wrong strings. `strerror` hands back an
-    //                             immutable table entry; there is no buffer to
-    //                             share and nothing to race.
-    //   codes it does NOT know    33,692 wrong strings out of 240,000 — and
-    //                             100,265 when the callers do the string work
-    //                             `errnoText` really does, because that work
-    //                             WIDENS the window between the pointer coming
-    //                             back and being read. "Unknown error: N" is
-    //                             formatted into ONE shared static buffer, so
-    //                             every thread on an unknown code overwrites
-    //                             every other's message.
-    //
-    // glibc 2.39 shows 0 on BOTH populations (its buffer is thread-local) and
-    // the Windows UCRT never reaches this function. So this is one platform,
-    // on one sub-population of inputs — not a "strictest reading" concern, and
-    // not a general one either. Saying which is the whole value of the
-    // measurement.
-    //
-    // ⚠ AND IT IS EXACTLY THE POPULATION THIS FUNCTION CANNOT PROMISE TO AVOID.
-    // Every caller here passes a kernel-supplied errno, which is normally a
-    // code the libc knows — but "the set of errnos a kernel can return" is not
-    // closed and is not ours to bound: `Unknown error: N` exists precisely
-    // because a filesystem or a future release can hand back a number this
-    // libc's table does not cover. Betting the diagnostic on that never
-    // happening is the same shape of bet the old comment made and lost.
-    //
-    // Blast radius stays bounded — garbled TEXT, never a wrong `spawned`
-    // verdict — so this was not a correctness cliff. It is a diagnostic that
-    // LIES, in the substrate whose stated contract is that "every OS failure
-    // carries the platform's own error text" (the header's FAIL LOUD, NEVER
-    // SWALLOW note), and on the host where that text carries the most weight:
-    // macOS takes the `posix_spawn` arm, whose single errno is the entire error
-    // channel and already cannot say whether chdir or exec failed.
-    //
-    // 256 bytes is larger than any message either libc produces; on a host that
-    // disagreed, XSI reports ERANGE and the truncated-but-terminated text is
-    // still better than none. Numeric errno is included first so the message is
-    // never the only clue.
-    char buffer[256];
-    buffer[0] = '\0';
-    char const* const msg =
-        selectStrerrorResult(::strerror_r(code, buffer, sizeof buffer), buffer);
-    return "errno=" + std::to_string(code) + ": "
-         + (msg != nullptr && msg[0] != '\0'
-                ? msg
-                : "<no message text for this errno>");
-}
+std::string errnoText(int code) { return core::reasonText(std::error_code{code, std::generic_category()}); }
 
 // One byte as REAL hex. `"0x" + std::to_string(b)` renders DECIMAL behind a hex
 // prefix and can print `0x200` for a value no byte can hold — the same mistake
@@ -403,17 +286,12 @@ CandidateVerdict classifyCandidate(core::HostPath const& candidate) {
 //
 // POSIX keeps the bytes untouched: a path there IS a byte string, `execv` takes
 // bytes, and there is no re-encoding step available to get wrong.
+// ONE DECODER (P69 H6c2, T4): the home's GIVEN narrow reading (`core::givenText`), which decodes through
+// `decodeUtf8ToWide` -- the same answer a narrow GIVEN `HostPath` takes.
 std::optional<fs::path> pathFromUtf8(std::string const& utf8) {
-#if defined(_WIN32)
-    std::wstring wide;
-    std::string  error;
-    if (!decodeUtf8ToWide(utf8, wide, error)) {
-        return std::nullopt;
-    }
-    return fs::path{wide};
-#else
-    return fs::path{utf8};
-#endif
+    core::GivenText read = core::givenText(utf8);
+    if (read.illFormed) return std::nullopt;
+    return std::move(read.text);
 }
 
 // A PATH entry, which is deliberately NOT held to the rule above.
@@ -505,9 +383,12 @@ std::optional<core::HostPath> probeCandidate(core::HostPath const& candidate,
         // the extension, cut from the candidate's reference and extended
         // literally; `replace_extension` would eat a legitimate dot in the name
         // (`python3.11` → `python3.EXE`).
-        core::HostPath const withExt = candidate.withSuffix(fs::path{ext}.native());
-        if (consider(withExt)) {
-            return withExt;
+        // A candidate that names no last name (a volume root; a first-level PATH entry `C:\Windows` and `..`) has
+        // no sibling by any extension: nothing is found by it (H1 -- the refusal by name, never a throw).
+        auto const withExt = candidate.withSuffix(fs::path{ext}.native());
+        if (!withExt) return std::nullopt;
+        if (consider(*withExt)) {
+            return *withExt;
         }
     }
     return std::nullopt;
@@ -992,6 +873,17 @@ SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
         out.diagnostic = self + "empty argv — there is no program to run";
         return out;
     }
+    // ★ A VALUE THAT NAMES NOTHING IS REFUSED BY NAME (P69 H6c2, T4): a GIVEN narrow spelling that is no UTF-8 has no
+    // reference, and an empty working directory or stdout file would read as "inherit".
+    for (auto const& [what, value] : {std::pair<char const*, core::HostPath const*>{"image", &image},
+                                      {"working directory", &cwd},
+                                      {"stdout file", &stdoutFile}}) {
+        if (core::HostPathAccess::illFormed(*value)) {
+            out.diagnostic = self + "the " + what + " '" + value->spelling().display() + "' is refused: "
+                           + core::pathRefusalName(core::PathRefusal::IllFormedSpelling);
+            return out;
+        }
+    }
 
     // ★ AN EMBEDDED NUL IS A TOTAL-FUNCTION GUARD, NOT A PEDANTRY. `std::string`
     // carries a '\0' happily and a manifest can produce one (JSON permits an
@@ -1062,7 +954,7 @@ SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
         if (ec || kind != core::EntryKind::Directory) {
             out.diagnostic = self + "working directory '" + cwd.spelling().display() + "' "
                            + (kind == core::EntryKind::Absent && !ec ? "does not exist" : "is not a directory")
-                           + (ec ? ": " + ec.message() : std::string{});
+                           + (ec ? ": " + core::reasonText(ec) : std::string{});
             return out;
         }
 #if defined(_WIN32)
@@ -1220,9 +1112,12 @@ SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                        nullptr);
         if (redirectHandle == INVALID_HANDLE_VALUE) {
+            // The code is read FIRST, before the message's other operands run: C++ leaves the operands of a `+`
+            // chain unordered, so a `GetLastError()` among them may be read after a call that reset it (H6c2).
+            DWORD const createFailure = ::GetLastError();
             out.diagnostic = self + "could not create the stdout redirect file '"
                            + stdoutFile.spelling().display() + "' ("
-                           + windowsErrorText(::GetLastError())
+                           + windowsErrorText(createFailure)
                            + "), so '" + exe->spelling().display() + "' was not started — "
                              "running it with our own stdout attached would "
                              "have left nothing to read and no error to see";
@@ -1296,6 +1191,8 @@ SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
 
     DWORD const waitResult = ::WaitForSingleObject(pi.hProcess, INFINITE);
     if (waitResult != WAIT_OBJECT_0) {
+        // Read first, as at the redirect's create: no other call between the failure and its code.
+        DWORD const waitFailure = ::GetLastError();
         // The process WAS created (so `spawned` stays true — that is a fact
         // about the OS, not about our bookkeeping), but we cannot report an
         // exit code we never obtained. -1 plus a loud diagnostic beats 0,
@@ -1304,7 +1201,7 @@ SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
         out.diagnostic = self
                        + "WaitForSingleObject did not signal completion for '"
                        + exe->spelling().display() + "' ("
-                       + windowsErrorText(::GetLastError()) + ")";
+                       + windowsErrorText(waitFailure) + ")";
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
         return out;
@@ -1312,9 +1209,10 @@ SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
 
     DWORD exitCode = 0;
     if (::GetExitCodeProcess(pi.hProcess, &exitCode) == 0) {
+        DWORD const exitCodeFailure = ::GetLastError();   // read first, as at the redirect's create
         out.exitCode   = -1;
         out.diagnostic = self + "GetExitCodeProcess failed for '" + exe->spelling().display()
-                       + "' (" + windowsErrorText(::GetLastError()) + ")";
+                       + "' (" + windowsErrorText(exitCodeFailure) + ")";
     } else {
         // Windows exit codes are DWORD; the struct exposes `int` so that the
         // POSIX 0..255 range and the Windows range share one field. The cast
@@ -1955,6 +1853,7 @@ SpawnResult spawnAndWaitRedirectStdout(core::HostPath const&           image,
 unsigned long startImageInheriting(core::HostPath const& image, std::wstring const& commandLine, void* startupInfo,
                                    void* processInformation) {
     if (image.empty()) return ERROR_INVALID_PARAMETER;   // the empty spelling names no image (B2)
+    if (core::HostPathAccess::illFormed(image)) return ERROR_INVALID_NAME;   // T4: it names nothing
     // The image's form handed: the spawn's own (the header), taken ONCE from the value's leaf reference.
     std::wstring const startPath = core::HostPathAccess::spawnImage(image);
     // CreateProcessW WRITES THROUGH lpCommandLine: a mutable, NUL-terminated buffer of our own.

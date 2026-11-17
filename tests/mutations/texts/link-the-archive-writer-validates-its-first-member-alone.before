@@ -1,1 +1,2 @@
-    bool const everyMemberStorable = dss::substrate::runEveryUnit(members.size(), [&](std::size_t mi) {
+    bool const everyMemberStorable = dss::substrate::runEveryUnit(
+        members.size(),

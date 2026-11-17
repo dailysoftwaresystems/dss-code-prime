@@ -4,10 +4,11 @@
 // every string or character literal blanked to spaces, its new-lines kept -- so a line number still names the
 // source line, an offset still names the same character, and prose that names a form is never read as one. Read by
 // the guards that refuse a form outside its one home (test_symbol_id_mints_guard.cpp,
-// test_module_symbol_id_holders.cpp). Its rules are test_filesystem_queries_guard.cpp's (raw strings with their
+// test_module_symbol_id_holders.cpp, test_filesystem_queries_guard.cpp, test_no_regex_guard.cpp). Its rules are the
+// ones test_filesystem_queries_guard.cpp's own copy held until P69 H6c2 deleted it (raw strings with their
 // delimiters and encoding prefixes, a `'` after a digit or a letter read as a digit separator or a prefixed
-// literal's quote); that guard and five other tests keep a copy of their own, a neighbour stated in fold f26d's
-// hand-back.
+// literal's quote) -- MEASURED the same over every C++ source of src/, tests/ and integrated_tests/ (1507 files,
+// lane `hm`); five other tests keep a copy of their own, a neighbour stated in fold f26d's hand-back.
 
 #include <algorithm>
 #include <cctype>

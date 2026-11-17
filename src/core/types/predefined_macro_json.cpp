@@ -129,7 +129,7 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
         out.push_back(std::format("the config tree '{}' could not be read whole: the walk stopped at '{}' ({}), so "
                                   "no document beyond it was compared",
                                   core::genericSpelling(fs::path{configRootDir}),
-                                  walk.where.spelling().generic(), walk.error.message()));
+                                  walk.where.spelling().generic(), core::reasonText(walk.error)));
     }
     // Deterministic on every host: a directory iteration order is the
     // filesystem's, and "which document is FIRST" decides which one the message
@@ -138,8 +138,13 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
     std::sort(files.begin(), files.end());
 
     for (fs::path const& f : files) {
-        std::ifstream in = core::openInputStream(f, std::ios::binary);   // at any length (the home)
-        if (!in) continue;
+        auto opened = core::openInputStream(f, std::ios::binary);   // at any length (the home)
+        if (!opened) {   // a document not read is not compared: a finding, with the OS's reason (H6c2 (d))
+            out.push_back(std::format("the config document '{}' could not be opened ({}), so it was not compared",
+                                      core::genericSpelling(f), core::reasonText(opened.error())));
+            continue;
+        }
+        std::ifstream& in = *opened;
         // THE ONE CONFIG PARSE (`core/types/config_document_parse.hpp`).
         // `operator>>` into a `json` is `json::parse` under another spelling —
         // one of the THREE ways this repository ingests JSON, and the one a

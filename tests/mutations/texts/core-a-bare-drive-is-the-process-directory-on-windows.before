@@ -1,0 +1,1 @@
+    std::wstring out     = verbatimOf(osFullPath(appended ? plain + L'\\' : plain));

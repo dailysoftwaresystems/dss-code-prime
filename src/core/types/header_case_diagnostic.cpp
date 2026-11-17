@@ -36,34 +36,15 @@ namespace {
 // report wrong in the very case it was rewritten for: a header collision on a
 // network share names two files on a drive that has neither.
 //
-// The fallback is not a swallow: a native name can be text no encoding accepts
-// (NTFS permits lone surrogates, and BOTH toolchains throw on those), and such
-// a file still has to be IDENTIFIABLE and still has to stay DISTINCT from its
-// neighbour or the report becomes a lie. So it is escaped code unit by code
-// unit from `native()`, which involves no conversion and therefore cannot
-// throw. Agnostic: `NativeChar` is `char` on POSIX and `wchar_t` on Windows and
-// the loop below reads the same either way.
+// A native name can be text no encoding accepts (NTFS permits lone
+// surrogates), and such a file still has to be IDENTIFIABLE and still has to
+// stay DISTINCT from its neighbour or the report becomes a lie. Since P69 H6c2
+// (T4) the rendering itself is TOTAL and LOSSLESS -- WTF-8, which round-trips
+// every native name -- so the code-unit escape that stood here in a catch went
+// with the throw.
 [[nodiscard]] std::string renderCandidatePath(fs::path const& p) {
-    try {
-        std::u8string const u8 = core::genericSpellingU8(p);
-        return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
-    } catch (std::exception const&) {
-        using NativeChar = fs::path::value_type;
-        std::string out;
-        char        buf[16];
-        for (NativeChar unit : p.native()) {
-            auto const v = static_cast<std::uint32_t>(
-                static_cast<std::make_unsigned_t<NativeChar>>(unit));
-            if (v >= 0x20 && v < 0x7F) {
-                out.push_back(static_cast<char>(v));
-            } else {
-                std::snprintf(buf, sizeof buf, "\\u%04X",
-                              static_cast<unsigned>(v));
-                out += buf;
-            }
-        }
-        return out;
-    }
+    std::u8string const u8 = core::genericSpellingU8(p);
+    return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
 }
 
 } // namespace

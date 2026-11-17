@@ -22,7 +22,7 @@ description: >-
   needs no selector: on a Windows host the driver runs its POSIX half (the sqlite
   configure, the recipe derivation, the reference oracles) inside WSL through
   `wsl.exe -d <distribution> -e`, which is the only host switch it has -- the
-  distribution the tree's WSL legs declare (config.json `legs.<leg>.wsl`), read,
+  distribution the tree declares (config.json `hosts.wsl`), read,
   never the machine's default (2026-09-30).
 
   ★ ONE CHECKOUT PER CONSUMER (2026-09-30). Each run stages sqlite from its OWN

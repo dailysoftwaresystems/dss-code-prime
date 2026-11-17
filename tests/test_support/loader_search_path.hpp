@@ -62,7 +62,7 @@
 // a `\\?\` or `\\server\share` root on the MinGW build, and its `absolute()`
 // re-roots a share onto the local drive).
 
-#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, normalizeKeepingRoot, parentWithinRoot
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, containingDirectory, reachedKind, PathIdentity
 
 #include <filesystem>
 #include <set>
@@ -105,9 +105,19 @@ isPortableEnvironmentVariableName(std::string_view name) noexcept {
 //
 // Directories are made ABSOLUTE: the child is spawned with its own working
 // directory, so a relative entry would be resolved against a directory the
-// build never meant. The FILE path is normalised before its directory is taken
-// — normalising the directory instead leaves `a/sub/..` as `a/` with a trailing
-// separator, which would make one directory two entries.
+// build never meant.
+//
+// ★ ONE DIRECTORY IS ONE OBJECT, NEVER ONE RENDERING (P69 H6c2, ledger 629). Two
+// libraries' directories are one entry when the host REACHES one directory for
+// them: the key is `PathIdentity::of(directory, Container)`, and the entry is
+// the FIRST spelling met. A rendering decides nothing: on POSIX `a/sub/..` is
+// resolved at the object (through `sub`, a link or not), so its text is never
+// folded to `a`, and on Windows GetFullPathNameW folds it before any object is
+// read -- both are what the child's loader will do with the text it is given.
+// ★ A DIRECTORY THAT REACHES NO OBJECT IS NEVER MERGED BY IDENTITY (the re-audit's
+// N2): its identity's lexical tail names an object nobody reaches (POSIX cannot
+// traverse `a/missing/..`), so it keeps its own entry; only the same TEXT twice,
+// one search request to the loader, is said once.
 //
 // An EMPTY library list yields `priorValue` unchanged — but both parsers refuse
 // the declaration on a target with no library input, so a runner never reaches
@@ -117,18 +127,29 @@ isPortableEnvironmentVariableName(std::string_view name) noexcept {
 loaderSearchPathValue(std::vector<std::filesystem::path> const& resolvedLibraries,
                       std::string_view priorValue) {
     std::string           value;
-    std::set<std::string> seen;
+    std::set<std::string> reachedDirectories;   // the identity of each directory that reaches one
+    std::set<std::string> requestedTexts;       // the text of each directory that reaches none
     for (auto const& lib : resolvedLibraries) {
         // The non-throwing overload: the throwing one consults the process
         // working directory and ends a run whose cwd has been deleted.
         // ★ A VALUE (P69 H6c): the library as an absolute LEAF (the file itself), and its directory the level
-        // above that one reference (`containingDirectory`) -- one directory, one entry -- rendered into the
-        // variable the child is given, with the host's own separators, as a spawn's argument is.
+        // above that one reference (`containingDirectory`), rendered into the variable the child is given, with
+        // the host's own separators, as a spawn's argument is.
         std::error_code     ec;
         dss::core::HostPath file = dss::core::absoluteKeepingRoot(lib, dss::core::Use::Leaf, ec);
         if (ec) file = lib;
-        std::string const spelled = dss::core::containingDirectory(file).spelling().display();
-        if (spelled.empty() || !seen.insert(spelled).second) continue;
+        dss::core::HostPath const directory = dss::core::containingDirectory(file);
+        std::string const         spelled   = directory.spelling().display();
+        if (spelled.empty()) continue;
+        std::error_code kindEc;
+        bool const      reaches =
+            dss::core::reachedKind(directory, dss::core::Use::Container, kindEc) == dss::core::EntryKind::Directory
+            && !kindEc;
+        bool const first =
+            reaches ? reachedDirectories.insert(dss::core::PathIdentity::of(directory, dss::core::Use::Container).string())
+                          .second
+                    : requestedTexts.insert(spelled).second;
+        if (!first) continue;
         if (!value.empty()) value += kLoaderSearchPathListSeparator;
         value += spelled;
     }

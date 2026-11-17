@@ -2264,12 +2264,12 @@ TEST(RuntimeObjectCacheStore, TempClaimNeverEscapesThroughADanglingSymlink) {
            "the escape and the arm below is vacuous";
 
     // ── THE PRIMITIVE THE CLAIM NOW USES ───────────────────────────────────
-    std::FILE* const claimed = dss::linker::detail::createExclusiveBinary(linkB);
-    EXPECT_EQ(claimed, nullptr)
+    auto const claimed = dss::linker::detail::createExclusiveBinary(linkB);
+    EXPECT_FALSE(claimed.has_value())
         << "the exclusive create ACCEPTED a name occupied by a dangling "
            "symlink — the claim would follow the link out of the cache "
            "directory, exactly as the control above just did";
-    if (claimed != nullptr) std::fclose(claimed);
+    if (claimed) std::fclose(*claimed);
     EXPECT_FALSE(fs::exists(canaryB))
         << "THE WRITE ESCAPED: the claim created the symlink's TARGET, which "
            "is outside the directory the cache thought it had claimed "

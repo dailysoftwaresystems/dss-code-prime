@@ -227,13 +227,14 @@ readWholeFile(fs::path const& path, std::string_view role) {
             "Anchored: {}.",
             role, core::genericSpelling(path), kAnchor));
     }
-    std::ifstream in = core::openInputStream(path, std::ios::binary);   // at any length (the home)
-    if (!in) {
+    auto opened = core::openInputStream(path, std::ios::binary);   // at any length (the home)
+    if (!opened) {
         return std::unexpected(std::format(
-            "runtime object cache: could not open the {} '{}' for reading. "
+            "runtime object cache: could not open the {} '{}' for reading: {}. "
             "Anchored: {}.",
-            role, core::genericSpelling(path), kAnchor));
+            role, core::genericSpelling(path), core::reasonText(opened.error()), kAnchor));
     }
+    std::ifstream& in = *opened;
     std::string contents{std::istreambuf_iterator<char>(in),
                          std::istreambuf_iterator<char>()};
     if (in.bad()) {
@@ -457,10 +458,12 @@ private:
     static std::atomic<std::uint64_t> probeCounter{0};
     fs::path const probe =
         directory / ("." + std::to_string(probeCounter.fetch_add(1u)));
-    bool shortNameOpens = false;
+    bool            shortNameOpens = false;
+    std::error_code shortNameRefused;   // the OS's reason when the short name fails too (H6c2 (d))
     {
-        std::ofstream out = core::openOutputStream(probe, std::ios::binary | std::ios::trunc);
-        shortNameOpens = static_cast<bool>(out);
+        auto const out = core::openOutputStream(probe, std::ios::binary | std::ios::trunc);
+        shortNameOpens = out.has_value();
+        if (!out) shortNameRefused = out.error();
     }
     std::error_code removeEc;
     static_cast<void>(core::removeEntry(probe, removeEc));
@@ -476,8 +479,8 @@ private:
     } else {
         note +=
             ". ✔MEASURED just now by this refusal: a SHORT name in the SAME "
-            "directory ALSO failed to open, so the path's LENGTH is not the "
-            "cause — the directory itself cannot be written";
+            "directory ALSO failed to open (" + core::reasonText(shortNameRefused) + "), so the path's LENGTH is "
+            "not the cause — the directory itself cannot be written";
     }
     return note;
 }
@@ -554,12 +557,13 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
             core::genericSpelling(documentPath)));
     }
 
-    std::ifstream in = core::openInputStream(documentPath, std::ios::binary);   // at any length (the home)
-    if (!in) {
+    auto opened = core::openInputStream(documentPath, std::ios::binary);   // at any length (the home)
+    if (!opened) {
         return std::unexpected(std::format(
-            "the key document '{}' exists but could not be opened for reading",
-            core::genericSpelling(documentPath)));
+            "the key document '{}' exists but could not be opened for reading: {}",
+            core::genericSpelling(documentPath), core::reasonText(opened.error())));
     }
+    std::ifstream& in = *opened;
     std::string contents{std::istreambuf_iterator<char>(in),
                          std::istreambuf_iterator<char>()};
     if (in.bad()) {
@@ -725,11 +729,14 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             / ("." + destination.filename().string() + ".tmp-"
                + std::to_string(pid) + "-"
                + std::to_string(tempCounter.fetch_add(1u)));
-        claimed = linker::detail::createExclusiveBinary(candidate);
-        if (claimed != nullptr) {
+        auto const claim = linker::detail::createExclusiveBinary(candidate);
+        if (claim) {
+            claimed   = *claim;
             temporary = std::move(candidate);
             break;
         }
+        // The claim's OWN reason, read at the call (H6c2) -- before the entry probe below overwrites it.
+        std::error_code const refused = claim.error();
         // ── WHY THE CLAIM WAS REFUSED, ASKED AT THE ENTRY AND NOT AT ITS
         //    TARGET ────────────────────────────────────────────────────────
         //
@@ -759,8 +766,8 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             return std::unexpected(unwritableMissRefusal(
                 key,
                 std::format("could not open the temporary file '{}' for "
-                            "writing.{}",
-                            core::genericSpelling(candidate),
+                            "writing: {}.{}",
+                            core::genericSpelling(candidate), core::reasonText(refused),
                             composedPathNote(directory, candidate))));
         }
     }
@@ -773,13 +780,15 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             void operator()(std::FILE* f) const noexcept { std::fclose(f); }
         };
         std::unique_ptr<std::FILE, FileCloser> out{claimed};
+        core::clearRuntimeReason();
         if (!bytes.empty()
             && std::fwrite(bytes.data(), 1u, bytes.size(), out.get())
                    != bytes.size()) {
+            std::error_code const why = core::runtimeReason();   // read before the deleter's close (H6c2)
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("failed writing {} byte(s) to the temporary "
-                                 "file '{}'",
-                                 bytes.size(), core::genericSpelling(temporary))));
+                                 "file '{}': {}",
+                                 bytes.size(), core::genericSpelling(temporary), core::reasonText(why))));
         }
         // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the deleter. A
         // close-time flush failure (a full disk, a quota) is DISCARDED by a
@@ -787,11 +796,13 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         // place under a key that promises the full bytes — a silently wrong
         // artifact, which is the one outcome this whole mechanism exists to
         // make impossible.
+        core::clearRuntimeReason();
         if (std::fclose(out.release()) != 0) {
+            std::error_code const why = core::runtimeReason();   // read at the failing close (H6c2)
             return std::unexpected(unwritableMissRefusal(
-                key, std::format("failed writing {} byte(s) to the temporary "
-                                 "file '{}'",
-                                 bytes.size(), core::genericSpelling(temporary))));
+                key, std::format("failed closing {} byte(s) written to the temporary "
+                                 "file '{}': {}",
+                                 bytes.size(), core::genericSpelling(temporary), core::reasonText(why))));
         }
     }
 
@@ -1577,7 +1588,7 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
                 key,
                 std::format("could not create the artifact directory '{}' ({} "
                             "characters): {}",
-                            rendered, rendered.size(), ec.message())));
+                            rendered, rendered.size(), core::reasonText(ec))));
         }
         ec.clear();
     }

@@ -1,1 +1,1 @@
-    bool const everyTreeAssembled = substrate::runEveryUnit(trees.size(), [&](std::size_t ti) {
+    bool const everyTreeAssembled = substrate::runEveryUnit(trees.size(), substrate::namingSilentUnits(

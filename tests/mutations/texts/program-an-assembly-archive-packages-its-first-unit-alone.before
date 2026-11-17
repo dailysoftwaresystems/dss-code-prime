@@ -1,2 +1,2 @@
-                bool const everyUnitAssembled = substrate::runEveryUnitReportingSilence(
+                bool const everyUnitAssembled = substrate::runEveryUnit(
                     cus.size(),

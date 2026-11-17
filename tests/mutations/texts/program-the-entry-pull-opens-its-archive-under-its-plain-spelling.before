@@ -1,1 +1,1 @@
-        std::ifstream in = core::openInputStream(archivePaths[ai], std::ios::binary);
+        auto opened = core::openInputStream(archivePaths[ai], std::ios::binary);

@@ -1,1 +1,1 @@
-        if (false && rootSpelling(p).kind == RootSpelling::Kind::Verbatim) return;
+        if (false && verbatim) return;

@@ -1075,9 +1075,14 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
     // BINARY ("ab"): the dump is the same bytes whichever host's DSS writes it -- in text mode a Windows-built DSS
     // wrote every line ending as CR LF, so two hosts' dumps of one module differed (P69 fold f26d, the
     // host-toolchain class).
-    std::FILE* const f = core::openFileStream(
+    auto const opened = core::openFileStream(
         std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "ab");   // at any length
-    if (f == nullptr) return;
+    if (!opened) {   // the dump was asked for: its refusal is said, with the OS's reason (H6c2 (d))
+        std::fprintf(stderr, "DSS_DUMP_LIR_FILE: the LIR dump '%s' could not be opened: %s\n",
+                     path != nullptr ? path : "dss_lir_dump.txt", core::reasonText(opened.error()).c_str());
+        return;
+    }
+    std::FILE* const f = *opened;
     for (std::uint32_t i = 0; i < lir.moduleFuncCount(); ++i) {
         LirFuncId const fn = lir.funcAt(i);
         std::uint32_t const nb = lir.funcBlockCount(fn);
@@ -1138,8 +1143,12 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
 void dumpLirFuncs(Lir const& lir, TargetSchema const& schema, char const* stage) {
     if (std::getenv("DSS_DUMP_LIR_MIN_INSTS") == nullptr) return;
     char const* const path = std::getenv("DSS_DUMP_LIR_FILE");
-    if (std::FILE* const f = core::openFileStream(   // BINARY, as the function dump above (its note)
-            std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "ab")) {   // at any length
+    auto const opened = core::openFileStream(   // BINARY, as the function dump above (its note)
+        std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "ab");   // at any length
+    if (!opened) {   // asked for, so said, with the OS's reason (as the function dump above)
+        std::fprintf(stderr, "DSS_DUMP_LIR_FILE: the LIR dump '%s' could not be opened: %s\n",
+                     path != nullptr ? path : "dss_lir_dump.txt", core::reasonText(opened.error()).c_str());
+    } else if (std::FILE* const f = *opened) {
         auto const c = lir_pass_util::censusIdentityClassMoves(lir, schema);
         std::fprintf(f,
                      "########## STAGE %s ##########"

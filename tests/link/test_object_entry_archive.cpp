@@ -216,7 +216,7 @@ TEST(ObjectEntryNative, AnEntrysArchiveAtAnyLengthIsPulledAndRuns) {
     fs::path const archive = buildArtifact(scratch.path() / "lib", "member_main.c", "int main(void) { return 42; }\n",
                                            "x86_64:pe64-x86_64-windows-staticlib");
     ASSERT_FALSE(archive.empty());   // reported
-    std::ifstream in = core::openInputStream(archive, std::ios::binary);
+    std::ifstream in = core::openInputStream(archive, std::ios::binary).value_or(std::ifstream{});
     std::string const bytes{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
     ASSERT_FALSE(bytes.empty()) << "the archive DSS built was not read";
     std::size_t k = 0;
@@ -230,7 +230,7 @@ TEST(ObjectEntryNative, AnEntrysArchiveAtAnyLengthIsPulledAndRuns) {
         fs::path const placed = dir / archive.filename();
         if (cell.atLeast != 0) EXPECT_GE(placed.native().size(), 300u) << "the archive's path is not past the limit";
         {
-            std::ofstream out = core::openOutputStream(placed, std::ios::binary);
+            std::ofstream out = core::openOutputStream(placed, std::ios::binary).value();
             out << bytes;
             ASSERT_TRUE(out.good()) << "the archive was not placed";
         }

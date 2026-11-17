@@ -1,1 +1,1 @@
-    bool const everyArchiveParsed = substrate::runEveryUnit(std::min<std::size_t>(archivePaths.size(), 1), [&](std::size_t a) {
+    bool const everyArchiveParsed = substrate::runEveryUnit(std::min<std::size_t>(archivePaths.size(), 1), substrate::namingSilentUnits(

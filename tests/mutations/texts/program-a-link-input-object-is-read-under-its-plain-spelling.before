@@ -1,1 +1,1 @@
-        std::ifstream in = core::openInputStream(objectPath, std::ios::binary);
+        auto opened = core::openInputStream(objectPath, std::ios::binary);

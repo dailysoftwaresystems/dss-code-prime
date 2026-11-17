@@ -42,7 +42,7 @@
 // src/core/substrate/, under integrated_tests/ (whose runner compiles the substrate's unit beside it), and under
 // tests/examples/ (the in-process examples runner, the CLI runner's twin: the scope is the RUNNERS, not one of
 // them -- P69 fold H5, the review of H4b's F4). The scan also reads tests/test_support/, which both runners
-// include, for the aliases its headers declare. Comments and string literals are not code, and are not read.
+// include, for the aliases its headers declare. Comments and string literals are not code, and are not read (tests/test_support/source_code_only.hpp).
 //
 // ★ WHICH CODE TOUCHES A HOST PATH (P69 H6c): every operation on a host path takes its reading from one home, the
 // substrate (src/core/substrate/host_path.hpp's value and path_identity.hpp's operations). Over src/ outside the
@@ -54,20 +54,23 @@
 
 #include "core/substrate/path_identity.hpp"   // walkTree: the substrate's own walk, never through a link
 #include "repo_root.hpp"
+#include "source_code_only.hpp"   // codeOnly: the code of a source, its comments and literals blanked
+#include "text_scan.hpp"          // the linear scanners
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <optional>
-#include <regex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -126,64 +129,6 @@ std::set<std::string> const kEntryMembers = {
 // The `copy_options` that read a link.
 std::set<std::string> const kLinkOptions = {"copy_symlinks", "skip_symlinks", "create_symlinks"};
 
-// Whether the `R` at `i` opens a raw string literal: it begins a token, alone or after an encoding prefix.
-[[nodiscard]] bool opensRawLiteral(std::string const& text, std::size_t i) {
-    auto const ident = [&](std::size_t k) {
-        unsigned char const ch = static_cast<unsigned char>(text[k]);
-        return std::isalnum(ch) != 0 || ch == '_';
-    };
-    std::size_t start = i;
-    if (start >= 2 && text.compare(start - 2, 2, "u8") == 0) start -= 2;
-    else if (start >= 1 && (text[start - 1] == 'u' || text[start - 1] == 'U' || text[start - 1] == 'L')) start -= 1;
-    return start == 0 || !ident(start - 1);
-}
-
-// `text` with every comment and every string or character literal blanked to spaces, its newlines kept -- so a
-// line number still names the source line, an offset still names the same character, and prose that names a call
-// is never read as one.
-[[nodiscard]] std::string codeOnly(std::string const& text) {
-    std::string out = text;
-    std::size_t i   = 0;
-    auto const  blank = [&](std::size_t from, std::size_t to) {
-        for (std::size_t k = from; k < to && k < out.size(); ++k)
-            if (out[k] != '\n') out[k] = ' ';
-    };
-    while (i < text.size()) {
-        char const c = text[i];
-        if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
-            std::size_t const end = text.find('\n', i);
-            std::size_t const stop = end == std::string::npos ? text.size() : end;
-            blank(i, stop);
-            i = stop;
-        } else if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
-            std::size_t const end = text.find("*/", i + 2);
-            std::size_t const stop = end == std::string::npos ? text.size() : end + 2;
-            blank(i, stop);
-            i = stop;
-        } else if (c == 'R' && i + 1 < text.size() && text[i + 1] == '"' && opensRawLiteral(text, i)) {
-            // A raw string: R"delim( ... )delim"
-            std::size_t const open = text.find('(', i + 2);
-            if (open == std::string::npos) break;
-            std::string const delim = ")" + text.substr(i + 2, open - (i + 2)) + "\"";
-            std::size_t const end = text.find(delim, open + 1);
-            std::size_t const stop = end == std::string::npos ? text.size() : end + delim.size();
-            blank(i, stop);
-            i = stop;
-        } else if (c == '"' || (c == '\'' && !(i > 0 && std::isalnum(static_cast<unsigned char>(text[i - 1])) != 0))) {
-            // (A `'` right after a digit or a letter is a digit separator or a prefixed literal's quote, not
-            // the start of a character literal to blank.)
-            std::size_t k = i + 1;
-            while (k < text.size() && text[k] != c && text[k] != '\n') k += text[k] == '\\' ? 2 : 1;
-            std::size_t const stop = std::min(text.size(), k + 1);
-            blank(i, stop);
-            i = stop;
-        } else {
-            ++i;
-        }
-    }
-    return out;
-}
-
 [[nodiscard]] std::vector<std::string> linesOf(std::string const& text) {
     std::vector<std::string> lines;
     std::istringstream       in{text};
@@ -199,7 +144,7 @@ struct Source {
 };
 
 [[nodiscard]] Source sourceOf(std::string relative, std::string text) {
-    std::string code = codeOnly(text);
+    std::string code = dss::test::codeOnly(text);
     return Source{std::move(relative), std::move(text), std::move(code)};
 }
 
@@ -212,16 +157,98 @@ struct Source {
     return at == std::string::npos ? squeezed : squeezed.substr(at + 2);
 }
 
+// ── THE SCAN'S FORMS: each a loop over the text it reads, its work proportional to that text and its stack depth
+// constant (tests/test_support/text_scan.hpp says why no test matches text with `std::regex`) ──
+using dss::test::isWordChar;
+using dss::test::skipSpace;
+
+// One past the run of word characters at `i` (`\w*`): `i` itself where none begins there.
+[[nodiscard]] std::size_t wordRunEnd(std::string_view s, std::size_t i) {
+    while (i < s.size() && isWordChar(s[i])) ++i;
+    return i;
+}
+
+// Whether `at` begins a word: no word character stands before it.
+[[nodiscard]] bool beginsWord(std::string_view s, std::size_t at) { return at == 0 || !isWordChar(s[at - 1]); }
+
+// One past a qualifier as written at `i` -- an optional leading `::`, a word, then `::` and a word as often as they
+// follow, white space about each `::` -- or `i` itself where no word begins one. A `::` no word follows ends it.
+[[nodiscard]] std::size_t qualifierEnd(std::string_view s, std::size_t i) {
+    std::size_t const first = s.compare(i, 2, "::") == 0 ? skipSpace(s, i + 2) : i;
+    std::size_t       end   = wordRunEnd(s, first);
+    if (end == first) return i;
+    for (;;) {
+        std::size_t const colons = skipSpace(s, end);
+        if (s.compare(colons, 2, "::") != 0) return end;
+        std::size_t const word = skipSpace(s, colons + 2);
+        std::size_t const next = wordRunEnd(s, word);
+        if (next == word) return end;
+        end = next;
+    }
+}
+
+// The NAME of `:: NAME` after a scope that ends at `i` -- white space about the `::`, NAME a whole word that is one of
+// `names` -- as its bounds, or nothing.
+[[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> scopedName(std::string_view s, std::size_t i,
+                                                                            std::set<std::string> const& names) {
+    std::size_t const colons = skipSpace(s, i);
+    if (s.compare(colons, 2, "::") != 0) return std::nullopt;
+    std::size_t const name = skipSpace(s, colons + 2);
+    std::size_t const end  = wordRunEnd(s, name);
+    if (names.count(std::string{s.substr(name, end - name)}) == 0) return std::nullopt;
+    return std::pair{name, end};
+}
+
+// Every place `word` begins a word in `s`: `visit(at)` reads what follows it and answers where the scan resumes.
+template <typename Visit>
+void forEachStart(std::string_view s, std::string_view word, Visit&& visit) {
+    for (std::size_t at = s.find(word); at != std::string_view::npos;) {
+        std::size_t const resume = beginsWord(s, at) ? visit(at) : at + 1;
+        at = s.find(word, std::max(resume, at + 1));
+    }
+}
+
+// Every `SCOPE :: NAME` of a line: SCOPE the word `scope` beginning a word, NAME a whole word of `names`.
+[[nodiscard]] std::vector<std::string> scopedBy(std::string_view line, std::string_view scope,
+                                                std::set<std::string> const& names) {
+    std::vector<std::string> out;
+    forEachStart(line, scope, [&](std::size_t at) {
+        auto const name = scopedName(line, at + scope.size(), names);
+        if (!name) return at + 1;
+        out.emplace_back(line.substr(name->first, name->second - name->first));
+        return name->second;
+    });
+    return out;
+}
+
+// Every namespace alias a code text declares -- `namespace NAME = QUALIFIER ;` -- as NAME and the last component of
+// what it names.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> aliasDeclarations(std::string_view code) {
+    std::vector<std::pair<std::string, std::string>> out;
+    forEachStart(code, "namespace", [&](std::size_t at) {
+        std::size_t const after   = at + std::string_view{"namespace"}.size();
+        std::size_t const name    = skipSpace(code, after);
+        std::size_t const nameEnd = wordRunEnd(code, name);
+        if (name == after || nameEnd == name) return at + 1;
+        std::size_t const equals = skipSpace(code, nameEnd);
+        if (equals >= code.size() || code[equals] != '=') return at + 1;
+        std::size_t const qualifier = skipSpace(code, equals + 1);
+        std::size_t const stop      = qualifierEnd(code, qualifier);
+        std::size_t const semicolon = skipSpace(code, stop);
+        if (stop == qualifier || semicolon >= code.size() || code[semicolon] != ';') return at + 1;
+        std::string const target{code.substr(qualifier, stop - qualifier)};
+        out.emplace_back(std::string{code.substr(name, nameEnd - name)}, lastComponent(target));
+        return semicolon + 1;
+    });
+    return out;
+}
+
 // Every name `std::filesystem` goes by in the tree: every namespace alias of it, and of an alias of it, wherever it
 // is declared -- to a fixed point, so the order the files are read in decides nothing.
 [[nodiscard]] std::set<std::string> aliasesIn(std::vector<Source> const& sources) {
-    static std::regex const alias{R"(\bnamespace\s+(\w+)\s*=\s*((?:::\s*)?\w+(?:\s*::\s*\w+)*)\s*;)"};
     std::vector<std::pair<std::string, std::string>> declared;   // (alias, last component of what it names)
-    for (auto const& s : sources) {
-        if (s.code.find("namespace") == std::string::npos) continue;
-        for (std::sregex_iterator it{s.code.begin(), s.code.end(), alias}, end; it != end; ++it)
-            declared.emplace_back((*it)[1].str(), lastComponent((*it)[2].str()));
-    }
+    for (auto const& s : sources)
+        for (auto& declaration : aliasDeclarations(s.code)) declared.push_back(std::move(declaration));
     std::set<std::string> aliases;
     for (bool grew = true; grew;) {
         grew = false;
@@ -238,45 +265,107 @@ struct Finding {
     std::string ask;     // the substrate call to use
 };
 
-[[nodiscard]] std::string alternation(std::set<std::string> const& names) {
-    std::string out;
-    for (auto const& n : names) out += (out.empty() ? "" : "|") + n;
+// Every using-directive of a line -- `using namespace QUALIFIER` -- as the last component of what it names.
+[[nodiscard]] std::vector<std::string> directiveNames(std::string_view line) {
+    std::vector<std::string> out;
+    forEachStart(line, "using", [&](std::size_t at) {
+        std::size_t const after   = at + std::string_view{"using"}.size();
+        std::size_t const keyword = skipSpace(line, after);
+        if (keyword == after || line.compare(keyword, 9, "namespace") != 0) return at + 1;
+        std::size_t const qualifier = skipSpace(line, keyword + 9);
+        std::size_t const stop      = qualifierEnd(line, qualifier);
+        if (qualifier == keyword + 9 || stop == qualifier) return at + 1;
+        out.push_back(lastComponent(std::string{line.substr(qualifier, stop - qualifier)}));
+        return stop;
+    });
     return out;
 }
 
-// The scan's patterns, built ONCE for a set of sources: `aliases` are that set's names for `std::filesystem`.
+// The macro a line DEFINES when its definition names `filesystem` (`#define FS std::filesystem`), or nothing.
+[[nodiscard]] std::optional<std::string> macroNamingFilesystem(std::string_view line) {
+    std::size_t const hash = skipSpace(line, 0);
+    if (hash >= line.size() || line[hash] != '#') return std::nullopt;
+    std::size_t const keyword = skipSpace(line, hash + 1);
+    if (line.compare(keyword, 6, "define") != 0) return std::nullopt;
+    std::size_t const name = skipSpace(line, keyword + 6);
+    std::size_t const end  = wordRunEnd(line, name);
+    if (name == keyword + 6 || end == name || !dss::test::holdsWord(line.substr(end), "filesystem")) return std::nullopt;
+    return std::string{line.substr(name, end - name)};
+}
+
+// Every call of a refused FUNCTION in a line that passes an argument -- `NAME ( ARG`: NAME a whole word, ARG's first
+// character neither white space nor `)` -- as where NAME begins and NAME. What stands before it is the caller's to read.
+[[nodiscard]] std::vector<std::pair<std::size_t, std::string>> callsIn(std::string_view line) {
+    std::vector<std::pair<std::size_t, std::string>> out;
+    dss::test::forEachIdentifier(line, [&](std::size_t begin, std::size_t end) {
+        std::string       name{line.substr(begin, end - begin)};
+        std::size_t const open = skipSpace(line, end);
+        if (!beginsWord(line, begin) || kFunctions.count(name) == 0 || open >= line.size() || line[open] != '(')
+            return end;
+        std::size_t const argument = skipSpace(line, open + 1);
+        if (argument < line.size() && line[argument] != ')') out.emplace_back(begin, std::move(name));
+        return end;
+    });
+    return out;
+}
+
+// The scan's forms for a set of sources: `aliases` are that set's names for `std::filesystem`. Each form refused by
+// the NAME its match ends in answers every such name of a line, in order.
 struct Scanner {
     explicit Scanner(std::set<std::string> aliasNames) : aliases{std::move(aliasNames)} {
         for (auto const& entry : kAsk) names.insert(entry.first);
-        std::set<std::string> qualifiers = aliases;
+        qualifiers = aliases;
         qualifiers.insert("filesystem");
-        qualified   = std::regex{R"re((?:^|[^\w])(?:)re" + alternation(qualifiers) + R"re()\s*::\s*()re"
-                               + alternation(names) + R"re()\b)re"};
-        member      = std::regex{R"re((?:\.|->)\s*()re" + alternation(kEntryMembers) + R"re()\s*\()re"};
-        option      = std::regex{R"re(\bcopy_options\s*::\s*()re" + alternation(kLinkOptions) + R"re()\b)re"};
-        unqualified = std::regex{R"re(\b()re" + alternation(kFunctions) + R"re()\s*\(\s*[^\s)])re"};
-        directive   = std::regex{R"(\busing\s+namespace\s+((?:::\s*)?\w+(?:\s*::\s*\w+)*))"};
-        projection  = std::regex{R"re(\bdirectory_entry\s*::\s*()re" + alternation(kEntryMembers) + R"re()\b)re"};
-        macro       = std::regex{R"(^\s*#\s*define\s+(\w+)\b.*\bfilesystem\b)"};
     }
     std::set<std::string> aliases;
     std::set<std::string> names;
-    std::regex            qualified, member, option, unqualified, directive, projection, macro;
+    std::set<std::string> qualifiers;   // `filesystem` (so any qualifier that ends in it) and every alias of it
+
+    // `Q :: NAME`: Q a name of std::filesystem beginning a word, NAME a refused name.
+    [[nodiscard]] std::vector<std::string> qualified(std::string_view line) const {
+        std::vector<std::string> out;
+        dss::test::forEachIdentifier(line, [&](std::size_t begin, std::size_t end) {
+            if (qualifiers.count(std::string{line.substr(begin, end - begin)}) == 0) return end;
+            auto const name = scopedName(line, end, names);
+            if (!name) return end;
+            out.emplace_back(line.substr(name->first, name->second - name->first));
+            return name->second;
+        });
+        return out;
+    }
+    // `.NAME (` or `->NAME (`: a question a `directory_entry` answers itself.
+    [[nodiscard]] std::vector<std::string> member(std::string_view line) const {
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            std::size_t const after = line[i] == '.' ? i + 1 : line.compare(i, 2, "->") == 0 ? i + 2 : 0;
+            if (after == 0) continue;
+            std::size_t const name = skipSpace(line, after);
+            std::size_t const end  = wordRunEnd(line, name);
+            std::size_t const open = skipSpace(line, end);
+            if (kEntryMembers.count(std::string{line.substr(name, end - name)}) == 0 || open >= line.size()
+                || line[open] != '(')
+                continue;
+            out.emplace_back(line.substr(name, end - name));
+            i = open;   // the scan resumes past the `(`
+        }
+        return out;
+    }
+    // `copy_options :: OPTION`: a copy option that reads a link.
+    [[nodiscard]] std::vector<std::string> option(std::string_view line) const {
+        return scopedBy(line, "copy_options", kLinkOptions);
+    }
+    // `directory_entry :: NAME`: a question named through the entry (a pointer to the member, a projection).
+    [[nodiscard]] std::vector<std::string> projection(std::string_view line) const {
+        return scopedBy(line, "directory_entry", kEntryMembers);
+    }
 };
 
 // Every refused form in one source's code.
 [[nodiscard]] std::vector<Finding> refusedIn(Source const& source, Scanner const& scan) {
-    auto const& aliases     = scan.aliases;
-    auto const& names       = scan.names;
-    auto const& qualified   = scan.qualified;
-    auto const& member      = scan.member;
-    auto const& option      = scan.option;
-    auto const& unqualified = scan.unqualified;
-    auto const& directive   = scan.directive;
-    auto const& projection  = scan.projection;
-    auto const& macro       = scan.macro;
+    auto const& aliases = scan.aliases;
+    auto const& names   = scan.names;
 
-    // A line where no refused name and no `using` appears holds no refused form: only the rest are matched, which
+    // A line where no refused name and no `using` appears holds no refused form: only the rest are scanned, which
     // keeps a scan of the whole tree to the few lines that can hold one.
     auto const mayHold = [&](std::string const& line) {
         if (line.find("using") != std::string::npos || line.find("filesystem") != std::string::npos) return true;
@@ -290,32 +379,27 @@ struct Scanner {
         std::string const& line = lines[n];
         if (!mayHold(line)) continue;
         std::string const where = source.relative + ":" + std::to_string(n + 1);
-        for (auto const* re : {&qualified, &member, &option, &projection}) {
-            for (std::sregex_iterator it{line.begin(), line.end(), *re}, end; it != end; ++it) {
-                std::string const name = (*it)[1].str();
-                out.push_back({where, name, kAsk.at(name)});
-            }
+        for (auto const form : {&Scanner::qualified, &Scanner::member, &Scanner::option, &Scanner::projection}) {
+            for (std::string const& name : (scan.*form)(line)) out.push_back({where, name, kAsk.at(name)});
         }
-        for (std::sregex_iterator it{line.begin(), line.end(), directive}, end; it != end; ++it) {
-            std::string const last = lastComponent((*it)[1].str());
+        for (std::string const& last : directiveNames(line)) {
             if (last == "filesystem" || aliases.count(last) != 0)
                 out.push_back({where, "using namespace " + last, "a qualified call, asked of the substrate"});
         }
-        if (std::smatch m; std::regex_search(line, m, macro))
-            out.push_back({where, "#define " + m[1].str() + " naming filesystem",
+        if (std::optional<std::string> const name = macroNamingFilesystem(line))
+            out.push_back({where, "#define " + *name + " naming filesystem",
                            "a namespace alias (`namespace x = std::filesystem;`), which the scan follows"});
         // Keyed on the CALL, wherever it stands (the scope note): whether argument-dependent lookup reaches
         // std::filesystem from here is a question of types and of unread headers, which this scan cannot answer.
-        for (std::sregex_iterator it{line.begin(), line.end(), unqualified}, end; it != end; ++it) {
+        for (auto const& [at, name] : callsIn(line)) {
             // Qualified or a member: not argument-dependent lookup (a qualified mention is refused above).
-            std::string before = line.substr(0, static_cast<std::size_t>(it->position(0)));
+            std::string before = line.substr(0, at);
             while (!before.empty() && std::isspace(static_cast<unsigned char>(before.back())) != 0) before.pop_back();
             auto const endsWith = [&](char const* tail) {
                 std::string const t{tail};
                 return before.size() >= t.size() && before.compare(before.size() - t.size(), t.size(), t) == 0;
             };
             if (endsWith(".") || endsWith("->") || endsWith("::")) continue;
-            std::string const name = (*it)[1].str();
             out.push_back(
                 {where, name + " (unqualified: argument-dependent lookup may reach std::filesystem)", kAsk.at(name)});
         }
@@ -346,8 +430,12 @@ struct Scanner {
 
 // A source's bytes, read through the home (H6c): `p` is the walk's LISTED value, never its text re-resolved.
 [[nodiscard]] std::string readAll(dss::core::HostPath const& p) {
-    std::ifstream in = dss::core::openInputStream(p, std::ios::binary);
-    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    // A source the scan cannot open is no clean source: the scan stops, naming it and the OS's reason (H6c2 (d)).
+    auto opened = dss::core::openInputStream(p, std::ios::binary);
+    if (!opened)
+        throw std::runtime_error("the scan could not open '" + p.spelling().generic() + "': "
+                                 + dss::core::reasonText(opened.error()));
+    return {std::istreambuf_iterator<char>{*opened}, std::istreambuf_iterator<char>{}};
 }
 
 // `found` as `<line>=<call>` words, or `<file> line <line>=<call>` when `withFile` -- the file and its line
@@ -836,6 +924,216 @@ StoreRoutePin const kStoreRoutePin = {
     return sources;
 }
 
+// ── THE HOME'S OPERATIONS AS ONE LIST (P69 H6c2, T3): every operation a header of the home declares is a row of
+// `DSS_HOST_PATH_OPERATIONS` (src/core/substrate/host_path.hpp), and every row is declared by the header it names.
+// The headers are the list's own (its `header` column), read by data. An OPERATION is a declaration of a function at
+// namespace or class scope (a definition's head included) that is: a public member of a value type, whatever its
+// signature; a friend of one; or any other whose declaration names a path (a value type, or a `::path`). A row names
+// the operation's own name: a constructor its class's, an operator its operator-function-id (`operator<<`). ──
+
+// The value types of the home: a public member of one is an operation whatever its signature.
+std::set<std::string, std::less<>> const kValueTypes = {"HostPath", "PathText", "ListedRelative", "PathIdentity"};
+
+// `code` with every preprocessor directive blanked, its continuation lines too, the new-lines kept.
+[[nodiscard]] std::string withoutDirectives(std::string code) {
+    bool inDirective = false;
+    for (std::size_t lineStart = 0; lineStart < code.size();) {
+        std::size_t const end   = std::min(code.find('\n', lineStart), code.size());
+        std::size_t const first = dss::test::skipSpace(std::string_view{code}.substr(0, end), lineStart);
+        if (inDirective || (first < end && code[first] == '#')) {
+            std::size_t last = end;
+            while (last > lineStart && (code[last - 1] == '\r' || code[last - 1] == ' ')) --last;
+            inDirective = last > lineStart && code[last - 1] == '\\';
+            for (std::size_t k = lineStart; k < end; ++k) code[k] = ' ';
+        }
+        lineStart = end + 1;
+    }
+    return code;
+}
+
+// Whether a declaration names a path: a value type as a whole word, or `path` after a `::`.
+[[nodiscard]] bool namesAPath(std::string_view declaration) {
+    bool found = false;
+    dss::test::forEachIdentifier(declaration, [&](std::size_t begin, std::size_t end) {
+        std::string_view const word = declaration.substr(begin, end - begin);
+        if (kValueTypes.count(word) != 0) found = true;
+        if (word == "path") {
+            std::size_t k = begin;
+            while (k > 0 && dss::test::isSpace(declaration[k - 1])) --k;
+            if (k >= 2 && declaration.compare(k - 2, 2, "::") == 0) found = true;
+        }
+        return end;
+    });
+    return found;
+}
+
+// The name a declaration declares a FUNCTION by -- the identifier or operator-function-id before its parameter list,
+// the first `(` outside every bracket, `<...>` and `[[...]]` -- and where it stands; or nothing (a variable, a type,
+// a data member).
+struct Declared {
+    std::string name;
+    std::size_t at;
+};
+[[nodiscard]] std::optional<Declared> declaredFunction(std::string_view d) {
+    static std::set<std::string, std::less<>> const kNotANameBeforeItsList = {
+        "decltype", "alignas", "noexcept", "requires", "sizeof", "static_assert", "explicit", "__attribute__",
+        "__declspec"};
+    int         angle = 0;
+    std::size_t i     = 0;
+    while (i < d.size()) {
+        char const c = d[i];
+        if (d.compare(i, 2, "[[") == 0) {   // an attribute: to its `]]`
+            std::size_t const close = d.find("]]", i + 2);
+            i = close == std::string_view::npos ? d.size() : close + 2;
+            continue;
+        }
+        if (dss::test::isIdentStart(c) && dss::test::boundaryAt(d, i)) {
+            std::size_t const end  = dss::test::identEnd(d, i);
+            std::string_view  word = d.substr(i, end - i);
+            if (word == "operator") {   // the operator-function-id: `operator` and the operator's own characters
+                std::size_t       k  = dss::test::skipSpace(d, end);
+                std::size_t const op = k;
+                if (d.compare(k, 2, "()") == 0) k += 2;
+                else while (k < d.size() && d[k] != '(' && !dss::test::isSpace(d[k])) ++k;
+                std::size_t const open = dss::test::skipSpace(d, k);
+                if (angle == 0 && open < d.size() && d[open] == '(')
+                    return Declared{"operator" + std::string{d.substr(op, k - op)}, i};
+                i = k;
+                continue;
+            }
+            std::size_t const next = dss::test::skipSpace(d, end);
+            if (next < d.size() && d[next] == '(') {
+                if (angle == 0 && kNotANameBeforeItsList.count(word) == 0) {
+                    std::size_t k = i;   // a destructor's `~` names no operation of its own
+                    while (k > 0 && dss::test::isSpace(d[k - 1])) --k;
+                    if (k > 0 && d[k - 1] == '~') return std::nullopt;
+                    return Declared{std::string{word}, i};
+                }
+                // `decltype(...)`, `alignas(...)` or a call inside a template argument: past its parentheses
+                int depth = 0;
+                for (i = next; i < d.size(); ++i) {
+                    if (d[i] == '(') ++depth;
+                    if (d[i] == ')' && --depth == 0) break;
+                }
+                ++i;
+                continue;
+            }
+            i = end;
+            continue;
+        }
+        if (c == '<') ++angle;
+        if (c == '>' && angle > 0) --angle;
+        if (c == '(' || c == '=' || c == '{') return std::nullopt;   // a list, an initializer: no function named first
+        ++i;
+    }
+    return std::nullopt;
+}
+
+// The name a class head declares: the last identifier before its template arguments, its bases or its end, a
+// leading `template <...>` passed (`struct std::hash<dss::core::PathIdentity>` -> `hash`; `class DSS_EXPORT HostPath
+// final` -> `HostPath`).
+[[nodiscard]] std::string classNameOf(std::string_view head) {
+    static std::set<std::string, std::less<>> const kNotItsName = {"class", "struct", "union", "final", "DSS_EXPORT"};
+    std::size_t from = dss::test::skipSpace(head, 0);
+    if (dss::test::wordAt(head, from, "template")) {   // past its parameter list's `>`
+        int depth = 0;
+        for (std::size_t k = from; k < head.size(); ++k) {
+            if (head[k] == '<') ++depth;
+            if (head[k] == '>' && --depth == 0) {
+                from = k + 1;
+                break;
+            }
+        }
+    }
+    std::size_t stop = head.size();
+    for (std::size_t k = from; k < head.size(); ++k) {
+        bool const single = head[k] == ':' && head.compare(k, 2, "::") != 0 && (k == 0 || head[k - 1] != ':');
+        if (head[k] == '<' || single) {
+            stop = k;
+            break;
+        }
+    }
+    std::string name;
+    std::string_view const named = head.substr(from, stop - from);
+    dss::test::forEachIdentifier(named, [&](std::size_t b, std::size_t e) {
+        if (kNotItsName.count(named.substr(b, e - b)) == 0) name = std::string{named.substr(b, e - b)};
+        return e;
+    });
+    return name;
+}
+
+// Every operation a header's code declares, by the rule above.
+[[nodiscard]] std::set<std::string> operationsDeclaredIn(std::string const& headerCode) {
+    std::string const code = withoutDirectives(headerCode);
+    struct Scope {
+        enum class Kind { Namespace, Class, Body } kind;
+        bool valueType = false;
+        bool publicNow = true;
+    };
+    std::vector<Scope>    scopes{{Scope::Kind::Namespace}};
+    std::set<std::string> out;
+    std::size_t           statement = 0;   // where the statement being read began
+    int                   parens    = 0;
+    auto const            judge     = [&](std::size_t stop) {
+        std::string_view const d     = std::string_view{code}.substr(statement, stop - statement);
+        Scope const&           scope = scopes.back();
+        if (scope.kind == Scope::Kind::Body) return;
+        std::optional<Declared> const declared = declaredFunction(d);
+        if (!declared) return;
+        // The declared name itself is no path the declaration names (a value type's constructor).
+        std::string signature{d};
+        for (std::size_t k = 0; k < declared->name.size(); ++k) signature[declared->at + k] = ' ';
+        bool const isFriend = dss::test::holdsWord(d, "friend");
+        if ((scope.valueType && (scope.publicNow || isFriend)) || namesAPath(signature)) out.insert(declared->name);
+    };
+    for (std::size_t i = 0; i < code.size(); ++i) {
+        char const c = code[i];
+        if (c == '(') ++parens;
+        if (c == ')') --parens;
+        if (parens != 0) continue;
+        if (c == ':' && scopes.back().kind == Scope::Kind::Class && code.compare(i, 2, "::") != 0
+            && (i == 0 || code[i - 1] != ':')) {
+            std::string_view const head = std::string_view{code}.substr(statement, i - statement);
+            for (char const* access : {"public", "private", "protected"}) {
+                std::size_t const at = dss::test::skipSpace(head, 0);
+                if (dss::test::wordAt(head, at, access) && dss::test::skipSpace(head, at + std::strlen(access)) == head.size()) {
+                    scopes.back().publicNow = std::string_view{access} == "public";
+                    statement               = i + 1;
+                }
+            }
+            continue;
+        }
+        if (c == ';') {
+            judge(i);
+            statement = i + 1;
+        } else if (c == '{') {
+            std::string_view const head = std::string_view{code}.substr(statement, i - statement);
+            std::size_t const      at   = dss::test::skipSpace(head, 0);
+            Scope                  next{Scope::Kind::Body};
+            if (scopes.back().kind != Scope::Kind::Body) {
+                bool const isClass  = dss::test::holdsWord(head, "class") || dss::test::holdsWord(head, "struct");
+                bool const isEnum   = dss::test::holdsWord(head, "enum");
+                bool const function = declaredFunction(head).has_value();
+                if (dss::test::wordAt(head, at, "namespace") || dss::test::wordAt(head, at, "extern")) {
+                    next.kind = Scope::Kind::Namespace;
+                } else if (isClass && !isEnum && !function) {
+                    next.kind      = Scope::Kind::Class;
+                    next.publicNow = !dss::test::holdsWord(head, "class");
+                    next.valueType = kValueTypes.count(classNameOf(head)) != 0;
+                } else if (function) {
+                    judge(i);   // a definition's head declares its function too
+                }
+            }
+            scopes.push_back(next);
+            statement = i + 1;
+        } else if (c == '}') {
+            if (scopes.size() > 1) scopes.pop_back();
+            statement = i + 1;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 // THE TREE: no source in scope asks the library a question its answer to depends on how it reads a link.
@@ -1211,4 +1509,300 @@ TEST(FilesystemQueriesGuard, TheFenceRefusesEveryStoreRouteUseItDoesNotPin) {
     EXPECT_EQ(breaches({sourceOf("src/store/a.cpp", a), sourceOf("src/store/b.cpp", "auto z = 1;\n")}),
               "[src/store/b.cpp: storeRouteWhere taken 0 time(s), pinned 1]")
         << "a pinned use that is gone: the pin is the census, and H6d lowers it with every store it types";
+}
+
+// THE HOME'S OPERATIONS AS ONE LIST (T3): every operation each listed header declares is a row, and every row is
+// declared by the header it names -- the headers are the list's own, read by data.
+TEST(FilesystemQueriesGuard, EveryOperationOfTheHomeIsInTheList) {
+    fs::path const                               root = dss::test::repoRoot() / "src" / "core" / "substrate";
+    std::map<std::string, std::set<std::string>> rows;   // header stem -> the names its rows give
+    for (auto const& op : dss::core::kHostPathOperations) rows[op.header].insert(op.name);
+    ASSERT_GE(rows.size(), 5u) << "the list names " << rows.size() << " headers";
+    std::string missing;
+    std::size_t declaredInAll = 0;
+    for (auto const& [header, names] : rows) {
+        std::string const text = readAll(dss::core::HostPath{root / (header + ".hpp")});
+        ASSERT_FALSE(text.empty()) << "src/core/substrate/" << header << ".hpp was not read";
+        std::set<std::string> const declared = operationsDeclaredIn(dss::test::codeOnly(text));
+        declaredInAll += declared.size();
+        for (auto const& d : declared)
+            if (names.count(d) == 0) missing += "\n  " + header + ".hpp declares `" + d + "`, which no row names";
+        for (auto const& n : names)
+            if (declared.count(n) == 0) missing += "\n  the row `" + n + "` names no operation " + header + ".hpp declares";
+    }
+    EXPECT_GE(declaredInAll, 80u) << "the scan read only " << declaredInAll << " operations";
+    EXPECT_TRUE(missing.empty()) << "DSS_HOST_PATH_OPERATIONS and the headers disagree:" << missing;
+}
+
+// THE OPERATION SCAN ITSELF, on a synthetic header holding every declaration it must read and every one it must not.
+TEST(FilesystemQueriesGuard, TheOperationScanReadsEveryOperationAndNothingElse) {
+    std::string const header = R"~(#pragma once
+#define LIST(X) \
+    X("listed", h, Spelling) \
+    X(notThis(HostPath), h, Spelling)
+namespace dss::core {
+class HostPath {
+public:
+    HostPath() = default;
+    explicit HostPath(std::filesystem::path p);
+    ~HostPath();
+    [[nodiscard]] Spelling spelling() const;
+    [[nodiscard]] std::size_t size() const noexcept { return helper(text_).size(); }
+    friend std::ostream& operator<<(std::ostream& os, HostPath const& p);
+    HostPath& operator=(HostPath const&) = default;
+private:
+    [[nodiscard]] int hidden() const;
+    static HostPath madeHere(int origin);
+    std::filesystem::path text_;
+};
+struct TreeEntry {
+    HostPath at;
+    int      kind = compute(3);
+    [[nodiscard]] bool isFile() const;
+};
+enum class Kind : int { A, B };
+[[nodiscard]] DSS_EXPORT HostPath reachedPath(HostPath const& p, Use use, std::error_code& ec);
+[[nodiscard]] DSS_EXPORT std::filesystem::path programPath(std::string_view utf8);
+DSS_EXPORT void walk(HostPath const& root, std::function<Step(Entry const&)> const& visit, Options o = {});
+template <typename Visit> void forEachName(std::string const& path, Visit&& v);
+[[nodiscard]] constexpr bool takesText(std::string_view text) noexcept;
+inline decltype(auto) typed(fs::path const& p) { return p; }
+inline constexpr int kTable[] = {LIST(ROW)};
+}
+template <>
+struct std::hash<dss::core::HostPath> {
+    std::size_t operator()(dss::core::HostPath const& p) const noexcept;
+};
+)~";
+    std::set<std::string> const want = {"HostPath",    "spelling", "size",     "operator<<",  "operator=",
+                                        "madeHere",    "reachedPath", "programPath", "walk",   "typed",
+                                        "operator()"};
+    EXPECT_EQ(operationsDeclaredIn(dss::test::codeOnly(header)), want);
+}
+
+// ════ THE OS'S REASON IS RENDERED BY ITS ONE HOME (P69 H6c2 (e), main's ruling 684) ═══════════════════════════════════
+// A host primitive that fails answers the OS's reason, and every diagnostic built on it renders that reason through the
+// ONE rendering, `core::reasonText` (src/core/substrate/path_identity.cpp): the code AND the system's text. Outside that
+// home, on CODE-ONLY text (comments and literals blanked), no source of src/ may render a reason another way:
+//  R1  a call of a member named `message`, with ANY argument list (`.message(`, `->message(`) -- an error_code's text
+//      without its number; lexical, so it refuses ANY receiver: it fails toward LOUD, and a future member of that name
+//      is renamed, never excepted;
+//  R2  BY TYPE: `<name>.what()` / `<name>->what()` where the file binds <name> as a `::system_error`,
+//      `::filesystem_error` or `::failure` (a handler's parameter or a declaration, the type spelled after `::`);
+//  R3  a SELF-RENDERER of an OS code: `FormatMessage[AW]`, `strerror[_r|_s]`, `_strerror[_s]`, `_wcserror[_s]`,
+//      `strerrordesc_np`, `strerrorname_np`, called;
+//  R4  BY TYPE: a `std::error_code` the file declares by name, streamed (`<< name`) or handed whole to
+//      `std::format` / `std::vformat` / `std::print` / `std::println` -- a code rendered as "category:value".
+// NO EXEMPTION LIST: the one file not judged is the home itself, where R1 must find the home's own rendering (the
+// control that the scan sees a real call). STATED BLINDNESS: R2 and R4 see only names the SAME file declares with the
+// type spelled -- not an `auto`, not a member declared in another file, not a template parameter, not a `using` of the
+// bare type name; a `catch (std::exception const&)` handler's `what()` has no type in the text (pinned below AS
+// blindness). R1 and R3 are lexical and see every call.
+namespace {
+
+constexpr std::string_view kReasonHome = "src/core/substrate/path_identity.cpp";
+
+struct ReasonFinding {
+    std::string relative;
+    std::size_t line = 0;
+    std::string rule;
+    std::string text;
+};
+
+[[nodiscard]] std::size_t reasonLineAt(std::string const& code, std::size_t at) {
+    return static_cast<std::size_t>(std::count(code.begin(), code.begin() + static_cast<std::ptrdiff_t>(at), '\n')) + 1;
+}
+
+// The last character before `k` that is not a space (npos when none).
+[[nodiscard]] std::size_t reasonCodeBefore(std::string const& code, std::size_t k) {
+    while (k > 0) {
+        --k;
+        if (!dss::test::isSpace(code[k])) return k;
+    }
+    return std::string::npos;
+}
+
+// Does a member access (`.` or `->`) end just before the word at `b`? Answers the receiver's last character's index,
+// or npos.
+[[nodiscard]] std::size_t reasonMemberAccessBefore(std::string const& code, std::size_t b) {
+    std::size_t const k = reasonCodeBefore(code, b);
+    if (k == std::string::npos) return std::string::npos;
+    if (code[k] == '.') return reasonCodeBefore(code, k);
+    if (code[k] == '>' && k > 0 && code[k - 1] == '-') return reasonCodeBefore(code, k - 1);
+    return std::string::npos;
+}
+
+[[nodiscard]] bool reasonCalledAt(std::string const& code, std::size_t end) {
+    std::size_t const k = dss::test::skipSpace(code, end);
+    return k < code.size() && code[k] == '(';
+}
+
+// The identifier ENDING at `last` (inclusive), or empty.
+[[nodiscard]] std::string_view reasonIdentifierEndingAt(std::string const& code, std::size_t last) {
+    if (last == std::string::npos || !dss::test::isWordChar(code[last])) return {};
+    std::size_t b = last;
+    while (b > 0 && dss::test::isWordChar(code[b - 1])) --b;
+    if (!dss::test::isIdentStart(code[b])) return {};
+    return std::string_view{code}.substr(b, last + 1 - b);
+}
+
+// The names the file declares with one of `typeWords` spelled before them (`std::error_code const& why`,
+// `catch (std::filesystem::filesystem_error const& e)`): the identifier after the type word, its cv and reference
+// marks skipped. With `afterScope`, the type word must follow `::` (`std::system_error`, `std::ios_base::failure`).
+[[nodiscard]] std::set<std::string, std::less<>> reasonNamesDeclaredAs(std::string const& code,
+                                                                       std::vector<std::string_view> const& typeWords,
+                                                                       bool afterScope) {
+    std::set<std::string, std::less<>> names;
+    dss::test::forEachIdentifier(code, [&](std::size_t b, std::size_t e) {
+        std::string_view const word{code.data() + b, e - b};
+        if (std::find(typeWords.begin(), typeWords.end(), word) == typeWords.end()) return e;
+        if (afterScope) {
+            std::size_t const k = reasonCodeBefore(code, b);
+            if (k == std::string::npos || k == 0 || code[k] != ':' || code[k - 1] != ':') return e;
+        }
+        std::size_t k = e;
+        for (;;) {
+            k = dss::test::skipSpace(code, k);
+            if (k < code.size() && (code[k] == '&' || code[k] == '*')) {
+                ++k;
+                continue;
+            }
+            if (dss::test::wordAt(code, k, "const")) {
+                k += 5;
+                continue;
+            }
+            break;
+        }
+        std::size_t const end = dss::test::identEnd(code, k);
+        if (end > k) names.emplace(code.substr(k, end - k));
+        return e;
+    });
+    return names;
+}
+
+[[nodiscard]] std::vector<ReasonFinding> reasonRenderingsIn(Source const& source) {
+    std::string const&         code = source.code;
+    std::vector<ReasonFinding> found;
+    auto const report = [&](std::size_t at, char const* rule) {
+        std::size_t const lineStart = code.rfind('\n', at) == std::string::npos ? 0 : code.rfind('\n', at) + 1;
+        std::size_t const lineEnd   = code.find('\n', at);
+        std::string       text      = code.substr(lineStart, lineEnd == std::string::npos ? std::string::npos
+                                                                                          : lineEnd - lineStart);
+        found.push_back({source.relative, reasonLineAt(code, at), rule, std::move(text)});
+    };
+    static std::vector<std::string_view> const kSelfRenderers = {
+        "FormatMessage", "FormatMessageA", "FormatMessageW", "strerror", "strerror_r", "strerror_s", "_strerror",
+        "_strerror_s",   "_wcserror",      "_wcserror_s",    "strerrordesc_np", "strerrorname_np"};
+    static std::vector<std::string_view> const kFormatters = {"format", "vformat", "print", "println"};
+    auto const errorCodes = reasonNamesDeclaredAs(code, {"error_code"}, false);
+    auto const exceptions = reasonNamesDeclaredAs(code, {"system_error", "filesystem_error", "failure"}, true);
+    dss::test::forEachIdentifier(code, [&](std::size_t b, std::size_t e) {
+        std::string_view const word{code.data() + b, e - b};
+        if (word == "message" && reasonMemberAccessBefore(code, b) != std::string::npos && reasonCalledAt(code, e))
+            report(b, "R1");   // R1: a member named `message`, called
+        else if (word == "what" && reasonCalledAt(code, e)) {
+            std::size_t const receiverEnd = reasonMemberAccessBefore(code, b);
+            if (receiverEnd != std::string::npos && exceptions.contains(reasonIdentifierEndingAt(code, receiverEnd)))
+                report(b, "R2");   // R2: the what() of an OS-reason exception the file names
+        } else if (std::find(kSelfRenderers.begin(), kSelfRenderers.end(), word) != kSelfRenderers.end()
+                   && reasonCalledAt(code, e))
+            report(b, "R3");   // R3: a self-renderer of an OS code
+        else if (std::find(kFormatters.begin(), kFormatters.end(), word) != kFormatters.end() && reasonCalledAt(code, e)
+                 && reasonMemberAccessBefore(code, b) == std::string::npos) {
+            std::size_t const open  = dss::test::skipSpace(code, e);
+            int               depth = 0;
+            std::size_t       close = open;
+            for (; close < code.size(); ++close) {
+                if (code[close] == '(' || code[close] == '[' || code[close] == '{') ++depth;
+                else if ((code[close] == ')' || code[close] == ']' || code[close] == '}') && --depth == 0) break;
+            }
+            for (std::string const& argument :
+                 dss::test::topLevelArguments(std::string_view{code}.substr(open + 1, close - open - 1))) {
+                std::size_t const a = dss::test::skipSpace(argument, 0);
+                std::size_t const z = dss::test::identEnd(argument, a);
+                if (z > a && dss::test::skipSpace(argument, z) == argument.size()
+                    && errorCodes.contains(std::string_view{argument}.substr(a, z - a)))
+                    report(b, "R4");   // R4: a declared error_code handed whole to a formatter
+            }
+        }
+        return e;
+    });
+    for (std::size_t at = code.find("<<"); at != std::string::npos; at = code.find("<<", at + 2)) {
+        std::size_t const a = dss::test::skipSpace(code, at + 2);
+        std::size_t const z = dss::test::identEnd(code, a);
+        if (z == a || !errorCodes.contains(std::string_view{code}.substr(a, z - a))) continue;
+        std::size_t const next = dss::test::skipSpace(code, z);
+        if (next < code.size() && (code[next] == '(' || code[next] == '.' || code[next] == '-' || code[next] == '['))
+            continue;   // a call, a member or an element of it: not the code itself
+        report(at, "R4");   // R4: a declared error_code streamed
+    }
+    std::sort(found.begin(), found.end(),
+              [](ReasonFinding const& x, ReasonFinding const& y) { return x.line < y.line; });
+    return found;
+}
+
+[[nodiscard]] std::string reasonSpelled(std::vector<ReasonFinding> const& found) {
+    std::string out;
+    for (ReasonFinding const& f : found)
+        out += "\n  " + f.relative + ":" + std::to_string(f.line) + " " + f.rule + ": " + f.text;
+    return out;
+}
+
+}  // namespace
+
+// THE TREE: every source of src/ outside the home renders an OS reason through `core::reasonText` -- zero findings.
+// Its controls: the walk read at least 400 sources (a non-vacuity floor, never an exemption: every file read is
+// judged), and the home was read and R1 finds its own rendering there (the scan sees a real call).
+TEST(FilesystemQueriesGuard, EveryOsReasonIsRenderedByTheOneHome) {
+    std::vector<Source> const sources = sourcesUnder(dss::test::repoRoot(), {"src"});
+    ASSERT_GE(sources.size(), 400u) << "the walk of src/ read too little to judge";
+    std::vector<ReasonFinding> found;
+    bool                       homeRead = false;
+    for (Source const& source : sources) {
+        if (source.relative == kReasonHome) {
+            homeRead = true;
+            auto const own = reasonRenderingsIn(source);
+            EXPECT_TRUE(std::any_of(own.begin(), own.end(), [](ReasonFinding const& f) { return f.rule == "R1"; }))
+                << "control: R1 does not see the home's own `reason.message()`";
+            continue;
+        }
+        auto const here = reasonRenderingsIn(source);
+        found.insert(found.end(), here.begin(), here.end());
+    }
+    EXPECT_TRUE(homeRead) << "the home " << kReasonHome << " was not read";
+    EXPECT_TRUE(found.empty()) << found.size() << " reason(s) rendered outside the home -- render each through "
+                               << "core::reasonText(<the error_code>):" << reasonSpelled(found);
+}
+
+// THE SCAN, ON A SYNTHESIZED NEGATIVE: every refused form is found ONCE, by its rule, on its line; every near miss is
+// found NOWHERE -- the home's call, a comment, a literal, other names -- and the stated blindness (a base handler's
+// `what()`, an `auto` code streamed) is pinned AS blindness, so a scan that learns to see it must say so here.
+TEST(FilesystemQueriesGuard, TheReasonScanFindsEveryRefusedFormAndNoNearMiss) {
+    std::vector<std::string> const lines = {
+        "void a(std::error_code const& ec) { use(ec.message()); }",                                          // 1 R1
+        "void b(Holder* p) { use(p->message(3)); }",                                                         // 2 R1
+        "void c(int e) { use(std::generic_category().message(e)); }",                                        // 3 R1
+        "void d() { try { f(); } catch (std::system_error const& e) { use(e.what()); } }",                   // 4 R2
+        "void d2() { try { f(); } catch (std::filesystem::filesystem_error const& fe) { use(fe.what()); } }",  // 5 R2
+        "void g(wchar_t* t) { FormatMessageW(0, nullptr, 5, 0, t, 0, nullptr); }",                           // 6 R3
+        "void h() { use(std::strerror(errno)); }",                                                           // 7 R3
+        "void i() { std::error_code ec; out << ec; }",                                                       // 8 R4
+        "void j() { std::error_code why; use(std::format(\"{}\", why)); }",                                  // 9 R4
+        "void k(std::error_code const& ec) { use(core::reasonText(ec)); }",                                  // 10
+        "// ec.message(), strerror(errno), out << ec",                                                       // 11
+        "void l() { use(\"strerror(errno) and e.what() and ec.message()\"); }",                              // 12
+        "void m() { try { f(); } catch (std::exception const& any) { use(any.what()); } }",                  // 13 R2 blind
+        "void n() { use(messages()); use(messageCount(3)); use(o.messageText()); }",                         // 14
+        "void p() { auto code = f(); out << code; }",                                                        // 15 R4 blind
+        "void q() { std::error_code ec; out << ec.value(); use(std::format(\"{}\", ec.value())); }",         // 16
+        "void r(Settings const& s) { use(s.message); }",                                                     // 17
+    };
+    std::string text;
+    for (std::string const& l : lines) text += l + "\n";
+    auto const found = reasonRenderingsIn(sourceOf("src/fixture/reasons.cpp", text));
+    std::vector<std::pair<std::size_t, std::string>> got;
+    for (ReasonFinding const& f : found) got.emplace_back(f.line, f.rule);
+    std::vector<std::pair<std::size_t, std::string>> const want = {
+        {1, "R1"}, {2, "R1"}, {3, "R1"}, {4, "R2"}, {5, "R2"}, {6, "R3"}, {7, "R3"}, {8, "R4"}, {9, "R4"}};
+    EXPECT_EQ(got, want) << reasonSpelled(found);
 }

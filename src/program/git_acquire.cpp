@@ -92,11 +92,11 @@ struct CaptureSlot {
 
     std::error_code      ec;
     core::HostPath const temporary = core::temporaryDirectory(ec);   // the home's answer, a value (H6c)
-    if (ec) return "the system temporary directory is unknown (" + ec.message() + ")";
+    if (ec) return "the system temporary directory is unknown (" + core::reasonText(ec) + ")";
     core::HostPath const base = temporary / "dss-git-rev-parse";
     static_cast<void>(core::createDirectories(base, ec));   // at any length (`core::createDirectories`)
     if (ec)
-        return "'" + base.spelling().generic() + "' could not be created (" + ec.message() + ")";
+        return "'" + base.spelling().generic() + "' could not be created (" + core::reasonText(ec) + ")";
 
     auto const stamp = static_cast<std::uint64_t>(
         std::chrono::system_clock::now().time_since_epoch().count());
@@ -110,7 +110,7 @@ struct CaptureSlot {
             // exists, so the candidate is the one level it can make.
             if (core::createDirectories(candidate, cec) && !cec) return candidate;
             whyNot = "'" + candidate.spelling().generic() + "' "
-                   + (cec ? "could not be created (" + cec.message() + ")"
+                   + (cec ? "could not be created (" + core::reasonText(cec) + ")"
                           : std::string{"already exists"});
             return std::nullopt;
         });
@@ -297,13 +297,14 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
         "git rev-parse " + rev + " in '" + core::genericSpelling(checkoutDir) + "'");
     if (!out.ok) return out;
 
-    std::ifstream in = core::openInputStream(slot.file, std::ios::binary);   // the value's leaf, at any length
-    if (!in) {
+    auto opened = core::openInputStream(slot.file, std::ios::binary);   // the value's leaf, at any length
+    if (!opened) {
         out.ok     = false;
         out.detail = "git rev-parse succeeded but its captured output at '"
-                   + slot.file.spelling().generic() + "' could not be read";
+                   + slot.file.spelling().generic() + "' could not be read: " + core::reasonText(opened.error());
         return out;
     }
+    std::ifstream& in = *opened;
     out.output = trimAscii(std::string{std::istreambuf_iterator<char>{in},
                                        std::istreambuf_iterator<char>{}});
 

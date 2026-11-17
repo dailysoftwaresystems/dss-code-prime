@@ -290,15 +290,15 @@ _WSL_DISTRIBUTIONS = {}
 
 
 def wsl_distribution(tree=None):
-    """The WSL distribution this harness's POSIX half runs in on a Windows host: the ONE distribution the WSL legs
-    of the tree's own DssHarness configuration declare (`.harness-config/config.json`, `legs.<leg>.wsl` -- the linux
-    x86_64 legs), READ, never typed here. ★ (2026-09-30, the round-12 audit's S8): the POSIX half used to enter
+    """The WSL distribution this harness's POSIX half runs in on a Windows host: the ONE distribution the tree's own
+    DssHarness configuration declares (`.harness-config/config.json`, `hosts.wsl`; until 2026-11-17 read from the
+    linux x86_64 legs that named it, which moved to an ssh host), READ, never typed here. ★ (2026-09-30, the round-12 audit's S8): the POSIX half used to enter
     `wsl.exe -e`, the machine's DEFAULT distribution -- whatever a person last set -- while the WSL legs run in the
     one their configuration names, so the derive could configure sqlite in one Linux and the WSL leg run in
     another. ONE READER: the resolver's (`harness_legs.py --wsl-distribution`), the same one that enters the
     distribution into every argv the legs' launchers, path translator, probes and sweeps are spawned with -- a
     second reader here would be a second place for the two halves to disagree. Refused, by name (the resolver's
-    words), when the configuration cannot be read, when no leg declares a distribution, and when the legs declare
+    words), when the configuration cannot be read, when it declares no distribution, and when it declares
     two. Read once per tree; `tree` is the self-tests'."""
     key = tree or ""
     if key not in _WSL_DISTRIBUTIONS:
@@ -322,7 +322,7 @@ class PosixSide:
     """Where this harness's POSIX half runs: in THIS process on a POSIX host, and inside WSL
     (`wsl.exe -d <distribution> -e …`, never a login shell, never `wsl.exe --`) on a Windows host --
     the ONE host-keyed switch the Windows driver had (`HostNeedsWsl`), which decides WHERE the POSIX
-    toolchain runs and never which legs exist. The distribution is the one the tree's WSL legs declare
+    toolchain runs and never which legs exist. The distribution is the one the tree declares
     (`wsl_distribution`), read when first needed -- never the machine's default; `distribution` is the
     self-tests' injection."""
 
@@ -548,7 +548,7 @@ def site_pinned(site, lack):
 
 def wsl_usable(runner=None, which_=None, side=None):
     """(usable, why) for this host's WSL: usable when `wsl.exe` is on PATH AND runs a command in the
-    distribution the POSIX half runs in (`PosixSide`: the one the tree's WSL legs declare, 2026-09-30) --
+    distribution the POSIX half runs in (`PosixSide`: the one the tree declares, 2026-09-30) --
     `wsl.exe -d <it> -e echo <WSL_ANSWER>` exits 0 and prints the token. `why` is the measured reason it is
     not, in wsl.exe's own words (its UTF-16 output read without the NULs), or why the distribution cannot be
     named. The real host is probed once per process; `runner` (argv -> Result), `which_` and `side` (a

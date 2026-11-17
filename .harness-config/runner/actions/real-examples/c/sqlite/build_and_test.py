@@ -4,7 +4,7 @@
 ONE command proves dsscp builds SQLite from its REAL sources into the Tcl `testfixture` and the
 `sqlite3` CLI, and runs SQLite's own `.test` corpus green, for EVERY leg `legs.json` declares, on
 whatever host runs it -- Linux, macOS, an arm64 VPS or Windows (the POSIX half then runs inside
-WSL through `wsl.exe -d <the WSL legs' distribution> -e`). It replaced `build-and-test.sh` and its
+WSL through `wsl.exe -d <the tree's WSL distribution> -e`). It replaced `build-and-test.sh` and its
 Windows twin `build-and-test.ps1` on 2026-09-21 (lane mig, part 4: the operator's order that no
 `.sh`/`.ps1` lives under the actions directory), and carries the UNION of both drivers' checks.
 

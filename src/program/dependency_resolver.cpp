@@ -1,6 +1,7 @@
 #include "program/dependency_resolver.hpp"
 
 #include "core/substrate/every_unit.hpp"   // runEveryUnit -- every entry before a step fails
+#include "core/substrate/silent_unit.hpp"  // namingSilentUnits -- an entry that fails having said nothing is named
 #include "core/substrate/path_identity.hpp"
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_path_walk.hpp"   // findShippedConfigDir
@@ -194,7 +195,7 @@ private:
                std::size_t depth);
     [[nodiscard]] std::optional<fs::path>
     locateEntry_(Node const& parent, DependencyEntry const& entry,
-                 std::optional<std::string> const& acquiredGitName);
+                 std::optional<fs::path> const& acquiredCheckout);
     [[nodiscard]] bool prepareNodeSources_(std::size_t index);
     [[nodiscard]] bool registerOutputName_(Node& node);
 
@@ -229,6 +230,12 @@ private:
     std::map<std::string, std::size_t>    nodeByManifest_;   // canonical → index
     std::vector<std::size_t>              stack_;            // DFS, cycle keys
     std::map<std::string, std::string>    outputNameOwner_;  // name → canonical dir
+    // ★ A FAILURE IS SAID ONCE, BY THE FIRST UNIT THAT MEETS IT (P69 H6c2; the several-unit net's contract): an entry
+    // a manifest names twice, or a dependency two consumers reach (a diamond), meets the failure an earlier unit
+    // already reported. That unit's false already fails the walk, so a later one answers TRUE and says nothing --
+    // asking again would say the same words, which the reporter keeps once, and the net would name the second silent.
+    std::set<std::string>                         refusedEntries_;   // a refused entry, or a refused manifest
+    std::set<std::pair<std::size_t, std::string>> refusedGathers_;   // (node, consumer target) a gather refused
 
     // Lazily opened: a graph with no git entry must not create `.dss-deps`, and
     // that is also what makes `--force-git-cache` the silent no-op U-10 asks
@@ -327,7 +334,7 @@ DependencyCache* Resolver::cache_() {
 // every reader of a typo'd path looking for a manifest they never had.
 std::optional<fs::path>
 Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
-                       std::optional<std::string> const& acquiredCheckout) {
+                       std::optional<fs::path> const& acquiredCheckout) {
     fs::path dir;
     std::string spelling;
     if (entry.path.has_value()) {
@@ -358,7 +365,7 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
     } else {
         // A git entry: the checkout `DependencyCache::acquire` produced.
         spelling = entry.git.value_or(std::string{});
-        dir      = canonicalize(fs::path{*acquiredCheckout}, core::Use::Container);
+        dir      = canonicalize(*acquiredCheckout, core::Use::Container);   // the checkout's VALUE, never its rendering
     }
 
     fs::path const manifest = dir / std::string{kDependencyManifestName};
@@ -679,6 +686,13 @@ bool Resolver::walkChildren_(std::size_t parent, std::size_t depth) {
     // different-ref shape it makes it undetectable at ALL, because the second
     // entry's checkout target already exists and reads as a cache hit.
     std::vector<std::optional<std::string>> gitNames(entries.size());
+    // Each acquired checkout as the PATH the cache answered (P69 H6c2): a rendering re-entering as a path is read
+    // through the library's narrow conversion, the code page on MS STL.
+    std::vector<std::optional<fs::path>> checkouts(entries.size());
+    auto const entryName = [&](std::size_t i) {
+        return "dependency entry " + std::to_string(i) + " of '" + core::genericSpelling(nodes_[parent].manifestPath)
+               + "'";
+    };
     bool const hasGit = std::any_of(
         entries.begin(), entries.end(),
         [](DependencyEntry const& e) { return e.git.has_value(); });
@@ -695,35 +709,57 @@ bool Resolver::walkChildren_(std::size_t parent, std::size_t depth) {
         // entries after it are still asked. The STEPS stay in sequence -- nothing
         // is acquired until every name is registered collision-free, and nothing
         // located until every checkout is in hand.
-        bool const everyNameRegistered = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {
+        // Netted (H6c2): each refusal names its entry (its url and ref, or its path, and the declaring manifest).
+        bool const everyNameRegistered = substrate::runEveryUnit(
+            entries.size(), substrate::namingSilentUnits(rep_, "the git dependency registration", entryName,
+                                                         [&](std::size_t i) {
             if (!entries[i].git.has_value()) return true;
             auto name = cache->registerGitDependency(*entries[i].git,
                                                      entries[i].ref, rep_);
             if (!name) return false;   // 0xD020 / 0xD024 already reported
             gitNames[i] = *std::move(name);
             return true;
-        });
+        }));
         if (!everyNameRegistered) return false;
-        bool const everyCheckoutAcquired = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {
+        bool const everyCheckoutAcquired = substrate::runEveryUnit(
+            entries.size(), substrate::namingSilentUnits(rep_, "the git checkout acquisition", entryName,
+                                                         [&](std::size_t i) {
             if (!gitNames[i].has_value()) return true;
             auto const got = cache->acquire(*gitNames[i], rep_);
             if (got.outcome == CacheOutcome::AcquireFailed) {
                 return false;          // 0xD01E already reported
             }
-            // The checkout path replaces the name for the locate step below.
-            gitNames[i] = core::genericSpelling(got.checkout);
+            // The checkout path, as its value, for the locate step below.
+            checkouts[i] = got.checkout;
             return true;
-        });
+        }));
         if (!everyCheckoutAcquired) return false;
     }
 
     // Every entry is located and admitted, and reports its own refusal, before
-    // the walk fails (site (l), as above).
-    bool const everyEntryAdmitted = substrate::runEveryUnit(entries.size(), [&](std::size_t i) {
-        auto const manifest = locateEntry_(nodes_[parent], entries[i], gitNames[i]);
-        if (!manifest) return false;
+    // the walk fails (site (l), as above). An entry this resolution already
+    // refused -- named twice by one manifest -- and a manifest it already
+    // refused -- reached again through another entry -- answer true: the first
+    // refusal said it, and fails the walk.
+    auto const declared = [&](std::size_t i) {
+        return core::genericSpelling(nodes_[parent].manifestPath) + "\n"
+               + entries[i].path.value_or(entries[i].git.value_or(std::string{}));
+    };
+    bool const everyEntryAdmitted = substrate::runEveryUnit(
+        entries.size(), substrate::namingSilentUnits(rep_, "the dependency walk", entryName, [&](std::size_t i) {
+        if (refusedEntries_.contains(declared(i))) return true;   // said once, by the unit that met it first
+        auto const manifest = locateEntry_(nodes_[parent], entries[i], checkouts[i]);
+        if (!manifest) {
+            refusedEntries_.insert(declared(i));
+            return false;
+        }
+        std::string const admitted = "\n" + core::genericSpelling(*manifest);   // a manifest, whoever declares it
+        if (refusedEntries_.contains(admitted)) return true;
         auto const child = admitNode_(parent, *manifest, depth);
-        if (!child) return false;
+        if (!child) {
+            refusedEntries_.insert(admitted);
+            return false;
+        }
         // A manifest may name the same dependency twice; the graph edge is a
         // SET, so the second mention is the diamond case at one level.
         auto& kids = nodes_[parent].children;
@@ -731,7 +767,7 @@ bool Resolver::walkChildren_(std::size_t parent, std::size_t depth) {
             kids.push_back(*child);
         }
         return true;
-    });
+    }));
     if (!everyEntryAdmitted) return false;
     return true;
 }
@@ -1011,7 +1047,28 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
         }
     };
 
-    for (std::size_t const child : nodes_[index].children) {
+    // ★ EVERY CHILD IS GATHERED, AND BUILT, OR SAYS WHY NOT, BEFORE THE GATHER FAILS (`runEveryUnit`, the several-
+    // unit class's one home, P69 H6c2): a child's gather reads only its own subtree, memoised by (node, consumer), so a
+    // child that fails never stops its siblings. ONE child's sequence -- validate, derive, gather, build -- stays one
+    // unit's step, and the memo is written only when every child succeeded. A child a gather already refused for this
+    // consumer target (a diamond) answers true: the first refusal said it, and fails the gather.
+    std::vector<std::size_t> const children = nodes_[index].children;
+    bool const everyChildGathered = substrate::runEveryUnit(
+        children.size(),
+        substrate::namingSilentUnits(
+            rep_, "the dependency gather",
+            [&](std::size_t c) {
+                return "dependency '" + core::genericSpelling(nodes_[children[c]].manifestPath)
+                       + "' for consumer target '" + consumerSpec + "'";
+            },
+            [&](std::size_t c) {
+        std::size_t const child    = children[c];
+        auto const        childKey = std::pair{child, consumerSpec};
+        if (refusedGathers_.contains(childKey)) return true;   // said once, by the unit that met it first
+        auto const refuse = [&] {
+            refusedGathers_.insert(childKey);
+            return false;
+        };
         // ★ THE LANGUAGE↔TARGET ARCHITECTURE GATE, DEPENDENCY ARM
         // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE) — ONE SITE, ABOVE THE
         // COMPOSITION FORK, DELIBERATELY.
@@ -1052,7 +1109,7 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
                    "project 'dependsOn': dependency '"
                        + core::genericSpelling(nodes_[child].manifestPath) + "'",
                    rep_)) {
-            return std::nullopt;
+            return refuse();
         }
         if (nodes_[child].composition == DependencyComposition::SourceMerge) {
             // A source-merge node is NOT a build, so nothing is absorbed here:
@@ -1061,16 +1118,16 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
             // unchanged. Getting this wrong yields an undefined symbol whose
             // cause is two hops away.
             auto sub = gather_(child, consumerSpec, target, enclosingFmt);
-            if (!sub) return std::nullopt;
+            if (!sub) return refuse();
             for (auto const& a : sub->forThisBuild) add(a);
-            continue;
+            return true;
         }
         // ArtifactLink: its own build, its own derived format.
         auto depFmt = deriveFormat_(nodes_[child], consumerSpec, target,
                                     enclosingFmt);
-        if (!depFmt) return std::nullopt;
+        if (!depFmt) return refuse();
         auto inner = gather_(child, consumerSpec, target, *depFmt->schema);
-        if (!inner) return std::nullopt;
+        if (!inner) return refuse();
 
         fs::path artifact;
         auto const builtKey = std::pair{child, consumerSpec};
@@ -1080,7 +1137,7 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
         } else {
             auto produced = buildNode_(child, consumerSpec, target, *depFmt,
                                        inner->forThisBuild);
-            if (!produced) return std::nullopt;
+            if (!produced) return refuse();
             artifact = *produced;
             artifactMemo_.emplace(builtKey, artifact);
         }
@@ -1091,7 +1148,9 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
         for (auto const& a : inner->forThisBuild) {
             if (!absorbs(*depFmt->schema, a)) add(a);
         }
-    }
+        return true;
+    }));
+    if (!everyChildGathered) return std::nullopt;
 
     gatherMemo_.emplace(memoKey, incoming);
     return Gathered{std::move(incoming)};
@@ -1135,48 +1194,68 @@ std::optional<DependencyResolution> Resolver::run(ProjectConfig const& rootConfi
         }
     }
 
-    // The `ArtifactLink` half, once per CONSUMER target.
-    for (auto const& spec : req_.targets) {
+    // The `ArtifactLink` half, once per CONSUMER target. ★ EVERY TARGET IS
+    // GATHERED, OR SAYS WHY NOT, BEFORE THE RESOLUTION FAILS (`runEveryUnit`,
+    // P69 H6c2): a target whose gather fails never stops the targets after it.
+    bool const everyTargetGathered = substrate::runEveryUnit(
+        req_.targets.size(),
+        substrate::namingSilentUnits(
+            rep_, "the dependency resolution",
+            [&](std::size_t s) { return "consumer target '" + req_.targets[s] + "'"; },
+            [&](std::size_t s) {
+        std::string const& spec = req_.targets[s];
         auto parsed = TargetSpec::parse(spec);
         // A spec that will not parse, a target or format that will not load:
         // SKIPPED here, exactly as the driver's own AP3 gate skips them, so the
         // authoritative `D_InvalidTargetSpec` / `D_SchemaLoadFailed` comes from
         // the one place that owns it. Such a target still fails the whole build
         // downstream, so nothing slips past.
-        if (!parsed) continue;
+        if (!parsed) return true;
         auto targetR = TargetSchema::loadShipped(parsed->targetName);
-        if (!targetR.has_value()) continue;
+        if (!targetR.has_value()) return true;
         auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
-        if (!formatR.has_value()) continue;
+        if (!formatR.has_value()) return true;
 
         auto gathered = gather_(0, spec, **targetR, **formatR);
-        if (!gathered) return std::nullopt;
-        if (gathered->forThisBuild.empty()) continue;
+        if (!gathered) return false;
+        if (gathered->forThisBuild.empty()) return true;
         std::vector<ResolveLibrarySpec> libs;
         libs.reserve(gathered->forThisBuild.size());
         for (auto const& a : gathered->forThisBuild) {
             libs.push_back(ResolveLibrarySpec{a.path, {}});
         }
         out.libraryAdditionsByTarget.emplace(spec, std::move(libs));
-    }
+        return true;
+    }));
+    if (!everyTargetGathered) return std::nullopt;
 
     // U-7's post-build half: ONLY for an `ArtifactLink` dependency whose own
     // build returned 0, mirroring the root's rule. Run once per dependency
     // rather than once per consumer target — a hook is a statement about the
     // project, not about a platform — and only after every target of it
-    // succeeded, which is exactly the state reached here.
-    for (std::size_t i = 1; i < nodes_.size(); ++i) {
-        Node const& node = nodes_[i];
-        if (node.composition != DependencyComposition::ArtifactLink) continue;
+    // succeeded, which is exactly the state reached here. ★ EVERY DEPENDENCY'S
+    // HOOKS RUN, OR SAY WHY NOT, BEFORE THE RESOLUTION FAILS (`runEveryUnit`,
+    // P69 H6c2): each runs in its own directory after its own build, so one
+    // dependency's failed hook decides nothing about the next; ONE dependency's
+    // hooks stay a sequence (`runBuildScripts`).
+    std::size_t const dependencies = nodes_.size() - 1;   // node 0 is the root, which runs its own hooks
+    bool const everyHookRan = substrate::runEveryUnit(
+        dependencies,
+        substrate::namingSilentUnits(
+            rep_, "the post-build hooks",
+            [&](std::size_t d) { return "dependency '" + core::genericSpelling(nodes_[d + 1].manifestPath) + "'"; },
+            [&](std::size_t d) {
+        std::size_t const i    = d + 1;
+        Node const&       node = nodes_[i];
+        if (node.composition != DependencyComposition::ArtifactLink) return true;
         bool built = false;
         for (auto const& [key, path] : artifactMemo_) {
             if (key.first == i) { built = true; break; }
         }
-        if (!built) continue;
-        if (!runBuildScripts(node.config.postBuildScripts, node.dir, rep_)) {
-            return std::nullopt;
-        }
-    }
+        if (!built) return true;
+        return runBuildScripts(node.config.postBuildScripts, node.dir, rep_);
+    }));
+    if (!everyHookRan) return std::nullopt;
 
     // The lockfile is written ONCE, after the walk — the file is rewritten
     // whole, so N writes would buy nothing. Only when a git dependency actually

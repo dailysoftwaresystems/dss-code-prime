@@ -8,10 +8,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <filesystem>
 #include <functional>
 #include <span>
 #include <string>
+#include <system_error>
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate.
 //
@@ -223,8 +225,10 @@ inline constexpr std::uint32_t kMaxClaimAttempts = 1000;
 // three-way path-type differential, and the host split are at the definition
 // site in writer.cpp.
 //
-// Caller owns the returned stream and must `std::fclose` it.
-[[nodiscard]] DSS_EXPORT std::FILE*
+// Caller owns the returned stream and must `std::fclose` it. A refused claim answers the OS's REASON (P69 H6c2: read at
+// the failing call; `core::reasonText` renders it), never a bare null: an occupied name answers ERROR_FILE_EXISTS /
+// EEXIST like every other refusal, and the caller's probe of the entry decides whether to step over it.
+[[nodiscard]] DSS_EXPORT std::expected<std::FILE*, std::error_code>
 createExclusiveBinary(core::HostPath const& p);
 
 // ── THE COMMIT: rename a staged file over its target ───────────────────────

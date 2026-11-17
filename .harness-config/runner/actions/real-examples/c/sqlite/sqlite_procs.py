@@ -9,7 +9,7 @@ twin's `ps_enum_available` / `our_fixture_pids` / `stop_our_fixtures` / `proc_st
 run-lock liveness (`Get-LockOwner`, `Test-LockOwnerAlive`). The union, with two defects closed:
   * the PowerShell sweep compared two WINDOWS spellings of a fixture that a WSL launcher runs as
     a LINUX process, so on WSL legs it matched nothing; a launched fixture is now swept INSIDE its
-    own kernel (the plan's `kernelEntryArgv`, e.g. `wsl.exe -d <the WSL legs' distribution> -e`),
+    own kernel (the plan's `kernelEntryArgv`, e.g. `wsl.exe -d <the tree's WSL distribution> -e`),
     matching the path spelled in that kernel's namespace;
   * the bash sweep excluded only itself; this process AND its ancestors are excluded now, and an
     enumeration that cannot run is UNVERIFIED (warned), never "none found".
@@ -1592,7 +1592,7 @@ def _selftest_unverified(t):
 
 
 def _wsl_path(win_path):
-    # Through the POSIX side's own entry: the distribution the WSL legs declare, the one `wsl_usable` judged
+    # Through the POSIX side's own entry: the distribution the tree declares, the one `wsl_usable` judged
     # (2026-09-30, the round-12 audit's S8) -- never the machine's default.
     r = _run(C.PosixSide("windows").argv(["wslpath", "-a", "-u", win_path]), timeout=ENUM_TIMEOUT_S,
              c_locale=False)
@@ -1622,7 +1622,7 @@ def _selftest_launched(t, work):
     if os.name == "nt":
         if not _launched_capability(t, *C.wsl_usable()):
             return
-        # The kernel `wsl_usable` just judged: the WSL legs' own distribution, never the machine's default.
+        # The kernel `wsl_usable` just judged: the tree's declared distribution, never the machine's default.
         side = C.PosixSide("windows")
         prefix = side.entry()
         ready_win = os.path.join(work, tag + ".ready")

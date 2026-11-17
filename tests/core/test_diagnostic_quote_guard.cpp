@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -241,10 +242,12 @@ struct FileExtras {
 
 // A source's bytes, read through the home: `p` is the walk's LISTED value, never its text re-resolved.
 [[nodiscard]] std::string readAll(dss::core::HostPath const& p) {
-    std::ifstream in = dss::core::openInputStream(p, std::ios::binary);
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+    // A source the scan cannot open is no clean source: the scan stops, naming it and the OS's reason (H6c2 (d)).
+    auto opened = dss::core::openInputStream(p, std::ios::binary);
+    if (!opened)
+        throw std::runtime_error("the scan could not open '" + p.spelling().generic() + "': "
+                                 + dss::core::reasonText(opened.error()));
+    return {std::istreambuf_iterator<char>{*opened}, std::istreambuf_iterator<char>{}};
 }
 
 // THE TREE: every source under src/ -- not a list of the files known to quote today, so a file that starts

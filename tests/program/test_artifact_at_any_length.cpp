@@ -60,7 +60,7 @@ constexpr char const* kMainSource = "int dss_long_path_value(void);\nint main(vo
 
 // `text` written to `file` -- through the extended-length spelling, as DSS writes.
 [[nodiscard]] bool writeText(fs::path const& file, char const* text) {
-    std::ofstream out = dss::core::openOutputStream(file, std::ios::binary);
+    std::ofstream out = dss::core::openOutputStream(file, std::ios::binary).value();
     out << text;
     return out.good();
 }
@@ -121,7 +121,7 @@ TEST(ArtifactAtAnyLength, AnObjectIsWrittenReadBackAndLinkedIntoAnImageThatRuns)
         if (cell.atLeast != 0) EXPECT_GE(image.native().size(), 300u) << "the image's own path is not past the limit";
 
         // (3) THE IMAGE'S BYTES read back.
-        std::ifstream in = dss::core::openInputStream(image, std::ios::binary);   // at any length (the home)
+        std::ifstream in = dss::core::openInputStream(image, std::ios::binary).value_or(std::ifstream{});   // any length
         std::string const head{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
         ASSERT_GE(head.size(), 2u) << "the image was not read back";
         EXPECT_EQ(head.substr(0, 2), "MZ");

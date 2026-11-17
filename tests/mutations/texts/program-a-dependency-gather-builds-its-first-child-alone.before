@@ -1,0 +1,2 @@
+    bool const everyChildGathered = substrate::runEveryUnit(
+        children.size(),

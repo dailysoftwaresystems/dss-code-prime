@@ -15,6 +15,7 @@
 #include "link/got_slots.hpp"          // lowerGotSlotReferences — the image's GOT slots
 #include "link/pc_relative_import_address.hpp"   // bindPcRelativeImportAddressUnits
 #include "link/pointer_reloc.hpp"      // absolutePointerRelocKind — the one pointer-slot predicate
+#include "link/standing_fallback.hpp"  // standingFallback — which of a name's fallbacks stands
 #include "link/static_init_tables.hpp"
 #include "link/thread_storage_agreement.hpp"   // reportThreadStorageDisagreements (P69 round 4)
 #include "link/unit_linker_decisions.hpp"   // decideUnitLinkerRequests / applyUnitLinkerDecisions (P69 round 4)
@@ -2591,6 +2592,16 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             conflict(e, field, std::to_string(kept), std::to_string(incoming));
         };
         auto const boolStr = [](bool b) { return std::string{b ? "true" : "false"}; };
+        // What a row of unit `i` states of its name's fallback (`standingFallback`): a weak external's own default,
+        // the absolute 0 included, or a directive's; none for a plain reference.
+        auto const fallbackStatementOf = [&](std::size_t i, ExternImport const& ext) -> std::optional<FallbackStatement> {
+            bool const weakDefault = ext.binding == SymbolBinding::Weak;
+            if (ext.fallbackName.empty() && !weakDefault) return std::nullopt;
+            return FallbackStatement{ext.fallbackName,
+                                     weakDefault ? FallbackSource::WeakDefault : FallbackSource::Directive,
+                                     linkPositionOf(modules[i], ext.symbol), "linked unit #" + std::to_string(i)};
+        };
+        std::unordered_map<std::size_t, FallbackStatement> fallbackStatedAt;   // combined row -> its standing statement
 
         std::unordered_map<std::string, std::size_t> externIdxForKey;
         for (std::size_t i = 0; i < modules.size(); ++i) {
@@ -2601,6 +2612,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                     externIdxForKey.try_emplace(dedupKey(ext),
                                                 combined.externImports.size());
                 if (firstOfItsKind) {
+                    if (auto statement = fallbackStatementOf(i, ext); statement.has_value()) {
+                        fallbackStatedAt.emplace(kit->second, std::move(*statement));
+                    }
                     ExternImport out = ext;
                     out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};  // the CANONICAL id
                     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the
@@ -2664,14 +2678,15 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 kept.searchesArchives = kept.searchesArchives || ext.searchesArchives;
                 // `fallbackName` — an image decided every fallback before the
                 // merge (`bindFallbackReferences`), so only a relocatable
-                // artifact's rows still state one; a row that states none adopts
-                // the other's, and two different fallbacks for one name are a
-                // real conflict, refused like any other.
-                if (kept.fallbackName.empty()) {
-                    kept.fallbackName = ext.fallbackName;
-                } else if (!ext.fallbackName.empty() && kept.fallbackName != ext.fallbackName) {
-                    conflict(ext, "`fallbackName` (what the name resolves to when nothing defines it)",
-                             kept.fallbackName, ext.fallbackName);
+                // artifact's rows still state one. Of two statements of the
+                // name's fallback, the one that stands is handed on, by the one
+                // rule (`standingFallback`, P69 H6c2): its final linker takes the
+                // first it reads (u8), so handing on the standing one gives what
+                // handing on both in the link's order would.
+                if (auto const candidate = fallbackStatementOf(i, ext); candidate.has_value()) {
+                    auto const [st, fresh] = fallbackStatedAt.try_emplace(kit->second, *candidate);
+                    if (!fresh) standingFallback(ext.mangledName, st->second, *candidate, reporter);
+                    kept.fallbackName = st->second.fallback;
                 }
                 // `commonSize` / `commonAlignment` / `commonVisibility` — only a
                 // relocatable artifact's rows are still COMMONS here (an image
@@ -3422,26 +3437,36 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // Afterwards no row states a fallback. A RELOCATABLE artifact never gets here:
 // its fallbacks are its final linker's, which the writer hands on as
 // directives. Returns TRUE when no row states one (`out` untouched).
+//
+// ★ ONE FALLBACK STANDS PER NAME, BY THE ONE RULE (P69 H6c2, `standingFallback`):
+// a weak external's own default -- a row of WEAK binding, with the undefined
+// default it names or with none, the absolute 0 -- over every directive's; of
+// two of one source, the first in the LINK's order (`linkPositionOf`), never the
+// order `modules` holds them in. A dropped fallback is warned about, and a name
+// whose standing statement is the absolute 0 keeps no fallback at all.
 [[nodiscard]] bool bindFallbackReferences(std::span<AssembledModule const> modules,
                                           std::vector<AssembledModule>&    out,
                                           DiagnosticReporter&              reporter) {
-    std::unordered_map<std::string, std::string> fallbackOf;
-    for (auto const& m : modules) {
+    bool anyStated = false;
+    std::unordered_map<std::string, FallbackStatement> standingOf;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        AssembledModule const& m = modules[i];
         for (auto const& e : m.externImports) {
-            if (e.fallbackName.empty()) continue;
-            auto const [it, fresh] = fallbackOf.emplace(e.mangledName, e.fallbackName);
-            if (!fresh && it->second != e.fallbackName) {
-                report(reporter, DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                       DiagnosticSeverity::Error,
-                       std::format("linker: the linked objects give '{}' two fallbacks, "
-                                   "'{}' and '{}' — a name nothing defines can resolve "
-                                   "to only one of them.",
-                                   e.mangledName, it->second, e.fallbackName));
-                return false;
-            }
+            bool const weakDefault = e.binding == SymbolBinding::Weak;
+            if (e.fallbackName.empty() && !weakDefault) continue;
+            anyStated = anyStated || !e.fallbackName.empty();
+            FallbackStatement statement{e.fallbackName,
+                                        weakDefault ? FallbackSource::WeakDefault : FallbackSource::Directive,
+                                        linkPositionOf(m, e.symbol), "linked unit #" + std::to_string(i)};
+            auto const [it, fresh] = standingOf.try_emplace(e.mangledName, statement);
+            if (!fresh) standingFallback(e.mangledName, it->second, std::move(statement), reporter);
         }
     }
-    if (fallbackOf.empty()) return true;
+    if (!anyStated) return true;
+    std::unordered_map<std::string, std::string> fallbackOf;
+    for (auto const& [name, statement] : standingOf) {
+        if (!statement.fallback.empty()) fallbackOf.emplace(name, statement.fallback);
+    }
     // What the link resolves with no fallback: a definition a linked unit
     // makes with external linkage, and a name a library binds — with the
     // first row binding each such name, whose binding a renamed row adopts.
@@ -3462,9 +3487,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         std::vector<std::size_t> dropped;   // rows folded onto the fallback's own row
         for (std::size_t k = 0; k < m.externImports.size(); ++k) {
             ExternImport& e = m.externImports[k];
+            e.fallbackName.clear();   // the standing fallback is the name's, below; a dropped one goes
             auto const fb = fallbackOf.find(e.mangledName);
             if (fb == fallbackOf.end()) continue;
-            e.fallbackName.clear();
             if (resolved.contains(e.mangledName)) continue;   // A answers for itself
             std::string target = fb->second;
             std::unordered_set<std::string> seen{e.mangledName};
@@ -4395,13 +4420,19 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                 if (own->fallbackName.empty()) {
                     own->fallbackName = fallback;
                 } else if (own->fallbackName != fallback) {
-                    report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
-                           std::format("linker: linked unit #{} gives '{}' the fallback '{}', and its definition of "
-                                       "the name lies in section group '{}', whose copy the link keeps from linked "
-                                       "unit #{}: the name stays and resolves to '{}', so it would have two "
-                                       "fallbacks -- refused rather than pick one.",
-                                       i, ms.name, own->fallbackName, lostIn->second, keeperOf.at(lostIn->second),
-                                       fallback));
+                    // ★ REFUSED, AS BOTH REFERENCE LINKERS REFUSE IT (P69 H6c2, ✔MEASURED 2026-11-16, u9 F3: lane
+                    // cs's carried-alias units with b's own `/alternatename:` for the weak name, link.exe LNK1120 and
+                    // GNU ld "undefined reference", in BOTH orders). The weak name's own default would stand over the
+                    // directive (`standingFallback`), and it lies in the copy the link discards, so the name is
+                    // undefined.
+                    report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                           std::format("linker: '{}' of linked unit #{} is a weak name whose default '{}' lies in "
+                                       "section group '{}', whose copy the link keeps from linked unit #{}, and the "
+                                       "unit's linker directives also give it the fallback '{}': a weak external's "
+                                       "own default stands over a directive's, and it goes with the discarded copy, "
+                                       "so the name is undefined -- link.exe and GNU ld refuse it in either order.",
+                                       ms.name, i, fallback, lostIn->second, keeperOf.at(lostIn->second),
+                                       own->fallbackName));
                 }
                 continue;
             }

@@ -1036,6 +1036,44 @@ round's close; each checkpoint's commit message says what was and was not run on
     stage 6, split off by size (ruled 2026-11-17 on cs's MEASURED census of 38 cells): the 17
     `unimplementedCallingConventions` rows on every axis, and the swift parameter attributes. aarch64_sve_pcs's
     scalable types are being measured before a ruling.
+- **Checkpoint 48 (2026-11-17) = the harness lane's fold H6c2, with main's fix of checkpoint 47's red:**
+  - THE MERGE BLOCKER `examples/corpus-lints` (known defect (14), its second half) is FIXED: a loader search
+    directory is one OBJECT (`PathIdentity::of(directory, Container)`), never one rendering. ✔MEASURED green by the
+    lane on all five legs, linux-arm64 included.
+  - THE OS-REASON CLASS is closed at its one home (`path_identity`): a failing host primitive answers the OS's
+    reason, read at the failing call. The stream family returns `std::expected<…, std::error_code>`, and every one
+    of its 71 calls takes the answer. Every diagnostic renders the reason through `core::reasonText`, which is
+    guarded with no exemption list. `PathRefusal::NoLastName` was valued 0, a code read as success; it is now 1.
+  - Also folded: the per-CU drain onto the one loop, site 15 netted, five argv cells, and the checkpoint-45 sweep's
+    arms redeclared.
+  - Decisions, veto-able:
+    - a VERSION file that is there but cannot be opened is refused, naming the reason;
+    - an unopenable shipped descriptor throws, as the corpus walk does.
+  - CHECKPOINT 47 WAS RED, MAIN'S OWN DEFECT (✔MEASURED by main's five-leg suite of `f7754be6`): moving the
+    linux-x86_64 legs off WSL left no DssHarness leg naming a WSL distribution.
+    - The sqlite resolver read the distribution from `legs.<leg>.wsl`, so every Windows plan was refused, on every
+      host.
+    - Red because of it: `harness/test_sqlite_harness_legs` (6 cases), `sqlite_driver_selftest`,
+      `sqlite_benchmark_selftest` and `corpus-lints`.
+    - The fact's one home is now the HOST declaration, `hosts.wsl` (exactly one, refused by name otherwise). The
+      self-tests' synthesized trees include checkpoint 47's shape. The new arm is
+      tests-harness-legs-takes-the-wsl-distribution-from-a-leg.
+    - ✔MEASURED on this Windows host: the resolver self-test 2101/0, the benchmark self-test 121/0, and
+      `build_and_test.py --self-test` OK.
+  - FOUND BY THE NEW NATIVE UBUNTU HOST (g++ 15.2.0), in the same suite and not on WSL: two reds, known defect
+    (17), routed to hm before H6d.
+  - This machine takes THREE heavy legs (`hosts.local.admission`): ✔MEASURED 125.7 GiB RAM, a 154.7 GiB commit
+    limit, 32 CPUs.
+    - The arm64 VPS (47.4 GiB, which cannot grow) holds only two full debug builds of ~16 GiB each. Every lane
+      cleans its arm64 legs once their verdict is read. The DssHarness issue that a leg short of room should
+      reclaim idle builds is held for the operator.
+  - Rows: H6c2 opens 8, all 🔵 DISCLOSED and HEAD's debt. D-LK-A-NAME-GIVEN-TWO-FALLBACKS-IS-REFUSED-WHERE-LINK-EXE-LINKS
+    is FIXED here and closes when its arms read `passed`. Six measure H7's plans, and D-LIR-A-REFUSED-LOWERING-CASCADES-A-USED-BEFORE-DEFINITION
+    is H7's to close.
+  - Arms: 63 new, 2 retired, 137 changed, plus main's 1; 1955 arms. Balance: 700 open against 620 at `71648598`,
+    and 700 against 692 at `f7754be6` (+8 disclosed).
+  - Fold order now: f26e → U1 (hm: known defect (17)) → f26f → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 →
+    H7b2 → H7c, with f26g (SVE) placed where ready.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -1101,8 +1139,8 @@ round's close; each checkpoint's commit message says what was and was not run on
   - `program/test_entry_envp_run` is red on both Windows legs and both Linux legs. It is a STALE TEST of 3e's, which
     xa restates in 3f.
   - `examples/corpus-lints` (`ExamplesCorpusLint.LoaderSearchPathValueIsTheResolvedLibraryDirectories`) is red on
-    macos-arm64 and both Linux legs. H6c's examples runner no longer resolves `a/sub/..` to `a` on POSIX. It is a
-    MERGE BLOCKER of hm's H6c2.
+    macos-arm64 and both Linux legs. H6c's examples runner no longer resolves `a/sub/..` to `a` on POSIX. FIXED by
+    checkpoint 48 (H6c2), ✔MEASURED by the lane on all five legs.
   - Checkpoint 44's Mac sweep left 12 arms violated and 2 survived, all routed.
   - Checkpoint 45's sweeps: on macos-arm64-debug, 8 violated and 1 survived; on windows-x86_64-debug, 11 violated.
     - Every one is hm's, for H6c2, except three site arms of xa's in `dss_program_test_every_unit`.
@@ -1121,6 +1159,13 @@ round's close; each checkpoint's commit message says what was and was not run on
   - With it, a pre-existing SILENT WRONG VALUE: `_Generic(CT, const int: 1, int: 2)` exited 2 at `ae057909`, where
     the clangs select 1.
   - Both close in lm's L2b4: the type-operand alternative of `genericExpr`, selected by the unconverted type.
+  (17) FOUND BY THE NATIVE UBUNTU HOST (g++ 15.2.0), ✔MEASURED by main's five-leg suite of `f7754be6` (run
+  20261117-163612-b7e572c4), never red on WSL. Each is diagnosed by hm's U1 before its fix:
+  - `c23_formatted_io`, red in both runners: `sscanf("0b", "%i%n", …)` prints `1 0 2` on this host, where the
+    example expects `0 -1 -1`. It is the platform C library's answer, and the expectation names one library's.
+  - (`program/test_entry_envp_run`, red there too, is known defect (14)'s stale test, xa's in 3f.)
+  - `ConfigMemoHoldsATotalScan.AFormatScanDoesNotEvictTheLanguageDocument`: `GrammarSchema::loadShipped` of the
+    language the test names fails there.
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the

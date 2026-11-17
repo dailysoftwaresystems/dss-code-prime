@@ -199,6 +199,10 @@ endif()
 # (tests/test_support/os_link.hpp), so they run on the MinGW build -- whose library can neither make
 # a link nor see one -- as on every other.
 dss_add_test(NAME core/substrate/test_directory_tree    SOURCES substrate/test_directory_tree.cpp)
+# THE TYPED HOST PATH HOME'S UNIVERSE: one case per cell of the product the home's own vocabulary generates
+# (substrate/host_path_universe.hpp: origin x use x root shape x name edge x position x drive), each judged by
+# the host's own answer -- the reference rule over every cell, the operations over the witness cells, totality.
+dss_add_test(NAME core/substrate/test_host_path_universe SOURCES substrate/test_host_path_universe.cpp)
 # THE SOURCE GUARD of the substrate's filesystem questions: no std::filesystem question whose answer depends on
 # how a link is read, in src/ outside src/core/substrate/ or in integrated_tests/ (the guard's header states
 # the class, the forms it refuses and why).
@@ -207,6 +211,11 @@ dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_
 # leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for (stated where the
 # top-level CMakeLists sums the declarations). The mutation sweep starts the binary itself and asks no label.
 dss_label_repo_guard(core/test_filesystem_queries_guard)
+# THE ENGINE GUARD of the linear scanners: no C++ source under src/, tests/ or integrated_tests/ includes <regex>
+# or names its vocabulary (the guard's header states the class: a regex executor's stack depth follows its input).
+dss_add_test(NAME core/test_no_regex_guard SOURCES test_no_regex_guard.cpp)
+# `repo-guard`, DECLARED beside its registration: what it judges is the SOURCE TREE, the same bytes on every leg.
+dss_label_repo_guard(core/test_no_regex_guard)
 # THE SOURCE GUARD of a fresh SymbolId (P69 fold f26d, review-csf26c2 N9): no source under src/ but
 # src/core/types/symbol_id_cursor.hpp makes one from arithmetic, a counter or a size (the guard's header
 # states the forms it refuses). `repo-guard`, as the filesystem guard above: it judges the source tree.

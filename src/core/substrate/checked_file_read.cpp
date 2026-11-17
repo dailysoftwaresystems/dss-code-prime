@@ -90,15 +90,12 @@ readChecked(HostPath const& path, std::optional<std::uintmax_t> maxBytes) {
 
     // The OS's reason for a refused open is read from `errno` the open left -- it is cleared first, so a stale one
     // is never reported: gcc and clang name it ("Permission denied"), and so does this.
-    errno = 0;
-    std::ifstream in = openInputStream(path, std::ios::binary);   // the value's LEAF reference, at any length
-    if (!in) {
-        int const why = errno;
+    auto opened = openInputStream(path, std::ios::binary);   // the value's LEAF reference, at any length
+    if (!opened) {
         return std::unexpected(FileReadError{
-            FileReadFailure::OpenFailed,
-            "failed to open '" + shown + "' for reading"
-                + (why != 0 ? " (" + std::generic_category().message(why) + ")" : std::string{})});
+            FileReadFailure::OpenFailed, "failed to open '" + shown + "' for reading: " + reasonText(opened.error())});
     }
+    std::ifstream& in = *opened;
 
     // AFTER the open, so a MISSING file reports "failed to open" (what every
     // caller reported before this helper existed) rather than the narrower

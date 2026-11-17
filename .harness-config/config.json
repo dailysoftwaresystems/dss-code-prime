@@ -194,7 +194,19 @@
     }
   ],
   "hosts": {
-    "local": {},
+    // THIS PC TAKES THREE HEAVY LEGS, two elsewhere (P69, 2026-11-17). ✔MEASURED that day after its RAM grew: 125.7 GiB
+    // physical, a 154.7 GiB commit limit (29 GiB page file), 91.4 GiB committed (59.1%) with the operator's own IDEs
+    // open, 32 logical CPUs. Three legs at buildCores 6 use 18 of the 32. maxMemoryPercent 76 (117.6 GiB) still gates
+    // each start, so a third leg waits whenever two big builds hold the commit. The linux-x86_64 legs left this PC for
+    // the Ubuntu host the same day, so its slots now carry only the Windows legs, WSL's and the mutation sweeps.
+    // ⓘ Where trees that declare different counts share this PC, a leg starts only within the LOWEST count in front of
+    // it ('help admission'), so a lane's tree runs on three only once a refresh has carried this line into it.
+    "local": { "admission": { "heavyLegs": 3 } },
+    // ★ THE ONE WSL DISTRIBUTION THIS TREE DECLARES (2026-11-17). No DssHarness leg runs in WSL any more (the
+    // linux-x86_64 legs moved to the `ubuntu` ssh host), but a Windows-driven sqlite corpus still launches its Linux
+    // legs, and runs its POSIX half, inside WSL: the sqlite resolver (harness_legs.py `wsl_distribution_of`) reads
+    // the distribution HERE, exactly one, never the machine's default. Until that day it read the legs' `wsl`, and
+    // checkpoint 47 went red on every host when the last such leg moved.
     "wsl": {
       "Ubuntu": {
         "repositoryPath": "~/src/dss-code-prime"

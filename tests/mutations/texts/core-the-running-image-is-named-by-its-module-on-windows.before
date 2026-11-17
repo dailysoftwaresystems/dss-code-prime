@@ -1,1 +1,1 @@
-    if (!::QueryFullProcessImageNameW(::GetCurrentProcess(), 0, answer.data(), &size)) {
+    if (!::QueryFullProcessImageNameW(process, 0, answer.data(), &size)) {

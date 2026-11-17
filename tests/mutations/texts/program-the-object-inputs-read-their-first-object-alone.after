@@ -1,1 +1,1 @@
-    bool const everyObjectRead = substrate::runEveryUnit(std::min<std::size_t>(objectPaths.size(), 1), [&](std::size_t o) {
+    bool const everyObjectRead = substrate::runEveryUnit(std::min<std::size_t>(objectPaths.size(), 1), substrate::namingSilentUnits(

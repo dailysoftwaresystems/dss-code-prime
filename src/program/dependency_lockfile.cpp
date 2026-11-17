@@ -116,13 +116,14 @@ DependencyLockfile::load(fs::path const& lockPath, DiagnosticReporter& rep) {
     // through the filesystem instead of through the parser.
     if (core::reachedKind(lockPath, core::Use::Leaf, ec) == core::EntryKind::Absent || ec) return DependencyLockfile{};
 
-    std::ifstream in = core::openInputStream(lockPath, std::ios::binary);   // at any length (the home)
-    if (!in) {
+    auto opened = core::openInputStream(lockPath, std::ios::binary);   // at any length (the home)
+    if (!opened) {
         emitLockfileMalformed(rep, lockPath,
                               "the file exists but could not be opened for "
-                              "reading");
+                              "reading: " + core::reasonText(opened.error()));
         return std::nullopt;
     }
+    std::ifstream& in = *opened;
     std::string const text{std::istreambuf_iterator<char>{in},
                            std::istreambuf_iterator<char>{}};
 
@@ -236,7 +237,7 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         if (ec) {
             emitLockfileWriteFailed(rep, "the directory '" + core::genericSpelling(dir)
                                              + "' could not be created: "
-                                             + ec.message());
+                                             + core::reasonText(ec));
             return false;
         }
     }
@@ -301,11 +302,14 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
             lockPath.parent_path()
             / (lockPath.filename().string() + ".tmp-" + std::to_string(pid)
                + "-" + std::to_string(n));
-        claimed = linker::detail::createExclusiveBinary(candidate);
-        if (claimed != nullptr) {
-            tmp = std::move(candidate);
+        auto const attempt = linker::detail::createExclusiveBinary(candidate);
+        if (attempt) {
+            claimed = *attempt;
+            tmp     = std::move(candidate);
             break;
         }
+        // The claim's OWN reason, read at the call (H6c2) -- before the probe below overwrites errno.
+        std::error_code const refused = attempt.error();
         // Occupied — another save's, or a killed build's — is STEPPED OVER.
         // Asked at the ENTRY (`symlink_status`), which is the question the
         // exclusive create asked; anything else is a real failure, reported now.
@@ -313,21 +317,27 @@ bool DependencyLockfile::save(fs::path const&     lockPath,
         if (core::entryKind(candidate, core::Use::Leaf, eec) != core::EntryKind::Absent && !eec) continue;
         emitLockfileWriteFailed(rep, "the scratch file '"
                                          + core::genericSpelling(candidate)
-                                         + "' could not be created for writing");
+                                         + "' could not be created for writing: " + core::reasonText(refused));
         return false;
     }
     {
+        core::clearRuntimeReason();
         std::size_t const written =
             text.empty() ? std::size_t{0}
                          : std::fwrite(text.data(), 1, text.size(), claimed);
+        // The write's reason, read before the close can overwrite it (H6c2).
+        std::error_code const wrote = written != text.size() ? core::runtimeReason() : std::error_code{};
         // The close is checked, not left to a destructor: a flush that failed
         // on a full disk would otherwise be swallowed — the silent-truncation
         // shape `K_ImageWriteCloseFailed` exists for one tier down.
-        bool const closed = std::fclose(claimed) == 0;
+        core::clearRuntimeReason();
+        bool const            closed = std::fclose(claimed) == 0;
+        std::error_code const shut   = closed ? std::error_code{} : core::runtimeReason();
         if (written != text.size() || !closed) {
             emitLockfileWriteFailed(rep, "writing the scratch file '"
                                              + core::genericSpelling(tmp)
-                                             + "' failed");
+                                             + "' failed: "
+                                             + core::reasonText(written != text.size() ? wrote : shut));
             std::error_code rmec;
             static_cast<void>(core::removeEntry(tmp, rmec));
             return false;

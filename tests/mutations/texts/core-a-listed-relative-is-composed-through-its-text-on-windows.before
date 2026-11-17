@@ -1,2 +1,1 @@
-HostPath HostPath::operator/(ListedRelative const& listed) const {
-    if (listed.names_.empty()) return *this;
+    if (listed.names_.empty() || illFormed_) return *this;   // T4: below a value that names nothing, nothing

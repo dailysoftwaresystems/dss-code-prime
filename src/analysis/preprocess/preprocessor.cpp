@@ -6244,7 +6244,7 @@ private:
     // What `__has_embed` is handed for a pipe it does not open: "as wide as any
     // `limit`", so the ONE width formula answers FOUND, and EMPTY at `limit(0)`.
     static constexpr std::uint64_t kUnreadPipeBytes = std::numeric_limits<std::uint64_t>::max();
-    static std::optional<ResourceSize> resourceSize(fs::path const& path) {
+    static std::expected<ResourceSize, std::string> resourceSize(fs::path const& path) {
         // The shared search passes over a DIRECTORY (`descend`) and hands back a
         // device or a named pipe. A pipe is read (Apple clang embeds a fed one); a
         // DEVICE stays refused -- nullopt, the caller's loud unreadable diagnostic
@@ -6260,10 +6260,12 @@ private:
         // ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]).
         std::error_code ec;
         auto const size = core::reachedFileSize(path, ec);
-        if (ec) return std::nullopt;
+        if (ec) return std::unexpected("it could not be sized: " + core::reasonText(ec));
         if (size) return ResourceSize{static_cast<std::uint64_t>(*size), false};
         if (core::reachedPipe(path, ec) && !ec) return ResourceSize{0, true};
-        return std::nullopt;
+        if (ec) return std::unexpected("it could not be examined: " + core::reasonText(ec));
+        return std::unexpected(std::string{"it is not a regular file or a named pipe (a device: no working "
+                                           "reference's #embed reads one)"});
     }
 
     // FC17.9(h): read AT MOST `maxBytes` of `path` BINARY-exact into a string,
@@ -6285,20 +6287,22 @@ private:
     // writer closing -- ending the read early: the bytes it gave ARE its width.
     // Nothing past `maxBytes` is ever read, so `limit(513)` over an endless
     // stream reads 513 bytes (6.10.4.2 EXAMPLE 4).
-    static std::optional<std::string> readResourceBytes(fs::path const& path,
-                                                        std::uint64_t maxBytes,
-                                                        bool pipe = false) {
+    static std::expected<std::string, std::string> readResourceBytes(fs::path const& path,
+                                                                     std::uint64_t maxBytes,
+                                                                     bool pipe = false) {
         if (pipe) {
-            std::ifstream in = core::openInputStream(path, std::ios::binary);
-            if (!in) return std::nullopt;
+            auto opened = core::openInputStream(path, std::ios::binary);
+            if (!opened) return std::unexpected("it could not be opened: " + core::reasonText(opened.error()));
+            std::ifstream& in = *opened;
             std::string out(static_cast<std::size_t>(maxBytes), '\0');
             in.read(out.data(), static_cast<std::streamsize>(maxBytes));
-            if (in.bad()) return std::nullopt;
+            if (in.bad()) return std::unexpected(std::string{"an I/O error interrupted its read"});
             out.resize(static_cast<std::size_t>(in.gcount()));
             return out;
         }
         auto const size = resourceSize(path);
-        if (!size || size->pipe) return std::nullopt;
+        if (!size) return std::unexpected(size.error());
+        if (size->pipe) return std::unexpected(std::string{"it became a named pipe after it was sized"});
         if (maxBytes >= size->bytes) {
             // A mid-stream IO error (disk/share failure) can silently truncate
             // the read, and a truncated `#embed` is a SILENT MISCOMPILE — the
@@ -6311,18 +6315,20 @@ private:
             // since it was written. The helper compares BYTES against the size
             // it measured, which is the only detector a short read has.
             auto text = core::readFileChecked(path);
-            if (!text) return std::nullopt;
+            if (!text) return std::unexpected(text.error().message);
             return *std::move(text);
         }
         // The BOUNDED arm keeps the same short-read detector: `gcount()` must
         // deliver exactly the bytes asked for, or the read failed and the
         // caller refuses LOUD rather than embedding a shorter resource.
-        std::ifstream in = core::openInputStream(path, std::ios::binary);
-        if (!in) return std::nullopt;
+        auto opened = core::openInputStream(path, std::ios::binary);
+        if (!opened) return std::unexpected("it could not be opened: " + core::reasonText(opened.error()));
+        std::ifstream& in = *opened;
         std::string out(static_cast<std::size_t>(maxBytes), '\0');
         in.read(out.data(), static_cast<std::streamsize>(maxBytes));
         if (in.gcount() != static_cast<std::streamsize>(maxBytes)) {
-            return std::nullopt;
+            return std::unexpected("it gave " + std::to_string(in.gcount()) + " of the "
+                                   + std::to_string(maxBytes) + " bytes asked");
         }
         return out;
     }
@@ -6654,17 +6660,17 @@ private:
         auto const size = resourceSize(*resolved);
         if (!size) {
             failAt(dirSpan, std::string{"#embed resource could not be read: "}
-                                + resolved->string());
+                                + resolved->string() + " (" + size.error() + ")");
             return;
         }
-        std::optional<std::string> piped;   // a pipe's bytes, read before its width is known
+        std::expected<std::string, std::string> piped;   // a pipe's bytes, read before its width is known
         if (size->pipe) {
             std::uint64_t const budget = static_cast<std::uint64_t>(kEmbedMaxResourceBytes);
             piped = readResourceBytes(*resolved, limit ? std::min(*limit, budget + 1) : budget + 1,
                                       /*pipe=*/true);
             if (!piped) {
                 failAt(dirSpan, std::string{"#embed resource could not be read: "}
-                                    + resolved->string());
+                                    + resolved->string() + " (" + piped.error() + ")");
                 return;
             }
             if (piped->size() > kEmbedMaxResourceBytes) {
@@ -6736,8 +6742,11 @@ private:
             // get fewer bytes than the resource holds. Loud, always -- including
             // the case where the file SHRANK between the size measurement above
             // and this read.
-            failAt(dirSpan, std::string{"#embed resource could not be read: "}
-                                + resolved->string());
+            failAt(dirSpan, std::string{"#embed resource could not be read: "} + resolved->string() + " ("
+                                + (bytes ? "it gave " + std::to_string(bytes->size()) + " of the "
+                                               + std::to_string(width) + " bytes it holds"
+                                         : bytes.error())
+                                + ")");
             return;
         }
 

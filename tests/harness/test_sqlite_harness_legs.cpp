@@ -496,7 +496,7 @@ import tokenize
 WSL_NAMES = ("wsl", "wsl.exe")
 # The wsl.exe options that take ONE value and may stand before `-e`: `--cd <dir>` (the resolver's working-
 # directory splice) and `-d`/`--distribution <name>` (since 2026-09-30 every WSL-entering argv names the
-# distribution the WSL legs declare). Each is skipped WITH its value, so an `-e` taken as a value is no `-e`.
+# distribution the tree declares). Each is skipped WITH its value, so an `-e` taken as a value is no `-e`.
 VALUE_OPTIONS = ("--cd", "-d", "--distribution")
 WSL_WORD = re.compile(r"(?<![\w./\\$-])wsl(?:\.exe)?(?![\w.-])")
 SHELL_FUNCS = {("os", "system"), ("os", "popen"), ("subprocess", "getoutput"),
@@ -5351,7 +5351,7 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
     // one more of its own). The number is not lowered — it moved with the door.
     // ★ AND IT MOVED AGAIN WITH THE ENTRY (2026-09-30, the round-12 audit's S8): the
     // three doors now all begin with ONE entry, `PosixSide.entry` — `wsl.exe -d
-    // <the WSL legs' distribution> -e`, the one spelling that names the distribution
+    // <the tree's WSL distribution> -e`, the one spelling that names the distribution
     // — so the file holds ONE wsl argv literal (✔MEASURED 2026-09-30), the one a
     // door cannot bypass without dropping the distribution the contract suite pins
     // (MS18: every door enters it). One spelling of one entry is the fix, not a loss.

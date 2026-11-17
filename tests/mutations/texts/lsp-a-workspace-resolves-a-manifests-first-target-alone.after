@@ -1,0 +1,3 @@
+            std::min<std::size_t>(cfg->targets.size(), 1),
+            refused.naming(WorkspaceProjectErrorKind::TargetConfigLoadFailed,
+                           [&](std::size_t s) { return "target `" + cfg->targets[s] + "` of " + where; },

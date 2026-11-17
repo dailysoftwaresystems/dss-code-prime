@@ -817,7 +817,7 @@ class StageConfig:
                  environ=None, pkg_install=None, lock_what=""):
         if host_os not in ("linux", "darwin"):
             C.die("the POSIX half runs on a POSIX host (this one is '%s'): in-process on linux/darwin, "
-                  "and inside WSL through `wsl.exe -d <the WSL legs' distribution> -e python3 sqlite_stage.py "
+                  "and inside WSL through `wsl.exe -d <the tree's WSL distribution> -e python3 sqlite_stage.py "
                   "derive ...` for a Windows "
                   "host." % host_os)
         if not sqlite_dir or not out_dir:

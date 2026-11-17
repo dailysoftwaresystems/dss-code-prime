@@ -94,6 +94,7 @@
 // Where a spawned arm's loader looks for the libraries it was built against —
 // the value both runners compute, from ONE definition (see its header note).
 #include "loader_search_path.hpp"
+#include "os_link.hpp"   // the loader value's link arm: a link made by the OS
 #include "opt/optimizer.hpp"
 #include "program/program.hpp"
 #include "program/compile_pipeline.hpp"  // resolveCompileConfigFromPipelineName (P10 real-channel arm)
@@ -5345,6 +5346,10 @@ TEST(ExamplesCorpusLint, LoaderSearchPathValueIsTheResolvedLibraryDirectories) {
         return fs::absolute(p).lexically_normal().make_preferred().string();
     };
     std::string const sep(1, kLoaderSearchPathListSeparator);
+    // The libraries' directories are THERE, as a build's resolved ones are: a
+    // directory is one entry by the object it reaches (P69 H6c2, ledger 629).
+    fs::create_directories(a / "sub");
+    fs::create_directories(b);
 
     // Two libraries in ONE directory and one in another: each directory ONCE,
     // in resolve order, and the prior value LAST, so the example's own
@@ -5356,12 +5361,63 @@ TEST(ExamplesCorpusLint, LoaderSearchPathValueIsTheResolvedLibraryDirectories) {
     // No prior value ⇒ no dangling separator: an EMPTY list entry means "the
     // working directory" to a POSIX loader, which nobody asked for.
     EXPECT_EQ(loaderSearchPathValue(libs, ""), spelled(a) + sep + spelled(b));
-    // One directory reached by two spellings is still ONE entry.
+    // One directory reached by two spellings is still ONE entry -- asked of
+    // the directory each REACHES (P69 H6c2, ledger 629).
     EXPECT_EQ(loaderSearchPathValue({a / "one.lib", a / "sub" / ".." / "x.lib"},
                                     ""),
               spelled(a));
     // Nothing resolved ⇒ the prior value, untouched.
     EXPECT_EQ(loaderSearchPathValue({}, "PRIOR"), "PRIOR");
+
+    // ★ A `..` BELOW A LINK, AND BELOW NOTHING (P69 H6c2, ledger 629 and the
+    // re-audit's N2): the entry count is what the OS reaches, never the text.
+    // The oracle is the OS's own open of `a/<middle>/../marker`, beside the
+    // home: it reads `a`'s marker where the host folds or reaches `a` (one
+    // entry), and anything else where it does not (two entries, the first
+    // spelling of each). INFERRED, so the OS decides it per leg: POSIX
+    // resolves `..` at the object (through the link to its target's parent;
+    // not at all below a missing name), Windows folds it in the text first.
+    {
+        std::ofstream{a / "marker", std::ios::binary} << "a";
+        fs::path const elsewhere = sandbox.path() / "elsewhere";
+        fs::create_directories(elsewhere / "t");
+        std::ofstream{elsewhere / "marker", std::ios::binary} << "elsewhere";
+#if defined(_WIN32)
+        DSS_ASSERT_LINK_MADE(dss::test_support::makeJunction(elsewhere / "t", a / "lnk"));
+#else
+        DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(
+            elsewhere / "t", a / "lnk", dss::test_support::LinkTo::Directory));
+#endif
+        auto const osReachesA = [&a](fs::path const& middle) {
+            std::ifstream in{a / middle / ".." / "marker", std::ios::binary};
+            std::string   text;
+            std::getline(in, text);
+            return in.is_open() && text == "a";
+        };
+        auto const value = [&](fs::path const& middle) {
+            return loaderSearchPathValue({a / middle / ".." / "x.lib", a / "one.lib"}, "");
+        };
+        auto const firstSpelled = [&](fs::path const& middle) {
+            return fs::absolute(a / middle / "..").make_preferred().string();
+        };
+        for (fs::path const middle : {fs::path{"lnk"}, fs::path{"missing"}}) {
+            if (osReachesA(middle)) {
+                EXPECT_EQ(value(middle), spelled(a))
+                    << "the host reaches `a` through `" << middle.string() << "/..`: one directory, one entry";
+            } else {
+                EXPECT_EQ(value(middle), firstSpelled(middle) + sep + spelled(a))
+                    << "the host does not reach `a` through `" << middle.string()
+                    << "/..`: two entries, each its first spelling";
+            }
+        }
+#if !defined(_WIN32)
+        EXPECT_FALSE(osReachesA("lnk")) << "POSIX resolves `..` at the link's target";
+        EXPECT_FALSE(osReachesA("missing")) << "POSIX cannot traverse a missing name";
+#else
+        EXPECT_TRUE(osReachesA("lnk")) << "Win32 folds `..` before any link is read";
+        EXPECT_TRUE(osReachesA("missing")) << "Win32 folds `..` before any name is read";
+#endif
+    }
 
     // The name grammar both parsers enforce.
     EXPECT_TRUE(isPortableEnvironmentVariableName("DSS_PROBE_1"));

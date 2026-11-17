@@ -299,39 +299,47 @@ namespace detail {
 // ⓘ `_close` owns the descriptor AND the underlying handle once
 // `_open_osfhandle` succeeds, so the failure paths below must not also
 // `CloseHandle` — that would be a double close.
-[[nodiscard]] std::FILE*
+// ★ A REFUSED CLAIM ANSWERS THE OS'S REASON (P69 H6c2), read at the call that failed and carried past the CloseHandle /
+// close / removal that follows it, which would otherwise overwrite the thread's last error or errno.
+[[nodiscard]] std::expected<std::FILE*, std::error_code>
 createExclusiveBinary(core::HostPath const& p) {
 #ifdef _WIN32
     // Through the home (`core::openHandle`, H6c A4): the value's LEAF reference, at any length; not inheritable.
-    HANDLE const h = static_cast<HANDLE>(core::openHandle(
-        p,
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        CREATE_NEW,                                 // the exclusive claim
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT));
-    if (h == INVALID_HANDLE_VALUE) { return nullptr; }
-    int const fd =
-        ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), _O_WRONLY | _O_BINARY);
+    auto const opened = core::openHandle(p,
+                                         GENERIC_WRITE,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         CREATE_NEW,   // the exclusive claim
+                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT);
+    if (!opened) return std::unexpected(opened.error());
+    HANDLE const h = static_cast<HANDLE>(*opened);
+    core::clearRuntimeReason();
+    int const fd = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), _O_WRONLY | _O_BINARY);
     if (fd < 0) {
+        std::error_code const why = core::runtimeReason();
         ::CloseHandle(h);
-        return nullptr;
+        return std::unexpected(why);
     }
+    core::clearRuntimeReason();
     std::FILE* const f = ::_fdopen(fd, "wb");
     if (!f) {
+        std::error_code const why = core::runtimeReason();
         ::_close(fd);   // closes the handle too
-        return nullptr;
+        return std::unexpected(why);
     }
     return f;
 #else
     // 0666 & umask — the same permissions `fopen` would have created, so
     // `writeImage`'s load-bearing re-apply (D-OUTPUT-EXEC-BIT) is unaffected.
-    int const fd = core::openDescriptor(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);   // through the home (A4)
-    if (fd < 0) { return nullptr; }
-    std::FILE* const f = ::fdopen(fd, "wb");
+    auto const fd = core::openDescriptor(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);   // through the home (A4)
+    if (!fd) return std::unexpected(fd.error());
+    core::clearRuntimeReason();
+    std::FILE* const f = ::fdopen(*fd, "wb");
     if (!f) {
-        ::close(fd);
+        std::error_code const why = core::runtimeReason();
+        ::close(*fd);
         std::error_code removed;
         static_cast<void>(core::removeEntry(p, removed));
+        return std::unexpected(why);
     }
     return f;
 #endif
@@ -361,11 +369,10 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 // current locale's ANSI codepage. A throw inside the failure-
 // reporting path would silently abort the writer mid-diagnostic.
 //
-// Safe approach: try the narrow form first; on throw, fall back to the
-// UTF-8 form and reinterpret to `std::string`.
-// (silent-failure-hunter HIGH fold #2, LK10 cycle 1 post-fold #2
-// review — the post-fold #1 `generic_string()`-only fix did not
-// fully close the Windows throw hazard.)
+// ★ SINCE P69 H6c2 (T4) `core::genericSpelling` IS TOTAL: lossless UTF-8 on
+// every library, an unpaired surrogate as WTF-8, never the code page -- so
+// this is that rendering and nothing else; the try/catch that stood here
+// (silent-failure-hunter HIGH fold #2, LK10 cycle 1) went with the throw.
 //
 // ★★★ AND THE TWO ARMS USED TO DISAGREE ABOUT WHICH FILE THEY NAME, which is
 // strictly worse than the throw they were written for. `generic_string()`
@@ -378,20 +385,7 @@ using StagedFile = std::unique_ptr<std::FILE, StagedFileCloser>;
 // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]), so they differ in ENCODING
 // only — which is the one axis this fallback exists for.
 //
-// ⚠ `genericSpellingU8` throws exactly where `u8string()` does (a native name
-// can be text no encoding accepts), which is unchanged from the code this
-// replaced: the catch arm could always propagate. Swallowing it here would hand
-// back a name that is not the file's, and this function's whole job is to name
-// the file.
-[[nodiscard]] std::string pathForDiag(std::filesystem::path const& p) {
-    try {
-        return core::genericSpelling(p);
-    } catch (...) {
-        auto const u8 = core::genericSpellingU8(p);
-        return std::string(reinterpret_cast<char const*>(u8.data()),
-                           u8.size());
-    }
-}
+[[nodiscard]] std::string pathForDiag(std::filesystem::path const& p) { return core::genericSpelling(p); }
 
 // A VALUE's name (H6c): its rendering, which never throws (a name no encoding accepts is rendered losslessly).
 [[nodiscard]] std::string pathForDiag(core::HostPath const& p) { return p.spelling().generic(); }
@@ -415,7 +409,7 @@ removeTempNote(core::HostPath const& tempPath) {
     }
     return std::string{" [additionally: the staging temp '"}
          + pathForDiag(tempPath)
-         + "' could NOT be removed (" + ec.message()
+         + "' could NOT be removed (" + core::reasonText(ec)
          + ") — delete it manually]";
 }
 
@@ -427,9 +421,11 @@ removeTempNote(core::HostPath const& tempPath) {
 //
 // ★★★ WHAT FAILED, AND WHY IT WAS A WRONG ANSWER RATHER THAN A USER ERROR.
 // Round 7 of cycle P68's gate failed a correct compile: `writeBytes` staged
-// `repeat0.o` and the commit — then `std::filesystem::rename`, i.e.
+// `repeat0.o` and the commit — at that time `std::filesystem::rename`, i.e.
 // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` under both Windows standard
-// libraries — was refused with `Permission denied`. ✔MEASURED out of tree on
+// libraries; the commit is now `detail::commitReplacing`, by handle through the
+// home (`core::commitByHandle`) on Windows and `core::renameEntry` elsewhere —
+// was refused with `Permission denied`. ✔MEASURED out of tree on
 // that workstation, repeating the failing test's own pattern (stage, close,
 // commit over the target, read it back) with the CPU at 100%:
 //
@@ -503,13 +499,8 @@ namespace {
 #ifdef _WIN32
 
 
-// The Win32 error BY NUMBER first: the text is localized (this workstation's is
-// Portuguese) and the number is what a report can be searched on — the same
-// order `core/substrate/process_spawn.cpp` gives its host error text.
-[[nodiscard]] std::string windowsError(DWORD error) {
-    return "Windows error " + std::to_string(error) + " ("
-         + std::system_category().message(static_cast<int>(error)) + ")";
-}
+// (The Win32 error's rendering is the home's ONE `core::reasonText` since H6c2: the number first -- the text is
+// localized, this workstation's Portuguese, and the number is what a report is searched on -- the text as UTF-8.)
 
 
 // The answers that mean the VOLUME (or an OS older than the class) cannot
@@ -544,15 +535,15 @@ enum class RefusalKind : std::uint8_t {
                                           core::HostPath const& target) {
     if (error == ERROR_SHARING_VIOLATION) return RefusalKind::Holder;
     if (error != ERROR_ACCESS_DENIED || onStaged) return RefusalKind::Other;
-    DWORD const attributes = core::fileAttributes(target);   // through the home (A4)
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        DWORD const why = ::GetLastError();
-        return (why == ERROR_FILE_NOT_FOUND || why == ERROR_PATH_NOT_FOUND)
-                 ? RefusalKind::Other
-                 : RefusalKind::Holder;
+    auto const attributes = core::fileAttributes(target);   // through the home (A4); its reason read at the call
+    if (!attributes) {
+        std::error_code const why = attributes.error();
+        bool const nothingThere = why.category() == std::system_category()
+                               && (why.value() == ERROR_FILE_NOT_FOUND || why.value() == ERROR_PATH_NOT_FOUND);
+        return nothingThere ? RefusalKind::Other : RefusalKind::Holder;
     }
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return RefusalKind::Directory;
-    if ((attributes & FILE_ATTRIBUTE_READONLY) != 0) return RefusalKind::ReadOnly;
+    if ((*attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return RefusalKind::Directory;
+    if ((*attributes & FILE_ATTRIBUTE_READONLY) != 0) return RefusalKind::ReadOnly;
     return RefusalKind::Holder;
 }
 
@@ -581,25 +572,15 @@ constexpr int  kFileProcessIdsUsingFileInformation = 47;
 constexpr LONG kStatusInfoLengthMismatch = static_cast<LONG>(0xC0000004UL);
 constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
 
+// A holder named by the image it runs, asked of the home (`core::processImage`, an ANSWERED value: P69 H6c2, H7 --
+// the writer holds no Win32 path call of its own).
 [[nodiscard]] std::string nameProcess(DWORD pid) {
     std::string const id = "(pid " + std::to_string(pid) + ")";
     if (pid == ::GetCurrentProcessId()) return "this process " + id;
-    HANDLE const process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (process == nullptr) {
-        return "a process " + id + " whose image could not be read ("
-             + windowsError(::GetLastError()) + ")";
-    }
-    // 32767 is the longest path the NT namespace can hold, so this never truncates.
-    std::wstring image(32768, L'\0');
-    DWORD        length = static_cast<DWORD>(image.size());
-    BOOL const   ok     = ::QueryFullProcessImageNameW(process, 0, image.data(), &length);
-    DWORD const  error  = ok ? ERROR_SUCCESS : ::GetLastError();
-    ::CloseHandle(process);
-    if (!ok) {
-        return "a process " + id + " whose image could not be read (" + windowsError(error) + ")";
-    }
-    image.resize(length);
-    return pathForDiag(std::filesystem::path{image}) + " " + id;
+    std::error_code      ec;
+    core::HostPath const image = core::processImage(pid, ec);
+    if (ec) return "a process " + id + " whose image could not be read (" + core::reasonText(ec) + ")";
+    return pathForDiag(image) + " " + id;
 }
 
 [[nodiscard]] std::string describeHolders(core::HostPath const& file) {
@@ -610,12 +591,11 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
         return "the holders could not be listed (ntdll exports no "
                "NtQueryInformationFile)";
     }
-    HANDLE const handle = static_cast<HANDLE>(core::openHandle(   // through the home (A4)
+    auto const opened = core::openHandle(   // through the home (A4); its reason read at the call
         file, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS));
-    if (handle == INVALID_HANDLE_VALUE) {
-        return "the holders could not be listed (" + windowsError(::GetLastError()) + ")";
-    }
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    if (!opened) return "the holders could not be listed (" + core::reasonText(opened.error()) + ")";
+    HANDLE const handle = static_cast<HANDLE>(*opened);
     // Grown until the list fits; every growth is the system saying "too small".
     std::vector<std::uint64_t> buffer(1 + 16, 0);
     LONG                       status = 0;
@@ -647,7 +627,7 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
     return names;
 }
 
-[[nodiscard]] std::string composeRefusal(DWORD                        error,
+[[nodiscard]] std::string composeRefusal(std::error_code const&       reason,
                                          RefusalKind                  kind,
                                          bool                         onStaged,
                                          bool                         posix,
@@ -655,7 +635,7 @@ constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
                                          std::chrono::milliseconds    waited,
                                          core::HostPath const&        staged,
                                          core::HostPath const&        target) {
-    std::string text = windowsError(error);
+    std::string text = core::reasonText(reason);   // the home's ONE rendering of the OS's reason (H6c2)
     if (onStaged) {
         text += " opening the staged file '" + pathForDiag(staged) + "' for the rename";
     }
@@ -698,11 +678,12 @@ CommitOutcome commitReplacing(core::HostPath const& staged,
                               CommitPatience const&        patience) {
     CommitOutcome outcome;
 #ifdef _WIN32
-    bool   posix    = true;  // until the volume answers that it cannot
-    bool   onStaged = false;
-    DWORD  error    = ERROR_SUCCESS;
-    HANDLE handle   = INVALID_HANDLE_VALUE;
-    auto   firstRefusal = std::chrono::steady_clock::time_point{};
+    bool            posix    = true;  // until the volume answers that it cannot
+    bool            onStaged = false;
+    DWORD           error    = ERROR_SUCCESS;
+    std::error_code reason;   // the OS's reason for `error`, as read at the call that failed (H6c2)
+    HANDLE          handle   = INVALID_HANDLE_VALUE;
+    auto            firstRefusal = std::chrono::steady_clock::time_point{};
     for (;;) {
         // The rename is made on a handle to the staged file — DELETE access,
         // every share granted, not inheritable (null SECURITY_ATTRIBUTES, the
@@ -710,13 +691,19 @@ CommitOutcome commitReplacing(core::HostPath const& staged,
         // needed and a cross-volume target cannot be copied into.
         // FILE_FLAG_OPEN_REPARSE_POINT renames the ENTRY, as `MoveFileExW`
         // does, never a link's target.
+        std::error_code openRefused;
         if (handle == INVALID_HANDLE_VALUE) {
-            handle = static_cast<HANDLE>(core::openHandle(staged, DELETE | SYNCHRONIZE,   // through the home (A4)
-                                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                                          OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT));
+            auto const opened = core::openHandle(staged, DELETE | SYNCHRONIZE,   // through the home (A4)
+                                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                 OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
+            if (opened) handle = static_cast<HANDLE>(*opened);
+            else openRefused = opened.error();
         }
         if (handle == INVALID_HANDLE_VALUE) {
-            error    = ::GetLastError();
+            reason = openRefused;
+            // A refusal of the home's own (a value that names nothing) is no Win32 code: it classifies as Other.
+            error    = reason.category() == std::system_category() ? static_cast<DWORD>(reason.value())
+                                                                   : DWORD{ERROR_INVALID_PARAMETER};
             onStaged = true;
         } else {
             onStaged = false;
@@ -731,11 +718,12 @@ CommitOutcome commitReplacing(core::HostPath const& staged,
                 outcome.committed = true;
                 return outcome;
             }
+            reason = std::error_code{static_cast<int>(error), std::system_category()};
         }
         RefusalKind const kind = classifyRefusal(error, onStaged, target);
         if (kind != RefusalKind::Holder) {
             if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
-            outcome.refusal = composeRefusal(error, kind, onStaged, posix,
+            outcome.refusal = composeRefusal(reason, kind, onStaged, posix,
                                              outcome.holderRefusals,
                                              std::chrono::milliseconds{0}, staged,
                                              target);
@@ -748,7 +736,7 @@ CommitOutcome commitReplacing(core::HostPath const& staged,
     if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
     auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - firstRefusal);
-    outcome.refusal = composeRefusal(error, RefusalKind::Holder, onStaged, posix,
+    outcome.refusal = composeRefusal(reason, RefusalKind::Holder, onStaged, posix,
                                      outcome.holderRefusals, waited, staged, target);
     return outcome;
 #else
@@ -761,11 +749,10 @@ CommitOutcome commitReplacing(core::HostPath const& staged,
         outcome.committed = true;
         return outcome;
     }
-    outcome.refusal = ec.message()
+    // The OS's reason (H6c2), never a list of guesses.
+    outcome.refusal = core::reasonText(ec)
                     + " (rename(2); it is never refused because another process "
-                      "holds the file, so nothing was waited for — likely "
-                      "causes: the target is a directory, the target's directory "
-                      "is not writable, or the parent was removed mid-write)";
+                      "holds the file, so nothing was waited for)";
     return outcome;
 #endif
 }
@@ -870,7 +857,7 @@ bool writeImage(LinkedImage const&             image,
                         std::string{"link::writeImage: wrote '"}
                             + pathForDiag(path)
                             + "' but could not set its POSIX execute bit ("
-                            + ec.message()
+                            + core::reasonText(ec)
                             + "); the binary is valid but needs `chmod +x` to "
                               "run directly.");
         }
@@ -975,7 +962,7 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
             emit(reporter, DiagnosticCode::K_ImageWriteParentMissing,
                  std::string{"link::writeBytes: failed to stat "
                              "parent directory '"}
-                     + pathForDiag(parent) + "': " + ec.message());
+                     + pathForDiag(parent) + "': " + core::reasonText(ec));
             return false;
         }
         if (!exists) {
@@ -1019,11 +1006,13 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     // suffix to `path` itself, so it is a sibling BY CONSTRUCTION — there is
     // no separate directory expression a later edit could point at
     // `/tmp`/`$TMPDIR`. That matters on BOTH hosts: a temp on a different
-    // filesystem turns POSIX `rename(2)` into EXDEV, and on Windows MSVC's
-    // `std::filesystem::rename` is MoveFileExW with MOVEFILE_COPY_ALLOWED,
-    // which "simulates the move by using the CopyFile and DeleteFile
-    // functions" — silently copying INTO the existing target and
-    // reintroducing exactly this defect.
+    // filesystem turns POSIX `rename(2)` into EXDEV, and on Windows the commit
+    // this replaced, MSVC's `std::filesystem::rename`, is MoveFileExW with
+    // MOVEFILE_COPY_ALLOWED, which "simulates the move by using the CopyFile
+    // and DeleteFile functions" — silently copying INTO the existing target
+    // and reintroducing exactly this defect. (The commit is now a rename ON A
+    // HANDLE, `core::commitByHandle`, which refuses a cross-volume target: the
+    // paragraph "SUPERSEDED FOR WINDOWS" below.)
     //
     // CROSS-PLATFORM, determined by reading the sources rather than
     // assuming: [fs.op.rename] specifies rename "as if by POSIX rename",
@@ -1091,18 +1080,33 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         // Sibling by construction: the target plus an ASCII suffix -- `withSuffix` (H6c, A1): the target's LEAF
         // reference's last name extended LITERALLY, so the sibling lies in the directory the target's own write
         // names (a target in a listed `d ` stages in `d `, never its twin), in the NATIVE encoding.
-        core::HostPath candidate = core::HostPath{path}.withSuffix(
+        auto sibling = core::HostPath{path}.withSuffix(
             std::filesystem::path{".dsstmp-" + std::to_string(seed) + "-"
                                   + std::to_string(tempCounter.fetch_add(1))}.native());
+        if (!sibling) {
+            // H1: a target that names no last name (`C:\x\..`, a volume root) has no sibling to stage in -- refused
+            // by name, never thrown.
+            emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
+                 std::string{"link::writeBytes: refusing to write to '"} + pathForDiag(path) + "' — "
+                     + core::pathRefusalName(sibling.error())
+                     + " (it reaches a volume root, or ends in `.` or `..`), so no staging file can lie beside it. "
+                       "The caller must supply the output file's own path.");
+            return false;
+        }
+        core::HostPath candidate = std::move(*sibling);
 
-        if (std::FILE* claimed = detail::createExclusiveBinary(candidate)) {
+        auto const claimed = detail::createExclusiveBinary(candidate);
+        if (claimed) {
             // Take ownership FIRST: the path assignment below allocates, and
             // nothing between the successful open and the guard may be able
             // to leave the handle unowned.
-            out.reset(claimed);
+            out.reset(*claimed);
             tempPath = std::move(candidate);
             break;
         }
+        // The claim's OWN reason, read at the call that failed (H6c2) -- before the probe below, which would
+        // overwrite the thread's last error or errno.
+        std::error_code const refused = claimed.error();
         // The open failed, and the two causes need opposite responses.
         // If the candidate NAME is occupied, another writer (or a stale temp)
         // holds that slot — take the next one. Otherwise this is a real error
@@ -1159,10 +1163,8 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
              std::string{"link::writeBytes: failed to create the staging "
                          "temp '"}
-                 + pathForDiag(candidate)
-                 + "' for binary write (permission denied, a path component "
-                   "is not a directory, invalid filename, or parent removed "
-                   "post-stat). The name itself was probed as a directory "
+                 + pathForDiag(candidate) + "' for binary write: " + core::reasonText(refused)
+                 + ". The name itself was probed as a directory "
                    "ENTRY, so an occupant of ANY kind — a regular file, a "
                    "directory, or a dangling symlink — would have been stepped "
                    "over rather than reported here. The artifact '"
@@ -1177,11 +1179,14 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     // which is the right answer for a producer whose output genuinely is zero
     // bytes. (`writeImage` rejects empty bytes one level up, but the
     // raw-bytes producers that call `writeBytes` directly do not.)
+    core::clearRuntimeReason();
     std::size_t const written =
         bytes.empty()
             ? std::size_t{0}
             : std::fwrite(bytes.data(), 1, bytes.size(), out.get());
     if (written != bytes.size()) {
+        // The write's OWN reason, read before the close below can overwrite it (H6c2).
+        std::error_code const why = core::runtimeReason();
         // Close BEFORE attempting cleanup: on Windows an open handle blocks
         // `remove`, so leaving it open would turn every short write into a
         // leaked temp plus a misleading "could NOT be removed" note. The
@@ -1193,7 +1198,7 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         emit(reporter, DiagnosticCode::K_ImageWriteShort,
              std::string{"link::writeBytes: short write to the staging temp "
                          "for '"}
-                 + pathForDiag(path) + "' (disk full or I/O error). The "
+                 + pathForDiag(path) + "': " + core::reasonText(why) + ". The "
                    "previous artifact at that path is unchanged."
                  + removeTempNote(tempPath));
         return false;
@@ -1201,7 +1206,9 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     // `release()` hands the handle out of the guard so it is closed EXACTLY
     // once — here, where the result is actually checked — and the guard is
     // left empty for every path below.
+    core::clearRuntimeReason();
     if (std::fclose(out.release()) != 0) {
+        std::error_code const why = core::runtimeReason();   // read at the failing close (H6c2)
         // fclose() can fail when buffered writes flush to disk.
         // Letting the guard close it silently would swallow this; we
         // surface it as a write failure. Because the bytes were staged in a
@@ -1212,9 +1219,8 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         emit(reporter, DiagnosticCode::K_ImageWriteCloseFailed,
              std::string{"link::writeBytes: close() failed for the staging "
                          "temp for '"}
-                 + pathForDiag(path)
-                 + "' (deferred I/O error on flush — the staged bytes are "
-                   "incomplete). The previous artifact at that path is "
+                 + pathForDiag(path) + "': " + core::reasonText(why)
+                 + " — the staged bytes are incomplete. The previous artifact at that path is "
                    "unchanged." + removeTempNote(tempPath));
         return false;
     }

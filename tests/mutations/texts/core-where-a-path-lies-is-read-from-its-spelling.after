@@ -1,2 +1,1 @@
-    return fs::path{p.native().substr(rootSpelling(p).volume)}.lexically_relative(
-        fs::path{base.native().substr(rootSpelling(base).volume)});
+    return HostPathAccess::text(p).lexically_relative(HostPathAccess::text(base));

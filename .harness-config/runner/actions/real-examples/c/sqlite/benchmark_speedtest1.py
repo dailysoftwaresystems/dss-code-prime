@@ -43,7 +43,7 @@ THE PHASES
            call); SQLITE_CORE by name AND every `stageBuild.requiredDefines` (the .sh checked only
            SQLITE_CORE); `shell.c` -> `speedtest1.c`; the build dir appended LAST to the include
            list; the manifest. In THIS process on a POSIX host. On a Windows host inside WSL as
-               wsl.exe -d <the WSL legs' distribution> -e python3 <this file's WSL path> --derive-only
+               wsl.exe -d <the tree's WSL distribution> -e python3 <this file's WSL path> --derive-only
                        --path-style windows ...
            -- THIS program, never a second implementation -- whose manifest comes back with every
            path spelled for the Windows host (`wslpath -w`, once per path, a double translation
@@ -1265,7 +1265,7 @@ def verify_host_paths(manifest):
 
 
 def hop_argv(posix, this_posix, sqlite_posix, out_posix, facts):
-    """The WSL hop: THIS program's derive half, argv only (`wsl.exe -d <the WSL legs' distribution> -e`,
+    """The WSL hop: THIS program's derive half, argv only (`wsl.exe -d <the tree's WSL distribution> -e`,
     never a login shell, never `wsl.exe --`, never a shell string)."""
     return posix.python_argv(this_posix, "--derive-only", "--path-style", "windows",
                              "--sqlite-dir", sqlite_posix, "--out", out_posix, "--target", facts.spec,
@@ -2185,7 +2185,7 @@ class _FakePosix:
         return self.argv(["python3", script] + [str(a) for a in args])
 
 
-_PS03 = ("ps03 a usable WSL answers (this host can derive): `wsl.exe -d <the WSL legs' distribution> -e echo` "
+_PS03 = ("ps03 a usable WSL answers (this host can derive): `wsl.exe -d <the tree's WSL distribution> -e echo` "
          "prints its token, not merely wsl.exe on PATH")
 
 
@@ -3123,7 +3123,7 @@ def _st_plan(A, fx):
     argv = hop_argv(C.PosixSide("windows", distribution="an-injected-distro"), "/mnt/c/x/benchmark_speedtest1.py",
                     "/mnt/c/s", "/mnt/c/o", facts)
     parsed = parse_args(argv[6:])
-    A.arm("n67 the hop argv is `wsl.exe -d <the WSL legs' distribution> -e python3 <this> ...` (no `--`, no login "
+    A.arm("n67 the hop argv is `wsl.exe -d <the tree's WSL distribution> -e python3 <this> ...` (no `--`, no login "
           "shell, never the machine's default distribution), and the derive half ACCEPTS exactly what the Windows "
           "side builds",
           lambda: (argv[:6] == ["wsl.exe", "-d", "an-injected-distro", "-e", "python3",

@@ -235,12 +235,12 @@ constexpr std::string_view kNoSource{};
 }
 
 [[nodiscard]] std::vector<std::uint8_t> bytesOf(fs::path const& path) {
-    std::ifstream in = dss::core::openInputStream(path, std::ios::binary);   // at any length (the home)
-    if (!in.good()) {
-        ADD_FAILURE() << "cannot open " << path.string();
+    auto opened = dss::core::openInputStream(path, std::ios::binary);   // at any length (the home)
+    if (!opened) {
+        ADD_FAILURE() << "cannot open " << path.string() << ": " << dss::core::reasonText(opened.error());
         return {};
     }
-    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    return {std::istreambuf_iterator<char>{*opened}, std::istreambuf_iterator<char>{}};
 }
 
 [[nodiscard]] std::string diagnosticsOf(DiagnosticReporter const& rep) {
@@ -346,7 +346,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> inputs;
     if (!source.empty()) {
         auto const unit = dir / "main.c";
-        dss::core::openOutputStream(unit, std::ios::binary) << source;   // at any length (the home)
+        dss::core::openOutputStream(unit, std::ios::binary).value() << source;   // at any length (the home)
         inputs.push_back(unit.string());
     }
     if (!object.empty()) inputs.push_back(object.string());
@@ -632,7 +632,7 @@ TEST(PeCompilerSupportRuntimeNative, ClsLinkFindsTheFloatMarkerInTheRuntime) {
     auto const tools = np::msvcToolsIn(msvc, dir);
     ASSERT_TRUE(tools.ready()) << tools.describe();
     {
-        std::ofstream out = dss::core::openOutputStream(dir / "f.c", std::ios::binary);
+        std::ofstream out = dss::core::openOutputStream(dir / "f.c", std::ios::binary).value();
         out << "double fl_scale(double x) { return x * 2.5; }\nint fl_entry(void) { return (int)fl_scale(4.0); }\n";
     }
     std::string const cl =
@@ -662,7 +662,7 @@ TEST(PeCompilerSupportRuntimeNative, ClsLinkFindsTheFloatMarkerInTheRuntime) {
                                                    + " kernel32.lib",
                                                dir / (log + ".txt"));
         int const     rc = np::systemUnder(tools.env, cmd);
-        std::ifstream in = dss::core::openInputStream(dir / (log + ".txt"), std::ios::binary);
+        std::ifstream in = dss::core::openInputStream(dir / (log + ".txt"), std::ios::binary).value_or(std::ifstream{});
         return std::pair<int, std::string>{rc, std::string{std::istreambuf_iterator<char>{in},
                                                            std::istreambuf_iterator<char>{}}};
     };

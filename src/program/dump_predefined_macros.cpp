@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <ostream>
 #include <span>
+#include <streambuf>
 #include <system_error>
 #include <utility>
 #include <string>
@@ -56,6 +57,34 @@ void emitLoud(std::ostream& err, DiagnosticCode code, std::string_view message) 
     err << severityName(DiagnosticSeverity::Error) << '['
         << diagnosticCodeName(code) << "]: " << message << '\n';
 }
+
+// THE NET'S COUNT for a step that reports on a STREAM, never a counted reporter (above, "WHY NOT A
+// DiagnosticReporter"): the lines it says through `stream`, every byte forwarded to the dump's own error stream
+// unchanged. The several-unit net (`substrate::namingSilentFailures`) reads it before and after each target's step, so
+// a target that fails having said nothing is named (P69 H6c2, site 15).
+class LinesSaid final : public std::streambuf {
+public:
+    explicit LinesSaid(std::ostream& to) : to_{*to.rdbuf()} {}
+    LinesSaid(LinesSaid const&)            = delete;
+    LinesSaid& operator=(LinesSaid const&) = delete;
+    [[nodiscard]] std::size_t lines() const noexcept { return lines_; }
+    std::ostream              stream{this};
+
+private:
+    int_type overflow(int_type c) override {
+        if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+        if (traits_type::to_char_type(c) == '\n') ++lines_;
+        return to_.sputc(traits_type::to_char_type(c));
+    }
+    std::streamsize xsputn(char const* s, std::streamsize n) override {
+        lines_ += static_cast<std::size_t>(std::count(s, s + n, '\n'));
+        return to_.sputn(s, n);
+    }
+    int sync() override { return to_.pubsync(); }
+
+    std::streambuf& to_;
+    std::size_t     lines_ = 0;
+};
 
 // Print a config document's own diagnostics verbatim, severity preserved.
 //
@@ -531,7 +560,12 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
     // (`substrate::runEveryUnit`; site (k) of the orchestrator's ledger 568, P69
     // fold 3e): a target that fails says why, and the targets after it are still
     // rendered and checked -- then nothing is printed, by the rule above.
-    bool const everySectionRendered = substrate::runEveryUnit(args.targets.size(), [&](std::size_t t) {
+    // Netted (P69 H6c2, site 15): a target whose step failed having said nothing is named, on the dump's stream.
+    LinesSaid  said{err};
+    bool const everySectionRendered = substrate::runEveryUnit(
+        args.targets.size(),
+        substrate::namingSilentFailures(
+            [&, &err = said.stream](std::size_t t) {
         std::string const& spec = args.targets[t];
         auto parsed = TargetSpec::parse(spec);
         if (!parsed) {
@@ -659,7 +693,13 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         }
         sections.push_back(std::move(*rendered));
         return true;
-    });
+            },
+            [&said] { return said.lines(); },
+            [&](std::size_t t) {
+                emitLoud(err, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                         "internal: the dump's step failed --target '" + args.targets[t]
+                             + "' without saying why -- substrate-contract violation: a failing step must say why");
+            }));
     if (!everySectionRendered) return 1;
 
     for (std::string const& s : sections) out << s;

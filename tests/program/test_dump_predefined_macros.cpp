@@ -488,6 +488,9 @@ TEST(DumpPredefinedMacros, AFailureOnALaterTargetPrintsNothingForTheEarlierOnes)
     EXPECT_EQ(dumpPredefinedMacros(args, out, err), 1);
     EXPECT_EQ(out.str(), "")
         << "the two good sections leaked despite the run failing";
+    // The step's net (P69 H6c2, site 15): the failing target said why, so no target is named silent.
+    EXPECT_EQ(err.str().find("without saying why"), std::string::npos) << err.str();
+    EXPECT_NE(err.str().find("not-a-real-format"), std::string::npos) << "the failing target was not named: " << err.str();
 }
 
 // ── The CLI happy path over real shipped config ────────────────────────────

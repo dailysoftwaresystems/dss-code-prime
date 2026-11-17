@@ -1,1 +1,2 @@
-    bool const everyInputClaimed = substrate::runEveryUnit(sourceFiles.size(), [&](std::size_t i) {
+    bool const everyInputClaimed = substrate::runEveryUnit(
+        sourceFiles.size(),

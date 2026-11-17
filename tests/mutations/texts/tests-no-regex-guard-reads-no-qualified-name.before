@@ -1,0 +1,1 @@
+        if (kRegexNames.count(name) != 0) out.push_back(form + std::string{name});

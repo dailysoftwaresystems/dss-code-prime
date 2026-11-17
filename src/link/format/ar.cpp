@@ -1,6 +1,7 @@
 #include "link/format/ar.hpp"
 
 #include "core/substrate/every_unit.hpp"   // runEveryUnit -- every member before the write fails
+#include "core/substrate/silent_unit.hpp"  // namingSilentUnits -- a member that fails having said nothing is named
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 
@@ -123,18 +124,28 @@ writeArArchive(std::span<ArMemberInput const> members,
     // whose name, payload or exported symbol cannot be stored never stops the
     // members after it, so one run names every member to fix. The loops below
     // build the archive from members this pass accepted.
-    bool const everyMemberStorable = dss::substrate::runEveryUnit(members.size(), [&](std::size_t mi) {
+    // ★ NETTED (H6c2): every refusal names its member by its POSITION and its
+    // name (`who`), so two members with one defect never say the same words --
+    // the reporter's dedup window drops a repeat, and the net would then name a
+    // member that reported as silent; a member that fails having said nothing is
+    // named.
+    bool const everyMemberStorable = dss::substrate::runEveryUnit(
+        members.size(),
+        dss::substrate::namingSilentUnits(reporter, "the ar writer's member validation",
+                                          [](std::size_t mi) { return "member " + std::to_string(mi); },
+                                          [&](std::size_t mi) {
         ArMemberInput const& m = members[mi];
+        std::string const who = "member " + std::to_string(mi) + (m.name.empty() ? std::string{} : " '" + m.name + "'");
         bool storable = true;
         if (m.name.empty()) {
             emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                 "ar writer: a member has an empty file name -- an ar member "
+                 "ar writer: " + who + " has an empty file name -- an ar member "
                  "must carry a non-empty name (D-LK-STATIC-ARCHIVE-WRITER)");
             storable = false;
         }
         if (std::any_of(m.name.begin(), m.name.end(), isFramingReservedByte)) {
             emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                 "ar writer: member name '" + m.name + "' contains a byte "
+                 "ar writer: " + who + ": its name contains a byte "
                  "reserved by the archive framing ('/', newline, or NUL) -- "
                  "the container would mis-resolve it "
                  "(D-LK-STATIC-ARCHIVE-WRITER)");
@@ -142,7 +153,7 @@ writeArArchive(std::span<ArMemberInput const> members,
         }
         if (m.objectBytes.size() > kMaxArFieldSize) {
             emit(reporter, DiagnosticCode::K_ArchiveFieldOverflow,
-                 "ar writer: member '" + m.name + "' payload ("
+                 "ar writer: " + who + ": its payload ("
                  + std::to_string(m.objectBytes.size())
                  + " bytes) exceeds the 10-digit ASCII ar_hdr size field "
                    "(D-LK-STATIC-ARCHIVE-WRITER)");
@@ -151,21 +162,21 @@ writeArArchive(std::span<ArMemberInput const> members,
         for (std::string const& sym : m.exportedSymbols) {
             if (sym.empty()) {
                 emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                     "ar writer: member '" + m.name + "' exports an "
+                     "ar writer: " + who + " exports an "
                      "empty symbol name -- an armap entry must be named "
                      "(D-LK-STATIC-ARCHIVE-WRITER)");
                 storable = false;
             } else if (sym.find('\0') != std::string::npos) {
                 emit(reporter, DiagnosticCode::K_ArchiveMemberNameInvalid,
-                     "ar writer: an exported symbol name of member '"
-                     + m.name + "' contains a NUL, which would "
+                     "ar writer: an exported symbol name of " + who
+                     + " contains a NUL, which would "
                      "truncate the armap name blob "
                      "(D-LK-STATIC-ARCHIVE-WRITER)");
                 storable = false;
             }
         }
         return storable;
-    });
+    }));
     if (!everyMemberStorable) return {};
 
     std::vector<std::string> nameFields;        // the 16-byte name spelling per member

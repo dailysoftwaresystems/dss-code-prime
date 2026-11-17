@@ -1,0 +1,1 @@
+                    report(b, "R4");   // R4: a declared error_code handed whole to a formatter

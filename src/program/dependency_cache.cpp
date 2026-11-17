@@ -82,14 +82,16 @@ public:
         AcquisitionLock lock;
 #ifdef _WIN32
         // Through the home (`core::openHandle`, H6c A4): the file's LEAF reference, at any length; not inheritable.
-        lock.handle_ = static_cast<HANDLE>(core::openHandle(
+        // Every refusal names the OS's reason, read at the call that failed (H6c2: `core::reasonText`).
+        auto const opened = core::openHandle(
             file, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL));
-        if (lock.handle_ == INVALID_HANDLE_VALUE) {
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+        if (!opened) {
             return std::unexpected("the lock file '" + core::genericSpelling(file)
-                                   + "' could not be opened (Windows error "
-                                   + std::to_string(::GetLastError()) + ")");
+                                   + "' could not be opened: " + core::reasonText(opened.error()));
         }
+        lock.handle_ = static_cast<HANDLE>(*opened);
+        auto const winReason = [](DWORD e) { return core::reasonText(std::error_code{static_cast<int>(e), std::system_category()}); };
         OVERLAPPED tryRange{};
         if (!::LockFileEx(lock.handle_,
                           LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0,
@@ -97,37 +99,40 @@ public:
             DWORD const busy = ::GetLastError();
             if (busy != ERROR_LOCK_VIOLATION) {
                 return std::unexpected("the lock file '" + core::genericSpelling(file)
-                                       + "' could not be locked (Windows error "
-                                       + std::to_string(busy) + ")");
+                                       + "' could not be locked: " + winReason(busy));
             }
             if (onContention) onContention();
             OVERLAPPED waitRange{};
             if (!::LockFileEx(lock.handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD,
                               MAXDWORD, &waitRange)) {
+                DWORD const failed = ::GetLastError();
                 return std::unexpected("waiting for the lock file '"
                                        + core::genericSpelling(file)
-                                       + "' failed (Windows error "
-                                       + std::to_string(::GetLastError()) + ")");
+                                       + "' failed: " + winReason(failed));
             }
         }
 #else
-        lock.fd_ = core::openDescriptor(file, O_RDWR | O_CREAT | O_CLOEXEC, 0666);   // through the home (A4)
-        if (lock.fd_ < 0) {
+        // Every refusal names the OS's reason, read at the call that failed (H6c2: `core::reasonText`).
+        auto const opened = core::openDescriptor(file, O_RDWR | O_CREAT | O_CLOEXEC, 0666);   // through the home (A4)
+        if (!opened) {
             return std::unexpected("the lock file '" + core::genericSpelling(file)
-                                   + "' could not be opened: " + std::strerror(errno));
+                                   + "' could not be opened: " + core::reasonText(opened.error()));
         }
+        lock.fd_ = *opened;
+        auto const errnoReason = [](int e) { return core::reasonText(std::error_code{e, std::generic_category()}); };
         if (::flock(lock.fd_, LOCK_EX | LOCK_NB) != 0) {
-            if (errno != EWOULDBLOCK) {
+            int const busy = errno;
+            if (busy != EWOULDBLOCK) {
                 return std::unexpected("the lock file '" + core::genericSpelling(file)
-                                       + "' could not be locked: "
-                                       + std::strerror(errno));
+                                       + "' could not be locked: " + errnoReason(busy));
             }
             if (onContention) onContention();
             while (::flock(lock.fd_, LOCK_EX) != 0) {
-                if (errno != EINTR) {
+                int const failed = errno;
+                if (failed != EINTR) {
                     return std::unexpected("waiting for the lock file '"
                                            + core::genericSpelling(file)
-                                           + "' failed: " + std::strerror(errno));
+                                           + "' failed: " + errnoReason(failed));
                 }
             }
         }
@@ -207,6 +212,18 @@ void emitDerivedNameInvalid(DiagnosticReporter& rep, std::string_view url,
 describeEntry(std::string const& url, std::optional<std::string> const& ref) {
     return "'" + url + "'" + (ref ? " at ref '" + *ref + "'"
                                   : " with no ref declared");
+}
+
+// THE COMPLETENESS MARKER, claimed EXCLUSIVELY and closed: no reason when it was made, else the OS's reason for the
+// step that refused -- the directory's creation (`made`, as `createDirectoriesFor` left it), the claim (its own reason,
+// read at the call), or the close (the runtime's reason, read at the call) (H6c2).
+[[nodiscard]] std::error_code markCompleteness(core::HostPath const& marker, std::error_code const& made) {
+    if (made) return made;
+    auto const claimed = linker::detail::createExclusiveBinary(marker);
+    if (!claimed) return claimed.error();
+    core::clearRuntimeReason();
+    if (std::fclose(*claimed) != 0) return core::runtimeReason();
+    return {};
 }
 
 } // namespace
@@ -407,7 +424,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
                        + core::genericSpelling(checkoutDir)
                        + "' could not be removed: '"
                        + removal.firstPath.spelling().generic() + "': "
-                       + removal.firstError.message();
+                       + core::reasonText(removal.firstError);
             return out;
         }
     }
@@ -416,12 +433,9 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
     // ── MARK INCOMPLETE BEFORE ONE BYTE OF THE TREE IS WRITTEN ──────────────
     if (!markedOurs) {
         static_cast<void>(core::createDirectoriesFor(marker, ec));   // the directory the marker's write names
-        std::FILE* const claimed =
-            ec ? nullptr : linker::detail::createExclusiveBinary(marker);
-        if (claimed == nullptr || std::fclose(claimed) != 0) {
+        if (std::error_code const refused = markCompleteness(marker, ec)) {
             out.detail = "the completeness marker '" + core::genericSpelling(marker)
-                       + "' could not be created"
-                       + (ec ? ": " + ec.message() : std::string{});
+                       + "' could not be created: " + core::reasonText(refused);
             return out;
         }
     }
@@ -460,7 +474,7 @@ DependencyCache::cloneInPlace_(std::string const& name, std::string const& url,
         out.detail = "the checkout at '" + core::genericSpelling(checkoutDir)
                    + "' is complete but could not be marked so — '"
                    + core::genericSpelling(marker)
-                   + "' could not be removed: " + ec.message();
+                   + "' could not be removed: " + core::reasonText(ec);
     }
     return out;
 }
@@ -500,7 +514,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     static_cast<void>(core::createDirectories(lockDir, ec));
     auto held = ec ? std::expected<AcquisitionLock, std::string>{std::unexpected(
                          "the lock directory '" + core::genericSpelling(lockDir)
-                         + "' could not be created: " + ec.message())}
+                         + "' could not be created: " + core::reasonText(ec))}
                    : AcquisitionLock::acquire(lockDir / name, [this, &name] {
                          if (lockContentionObserver_) lockContentionObserver_(name);
                      });
@@ -581,13 +595,11 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
     bool refreshLeftTreeIncomplete = false;
     if (acq.ok && hasCheckout) {
         static_cast<void>(core::createDirectoriesFor(marker, ec));   // the directory the marker's write names
-        std::FILE* const claimed =
-            ec ? nullptr : linker::detail::createExclusiveBinary(marker);
-        if (claimed == nullptr || std::fclose(claimed) != 0) {
+        if (std::error_code const refused = markCompleteness(marker, ec)) {
             acq.ok     = false;
             acq.detail = "the completeness marker '" + core::genericSpelling(marker)
-                       + "' could not be created, so the working tree was not "
-                         "rewritten";
+                       + "' could not be created (" + core::reasonText(refused)
+                       + "), so the working tree was not rewritten";
         } else {
             acq = git_->checkout(checkoutDir, "FETCH_HEAD");
             if (acq.ok) {
@@ -597,7 +609,7 @@ ResolvedGitDependency DependencyCache::acquire(std::string const&  name,
                     acq.detail = "the refreshed checkout is complete but could "
                                  "not be marked so — '"
                                + core::genericSpelling(marker)
-                               + "' could not be removed: " + ec.message();
+                               + "' could not be removed: " + core::reasonText(ec);
                     refreshLeftTreeIncomplete = true;
                 }
             } else {

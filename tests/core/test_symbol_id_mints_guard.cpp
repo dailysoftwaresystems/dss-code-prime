@@ -62,6 +62,7 @@
 #include <iterator>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -681,8 +682,12 @@ struct Container {
 
 // A source's bytes, read through the home: `p` is the walk's LISTED value, never its text re-resolved.
 [[nodiscard]] std::string readAll(dss::core::HostPath const& p) {
-    std::ifstream in = dss::core::openInputStream(p, std::ios::binary);
-    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    // A source the scan cannot open is no clean source: the scan stops, naming it and the OS's reason (H6c2 (d)).
+    auto opened = dss::core::openInputStream(p, std::ios::binary);
+    if (!opened)
+        throw std::runtime_error("the scan could not open '" + p.spelling().generic() + "': "
+                                 + dss::core::reasonText(opened.error()));
+    return {std::istreambuf_iterator<char>{*opened}, std::istreambuf_iterator<char>{}};
 }
 
 [[nodiscard]] std::string listed(std::vector<Finding> const& found) {

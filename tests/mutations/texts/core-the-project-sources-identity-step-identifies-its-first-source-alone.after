@@ -1,0 +1,2 @@
+    bool const everySourceIdentified = substrate::runEveryUnit(
+        std::min<std::size_t>(expanded.size(), 1),

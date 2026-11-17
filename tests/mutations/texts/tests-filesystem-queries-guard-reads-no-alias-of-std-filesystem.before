@@ -1,1 +1,1 @@
-            declared.emplace_back((*it)[1].str(), lastComponent((*it)[2].str()));
+        out.emplace_back(std::string{code.substr(name, nameEnd - name)}, lastComponent(target));

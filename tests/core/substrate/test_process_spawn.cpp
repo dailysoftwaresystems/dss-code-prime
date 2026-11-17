@@ -33,6 +33,7 @@
 #include "scoped_env.hpp"  // the environment arm's pins set what the child must NOT get
 #include "scratch_dir.hpp"
 #include "spawn_image.hpp"  // the image argv[0] names, as the product names it (H6c)
+#include "system_reason_text.hpp"  // the test side's one oracle for an OS code's own text (H6c2)
 #include "test_wait_budget.hpp"  // kWaitBudget — the shared, measured wait cap
 
 #include <gtest/gtest.h>
@@ -1230,6 +1231,49 @@ TEST(ResolveExecutableOnPath, ANameHoldingAWindowsWildcardIsNoProgram) {
 #endif
 }
 
+// A SPAWN OF A VALUE THAT NAMES NOTHING IS REFUSED BY NAME (P69 H6c2, T4): a GIVEN narrow spelling that is no UTF-8
+// names no Windows file, so neither an image nor a working directory spelled so is handed to CreateProcessW -- and an
+// ill-formed working directory is never read as "inherit the parent's". On POSIX a name is bytes.
+TEST(SpawnAndWait, AnIllFormedImageOrWorkingDirectoryIsRefusedByName) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX name is bytes: no narrow spelling is ill-formed there";
+#else
+    // A diagnostic is UTF-8 text: the byte that is no UTF-8 is spelt in it as its escape, `\xFF`, never as itself.
+    SpawnResult const image = spawnAndWaitInherit(dss::core::HostPath{std::string{"bad\xFF.exe"}}, {"bad"});
+    EXPECT_FALSE(image.spawned);
+    EXPECT_NE(image.diagnostic.find("the image 'bad\\xFF.exe' is refused"), std::string::npos) << image.diagnostic;
+    SpawnResult const cwd = spawnAndWaitInherit(dss::core::HostPath{selfPath()}, {"self", "--gtest_list_tests"},
+                                                dss::core::HostPath{std::string{"dir\xC3"}});
+    EXPECT_FALSE(cwd.spawned) << "the child ran in a directory that names nothing";
+    EXPECT_NE(cwd.diagnostic.find("the working directory 'dir\\xC3' is refused"), std::string::npos)
+        << cwd.diagnostic;
+#endif
+}
+
+// A CANDIDATE THAT NAMES NO LAST NAME IS NOT FOUND, NEVER THROWN (P69 H6c2, H1): `..` searched below a FIRST-LEVEL
+// PATH entry reaches the volume's root, and a root spelled as the command is taken as given -- on Windows each has no
+// sibling by a PATHEXT extension (`withSuffix` answers `NoLastName`; until H6c2 it threw, uncaught, and the compiler
+// aborted with no diagnostic), on POSIX each is a directory. The probe answers "not found" for both.
+TEST(ResolveExecutableOnPath, ACandidateThatNamesNoLastNameIsNotFound) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "process-spawn-no-last-name"};
+    // The scratch's first-level ancestor: the directory just below its volume root (`C:\Users`, `/tmp`).
+    fs::path firstLevel = fs::absolute(scratch.path());
+    while (firstLevel.has_parent_path() && firstLevel.parent_path().has_parent_path()
+           && firstLevel.parent_path() != firstLevel.parent_path().root_path())
+        firstLevel = firstLevel.parent_path();
+    ASSERT_FALSE(firstLevel.empty());
+    PathVarGuard guard;
+    setPathVar(firstLevel.string());
+    std::optional<dss::core::HostPath> found;
+    ASSERT_NO_THROW(found = resolveExecutableOnPath(".."));
+    EXPECT_FALSE(found.has_value()) << "`..` below `" << firstLevel.string() << "` resolved to "
+                                    << (found ? found->spelling().display() : std::string{});
+    std::string const root = fs::absolute(scratch.path()).root_path().string();
+    ASSERT_NO_THROW(found = resolveExecutableOnPath(root));
+    EXPECT_FALSE(found.has_value()) << "the root `" << root << "` resolved to "
+                                    << (found ? found->spelling().display() : std::string{});
+}
+
 // A command that already carries a directory component is NOT a PATH lookup —
 // it is taken as given. Pinned with a PATH that contains only a known-empty
 // directory, so a resolver that (wrongly) routed this through the search would
@@ -2057,6 +2101,59 @@ TEST(SpawnAndWaitRedirectStdout, AnUncreatableCaptureFileIsReportedAndNoChildRun
         << "a child was created despite the capture being impossible — it ran "
            "with the compiler's own stdout and the caller would have been "
            "handed a clean exit code with nothing to read";
+}
+
+// THE REASON IS THE HOST'S OWN, READ AT THE CALL THAT FAILED (P69 H6c2). The
+// redirect's create is refused for two different reasons -- its directory is
+// MISSING, or its "directory" is a FILE -- and the diagnostic names exactly the
+// code the host itself answers to the same create of the same spelling: the
+// ORACLE is that create, made here (CreateFileW of the literal `\\?\` spelling
+// and GetLastError; POSIX `open` and errno), and its text the system's own
+// (`systemReasonText`, never the product's renderer). A code read after a call
+// that reset it, or one fixed in the message, names the wrong reason here.
+TEST(SpawnAndWaitRedirectStdout, AnUncreatableCaptureFileNamesTheHostsOwnReason) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "process-spawn-redirect-reason"};
+    fs::path const notADirectory = scratch.path() / "a-file";
+    {
+        std::ofstream plant{notADirectory, std::ios::binary};
+        plant << "a file where the capture's directory should be\n";
+    }
+    ASSERT_TRUE(fs::is_regular_file(notADirectory));
+    struct Shape {
+        char const* what;
+        fs::path    capture;
+    };
+    Shape const shapes[] = {
+        {"its directory is missing", scratch.path() / "no-such-subdir" / "cap.out"},
+        {"its directory is a file", notADirectory / "cap.out"},
+    };
+    for (Shape const& shape : shapes) {
+        fs::path const marker = scratch.path() / "never.marker";
+#if defined(_WIN32)
+        fs::path literal = shape.capture;
+        literal.make_preferred();
+        std::wstring const spelling = L"\\\\?\\" + literal.native();
+        HANDLE const       probe    = ::CreateFileW(spelling.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD const oracle = probe == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
+        if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+        ASSERT_NE(oracle, static_cast<DWORD>(ERROR_SUCCESS)) << shape.what << ": the host made the file";
+#else
+        int const probe  = ::open(shape.capture.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        int const oracle = probe < 0 ? errno : 0;
+        if (probe >= 0) ::close(probe);
+        ASSERT_NE(oracle, 0) << shape.what << ": the host made the file";
+#endif
+        auto const run = runFixtureRedirected(marker, 0, {}, shape.capture);
+
+        EXPECT_FALSE(run.result.spawned) << shape.what << ": " << run.result.diagnostic;
+        EXPECT_NE(run.result.diagnostic.find("' (" + dss::test_support::systemReasonText(oracle) + "), so '"),
+                  std::string::npos)
+            << shape.what << ": the diagnostic must name the host's own reason for this create, "
+            << dss::test_support::systemReasonText(oracle) << ", and it says: " << run.result.diagnostic;
+        EXPECT_FALSE(fs::exists(marker)) << shape.what << ": a child ran although its capture was impossible";
+    }
 }
 
 // An EMPTY path is the internal sentinel for "inherit", so letting it through

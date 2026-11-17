@@ -70,6 +70,21 @@ using json = nlohmann::json;
 
 namespace {
 
+// A workspace is refused with EVERY reason (P69 H6c2: `WorkspaceProjectRefusals`, non-empty, in unit order). A fixture
+// that holds ONE failure asserts the list holds exactly that one, and reads it.
+template <class Result>
+dss::lsp::WorkspaceProjectError const& theOneRefusal(Result const& result) {
+    static dss::lsp::WorkspaceProjectError const none{WorkspaceProjectErrorKind::NoWorkspaceRoot, "<no refusal>"};
+    if (result.has_value()) {
+        ADD_FAILURE() << "the workspace was not refused";
+        return none;
+    }
+    auto const& refusals = result.error().refusals;
+    EXPECT_EQ(refusals.size(), 1u) << "a fixture of one failure was refused " << refusals.size() << " time(s)";
+    if (refusals.empty()) return none;
+    return refusals.front();
+}
+
 // Write `body` to `<dir>/<name>`. Throws on failure — a fixture we could not
 // build is a setup error the suite must SEE, never something to skip past.
 void writeFile(fs::path const& dir, std::string_view name, std::string_view body) {
@@ -303,10 +318,10 @@ TEST(WorkspaceProject, SeveralManifestsAgreeingOnOneCpuStillResolve) {
 TEST(WorkspaceProject, NoWorkspaceRootIsItsOwnFailure) {
     auto pref = resolveWorkspaceLanguagePreference({});
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::NoWorkspaceRoot);
-    EXPECT_NE(pref.error().detail.find("workspaceFolders"), std::string::npos)
+    EXPECT_EQ(theOneRefusal(pref).kind, WorkspaceProjectErrorKind::NoWorkspaceRoot);
+    EXPECT_NE(theOneRefusal(pref).detail.find("workspaceFolders"), std::string::npos)
         << "the message must name the protocol field the client omitted; got: "
-        << pref.error().detail;
+        << theOneRefusal(pref).detail;
 }
 
 TEST(WorkspaceProject, EmptyWorkspaceReportsProjectFileNotFound) {
@@ -314,14 +329,14 @@ TEST(WorkspaceProject, EmptyWorkspaceReportsProjectFileNotFound) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::ProjectFileNotFound);
-    EXPECT_NE(pref.error().detail.find(".dss-project.json"), std::string::npos)
+    EXPECT_NE(theOneRefusal(pref).detail.find(".dss-project.json"), std::string::npos)
         << "the message must name the suffix that was looked for; got: "
-        << pref.error().detail;
-    EXPECT_NE(pref.error().detail.find(ws.path().string()), std::string::npos)
+        << theOneRefusal(pref).detail;
+    EXPECT_NE(theOneRefusal(pref).detail.find(ws.path().string()), std::string::npos)
         << "the message must name the directory that was searched; got: "
-        << pref.error().detail;
+        << theOneRefusal(pref).detail;
 }
 
 // A DANGLING LINK IS NO PROJECT FILE, on every build: a workspace whose one `.dss-project.json` entry is a
@@ -336,9 +351,9 @@ TEST(WorkspaceProject, ADanglingManifestLinkIsNoProjectFile) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
+    EXPECT_EQ(theOneRefusal(pref).kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
         << "the workspace whose one manifest is a dangling link answered "
-        << dss::lsp::workspaceProjectErrorName(pref.error().kind);
+        << dss::lsp::workspaceProjectErrorName(theOneRefusal(pref).kind);
 }
 
 // A PROJECT FILE THAT CANNOT BE READ IS REFUSED, NAMING IT: a workspace whose `.dss-project.json` entry is a link
@@ -352,11 +367,11 @@ TEST(WorkspaceProject, AManifestLinkThatCannotBeReadIsRefusedNamingIt) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind, WorkspaceProjectErrorKind::ProjectFileLoadFailed)
+    EXPECT_EQ(theOneRefusal(pref).kind, WorkspaceProjectErrorKind::ProjectFileLoadFailed)
         << "the workspace whose one manifest is a looping link answered "
-        << dss::lsp::workspaceProjectErrorName(pref.error().kind) << ": " << pref.error().detail;
-    EXPECT_NE(pref.error().detail.find("app.dss-project.json"), std::string::npos)
-        << "the refusal does not name the entry: " << pref.error().detail;
+        << dss::lsp::workspaceProjectErrorName(theOneRefusal(pref).kind) << ": " << theOneRefusal(pref).detail;
+    EXPECT_NE(theOneRefusal(pref).detail.find("app.dss-project.json"), std::string::npos)
+        << "the refusal does not name the entry: " << theOneRefusal(pref).detail;
 
     ScratchDir other{Location::Temp, "lsp-ws-loop-other"};
     DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(other.path() / "loop", other.path() / "loop",
@@ -364,9 +379,9 @@ TEST(WorkspaceProject, AManifestLinkThatCannotBeReadIsRefusedNamingIt) {
     const std::array<fs::path, 1> otherRoots{other.path()};
     auto none = resolveWorkspaceLanguagePreference(otherRoots);
     ASSERT_FALSE(none.has_value());
-    EXPECT_EQ(none.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
-        << "a looping link named as no project file answered " << dss::lsp::workspaceProjectErrorName(none.error().kind)
-        << ": " << none.error().detail;
+    EXPECT_EQ(theOneRefusal(none).kind, WorkspaceProjectErrorKind::ProjectFileNotFound)
+        << "a looping link named as no project file answered " << dss::lsp::workspaceProjectErrorName(theOneRefusal(none).kind)
+        << ": " << theOneRefusal(none).detail;
 }
 
 // ★ A MANIFEST NAMING NO TARGET IS REJECTED BY THE SHARED PARSER, NOT BY A
@@ -381,14 +396,14 @@ TEST(WorkspaceProject, ManifestNamingNoTargetIsRejectedByTheSharedParser) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::ProjectFileLoadFailed);
-    EXPECT_NE(pref.error().detail.find("targets"), std::string::npos)
+    EXPECT_NE(theOneRefusal(pref).detail.find("targets"), std::string::npos)
         << "the shared parser's message names the offending field and must "
-           "reach the editor verbatim; got: " << pref.error().detail;
-    EXPECT_NE(pref.error().detail.find("C_MissingField"), std::string::npos)
+           "reach the editor verbatim; got: " << theOneRefusal(pref).detail;
+    EXPECT_NE(theOneRefusal(pref).detail.find("C_MissingField"), std::string::npos)
         << "the shared parser's diagnostic CODE must survive too; got: "
-        << pref.error().detail;
+        << theOneRefusal(pref).detail;
 }
 
 // Same kind, different message: proving the parser is genuinely being run
@@ -405,11 +420,11 @@ TEST(WorkspaceProject, UnknownManifestKeyIsRejectedByTheSharedParser) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::ProjectFileLoadFailed);
-    EXPECT_NE(pref.error().detail.find("targetz"), std::string::npos)
+    EXPECT_NE(theOneRefusal(pref).detail.find("targetz"), std::string::npos)
         << "the shared parser's CLOSED key vocabulary is inherited, not "
-           "re-implemented; got: " << pref.error().detail;
+           "re-implemented; got: " << theOneRefusal(pref).detail;
 }
 
 // ★★ THE ANTI-DUPLICATION PIN (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS).
@@ -467,12 +482,12 @@ TEST(WorkspaceProject, LspAndDriverParseAManifestThroughTheSameLoader) {
         << "axis 1 (behaviour): a `targets`-only re-implementation would have "
            "returned a preference here. The LSP must inherit the shared "
            "loader's refusal, key vocabulary and all";
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::ProjectFileLoadFailed);
-    EXPECT_NE(pref.error().detail.find(driverSays), std::string::npos)
+    EXPECT_NE(theOneRefusal(pref).detail.find(driverSays), std::string::npos)
         << "axis 2 (text): the LSP's reason must CONTAIN the driver's own "
            "rendered diagnostic byte-for-byte.\n  driver: " << driverSays
-        << "\n  lsp:    " << pref.error().detail;
+        << "\n  lsp:    " << theOneRefusal(pref).detail;
 }
 
 TEST(WorkspaceProject, MalformedTargetSpecIsItsOwnFailure) {
@@ -481,11 +496,11 @@ TEST(WorkspaceProject, MalformedTargetSpecIsItsOwnFailure) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::TargetSpecMalformed);
-    EXPECT_NE(pref.error().detail.find("MissingColon"), std::string::npos)
+    EXPECT_NE(theOneRefusal(pref).detail.find("MissingColon"), std::string::npos)
         << "the driver's own spec-error vocabulary must be carried through, "
-           "not flattened; got: " << pref.error().detail;
+           "not flattened; got: " << theOneRefusal(pref).detail;
 }
 
 TEST(WorkspaceProject, UnknownTargetIsItsOwnFailure) {
@@ -495,11 +510,11 @@ TEST(WorkspaceProject, UnknownTargetIsItsOwnFailure) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto pref = resolveWorkspaceLanguagePreference(roots);
     ASSERT_FALSE(pref.has_value());
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::TargetConfigLoadFailed);
-    EXPECT_NE(pref.error().detail.find("no-such-cpu"), std::string::npos)
+    EXPECT_NE(theOneRefusal(pref).detail.find("no-such-cpu"), std::string::npos)
         << "the message must name the target that could not be loaded; got: "
-        << pref.error().detail;
+        << theOneRefusal(pref).detail;
 }
 
 // ★ A REAL TARGET DOCUMENT WITH THE KEY REMOVED, THROUGH THE REAL LOADER.
@@ -542,14 +557,14 @@ TEST(WorkspaceProject, TargetWithoutAssemblyLanguageIsItsOwnFailure) {
         << "a target that declares no assembly dialect cannot break a dialect "
            "tie, and narrowing the preference by skipping it would break the "
            "tie by accident";
-    EXPECT_EQ(pref.error().kind,
+    EXPECT_EQ(theOneRefusal(pref).kind,
               WorkspaceProjectErrorKind::TargetDeclaresNoAssemblyLanguage);
-    EXPECT_NE(pref.error().detail.find("defaultAssemblyLanguage"),
+    EXPECT_NE(theOneRefusal(pref).detail.find("defaultAssemblyLanguage"),
               std::string::npos)
-        << "the message must name the key to add; got: " << pref.error().detail;
-    EXPECT_NE(pref.error().detail.find(kName), std::string::npos)
+        << "the message must name the key to add; got: " << theOneRefusal(pref).detail;
+    EXPECT_NE(theOneRefusal(pref).detail.find(kName), std::string::npos)
         << "the message must name the target that is silent; got: "
-        << pref.error().detail;
+        << theOneRefusal(pref).detail;
 }
 
 // ── The composed message an editor actually sees ────────────────────────────
@@ -1339,8 +1354,8 @@ TEST(WorkspaceBuild, AManifestIsReadTheWayTheBuildReadsIt) {
 
     auto const build = dss::lsp::resolveWorkspaceBuild(roots);
     ASSERT_TRUE(build.has_value())
-        << dss::lsp::workspaceProjectErrorName(build.error().kind) << ": "
-        << build.error().detail;
+        << dss::lsp::workspaceProjectErrorName(theOneRefusal(build).kind) << ": "
+        << theOneRefusal(build).detail;
     ASSERT_EQ(build->manifests.size(), 1u);
     auto const& m = build->manifests[0];
     EXPECT_EQ(m.language, "c");
@@ -1394,10 +1409,10 @@ TEST(WorkspaceBuild, AManifestTheBuildRefusesIsRefusedUnderTheBuildsCode) {
         const std::array<fs::path, 1> roots{ws.path()};
         auto const build = dss::lsp::resolveWorkspaceBuild(roots);
         ASSERT_FALSE(build.has_value()) << c.name << ": the manifest must be refused";
-        EXPECT_EQ(build.error().kind, c.kind)
-            << c.name << ": got " << dss::lsp::workspaceProjectErrorName(build.error().kind);
-        EXPECT_EQ(build.error().code, c.code)
-            << c.name << ": got " << dss::diagnosticCodeName(build.error().code);
+        EXPECT_EQ(theOneRefusal(build).kind, c.kind)
+            << c.name << ": got " << dss::lsp::workspaceProjectErrorName(theOneRefusal(build).kind);
+        EXPECT_EQ(theOneRefusal(build).code, c.code)
+            << c.name << ": got " << dss::diagnosticCodeName(theOneRefusal(build).code);
     }
 }
 
@@ -1408,7 +1423,7 @@ TEST(WorkspaceBuild, NoManifestIsNoBuildRatherThanARefusal) {
     const std::array<fs::path, 1> roots{ws.path()};
     auto const build = dss::lsp::resolveWorkspaceBuild(roots);
     ASSERT_FALSE(build.has_value());
-    EXPECT_EQ(build.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound);
+    EXPECT_EQ(theOneRefusal(build).kind, WorkspaceProjectErrorKind::ProjectFileNotFound);
 }
 
 // A document a manifest LISTS is analyzed under exactly the manifests that list
@@ -1423,7 +1438,7 @@ TEST(WorkspaceBuild, ADocumentGetsTheManifestsThatListIt) {
     writeFile(ws.path(), "b.dss-project.json", buildManifest({kElf}, {"b.c"}));
     const std::array<fs::path, 1> roots{ws.path()};
     auto const build = dss::lsp::resolveWorkspaceBuild(roots);
-    ASSERT_TRUE(build.has_value()) << build.error().detail;
+    ASSERT_TRUE(build.has_value()) << theOneRefusal(build).detail;
 
     auto const a = dss::lsp::selectDocumentConfigurations(*build, ws.path() / "a.c", "c");
     EXPECT_TRUE(a.listed);
@@ -1462,7 +1477,7 @@ TEST(WorkspaceBuild, IdenticalConfigurationsCollapseAndSharedSpecsAreTold) {
     writeFile(ws.path(), "c.dss-project.json", buildManifest({kElf}, {"main.c"}, {}, {"MODE=1"}));
     const std::array<fs::path, 1> roots{ws.path()};
     auto const build = dss::lsp::resolveWorkspaceBuild(roots);
-    ASSERT_TRUE(build.has_value()) << build.error().detail;
+    ASSERT_TRUE(build.has_value()) << theOneRefusal(build).detail;
 
     auto const sel = dss::lsp::selectDocumentConfigurations(*build, ws.path() / "main.c", "c");
     EXPECT_EQ(specsOf(sel.configurations),

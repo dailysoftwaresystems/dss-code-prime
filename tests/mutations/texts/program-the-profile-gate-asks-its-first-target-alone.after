@@ -1,1 +1,2 @@
-    bool const everyTargetServed = substrate::runEveryUnit(std::min<std::size_t>(pc.targets.size(), 1), [&](std::size_t t) {
+    bool const everyTargetServed = substrate::runEveryUnit(
+        std::min<std::size_t>(pc.targets.size(), 1),

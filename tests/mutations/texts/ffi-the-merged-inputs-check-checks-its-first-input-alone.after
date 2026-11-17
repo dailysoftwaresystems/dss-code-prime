@@ -1,0 +1,2 @@
+        return substrate::runEveryUnit(
+            std::min<std::size_t>(inputs.size(), 1),

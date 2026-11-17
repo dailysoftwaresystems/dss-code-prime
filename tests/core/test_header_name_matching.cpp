@@ -82,19 +82,11 @@ void writeFile(fs::path const& p, std::string_view text = "{}\n") {
 // `ShippedConfigTreeHasNoCaseCollidingPaths` die with `C++ exception with description "Não existe
 // mapeamento para o caractere Unicode…"` — a localized message naming NO PATH, thrown by a guard
 // whose entire job is to name paths. gcc and clang narrow as UTF-8 and never saw it.
-// ★ THE FALLBACK IS THE CALLER'S BY DESIGN, WHICH IS WHY IT LIVES HERE AND NOT IN THE OWNER.
-// `genericSpellingU8` throws exactly where `u8string()` does, deliberately: a native name can be
-// text no encoding accepts (NTFS permits lone surrogates), and swallowing that inside the owner
-// would hand back a name that is not the file's. So the owner is reused for the spelling, and the
-// decision about an unrenderable entry is made by each caller — here, an EMPTY string meaning
-// "cannot classify", counted rather than silently skipped.
-[[nodiscard]] std::string narrowUtf8OrEmpty(fs::path const& p) {
-    try {
-        return u8Bytes(dss::core::genericSpellingU8(p));
-    } catch (...) {
-        return {};
-    }
-}
+// ★ THE OWNER'S SPELLING, WHICH IS TOTAL SINCE P69 H6c2 (T4): `genericSpellingU8` renders every
+// native name losslessly -- a name no encoding accepts (NTFS permits lone surrogates) as WTF-8,
+// which round-trips it -- so it still names the file and no caller keeps a fallback. (Until H6c2 it
+// threw where `u8string()` does, and this sweep counted such an entry "unrenderable" and skipped it.)
+[[nodiscard]] std::string utf8Spelling(fs::path const& p) { return u8Bytes(dss::core::genericSpellingU8(p)); }
 
 // Can THIS filesystem hold two entries whose names differ only by ASCII case?
 // Answered by EXPERIMENT in the very directory under test, never by an
@@ -132,7 +124,7 @@ bool hostCanHoldCaseCollidingPair(fs::path const& dir) {
         // directory lives under TEMP, whose path carries the account name — on a host whose
         // user name the code page cannot map, `.string()` would throw and take the host-capability
         // probe with it, turning "can this filesystem hold a colliding pair?" into a crash.
-        std::string const n = narrowUtf8OrEmpty(it->path().filename());
+        std::string const n = utf8Spelling(it->path().filename());
         if (asciiToLower(n) == "dss_case_probe.tmp") ++entries;
     }
     fs::remove(lower, ec);
@@ -217,12 +209,8 @@ using dss::test_support::TreeIgnores;
 // stores a `:` written by a POSIX tool) made `ShippedConfigTreeHasNoCaseCollidingPaths` die with
 // `C++ exception with description "Não existe mapeamento para o caractere Unicode…"` — a localized
 // message naming NO PATH, from a guard whose whole job is to name paths.
-// ★ THE FALLBACK IS THE CALLER'S BY DESIGN. `genericSpellingU8` throws exactly where `u8string()`
-// does, deliberately, because a native name can be text no encoding accepts (NTFS permits lone
-// surrogates) and swallowing that inside the owner would hand back a name that is not the file's.
-// So the owner is reused and the fallback lives HERE: an unrenderable entry yields an EMPTY
-// spelling, which the callers treat as "cannot classify" and COUNT, rather than aborting a sweep
-// over a whole repository because of one path it only needed to compare.
+// ★ THE OWNER'S TOTAL SPELLING (`utf8Spelling`, P69 H6c2 T4): every entry is spelled losslessly and
+// compared, a name no encoding accepts among them -- no entry is skipped as unrenderable.
 struct CaseCollisionScan {
     std::vector<std::vector<std::string>> groups;   // each >= 2 fold-equal paths
     // ★ THE SCAN MUST REPORT ITS OWN DENOMINATOR. `groups` is empty both when
@@ -236,11 +224,6 @@ struct CaseCollisionScan {
     // in this very tree.
     std::size_t     filesScanned = 0;
     std::error_code walkError;   // non-empty ⇒ TRUNCATED walk, never a pass
-    // ★ THE SAME DENOMINATOR DISCIPLINE, ONE STEP FURTHER: an entry whose name cannot be
-    // rendered is SKIPPED, and a silent skip is the vacuous-pass class this struct already
-    // guards against. Counting it makes the limit legible — the sweep can then say "clean over
-    // N files, and M I could not spell" instead of implying it looked at everything.
-    std::size_t     unrenderable = 0;
     // ★ AND WHAT IT LEFT OUT IS SAID, NEVER SILENT: a `.gitignore` the one reader cannot
     // read as git does refuses the whole sweep, and so does a swept root the tree's rules
     // leave out — a sweep of nothing.
@@ -274,7 +257,7 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root
         return p.has_filename() ? p : p.parent_path();
     };
     fs::path const treeFrame = frame(tree);
-    auto const     treeRel = [&](fs::path const& p) { return narrowUtf8OrEmpty(frame(p).lexically_relative(treeFrame)); };
+    auto const     treeRel = [&](fs::path const& p) { return utf8Spelling(frame(p).lexically_relative(treeFrame)); };
     // ★ A PATH THE ONE READER CANNOT ANSWER AS GIT DOES REFUSES THE WHOLE SWEEP, naming it (a name
     // holding a backslash, a rule whose match core.ignorecase would change): the sweep's verdict
     // would otherwise be one host's answer.
@@ -307,9 +290,7 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root
             // reads a link as what it reaches (✔MEASURED, the substrate's header), so a scan that asked
             // `symlink_status` DESCENDED a directory link when built with MinGW.
             if (entry.kind == EntryKind::Directory) {
-                // An unrenderable directory name yields "" — which no rule can judge, so the walk
-                // DESCENDS rather than pruning. Erring toward scanning more is the safe direction
-                // for a collision guard.
+                // An empty spelling is the tree's own frame, which no rule judges: the walk DESCENDS.
                 if (!inTree.empty() && !ignores.decide(names, true).empty()) return WalkStep::Prune;
                 return WalkStep::Continue;
             }
@@ -318,14 +299,8 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& tree, fs::path const& root
             // LEXICALLY relative to the swept root, never through `fs::relative`, which resolves a
             // symbolic link to what it points at and would report the target, not the link.
             fs::path const    relPath = frame(entryText).lexically_relative(frame(root));
-            std::string const rel     = narrowUtf8OrEmpty(relPath);
-            if (rel.empty()) {
-                // Distinguish the two reasons rather than folding them: no relative path is a
-                // walk problem, an unrenderable spelling is a text problem, and only the second is
-                // this scan's own blind spot.
-                if (!relPath.empty()) ++scan.unrenderable;
-                return WalkStep::Continue;
-            }
+            std::string const rel     = utf8Spelling(relPath);
+            if (rel.empty()) return WalkStep::Continue;   // no relative path: a walk problem, never a name
             ++scan.filesScanned;
             scan.paths.push_back(rel);
             byFolded[asciiToLower(rel)].push_back(rel);
@@ -1025,14 +1000,6 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
             << ") — a partial tree is not a clean tree";
         EXPECT_GT(scan.filesScanned, 0u)
             << sub << ": scanned ZERO files, so an empty result says nothing";
-        // NOT a failure: an entry this host cannot spell is a real limit of the sweep, not a
-        // collision. It is REPORTED so a clean verdict cannot quietly mean "clean over the part
-        // I could read" — the same reason `filesScanned` is asserted at all.
-        if (scan.unrenderable > 0)
-            std::cerr << "[ note ] " << sub << ": " << scan.unrenderable
-                      << " entr" << (scan.unrenderable == 1 ? "y" : "ies")
-                      << " could not be rendered on this host's code page and were not "
-                         "compared\n";
         for (auto const& g : scan.groups) {
             std::string joined;
             for (auto const& p : g) { joined += "\n  "; joined += p; }
@@ -1479,7 +1446,7 @@ TEST(TreeIgnoresGrammar, LiveEveryScenarioIsAnsweredAsGitCheckIgnoreAnswersIt) {
     std::map<std::string, std::map<std::string, std::string>> said;   // setting -> path -> pattern ("" none)
     for (std::string const fold : {"false", "true"}) {
         std::vector<std::string> argv{gitExe->spelling().display(), "-c", "core.ignorecase=" + fold, "-c",
-                                      "core.excludesFile=" + narrowUtf8OrEmpty(scratch.path() / "no-excludes-file"),
+                                      "core.excludesFile=" + utf8Spelling(scratch.path() / "no-excludes-file"),
                                       "-c", "core.quotePath=true", "check-ignore", "--no-index", "-v", "-n", "--"};
         for (auto const& a : asked) argv.push_back(a.asAsked);
         fs::path const out = scratch.path() / ("check-ignore-" + fold + ".out");

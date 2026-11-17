@@ -50,6 +50,7 @@
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
 #include "core/substrate/every_unit.hpp"           // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/substrate/silent_unit.hpp"          // namingSilentUnits: the net bound to the run's reporter
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
 #include "core/types/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
@@ -295,8 +296,9 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 // it.
 [[nodiscard]] std::string artifactPathForReport(fs::path const& p) {
     // `generic_string()` throws for a path the current locale cannot encode;
-    // the u8 fallback mirrors `link/writer.cpp`'s `pathForDiag`, which the
-    // write-failure diagnostics for this very artifact already use. Forward
+    // `core::genericSpelling` is TOTAL since P69 H6c2 (T4: lossless UTF-8, an
+    // unpaired surrogate as WTF-8, never the code page), so the u8 fallback
+    // that stood here went with the throw. Forward
     // slashes on every host — that is what this codebase prints, and every
     // consumer of the line (POSIX shell, PowerShell, .NET `Path`) takes them.
     // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `core::genericSpelling`,
@@ -305,12 +307,7 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
     // local drive root. The exported spelling substitutes the model's OWN
     // separator per character and leaves the run intact, giving the same
     // forward-slash result this line has always printed for an ordinary path.
-    try {
-        return core::genericSpelling(p);
-    } catch (...) {
-        auto const u8 = p.u8string();
-        return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
-    }
+    return core::genericSpelling(p);
 }
 
 // Called ONCE per artifact, and ONLY after the write path reported success.
@@ -1135,7 +1132,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // `D_DirectoryScanFailed` (mid-scan failure on input dirs).
         emitDriver(reporter, DiagnosticCode::D_OutputDirCreateFailed,
                    "failed to create output directory '"
-                   + core::genericSpelling(outDir) + "': " + ec.message());
+                   + core::genericSpelling(outDir) + "': " + core::reasonText(ec));
         return std::nullopt;
     }
     auto const outPath =
@@ -1740,16 +1737,14 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // driver never exits 1 with ZERO output. A no-op on the happy path and on
     // every genuine (already-reported) failure. Mirrors the optimizer's
     // X_OptReturnFalseWithoutDiagnostic belt-and-suspenders guard.
-    // ★ A SEVERAL-UNIT STEP NAMES EACH SILENT UNIT ITSELF (P69 H6c, R4): `substrate::runEveryUnitReportingSilence`
-    // asks the count before EACH unit and calls this for a unit that failed having said nothing -- one snapshot
-    // for the whole build let an earlier unit's error hide a later unit's silence.
-    auto const emitSilentUnit = [&](char const* where, std::size_t unit) {
+    // ★ A SEVERAL-UNIT STEP NAMES EACH SILENT UNIT ITSELF (P69 H6c, R4; H6c2: the net is a STEP):
+    // `substrate::namingSilentFailures` reads the count before EACH unit and calls this for a unit that failed having
+    // said nothing -- one snapshot for the whole build let an earlier unit's error hide a later unit's silence. A
+    // unit's report names its unit by its own source buffer (a CU's diagnostics carry its buffer, which the reporter's
+    // dedup key holds), so no reporting unit is named silent.
+    auto const silentUnitName = [&](std::size_t unit) {
         std::string_view const name = unit < cus.size() ? cus[unit].primarySourceName() : std::string_view{};
-        emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
-                   std::string{"internal: "} + where + " of unit " + std::to_string(unit)
-                       + (name.empty() ? std::string{} : " ('" + std::string{name} + "')")
-                       + " returned a null module without reporting any diagnostic — substrate-contract "
-                         "violation: a failing tier must say why.");
+        return "unit " + std::to_string(unit) + (name.empty() ? std::string{} : " ('" + std::string{name} + "')");
     };
     auto const errorsBeforeCuBuild = reporter.errorCount();
     auto const emitNullNoDiagnostic = [&](char const* where) {
@@ -1964,17 +1959,17 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // EVERY unit is assembled and reports its own errors before the build fails (the one home: P69 H6b,
                 // the review of H6's N1), and a unit that fails having said nothing is named, per unit (its netted
                 // form, H6c R4).
-                bool const everyUnitAssembled = substrate::runEveryUnitReportingSilence(
+                bool const everyUnitAssembled = substrate::runEveryUnit(
                     cus.size(),
-                    [&](std::size_t i) {
-                        auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
-                                                    reporter, perCuOpts);
-                        if (!unit) return false;
-                        units.push_back(std::move(*unit));
-                        return true;
-                    },
-                    [&] { return reporter.errorCount(); },
-                    [&](std::size_t i) { emitSilentUnit("the assembly unit build (assembleAsmUnit)", i); });
+                    substrate::namingSilentUnits(
+                        reporter, "the assembly unit build (assembleAsmUnit)", silentUnitName,
+                        [&](std::size_t i) {
+                            auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
+                                                        reporter, perCuOpts);
+                            if (!unit) return false;
+                            units.push_back(std::move(*unit));
+                            return true;
+                        }));
                 // PACKAGING'S PRECONDITION, NOT A SECOND COPY OF THE WRITER'S DECISION (P69 H6c, ledger 576 (2)):
                 // the step names member i after unit i's source (`packageUnitsAsStaticArchive`), so it takes EVERY
                 // unit's module or none -- packaging the units that assembled would name a member after another
@@ -2141,14 +2136,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // fail's — an improvement the parallel model makes free: every CU is always built). The verb is
         // `runEveryUnit`, the one home every several-unit step takes (P69 H6b).
         // Each unit that failed having said nothing is named (the netted form, H6c R4).
-        bool const allBuilt = substrate::runEveryUnitReportingSilence(
-            cus.size(),
-            [&](std::size_t i) {
-                copyDiagnostics(cuScratch[i], reporter);
-                return cuMirSlots[i].has_value();
-            },
-            [&] { return reporter.errorCount(); },
-            [&](std::size_t i) { emitSilentUnit("a per-CU build (buildCuMir)", i); });
+        bool const allBuilt = substrate::runEveryUnit(
+            cus.size(), substrate::namingSilentUnits(reporter, "a per-CU build (buildCuMir)", silentUnitName,
+                                                     [&](std::size_t i) {
+                                                         copyDiagnostics(cuScratch[i], reporter);
+                                                         return cuMirSlots[i].has_value();
+                                                     }));
         if (!allBuilt) return std::nullopt;  // ≥1 front-half tier failure — every unit's diagnostics reported
     }
 
@@ -2200,7 +2193,10 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // that failed having said nothing is named, per unit (the netted form, H6c
         // R4): the single-unit route names a silent `lowerCuMirToAssembly` null, and
         // this loop failed the build on one with nothing said.
-        bool const everyMemberBuilt = substrate::runEveryUnitReportingSilence(cuMirs.size(), [&](std::size_t i) {
+        bool const everyMemberBuilt = substrate::runEveryUnit(
+            cuMirs.size(), substrate::namingSilentUnits(
+                reporter, "a static-archive member's build (shims, optimizeModule, lowerCuMirToAssembly)",
+                silentUnitName, [&](std::size_t i) {
             // P10: a static-archive member is the FINAL module of its own
             // artifact (nothing downstream merges it — the foreign linker
             // pulls members whole), so it gets the PROGRAM-stage schedule
@@ -2241,11 +2237,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             if (!mod) return false;  // back-half tier failure already reported
             units.push_back(std::move(*mod));
             return true;
-        },
-            [&] { return reporter.errorCount(); },
-            [&](std::size_t i) {
-                emitSilentUnit("a static-archive member's build (shims, optimizeModule, lowerCuMirToAssembly)", i);
-            });
+        }));
         if (!everyMemberBuilt) return std::nullopt;
         // The members are packaged by the one step every unit enters (`packageUnitsAsStaticArchive`,
         // above the `encode` route): the archive-wide visibility, the names, the input archives and objects.
@@ -3147,8 +3139,13 @@ struct CuBuildKey {
     // comparison is case-insensitive on the extension INCLUDING its dot, the
     // same rule `UnitBuilder::schemasForPath_` applies, so `foo.S` and `foo.s`
     // route identically on every host filesystem. EVERY unclaimed input is named before the build fails
-    // (`runEveryUnit`, P69 H6b: the several-unit class's one home) -- never the first alone.
-    bool const everyInputClaimed = substrate::runEveryUnit(sourceFiles.size(), [&](std::size_t i) {
+    // (`runEveryUnit`, P69 H6b: the several-unit class's one home) -- never the first alone. Netted (H6c2): the
+    // refusal names its input by its path, so a unit that failed having said nothing is named too.
+    bool const everyInputClaimed = substrate::runEveryUnit(
+        sourceFiles.size(),
+        substrate::namingSilentUnits(rep, "the input-language claim",
+                                     [&](std::size_t i) { return "input '" + sourceFiles[i] + "'"; },
+                                     [&](std::size_t i) {
         std::string const& file = sourceFiles[i];
         std::string const ext = asciiLowerCopy(fs::path{file}.extension().string());
         bool claimed = false;
@@ -3171,7 +3168,7 @@ struct CuBuildKey {
             + "'. Pass --language <name> to name the source language "
               "explicitly.");
         return false;
-    });
+    }));
     if (!everyInputClaimed) return nullptr;
     return schema;
 }
@@ -3332,8 +3329,9 @@ class LanguageBlockExtensionReader {
 // failure, so a broken sibling document never became a claimant then and does
 // not now.
 [[nodiscard]] std::vector<std::string> declaredFileExtensionsOf(fs::path const& doc) {
-    std::ifstream in = core::openInputStream(doc, std::ios::binary);
-    if (!in) return {};
+    auto opened = core::openInputStream(doc, std::ios::binary);
+    if (!opened) return {};   // no claimant (above); the document's own load names the OS's reason
+    std::ifstream&               in = *opened;
     LanguageBlockExtensionReader reader;
     // The return value is DELIBERATELY ignored: `false` means either "we aborted
     // on purpose at the end of the `language` block" (the fast path, every
@@ -3703,7 +3701,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
                    "shipped-source realization: the descriptor corpus at '"
                    + core::genericSpelling(descriptorDir)
                    + "' could not be walked (stopped at '"
-                   + walk.where.spelling().generic() + "': " + walk.error.message()
+                   + walk.where.spelling().generic() + "': " + core::reasonText(walk.error)
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
                      "cache keys on their CONTENT (the unit includes their "
@@ -3755,13 +3753,15 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
 // Read a whole file as bytes. Binary on every host — the cache stores exactly
 // what the writer produced, and a text-mode CR translation would make the
 // stored artifact host-dependent under a key that says it is not.
-[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+// A failed read answers WHY (the OS's reason for a refused open, through `core::reasonText`), never a bare "no".
+[[nodiscard]] std::expected<std::vector<std::uint8_t>, std::string>
 readWholeBinaryFile(fs::path const& path) {
-    std::ifstream in = core::openInputStream(path, std::ios::binary);
-    if (!in) return std::nullopt;
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) return std::unexpected("it could not be opened: " + core::reasonText(opened.error()));
+    std::ifstream&            in = *opened;
     std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                     std::istreambuf_iterator<char>()};
-    if (in.bad()) return std::nullopt;
+    if (in.bad()) return std::unexpected(std::string{"an I/O error interrupted its read"});
     return bytes;
 }
 
@@ -3837,7 +3837,7 @@ serveArtifactFromCache(ArtifactCacheTicket const& ticket,
             "this build's artifact, so this is a failure to produce it rather "
             "than a reason to compile again: make the output path writable.",
             core::genericSpelling(**hit), core::genericSpelling(outPath),
-            ec.message()));
+            core::reasonText(ec)));
         // Anchored: D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.
     }
     return true;
@@ -3854,7 +3854,7 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
     if (!bytes.has_value()) {
         reportDriverNote(
             "the artifact '" + core::genericSpelling(artifactPath)
-            + "' could not be read back, so it was not added to the dependency "
+            + "' could not be read back (" + bytes.error() + "), so it was not added to the dependency "
               "artifact cache; the next build will compile it again.");
         return;
     }
@@ -3885,7 +3885,7 @@ public:
         std::error_code    ec;
         fs::path const     base = core::storeRouteTemporaryDirectory(ec);   // the home's answer, the staging route's text (H6d)
         if (ec) {   // still empty ⇒ the caller reports the failure
-            failure_ = "the system temporary directory is unknown (" + ec.message() + ")";
+            failure_ = "the system temporary directory is unknown (" + core::reasonText(ec) + ")";
             return dir_;
         }
         static std::atomic<unsigned> counter{0u};
@@ -3907,7 +3907,7 @@ public:
                 // can make; and it makes it at any length.)
                 if (core::createDirectories(candidate, mkEc) && !mkEc) return candidate;
                 whyNot = "'" + core::genericSpelling(candidate) + "' "
-                       + (mkEc ? "could not be created (" + mkEc.message() + ")"
+                       + (mkEc ? "could not be created (" + core::reasonText(mkEc) + ")"
                                : std::string{"already exists"});
                 return std::nullopt;
             });
@@ -4015,7 +4015,7 @@ digestLinkInput(std::string_view label, fs::path const& path) {
         bytes.has_value()
             ? dss::crypto::sha256Hex(std::string_view{
                   reinterpret_cast<char const*>(bytes->data()), bytes->size()})
-            : std::string{}};
+            : std::string{}};   // unreadable: the link that reads this input names its reason (H6c2 (d))
 }
 
 // Build ONE target's dependency-artifact cache key, or say why it cannot be
@@ -4573,7 +4573,7 @@ buildDependencyArtifactKey(
                        "shipped-source realization: could not create the "
                        "staging directory '" + core::genericSpelling(unitDir)
                        + "' for shipped runtime unit '" + claim.source
-                       + "': " + mkEc.message());
+                       + "': " + core::reasonText(mkEc));
             continue;
         }
 
@@ -4686,7 +4686,7 @@ buildDependencyArtifactKey(
             reportDriverNote(
                 "the shipped runtime archive '"
                 + core::genericSpelling(archives.back())
-                + "' could not be read back, so it was not added to the runtime "
+                + "' could not be read back (" + bytes.error() + "), so it was not added to the runtime "
                   "object cache; this build links it from the staging area and "
                   "the next build will compile it again.");
             continue;
@@ -5316,7 +5316,10 @@ int runCusToTargets(
     for (auto& kv : cuByKey) {
         std::vector<CompilationUnit>& keyCus = kv.second;
         std::vector<char>             cuFailed(keyCus.size(), 0);
-        for (std::size_t ci = 0; ci < keyCus.size(); ++ci) {
+        // EVERY CU of the key is drained, and its verdict read, before the run decides (`runEveryUnit`, the one
+        // home every several-unit step takes; P69 H6c2, site (k)). NOT netted: a unit's failure is read from its
+        // OWN streams below, and the run's dedup window can hold the run's count still for a unit that did report.
+        static_cast<void>(substrate::runEveryUnit(keyCus.size(), [&](std::size_t ci) {
             CompilationUnit const& cu = keyCus[ci];
             // ★ THE DELTA *AND* THE UNIT'S OWN VERDICT, BOTH, BECAUSE EACH SEES
             // WHAT THE OTHER CANNOT. `rep.errorCount()` moves when a WARNING is
@@ -5350,7 +5353,8 @@ int runCusToTargets(
             cuFailed[ci] = failed ? 1 : 0;
             ++totalCus;
             if (failed) ++failedCus;
-        }
+            return !failed;
+        }));
         // Compact the survivors to the FRONT, order preserved, so a target can
         // be handed `span{data(), live}` without a second container. Safe only
         // BECAUSE the loop above already copied every unit's diagnostics into
@@ -5897,8 +5901,10 @@ int Program::run(int argc, char* argv[]) {
     // LK10 cycle 3: rich CLI argument dispatch.
     auto parsed = parseCliArgs(argc, argv);
     if (!parsed) {
-        std::cerr << "error: " << parsed.error().detail << "\n\n"
-                  << cliHelpText();
+        // Every unit the walk refused, one line each, in argv order (one refusal prints what it always printed).
+        std::cerr << "error: " << parsed.error().detail << "\n";
+        for (CliArgsErrorInfo const& more : parsed.error().also) std::cerr << "error: " << more.detail << "\n";
+        std::cerr << "\n" << cliHelpText();
         return 2;
     }
     CliArgs const& args = *parsed;
@@ -6227,10 +6233,17 @@ int Program::compileProject(
     // format does not serve the profile is named, and the targets after it are
     // still asked -- as the driver's target pre-flight and the per-target compile
     // already do. The inventory of the formats that serve the profile is read
-    // once, by the first rejected target; when it cannot be read, that is said
-    // once and every later rejected target fails with no second word.
+    // once, by the first rejected target; when it cannot be read, that target
+    // says so and fails, and every later rejected target meets the SAME failure
+    // and answers true -- the first one's false already fails the gate (the
+    // net's contract, H6c2: a step fails only for a failure it reported itself,
+    // so the net names no reporting target silent).
     std::optional<std::expected<std::vector<std::string>, std::string>> serving;
-    bool const everyTargetServed = substrate::runEveryUnit(pc.targets.size(), [&](std::size_t t) {
+    bool const everyTargetServed = substrate::runEveryUnit(
+        pc.targets.size(),
+        substrate::namingSilentUnits(rep, "the artifact-profile gate",
+                                     [&](std::size_t t) { return "target '" + pc.targets[t] + "'"; },
+                                     [&](std::size_t t) {
         std::string const& spec = pc.targets[t];
         auto parsed = TargetSpec::parse(spec);
         if (!parsed.has_value()) return true;        // delegate → D_InvalidTargetSpec
@@ -6257,9 +6270,10 @@ int Program::compileProject(
                              "it. Set DSS_CONFIG_ROOT to the directory that contains "
                              "'src/dss-config', or run from inside the compiler's "
                              "source tree.");
+                return false;   // this target said it
             }
         }
-        if (!serving->has_value()) return false;   // said once, above
+        if (!serving->has_value()) return true;   // an earlier target said it, and failed the gate
         // The verdict is already known (the predicate above is the SAME one
         // this call re-asks), so the return value carries no new information
         // and is deliberately discarded — the call's remaining job is to write
@@ -6269,7 +6283,7 @@ int Program::compileProject(
                                             pc.artifactProfile,
                                             parsed->formatName, **serving, rep);
         return false;
-    });
+    }));
     if (!everyTargetServed) {
         drainDiagnosticsToStderr(rep);
         return 1;
@@ -6404,13 +6418,10 @@ int Program::compileProject(
         if (!outputDir().has_value()) {
             setOutputDir(manifestBase);
         } else if (!sameOutputBase(*outputDir(), manifestBase)) {
-            // `artifactPathForReport`, NOT bare `core::genericSpelling`:
-            // the latter THROWS for a path the current locale cannot
-            // encode, and this note sits on a SUCCESS path -- a throw here
-            // would abort a build that was about to work. The other
-            // `genericSpelling` call sites in this file are on paths that
-            // are ALREADY failing. This wrapper is what every
-            // operator-facing report line already uses, u8 fallback and all.
+            // `artifactPathForReport`: the rendering every operator-facing
+            // report line uses (total since P69 H6c2: `core::genericSpelling`
+            // no longer throws for a path the current locale cannot encode,
+            // and this note sits on a SUCCESS path).
             reportDriverNote(
                 "the command-line output directory '"
                 + artifactPathForReport(*outputDir())
@@ -7166,12 +7177,13 @@ int Program::emitHirText(
     // compared byte-for-byte by its consumers (and by this repo's goldens), so a
     // host-dependent line ending would make the same compiler produce two
     // different files for one input.
-    std::ofstream o = core::openOutputStream(fs::path{path}, std::ios::binary | std::ios::trunc);
-    if (!o) {
+    auto opened = core::openOutputStream(fs::path{path}, std::ios::binary | std::ios::trunc);
+    if (!opened) {
         err << "error: --emit-hir: could not open '" << path
-            << "' for writing.\n";
+            << "' for writing: " << core::reasonText(opened.error()) << ".\n";
         return 1;
     }
+    std::ofstream& o = *opened;
     o.write(text.data(), static_cast<std::streamsize>(text.size()));
     o.close();
     if (!o) {

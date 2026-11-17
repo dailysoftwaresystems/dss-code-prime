@@ -98,18 +98,22 @@
 #include "link/writer.hpp"
 #include "os_link.hpp"                         // links made by the OS: MinGW's library makes none
 #include "scratch_dir.hpp"
+#include "system_reason_text.hpp"                // the test side's one oracle for an OS code's own text
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <ios>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -132,10 +136,12 @@
 #endif
 #include <windows.h>
 
+#include <aclapi.h>   // the denied directory's DACL (the reason cells)
 #include <io.h>
 #include <process.h>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -156,8 +162,10 @@ struct FileCloser {
 // cascade of stale-directory warnings in every later run.
 using Claimed = std::unique_ptr<std::FILE, FileCloser>;
 
+// The claim's stream, or null for a refusal (whose reason the cells that need it read from the primitive itself).
 [[nodiscard]] Claimed claim(fs::path const& p) {
-    return Claimed{linker::detail::createExclusiveBinary(p)};
+    auto claimed = linker::detail::createExclusiveBinary(p);
+    return Claimed{claimed ? *claimed : nullptr};
 }
 
 [[nodiscard]] std::vector<std::uint8_t> readAll(fs::path const& p) {
@@ -951,4 +959,321 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverDanglingSymlinkCandidates) {
 
     // `kDanglingAhead` slots stepped over plus the one actually claimed.
     nextSlot += kDanglingAhead + 1;
+}
+
+// ════ THE OS'S REASON (P69 H6c2, main's ruling on the staging claim's guess list) ════════════════════════════════════
+// A host primitive that fails ANSWERS the OS's reason, read at the failing call, and every diagnostic built on it NAMES
+// that reason. ★ THE ORACLE IS THE HOST'S OWN CALL on the same spelling -- CreateFileW / GetFileAttributesW and
+// GetLastError, POSIX `open` and errno -- and its text the system's own (`dss::test_support::systemReasonText`, the
+// test side's one oracle: FormatMessageW spelt as UTF-8 by its own conversion; `std::strerror` on POSIX), never the
+// home's answer.
+
+namespace {
+
+using dss::test_support::systemReasonText;
+
+#ifdef _WIN32
+// What the host answers to CREATE_NEW of `spelling` (the claim's own disposition): 0 when it made the file (removed).
+[[nodiscard]] DWORD hostCreateRefusal(std::wstring const& spelling) {
+    HANDLE const h = ::CreateFileW(spelling.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return ::GetLastError();
+    ::CloseHandle(h);
+    ::DeleteFileW(spelling.c_str());
+    return 0;
+}
+#else
+[[nodiscard]] int hostCreateRefusal(std::string const& spelling) {
+    int const fd = ::open(spelling.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return errno;
+    ::close(fd);
+    ::unlink(spelling.c_str());
+    return 0;
+}
+#endif
+
+// The LITERAL spelling of an absolute scratch path: what the home hands the host for these plain names (its leaf
+// reference), so the oracle asks the host the same question (`\\?\` on Windows: a long last name reaches the file
+// system there, where a plain spelling past MAX_PATH would be refused by the path parser first).
+[[nodiscard]] fs::path::string_type literalOf(fs::path const& p) {
+#ifdef _WIN32
+    return L"\\\\?\\" + p.native();
+#else
+    return p.native();
+#endif
+}
+
+[[nodiscard]] std::error_code hostCode(long code) {
+#ifdef _WIN32
+    return std::error_code{static_cast<int>(code), std::system_category()};
+#else
+    return std::error_code{static_cast<int>(code), std::generic_category()};
+#endif
+}
+
+// The names a claim is refused for on every host, each with the host's own refusal: a name below a FILE, and a last
+// name longer than any file system holds (300 units; NAME_MAX is 255 on every POSIX file system of the legs).
+struct RefusedName {
+    char const* what;
+    fs::path    path;
+};
+[[nodiscard]] std::vector<RefusedName> refusedNames(fs::path const& scratch) {
+    {
+        std::ofstream file(scratch / "a-file", std::ios::binary);
+        file << "x";
+    }
+    return {{"a name below a file", scratch / "a-file" / "x.o"},
+            {"a 300-unit last name", scratch / std::string(300, 'n')}};
+}
+
+}  // namespace
+
+// A REFUSED CLAIM ANSWERS THE HOST'S OWN REASON FOR THE NAME -- the code the host's own create answers, its text the
+// system's -- on every leg (main's PINS: Windows not-found / invalid-name, Linux ENOTDIR, macOS too).
+TEST(LinkWriterExclusiveClaim, ARefusedClaimAnswersTheHostsOwnReasonForTheName) {
+    ScratchDir const scratch{Location::Temp, "link-writer-claim-reason"};
+    for (RefusedName const& name : refusedNames(scratch.path())) {
+        SCOPED_TRACE(name.what);
+        auto const oracle = hostCreateRefusal(literalOf(name.path));
+        ASSERT_NE(oracle, 0) << "the host made " << name.what << ": the refusal cannot be asked here";
+        auto const claimed = linker::detail::createExclusiveBinary(core::HostPath{name.path});
+        ASSERT_FALSE(claimed.has_value()) << "the claim made " << name.what;
+        EXPECT_EQ(claimed.error(), hostCode(oracle)) << core::reasonText(claimed.error());
+        EXPECT_EQ(core::reasonText(claimed.error()), systemReasonText(oracle));
+    }
+}
+
+// EVERY HANDLE CALL OF THE HOME ANSWERS THE HOST'S OWN REASON, read at the call (the convention primitives, main's (b)):
+// an absent name and a name below a file, against the host's own call of the same spelling.
+TEST(LinkWriterExclusiveClaim, EveryHandleCallOfTheHomeAnswersTheHostsOwnReason) {
+    ScratchDir const scratch{Location::Temp, "link-writer-handle-reason"};
+    std::vector<RefusedName> names = refusedNames(scratch.path());
+    names.push_back({"an absent name", scratch.path() / "absent.o"});
+    for (RefusedName const& name : names) {
+        SCOPED_TRACE(name.what);
+#ifdef _WIN32
+        HANDLE const plain = ::CreateFileW(literalOf(name.path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        DWORD const  oracle = plain == INVALID_HANDLE_VALUE ? ::GetLastError() : 0;
+        if (plain != INVALID_HANDLE_VALUE) ::CloseHandle(plain);
+        ASSERT_NE(oracle, 0u) << "the host opened " << name.what;
+        auto const opened = core::openHandle(core::HostPath{name.path}, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS);
+        ASSERT_FALSE(opened.has_value());
+        EXPECT_EQ(opened.error(), hostCode(oracle)) << core::reasonText(opened.error());
+        EXPECT_EQ(core::reasonText(opened.error()), systemReasonText(oracle));   // the code AND its text
+        DWORD const attributesOracle =
+            ::GetFileAttributesW(literalOf(name.path).c_str()) == INVALID_FILE_ATTRIBUTES ? ::GetLastError() : 0;
+        ASSERT_NE(attributesOracle, 0u);
+        auto const attributes = core::fileAttributes(core::HostPath{name.path});
+        ASSERT_FALSE(attributes.has_value());
+        EXPECT_EQ(attributes.error(), hostCode(attributesOracle)) << core::reasonText(attributes.error());
+        EXPECT_EQ(core::reasonText(attributes.error()), systemReasonText(attributesOracle));
+#else
+        int const plain  = ::open(name.path.c_str(), O_RDONLY);
+        int const oracle = plain < 0 ? errno : 0;
+        if (plain >= 0) ::close(plain);
+        ASSERT_NE(oracle, 0) << "the host opened " << name.what;
+        auto const opened = core::openDescriptor(core::HostPath{name.path}, O_RDONLY, 0);
+        ASSERT_FALSE(opened.has_value());
+        EXPECT_EQ(opened.error(), hostCode(oracle)) << core::reasonText(opened.error());
+        EXPECT_EQ(core::reasonText(opened.error()), systemReasonText(oracle));   // the code AND its text
+#endif
+    }
+}
+
+// EVERY STREAM OPEN OF THE HOME ANSWERS THE HOST'S OWN REASON (H6c2 (d), main's ruling 677): `openInputStream`,
+// `openOutputStream` and `openFileStream` ("rb" / "wb"), each against the host's own open of the SAME spelling with the
+// same disposition (CreateFileW OPEN_EXISTING / CREATE_ALWAYS and GetLastError; POSIX `open` O_RDONLY /
+// O_WRONLY|O_CREAT|O_TRUNC and errno) -- where the host refuses, the home answers its code AND its text; where the host
+// opens, the home opens. The names: an absent name, a name below a file, a 300-unit last name, and on POSIX a last name
+// that is no UTF-8 (APFS refuses it, EILSEQ; ext4 takes it). A refusal the C runtime reports by `_doserrno` / errno
+// is the home's to read AT the failing open (`runtimeReason`), never a stream left to be checked.
+TEST(LinkWriterExclusiveClaim, EveryStreamOpenOfTheHomeAnswersTheHostsOwnReason) {
+    ScratchDir const         scratch{Location::Temp, "link-writer-stream-reason"};
+    std::vector<RefusedName> names = refusedNames(scratch.path());
+    names.push_back({"an absent name", scratch.path() / "absent.o"});
+#ifndef _WIN32
+    names.push_back({"a last name that is no UTF-8", scratch.path() / std::string{"out\xFF.o"}});
+#endif
+    for (RefusedName const& name : names) {
+        for (bool const writing : {false, true}) {
+            SCOPED_TRACE(std::string{name.what} + (writing ? ", opened to write" : ", opened to read"));
+#ifdef _WIN32
+            HANDLE const plain = ::CreateFileW(literalOf(name.path).c_str(), writing ? GENERIC_WRITE : GENERIC_READ,
+                                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                               writing ? CREATE_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            DWORD const  oracle = plain == INVALID_HANDLE_VALUE ? ::GetLastError() : 0;
+            if (plain != INVALID_HANDLE_VALUE) ::CloseHandle(plain);
+#else
+            int const plain  = writing ? ::open(name.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666)
+                                       : ::open(name.path.c_str(), O_RDONLY);
+            int const oracle = plain < 0 ? errno : 0;
+            if (plain >= 0) ::close(plain);
+#endif
+            auto const judge = [&](char const* family, std::optional<std::error_code> const& refused) {
+                SCOPED_TRACE(family);
+                if (oracle == 0) {
+                    EXPECT_FALSE(refused.has_value())
+                        << "the host opened it and the home refused: " << core::reasonText(refused.value_or(std::error_code{}));
+                    return;
+                }
+                ASSERT_TRUE(refused.has_value()) << "the host refused it and the home opened it";
+                EXPECT_EQ(*refused, hostCode(oracle)) << core::reasonText(*refused);
+                EXPECT_EQ(core::reasonText(*refused), systemReasonText(oracle));   // the code AND its text
+            };
+            core::HostPath const value{name.path};
+            if (writing) {
+                auto stream = core::openOutputStream(value, std::ios::binary | std::ios::trunc);
+                judge("openOutputStream", stream ? std::nullopt : std::optional<std::error_code>{stream.error()});
+                if (stream) stream->close();
+                auto const file = core::openFileStream(value, "wb");
+                judge("openFileStream wb", file ? std::nullopt : std::optional<std::error_code>{file.error()});
+                if (file) std::fclose(*file);
+            } else {
+                auto const stream = core::openInputStream(value, std::ios::binary);
+                judge("openInputStream", stream ? std::nullopt : std::optional<std::error_code>{stream.error()});
+                auto const file = core::openFileStream(value, "rb");
+                judge("openFileStream rb", file ? std::nullopt : std::optional<std::error_code>{file.error()});
+                if (file) std::fclose(*file);
+            }
+        }
+    }
+    // A value that names nothing (the empty spelling as a leaf) answers the home's OWN refusal in each family, as every
+    // call of the home does -- until H6c2 `openFileStream` set errno itself, a reason no host gave.
+    core::HostPath const nothing{fs::path{}};
+    auto const           noInput = core::openInputStream(nothing, std::ios::binary);
+    auto const           noOutput = core::openOutputStream(nothing, std::ios::binary);
+    auto const           noFile = core::openFileStream(nothing, "rb");
+    ASSERT_FALSE(noInput.has_value());
+    ASSERT_FALSE(noOutput.has_value());
+    ASSERT_FALSE(noFile.has_value());
+    EXPECT_EQ(noInput.error(), std::make_error_code(std::errc::invalid_argument)) << core::reasonText(noInput.error());
+    EXPECT_EQ(noOutput.error(), std::make_error_code(std::errc::invalid_argument)) << core::reasonText(noOutput.error());
+    EXPECT_EQ(noFile.error(), std::make_error_code(std::errc::invalid_argument)) << core::reasonText(noFile.error());
+}
+
+// A VALUE THAT NAMES NOTHING IS REFUSED BY THE HOME'S OWN REASON, never by a code it made up (until H6c2 the handle
+// calls set ERROR_INVALID_PARAMETER / EINVAL for it): an ill-formed GIVEN on Windows, the empty spelling as a leaf
+// everywhere.
+TEST(LinkWriterExclusiveClaim, AValueThatNamesNothingIsRefusedByTheHomesOwnReason) {
+    auto const empty = linker::detail::createExclusiveBinary(core::HostPath{fs::path{}});
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), std::make_error_code(std::errc::invalid_argument)) << core::reasonText(empty.error());
+    // The code AND its text: an errno's is the C runtime's own on every host.
+    EXPECT_EQ(core::reasonText(empty.error()), "errno=" + std::to_string(EINVAL) + ": " + std::strerror(EINVAL));
+#ifdef _WIN32
+    auto const illFormed = linker::detail::createExclusiveBinary(core::HostPath{std::string{"bad\xFF.o"}});
+    ASSERT_FALSE(illFormed.has_value());
+    EXPECT_EQ(illFormed.error(), core::pathRefusalCode(core::PathRefusal::IllFormedSpelling))
+        << core::reasonText(illFormed.error());
+    EXPECT_NE(core::reasonText(illFormed.error()).find(core::pathRefusalName(core::PathRefusal::IllFormedSpelling)),
+              std::string::npos);
+#endif
+}
+
+// A WRITE REFUSED BY ITS DIRECTORY NAMES THE CLAIM'S REASON, NOT THE PROBE'S (main's (b): the reason survives the call
+// that follows the refusal). The directory denies adding a file, so the claim is refused (ERROR_ACCESS_DENIED / EACCES),
+// and the writer's entry probe that follows answers "nothing there" (ERROR_FILE_NOT_FOUND / ENOENT) -- the reason a
+// diagnostic reading the thread's last error or errno AFTER the probe would name.
+namespace {
+struct DeniedDirectory {
+    fs::path dir;
+    bool     denied = false;
+#ifdef _WIN32
+    PACL                 oldDacl    = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    explicit DeniedDirectory(fs::path d) : dir(std::move(d)) {
+        fs::create_directories(dir);
+        if (::GetNamedSecurityInfoW(dir.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &oldDacl,
+                                    nullptr, &descriptor)
+            != ERROR_SUCCESS)
+            return;
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) return;
+        std::vector<std::uint8_t> user(512);
+        DWORD                     got = 0;
+        bool const known = ::GetTokenInformation(token, TokenUser, user.data(), static_cast<DWORD>(user.size()), &got);
+        ::CloseHandle(token);
+        if (!known) return;
+        EXPLICIT_ACCESS_W deny{};
+        deny.grfAccessPermissions = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+        deny.grfAccessMode        = DENY_ACCESS;
+        deny.grfInheritance       = NO_INHERITANCE;
+        deny.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+        deny.Trustee.TrusteeType  = TRUSTEE_IS_USER;
+        deny.Trustee.ptstrName    = static_cast<LPWSTR>(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid);
+        PACL newDacl = nullptr;
+        if (::SetEntriesInAclW(1, &deny, oldDacl, &newDacl) != ERROR_SUCCESS) return;
+        denied = ::SetNamedSecurityInfoW(const_cast<LPWSTR>(dir.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, newDacl, nullptr)
+              == ERROR_SUCCESS;
+        ::LocalFree(newDacl);
+    }
+    ~DeniedDirectory() {
+        if (denied)
+            static_cast<void>(::SetNamedSecurityInfoW(const_cast<LPWSTR>(dir.c_str()), SE_FILE_OBJECT,
+                                                      DACL_SECURITY_INFORMATION, nullptr, nullptr, oldDacl, nullptr));
+        if (descriptor != nullptr) ::LocalFree(descriptor);
+    }
+#else
+    explicit DeniedDirectory(fs::path d) : dir(std::move(d)) {
+        fs::create_directories(dir);
+        denied = ::chmod(dir.c_str(), 0500) == 0;
+    }
+    ~DeniedDirectory() {
+        if (denied) static_cast<void>(::chmod(dir.c_str(), 0700));
+    }
+#endif
+    DeniedDirectory(DeniedDirectory const&)            = delete;
+    DeniedDirectory& operator=(DeniedDirectory const&) = delete;
+};
+}  // namespace
+
+TEST(LinkWriterExclusiveClaim, AWriteRefusedByItsDirectoryNamesTheClaimsReasonNotTheProbes) {
+    ScratchDir const      scratch{Location::Temp, "link-writer-denied-dir"};
+    DeniedDirectory const denied{scratch.path() / "denied"};
+    ASSERT_TRUE(denied.denied) << "the test could not make its own directory refuse a new file";
+    auto const oracle = hostCreateRefusal(literalOf(denied.dir / "probe.o"));
+    if (oracle == 0) GTEST_SKIP() << "this process may add a file to a directory that denies it (a superuser): the refusal cannot arise here";
+    fs::path const      target = denied.dir / "out.o";
+    std::uint8_t const  byte   = 0x01;
+    DiagnosticReporter  rep;
+    bool                wrote  = true;
+    ASSERT_NO_THROW(wrote = linker::writeBytes(std::span<std::uint8_t const>{&byte, 1}, target, rep));
+    EXPECT_FALSE(wrote);
+    std::string said;
+    bool        named = false;
+    for (auto const& d : rep.all()) {
+        said += "\n  " + d.actual;
+        if (d.code == DiagnosticCode::K_ImageWriteOpenFailed && d.actual.find(systemReasonText(oracle)) != std::string::npos)
+            named = true;
+    }
+    EXPECT_TRUE(named) << "no diagnostic names the claim's own reason `" << systemReasonText(oracle) << "`:" << said;
+#ifdef _WIN32
+    std::string const probes = "GetLastError=" + std::to_string(ERROR_FILE_NOT_FOUND) + ":";
+#else
+    std::string const probes = "errno=" + std::to_string(ENOENT) + ":";
+#endif
+    EXPECT_EQ(said.find(probes), std::string::npos) << "a diagnostic names the entry probe's reason:" << said;
+}
+
+// THE REASON'S TEXT IS THE SYSTEM'S OWN, by number first (`core::reasonText`): a Win32 code's message as UTF-8, an
+// errno's strerror text, and the home's own refusal by its name -- never "no reason" for a code the host gave.
+TEST(LinkWriterExclusiveClaim, TheReasonsTextIsTheSystemsOwnByNumberFirst) {
+#ifdef _WIN32
+    for (DWORD const code : {DWORD{ERROR_FILE_NOT_FOUND}, DWORD{ERROR_ACCESS_DENIED}, DWORD{ERROR_INVALID_NAME}})
+        EXPECT_EQ(core::reasonText(hostCode(static_cast<long>(code))), systemReasonText(code));
+#else
+    for (int const code : {ENOENT, EACCES, ENOTDIR, ENAMETOOLONG})
+        EXPECT_EQ(core::reasonText(hostCode(code)), systemReasonText(code));
+#endif
+    // EVERY REFUSAL'S CODE IS AN ERROR: a refusal valued 0 would read as success to every `if (ec)` (the enumeration
+    // starts at 1 for it). Each value from the first to the last.
+    for (int r = static_cast<int>(core::PathRefusal::NoLastName);
+         r <= static_cast<int>(core::PathRefusal::HostAnsweredNoReason); ++r)
+        EXPECT_TRUE(static_cast<bool>(core::pathRefusalCode(static_cast<core::PathRefusal>(r))))
+            << core::pathRefusalName(static_cast<core::PathRefusal>(r)) << " reads as success";
+    EXPECT_EQ(core::reasonText(core::pathRefusalCode(core::PathRefusal::HostAnsweredNoReason)),
+              std::string{"dss.path-refusal="} + std::to_string(static_cast<int>(core::PathRefusal::HostAnsweredNoReason))
+                  + ": " + core::pathRefusalName(core::PathRefusal::HostAnsweredNoReason));
 }

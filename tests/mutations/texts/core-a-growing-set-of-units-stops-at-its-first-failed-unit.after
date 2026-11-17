@@ -1,1 +1,0 @@
-        if (!step(cursor)) return false;

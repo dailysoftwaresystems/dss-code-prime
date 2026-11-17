@@ -26,8 +26,10 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -581,6 +583,9 @@ TEST(PathIdentitySubstrate, EveryWin32RootIsParsedOnceAndNormalizedAsWin32Does) 
         EXPECT_EQ(root.prefix, row.prefix);
         EXPECT_EQ(root.volume, row.volume);
         EXPECT_EQ(root.authority, row.authority);
+        // The kind and the authority are the ROW's (T2): read from the shape the parse answered.
+        EXPECT_EQ(root.kind, dss::core::kindOf(root.shape)) << dss::core::shapeName(root.shape);
+        EXPECT_EQ(root.authority, dss::core::namesAnAuthority(root.shape)) << dss::core::shapeName(root.shape);
         std::wstring const normal = dss::core::normalizedSpelling(row.spelling, dss::core::PathGrammar::Win32);
         EXPECT_EQ(normal, row.normalized) << "normalized as " << ascii(normal);
     }
@@ -612,8 +617,199 @@ TEST(PathIdentitySubstrate, EveryPosixRootIsParsedOnceAndNormalizedAsPosixSays) 
         EXPECT_EQ(root.prefix, row.volume);
         EXPECT_EQ(root.volume, row.volume);
         EXPECT_EQ(root.authority, row.authority);
+        EXPECT_EQ(root.kind, dss::core::kindOf(root.shape)) << dss::core::shapeName(root.shape);
+        EXPECT_EQ(root.authority, dss::core::namesAnAuthority(root.shape)) << dss::core::shapeName(root.shape);
         EXPECT_EQ(dss::core::normalizedSpelling(row.spelling, dss::core::PathGrammar::Posix), row.normalized);
     }
+}
+
+// ★ THE PARSE'S OUTPUT IS ITS VOCABULARY (P69 H6c2, T2): every row of `DSS_ROOT_SHAPES` parses its own example to
+// itself, in its grammar, through both code units; no two rows of one grammar share an example; and every Win32
+// row's example is, in the POSIX grammar, a POSIX relative spelling -- one literal name, the host grammar never leaking
+// onto a POSIX leg (T13 (ii)). A branch that changes what an existing example parses to reddens here; a branch with no
+// row cannot be written (the parse makes its answer from a row alone, `rootRow`).
+TEST(RootShape, EveryRowsExampleParsesToItsRow) {
+    using dss::core::PathGrammar;
+    std::size_t                                    rows = 0;
+    std::vector<std::pair<PathGrammar, std::string>> seen;
+    for (dss::core::RootShapeRow const& row : dss::core::kRootShapes) {
+        ++rows;
+        SCOPED_TRACE(row.name);
+        std::string_view const example{row.example};
+        std::wstring const     wide(example.begin(), example.end());
+        dss::core::RootSpelling const narrow = dss::core::rootSpelling(example, row.grammar);
+        dss::core::RootSpelling const wideRoot = dss::core::rootSpelling(std::wstring_view{wide}, row.grammar);
+        EXPECT_EQ(narrow.shape, row.shape) << "`" << row.example << "` parses to " << dss::core::shapeName(narrow.shape);
+        EXPECT_EQ(wideRoot.shape, row.shape) << "wide `" << row.example << "` parses to "
+                                             << dss::core::shapeName(wideRoot.shape);
+        EXPECT_EQ(narrow.kind, row.kind);
+        EXPECT_EQ(dss::core::kindOf(row.shape), row.kind);
+        EXPECT_EQ(narrow.authority, dss::core::namesAnAuthority(row.shape));
+        for (auto const& [grammar, text] : seen)
+            EXPECT_FALSE(grammar == row.grammar && text == example) << "two rows share the example `" << text << "`";
+        seen.emplace_back(row.grammar, std::string{example});
+        if (row.grammar == PathGrammar::Win32)
+            EXPECT_EQ(dss::core::rootSpelling(example, PathGrammar::Posix).shape, dss::core::RootShape::PosixRelative)
+                << "the Win32 spelling `" << row.example << "` is one literal POSIX name";
+    }
+    EXPECT_EQ(rows, std::size(dss::core::kRootShapes));
+    EXPECT_GE(rows, 46u) << "the parse's rows: every branch of it";
+}
+
+// ★ EVERY RENDERING OF THE HOME IS TOTAL (P69 H6c2, T4): `genericSpelling`, `genericSpellingU8` and `PathText` render a
+// name no encoding accepts -- an unpaired surrogate, which NTFS keeps -- as its own three bytes (WTF-8), the same on
+// both Windows libraries, and never throw; until H6c2 `genericSpelling` narrowed through the code page (MS STL threw)
+// and `genericSpellingU8` threw where `u8string()` does. The string form takes its text AS GIVEN: UTF-8 bytes are kept,
+// never read through the library's narrow conversion. On POSIX a name is bytes, rendered as they are.
+TEST(PathIdentitySubstrate, EveryRenderingOfTheHomeIsTotal) {
+#if defined(_WIN32)
+    std::wstring name = L"C:\\d\\lone";
+    name += static_cast<wchar_t>(0xD800);
+    name += L".json";
+    fs::path const          lone{name};
+    std::string const       want = "C:/d/lone\xED\xA0\x80.json";
+    std::string             got;
+    ASSERT_NO_THROW(got = dss::core::genericSpelling(lone));
+    EXPECT_EQ(got, want);
+    std::u8string u8;
+    ASSERT_NO_THROW(u8 = dss::core::genericSpellingU8(lone));
+    EXPECT_EQ(std::string(reinterpret_cast<char const*>(u8.data()), u8.size()), want);
+    EXPECT_EQ(dss::core::HostPath{lone}.spelling().generic(), want);
+    EXPECT_EQ(dss::core::HostPath{lone}.spelling().display(), "C:\\d\\lone\xED\xA0\x80.json");
+    // A name the code page cannot encode (U+4E2D) is UTF-8, never `?`.
+    EXPECT_EQ(dss::core::genericSpelling(fs::path{L"C:\\d\\\u4E2D.h"}), "C:/d/\xE4\xB8\xAD.h");
+    // The string form: the generic rule on the text as given -- a verbatim spelling keeps its `\`.
+    EXPECT_EQ(dss::core::genericSpelling(std::string_view{"C:\\d\\\xE4\xB8\xAD.h"}), "C:/d/\xE4\xB8\xAD.h");
+    EXPECT_EQ(dss::core::genericSpelling(std::string_view{"\\\\?\\C:\\d\\x/y"}), "\\\\?\\C:\\d\\x/y");
+#else
+    std::string const bytes = "/d/odd\xFF\xFEname.json";
+    std::string       got;
+    ASSERT_NO_THROW(got = dss::core::genericSpelling(fs::path{bytes}));
+    EXPECT_EQ(got, bytes) << "a POSIX name is bytes, rendered as they are";
+    EXPECT_EQ(dss::core::genericSpelling(std::string_view{bytes}), bytes);
+    std::u8string u8;
+    ASSERT_NO_THROW(u8 = dss::core::genericSpellingU8(fs::path{bytes}));
+    EXPECT_EQ(std::string(reinterpret_cast<char const*>(u8.data()), u8.size()), bytes);
+#endif
+}
+
+// ★ A NARROW GIVEN SPELLING IS UTF-8 (P69 H6c2, T4): the text a JSON document or the CLI gives, decoded by the one
+// decoder -- so a non-ASCII name names the file its characters name, on BOTH Windows libraries (MS STL's narrow
+// conversion reads the code page, and named another file, or none). The file is made through its wide name, the
+// value given the same name's UTF-8 bytes, narrow. On POSIX the bytes ARE the name.
+TEST(PathIdentitySubstrate, ANarrowGivenSpellingIsReadAsUtf8) {
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp, "narrow-given-utf8"};
+    std::string const leaf = "caf\xC3\xA9-\xE4\xB8\xAD.txt";   // café-中.txt
+#if defined(_WIN32)
+    fs::path const made = sd.path() / fs::path{L"caf\u00E9-\u4E2D.txt"};
+#else
+    fs::path const made = sd.path() / fs::path{leaf};
+#endif
+    { std::ofstream{made, std::ios::binary} << "x"; }
+    std::error_code ec;
+    ASSERT_EQ(dss::core::reachedKind(dss::core::HostPath{made}, dss::core::Use::Leaf, ec), dss::core::EntryKind::File)
+        << "the fixture is not there: " << ec.message();
+    std::string const narrow = dss::core::genericSpelling(sd.path()) + "/" + leaf;   // UTF-8, as a document gives it
+    dss::core::HostPath const given{narrow};
+    EXPECT_EQ(dss::core::reachedKind(given, dss::core::Use::Leaf, ec), dss::core::EntryKind::File)
+        << "`" << narrow << "` (narrow, UTF-8) names no file: " << ec.message();
+    EXPECT_FALSE(ec) << ec.message();
+    EXPECT_TRUE(dss::core::reachedSameFile(given, dss::core::HostPath{made}, dss::core::Use::Leaf, ec))
+        << "the narrow spelling names another file: " << ec.message();
+}
+
+// ★ AN ILL-FORMED NARROW SPELLING NAMES NOTHING, AND EVERY OPERATION REFUSES IT BY NAME (P69 H6c2, T4): narrow text
+// that is no UTF-8 is no spelling of any Windows name. The value's text is its bytes escaped (for people); a question
+// answers the refusal `IllFormedSpelling` (never a throw, never "the current directory"), a walk and a making refuse
+// it, a sibling of it is refused, and a child of it names nothing too. On POSIX a name is bytes: no text is ill-formed.
+TEST(PathIdentitySubstrate, AnIllFormedNarrowSpellingNamesNothingAndEveryOperationRefusesIt) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX name is bytes: no narrow spelling is ill-formed there";
+#else
+    using dss::core::PathRefusal;
+    std::error_code const     refused = dss::core::pathRefusalCode(PathRefusal::IllFormedSpelling);
+    dss::core::HostPath const odd{std::string{"bad\xFF\xC3.txt"}};
+    EXPECT_EQ(odd.spelling().display(), "bad\\xFF\\xC3.txt") << "the bytes, escaped";
+    std::error_code ec;
+    EXPECT_EQ(dss::core::reachedKind(odd, dss::core::Use::Leaf, ec), dss::core::EntryKind::Absent);
+    EXPECT_EQ(ec, refused) << ec.message();
+    EXPECT_EQ(dss::core::entryKind(odd, dss::core::Use::Container, ec), dss::core::EntryKind::Other);
+    EXPECT_EQ(ec, refused) << ec.message();
+    EXPECT_FALSE(dss::core::createDirectories(odd, ec));
+    EXPECT_EQ(ec, refused) << ec.message();
+    auto const walk = dss::core::walkTree(odd, [](dss::core::TreeEntry const&) { return dss::core::WalkStep::Continue; });
+    EXPECT_EQ(walk.error, refused) << "a root that names nothing was walked: " << walk.error.message();
+    EXPECT_EQ(walk.root, dss::core::WalkRoot::Unreadable);
+    auto const sibling = odd.withSuffix(L".tmp");
+    ASSERT_FALSE(sibling.has_value());
+    EXPECT_EQ(sibling.error(), PathRefusal::IllFormedSpelling);
+    EXPECT_FALSE(dss::core::openInputStream(odd, std::ios::binary).has_value());
+    static_cast<void>(dss::core::canonicalIdentityKey(odd, dss::core::Use::Leaf, ec));
+    EXPECT_EQ(ec, refused) << ec.message();
+    dss::core::HostPath const child = odd / fs::path{"x.h"};
+    EXPECT_EQ(dss::core::reachedKind(child, dss::core::Use::Leaf, ec), dss::core::EntryKind::Absent);
+    EXPECT_EQ(ec, refused) << "a child of a value that names nothing named something: " << ec.message();
+    EXPECT_EQ(dss::core::reachedKind(dss::core::containingDirectory(odd), dss::core::Use::Container, ec),
+              dss::core::EntryKind::Absent);
+    EXPECT_EQ(ec, refused) << ec.message();
+#endif
+}
+
+// ★ THE IMAGE ANOTHER PROCESS RUNS IS THE OS'S ANSWER, ASKED OF THE HOME (P69 H6c2, H7): the writer names a locked
+// file's holders by `processImage`, an ANSWERED value taken by the same query `runningExecutable` takes -- so for this
+// process it is the same file, and a process that is not there is the OS's refusal, never an image. On a host with no
+// such query (POSIX: no caller asks one) the answer is `function_not_supported`.
+TEST(PathIdentitySubstrate, AProcessImageIsTheOsAnswerForThatProcess) {
+    std::error_code ec;
+#if defined(_WIN32)
+    dss::core::HostPath const self = dss::core::runningExecutable(ec);
+    ASSERT_FALSE(ec) << ec.message();
+    dss::core::HostPath const asked = dss::core::processImage(::GetCurrentProcessId(), ec);
+    ASSERT_FALSE(ec) << ec.message();
+    EXPECT_EQ(asked.origin(), dss::core::HostPath::Origin::Answered);
+    EXPECT_TRUE(dss::core::reachedSameFile(asked, self, dss::core::Use::Leaf, ec))
+        << asked.spelling().display() << " is not " << self.spelling().display() << ": " << ec.message();
+    static_cast<void>(dss::core::processImage(0xFFFFFFFCul, ec));   // no process has this id
+    EXPECT_TRUE(ec) << "a process that is not there answered an image";
+#else
+    static_cast<void>(dss::core::processImage(1, ec));
+    EXPECT_EQ(ec, std::make_error_code(std::errc::function_not_supported)) << ec.message();
+#endif
+}
+
+// ★ THE CONTAINER OF A BARE VERBATIM VOLUME IS ITS ROOT (P69 H6c2, H5): `\\?\C:` and its NT twin `\??\C:` name the
+// volume's DEVICE as a leaf (the reference stays as written) and its ROOT DIRECTORY as a container -- `\\?\C:\`, the
+// directory `below()` composes children in and the one `\\.\C:` resolves to. So its kind as a container is a
+// directory and a walk of it lists the root (until H6c2 the device: the walk reported its root Unreadable).
+TEST(PathIdentitySubstrate, TheContainerOfABareVerbatimVolumeIsItsRoot) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a verbatim volume is a Win32 spelling";
+#else
+    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp, "bare-verbatim-volume"};
+    std::wstring const drive = fs::absolute(sd.path()).root_name().wstring();   // `C:`
+    ASSERT_EQ(drive.size(), 2u) << "the scratch lies on no drive letter";
+    for (std::wstring const prefix : {std::wstring{L"\\\\?\\"}, std::wstring{L"\\??\\"}}) {
+        std::wstring const          spelled = prefix + drive;
+        dss::core::HostPath const   volume{fs::path{spelled}};
+        SCOPED_TRACE(std::string(spelled.begin(), spelled.end()));
+        EXPECT_EQ(dss::core::substrate_testing::referenceForTest(volume, dss::core::Use::Container),
+                  L"\\\\?\\" + drive + L"\\")
+            << "the container of a bare volume is its root, with its separator";
+        EXPECT_EQ(dss::core::substrate_testing::referenceForTest(volume, dss::core::Use::Leaf), L"\\\\?\\" + drive)
+            << "as a leaf it is the volume's device, as written";
+        std::error_code ec;
+        EXPECT_EQ(dss::core::reachedKind(volume, dss::core::Use::Container, ec), dss::core::EntryKind::Directory)
+            << ec.message();
+        std::size_t handed = 0;
+        auto const  walk = dss::core::walkTree(volume, [&](dss::core::TreeEntry const&) {
+            ++handed;
+            return dss::core::WalkStep::Stop;
+        });
+        EXPECT_FALSE(walk.error) << "the walk of the bare volume's root stopped: " << walk.error.message();
+        EXPECT_EQ(walk.root, dss::core::WalkRoot::Listed);
+        EXPECT_EQ(handed, 1u) << "the volume's root lists no entry";
+    }
+#endif
 }
 
 // When a verbatim final path may be spelled in the DOS form: exactly when the one normalization leaves its tail as it

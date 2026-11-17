@@ -29,6 +29,7 @@
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "system_reason_text.hpp"  // the test side's one oracle for an OS code's own text (H6c2)
 #include "test_wait_budget.hpp"   // kWaitBudget: how long a pipe's writer waits for its reader
 
 #include <gtest/gtest.h>
@@ -188,9 +189,29 @@ TEST(CheckedFileRead, AMissingFileIsAnOpenFailure) {
     EXPECT_EQ(r.error().kind, FileReadFailure::OpenFailed);
     EXPECT_TRUE(contains(r.error().message, "failed to open")) << r.error().message;
     EXPECT_TRUE(contains(r.error().message, "no-such-file.json")) << r.error().message;
-    // ... and the OS's reason, as gcc and clang name it.
-    EXPECT_TRUE(contains(r.error().message, std::generic_category().message(ENOENT)))
-        << "the open failure gave no reason: " << r.error().message;
+    // ... and the OS's reason, as gcc and clang name one: the HOST's own answer to the same open of the same spelling
+    // (the ORACLE, made here: CreateFileW OPEN_EXISTING and GetLastError; POSIX `open` and errno), in the system's own
+    // text -- never the product's renderer. (Until H6c2 the read named the errno it captured itself; it names the home's
+    // answer, read at the failing open.)
+#ifdef _WIN32
+    fs::path literal = p;
+    literal.make_preferred();
+    std::wstring const spelling = L"\\\\?\\" + literal.native();
+    HANDLE const       probe    = ::CreateFileW(spelling.c_str(), GENERIC_READ,
+                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD const oracle = probe == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
+    if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+    ASSERT_NE(oracle, static_cast<DWORD>(ERROR_SUCCESS)) << "the host opened a file that is not there";
+#else
+    int const probe  = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    int const oracle = probe < 0 ? errno : 0;
+    if (probe >= 0) ::close(probe);
+    ASSERT_NE(oracle, 0) << "the host opened a file that is not there";
+#endif
+    std::string const reason = dss::test_support::systemReasonText(oracle);
+    EXPECT_TRUE(contains(r.error().message, reason))
+        << "the open failure gave no reason (the host's own: " << reason << "): " << r.error().message;
 }
 
 TEST(CheckedFileRead, ADirectoryIsRefusedAndNeverReadsAsEmpty) {

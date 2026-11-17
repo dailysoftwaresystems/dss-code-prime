@@ -774,7 +774,7 @@ AngleIncludeResolution resolveAngleInclude(std::string_view          filename,
 }
 
 std::string describeUnexaminable(HeaderSearchResult const& r) {
-    return "'" + core::genericSpelling(r.path) + "' cannot be examined (" + r.error.message() + ")";
+    return "'" + core::genericSpelling(r.path) + "' cannot be examined (" + core::reasonText(r.error) + ")";
 }
 
 } // namespace dss

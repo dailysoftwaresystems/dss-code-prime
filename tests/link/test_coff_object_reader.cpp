@@ -3481,7 +3481,9 @@ TEST(CoffDirectiveRead, AnAlternateNameGivesTheReferenceItsFallback) {
     EXPECT_EQ(carrier->fallbackName, "fn");
 }
 
-TEST(CoffDirectiveRead, TwoFallbacksForOneNameAreRefused) {
+// ★ OF ONE OBJECT'S TWO DIRECTIVES FOR A NAME, THE FIRST IN ITS SECTION'S ORDER STANDS (P69 H6c2; ✔MEASURED
+// 2026-11-16, u8: link.exe of cl 19.52 takes it, silently); the second is warned about, and the read succeeds.
+TEST(CoffDirectiveRead, TheFirstFallbackOfAnObjectsDirectivesStands) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
     auto const obj = buildCoff(
@@ -3491,15 +3493,20 @@ TEST(CoffDirectiveRead, TwoFallbacksForOneNameAreRefused) {
          BSym{"ext", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(got.has_value());
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    auto const* ext = externRowNamed(*got, "ext");
+    ASSERT_NE(ext, nullptr);
+    EXPECT_EQ(ext->fallbackName, "a") << "the first directive in the section's order does not stand";
     EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_LinkerDirectiveUnhonourable));
-    EXPECT_TRUE(sawDetail(rep, "two fallbacks"));
+    EXPECT_TRUE(sawDetail(rep, "'b' is dropped")) << "the dropped fallback is not warned about";
+    EXPECT_EQ(rep.errorCount(), 0u);
 }
 
-// A weak external whose default is an undefined symbol already gives its name a fallback (the record arm); a
-// directive of the same object naming a DIFFERENT one gives the name two, which no order between the record and the
-// directive settles -- refused, as two directives are. A directive restating the record's own default is one fallback.
-TEST(CoffDirectiveRead, AWeakExternalsDefaultAndADirectiveGivingTwoFallbacksAreRefused) {
+// ★ A WEAK EXTERNAL'S OWN DEFAULT STANDS OVER ITS OBJECT'S DIRECTIVE (P69 H6c2; ✔MEASURED 2026-11-16, u11: a MinGW
+// gcc object whose own `.drectve` gives its weak `aa` the fallback `cc` -- link.exe and GNU ld take the weak's
+// default, a defined one and the absolute 0 alike). The directive is dropped and warned about, and the dropped
+// fallback gets no row. A directive restating the record's own default is one fallback, and says nothing.
+TEST(CoffDirectiveRead, AWeakExternalsDefaultStandsOverItsObjectsDirective) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
     auto const objectWith = [](std::string_view directive) {
@@ -3514,9 +3521,15 @@ TEST(CoffDirectiveRead, AWeakExternalsDefaultAndADirectiveGivingTwoFallbacksAreR
         DiagnosticReporter rep;
         auto const got =
             pe::readRelocatableObject(objectWith(" /alternatename:maybe=other"), *loaded.target, *loaded.format, rep);
-        EXPECT_FALSE(got.has_value()) << "which fallback wins must not be decided by which one is read last";
+        ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+        auto const* maybe = externRowNamed(*got, "maybe");
+        ASSERT_NE(maybe, nullptr);
+        EXPECT_EQ(maybe->fallbackName, "Wfb") << "the directive replaced the weak external's own default";
+        EXPECT_EQ(maybe->binding, SymbolBinding::Weak);
+        EXPECT_FALSE(hasExternNamed(*got, "other")) << "the dropped fallback got a row of its own";
         EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_LinkerDirectiveUnhonourable));
-        EXPECT_TRUE(sawDetail(rep, "two fallbacks"));
+        EXPECT_TRUE(sawDetail(rep, "'other' is dropped"));
+        EXPECT_EQ(rep.errorCount(), 0u);
     }
     {   // CONTROL: the same fallback stated twice is one.
         DiagnosticReporter rep;

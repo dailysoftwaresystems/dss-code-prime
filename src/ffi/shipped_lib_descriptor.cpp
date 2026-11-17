@@ -6323,8 +6323,10 @@ struct CorpusIndex {
         throw fs::filesystem_error("the shipped descriptor corpus could not be walked", walk.storeRouteWhere,
                                    walk.error);
     for (fs::path const& descriptor : descriptors) {
-        std::ifstream in = core::openInputStream(descriptor, std::ios::binary);
-        if (!in) continue;  // lenient: unreadable descriptor skipped
+        auto opened = core::openInputStream(descriptor, std::ios::binary);
+        if (!opened)   // not lenient: unread, its symbols would read "unknown" (the walk's rule above, H6c2 (d))
+            throw fs::filesystem_error("a shipped descriptor could not be opened", descriptor, opened.error());
+        std::ifstream& in = *opened;
         // THE ONE CONFIG PARSE, and the reason a LENIENT scanner routes through
         // it too: `operator>>` into a `json` is `json::parse` under another
         // spelling, so leaving this site alone would leave one of the three
@@ -7073,7 +7075,7 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
     if (ec) {
         emitMalformed(reporter,
             "shipped-lib descriptor directory '" + core::genericSpelling(descriptorDir)
-            + "' cannot be examined (" + ec.message() + "), so no descriptor's "
+            + "' cannot be examined (" + core::reasonText(ec) + "), so no descriptor's "
               "shipped-source claim under it could be read");
         return claims;
     }
@@ -7093,7 +7095,7 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
         emitMalformed(reporter,
             "shipped-lib descriptor directory '" + core::genericSpelling(descriptorDir)
             + "' could not be read whole: the walk stopped at '" + walk.where.spelling().generic() + "' ("
-            + walk.error.message() + "), so the claims of the descriptors beyond it were never read");
+            + core::reasonText(walk.error) + "), so the claims of the descriptors beyond it were never read");
     }
     for (std::filesystem::path const& descriptor : descriptors) {
         json const* const docPtr = cachedDescriptorJson(descriptor, reporter);
@@ -7213,7 +7215,7 @@ describeShippedSourceLookup(ShippedSourceLookup const& lookup,
     // to claim absence: the file is very often right there, held by antivirus, a
     // network share, or another process mid-write.
     return "'" + core::genericSpelling(lookup.path)
-           + "' could not be examined (" + lookup.error.message()
+           + "' could not be examined (" + core::reasonText(lookup.error)
            + ") — this is an I/O failure, NOT a missing file; the body may well be "
              "present. Retry before treating it as absent";
 }
@@ -7391,7 +7393,7 @@ bool validateShippedSourceTree(
     auto const unread = [&](std::filesystem::path const& subject, core::TreeWalk const& walk) {
         emitMalformed(reporter,
             "shipped-source tree: '" + core::genericSpelling(subject) + "' could not be read whole: the walk "
-            "stopped at '" + walk.where.spelling().generic() + "' (" + walk.error.message() + "), so no file "
+            "stopped at '" + walk.where.spelling().generic() + "' (" + core::reasonText(walk.error) + "), so no file "
             "beyond it was checked against its declarers");
     };
     std::vector<std::filesystem::path> tiers;
@@ -7408,7 +7410,7 @@ bool validateShippedSourceTree(
         if (ec) {
             emitMalformed(reporter,
                 "shipped-source tree: '" + core::genericSpelling(authored) + "' cannot be examined ("
-                + ec.message() + "), so no file under it was checked against its declarers");
+                + core::reasonText(ec) + "), so no file under it was checked against its declarers");
             continue;
         }
         if (authoredKind != core::EntryKind::Directory) continue;
@@ -7606,7 +7608,7 @@ bool validateShippedIncludeClosure(
         emitCorpusInvariant(reporter,
             "shipped-lib corpus sweep: '" + core::genericSpelling(descriptorDir)
             + "' could not be read whole: the walk stopped at '" + walk.where.spelling().generic() + "' ("
-            + walk.error.message() + "), so the descriptors beyond it were never swept");
+            + core::reasonText(walk.error) + "), so the descriptors beyond it were never swept");
     }
     // Deterministic order on every host (a directory iteration order is the
     // filesystem's, and a sweep that reports its failures in a host-dependent

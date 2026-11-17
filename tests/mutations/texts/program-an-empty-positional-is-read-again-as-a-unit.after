@@ -1,0 +1,3 @@
+                break;
+            }
+            if (next.starts_with("-")) break;

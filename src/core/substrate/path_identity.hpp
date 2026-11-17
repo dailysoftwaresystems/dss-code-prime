@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -76,6 +77,13 @@ namespace dss::core {
 // model's declared separator, so on a host whose separator already is `/` the
 // substitution compiles away entirely -- and it must be that character and not
 // a literal backslash, because a POSIX filename may legitimately CONTAIN one.
+//
+// ★★ TOTAL AND LOSSLESS (P69 H6c2, T4): the text is rendered as UTF-8 on every
+// library -- an unpaired surrogate (NTFS keeps one) as its own three bytes,
+// WTF-8, as `PathText::display` renders it -- and NEVER through the code page,
+// which MS STL's `string()` narrows by and throws on a name it cannot encode
+// ([[D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW]]). It never throws
+// (allocation excepted), so no caller keeps a fallback for it.
 [[nodiscard]] DSS_EXPORT std::string
 genericSpelling(std::filesystem::path const& p);
 
@@ -95,6 +103,9 @@ genericSpelling(std::filesystem::path const& p);
 // way to make a string into an identity — `PathIdentity::of()` remains the only
 // gate for that, and this returning a `std::string` (never a `PathIdentity`) is
 // what keeps the two from being confused.
+//
+// The text is taken AS GIVEN (UTF-8, a rendering): the same generic rule as the
+// path form, never the library's narrow construction (T4).
 [[nodiscard]] DSS_EXPORT std::string genericSpelling(std::string_view spelling);
 
 // The same spelling as UTF-8, for the one caller that cannot use the narrow
@@ -117,10 +128,12 @@ genericSpelling(std::filesystem::path const& p);
 // that cannot spell the filename; escaping one and not the other would have
 // left the report wrong in the case it was rewritten for.
 //
-// ⚠ THROWS EXACTLY WHERE `u8string()` DOES, WHICH IS THE POINT. A native name
-// can be text no encoding accepts (NTFS permits lone surrogates) and the caller
-// owns a code-unit-by-code-unit fallback for it; swallowing the throw here
-// would take that fallback away and hand back a name that is not the file's.
+// ★ TOTAL AND LOSSLESS (P69 H6c2, T4): the same bytes as `genericSpelling`.
+// A native name can be text no encoding accepts (NTFS permits lone
+// surrogates); it is rendered WTF-8, which round-trips every native name, so
+// the rendering still names the file and no caller keeps a fallback for it
+// (until H6c2 this threw where `u8string()` does, and three callers escaped
+// code units in a catch).
 [[nodiscard]] DSS_EXPORT std::u8string
 genericSpellingU8(std::filesystem::path const& p);
 
@@ -162,6 +175,78 @@ inline constexpr PathGrammar kHostPathGrammar = PathGrammar::Win32;
 inline constexpr PathGrammar kHostPathGrammar = PathGrammar::Posix;
 #endif
 
+// ★★★ THE PARSE'S OUTPUT IS A VOCABULARY (P69 H6c2, T2): ONE ROW PER BRANCH OF THE PARSE, `DSS_ROOT_SHAPES`. The
+// parse answers a row (`RootSpelling::shape`) and nothing else: the kind and the authority are READ from the row
+// (`kindOf`, `namesAnAuthority`), never assigned beside it, so every return of the parse names a row and a branch
+// without one cannot be written. A decision that tells two shapes of one kind apart reads `shape` in a `switch` with no
+// `default:` (`-Werror=switch` / `/we4062`, CMakeLists.txt), so a new row is a build failure until each answers it;
+// one that needs the kind alone reads `kind`, the row's own. `EveryRowsExampleParsesToItsRow`
+// (tests/core/test_path_identity.cpp) parses every row's example and asks for that row.
+// A row is X(shape, kind, grammar, example). A NAMESPACED root (`\\.\`, `\\?\`, `\??\`) is read by its first name: a
+// drive (`C:`), a volume GUID (`Volume{...}`, any case), `UNC` (a server and its share follow), `GLOBALROOT` (an object
+// directory and the device in it follow), or any other name (a NAMED device, `PIPE`, `COM1`, nothing at all). BARE is
+// the volume spelled with no separator after it, and nothing else; any other spelling of the family is its NAME row
+// (its root, `\\?\C:\`, among them). The CONTAINER MEANING of each row -- where the OS's documented grammar puts a
+// child spelled after it -- is the home audit's table (HOME-AUDIT-typed-host-path.md 4.1): a bare drive-relative `C:`
+// puts it in drive C's CURRENT directory (Microsoft, "Naming Files, Paths, and Namespaces": "C:tmp.txt" refers to a
+// file named "tmp.txt" in the current directory on drive C), a bare VOLUME (`\\?\C:`, `\\.\C:`, a bare share) in the
+// volume's root, a bare NAMED device names that device alone.
+// ⚠ BOUNDARY, NAMED: a namespaced UNC root with a server and no share (`\\?\UNC\s`) is its family's BARE row too, as a
+// share's `\\s` is `ShareServer`; no route of the compiler produces one.
+#define DSS_ROOT_SHAPES(X)                                                                \
+    X(Relative, Relative, Win32, "x")                                                     \
+    X(DriveRelativeBare, DriveRelative, Win32, "C:")                                      \
+    X(DriveRelativeName, DriveRelative, Win32, "C:x")                                     \
+    X(RootedBare, Rooted, Win32, "\\")                                                    \
+    X(Rooted, Rooted, Win32, "\\x")                                                       \
+    X(DriveRoot, Drive, Win32, "C:\\")                                                    \
+    X(Drive, Drive, Win32, "C:\\x")                                                       \
+    X(ShareServer, Share, Win32, "\\\\s")                                                 \
+    X(ShareBare, Share, Win32, "\\\\s\\sh")                                               \
+    X(ShareRoot, Share, Win32, "\\\\s\\sh\\")                                             \
+    X(ShareName, Share, Win32, "\\\\s\\sh\\x")                                            \
+    X(DeviceDriveBare, Device, Win32, "\\\\.\\C:")                                        \
+    X(DeviceDrive, Device, Win32, "\\\\.\\C:\\x")                                         \
+    X(DeviceVolumeBare, Device, Win32, "\\\\.\\Volume{0}")                                \
+    X(DeviceVolume, Device, Win32, "\\\\.\\Volume{0}\\x")                                 \
+    X(DeviceUncBare, Device, Win32, "\\\\.\\UNC\\s\\sh")                                  \
+    X(DeviceUnc, Device, Win32, "\\\\.\\UNC\\s\\sh\\x")                                   \
+    X(DeviceGlobalRootBare, Device, Win32, "\\\\.\\GLOBALROOT\\Device\\V")                \
+    X(DeviceGlobalRoot, Device, Win32, "\\\\.\\GLOBALROOT\\Device\\V\\x")                 \
+    X(DeviceNamedBare, Device, Win32, "\\\\.\\PIPE")                                      \
+    X(DeviceNamed, Device, Win32, "\\\\.\\PIPE\\x")                                       \
+    X(VerbatimDriveBare, Verbatim, Win32, "\\\\?\\C:")                                    \
+    X(VerbatimDrive, Verbatim, Win32, "\\\\?\\C:\\x")                                     \
+    X(VerbatimVolumeBare, Verbatim, Win32, "\\\\?\\Volume{0}")                            \
+    X(VerbatimVolume, Verbatim, Win32, "\\\\?\\Volume{0}\\x")                             \
+    X(VerbatimUncBare, Verbatim, Win32, "\\\\?\\UNC\\s\\sh")                              \
+    X(VerbatimUnc, Verbatim, Win32, "\\\\?\\UNC\\s\\sh\\x")                               \
+    X(VerbatimGlobalRootBare, Verbatim, Win32, "\\\\?\\GLOBALROOT\\Device\\V")            \
+    X(VerbatimGlobalRoot, Verbatim, Win32, "\\\\?\\GLOBALROOT\\Device\\V\\x")             \
+    X(VerbatimNamedBare, Verbatim, Win32, "\\\\?\\PIPE")                                  \
+    X(VerbatimNamed, Verbatim, Win32, "\\\\?\\PIPE\\x")                                   \
+    X(NtDriveBare, Verbatim, Win32, "\\??\\C:")                                           \
+    X(NtDrive, Verbatim, Win32, "\\??\\C:\\x")                                            \
+    X(NtVolumeBare, Verbatim, Win32, "\\??\\Volume{0}")                                   \
+    X(NtVolume, Verbatim, Win32, "\\??\\Volume{0}\\x")                                    \
+    X(NtUncBare, Verbatim, Win32, "\\??\\UNC\\s\\sh")                                     \
+    X(NtUnc, Verbatim, Win32, "\\??\\UNC\\s\\sh\\x")                                      \
+    X(NtGlobalRootBare, Verbatim, Win32, "\\??\\GLOBALROOT\\Device\\V")                   \
+    X(NtGlobalRoot, Verbatim, Win32, "\\??\\GLOBALROOT\\Device\\V\\x")                    \
+    X(NtNamedBare, Verbatim, Win32, "\\??\\PIPE")                                         \
+    X(NtNamed, Verbatim, Win32, "\\??\\PIPE\\x")                                          \
+    X(PosixRelative, Relative, Posix, "x")                                                \
+    X(PosixRoot, Rooted, Posix, "/")                                                      \
+    X(PosixRooted, Rooted, Posix, "/x")                                                   \
+    X(PosixAuthorityRoot, Authority, Posix, "//")                                         \
+    X(PosixAuthority, Authority, Posix, "//x")
+
+enum class RootShape : std::uint8_t {
+#define DSS_ROOT_SHAPE_ENUMERATOR(shape, kind, grammar, example) shape,
+    DSS_ROOT_SHAPES(DSS_ROOT_SHAPE_ENUMERATOR)
+#undef DSS_ROOT_SHAPE_ENUMERATOR
+};
+
 struct RootSpelling {
     enum class Kind : std::uint8_t {
         Relative,        // `x`, `..\x`: no root
@@ -177,7 +262,94 @@ struct RootSpelling {
     std::size_t prefix    = 0;      // code units a normalization keeps whole: what a `..` never climbs into
     std::size_t volume    = 0;      // code units of the volume root, its separator included when spelled
     bool        authority = false;  // names another machine: a share (also `UNC\` under a device prefix), POSIX `//`
+    RootShape   shape     = RootShape::Relative;   // the parse's row (T2): `kind` and `authority` are read from it
 };
+
+// THE ROWS AS DATA: every shape with its kind, the grammar it is parsed in, its example and its name.
+struct RootShapeRow {
+    RootShape          shape;
+    RootSpelling::Kind kind;
+    PathGrammar        grammar;
+    char const*        example;
+    char const*        name;
+};
+inline constexpr RootShapeRow kRootShapes[] = {
+#define DSS_ROOT_SHAPE_ROW(shape, kind, grammar, example) \
+    {RootShape::shape, RootSpelling::Kind::kind, PathGrammar::grammar, example, #shape},
+    DSS_ROOT_SHAPES(DSS_ROOT_SHAPE_ROW)
+#undef DSS_ROOT_SHAPE_ROW
+};
+
+// The kind of a shape: its row's.
+[[nodiscard]] constexpr RootSpelling::Kind kindOf(RootShape shape) noexcept {
+    switch (shape) {
+#define DSS_ROOT_SHAPE_KIND(shape, kind, grammar, example) \
+    case RootShape::shape: return RootSpelling::Kind::kind;
+        DSS_ROOT_SHAPES(DSS_ROOT_SHAPE_KIND)
+#undef DSS_ROOT_SHAPE_KIND
+    }
+    return RootSpelling::Kind::Relative;   // unreachable: the switch names every row
+}
+
+// Whether a shape names ANOTHER MACHINE: a share, a namespaced `UNC\` root, POSIX's `//`.
+[[nodiscard]] constexpr bool namesAnAuthority(RootShape shape) noexcept {
+    switch (shape) {
+        case RootShape::ShareServer:
+        case RootShape::ShareBare:
+        case RootShape::ShareRoot:
+        case RootShape::ShareName:
+        case RootShape::DeviceUncBare:
+        case RootShape::DeviceUnc:
+        case RootShape::VerbatimUncBare:
+        case RootShape::VerbatimUnc:
+        case RootShape::NtUncBare:
+        case RootShape::NtUnc:
+        case RootShape::PosixAuthorityRoot:
+        case RootShape::PosixAuthority: return true;
+        case RootShape::Relative:
+        case RootShape::DriveRelativeBare:
+        case RootShape::DriveRelativeName:
+        case RootShape::RootedBare:
+        case RootShape::Rooted:
+        case RootShape::DriveRoot:
+        case RootShape::Drive:
+        case RootShape::DeviceDriveBare:
+        case RootShape::DeviceDrive:
+        case RootShape::DeviceVolumeBare:
+        case RootShape::DeviceVolume:
+        case RootShape::DeviceGlobalRootBare:
+        case RootShape::DeviceGlobalRoot:
+        case RootShape::DeviceNamedBare:
+        case RootShape::DeviceNamed:
+        case RootShape::VerbatimDriveBare:
+        case RootShape::VerbatimDrive:
+        case RootShape::VerbatimVolumeBare:
+        case RootShape::VerbatimVolume:
+        case RootShape::VerbatimGlobalRootBare:
+        case RootShape::VerbatimGlobalRoot:
+        case RootShape::VerbatimNamedBare:
+        case RootShape::VerbatimNamed:
+        case RootShape::NtDriveBare:
+        case RootShape::NtDrive:
+        case RootShape::NtVolumeBare:
+        case RootShape::NtVolume:
+        case RootShape::NtGlobalRootBare:
+        case RootShape::NtGlobalRoot:
+        case RootShape::NtNamedBare:
+        case RootShape::NtNamed:
+        case RootShape::PosixRelative:
+        case RootShape::PosixRoot:
+        case RootShape::PosixRooted: return false;
+    }
+    return false;   // unreachable: the switch names every row
+}
+
+// The name of a shape (its row's, for a test's or a diagnostic's words).
+[[nodiscard]] constexpr char const* shapeName(RootShape shape) noexcept {
+    for (RootShapeRow const& row : kRootShapes)
+        if (row.shape == shape) return row.name;
+    return "?";
+}
 
 // The root of `native` under `grammar` (both grammars are pure text, so either can be asked on any host).
 [[nodiscard]] DSS_EXPORT RootSpelling rootSpelling(std::wstring_view native, PathGrammar grammar);
@@ -288,35 +460,60 @@ enum class NamePosition : std::uint8_t { Middle, Last };
 //   * `copyFile`: the file `from` reaches, copied to a NEW file `to` -- refused when `to` exists, as
 //     `fs::copy_file` under `copy_options::none`.
 //   * `openFileStream`: a C stream on `p`, opened as `std::fopen(p, mode)` opens it (`_wfopen` of the reference on
-//     Windows, which takes it under both libraries); null when the open is refused, `errno` as it left it.
+//     Windows, which takes it under both libraries).
 //   * `openInputStream` / `openOutputStream`: a C++ stream on `p` -- the reference, which `std::ifstream` and
-//     `std::ofstream` take at any length under both libraries (✔MEASURED, the runs above); check `is_open()`.
-[[nodiscard]] DSS_EXPORT std::FILE* openFileStream(HostPath const& p, char const* mode);
-[[nodiscard]] DSS_EXPORT std::ifstream openInputStream(HostPath const& p, std::ios::openmode mode = std::ios::in);
-[[nodiscard]] DSS_EXPORT std::ofstream openOutputStream(HostPath const& p, std::ios::openmode mode = std::ios::out);
+//     `std::ofstream` take at any length under both libraries (✔MEASURED, the runs above).
+//   A refused open of each answers the OS's REASON, never a stream or a null to check: the reason the C runtime left
+//   AT the failing open (`runtimeReason` below, `clearRuntimeReason` having preceded it -- the stream opens of MS STL,
+//   libstdc++ and libc++ each reach `_wfopen` / `fopen`), and a value that names nothing its own refusal. Every caller
+//   that reports the failure names it through `reasonText` (H6c2 (d), the OS-reason class).
+[[nodiscard]] DSS_EXPORT std::expected<std::FILE*, std::error_code> openFileStream(HostPath const& p, char const* mode);
+[[nodiscard]] DSS_EXPORT std::expected<std::ifstream, std::error_code> openInputStream(HostPath const& p,
+                                                                                       std::ios::openmode mode = std::ios::in);
+[[nodiscard]] DSS_EXPORT std::expected<std::ofstream, std::error_code> openOutputStream(HostPath const& p,
+                                                                                        std::ios::openmode mode = std::ios::out);
 [[nodiscard]] DSS_EXPORT bool createDirectories(HostPath const& p, std::error_code& ec);
 [[nodiscard]] DSS_EXPORT bool createDirectoriesFor(HostPath const& file, std::error_code& ec);
 [[nodiscard]] DSS_EXPORT bool removeEntry(HostPath const& p, std::error_code& ec);
 DSS_EXPORT void copyFile(HostPath const& from, HostPath const& to, std::error_code& ec);
 
+// ── THE OS'S REASON (P69 H6c2) ─────────────────────────────────────────────────────────────────────────────────────
+// ★ A HOST PRIMITIVE THAT FAILS ANSWERS THE OS'S REASON, captured AT the failing call -- before a CloseHandle, a probe
+// or any other call can overwrite the thread's last error or errno -- and every diagnostic built on it NAMES that
+// reason, its code and its text, never a list of guesses (✔MEASURED, H6c2: the staging claim refused an APFS name with
+// EILSEQ and its diagnostic offered "permission denied, a path component is not a directory, invalid filename, or
+// parent removed post-stat").
+// `reasonText` is the ONE rendering: `GetLastError=<n>: <text>` for a Win32 code (the system's own message, as UTF-8),
+// `errno=<n>: <text>` for an errno (strerror_r, whose text is the thread's own for every code, known or not),
+// `<category>=<n>: <message>` for any other (the home's own refusals).
+[[nodiscard]] DSS_EXPORT std::string reasonText(std::error_code const& reason);
+// The reason a C runtime call (`_wfopen` / `fopen`, `fwrite`, `fclose`, `_open_osfhandle`, `fdopen`) left: the OS's
+// own code where the runtime recorded one (`_doserrno`, Windows), its errno otherwise -- or
+// `PathRefusal::HostAnsweredNoReason` where it left none. Read AT ONCE after the call, which `clearRuntimeReason`
+// preceded, so a reason an earlier call left is never named.
+DSS_EXPORT void clearRuntimeReason();
+[[nodiscard]] DSS_EXPORT std::error_code runtimeReason();
+
 #ifdef _WIN32
 // THE HANDLE CALLS a site makes on a path (H6c, A4) -- the writer's exclusive create, its holder query and its staged
 // file's open, the dependency cache's lock: CreateFileW of `p`'s LEAF reference with the caller's own access, share,
-// disposition and flags (the HANDLE as `void*`, INVALID_HANDLE_VALUE and GetLastError when refused; the caller owns
-// and closes it); GetFileAttributesW of it (INVALID_FILE_ATTRIBUTES and GetLastError when refused); and the COMMIT BY
-// HANDLE: SetFileInformationByHandle FileRenameInfoEx (POSIX semantics) or FileRenameInfo of the file behind `staged`
-// -- a handle with DELETE access -- to `target`'s LEAF reference, replacing what is there (0, or the Win32 error;
-// never 0 for a refusal). The rename's name is resolved as MoveFileExW resolves one -- forward slashes, a bare
-// relative name and a `..` land against the current directory (✔MEASURED, the writer's measurement) -- so it is
-// handed the reference, which names `target` at any length.
-[[nodiscard]] DSS_EXPORT void* openHandle(HostPath const& p, unsigned long access, unsigned long share,
-                                          unsigned long disposition, unsigned long flagsAndAttributes);
-[[nodiscard]] DSS_EXPORT unsigned long fileAttributes(HostPath const& p);
+// disposition and flags (the HANDLE as `void*`, which the caller owns and closes); GetFileAttributesW of it; each
+// answering the OS's REASON when refused (the Win32 error, read at the failing call; the home's refusal for a value
+// that names nothing); and the COMMIT BY HANDLE: SetFileInformationByHandle FileRenameInfoEx (POSIX semantics) or
+// FileRenameInfo of the file behind `staged` -- a handle with DELETE access -- to `target`'s LEAF reference, replacing
+// what is there (0, or the Win32 error; never 0 for a refusal). The rename's name is resolved as MoveFileExW resolves
+// one -- forward slashes, a bare relative name and a `..` land against the current directory (✔MEASURED, the writer's
+// measurement) -- so it is handed the reference, which names `target` at any length.
+[[nodiscard]] DSS_EXPORT std::expected<void*, std::error_code> openHandle(HostPath const& p, unsigned long access,
+                                                                          unsigned long share, unsigned long disposition,
+                                                                          unsigned long flagsAndAttributes);
+[[nodiscard]] DSS_EXPORT std::expected<unsigned long, std::error_code> fileAttributes(HostPath const& p);
 [[nodiscard]] DSS_EXPORT unsigned long commitByHandle(void* staged, HostPath const& target, bool posixSemantics);
 #else
 // THE DESCRIPTOR CALL a site makes on a path (H6c, A4): `open(2)` of `p` with the caller's flags and mode -- the
-// writer's exclusive create, the dependency cache's lock -- the descriptor, or -1 with `errno` as `open` left it.
-[[nodiscard]] DSS_EXPORT int openDescriptor(HostPath const& p, int flags, unsigned mode);
+// writer's exclusive create, the dependency cache's lock -- the descriptor, or the OS's REASON (`open`'s errno, read at
+// the failing call; the home's refusal for a value that names nothing).
+[[nodiscard]] DSS_EXPORT std::expected<int, std::error_code> openDescriptor(HostPath const& p, int flags, unsigned mode);
 // `renameEntry`: `from` renamed to `to`, replacing a file there (`rename(2)`). POSIX alone: on Windows the one rename
 // DSS commits is the writer's, BY HANDLE (`commitByHandle`).
 DSS_EXPORT void renameEntry(HostPath const& from, HostPath const& to, std::error_code& ec);
@@ -335,9 +532,14 @@ DSS_EXPORT void renameEntry(HostPath const& from, HostPath const& to, std::error
 //     (`\\?\`, `\\?\UNC\` for a share) and never resolved -- resolved by the rule, it would be the twin again.
 //     ⚠ UNMEASURED, named: a child's DLL search from its application directory, INFERRED to take the same
 //     normalized name. `/proc/self/exe` on Linux, `_NSGetExecutablePath` on macOS.
+//   * `processImage`: the image ANOTHER process runs, by its id -- the same query as `runningExecutable`'s, taken
+//     the same way (P69 H6c2, H7: the writer named a file's holders by asking it itself). `ec` is the OS's refusal
+//     (the process is gone, or not ours to open); on a host with no such query (every POSIX one: no caller asks one
+//     there) `std::errc::function_not_supported`.
 [[nodiscard]] DSS_EXPORT HostPath currentDirectory(std::error_code& ec);
 [[nodiscard]] DSS_EXPORT HostPath temporaryDirectory(std::error_code& ec);
 [[nodiscard]] DSS_EXPORT HostPath runningExecutable(std::error_code& ec);
+[[nodiscard]] DSS_EXPORT HostPath processImage(unsigned long processId, std::error_code& ec);
 
 // `fs::absolute` WITHOUT letting it invent a drive for a path that already names
 // an AUTHORITY or a NAMESPACE (`rootSpelling`: a share, POSIX `//`, a device or verbatim prefix). Same invariant as

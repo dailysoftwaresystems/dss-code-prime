@@ -1016,11 +1016,13 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
 // ★ THE MANIFEST IS A VALUE (P69 H6c): a GIVEN spelling, or a walked entry's listed value -- opened through the
 // home, never as a listed value's text handed to the library.
 [[nodiscard]] bool readManifest(dss::core::HostPath const& path, ExampleManifest& out) {
-    std::ifstream in = dss::core::openInputStream(path);
-    if (!in) {
-        std::cerr << "  cannot open " << path.spelling().generic() << "\n";
+    auto opened = dss::core::openInputStream(path);
+    if (!opened) {
+        std::cerr << "  cannot open " << path.spelling().generic() << ": " << dss::core::reasonText(opened.error())
+                  << "\n";
         return false;
     }
+    std::ifstream& in = *opened;
     nlohmann::json j;
     try { in >> j; }
     catch (std::exception const& e) {

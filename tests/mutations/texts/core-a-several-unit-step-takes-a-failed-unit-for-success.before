@@ -1,1 +1,1 @@
-        if (!step(i)) every = false;
+        every = step(cursor) && every;

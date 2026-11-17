@@ -1,0 +1,4 @@
+                ++i;
+                continue;
+            }
+            if (next.starts_with("-")) break;

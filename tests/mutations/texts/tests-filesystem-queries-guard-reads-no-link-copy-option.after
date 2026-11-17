@@ -1,1 +1,1 @@
-        for (auto const* re : {&qualified, &member, &projection}) {
+        for (auto const form : {&Scanner::qualified, &Scanner::member, &Scanner::projection}) {

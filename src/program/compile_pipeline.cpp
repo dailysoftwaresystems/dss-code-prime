@@ -62,6 +62,7 @@
 #include "opt/optimizer.hpp"
 #include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize -- the data model's pointer width
 #include "core/substrate/every_unit.hpp"   // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/substrate/silent_unit.hpp"  // namingSilentUnits: the net bound to the run's reporter
 #include "core/substrate/input_named_diagnostics.hpp"   // readNamingTheInput: a refusal of one input names it
 // D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT:
 // `resolveArchiveSiblingFormat` -- the declared-property lookup that answers
@@ -510,20 +511,20 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
-            std::ifstream probe = core::openInputStream(lib.path, std::ios::binary);
+            auto probe = core::openInputStream(lib.path, std::ios::binary);
             if (!probe) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::F_FileOpenFailed;
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = std::format(
-                    "--resolve-library: failed to open '{}' for reading "
+                    "--resolve-library: failed to open '{}' for reading: {} "
                     "(the resolve-library binary must exist + be readable at "
                     "compile time). Check the path.",
-                    core::genericSpelling(lib.path));
+                    core::genericSpelling(lib.path), core::reasonText(probe.error()));
                 reporter.report(std::move(d));
                 continue;  // unopenable: nothing to classify, one message is enough
             }
-            probe.close();
+            probe->close();
             // Reports F_UnsupportedBinaryFormat itself when it objects; the
             // discarded return is the structured twin, which this site (a
             // reporter-driven probe) has no use for.
@@ -3381,7 +3382,9 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
     // (f) of the orchestrator's ledger 568, P69 fold 3e): a library whose
     // surface cannot be read never stops the libraries after it. The first row
     // a name meets still wins (`try_emplace`, in library order).
-    bool const everyLibraryRead = substrate::runEveryUnit(libraries.size(), [&](std::size_t l) {
+    bool const everyLibraryRead = substrate::runEveryUnit(libraries.size(), substrate::namingSilentUnits(
+        reporter, "the operator-named library binding", [&](std::size_t l) { return "library '" + core::genericSpelling(libraries[l].path) + "'"; },
+        [&](std::size_t l) {
         ResolveLibrarySpec const& lib = libraries[l];
         // ★ THE TARGET-AWARE READ, NOT THE BARE READER. This binder and
         // `ingest()`'s `readSource` are the paths a `--resolve-library` binary
@@ -3411,7 +3414,7 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
                                     row.kind});
         }
         return true;
-    });
+    }));
     if (!everyLibraryRead) return std::nullopt;
     return bySymbol;
 }
@@ -3419,8 +3422,9 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
 }  // namespace
 
 bool isArArchiveFile(std::filesystem::path const& path) {
-    std::ifstream in = core::openInputStream(path, std::ios::binary);
-    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) return false;   // unreadable -> stays dynamic (the eager probe names it, with the OS's reason)
+    std::ifstream& in = *opened;
     std::uint8_t buf[8] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
     if (in.gcount() != static_cast<std::streamsize>(sizeof(buf))) return false;
@@ -3432,8 +3436,9 @@ bool isArArchiveFile(std::filesystem::path const& path) {
 
 bool isRelocatableObjectFile(std::filesystem::path const& path,
                              ObjectFormatSchema const&    format) {
-    std::ifstream in = core::openInputStream(path, std::ios::binary);
-    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) return false;   // unreadable -> stays dynamic (the eager probe names it, with the OS's reason)
+    std::ifstream& in = *opened;
 
     // A HEADER PREFIX, never the file. Every field the backends inspect lives in
     // the first few dozen bytes (the ELF `e_type` at 16, the Mach-O `filetype`
@@ -4021,20 +4026,23 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // THE PULL FAILS (`substrate::runEveryUnit`; site (g) of the orchestrator's
     // ledger 568, P69 fold 3e): an unreadable archive never stops the archives
     // after it. Nothing is pulled from any archive when one failed.
-    bool const everyArchiveParsed = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {
+    bool const everyArchiveParsed = substrate::runEveryUnit(archivePaths.size(), substrate::namingSilentUnits(
+        reporter, "the archive pull's parse", [&](std::size_t a) { return "archive '" + core::genericSpelling(archivePaths[a]) + "'"; },
+        [&](std::size_t a) {
         std::filesystem::path const& archivePath = archivePaths[a];
-        std::ifstream in = core::openInputStream(archivePath, std::ios::binary);
-        if (!in) {
+        auto opened = core::openInputStream(archivePath, std::ios::binary);
+        if (!opened) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
-                "static-link: failed to open archive '{}' for reading "
+                "static-link: failed to open archive '{}' for reading: {} "
                 "(D-LK-STATIC-LINK).",
-                core::genericSpelling(archivePath));
+                core::genericSpelling(archivePath), core::reasonText(opened.error()));
             reporter.report(std::move(d));
             return false;
         }
+        std::ifstream& in = *opened;
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
         auto arch = readNamingTheInput(
@@ -4045,7 +4053,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
         if (!arch) return false;   // corrupt archive -> reader fail-loud, named
         archives.push_back(ParsedArchive{std::move(bytes), std::move(*arch)});
         return true;
-    });
+    }));
     if (!everyArchiveParsed) return std::nullopt;
 
     // Global armap: symbol name -> (archiveIdx, memberIndex). First-wins across
@@ -4701,13 +4709,14 @@ pullEntryArchiveMembers(std::span<EntryLinkName const>         names,
         if (archives[ai].has_value()) return &*archives[ai];
         if (unreadable[ai]) return nullptr;   // reported when it was first asked
         unreadable[ai] = true;   // until the read below succeeds
-        std::ifstream in = core::openInputStream(archivePaths[ai], std::ios::binary);
-        if (!in) {
+        auto opened = core::openInputStream(archivePaths[ai], std::ios::binary);
+        if (!opened) {
             report(reporter, DiagnosticCode::F_FileOpenFailed, DiagnosticSeverity::Error,
-                   std::format("static-link: failed to open archive '{}' for reading.",
-                               core::genericSpelling(archivePaths[ai])));
+                   std::format("static-link: failed to open archive '{}' for reading: {}.",
+                               core::genericSpelling(archivePaths[ai]), core::reasonText(opened.error())));
             return nullptr;
         }
+        std::ifstream& in = *opened;
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
         auto arch = readNamingTheInput(
@@ -4775,20 +4784,23 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     // class's one home: P69 H6b, the review of H6's N1; site (c) of the
     // orchestrator's ledger 550, fold 3e): an archive that does not open or
     // parse, or a member that does not read, never stops the ones after it.
-    bool const everyArchiveRead = substrate::runEveryUnit(archivePaths.size(), [&](std::size_t a) {
+    bool const everyArchiveRead = substrate::runEveryUnit(archivePaths.size(), substrate::namingSilentUnits(
+        reporter, "the input archive extraction", [&](std::size_t a) { return "archive '" + core::genericSpelling(archivePaths[a]) + "'"; },
+        [&](std::size_t a) {
         std::filesystem::path const& archivePath = archivePaths[a];
-        std::ifstream in = core::openInputStream(archivePath, std::ios::binary);
-        if (!in) {
+        auto opened = core::openInputStream(archivePath, std::ios::binary);
+        if (!opened) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
                 "fat-archive: failed to open input static archive '{}' for "
-                "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
-                core::genericSpelling(archivePath));
+                "reading: {} (D-FF1-STATICLIB-FAT-ARCHIVE).",
+                core::genericSpelling(archivePath), core::reasonText(opened.error()));
             reporter.report(std::move(d));
             return false;
         }
+        std::ifstream& in = *opened;
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
         auto arch = readNamingTheInput(
@@ -4806,7 +4818,9 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
         // is carried verbatim -- cosmetic (the armap selects members by index),
         // and `ar` permits duplicate member names; a rare empty name (never from
         // a well-formed archive) is synthesized so the writer's name belt holds.
-        return substrate::runEveryUnit(arch->members.size(), [&](std::size_t m) {
+        return substrate::runEveryUnit(arch->members.size(), substrate::namingSilentUnits(
+            reporter, "the input archive extraction", [&](std::size_t m) { return core::genericSpelling(archivePath) + "(" + arch->members[m].name + "), member " + std::to_string(m); },
+            [&](std::size_t m) {
             ffi::ArMember const& member = arch->members[m];
             std::span<std::uint8_t const> const memberBytes{
                 bytes.data() + static_cast<std::size_t>(member.dataOffset),
@@ -4822,8 +4836,8 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                     ? ("member_" + std::to_string(out.names.size()) + ".o")
                     : member.name);
             return true;
-        });
-    });
+        }));
+    }));
     if (!everyArchiveRead) return std::nullopt;
     return out;
 }
@@ -4849,22 +4863,25 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     // fails (`runEveryUnit`, the several-unit class's one home: P69 H6b; site
     // (c) of the orchestrator's ledger 550, fold 3e): an object that does not
     // open or read never stops the objects after it.
-    bool const everyObjectRead = substrate::runEveryUnit(objectPaths.size(), [&](std::size_t o) {
+    bool const everyObjectRead = substrate::runEveryUnit(objectPaths.size(), substrate::namingSilentUnits(
+        reporter, "the object input read", [&](std::size_t o) { return "object '" + core::genericSpelling(objectPaths[o]) + "'"; },
+        [&](std::size_t o) {
         std::filesystem::path const& objectPath = objectPaths[o];
-        std::ifstream in = core::openInputStream(objectPath, std::ios::binary);
-        if (!in) {
+        auto opened = core::openInputStream(objectPath, std::ios::binary);
+        if (!opened) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
-                "object input: failed to open '{}' for reading. It was named as "
+                "object input: failed to open '{}' for reading: {}. It was named as "
                 "a link input, so it cannot be skipped -- an omitted object "
                 "would link into a smaller image that may still run "
                 "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
-                core::genericSpelling(objectPath));
+                core::genericSpelling(objectPath), core::reasonText(opened.error()));
             reporter.report(std::move(d));
             return false;
         }
+        std::ifstream& in = *opened;
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
 
@@ -4880,7 +4897,7 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
         if (!object_mod) return false;   // read fail-loud already reported
         objects.push_back(std::move(*object_mod));
         return true;
-    });
+    }));
     if (!everyObjectRead) return std::nullopt;
     // P69 send-back 5 (review-xa4 MINOR 3): an object NAMED to the link keeps
     // its `/ENTRY:`, and the entry's name is a reference the archive search
@@ -5074,10 +5091,17 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     // EVERY member is linked and reports its own errors before the archive fails (`runEveryUnit`, the several-unit
     // class's one home): a member that fails never stops the members after it, and each member's cleanliness is
     // counted from its own start, not from the archive's.
-    bool const everyMemberLinked = substrate::runEveryUnit(modules.size(), [&](std::size_t i) {
+    bool const everyMemberLinked = substrate::runEveryUnit(modules.size(), substrate::namingSilentUnits(
+        reporter, "the static archive's member link", [&](std::size_t i) { return "member '" + memberNames[i] + "'"; },
+        [&](std::size_t i) {
         auto const memberEntry = reporter.errorCount();
-        auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
-                                  target, format, reporter, memberRequest);
+        // The member's link reports NAME THE MEMBER (`readNamingTheInput`, H6c2): the linker's words name symbols, and
+        // two members failing on one symbol would say the same words -- the reporter keeps one, and the net would
+        // then name the other silent.
+        auto image = substrate::readNamingTheInput(memberNames[i], reporter, [&](DiagnosticReporter& memberReporter) {
+            return linker::link(std::span<AssembledModule const>{&modules[i], 1}, target, format, memberReporter,
+                                memberRequest);
+        });
         if (!image.ok() || !tierClean(reporter, memberEntry)) {
             return false;
         }
@@ -5096,7 +5120,7 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
         members.push_back(link::format::ArMemberInput{
             memberNames[i], std::move(image.bytes), std::move(exported)});
         return true;
-    });
+    }));
     if (!everyMemberLinked) return false;
 
     // c169/c171 (D-FF1-AR-COFF-WRITER + D-FF1-AR-STATICLIB-DRIVER-WIRING):
@@ -5491,7 +5515,9 @@ assembleAsmUnit(CompilationUnit const&     cu,
     // fold 3e): a tree that fails never stops the trees after it.
     std::vector<AssembledModule> assembledTrees;
     std::span<Tree const> const trees = cu.trees();
-    bool const everyTreeAssembled = substrate::runEveryUnit(trees.size(), [&](std::size_t ti) {
+    bool const everyTreeAssembled = substrate::runEveryUnit(trees.size(), substrate::namingSilentUnits(
+        reporter, "the assembly unit's source assembly", [](std::size_t ti) { return "assembly source " + std::to_string(ti); },
+        [&](std::size_t ti) {
         Tree const& tree = trees[ti];
         // P68 round 9: the format kind, ONLY as a key into the dialect's
         // `symbolParts` / `impliedSymbolPart` (`:lo12:` on ELF, `@PAGEOFF` on
@@ -5602,7 +5628,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
         }
         assembledTrees.push_back(std::move(assembled));
         return true;
-    });
+    }));
     if (!everyTreeAssembled) return std::nullopt;
     // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
     // file's SymbolIds namespaced before the merge; refusing is the honest
@@ -5848,22 +5874,28 @@ bool runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
     // module is also a potential import SOURCE for every other importer, which
     // is exactly why `lazyImportOptimize` returns its module instead of writing
     // one through a reference.
-    bool ok = true;
-    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
-        copyDiagnostics(scratch[i], reporter);
-        // The import fixpoint's bound is an INVARIANT, never a truncation (`importBoundReached`, beside the stage
-        // rule): a unit that reached it stops the stage, whatever its report became.
-        if (importBoundReached(i, outcomes[i].demandLeftAtBound, reporter)) { ok = false; continue; }
-        if (!outcomes[i].ok) { ok = false; continue; }
-        if (!outcomes[i].mir.has_value()) continue;   // imported nothing
-        cuMirs[i].mir                 = std::move(*outcomes[i].mir);
-        cuMirs[i].importedHost        = std::move(outcomes[i].host);
-        cuMirs[i].importedSymbolNames = std::move(outcomes[i].symbolNames);
-        cuMirs[i].externImports       = std::move(outcomes[i].externImports);
-        cuMirs[i].libraryShimRecipes  = std::move(outcomes[i].synthRecipes);
-        cuMirs[i].usesImportedLattice = true;
-    }
-    return ok;
+    // ★ EVERY CU IS INSTALLED, OR SAYS WHY NOT, BEFORE THE STAGE FAILS (`runEveryUnit`, the several-unit class's one
+    // home, P69 H6c2): a CU whose import failed never stops the CUs after it. Netted: a CU's reports carry its own
+    // buffer, and the bound's names its module, so a CU that failed having said nothing is named.
+    return substrate::runEveryUnit(
+        cuMirs.size(),
+        substrate::namingSilentUnits(
+            reporter, "the thin-LTO import install", [](std::size_t i) { return "module #" + std::to_string(i); },
+            [&](std::size_t i) {
+                copyDiagnostics(scratch[i], reporter);
+                // The import fixpoint's bound is an INVARIANT, never a truncation (`importBoundReached`, beside the
+                // stage rule): a unit that reached it fails the stage, whatever its report became.
+                if (importBoundReached(i, outcomes[i].demandLeftAtBound, reporter)) return false;
+                if (!outcomes[i].ok) return false;
+                if (!outcomes[i].mir.has_value()) return true;   // imported nothing
+                cuMirs[i].mir                 = std::move(*outcomes[i].mir);
+                cuMirs[i].importedHost        = std::move(outcomes[i].host);
+                cuMirs[i].importedSymbolNames = std::move(outcomes[i].symbolNames);
+                cuMirs[i].externImports       = std::move(outcomes[i].externImports);
+                cuMirs[i].libraryShimRecipes  = std::move(outcomes[i].synthRecipes);
+                cuMirs[i].usesImportedLattice = true;
+                return true;
+            }));
 }
 
 } // namespace dss

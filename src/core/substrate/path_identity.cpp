@@ -1,12 +1,14 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "core/substrate/host_path_access.hpp"
+#include "core/substrate/windows_command_line.hpp"   // decodeUtf8ToWide: THE one UTF-8 decoder (T4)
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>   // _doserrno: the OS code the C runtime recorded (runtimeReason)
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -93,18 +95,60 @@ template <class C>
     return at;
 }
 
+// A NAMESPACED root's family (`\\.\`, `\\?\`, `\??\`), each with its bare row and its name row.
+struct NamespacedRows {
+    RootShape driveBare, drive, volumeBare, volume, uncBare, unc, globalRootBare, globalRoot, namedBare, named;
+};
+inline constexpr NamespacedRows kDeviceRows{RootShape::DeviceDriveBare,      RootShape::DeviceDrive,
+                                            RootShape::DeviceVolumeBare,     RootShape::DeviceVolume,
+                                            RootShape::DeviceUncBare,        RootShape::DeviceUnc,
+                                            RootShape::DeviceGlobalRootBare, RootShape::DeviceGlobalRoot,
+                                            RootShape::DeviceNamedBare,      RootShape::DeviceNamed};
+inline constexpr NamespacedRows kVerbatimRows{RootShape::VerbatimDriveBare,      RootShape::VerbatimDrive,
+                                              RootShape::VerbatimVolumeBare,     RootShape::VerbatimVolume,
+                                              RootShape::VerbatimUncBare,        RootShape::VerbatimUnc,
+                                              RootShape::VerbatimGlobalRootBare, RootShape::VerbatimGlobalRoot,
+                                              RootShape::VerbatimNamedBare,      RootShape::VerbatimNamed};
+inline constexpr NamespacedRows kNtRows{RootShape::NtDriveBare,      RootShape::NtDrive,
+                                        RootShape::NtVolumeBare,     RootShape::NtVolume,
+                                        RootShape::NtUncBare,        RootShape::NtUnc,
+                                        RootShape::NtGlobalRootBare, RootShape::NtGlobalRoot,
+                                        RootShape::NtNamedBare,      RootShape::NtNamed};
+
+// THE ROW A PARSE ANSWERS, with its two extents: the ONLY way the parse makes its answer, so every return names a row
+// and its kind and authority are the row's (T2).
+[[nodiscard]] RootSpelling rootRow(RootShape shape, std::size_t prefix, std::size_t volume) noexcept {
+    RootSpelling root;
+    root.shape     = shape;
+    root.kind      = kindOf(shape);
+    root.authority = namesAnAuthority(shape);
+    root.prefix    = prefix;
+    root.volume    = volume;
+    return root;
+}
+
+// The row of a NAMESPACED root whose first name is `name` and whose volume ends at `volume`: BARE when the spelling
+// is that volume and no separator follows it, else the family's name row.
+template <class C>
+[[nodiscard]] RootShape namespacedShape(NamespacedRows const& rows, std::basic_string_view<C> s,
+                                        std::basic_string_view<C> name, std::size_t volume, bool verbatim) {
+    bool const bare = volume == s.size() && (volume == 0 || !separatesIn(s[volume - 1], PathGrammar::Win32, verbatim));
+    if (equalsAsciiFolded(name, "UNC")) return bare ? rows.uncBare : rows.unc;
+    if (equalsAsciiFolded(name, "GLOBALROOT")) return bare ? rows.globalRootBare : rows.globalRoot;
+    if (name.size() == 2 && isAsciiAlpha(name[0]) && name[1] == C(':')) return bare ? rows.driveBare : rows.drive;
+    bool const volumeGuid = name.size() >= 8 && equalsAsciiFolded(name.substr(0, 7), "Volume{") && name.back() == C('}');
+    if (volumeGuid) return bare ? rows.volumeBare : rows.volume;
+    return bare ? rows.namedBare : rows.named;
+}
+
 template <class C>
 [[nodiscard]] RootSpelling parseRoot(std::basic_string_view<C> s, PathGrammar grammar) {
-    using Kind = RootSpelling::Kind;
-    RootSpelling root;
     if (grammar == PathGrammar::Posix) {
         std::size_t run = 0;
         while (run < s.size() && s[run] == C('/')) ++run;
-        if (run == 0) return root;
-        root.kind      = run == 2 ? Kind::Authority : Kind::Rooted;
-        root.authority = run == 2;
-        root.prefix = root.volume = run;
-        return root;
+        if (run == 0) return rootRow(RootShape::PosixRelative, 0, 0);
+        if (run == 2) return rootRow(run == s.size() ? RootShape::PosixAuthorityRoot : RootShape::PosixAuthority, run, run);
+        return rootRow(run == s.size() ? RootShape::PosixRoot : RootShape::PosixRooted, run, run);
     }
     auto const sep = [](C c) { return c == C('\\') || c == C('/'); };
     // ★ `\??\` -- the NT namespace's own spelling of `\\?\`, backslashes exactly -- is VERBATIM (P69 H6b, N4):
@@ -115,14 +159,11 @@ template <class C>
     // what a call takes (`referenceSpelling`): CreateDirectoryW refuses `\??\` past MAX_PATH (206). `/??/` is no
     // prefix at all (every call refuses it, 123), so it stays rooted, as GetFullPathNameW reads it.
     if (s.size() >= 4 && s[0] == C('\\') && s[1] == C('?') && s[2] == C('?') && s[3] == C('\\')) {
-        std::size_t const first = segmentEnd(s, 4, grammar, true);
-        auto const        name  = s.substr(4, first - 4);
-        bool const        unc   = equalsAsciiFolded(name, "UNC");
-        int const         depth = (unc || equalsAsciiFolded(name, "GLOBALROOT")) ? 3 : 1;
-        root.kind      = Kind::Verbatim;
-        root.authority = unc;
-        root.prefix = root.volume = pastSegments(s, 4, depth, grammar, true);
-        return root;
+        std::size_t const first  = segmentEnd(s, 4, grammar, true);
+        auto const        name   = s.substr(4, first - 4);
+        int const         depth  = (equalsAsciiFolded(name, "UNC") || equalsAsciiFolded(name, "GLOBALROOT")) ? 3 : 1;
+        std::size_t const volume = pastSegments(s, 4, depth, grammar, true);
+        return rootRow(namespacedShape(kNtRows, s, name, volume, true), volume, volume);
     }
     if (s.size() >= 2 && sep(s[0]) && sep(s[1])) {
         if (s.size() >= 3 && (s[2] == C('.') || s[2] == C('?')) && (s.size() == 3 || sep(s[3]))) {
@@ -131,33 +172,29 @@ template <class C>
             // its share, or, after `GLOBALROOT`, an object directory and the device in it.
             bool const verbatim = s.size() >= 4 && s[0] == C('\\') && s[1] == C('\\') && s[2] == C('?')
                                && s[3] == C('\\');
-            std::size_t const p     = std::min<std::size_t>(4, s.size());
-            std::size_t const first = segmentEnd(s, p, grammar, verbatim);
-            auto const        name  = s.substr(p, first - p);
-            bool const        unc   = equalsAsciiFolded(name, "UNC");
-            int const         depth = (unc || equalsAsciiFolded(name, "GLOBALROOT")) ? 3 : 1;
-            root.kind      = verbatim ? Kind::Verbatim : Kind::Device;
-            root.authority = unc;
-            root.volume    = pastSegments(s, p, depth, grammar, verbatim);
-            root.prefix    = verbatim ? root.volume : p;
-            return root;
+            std::size_t const p      = std::min<std::size_t>(4, s.size());
+            std::size_t const first  = segmentEnd(s, p, grammar, verbatim);
+            auto const        name   = s.substr(p, first - p);
+            int const         depth  = (equalsAsciiFolded(name, "UNC") || equalsAsciiFolded(name, "GLOBALROOT")) ? 3 : 1;
+            std::size_t const volume = pastSegments(s, p, depth, grammar, verbatim);
+            RootShape const   shape  = namespacedShape(verbatim ? kVerbatimRows : kDeviceRows, s, name, volume, verbatim);
+            return rootRow(shape, verbatim ? volume : p, volume);
         }
-        root.kind      = Kind::Share;
-        root.authority = true;
-        root.prefix = root.volume = pastSegments(s, 2, 2, grammar, false);
-        return root;
+        // A share: its server, then its share; a server alone (`\\s`, `\\s\`) is no share yet.
+        std::size_t const server = segmentEnd(s, 2, grammar, false);
+        std::size_t const volume = pastSegments(s, 2, 2, grammar, false);
+        RootShape const   shape  = server + 1 >= s.size()                    ? RootShape::ShareServer
+                                 : volume < s.size()                         ? RootShape::ShareName
+                                 : sep(s[volume - 1])                        ? RootShape::ShareRoot
+                                                                             : RootShape::ShareBare;
+        return rootRow(shape, volume, volume);
     }
     if (s.size() >= 2 && isAsciiAlpha(s[0]) && s[1] == C(':')) {
-        bool const rooted = s.size() >= 3 && sep(s[2]);
-        root.kind   = rooted ? Kind::Drive : Kind::DriveRelative;
-        root.prefix = root.volume = rooted ? 3 : 2;
-        return root;
+        if (s.size() >= 3 && sep(s[2])) return rootRow(s.size() == 3 ? RootShape::DriveRoot : RootShape::Drive, 3, 3);
+        return rootRow(s.size() == 2 ? RootShape::DriveRelativeBare : RootShape::DriveRelativeName, 2, 2);
     }
-    if (!s.empty() && sep(s[0])) {
-        root.kind   = Kind::Rooted;
-        root.prefix = root.volume = 1;
-    }
-    return root;
+    if (!s.empty() && sep(s[0])) return rootRow(s.size() == 1 ? RootShape::RootedBare : RootShape::Rooted, 1, 1);
+    return rootRow(RootShape::Relative, 0, 0);
 }
 
 // What Win32's DOS normalization leaves of one component that is not `.` or `..` (✔MEASURED 2026-11-04,
@@ -370,21 +407,179 @@ template <class C>
 // QueryFullProcessImageNameW's): `\\?\` before a drive, `\\?\UNC\` in place of a share's `\\`, `\\?\` in place of a
 // device's `\\.\` (one NT namespace: ✔MEASURED, run 20261104-215748-2946f6a6, one NT name and one file id each), a
 // verbatim answer as it is -- PREFIXED, never resolved again; EMPTY for an answer of no such form.
+// A READ OF THE SHAPE (T2): the parse's row decides the family, never a prefix compared again here. The OS answers
+// with backslashes, so a device answer's four-character prefix and a share's two are its separators exactly.
 [[nodiscard]] std::wstring verbatimOf(std::wstring const& full) {
-    if (full.size() >= 4 && full[0] == L'\\' && full[1] == L'\\' && full[2] == L'?' && full[3] == L'\\') return full;
-    if (full.size() >= 4 && full[0] == L'\\' && full[1] == L'\\' && full[2] == L'.' && full[3] == L'\\')
-        return L"\\\\?\\" + full.substr(4);
-    if (full.size() >= 3 && full[0] == L'\\' && full[1] == L'\\') return L"\\\\?\\UNC\\" + full.substr(2);
-    if (full.size() >= 3 && full[1] == L':' && full[2] == L'\\') return L"\\\\?\\" + full;
-    return {};
+    RootSpelling const root = parseRoot(std::wstring_view{full}, PathGrammar::Win32);
+    switch (root.shape) {
+        case RootShape::VerbatimDriveBare:
+        case RootShape::VerbatimDrive:
+        case RootShape::VerbatimVolumeBare:
+        case RootShape::VerbatimVolume:
+        case RootShape::VerbatimUncBare:
+        case RootShape::VerbatimUnc:
+        case RootShape::VerbatimGlobalRootBare:
+        case RootShape::VerbatimGlobalRoot:
+        case RootShape::VerbatimNamedBare:
+        case RootShape::VerbatimNamed: return full;
+        case RootShape::DeviceDriveBare:
+        case RootShape::DeviceDrive:
+        case RootShape::DeviceVolumeBare:
+        case RootShape::DeviceVolume:
+        case RootShape::DeviceUncBare:
+        case RootShape::DeviceUnc:
+        case RootShape::DeviceGlobalRootBare:
+        case RootShape::DeviceGlobalRoot:
+        case RootShape::DeviceNamedBare:
+        case RootShape::DeviceNamed: return full.size() >= 4 ? L"\\\\?\\" + full.substr(4) : std::wstring{};
+        case RootShape::ShareServer:
+        case RootShape::ShareBare:
+        case RootShape::ShareRoot:
+        case RootShape::ShareName: return full.size() >= 3 ? L"\\\\?\\UNC\\" + full.substr(2) : std::wstring{};
+        case RootShape::DriveRoot:
+        case RootShape::Drive: return L"\\\\?\\" + full;
+        // No full spelling the OS answers: relative, drive-relative, rooted, an NT `\??\` spelling (GetFullPathNameW
+        // reads it as rooted), a POSIX row.
+        case RootShape::Relative:
+        case RootShape::DriveRelativeBare:
+        case RootShape::DriveRelativeName:
+        case RootShape::RootedBare:
+        case RootShape::Rooted:
+        case RootShape::NtDriveBare:
+        case RootShape::NtDrive:
+        case RootShape::NtVolumeBare:
+        case RootShape::NtVolume:
+        case RootShape::NtUncBare:
+        case RootShape::NtUnc:
+        case RootShape::NtGlobalRootBare:
+        case RootShape::NtGlobalRoot:
+        case RootShape::NtNamedBare:
+        case RootShape::NtNamed:
+        case RootShape::PosixRelative:
+        case RootShape::PosixRoot:
+        case RootShape::PosixRooted:
+        case RootShape::PosixAuthorityRoot:
+        case RootShape::PosixAuthority: return {};
+    }
+    return {};   // unreachable: the switch names every row
+}
+
+// Whether a shape is the NT namespace's own `\??\` spelling.
+[[nodiscard]] constexpr bool isNtShape(RootShape shape) noexcept {
+    switch (shape) {
+        case RootShape::NtDriveBare:
+        case RootShape::NtDrive:
+        case RootShape::NtVolumeBare:
+        case RootShape::NtVolume:
+        case RootShape::NtUncBare:
+        case RootShape::NtUnc:
+        case RootShape::NtGlobalRootBare:
+        case RootShape::NtGlobalRoot:
+        case RootShape::NtNamedBare:
+        case RootShape::NtNamed: return true;
+        case RootShape::Relative:
+        case RootShape::DriveRelativeBare:
+        case RootShape::DriveRelativeName:
+        case RootShape::RootedBare:
+        case RootShape::Rooted:
+        case RootShape::DriveRoot:
+        case RootShape::Drive:
+        case RootShape::ShareServer:
+        case RootShape::ShareBare:
+        case RootShape::ShareRoot:
+        case RootShape::ShareName:
+        case RootShape::DeviceDriveBare:
+        case RootShape::DeviceDrive:
+        case RootShape::DeviceVolumeBare:
+        case RootShape::DeviceVolume:
+        case RootShape::DeviceUncBare:
+        case RootShape::DeviceUnc:
+        case RootShape::DeviceGlobalRootBare:
+        case RootShape::DeviceGlobalRoot:
+        case RootShape::DeviceNamedBare:
+        case RootShape::DeviceNamed:
+        case RootShape::VerbatimDriveBare:
+        case RootShape::VerbatimDrive:
+        case RootShape::VerbatimVolumeBare:
+        case RootShape::VerbatimVolume:
+        case RootShape::VerbatimUncBare:
+        case RootShape::VerbatimUnc:
+        case RootShape::VerbatimGlobalRootBare:
+        case RootShape::VerbatimGlobalRoot:
+        case RootShape::VerbatimNamedBare:
+        case RootShape::VerbatimNamed:
+        case RootShape::PosixRelative:
+        case RootShape::PosixRoot:
+        case RootShape::PosixRooted:
+        case RootShape::PosixAuthorityRoot:
+        case RootShape::PosixAuthority: return false;
+    }
+    return false;   // unreachable: the switch names every row
 }
 
 // `\??\` as its `\\?\` twin, anything else as it is (N4: one NT namespace; `\\?\` is what CreateDirectoryW takes past
-// MAX_PATH, and the one CreateProcessW takes at all -- it refuses `\??\`, 267).
+// MAX_PATH, and the one CreateProcessW takes at all -- it refuses `\??\`, 267). A read of the shape (T2).
 [[nodiscard]] std::wstring twinOf(std::wstring const& text) {
-    if (text.size() >= 4 && text[0] == L'\\' && text[1] == L'?' && text[2] == L'?' && text[3] == L'\\')
-        return L"\\\\?\\" + text.substr(4);
+    if (isNtShape(parseRoot(std::wstring_view{text}, PathGrammar::Win32).shape)) return L"\\\\?\\" + text.substr(4);
     return text;
+}
+
+// THE CONTAINER OF A BARE VOLUME IS ITS ROOT (P69 H6c2, H5): a verbatim spelling of a volume with no separator after
+// it -- `\\?\C:`, `\\?\Volume{G}`, `\\?\UNC\s\sh`, `\\?\GLOBALROOT\Device\V` and their `\??\` twins -- names the
+// volume's DEVICE as a leaf (✔MEASURED, H6c u2 part 5: attributes ERROR 87, open ERROR 5), and as a container its ROOT
+// DIRECTORY, the directory `below()` composes its children in and the one `\\.\C:` resolves to through GetFullPathNameW
+// (`\\?\C:\`). A bare NAMED device (`\\?\PIPE`) is no volume: it stays as written.
+[[nodiscard]] constexpr bool aContainerTakesTheRootSeparator(RootShape shape) noexcept {
+    switch (shape) {
+        case RootShape::VerbatimDriveBare:
+        case RootShape::VerbatimVolumeBare:
+        case RootShape::VerbatimUncBare:
+        case RootShape::VerbatimGlobalRootBare:
+        case RootShape::NtDriveBare:
+        case RootShape::NtVolumeBare:
+        case RootShape::NtUncBare:
+        case RootShape::NtGlobalRootBare: return true;
+        case RootShape::VerbatimDrive:
+        case RootShape::VerbatimVolume:
+        case RootShape::VerbatimUnc:
+        case RootShape::VerbatimGlobalRoot:
+        case RootShape::VerbatimNamedBare:
+        case RootShape::VerbatimNamed:
+        case RootShape::NtDrive:
+        case RootShape::NtVolume:
+        case RootShape::NtUnc:
+        case RootShape::NtGlobalRoot:
+        case RootShape::NtNamedBare:
+        case RootShape::NtNamed:
+        // The DOS and device shapes: GetFullPathNameW resolves their container form (`referenceSpelling`).
+        case RootShape::Relative:
+        case RootShape::DriveRelativeBare:
+        case RootShape::DriveRelativeName:
+        case RootShape::RootedBare:
+        case RootShape::Rooted:
+        case RootShape::DriveRoot:
+        case RootShape::Drive:
+        case RootShape::ShareServer:
+        case RootShape::ShareBare:
+        case RootShape::ShareRoot:
+        case RootShape::ShareName:
+        case RootShape::DeviceDriveBare:
+        case RootShape::DeviceDrive:
+        case RootShape::DeviceVolumeBare:
+        case RootShape::DeviceVolume:
+        case RootShape::DeviceUncBare:
+        case RootShape::DeviceUnc:
+        case RootShape::DeviceGlobalRootBare:
+        case RootShape::DeviceGlobalRoot:
+        case RootShape::DeviceNamedBare:
+        case RootShape::DeviceNamed:
+        case RootShape::PosixRelative:
+        case RootShape::PosixRoot:
+        case RootShape::PosixRooted:
+        case RootShape::PosixAuthorityRoot:
+        case RootShape::PosixAuthority: return false;
+    }
+    return false;   // unreachable: the switch names every row
 }
 
 // A reference without the separators after its last name -- but its volume root's own, which IS the root: without it
@@ -413,9 +608,10 @@ template <class C>
     bool const         container = use == Use::Container;
     if (root.kind == RootSpelling::Kind::Verbatim) {
         std::wstring twin = twinOf(plain);
+        if (container && aContainerTakesTheRootSeparator(root.shape)) return twin + L'\\';   // H5: the volume's root
         return container ? withoutTrailingSeparators(std::move(twin)) : twin;
     }
-    bool const bareDrive = root.kind == RootSpelling::Kind::DriveRelative && root.prefix == plain.size();
+    bool const bareDrive = root.shape == RootShape::DriveRelativeBare;
     bool const appended  = container && !bareDrive && !separatesIn(plain.back(), PathGrammar::Win32, false);
     std::wstring out     = verbatimOf(osFullPath(appended ? plain + L'\\' : plain));
     if (out.empty()) return plain;
@@ -545,7 +741,7 @@ template <class C>
 [[nodiscard]] std::wstring composedText(std::wstring const& text, std::wstring const& right) {
     if (text.empty()) return right;
     RootSpelling const root      = parseRoot(std::wstring_view{text}, PathGrammar::Win32);
-    bool const         bareDrive = root.kind == RootSpelling::Kind::DriveRelative && root.prefix == text.size();
+    bool const         bareDrive = root.shape == RootShape::DriveRelativeBare;
     if (bareDrive || separatesIn(text.back(), PathGrammar::Win32, root.kind == RootSpelling::Kind::Verbatim))
         return text + right;
     return text + L'\\' + right;
@@ -700,16 +896,28 @@ struct TypedNames {
 // as `/` -- but in a VERBATIM spelling (H6c, A10): under `\\?\` a `/` is a character, not a separator, so a `/` written
 // there would name another file, and a verbatim text keeps its `\`. (The model's separator, never a literal backslash:
 // a POSIX name may contain one.)
+// `verbatim` is the parse's answer for the spelling `out` renders (its kind, under the host's grammar).
 template <class S>
-void toGeneric(S& out, fs::path const& p) {
+void toGeneric(S& out, bool verbatim) {
     if constexpr (fs::path::preferred_separator != fs::path::value_type{'/'}) {
-        if (rootSpelling(p).kind == RootSpelling::Kind::Verbatim) return;
+        if (verbatim) return;
         using Unit = typename S::value_type;
         std::replace(out.begin(), out.end(), static_cast<Unit>(fs::path::preferred_separator), Unit{'/'});
     } else {
         static_cast<void>(out);
-        static_cast<void>(p);
+        static_cast<void>(verbatim);
     }
+}
+
+// THE ONE LOSSLESS RENDERING of a native spelling as UTF-8 (P69 H6c2, T4): on Windows the UTF-16 text as UTF-8, an
+// unpaired surrogate as its own three bytes (WTF-8, `wtf8Of`); on POSIX the name's own bytes. It never converts through
+// the code page and never throws (allocation excepted).
+[[nodiscard]] std::string losslessUtf8Of(fs::path const& p) {
+#ifdef _WIN32
+    return wtf8Of(p.native());
+#else
+    return p.native();
+#endif
 }
 
 // The spelling every host call on `p` takes for `use` (HostPathAccess::reference: the reference on Windows, the text
@@ -717,12 +925,54 @@ void toGeneric(S& out, fs::path const& p) {
 // (H6c, B2: ✔MEASURED, u3 part 6, GetFullPathNameW refuses "" with ERROR_INVALID_NAME and so does a spawn in "";
 // both libraries' `status("")` answer not-found -- never "the current directory").
 [[nodiscard]] fs::path::string_type callSpelling(HostPath const& p, Use use, std::error_code& ec) {
+    if (HostPathAccess::illFormed(p)) {   // T4: it names nothing -- refused by name
+        ec = pathRefusalCode(PathRefusal::IllFormedSpelling);
+        return {};
+    }
     fs::path::string_type reference = HostPathAccess::reference(p, use);
     if (reference.empty()) ec = std::make_error_code(std::errc::invalid_argument);
     return reference;
 }
 
+// The refusals' own category (T4): each refusal's message is its name.
+class PathRefusalCategory final : public std::error_category {
+public:
+    [[nodiscard]] char const* name() const noexcept override { return "dss.path-refusal"; }
+    [[nodiscard]] std::string message(int value) const override {
+        return pathRefusalName(static_cast<PathRefusal>(value));
+    }
+};
+
 }  // namespace
+
+std::error_code pathRefusalCode(PathRefusal refusal) {
+    static PathRefusalCategory const category;
+    return std::error_code{static_cast<int>(refusal), category};
+}
+
+GivenText givenText(std::string_view narrow) {
+#ifdef _WIN32
+    std::wstring wide;
+    std::string  error;
+    if (substrate::decodeUtf8ToWide(std::string{narrow}, wide, error)) return GivenText{fs::path{std::move(wide)}, false};
+    // The bytes escaped, for people: ASCII as itself, every other byte `\xNN` -- the value names nothing.
+    std::wstring shown;
+    for (char const c : narrow) {
+        auto const byte = static_cast<unsigned char>(c);
+        if (byte < 0x80) {
+            shown += static_cast<wchar_t>(byte);
+        } else {
+            wchar_t const digits[] = L"0123456789ABCDEF";
+            shown += L"\\x";
+            shown += digits[byte >> 4];
+            shown += digits[byte & 0xF];
+        }
+    }
+    return GivenText{fs::path{std::move(shown)}, true};
+#else
+    return GivenText{fs::path{std::string{narrow}}, false};   // a POSIX name is bytes
+#endif
+}
 
 RootSpelling rootSpelling(std::wstring_view native, PathGrammar grammar) { return parseRoot(native, grammar); }
 RootSpelling rootSpelling(std::string_view native, PathGrammar grammar) { return parseRoot(native, grammar); }
@@ -780,17 +1030,11 @@ bool dosSpellingNamesTheSameFile(std::wstring_view tail) {
 
 // ════ A PATH ON THIS HOST, AS A VALUE (host_path.hpp, host_path_access.hpp; P69 H6c) ════
 
-std::string PathText::display() const {
-#ifdef _WIN32
-    return wtf8Of(text_.native());
-#else
-    return text_.native();
-#endif
-}
+std::string PathText::display() const { return losslessUtf8Of(text_); }
 
 std::string PathText::generic() const {
     std::string out = display();
-    toGeneric(out, text_);
+    toGeneric(out, rootSpelling(text_).kind == RootSpelling::Kind::Verbatim);
     return out;
 }
 
@@ -798,6 +1042,11 @@ std::ostream& operator<<(std::ostream& out, PathText const& text) { return out <
 
 HostPath HostPath::operator/(fs::path const& right) const {
     if (right.empty()) return *this;
+    if (illFormed_) {   // T4: a child of a value that names nothing names nothing; its text the two joined, for people
+        HostPath out = *this;
+        out.text_    = text_ / right;
+        return out;
+    }
 #ifdef _WIN32
     std::wstring const& r    = right.native();
     RootSpelling const  root = parseRoot(std::wstring_view{r}, PathGrammar::Win32);
@@ -819,8 +1068,11 @@ HostPath HostPath::operator/(fs::path const& right) const {
         }
         case RootSpelling::Kind::DriveRelative: {
             // `D:x`: the left extended by `x` when D is the left's drive, the GIVEN `D:x` otherwise.
+            // A read of the shape (T2): the left's reference is a verbatim DRIVE, and its letter is the right's.
             std::wstring const base      = HostPathAccess::reference(*this, Use::Container);
-            bool const         sameDrive = base.size() >= 6 && base.compare(0, 4, L"\\\\?\\") == 0 && base[5] == L':'
+            RootShape const    baseShape = parseRoot(std::wstring_view{base}, PathGrammar::Win32).shape;
+            bool const         sameDrive = (baseShape == RootShape::VerbatimDriveBare
+                                            || baseShape == RootShape::VerbatimDrive)
                                    && asciiLower(base[4]) == asciiLower(r[0]);
             if (!sameDrive) return HostPath{right};
             return composedTyped(*this, r.substr(root.prefix));
@@ -839,7 +1091,7 @@ HostPath HostPath::operator/(fs::path const& right) const {
 }
 
 HostPath HostPath::operator/(ListedRelative const& listed) const {
-    if (listed.names_.empty()) return *this;
+    if (listed.names_.empty() || illFormed_) return *this;   // T4: below a value that names nothing, nothing
 #ifdef _WIN32
     std::wstring reference = HostPathAccess::reference(*this, Use::Container);
     std::wstring text      = twinOf(text_.native());
@@ -858,15 +1110,15 @@ HostPath HostPath::operator/(ListedRelative const& listed) const {
 #endif
 }
 
-HostPath HostPath::withSuffix(fs::path::string_type const& suffix) const {
+std::expected<HostPath, PathRefusal> HostPath::withSuffix(fs::path::string_type const& suffix) const {
+    if (illFormed_) return std::unexpected(PathRefusal::IllFormedSpelling);
 #ifdef _WIN32
     // The LEAF reference's last name, extended literally: a GIVEN value's taken now by the rule, a made value's fixed.
     std::wstring const      leaf = HostPathAccess::reference(*this, Use::Leaf);
     std::wstring_view const s    = leaf;
     RootSpelling const      root = parseRoot(s, PathGrammar::Win32);
     std::size_t const       end  = stepEnd(s, root, PathGrammar::Win32);
-    if (leaf.empty() || end <= root.volume)
-        throw std::invalid_argument{"HostPath::withSuffix: `" + spelling().display() + "` names no last name"};
+    if (leaf.empty() || end <= root.volume) return std::unexpected(PathRefusal::NoLastName);
     if (root.kind != RootSpelling::Kind::Verbatim) return HostPath{fs::path{text_.native() + suffix}};   // refused
     std::wstring const sibling = leaf.substr(0, end) + suffix;
     // Its text: this text grown by the suffix exactly where this text's last name IS the reference's and the grown name
@@ -889,8 +1141,10 @@ HostPath HostPath::withSuffix(fs::path::string_type const& suffix) const {
     if (text.empty()) text = dosSpellingOf(sibling);
     return HostPathAccess::made(fs::path{text}, sibling, sibling, Origin::Composed);
 #else
-    if (!text_.has_filename())
-        throw std::invalid_argument{"HostPath::withSuffix: `" + spelling().display() + "` names no last name"};
+    // A last `.` or `..` is no NAME of the object it reaches (POSIX resolves it at the object), so it has no sibling
+    // by suffix: `a/b/..` + `.tmp` would name `a/b/...tmp`, inside the directory the value is not.
+    if (!text_.has_filename() || text_.filename() == "." || text_.filename() == "..")
+        return std::unexpected(PathRefusal::NoLastName);
     HostPath out{fs::path{text_.native() + suffix}};
     out.origin_ = origin_ == Origin::Given ? Origin::Given : Origin::Composed;
     return out;
@@ -898,6 +1152,7 @@ HostPath HostPath::withSuffix(fs::path::string_type const& suffix) const {
 }
 
 HostPathAccess::String HostPathAccess::reference(HostPath const& value, Use use) {
+    if (value.illFormed_) return {};   // T4: it names nothing, for either use
 #ifdef _WIN32
     if (value.origin_ != HostPath::Origin::Given) return use == Use::Leaf ? value.leafRef_ : value.containerRef_;
     std::wstring const& text = value.text_.native();
@@ -1017,6 +1272,7 @@ HostPathAccess::String HostPathAccess::spawnImage(HostPath const& image) {
 // Windows 11 resolves a last `NUL` alone, older ones `CON`, `COM1`, ... too), and the OS, not a model of it, says what a
 // plain spelling means. Elsewhere it is the text's own normalization, answered as a value.
 HostPath normalizeKeepingRoot(HostPath const& p, Use use) {
+    if (HostPathAccess::illFormed(p)) return p;   // T4: it names nothing; it stays what it is
 #ifdef _WIN32
     return HostPathAccess::answered(HostPathAccess::reference(p, use));
 #else
@@ -1026,29 +1282,27 @@ HostPath normalizeKeepingRoot(HostPath const& p, Use use) {
 }
 
 std::string genericSpelling(fs::path const& p) {
-    std::string out = p.string();
-    toGeneric(out, p);
+    // TOTAL (P69 H6c2, T4): the lossless UTF-8 rendering, never `p.string()` (MS STL narrows through the code page and
+    // throws on a name it cannot encode: D-PP-HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW).
+    std::string out = losslessUtf8Of(p);
+    toGeneric(out, rootSpelling(p).kind == RootSpelling::Kind::Verbatim);
     return out;
 }
 
 std::string genericSpelling(std::string_view spelling) {
-    // Through the `fs::path` form, never a second `std::replace` here: two
-    // spellings of one rule are two owners of it, and the one that gets
-    // forgotten is the one that stops matching. `fs::path`'s narrow constructor
-    // does not touch the bytes, so a stored native spelling round-trips into
-    // the same substitution the path form performs.
-    return genericSpelling(fs::path{spelling});
+    // The SAME rule (`toGeneric`) on the text as it is given -- a stored rendering, UTF-8 -- with the same parse
+    // deciding a verbatim root (`parseRoot` is one template over both code units). Never through the library's narrow
+    // construction, which reads the bytes in the code page on MS STL (T4).
+    std::string out{spelling};
+    toGeneric(out, rootSpelling(std::string_view{out}, kHostPathGrammar).kind == RootSpelling::Kind::Verbatim);
+    return out;
 }
 
 std::u8string genericSpellingU8(fs::path const& p) {
-    // `u8string()` and NOT `generic_u8string()` -- the NATIVE spelling carries
-    // the leading run, and the substitution below is the same normalisation
-    // without the generic-format conversion that eats it. See the header.
-    // Every path separator is ASCII, so it is ONE UTF-8 code unit and a per-unit substitution cannot land inside a
-    // multi-byte sequence.
-    std::u8string out = p.u8string();
-    toGeneric(out, p);
-    return out;
+    // The same lossless bytes as `genericSpelling`, as `char8_t` (T4: total; the separators are ASCII, one code unit
+    // each, so the substitution cannot land inside a multi-byte sequence).
+    std::string const narrow = genericSpelling(p);
+    return std::u8string(narrow.begin(), narrow.end());
 }
 
 HostPath absoluteKeepingRoot(HostPath const& p, Use use, std::error_code& ec) {
@@ -1077,6 +1331,11 @@ std::string canonicalIdentityKey(HostPath const& p, Use use) {
 
 std::string canonicalIdentityKey(HostPath const& p, Use use, std::error_code& ec) {
     ec.clear();
+    // T4: a value that names nothing has no identity: refused by name, its key its escaped text (for people).
+    if (HostPathAccess::illFormed(p)) {
+        ec = pathRefusalCode(PathRefusal::IllFormedSpelling);
+        return p.spelling().generic();
+    }
     // The empty spelling as a leaf names no file, so it has no identity (B2): refused, the key empty.
     if (use == Use::Leaf && p.empty()) {
         ec = std::make_error_code(std::errc::invalid_argument);
@@ -1634,40 +1893,51 @@ constexpr int kOpenDirectoryOnly = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEX
 
 // ════ THE OPERATIONS A SITE WOULD ASK OF std::filesystem, AT ANY LENGTH (the header states why Win32 on Windows) ════
 
-std::FILE* openFileStream(HostPath const& p, char const* mode) {
+std::expected<std::FILE*, std::error_code> openFileStream(HostPath const& p, char const* mode) {
     std::error_code refused;
     auto const      reference = callSpelling(p, Use::Leaf, refused);
-    if (refused) {
-        errno = EINVAL;   // the empty spelling as a leaf (B2)
-        return nullptr;
-    }
+    if (refused) return std::unexpected(refused);   // a value that names nothing, the empty spelling as a leaf (B2)
 #ifdef _WIN32
     std::wstring wideMode;
     for (char const* m = mode; *m != '\0'; ++m) wideMode += static_cast<wchar_t>(static_cast<unsigned char>(*m));
-    return ::_wfopen(reference.c_str(), wideMode.c_str());
+    clearRuntimeReason();
+    std::FILE* const file = ::_wfopen(reference.c_str(), wideMode.c_str());
 #else
-    return std::fopen(reference.c_str(), mode);
+    clearRuntimeReason();
+    std::FILE* const file = std::fopen(reference.c_str(), mode);
 #endif
+    if (file == nullptr) return std::unexpected(runtimeReason());   // read AT the failing call
+    return file;
 }
 
-std::ifstream openInputStream(HostPath const& p, std::ios::openmode mode) {
-    std::ifstream   in;
+std::expected<std::ifstream, std::error_code> openInputStream(HostPath const& p, std::ios::openmode mode) {
     std::error_code refused;
     auto const      reference = callSpelling(p, Use::Leaf, refused);
-    if (!refused) in.open(fs::path{reference}, mode);
-    return in;
+    if (refused) return std::unexpected(refused);   // a value that names nothing, the empty spelling as a leaf (B2)
+    std::expected<std::ifstream, std::error_code> opened{std::in_place};
+    clearRuntimeReason();
+    opened->open(fs::path{reference}, mode);
+    if (!opened->is_open()) return std::unexpected(runtimeReason());   // read AT the failing open
+    return opened;
 }
 
-std::ofstream openOutputStream(HostPath const& p, std::ios::openmode mode) {
-    std::ofstream   out;
+std::expected<std::ofstream, std::error_code> openOutputStream(HostPath const& p, std::ios::openmode mode) {
     std::error_code refused;
     auto const      reference = callSpelling(p, Use::Leaf, refused);
-    if (!refused) out.open(fs::path{reference}, mode);
-    return out;
+    if (refused) return std::unexpected(refused);   // a value that names nothing, the empty spelling as a leaf (B2)
+    std::expected<std::ofstream, std::error_code> opened{std::in_place};
+    clearRuntimeReason();
+    opened->open(fs::path{reference}, mode);
+    if (!opened->is_open()) return std::unexpected(runtimeReason());   // read AT the failing open
+    return opened;
 }
 
 bool createDirectories(HostPath const& p, std::error_code& ec) {
     ec.clear();
+    if (HostPathAccess::illFormed(p)) {   // T4: it names nothing to make -- refused by name, never "nothing to do"
+        ec = pathRefusalCode(PathRefusal::IllFormedSpelling);
+        return false;
+    }
 #ifdef _WIN32
     // ★ `p` IS A CONTAINER (P69 H6b, ledger 541): the directory every `p \ name` lies in, so it is walked in its
     // CONTAINER reference -- `p` with a separator after it, resolved ONCE -- whose levels are literal cuts. Resolved as a
@@ -1722,6 +1992,11 @@ bool createDirectories(HostPath const& p, std::error_code& ec) {
 }
 
 HostPath containingDirectory(HostPath const& file) {
+    if (HostPathAccess::illFormed(file)) {   // T4: the level above a value that names nothing names nothing
+        HostPath above{parentWithinRoot(HostPathAccess::text(file))};
+        HostPathAccess::inheritIllFormed(above, file);
+        return above;
+    }
 #ifdef _WIN32
     // The level above the file's last name in the FILE's own LEAF reference, cut literally (a GIVEN value's taken now
     // by the rule, a made value's fixed one): the directory the file's write will name, whatever its last name is.
@@ -1788,27 +2063,101 @@ void copyFile(HostPath const& from, HostPath const& to, std::error_code& ec) {
 #endif
 }
 
-#ifdef _WIN32
+// ════ THE OS'S REASON (path_identity.hpp; P69 H6c2) ════
 
-void* openHandle(HostPath const& p, unsigned long access, unsigned long share, unsigned long disposition,
-                 unsigned long flagsAndAttributes) {
-    std::error_code    refused;
-    std::wstring const reference = callSpelling(p, Use::Leaf, refused);
-    if (refused) {
-        ::SetLastError(ERROR_INVALID_PARAMETER);   // the empty spelling as a leaf (B2)
-        return INVALID_HANDLE_VALUE;
+namespace {
+
+#ifdef _WIN32
+// An errno's text: the runtime's own (`strerror_s`, which writes the caller's buffer: no shared state).
+[[nodiscard]] std::string errnoMessage(int code) {
+    char buffer[256] = {};
+    if (::strerror_s(buffer, sizeof buffer, code) != 0 || buffer[0] == '\0') return "<no message text for this errno>";
+    return buffer;
+}
+#else
+// ★ WHICH `strerror_r` THIS PLATFORM DECLARED, DECIDED BY OVERLOAD RESOLUTION RATHER THAN BY GUESSING AT FEATURE
+// MACROS (moved here from process_spawn.cpp with its measurement, H6c2: the ONE rendering of a reason). GNU's returns
+// `char*` (and may hand back an immutable static instead of touching the buffer), XSI's returns `int` and fills the
+// buffer. MEASURED (process_spawn's): glibc 2.39 / g++ 13.3 selects the GNU arm, Apple clang 21 / Darwin 25.5 the XSI
+// arm, and both produce text byte-identical to `std::strerror` over 145 codes. ⚠ NOT `std::strerror`: MEASURED on
+// Darwin 25.5, 12 threads x 20,000 calls on codes the libc does NOT know gave 33,692 wrong strings of 240,000 -- its
+// "Unknown error: N" is formatted into ONE shared static buffer -- and the errnos a kernel returns are not a closed
+// set. A host that declares neither fails to compile here, loudly. Exactly one overload is ever selected.
+[[maybe_unused]] char const* selectStrerrorResult(char* gnuResult, char* buffer) {
+    return gnuResult != nullptr ? gnuResult : buffer;
+}
+[[maybe_unused]] char const* selectStrerrorResult(int xsiResult, char* buffer) {
+    static_cast<void>(xsiResult);   // EINVAL / ERANGE still leave usable text; an untouched buffer reads empty
+    return buffer;
+}
+[[nodiscard]] std::string errnoMessage(int code) {
+    char buffer[256];
+    buffer[0]               = '\0';
+    char const* const msg = selectStrerrorResult(::strerror_r(code, buffer, sizeof buffer), buffer);
+    return msg != nullptr && msg[0] != '\0' ? std::string{msg} : std::string{"<no message text for this errno>"};
+}
+#endif
+
+}  // namespace
+
+std::string reasonText(std::error_code const& reason) {
+#ifdef _WIN32
+    if (reason.category() == std::system_category()) {
+        // The system's own message, asked WIDE and spelt as UTF-8: a localized text (this workstation's is Portuguese)
+        // is never handed out in the ANSI code page.
+        wchar_t*    buffer = nullptr;
+        DWORD const length = ::FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+            static_cast<DWORD>(reason.value()), 0, reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+        std::wstring text = length != 0 && buffer != nullptr ? std::wstring{buffer, length} : std::wstring{};
+        if (buffer != nullptr) ::LocalFree(buffer);
+        while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ')) text.pop_back();
+        return "GetLastError=" + std::to_string(reason.value()) + ": "
+             + (text.empty() ? std::string{"<no message text for this code>"} : wtf8Of(text));
     }
-    return ::CreateFileW(reference.c_str(), access, share, nullptr, disposition, flagsAndAttributes, nullptr);
+    if (reason.category() == std::generic_category())
+        return "errno=" + std::to_string(reason.value()) + ": " + errnoMessage(reason.value());
+#else
+    if (reason.category() == std::generic_category() || reason.category() == std::system_category())
+        return "errno=" + std::to_string(reason.value()) + ": " + errnoMessage(reason.value());
+#endif
+    return std::string{reason.category().name()} + "=" + std::to_string(reason.value()) + ": " + reason.message();
 }
 
-unsigned long fileAttributes(HostPath const& p) {
+void clearRuntimeReason() {
+    errno = 0;
+#ifdef _WIN32
+    _doserrno = 0;
+#endif
+}
+
+std::error_code runtimeReason() {
+#ifdef _WIN32
+    if (unsigned long const os = _doserrno; os != 0) return std::error_code{static_cast<int>(os), std::system_category()};
+#endif
+    if (int const e = errno; e != 0) return std::error_code{e, std::generic_category()};
+    return pathRefusalCode(PathRefusal::HostAnsweredNoReason);
+}
+
+#ifdef _WIN32
+
+std::expected<void*, std::error_code> openHandle(HostPath const& p, unsigned long access, unsigned long share,
+                                                 unsigned long disposition, unsigned long flagsAndAttributes) {
     std::error_code    refused;
     std::wstring const reference = callSpelling(p, Use::Leaf, refused);
-    if (refused) {
-        ::SetLastError(ERROR_INVALID_PARAMETER);   // the empty spelling as a leaf (B2)
-        return INVALID_FILE_ATTRIBUTES;
-    }
-    return ::GetFileAttributesW(reference.c_str());
+    if (refused) return std::unexpected(refused);   // a value that names nothing, the empty spelling as a leaf (B2)
+    HANDLE const h = ::CreateFileW(reference.c_str(), access, share, nullptr, disposition, flagsAndAttributes, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return std::unexpected(winError(::GetLastError()));   // read AT the failing call
+    return h;
+}
+
+std::expected<unsigned long, std::error_code> fileAttributes(HostPath const& p) {
+    std::error_code    refused;
+    std::wstring const reference = callSpelling(p, Use::Leaf, refused);
+    if (refused) return std::unexpected(refused);
+    DWORD const attributes = ::GetFileAttributesW(reference.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return std::unexpected(winError(::GetLastError()));
+    return attributes;
 }
 
 // THE COMMIT BY HANDLE (moved here from the writer, H6c A4). ✔MEASURED (the writer's): the name a rename by handle is
@@ -1839,14 +2188,13 @@ unsigned long commitByHandle(void* staged, HostPath const& target, bool posixSem
 
 #else
 
-int openDescriptor(HostPath const& p, int flags, unsigned mode) {
+std::expected<int, std::error_code> openDescriptor(HostPath const& p, int flags, unsigned mode) {
     std::error_code refused;
     auto const      reference = callSpelling(p, Use::Leaf, refused);
-    if (refused) {
-        errno = EINVAL;   // the empty spelling as a leaf (B2)
-        return -1;
-    }
-    return ::open(reference.c_str(), flags, static_cast<mode_t>(mode));
+    if (refused) return std::unexpected(refused);   // a value that names nothing, the empty spelling as a leaf (B2)
+    int const fd = ::open(reference.c_str(), flags, static_cast<mode_t>(mode));
+    if (fd < 0) return std::unexpected(std::error_code{errno, std::generic_category()});   // read AT the failing call
+    return fd;
 }
 
 void renameEntry(HostPath const& from, HostPath const& to, std::error_code& ec) {
@@ -1940,14 +2288,14 @@ HostPath temporaryDirectory(std::error_code& ec) {
 #endif
 }
 
-HostPath runningExecutable(std::error_code& ec) {
-    ec.clear();
 #if defined(_WIN32)
-    // ★ QueryFullProcessImageNameW, NEVER GetModuleFileNameW (the header measures why), PREFIXED and never resolved:
-    // resolved by the rule, a literal `e.` image's name would be its TWIN's again.
+namespace {
+// THE IMAGE A PROCESS RUNS, as the OS answers it for the process `process` names: QueryFullProcessImageNameW,
+// PREFIXED and never resolved -- resolved by the rule, a literal `e.` image's name would be its TWIN's again.
+[[nodiscard]] HostPath imageOfProcess(HANDLE process, std::error_code& ec) {
     std::wstring answer(32768, L'\0');   // the longest Win32 path, its terminator included
     DWORD        size = static_cast<DWORD>(answer.size());
-    if (!::QueryFullProcessImageNameW(::GetCurrentProcess(), 0, answer.data(), &size)) {
+    if (!::QueryFullProcessImageNameW(process, 0, answer.data(), &size)) {
         ec = winError(::GetLastError());
         return {};
     }
@@ -1958,6 +2306,33 @@ HostPath runningExecutable(std::error_code& ec) {
         return {};
     }
     return HostPathAccess::answered(reference);
+}
+}  // namespace
+#endif
+
+HostPath processImage(unsigned long processId, std::error_code& ec) {
+    ec.clear();
+#if defined(_WIN32)
+    HANDLE const process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(processId));
+    if (process == nullptr) {
+        ec = winError(::GetLastError());
+        return {};
+    }
+    HostPath image = imageOfProcess(process, ec);
+    ::CloseHandle(process);
+    return image;
+#else
+    static_cast<void>(processId);
+    ec = std::make_error_code(std::errc::function_not_supported);
+    return {};
+#endif
+}
+
+HostPath runningExecutable(std::error_code& ec) {
+    ec.clear();
+#if defined(_WIN32)
+    // ★ QueryFullProcessImageNameW, NEVER GetModuleFileNameW (the header measures why).
+    return imageOfProcess(::GetCurrentProcess(), ec);
 #elif defined(__APPLE__)
     // `_NSGetExecutablePath` REPORTS the required size through the same out-parameter when it fails, so one retry
     // always suffices.
@@ -2391,6 +2766,13 @@ std::optional<bool> directoryFoldsCase(HostPath const& dir, std::error_code& ec)
 TreeWalk walkTree(HostPath const& root, std::function<WalkStep(TreeEntry const&)> const& visit,
                   TreeWalkOptions options) {
     TreeWalk walk;
+    if (HostPathAccess::illFormed(root)) {   // T4: a root that names nothing is refused by name, never listed
+        walk.error           = pathRefusalCode(PathRefusal::IllFormedSpelling);
+        walk.where           = root;
+        walk.storeRouteWhere = HostPathAccess::text(root);
+        walk.root            = WalkRoot::Unreadable;
+        return walk;
+    }
     // ★ THE ROOT IS A CONTAINER (P69 H6b, ledger 541), its reference taken ONCE: the kind asked and the listing made
     // through the same one -- never `root` re-resolved as a leaf, whose last name the OS may trim or map.
     auto const     rootReference = HostPathAccess::reference(root, Use::Container);

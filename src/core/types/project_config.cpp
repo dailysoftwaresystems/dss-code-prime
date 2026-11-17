@@ -1005,12 +1005,13 @@ parseProjectConfig(std::string_view jsonText,
 std::optional<ProjectConfig>
 loadProjectConfig(std::filesystem::path const& path,
                   DiagnosticReporter& rep) {
-    std::ifstream in = core::openInputStream(path, std::ios::binary);
-    if (!in) {
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) {
         emitProjectError(rep, DiagnosticCode::D_FileNotFound, path.string(),
-                         "project config file could not be opened");
+                         "project config file could not be opened: " + core::reasonText(opened.error()));
         return std::nullopt;
     }
+    std::ifstream& in = *opened;
     std::string text{std::istreambuf_iterator<char>{in},
                      std::istreambuf_iterator<char>{}};
     // The open() check above only proves the file opened; a hard I/O

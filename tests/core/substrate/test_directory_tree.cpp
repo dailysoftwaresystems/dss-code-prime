@@ -24,7 +24,10 @@
 #include <vector>
 
 #if !defined(_WIN32)
-#include <sys/stat.h>   // mkfifo: the special file a POSIX host can make
+#include <dirent.h>     // opendir: the OS's own listing, the unlistable root's control
+#include <sys/stat.h>   // mkfifo: the special file a POSIX host can make; chmod
+#include <unistd.h>     // geteuid
+#include <cerrno>
 #else
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -33,6 +36,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>   // the walk universe's objects, made through `\\?\` as the OS makes them
+#include <sddl.h>      // ConvertStringSecurityDescriptorToSecurityDescriptorW: the unlistable root's DACL
 #endif
 #include <cstring>
 #include <iostream>
@@ -292,8 +296,9 @@ TEST(DirectoryTree, TheWalkHandsADirectoryOutBeforeItsContentsAndObeysPruneAndSt
     EXPECT_EQ(handed, 1u) << "the walk went on after the visitor ended it";
 }
 
-// A root the walk cannot list is an error naming it -- never an empty, finished walk.
-TEST(DirectoryTree, TheWalkNamesTheRootItCannotList) {
+// A root that is NOT THERE is an error naming it -- never an empty, finished walk. The walk reads its root's kind
+// before any listing (H6c, A2), so this case is answered there; the root it cannot LIST is the next case's.
+TEST(DirectoryTree, TheWalkNamesARootThatIsNotThere) {
     ScratchDir     scratch{Location::Temp, "directory_tree_no_root"};
     fs::path const missing = scratch.path() / "not-here";
     std::size_t    handed = 0;
@@ -304,6 +309,66 @@ TEST(DirectoryTree, TheWalkNamesTheRootItCannotList) {
     EXPECT_TRUE(walk.error) << "a walk of a root that is not there reported a complete walk";
     EXPECT_EQ(walk.where.spelling().display(), utf8Of(missing));
     EXPECT_EQ(walk.root, dss::core::WalkRoot::Absent) << "the walk reports its root (H6c, A2)";
+    EXPECT_EQ(handed, 0u);
+}
+
+// A ROOT DIRECTORY THE WALK CANNOT LIST (P69 H6c2, ledger 628): it is there and it is a directory -- its kind is read
+// -- but the OS refuses to list it. The walk ends with the OS's error, the root named and called Unreadable, and hands
+// out nothing; never an empty, finished walk (a glob matching nothing, an input directory holding no source).
+// - POSIX: a mode-0 directory. It stats as a directory and `opendir` refuses it EACCES, for a process that is not the
+//   superuser (MEASURED 2026-11-16, u10l: macos-arm64-debug euid 501, linux-x86_64-debug euid 1000). The superuser
+//   lists it, so there the cell is UNMEASURED and says so.
+// - Windows: a DACL that denies FILE_LIST_DIRECTORY to everyone and allows the rest, so the kind is still read. Neither
+//   Windows leg holds the backup or restore privilege that would bypass it (MEASURED u6 P2).
+// The OS's own refusal is asserted first, so the cell never passes over a directory the OS would have listed.
+TEST(DirectoryTree, TheWalkNamesARootDirectoryItCannotList) {
+    ScratchDir     scratch{Location::Temp, "directory_tree_unlistable_root"};
+    fs::path const dir = scratch.path() / "unlistable";
+    writeFile(dir / "inside.json");
+#if defined(_WIN32)
+    // Deny FILE_LIST_DIRECTORY (0x1) to everyone on this directory alone, allow everything else; restored before the
+    // scratch is removed (the removal lists it).
+    auto const setDacl = [&dir](wchar_t const* sddl) {
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+        BOOL const set = ::SetFileSecurityW(dir.c_str(), DACL_SECURITY_INFORMATION, sd);
+        ::LocalFree(sd);
+        return set != FALSE;
+    };
+    struct Restore {
+        decltype(setDacl)& set;
+        ~Restore() { static_cast<void>(set(L"D:(A;OICI;FA;;;WD)")); }
+    } const restore{setDacl};
+    ASSERT_TRUE(setDacl(L"D:P(D;;0x1;;;WD)(A;OICI;FA;;;WD)")) << "the DACL was not set: " << ::GetLastError();
+    {
+        WIN32_FIND_DATAW found{};
+        HANDLE const     search = ::FindFirstFileW((dir / L"*").c_str(), &found);
+        DWORD const      error  = search == INVALID_HANDLE_VALUE ? ::GetLastError() : 0;
+        if (search != INVALID_HANDLE_VALUE) ::FindClose(search);
+        ASSERT_EQ(error, static_cast<DWORD>(ERROR_ACCESS_DENIED)) << "the OS lists the directory: the cell asks nothing";
+    }
+#else
+    if (::geteuid() == 0) GTEST_SKIP() << "UNMEASURED: the superuser lists a mode-0 directory";
+    struct Restore {
+        fs::path const& dir;
+        ~Restore() { static_cast<void>(::chmod(dir.c_str(), 0700)); }
+    } const restore{dir};
+    ASSERT_EQ(::chmod(dir.c_str(), 0), 0) << "the mode was not set: " << std::strerror(errno);
+    {
+        DIR* const listing = ::opendir(dir.c_str());
+        int const  error   = listing == nullptr ? errno : 0;
+        if (listing != nullptr) ::closedir(listing);
+        ASSERT_EQ(error, EACCES) << "the OS lists the directory: the cell asks nothing";
+    }
+#endif
+    std::size_t handed = 0;
+    auto const  walk   = dss::core::walkTree(dir, [&](TreeEntry const&) {
+        ++handed;
+        return WalkStep::Continue;
+    });
+    EXPECT_TRUE(walk.error) << "a walk of a root directory it cannot list reported a complete walk";
+    EXPECT_EQ(walk.root, dss::core::WalkRoot::Unreadable) << "the walk reports its root (H6c, A2)";
+    EXPECT_EQ(walk.where.spelling().display(), utf8Of(dir));
     EXPECT_EQ(handed, 0u);
 }
 
@@ -1001,7 +1066,7 @@ TEST(DirectoryTree, EveryOperationReachesAPathOf300CharactersAsBelow260) {
         EXPECT_FALSE(ec) << ec.message();
         fs::path const file = dir / "f.txt";
         {
-            std::ofstream out = dss::core::openOutputStream(file, std::ios::binary);
+            std::ofstream out = dss::core::openOutputStream(file, std::ios::binary).value();
             out << "abc";
             ASSERT_TRUE(out.good()) << "the file was not written";
         }
@@ -1018,7 +1083,7 @@ TEST(DirectoryTree, EveryOperationReachesAPathOf300CharactersAsBelow260) {
         EXPECT_FALSE(walk.error) << "the directory was not listed: " << walk.error.message();
         EXPECT_EQ(names, std::vector<std::string>{"f.txt"});
         {
-            std::ifstream in = dss::core::openInputStream(file, std::ios::binary);
+            std::ifstream in = dss::core::openInputStream(file, std::ios::binary).value_or(std::ifstream{});
             std::string   text;
             in >> text;
             EXPECT_EQ(text, "abc") << "the file was not read back";
@@ -1029,7 +1094,7 @@ TEST(DirectoryTree, EveryOperationReachesAPathOf300CharactersAsBelow260) {
         dss::core::copyFile(file, copy, ec);
         EXPECT_TRUE(ec) << "a copy onto an existing file must be refused";
         ec.clear();
-        if (std::FILE* const c = dss::core::openFileStream(copy, "rb")) {
+        if (std::FILE* const c = dss::core::openFileStream(copy, "rb").value_or(nullptr)) {
             char bytes[4] = {};
             EXPECT_EQ(std::fread(bytes, 1, 3, c), 3u);
             std::fclose(c);
@@ -1367,7 +1432,7 @@ constexpr ListedCell kListedCells[] = {
 }
 
 [[nodiscard]] std::string readValue(dss::core::HostPath const& v) {
-    std::ifstream in = dss::core::openInputStream(v, std::ios::binary);
+    std::ifstream in = dss::core::openInputStream(v, std::ios::binary).value_or(std::ifstream{});
     if (!in) return "<unopened>";
     return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
 }
@@ -1507,7 +1572,7 @@ TEST(DirectoryTree, EveryListedNameIsTheObjectItNamesInEveryMeasuredCell) {
 
         // SUFFIX: the sibling of the listed name, never of its twin.
         if (!c.dir) {
-            dss::core::openOutputStream(v.withSuffix(L".tmp"), std::ios::binary) << "sibling";
+            dss::core::openOutputStream(v.withSuffix(L".tmp").value(), std::ios::binary).value() << "sibling";
             EXPECT_EQ(readVerbatim(area + L"\\" + name + L".tmp"), "sibling") << "withSuffix named another sibling";
         }
 
@@ -1556,7 +1621,7 @@ TEST(DirectoryTree, EveryListedNameIsTheObjectItNamesInEveryMeasuredCell) {
             EXPECT_EQ(removal.failures, 0u) << removal.firstPath.spelling().display();
         } else {
             EXPECT_TRUE(dss::core::removeEntry(v, ec)) << ec.message();
-            EXPECT_TRUE(dss::core::removeEntry(v.withSuffix(L".tmp"), ec)) << ec.message();
+            EXPECT_TRUE(dss::core::removeEntry(v.withSuffix(L".tmp").value(), ec)) << ec.message();
         }
         EXPECT_EQ(namesIn(area), twinMade ? std::vector<std::wstring>{twin} : std::vector<std::wstring>{})
             << "the removal took another object than the listed one";
@@ -1732,7 +1797,7 @@ TEST(TypedHostPath, AnEmptySpellingIsTheCurrentDirectoryAsALeftSideAndRefusedAsA
     std::error_code idEc;
     static_cast<void>(dss::core::PathIdentity::of(empty, dss::core::Use::Leaf, idEc));
     EXPECT_TRUE(idEc == std::errc::invalid_argument) << "the empty leaf's identity was taken: " << idEc.message();
-    EXPECT_FALSE(dss::core::openInputStream(empty).is_open()) << "a stream was opened on the empty leaf";
+    EXPECT_FALSE(dss::core::openInputStream(empty).has_value()) << "a stream was opened on the empty leaf";
     std::error_code kindEc;
     EXPECT_EQ(dss::core::reachedKind(empty, dss::core::Use::Container, kindEc), EntryKind::Directory)
         << "the empty container is not the current directory: " << kindEc.message();
@@ -1743,7 +1808,7 @@ TEST(TypedHostPath, AnEmptySpellingIsTheCurrentDirectoryAsALeftSideAndRefusedAsA
     });
     EXPECT_FALSE(walk.error) << walk.error.message();
     EXPECT_EQ(listed, std::vector<std::string>{"a.c"}) << "a walk of the empty spelling lists the current directory";
-    std::ifstream in = dss::core::openInputStream(empty / fs::path{"a.c"});
+    std::ifstream in = dss::core::openInputStream(empty / fs::path{"a.c"}).value_or(std::ifstream{});
     std::string   line;
     std::getline(in, line);
     EXPECT_EQ(line, "EMPTY_LEFT") << "`\"\" / \"a.c\"` does not read the current directory's a.c";

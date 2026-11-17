@@ -10,15 +10,21 @@
 
 #include "core/substrate/every_unit.hpp"
 
+#include "core/substrate/path_identity.hpp"   // PathIdentity: does this host's identity of a spelling err
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/project_sources.hpp"   // expandAndDedupProjectSources -- sites (a), (b)
 #include "core/types/target_schema.hpp"
+#include "ffi/abi/abi_catalog.hpp"           // resolveAbi -- the pair a header is read under
+#include "ffi/ingest.hpp"                    // sites (g), (h), (i)
+#include "lsp/workspace_project.hpp"         // site (e)
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling: a name as the binary spells it
 #include "link/object_format_schema.hpp"
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"   // pullStaticArchiveMembers, pullEntryArchiveMembers
 #include "program/dump_predefined_macros.hpp"
 #include "program/git_acquire.hpp"
+#include "program/input_resolver.hpp"        // sites (c), (d)
 #include "program/program.hpp"
 
 #include "scratch_dir.hpp"
@@ -33,6 +39,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -70,38 +77,71 @@ TEST(EveryUnit, EveryUnitSucceedingSucceedsTheControl) {
     EXPECT_TRUE(dss::substrate::runEveryUnit(0, [](std::size_t) { return false; })) << "no unit asked is no unit failed";
 }
 
-// THE NETTED FORM (P69 H6c, R4): a unit that fails having reported nothing is named, the count read before EACH unit
-// -- a silent unit AFTER a reporting one, which one snapshot for the whole step leaves unnamed.
+// THE NET (P69 H6c, R4; H6c2: a STEP, `namingSilentFailures`, never a loop): a unit that fails having reported nothing
+// is named, the count read before EACH unit -- a silent unit AFTER a reporting one, which one snapshot for the whole
+// step leaves unnamed.
 TEST(EveryUnit, ASilentUnitAfterAReportingOneIsNamed) {
     std::size_t              errors = 0;
     std::vector<std::size_t> asked, silent;
-    bool const every = dss::substrate::runEveryUnitReportingSilence(
-        3,
-        [&](std::size_t i) {
-            asked.push_back(i);
-            if (i == 0) ++errors;   // unit 0 fails and says why; unit 1 fails and says nothing; unit 2 succeeds
-            return i == 2;
-        },
-        [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); });
+    bool const every = dss::substrate::runEveryUnit(
+        3, dss::substrate::namingSilentFailures(
+               [&](std::size_t i) {
+                   asked.push_back(i);
+                   if (i == 0) ++errors;   // unit 0 fails and says why; unit 1 fails and says nothing; unit 2 succeeds
+                   return i == 2;
+               },
+               [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); }));
     EXPECT_FALSE(every) << "two failed units were taken for success";
     EXPECT_EQ(asked, (std::vector<std::size_t>{0, 1, 2})) << "a failed unit stopped the units after it";
-    EXPECT_EQ(silent, std::vector<std::size_t>{1}) << "the silent unit after a reporting one was not named";
+    EXPECT_EQ(silent, std::vector<std::size_t>{1}) << "the silent unit after a reporting one was not named once";
 }
 
 // The control: every failing unit reports, so none is named -- and a unit that succeeds is never named.
 TEST(EveryUnit, AUnitThatReportsIsNeverNamedSilent) {
     std::size_t              errors = 0;
     std::vector<std::size_t> silent;
-    bool const every = dss::substrate::runEveryUnitReportingSilence(
-        3,
-        [&](std::size_t i) {
-            if (i == 1) return true;
-            ++errors;
-            return false;
-        },
-        [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); });
+    bool const every = dss::substrate::runEveryUnit(
+        3, dss::substrate::namingSilentFailures(
+               [&](std::size_t i) {
+                   if (i == 1) return true;
+                   ++errors;
+                   return false;
+               },
+               [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); }));
     EXPECT_FALSE(every);
     EXPECT_TRUE(silent.empty()) << "a unit that reported its failure was named silent";
+}
+
+// The net's control over units that succeed: no unit is named, whatever the count does.
+TEST(EveryUnit, ANettedStepThatSucceedsNamesNoUnit) {
+    std::vector<std::size_t> silent;
+    EXPECT_TRUE(dss::substrate::runEveryUnit(
+        3, dss::substrate::namingSilentFailures([](std::size_t) { return true; }, [] { return std::size_t{0}; },
+                                                [&](std::size_t i) { silent.push_back(i); })));
+    EXPECT_TRUE(silent.empty()) << "a unit that succeeded was named silent";
+}
+
+// ★ THE NET'S CONTRACT (H6c2, ledger 638 N1): a step fails only for a failure it reported ITSELF. A unit that meets
+// the failure an EARLIER unit already reported -- the same input named twice, a dependency two consumers reach --
+// answers TRUE: the earlier unit's false already fails the walk, and the net names nobody silent.
+TEST(EveryUnit, AnAlreadyReportedUnitMetAgainIsNotNamedSilent) {
+    std::size_t              errors = 0;
+    std::vector<std::size_t> silent;
+    std::vector<std::string> const units{"broken", "fine", "broken"};
+    std::vector<std::string>       refused;
+    bool const every = dss::substrate::runEveryUnit(
+        units.size(), dss::substrate::namingSilentFailures(
+                          [&](std::size_t i) {
+                              if (units[i] != "broken") return true;
+                              if (std::ranges::find(refused, units[i]) != refused.end()) return true;   // said once
+                              refused.push_back(units[i]);
+                              ++errors;
+                              return false;
+                          },
+                          [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); }));
+    EXPECT_FALSE(every) << "the walk the first unit failed succeeded";
+    EXPECT_EQ(errors, 1u) << "the one failure was not said exactly once";
+    EXPECT_TRUE(silent.empty()) << "the unit meeting an already-reported failure was named silent";
 }
 
 // THE INPUT-LANGUAGE CLAIM (program.cpp `resolveGrammarForTarget`): with no `--language`, the language the target
@@ -130,6 +170,33 @@ TEST(EveryUnit, EveryInputTheTargetsLanguageDoesNotClaimIsNamedBeforeTheBuildFai
         }
         EXPECT_TRUE(named) << "the unclaimed input " << name << " was not named; the build said:" << said;
     }
+}
+
+// SITE (k), THE PER-CU DRAIN (program.cpp `runCusToTargets`; P69 H6c2, the design re-audit's D2 (a)): every CU of a
+// build key is drained, and its verdict read, before the run decides -- one unit's PARSE error never hides another
+// unit's SEMANTIC one (gcc 13.3 and clang 18.1 report both on these two units: tests/program/test_parse_gate_scope.cpp).
+TEST(EveryUnit, EveryCuOfABuildKeyIsDrainedBeforeTheRunDecides) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-cu-drain"};
+    std::filesystem::path const   parseBroken    = scratch.path() / "tu_parse.c";
+    std::filesystem::path const   semanticBroken = scratch.path() / "tu_semantic.c";
+    std::ofstream(parseBroken, std::ios::binary) << "int broken(void) {\n    return 1 +\n}\n";
+    std::ofstream(semanticBroken, std::ios::binary) << "int later(void) {\n    return no_such_identifier_here;\n}\n";
+    dss::Program p;
+    p.setOutputDir(scratch.path());
+    dss::DiagnosticReporter rep;
+    EXPECT_NE(p.compileUnits({parseBroken.generic_string(), semanticBroken.generic_string()}, "c",
+                             {"x86_64:elf64-x86_64-linux-exec"}, rep),
+              0)
+        << "a build holding an unparseable unit was not refused";
+    std::string said;
+    bool        parse = false, semantic = false;
+    for (auto const& d : rep.all()) {
+        said += "\n  " + std::string{dss::diagnosticCodeName(d.code)} + ": " + d.actual;
+        parse    = parse || d.code == dss::DiagnosticCode::P_MissingRequiredChild;
+        semantic = semantic || d.code == dss::DiagnosticCode::S_UndeclaredIdentifier;
+    }
+    EXPECT_TRUE(parse) << "the first unit's parse error was not drained; the run said:" << said;
+    EXPECT_TRUE(semantic) << "the second unit was not drained: its semantic error is missing; the run said:" << said;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -545,6 +612,181 @@ TEST(EveryUnit, AValidUnitBeforeAnInvalidOneOfAGrowingSetIsAskedAndTheStepFails)
     EXPECT_TRUE(dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return valid.size(); }, step))
         << "a resumed search of one valid unit failed";
     EXPECT_EQ(asked, (std::vector<std::size_t>{0, 1, 2})) << "the resumed search asked an earlier unit again";
+}
+
+// ★ ONE LOOP, FOUR USES (H6c2): the growing form's net -- a unit a step APPENDS and fails silently after a reporting
+// one is named, once, and a resumed search's first unit too.
+TEST(EveryUnit, AnAppendedUnitFailingSilentlyAfterAReportingOneIsNamed) {
+    std::vector<std::size_t> units{0};
+    std::size_t              errors = 0;
+    std::vector<std::size_t> silent;
+    std::size_t              cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(
+        cursor, [&] { return units.size(); },
+        dss::substrate::namingSilentFailures(
+            [&](std::size_t i) {
+                if (i == 0) {
+                    units.push_back(1);   // unit 0 names a second, and fails saying why
+                    ++errors;
+                }
+                return false;             // the appended unit fails saying nothing
+            },
+            [&] { return errors; }, [&](std::size_t i) { silent.push_back(i); }));
+    EXPECT_FALSE(every);
+    EXPECT_EQ(silent, std::vector<std::size_t>{1}) << "the appended silent unit was not named once";
+    EXPECT_EQ(cursor, 2u);
+}
+
+TEST(EveryUnit, AResumedSearchsFirstUnitFailingSilentlyIsNamed) {
+    std::vector<bool>        valid{true};
+    std::size_t              errors = 0;
+    std::vector<std::size_t> silent;
+    std::size_t              cursor = 0;
+    auto step = dss::substrate::namingSilentFailures([&](std::size_t i) { return static_cast<bool>(valid[i]); },
+                                                     [&] { return errors; },
+                                                     [&](std::size_t i) { silent.push_back(i); });
+    EXPECT_TRUE(dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return valid.size(); }, step));
+    valid.push_back(false);
+    EXPECT_FALSE(dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return valid.size(); }, step));
+    EXPECT_EQ(silent, std::vector<std::size_t>{1}) << "the resumed search's silent unit was not named once";
+}
+
+TEST(EveryUnit, EveryUnitOfAGrowingSetFailingSilentlyIsEachNamed) {
+    std::vector<std::size_t> units{0, 1};
+    std::vector<std::size_t> silent;
+    std::size_t              cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(
+        cursor, [&] { return units.size(); },
+        dss::substrate::namingSilentFailures(
+            [&](std::size_t i) {
+                if (i == 0) units.push_back(2);
+                return false;
+            },
+            [] { return std::size_t{0}; }, [&](std::size_t i) { silent.push_back(i); }));
+    EXPECT_FALSE(every);
+    EXPECT_EQ(silent, (std::vector<std::size_t>{0, 1, 2})) << "a silent unit was not named once, in unit order";
+}
+
+// A UNIT THAT SPANS ENTRIES (an argument and the values it takes): the step moves the cursor FORWARD past the entries
+// its own unit spans, and the loop steps past the unit -- the entries a unit took are never asked as units.
+TEST(EveryUnit, AUnitSpanningEntriesIsAskedOnceWithItsEntries) {
+    std::vector<std::string> const entries{"-a", "value", "-b", "-c", "v1", "v2"};
+    std::vector<std::size_t>       asked;
+    std::size_t                    cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(
+        cursor, [&] { return entries.size(); },
+        [&](std::size_t i) {
+            asked.push_back(i);
+            std::size_t const takes = entries[i] == "-a" ? 1 : entries[i] == "-c" ? 2 : 0;
+            cursor += takes;          // past this unit's own values
+            return entries[i] != "-b";
+        });
+    EXPECT_FALSE(every) << "the refused unit was taken for success";
+    EXPECT_EQ(asked, (std::vector<std::size_t>{0, 2, 3})) << "a value a unit took was asked as a unit";
+    EXPECT_EQ(cursor, entries.size());
+}
+
+// A SET THAT CLOSES AT ITS FIRST ANSWER (ledger 633): the size closes at the answering unit, so no unit after it is
+// asked; every unit before it was asked and reported.
+TEST(EveryUnit, AFirstAnswerWalkEndsAtItsAnswer) {
+    std::vector<std::size_t>   asked;
+    std::size_t                end = 4;
+    std::optional<std::size_t> answer;
+    std::size_t                cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return end; }, [&](std::size_t u) {
+        asked.push_back(u);
+        if (u >= 2) {   // not here, not here, answered, would answer
+            answer = u;
+            end    = u + 1;
+        }
+        return true;
+    });
+    EXPECT_TRUE(every);
+    EXPECT_EQ(asked, (std::vector<std::size_t>{0, 1, 2})) << "the walk went past its first answer";
+    EXPECT_EQ(answer, std::optional<std::size_t>{2});
+    EXPECT_EQ(cursor, 3u);
+}
+
+TEST(EveryUnit, AFirstAnswerWalkAsksEveryUnitBeforeItsAnswer) {
+    std::vector<std::size_t>   asked;
+    std::size_t                end = 3;
+    std::optional<std::size_t> answer;
+    std::size_t                cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return end; }, [&](std::size_t u) {
+        asked.push_back(u);
+        if (u == 0) return false;   // failed (it reports, at its site)
+        if (u == 2) {
+            answer = u;
+            end    = u + 1;
+        }
+        return true;                // not here, or answered
+    });
+    EXPECT_FALSE(every) << "a walk a reached unit failed succeeded";
+    EXPECT_EQ(asked, (std::vector<std::size_t>{0, 1, 2})) << "a unit before the answer was not asked";
+    EXPECT_EQ(answer, std::optional<std::size_t>{2}) << "the answering unit was not reached";
+}
+
+TEST(EveryUnit, AFirstAnswerWalkNamesASilentUnitBeforeItsAnswer) {
+    std::vector<std::size_t> silent;
+    std::size_t              end    = 2;
+    std::size_t              cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(
+        cursor, [&] { return end; },
+        dss::substrate::namingSilentFailures(
+            [&](std::size_t u) {
+                if (u == 0) return false;   // failed silently
+                end = u + 1;                // answered
+                return true;
+            },
+            [] { return std::size_t{0}; }, [&](std::size_t u) { silent.push_back(u); }));
+    EXPECT_FALSE(every);
+    EXPECT_EQ(silent, std::vector<std::size_t>{0}) << "the silent unit before the answer was not named once";
+}
+
+TEST(EveryUnit, AFailedUnitAfterTheFirstAnswerIsNeverAsked) {
+    std::vector<std::size_t> asked;
+    std::size_t              end    = 2;
+    std::size_t              cursor = 0;
+    bool const every = dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return end; }, [&](std::size_t u) {
+        asked.push_back(u);
+        if (u == 0) {   // answered
+            end = 1;
+            return true;
+        }
+        return false;   // would fail
+    });
+    EXPECT_TRUE(every) << "a unit after the answer was asked and failed the walk";
+    EXPECT_EQ(asked, std::vector<std::size_t>{0});
+}
+
+TEST(EveryUnit, AFirstAnswerWalkWithNoAnswerAsksEveryUnit) {
+    std::vector<std::size_t> asked;
+    std::size_t const        end    = 3;
+    std::size_t              cursor = 0;
+    EXPECT_TRUE(dss::substrate::runEveryUnitOfAGrowingSet(cursor, [&] { return end; }, [&](std::size_t u) {
+        asked.push_back(u);
+        return true;   // not here
+    }));
+    EXPECT_EQ(asked, (std::vector<std::size_t>{0, 1, 2}));
+}
+
+// ★ THE LOOP NEVER MOVES BACK (H6c2, ledger 638): a step that moves the cursor BACK is refused LOUDLY -- the
+// substrate's fatal, never a walk that asks a unit again. The step moves it back ONCE, so the walk without the check
+// ends (asking unit 0 twice) instead of spinning.
+TEST(EveryUnitDeathTest, AStepThatMovesTheCursorBackIsFatal) {
+    auto const walk = [] {
+        bool        movedBack = false;
+        std::size_t cursor    = 0;
+        static_cast<void>(dss::substrate::runEveryUnitOfAGrowingSet(
+            cursor, [] { return std::size_t{3}; }, [&](std::size_t u) {
+                if (u == 1 && !movedBack) {
+                    movedBack = true;
+                    cursor    = 0;   // back, past the unit it is asked
+                }
+                return true;
+            }));
+    };
+    EXPECT_DEATH(walk(), "moved the cursor back");
 }
 
 namespace {
@@ -1025,5 +1267,381 @@ TEST(EveryUnit, EveryDependencyEntryIsAskedBeforeTheWalkFails) {
                     << "the invalid entry " << n << " was not refused by name; the build said:" << allSaid(rep);
             }
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// THE SITES H6c2 PUT ON THE ONE HOME (the several-unit home audit v2, §4.2): each pinned over both cells -- every unit
+// failing, and a valid unit before an invalid one -- and each NETTED site's cell asserts that no unit is named silent
+// (`D_CompileUnitNullNoDiagnostic`, the net's one code).
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+[[nodiscard]] std::size_t countCode(dss::DiagnosticReporter const& rep, dss::DiagnosticCode code) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(rep.all(), [&](dss::ParseDiagnostic const& d) { return d.code == code; }));
+}
+
+void expectNoUnitNamedSilent(dss::DiagnosticReporter const& rep) {
+    EXPECT_EQ(countCode(rep, dss::DiagnosticCode::D_CompileUnitNullNoDiagnostic), 0u)
+        << "a unit that reported its failure was named silent:" << allSaid(rep);
+}
+
+}  // namespace
+
+// SITE (a): a project's `sources` -- EVERY entry is expanded, and each glob that matches nothing is named, before the
+// list fails.
+TEST(EveryUnit, EveryProjectSourcesEntryIsExpandedBeforeTheBuildFails) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a matching glob, then one that matches nothing" : "two globs that match nothing");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-sources"};
+        fs::create_directories(scratch.path() / "src");
+        fs::create_directories(scratch.path() / "gen");   // listed, and holding nothing a glob matches
+        if (mixed) writeText(scratch.path() / "src" / "a.c", "int a(void) { return 1; }\n");
+        std::vector<std::string> const sources{mixed ? "src/*.c" : "src/*.zz", "gen/*.c"};
+        dss::DiagnosticReporter rep;
+        auto const list = dss::expandAndDedupProjectSources(sources, scratch.path(), rep);
+        EXPECT_FALSE(list.has_value()) << "a source list with an entry that matches nothing was answered";
+        for (std::string_view const pattern : {"src/*.zz", "gen/*.c"}) {
+            if (mixed && pattern == "src/*.zz") continue;
+            EXPECT_EQ(countSaying(rep, "glob pattern '" + std::string{pattern} + "' matched no files"), 1u)
+                << "the entry " << pattern << " was not named once:" << allSaid(rep);
+        }
+        expectNoUnitNamedSilent(rep);
+    }
+}
+
+// SITE (b): phase 2 identifies EVERY source phase 1 produced, and names each whose identity errs, before the list
+// fails. A source of a 300-byte name errs on POSIX (✔MEASURED 2026-11-16, u10l: ENAMETOOLONG, 63 on macos-arm64 and
+// 36 on linux-x86_64, as an unprivileged process); where this host's identity of that spelling does not err, the
+// cell says so and asks nothing it could not answer.
+TEST(EveryUnit, EveryProjectSourceIsIdentifiedBeforeTheBuildFails) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-identities"};
+    std::string const one = std::string(300, 'o') + ".c";
+    std::string const two = std::string(300, 't') + ".c";
+    std::error_code probe;
+    static_cast<void>(dss::core::PathIdentity::of(scratch.path() / one, dss::core::Use::Leaf, probe));
+    if (!probe) GTEST_SKIP() << "this host's identity of a 300-byte name does not err (measured here), so phase 2 has "
+                                "no erring source to name";
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a source that identifies, then one that errs" : "two sources that err");
+        writeText(scratch.path() / "fine.c", "int fine(void) { return 1; }\n");
+        std::vector<std::string> const sources{mixed ? "fine.c" : one, two};
+        dss::DiagnosticReporter rep;
+        auto const list = dss::expandAndDedupProjectSources(sources, scratch.path(), rep);
+        EXPECT_FALSE(list.has_value()) << "a source list with an unidentifiable source was answered";
+        EXPECT_EQ(countSaying(rep, "while de-duplicating the source list"), mixed ? 1u : 2u)
+            << "an unidentifiable source was not named once:" << allSaid(rep);
+        expectNoUnitNamedSilent(rep);
+    }
+}
+
+// SITE (c): EVERY input file is validated, and each missing one named, before the step fails.
+TEST(EveryUnit, EveryInputFileIsValidatedBeforeTheBuildFails) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "an input that exists, then a missing one" : "two missing inputs");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-inputs"};
+        writeText(scratch.path() / "here.c", "int here(void) { return 1; }\n");
+        std::vector<std::string> const inputs{(scratch.path() / (mixed ? "here.c" : "gone_one.c")).string(),
+                                              (scratch.path() / "gone_two.c").string()};
+        std::vector<std::string> out;
+        dss::DiagnosticReporter  rep;
+        EXPECT_FALSE(dss::InputResolver::validateFiles(inputs, out, rep)) << "a missing input was taken";
+        for (std::string_view const name : {"gone_one.c", "gone_two.c"}) {
+            if (mixed && name == "gone_one.c") continue;
+            EXPECT_EQ(countSaying(rep, name), 1u) << "the missing input " << name << " was not named once:" << allSaid(rep);
+        }
+        expectNoUnitNamedSilent(rep);
+    }
+}
+
+// SITE (d): EVERY search directory is asked, and each unusable one warned about; the step's answer is advisory, so a
+// usable directory before an unusable one changes nothing about the second.
+TEST(EveryUnit, EverySearchDirectoryIsAskedBeforeTheBuildGoesOn) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a usable directory, then a missing one" : "two missing directories");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-search-dirs"};
+        fs::create_directories(scratch.path() / "usable");
+        std::vector<std::string> const dirs{(scratch.path() / (mixed ? "usable" : "absent_one")).string(),
+                                            (scratch.path() / "absent_two").string()};
+        dss::DiagnosticReporter rep;
+        EXPECT_FALSE(dss::InputResolver::checkSearchDirectoriesUsable(dirs, "-I", rep));
+        for (std::string_view const name : {"absent_one", "absent_two"}) {
+            if (mixed && name == "absent_one") continue;
+            EXPECT_EQ(countSaying(rep, name), 1u) << "the missing directory " << name << " was not named once:"
+                                                  << allSaid(rep);
+        }
+        EXPECT_EQ(rep.errorCount(), 0u) << "an unusable search directory is warned about, never refused";
+    }
+}
+
+// SITE (e): a workspace -- EVERY manifest is read, and every target of each resolved, before the workspace is
+// refused, and the refusal holds one entry PER failed unit, each its own kind, in unit order.
+TEST(EveryUnit, EveryManifestOfAWorkspaceIsReadBeforeTheWorkspaceIsRefused) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a valid manifest, then an unloadable one" : "two unloadable manifests");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-workspace"};
+        writeText(scratch.path() / "main.c", "int main(void) { return 0; }\n");
+        if (mixed) {
+            writeManifest(scratch.path() / "a.dss-project.json", "cli", {"x86_64:elf64-x86_64-linux-exec"}, {"main.c"}, {});
+        } else {
+            writeText(scratch.path() / "a.dss-project.json", "{ not json\n");
+        }
+        writeText(scratch.path() / "b.dss-project.json", "{ not json either\n");
+        std::vector<fs::path> const roots{scratch.path()};
+        auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+        ASSERT_FALSE(build.has_value()) << "a workspace with an unloadable manifest was answered";
+        auto const& refusals = build.error().refusals;
+        // In unit order, every refusal of one manifest before the next's: `a` (when it fails), then `b`.
+        std::vector<std::string> order;
+        for (auto const& r : refusals) {
+            EXPECT_EQ(r.kind, dss::lsp::WorkspaceProjectErrorKind::ProjectFileLoadFailed) << r.detail;
+            EXPECT_NE(r.code, dss::DiagnosticCode::D_CompileUnitNullNoDiagnostic)
+                << "a manifest that reported its failure was named silent: " << r.detail;
+            std::string const which = r.detail.find("a.dss-project.json") != std::string::npos ? "a" : "b";
+            if (order.empty() || order.back() != which) order.push_back(which);
+        }
+        EXPECT_EQ(order, mixed ? std::vector<std::string>{"b"} : (std::vector<std::string>{"a", "b"}))
+            << "a manifest's refusal is missing, or out of unit order";
+    }
+}
+
+TEST(EveryUnit, EveryTargetOfAManifestIsResolvedBeforeTheWorkspaceIsRefused) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a valid target, then a malformed one" : "two malformed targets");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-workspace-targets"};
+        writeText(scratch.path() / "main.c", "int main(void) { return 0; }\n");
+        std::vector<std::string> const targets{mixed ? "x86_64:elf64-x86_64-linux-exec" : "malformed_one",
+                                               "malformed_two"};
+        writeManifest(scratch.path() / "app.dss-project.json", "cli", targets, {"main.c"}, {});
+        std::vector<fs::path> const roots{scratch.path()};
+        auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+        ASSERT_FALSE(build.has_value()) << "a manifest with a malformed target was answered";
+        auto const& refusals = build.error().refusals;
+        ASSERT_EQ(refusals.size(), mixed ? 1u : 2u) << "a target's refusal is missing, or said twice";
+        for (std::size_t r = 0; r < refusals.size(); ++r) {
+            EXPECT_EQ(refusals[r].kind, dss::lsp::WorkspaceProjectErrorKind::TargetSpecMalformed);
+            std::string const named = mixed || r == 1 ? "malformed_two" : "malformed_one";
+            EXPECT_NE(refusals[r].detail.find(named), std::string::npos) << refusals[r].detail;
+        }
+    }
+}
+
+// SITE (f): the C route's twin of site (f) of the assembly route -- every library named to a C unit's build is read,
+// and each one whose surface cannot be read is refused once, by name, before the ingest fails.
+TEST(EveryUnit, EveryOperatorNamedLibraryOfACUnitIsReadBeforeTheIngestFails) {
+    struct Family {
+        std::string_view arch, exec, dynamic, refusal;
+    };
+    constexpr Family kFamilies[] = {
+        {"x86_64", "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib", "Mach-O reader: export trie (off=2147418112 + "},
+        {"arm64", "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib", "Mach-O reader: export trie (off=2147418112 + "},
+        {"x86_64", "pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll",
+         "PE reader: export-directory RVA 2147418112 does not lie in any section's raw data"},
+    };
+    for (Family const& f : kFamilies) {
+        for (bool const mixed : {false, true}) {
+            SCOPED_TRACE(std::string{f.dynamic} + (mixed ? " / a readable library, then an unreadable one" : " / both unreadable"));
+            dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-c-libraries"};
+            fs::path const libs = scratch.path() / "libs";
+            fs::path const one = dynamicLibraryOf(libs, f.arch, f.dynamic, "lib_one", !mixed);
+            fs::path const two = dynamicLibraryOf(libs, f.arch, f.dynamic, "lib_two", true);
+            ASSERT_FALSE(one.empty() || two.empty());
+            fs::path const unit = scratch.path() / "main.c";
+            writeText(unit, "int lib_fn(void);\nint main(void) { return lib_fn(); }\n");
+            fs::path const out = scratch.path() / "out";
+            dss::Program p;
+            p.setOutputDir(out);
+            p.setResolveLibraries(std::vector<fs::path>{one, two});
+            dss::DiagnosticReporter rep;
+            EXPECT_NE(p.compileFiles({unit.string()}, "c", {spec(f.arch, f.exec)}, rep), 0)
+                << "a unit bound against an unreadable library was built" << allSaid(rep);
+            for (std::string_view const name : {"lib_one", "lib_two"}) {
+                bool const readable = mixed && name == "lib_one";
+                std::size_t refused = 0;
+                for (auto const& d : rep.all()) {
+                    if (d.actual.find(name) != std::string::npos && d.actual.find(f.refusal) != std::string::npos) ++refused;
+                }
+                EXPECT_EQ(refused, readable ? 0u : 1u)
+                    << "the library " << name << " is not refused exactly as its readability says; the build said:"
+                    << allSaid(rep);
+            }
+            EXPECT_EQ(artifactsUnder(out), std::vector<std::string>{}) << "the failed build wrote an artifact";
+            expectNoUnitNamedSilent(rep);
+        }
+    }
+}
+
+// SITE (g): an archive named to a build of another format -- EVERY member is compared with the target format, and
+// each wrong one named in `archive(member)` notation, before the check answers.
+TEST(EveryUnit, EveryMemberOfAnArchiveIsComparedWithTheTargetFormat) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a right member, then a wrong one" : "two wrong members");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-member-formats"};
+        // A Mach-O target, and ELF members: both formats carry a magic the comparison reads (a COFF object has none).
+        auto const macho = objectOf(scratch.path() / "macho", "x86_64", "macho64-x86_64-darwin", "macho_member");
+        auto const elf   = objectOf(scratch.path() / "elf", "x86_64", "elf64-x86_64-linux", "elf_member");
+        ASSERT_FALSE(macho.empty() || elf.empty());
+        fs::path const archive = scratch.path() / "lib.a";
+        writeBytes(archive, arOf({{"first.o", mixed ? macho : elf}, {"second.o", elf}}));
+        Loaded const l = loadedFor("x86_64", "macho64-x86_64-darwin-exec");
+        ASSERT_TRUE(l.target && l.format);
+        dss::DiagnosticReporter rep;
+        auto const rejected = dss::ffi::checkLibraryMatchesTargetFormat(archive, *l.format, rep);
+        EXPECT_TRUE(rejected.has_value()) << "an archive of a wrong-format member was taken";
+        for (std::string_view const member : {"(first.o)", "(second.o)"}) {
+            if (mixed && member == "(first.o)") continue;
+            EXPECT_EQ(countSaying(rep, member), 1u) << "the wrong member " << member << " was not named once:"
+                                                    << allSaid(rep);
+        }
+        expectNoUnitNamedSilent(rep);
+    }
+}
+
+// SITE (h): the merged inputs -- EVERY archive AND every object is compared with the target format, both partitions
+// asked, before the check fails.
+TEST(EveryUnit, EveryMergedInputIsComparedWithTheTargetFormat) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-merged-formats"};
+    auto const elf = objectOf(scratch.path() / "elf", "x86_64", "elf64-x86_64-linux", "elf_member");
+    ASSERT_FALSE(elf.empty());
+    std::vector<fs::path> archives, objects;
+    for (char const* stem : {"wrong_archive_one", "wrong_archive_two"}) {
+        archives.push_back(scratch.path() / (std::string{stem} + ".a"));
+        writeBytes(archives.back(), arOf({{"wrong.o", elf}}));
+    }
+    for (char const* stem : {"wrong_object_one", "wrong_object_two"}) {
+        objects.push_back(scratch.path() / (std::string{stem} + ".o"));
+        writeBytes(objects.back(), elf);
+    }
+    Loaded const l = loadedFor("x86_64", "macho64-x86_64-darwin-exec");
+    ASSERT_TRUE(l.target && l.format);
+    dss::DiagnosticReporter rep;
+    EXPECT_FALSE(dss::ffi::checkMergedLibraryInputsMatchTargetFormat(archives, objects, *l.format, rep));
+    for (std::string_view const name :
+         {"wrong_archive_one.a", "wrong_archive_two.a", "wrong_object_one.o", "wrong_object_two.o"}) {
+        EXPECT_GE(countSaying(rep, name), 1u) << "the wrong input " << name << " was not named:" << allSaid(rep);
+    }
+    expectNoUnitNamedSilent(rep);
+}
+
+// SITE (i): a header directory -- EVERY header is read and reports its own failure, and the read FAILS when any
+// header failed (the first failure its answer), never answering a partial surface. MOVED from tests/ffi/test_ingest.cpp
+// with the rule it inverts (`ReadCHeaderDirectoryPartialFailureReturnsSurface`): a surface short of a broken header's
+// declarations let the ingest refuse an extern that header declared, two steps from its cause.
+TEST(EveryUnit, EveryHeaderOfAHeaderDirectoryIsReadBeforeTheReadFails) {
+    Loaded const l = loadedFor("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(l.target && l.format);
+    dss::DiagnosticReporter abiRep;
+    auto const abi = dss::ffi::resolveAbi(*l.target, *l.format, abiRep);
+    ASSERT_TRUE(abi.has_value());
+    dss::ffi::HeaderReadPair const pair{*l.target, *l.format, abi->cc};
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a good header, then a bad one" : "two bad headers");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-headers"};
+        writeText(scratch.path() / "a_first.h", mixed ? "extern int puts(const char* s);\n" : "garbage one @@@\n");
+        writeText(scratch.path() / "b_second.h", "garbage two @@@\n");
+        dss::DiagnosticReporter rep;
+        auto const rows = dss::ffi::readCHeaderDirectory(scratch.path(), "libc.so.6", pair, rep);
+        ASSERT_FALSE(rows.has_value()) << "a header directory with a bad header answered a surface";
+        EXPECT_EQ(rows.error().kind, dss::ffi::HeaderReadErrorKind::HeaderParseFailed);
+        for (std::string_view const name : {"a_first.h", "b_second.h"}) {
+            if (mixed && name == "a_first.h") continue;
+            EXPECT_GE(countSaying(rep, name), 1u) << "the bad header " << name << " was not reported:" << allSaid(rep);
+        }
+        expectNoUnitNamedSilent(rep);
+    }
+    // The read's OWN refusal is reported by the read, as `readCHeader`'s are: a directory that is none.
+    dss::DiagnosticReporter rep;
+    auto const none = dss::ffi::readCHeaderDirectory("/no/such/dir/here", "libc.so.6", pair, rep);
+    ASSERT_FALSE(none.has_value());
+    EXPECT_EQ(rep.errorCount(), 1u) << "the read's own refusal was returned unreported:" << allSaid(rep);
+}
+
+// SITES (l), (m), (n): the dependency resolution -- EVERY child of a dependency is gathered and built, EVERY consumer
+// target gathered, and EVERY dependency's post-build hooks run, each failed one named, before the resolution fails.
+namespace {
+
+void writeDependency(fs::path const& dir, std::string const& source, std::string const& postBuildScripts = {}) {
+    fs::create_directories(dir);
+    writeText(dir / "lib.c", source);
+    std::string text = "{\n  \"language\": \"c\",\n  \"artifactProfile\": \"staticlib\",\n  \"targets\": "
+                       "[\"x86_64:elf64-x86_64-linux-staticlib\"],\n  \"sources\": [\"lib.c\"]";
+    if (!postBuildScripts.empty()) text += ",\n  \"postBuildScripts\": " + postBuildScripts;
+    writeText(dir / ".dss-project.json", text + "\n}\n");
+}
+
+[[nodiscard]] std::string pathEntry(fs::path const& dir) {
+    return "{\"path\": \"" + dir.generic_string() + "\"}";
+}
+
+}  // namespace
+
+TEST(EveryUnit, EveryChildDependencyIsBuiltBeforeTheGatherFails) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a child that builds, then one that does not" : "two children that do not build");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-children"};
+        fs::path const dir = scratch.path();
+        writeText(dir / "main.c", "int main(void) { return 0; }\n");
+        writeDependency(dir / "dep_one", mixed ? "int dep_one(void) { return 1; }\n" : "int dep_one(void) { return }\n");
+        writeDependency(dir / "dep_two", "int dep_two(void) { return }\n");
+        fs::path const manifest = dir / "app.dss-project.json";
+        writeManifest(manifest, "cli", {"x86_64:elf64-x86_64-linux-exec"}, {(dir / "main.c").generic_string()},
+                      {pathEntry(dir / "dep_one"), pathEntry(dir / "dep_two")});
+        dss::Program p;
+        p.setOutputDir(dir / "out");
+        dss::DiagnosticReporter rep;
+        EXPECT_NE(p.compileProject(manifest.string(), rep), 0) << "a project whose dependency fails was built";
+        for (std::string_view const name : {"dep_one", "dep_two"}) {
+            if (mixed && name == "dep_one") continue;
+            EXPECT_EQ(countSaying(rep, std::string{name} + "/.dss-project.json' failed to build"), 1u)
+                << "the failed dependency " << name << " was not named once:" << allSaid(rep);
+        }
+        expectNoUnitNamedSilent(rep);
+    }
+}
+
+TEST(EveryUnit, EveryConsumerTargetIsGatheredBeforeTheResolutionFails) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-consumer-targets"};
+    fs::path const dir = scratch.path();
+    writeText(dir / "main.c", "int main(void) { return 0; }\n");
+    writeDependency(dir / "dep", "int dep(void) { return }\n");
+    fs::path const manifest = dir / "app.dss-project.json";
+    writeManifest(manifest, "cli", {"x86_64:elf64-x86_64-linux-exec", "arm64:elf64-aarch64-linux-exec"},
+                  {(dir / "main.c").generic_string()}, {pathEntry(dir / "dep")});
+    dss::Program p;
+    p.setOutputDir(dir / "out");
+    dss::DiagnosticReporter rep;
+    EXPECT_NE(p.compileProject(manifest.string(), rep), 0);
+    for (std::string_view const target : {"x86_64:elf64-x86_64-linux-exec", "arm64:elf64-aarch64-linux-exec"}) {
+        EXPECT_EQ(countSaying(rep, "for consumer target '" + std::string{target} + "'"), 1u)
+            << "the consumer target " << target << " was not gathered and named once:" << allSaid(rep);
+    }
+    expectNoUnitNamedSilent(rep);
+}
+
+TEST(EveryUnit, EveryDependencysPostBuildHooksRunBeforeTheResolutionFails) {
+    for (bool const mixed : {false, true}) {
+        SCOPED_TRACE(mixed ? "a dependency whose hook runs, then one whose hook fails" : "two failing hooks");
+        dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-hooks"};
+        fs::path const dir = scratch.path();
+        writeText(dir / "main.c", "int main(void) { return 0; }\n");
+        auto const hookOf = [&](std::string const& program) {
+            return "[{\"run\": [\"" + (dir / program).generic_string() + "\"]}]";
+        };
+        writeDependency(dir / "dep_one", "int dep_one(void) { return 1; }\n", mixed ? "[]" : hookOf("no_such_hook_one"));
+        writeDependency(dir / "dep_two", "int dep_two(void) { return 2; }\n", hookOf("no_such_hook_two"));
+        fs::path const manifest = dir / "app.dss-project.json";
+        writeManifest(manifest, "cli", {"x86_64:elf64-x86_64-linux-exec"}, {(dir / "main.c").generic_string()},
+                      {pathEntry(dir / "dep_one"), pathEntry(dir / "dep_two")});
+        dss::Program p;
+        p.setOutputDir(dir / "out");
+        dss::DiagnosticReporter rep;
+        EXPECT_NE(p.compileProject(manifest.string(), rep), 0) << "a project whose dependency's hook fails succeeded";
+        for (std::string_view const hook : {"no_such_hook_one", "no_such_hook_two"}) {
+            if (mixed && hook == "no_such_hook_one") continue;
+            EXPECT_GE(countSaying(rep, hook), 1u) << "the failed hook " << hook << " was not named:" << allSaid(rep);
+        }
+        expectNoUnitNamedSilent(rep);
     }
 }
